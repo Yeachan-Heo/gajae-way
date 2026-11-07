@@ -901,9 +901,18 @@ export class MonitorPropagator {
 			return { kind: "hold", reason: "unresolved" };
 		}
 		const state = report.status?.status;
-		if (state === "failed") return turn.sizeRolled ? { kind: "hold", reason: "unresolved" } : { kind: "terminal", raw };
+		if (state === "failed" && !turn.sizeRolled) return { kind: "terminal", raw };
 		if (state === "accepted" || state === "in_flight") return { kind: "hold", reason: "running" };
-		if (state !== "terminal_ok") return { kind: "hold", reason: "unresolved" };
+		if (state !== "terminal_ok" && !(state === "failed" && turn.sizeRolled)) {
+			// Durable no-send failures (busy-refused, submission-wedged, host-unavailable)
+			// are explicit evidence the operation was never sent. Forget the pointer and recover.
+			// HOWEVER: verify the failure belongs to this pointer's operation (#742).
+			const failure = this.#database.monitors.failure(row.event_id);
+			if (isDurableNoSendFailureForOperation(failure, turn.sessionId, turn.opRef)) {
+				return { kind: "terminal", raw };
+			}
+			return { kind: "hold", reason: "unresolved" };
+		}
 		// The turn has ended. If the monitor is gone, the events are now unrecoverable.
 		if (!monitor) return { kind: "monitor_invalid", raw };
 		const related: MonitorEventDbRow[] = [];
@@ -1278,6 +1287,7 @@ export class MonitorPropagator {
 			let protocolResponseEntryCount: number | null = null;
 			let protocolValidationActive = false;
 			let readinessFailure: { readonly code: string; readonly detail: string } | undefined;
+			let opRef: string | undefined;
 			const flushReadinessFailure = () => {
 				if (!readinessFailure) return;
 				this.#recordReadinessFailure({
@@ -1408,7 +1418,147 @@ export class MonitorPropagator {
 				// the turn it started may still be running. Reuse its op-ref on retry.
 				const authoringEventIds = resumeTurn?.eventIds ?? claimed.map((row) => row.event_id);
 				const reusedOpRef = resumeTurn?.opRef ?? (await this.#reusableAuthoringTurn(authoringEventIds, sessionId));
-				const opRef = reusedOpRef ?? `gw-m-${batchId.replaceAll("-", "")}`;
+				opRef = reusedOpRef ?? `gw-m-${batchId.replaceAll("-", "")}`;
+				// #742: Check if we should hold the pointer instead of overwriting it with a fresh opRef
+				let shouldThrowOutputPending = false;
+				const authority = this.#database.bindings.brokerAuthority();
+				if (reusedOpRef === undefined && !resumeTurn && authority) {
+					for (const row of claimed) {
+						const priorRaw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
+						const prior = priorRaw === undefined ? undefined : parseAuthoringTurnPointer(priorRaw);
+						if (prior && prior.sessionId === sessionId && prior.opRef !== opRef) {
+							// Check if we have positive evidence the prior opRef was never admitted
+							const brokerOp = this.#database.bindings.brokerOperation(
+								authority,
+								"turn.prompt",
+								JSON.stringify([sessionId, prior.opRef]),
+							);
+							if (!isBrokerPromptBusyRefusal(brokerOp)) {
+								// No positive never-admitted evidence: check actual status.
+								// Explicit failure permits fresh authoring; unknown status holds the pointer.
+								try {
+									const report = await this.#sessionPort.status({
+										sessionId,
+										repo: this.#repo,
+										opRef: prior.opRef,
+									});
+									const state = report.status?.status;
+									if (state === "failed") {
+										// Explicit failure permits fresh authoring
+									} else {
+										// Durable no-send failures (busy-refused, submission-wedged, host-unavailable)
+										// are explicit evidence the operation was never sent. Permit fresh authoring.
+										// HOWEVER: verify the failure belongs to this pointer's operation (#742).
+										const failure = this.#database.monitors.failure(row.event_id);
+										if (isDurableNoSendFailureForOperation(failure, prior.sessionId, prior.opRef)) {
+											// Durable failure: permit fresh authoring
+										} else {
+											// Unknown status, throwing, or other states: hold the pointer (#742)
+											shouldThrowOutputPending = true;
+											break;
+										}
+									}
+								} catch {
+									// Unable to check status: hold the pointer instead
+									shouldThrowOutputPending = true;
+									break;
+								}
+							}
+						}
+					}
+				}
+				if (shouldThrowOutputPending) {
+					throw new AuthoringResultUnavailableError("output_pending");
+				}
+				// #742: Check pointers with different sessionId before transaction.
+				// Resolve them against their own sessionId to decide whether to hold, forget, or harvest.
+				const eventIdsToForget: string[] = [];
+				if (reusedOpRef === undefined && !resumeTurn) {
+					for (const row of claimed) {
+						const priorRaw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
+						const prior = priorRaw === undefined ? undefined : parseAuthoringTurnPointer(priorRaw);
+						if (prior && prior.sessionId !== sessionId) {
+							// Binding moved after this pointer was created. A durable busy refusal for
+							// the exact old op proves it was never admitted, so it needs no status read
+							// from the old session, which may be unreachable after a roll.
+							if (
+								authority !== null &&
+								isBrokerPromptBusyRefusal(
+									this.#database.bindings.brokerOperation(
+										authority,
+										"turn.prompt",
+										JSON.stringify([prior.sessionId, prior.opRef]),
+									),
+								)
+							) {
+								eventIdsToForget.push(row.event_id);
+								continue;
+							}
+							// Otherwise resolve the old op against its own session.
+							try {
+								const report = await this.#sessionPort.status({
+									sessionId: prior.sessionId,
+									repo: this.#repo,
+									opRef: prior.opRef,
+								});
+								const state = report.status?.status;
+								if (state === "accepted" || state === "in_flight") {
+									// Old turn still running: hold this dispatch, keep the pointer.
+									throw new AuthoringResultUnavailableError("output_pending");
+								}
+								if (state === "terminal_ok") {
+									// Old turn finished: would harvest, but session context differs.
+									// For safety, hold instead of attempting cross-session harvest.
+									throw new AuthoringResultUnavailableError("output_pending");
+								}
+								if (state === "failed") {
+									// A terminally failed turn permits a fresh prompt.
+									eventIdsToForget.push(row.event_id);
+								} else if (state === "unknown" || typeof state === "undefined") {
+									// Unknown status: hold pointer for operator judgement (#742).
+									// Exception: explicit failure rolls invalidate old session context and allow fresh authoring.
+									const lastRoll = this.#safetyState(sessionOriginKey).lastRoll;
+									if (
+										lastRoll === "session_submission_wedged" ||
+										lastRoll === "session_busy_stalled" ||
+										lastRoll === "session_prior_run_busy_stalled" ||
+										lastRoll === "session_host_unavailable"
+									) {
+										// Explicit failure roll: old context is invalid, forget the pointer
+										eventIdsToForget.push(row.event_id);
+									} else {
+										// Size roll or other reasons: hold pointer
+										throw new AuthoringResultUnavailableError("output_pending");
+									}
+								} else {
+									// Other inconclusive status: hold pointer
+									throw new AuthoringResultUnavailableError("output_pending");
+								}
+							} catch (error) {
+								// Unreadable status in old session after explicit failure roll: forget the pointer (#742/#738).
+								// Failure codes (session_*_stalled, session_submission_wedged, session_host_unavailable)
+								// are definitive reasons to roll. The old session context is invalid.
+								const lastRoll = this.#safetyState(sessionOriginKey).lastRoll;
+								if (
+									lastRoll === "session_submission_wedged" ||
+									lastRoll === "session_busy_stalled" ||
+									lastRoll === "session_prior_run_busy_stalled" ||
+									lastRoll === "session_host_unavailable"
+								) {
+									// Explicit failure roll: forget the old pointer
+									eventIdsToForget.push(row.event_id);
+								} else {
+									// Other errors (size roll, unknown reason): hold the pointer
+									if (!(error instanceof AuthoringResultUnavailableError)) {
+										throw new AuthoringResultUnavailableError("output_pending");
+									}
+									throw error;
+								}
+							}
+						}
+					}
+				}
+				// Build turn with sizeRolled tracking from #738
 				const savedRaw = this.#database.core.metaGet(authoringTurnKey(authoringEventIds[0] ?? ""));
 				const savedTurn = savedRaw === undefined ? undefined : parseAuthoringTurnPointer(savedRaw);
 				const turn: AuthoringTurnPointer = {
@@ -1424,8 +1574,13 @@ export class MonitorPropagator {
 					for (const row of claimed) {
 						const priorRaw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
 						const prior = priorRaw === undefined ? undefined : parseAuthoringTurnPointer(priorRaw);
-						if (prior && (prior.sessionId !== sessionId || prior.opRef !== opRef))
+						// Forget the prior pointer when same-session busy-refused OR in eventIdsToForget.
+						if (
+							eventIdsToForget.includes(row.event_id) ||
+							(prior && prior.sessionId === sessionId && prior.opRef !== opRef)
+						) {
 							this.#forgetAuthoringTurn(tx, [row.event_id], priorRaw);
+						}
 						this.#database.core.metaSet(authoringTurnKey(row.event_id), pendingTurn);
 					}
 				});
@@ -1772,7 +1927,11 @@ export class MonitorPropagator {
 							`dispatch phase failed (${code}): ${failureDetail(error)} ${JSON.stringify({ phase: dispatchPhase, operation: dispatchOperation, operation_args: dispatchOperationArgs, sessionId: boundSessionId ?? null, origin: sessionOriginKey, attempt: row.dispatch_attempts + 1 })}`,
 							now(),
 							false,
-							protocolFailure,
+							{
+								...(protocolFailure ?? {}),
+								sessionId: boundSessionId,
+								opRef,
+							},
 						);
 						if (failed) {
 							transitionedFailure = true;
@@ -1895,11 +2054,12 @@ export class MonitorPropagator {
 			if (prior.sessionId !== sessionId) throw new AuthoringResultUnavailableError("output_pending");
 			return prior.opRef;
 		}
-		if (
-			prior.sessionId !== sessionId ||
-			prior.eventIds.length !== eventIds.length ||
-			!eventIds.every((id) => prior.eventIds.includes(id))
-		) {
+		if (prior.sessionId !== sessionId) {
+			// A rebinding does not prove that the turn in the old session was never
+			// admitted. Leave it for the dispatch path to resolve against that session.
+			return undefined;
+		}
+		if (prior.eventIds.length !== eventIds.length || !eventIds.every((id) => prior.eventIds.includes(id))) {
 			forget();
 			return undefined;
 		}
@@ -1907,10 +2067,16 @@ export class MonitorPropagator {
 			const report = await this.#sessionPort.status({ sessionId, repo: this.#repo, opRef: prior.opRef });
 			const state = report.status.status;
 			if (state === "accepted" || state === "in_flight" || state === "terminal_ok") return prior.opRef;
+			// Failed status: forget and let dispatch author fresh (#742).
+			if (state === "failed") {
+				forget();
+				return undefined;
+			}
+			// Unknown status: hold for operator judgement, do not forget or reuse (#742).
+			return undefined;
 		} catch {
-			// Unreadable status is not evidence of a live turn.
+			// Unreadable status is not evidence of a live turn. Hold on throwing status.
 		}
-		forget();
 		return undefined;
 	}
 	/** Exact authority-scoped no-send evidence for this session and prompt. */
@@ -2660,6 +2826,25 @@ export class MonitorPropagator {
 			stage,
 		});
 	}
+}
+
+/**
+ * Verify that a failure is a durable no-send failure belonging to the specified operation (#742).
+ * Checks both the code AND that the operation reference matches (sessionId + opRef).
+ */
+function isDurableNoSendFailureForOperation(
+	failure: { readonly code: string; readonly session_id?: string | null; readonly op_ref?: string | null } | undefined,
+	sessionId: string,
+	opRef: string,
+): boolean {
+	if (!failure) return false;
+	if (
+		failure.code !== "session_busy" &&
+		failure.code !== "session_submission_wedged" &&
+		failure.code !== "session_host_unavailable"
+	)
+		return false;
+	return failure.session_id === sessionId && failure.op_ref === opRef;
 }
 
 function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase: string): DispatchFailureCode {
