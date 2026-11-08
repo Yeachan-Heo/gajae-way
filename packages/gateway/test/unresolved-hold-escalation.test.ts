@@ -685,45 +685,14 @@ test("a held op alternating between two reasons across scans logs recovery_hold 
 		useUnknownStatus = true; // Switch back to unknown
 		await f.manager.recover(); // Call 3: unknown -> dev logs reason A (changed), HEAD doesn't (A seen before)
 
-		// Extract logs from #logRecoveryHoldOnce, which are the ones affected by the dedup fix
-		const recoveryHolds = f.logs.filter((line) => {
-			if (!line.includes("recovery_hold ") || !line.includes("reason=") || !line.includes(`opRef=${f.heldOpRef}`)) {
-				return false;
-			}
-			// Exclude logs from direct recovery_hold calls (not from #logRecoveryHoldOnce)
-			const excludedReasons = [
-				"nonterminal_turn_owns_epoch",
-				"relay_dead",
-				"relay_lost_mid_turn",
-				"broker_authority_quarantined",
-				"session_binding_unavailable",
-				"retired_session_binding_unavailable",
-			];
-			return !excludedReasons.some((excluded) => line.includes(`reason=${excluded}`));
-		});
-
-		// Count how many times each reason appears in the logs
-		const reasonCounts = new Map<string, number>();
-		for (const log of recoveryHolds) {
-			const match = log.match(/reason=([\w_]+)/);
-			if (match) {
-				const reason = match[1]!;
-				reasonCounts.set(reason, (reasonCounts.get(reason) ?? 0) + 1);
-			}
-		}
-
-		// The fix uses #loggedRecoveryHolds Set to deduplicate by (opRef:reason) pair
-		// In dev, #recoveryHoldReasons Map only deduplicates consecutive changes
-		// To test the dedup works: verify that each reason in HEAD appears at most once
-		for (const [reason, count] of reasonCounts.entries()) {
-			if (count > 1) {
-				// This is the bug in dev (alternating reasons cause re-logs)
-				// In HEAD, each (opRef:reason) pair is only logged once, so count should always be 1
-				throw new Error(
-					`reason '${reason}' logged ${count} times; the fix should log each reason only once (dedup by opRef:reason) (#772)`,
-				);
-			}
-		}
+		// A -> B -> A logs each reason exactly once: neither re-logged on return nor suppressed.
+		const holds = f.logs.filter((line) => line.startsWith("recovery_hold ") && line.includes(`opRef=${f.heldOpRef}`));
+		const reasonA = holds.filter((line) => line.includes("reason=operation_state_unknown"));
+		const reasonB = holds.filter((line) =>
+			line.includes("reason=operation state terminal_uncertain is not decidable; do not resend, resume or recreate"),
+		);
+		expect(reasonA).toHaveLength(1);
+		expect(reasonB).toHaveLength(1);
 
 		// No escalation should occur since host is live and under the bound
 		expect(f.notices.length).toBe(0);
@@ -768,6 +737,8 @@ test("a terminal_uncertain hold held past unresolvedHoldMs emits exactly one rec
 			(line) => line.includes("recovery_hold_escalated") && line.includes(`opRef=${f.heldOpRef}`),
 		);
 		expect(escalationLogs).toHaveLength(1);
+		// The evidence names the status actually read and the hold kind, not a blanket unknown.
+		expect(escalationLogs[0]).toContain('evidence="status=terminal_ok holdKind=operation_uncertain live=false');
 	} finally {
 		await f.manager.stop();
 	}
@@ -815,6 +786,7 @@ test("an ambiguous authority hold held past unresolvedHoldMs emits exactly one r
 			(line) => line.includes("recovery_hold_escalated") && line.includes(`opRef=${f.heldOpRef}`),
 		);
 		expect(escalationLogs).toHaveLength(1);
+		expect(escalationLogs[0]).toContain('evidence="status=terminal_ok holdKind=ambiguous_authority live=false');
 
 		// Verify no second escalation happens on next recovery
 		const initialNoticeCount = f.notices.length;
@@ -827,3 +799,43 @@ test("an ambiguous authority hold held past unresolvedHoldMs emits exactly one r
 		await f.manager.stop();
 	}
 });
+
+for (const active of ["accepted", "in_flight"] as const) {
+	test(`an ambiguous authority hold whose fresh status reads ${active} stays fenced past unresolvedHoldMs on a dead host (#772)`, async () => {
+		const f = await heldOrigin(`ambiguous-${active}-fenced`, { heldForMs: 11 * MINUTE, live: false });
+		try {
+			// Every recovery scan sees the broker identity shift between its two inspects.
+			const inspect = f.port.inspect.bind(f.port);
+			let calls = 0;
+			f.port.inspect = async (input) => {
+				const result = await inspect(input);
+				if (input.sessionId !== f.binding.sessionId || !result) return result;
+				calls++;
+				return calls % 2 === 1 ? { ...result, sessionId: "mismatched-session-id" } : result;
+			};
+			const status = f.port.status.bind(f.port);
+			f.port.status = async (input) => {
+				const result = await status(input);
+				return input.opRef === f.heldOpRef ? { ...result, status: { status: active } } : result;
+			};
+
+			for (let scan = 0; scan < 3; scan++) await f.manager.recover();
+
+			// The op may still be mutating the workspace: no rotation, no queued dispatch, no notice.
+			expect(f.port.sends).toHaveLength(0);
+			expect(f.db.bindings.getSessionRecord(f.originKey)?.epoch).toBe(0);
+			expect(f.notices).toHaveLength(0);
+			expect(f.logs.some((line) => line.startsWith("recovery_hold_escalated"))).toBe(false);
+			expect(
+				f.logs.filter(
+					(line) =>
+						line.startsWith("recovery_hold ") &&
+						line.includes(`opRef=${f.heldOpRef}`) &&
+						line.includes("reason=broker authority is ambiguous"),
+				),
+			).toHaveLength(1);
+		} finally {
+			await f.manager.stop();
+		}
+	});
+}

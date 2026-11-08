@@ -11,6 +11,7 @@ import {
 	isOpRefRejection,
 	isTerminalStatus,
 	OpRefRejectedError,
+	type PromptStatus,
 	projectOpState,
 	type StatusReport,
 } from "@gajae-gateway/subsession";
@@ -1736,7 +1737,7 @@ class OriginActor {
 	async #escalateUnresolvedHold(
 		turn: InboundTurn,
 		bound: BoundTurn | undefined,
-		holdKind?: HoldKind,
+		evidence: { readonly status?: PromptStatus | "unavailable"; readonly holdKind?: HoldKind } = {},
 	): Promise<boolean> {
 		if (this.#stopped || this.#manager.stopped || bound?.retired) return false;
 		if (bound && this.#current !== bound) return false;
@@ -1770,15 +1771,19 @@ class OriginActor {
 		// A dead host is always evidence; a live unresponsive relay is if evidence spans long enough.
 		const host = await this.#bindingState(sessionId);
 		if (!hasRelayUnavailableEvidence && host.live !== false && host.disowned !== true) return false;
-		// A turn recovery never adopted carries no status verdict yet.
-		// For terminal_uncertain and ambiguous authority holds, escalate regardless of current status (#772).
-		const isTerminalUncertainOrAmbiguous = holdKind === "operation_uncertain" || holdKind === "ambiguous_authority";
-		if (
-			!bound &&
-			!isTerminalUncertainOrAmbiguous &&
-			(await this.#statusForRecovery(sessionId, turn.opRef)).status.status !== "unknown"
-		)
-			return false;
+		let status = evidence.status;
+		if (!bound) {
+			// A turn recovery never adopted carries no status verdict yet: read it fresh.
+			status = (await this.#statusForRecovery(sessionId, turn.opRef)).status.status;
+			// An accepted or in-flight op may still be mutating the workspace; no hold
+			// kind lifts that fence, whatever the broker liveness says (#772).
+			if (status === "accepted" || status === "in_flight") return false;
+			// Terminal-uncertain and ambiguous-authority holds escalate on a settled
+			// (terminal) status too; every other hold needs an unknown one (#772).
+			const settledEscalates =
+				evidence.holdKind === "operation_uncertain" || evidence.holdKind === "ambiguous_authority";
+			if (status !== "unknown" && !settledEscalates) return false;
+		}
 		const trigger = database.inbox.turnRow(turn.opRef);
 		if (!trigger) return false;
 		// One transaction: the fresh epoch, the held op's answer-wanted
@@ -1816,7 +1821,7 @@ class OriginActor {
 			);
 		}
 		this.#manager.log(
-			`recovery_hold_escalated origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} heldMs=${heldMs} evidence="status=unknown live=${host.live ?? "unknown"} disowned=${host.disowned ?? false}"`,
+			`recovery_hold_escalated origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} heldMs=${heldMs} evidence="status=${status ?? "unknown"} holdKind=${evidence.holdKind ?? "none"} live=${host.live ?? "unknown"} disowned=${host.disowned ?? false}"`,
 			"warn",
 		);
 		if (bound) {
@@ -2028,7 +2033,7 @@ class OriginActor {
 			case "operator_hold": {
 				// Unknown status and an empty queue do not authenticate non-admission.
 				// Also escalate terminal_uncertain and ambiguous authority holds after unresolvedHoldMs (#772).
-				if (await this.#escalateUnresolvedHold(turn, undefined, decision.holdKind)) return;
+				if (await this.#escalateUnresolvedHold(turn, undefined, { holdKind: decision.holdKind })) return;
 				this.#logRecoveryHoldOnce(turn, decision.reason);
 				return;
 			}
@@ -4117,7 +4122,7 @@ class OriginActor {
 				await this.#closeTerminatedStalledTurn(bound);
 				return;
 			}
-			if (await this.#escalateUnresolvedHold(bound.turn, bound)) {
+			if (await this.#escalateUnresolvedHold(bound.turn, bound, { status: "unavailable" })) {
 				await this.#dispatchNext();
 				return;
 			}
@@ -4148,7 +4153,7 @@ class OriginActor {
 			}
 			// Neither a missing acknowledgement nor queue/session observations
 			// establish non-admission or authorize a new operation identity.
-			if (await this.#escalateUnresolvedHold(bound.turn, bound)) {
+			if (await this.#escalateUnresolvedHold(bound.turn, bound, { status: report.status.status })) {
 				await this.#dispatchNext();
 				return;
 			}
