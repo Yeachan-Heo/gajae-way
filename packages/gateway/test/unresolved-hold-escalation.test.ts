@@ -661,3 +661,107 @@ test("a dead relay (onRelayDead) followed only by CLI-only status probes still e
 		await f.manager.stop();
 	}
 });
+
+test("a held op alternating between two reasons across scans logs recovery_hold exactly once per reason (#772 regression)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("alternating-reasons", { heldForMs: 2 * MINUTE, live: true, clock });
+	f.port.seedAcceptedSend({ sessionId: f.binding.sessionId, repo: "", text: "", opRef: f.heldOpRef });
+	try {
+		await f.manager.recover();
+
+		const status = f.port.status.bind(f.port);
+		let callCount = 0;
+
+		// Alternate between two different failure modes
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			callCount++;
+			// Even calls: endpoint stale; odd calls: broker unavailable
+			if (callCount % 2 === 0) {
+				throw endpointStale();
+			}
+			throw new Error("broker_unavailable: socket closed");
+		};
+
+		// Run multiple reconciles to trigger alternating holds
+		for (let i = 0; i < 6; i++) {
+			await clock.advance(10_000);
+			await f.manager.reconcile(f.originKey);
+		}
+
+		// Should have logged exactly 2 recovery_hold entries with different reasons
+		const recoveryHolds = f.logs.filter(
+			(line) => line.startsWith("recovery_hold ") && line.includes(`opRef=${f.heldOpRef}`),
+		);
+		// Filter to only those with "reason=" in the log
+		const holdsByReason: Record<string, number> = {};
+		for (const hold of recoveryHolds) {
+			const match = hold.match(/reason=(\S+)/);
+			if (match) {
+				holdsByReason[match[1]!] = (holdsByReason[match[1]!] ?? 0) + 1;
+			}
+		}
+
+		// Each unique reason should appear exactly once due to dedup logic (#705)
+		for (const [reason, count] of Object.entries(holdsByReason)) {
+			expect(count).toBe(1, `reason '${reason}' should log exactly once, got ${count}`);
+		}
+
+		// No escalation should occur since host is live and under the bound
+		expect(f.notices.length).toBe(0);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a terminal_uncertain hold held past unresolvedHoldMs emits exactly one recovery_hold_escalated (#772 regression)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("terminal-uncertain-escalate", { heldForMs: 11 * MINUTE, live: false, clock });
+	try {
+		// Make the operation state unknown to trigger terminal_uncertain hold
+		const port = f.port as HoldPort;
+		port.unknownOps.add(f.heldOpRef);
+
+		// On a dead host with terminal_uncertain (unknown) state past the bound, escalation should occur
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+
+		// Verify that escalation occurred due to terminal_uncertain hold
+		const escalations = f.notices.filter((n) => n.reason === UNRESOLVED_HOLD_ESCALATED);
+		expect(escalations).toHaveLength(1);
+
+		// Advance time and reconcile again; should not escalate a second time
+		const initialNoticeCount = f.notices.length;
+		for (let i = 0; i < 5; i++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+
+		// Only one escalation notice should exist
+		expect(f.notices.filter((n) => n.reason === UNRESOLVED_HOLD_ESCALATED)).toHaveLength(1);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("an ambiguous authority hold held past unresolvedHoldMs emits exactly one recovery_hold_escalated (#772 regression)", async () => {
+	const f = await heldOrigin("ambiguous-authority-escalate", { heldForMs: 11 * MINUTE, live: false });
+	try {
+		// Ambiguous authority with a dead host should escalate after unresolvedHoldMs
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+
+		// One escalation notice with the right reason
+		const escalations = f.notices.filter((n) => n.reason === UNRESOLVED_HOLD_ESCALATED);
+		expect(escalations).toHaveLength(1);
+
+		// Verify no second escalation happens on next recovery
+		const initialNoticeCount = f.notices.length;
+		await f.manager.recover();
+
+		expect(f.notices.filter((n) => n.reason === UNRESOLVED_HOLD_ESCALATED)).toHaveLength(1);
+		expect(f.notices.length).toBe(initialNoticeCount);
+	} finally {
+		await f.manager.stop();
+	}
+});

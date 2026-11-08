@@ -7,6 +7,7 @@ import {
 	CLIENT_REF_CONFLICT_CODE,
 	decideRecovery,
 	GjcCliError,
+	type HoldKind,
 	isOpRefRejection,
 	isTerminalStatus,
 	OpRefRejectedError,
@@ -1735,7 +1736,7 @@ class OriginActor {
 	async #escalateUnresolvedHold(
 		turn: InboundTurn,
 		bound: BoundTurn | undefined,
-		holdReason?: string,
+		holdKind?: HoldKind,
 	): Promise<boolean> {
 		if (this.#stopped || this.#manager.stopped || bound?.retired) return false;
 		if (bound && this.#current !== bound) return false;
@@ -1771,11 +1772,7 @@ class OriginActor {
 		if (!hasRelayUnavailableEvidence && host.live !== false && host.disowned !== true) return false;
 		// A turn recovery never adopted carries no status verdict yet.
 		// For terminal_uncertain and ambiguous authority holds, escalate regardless of current status (#772).
-		const isTerminalUncertainOrAmbiguous =
-			holdReason &&
-			(holdReason.includes("terminal_uncertain") ||
-				holdReason.includes("terminal_missing_receipt") ||
-				holdReason.includes("broker authority is ambiguous"));
+		const isTerminalUncertainOrAmbiguous = holdKind === "operation_uncertain" || holdKind === "ambiguous_authority";
 		if (
 			!bound &&
 			!isTerminalUncertainOrAmbiguous &&
@@ -2031,7 +2028,7 @@ class OriginActor {
 			case "operator_hold": {
 				// Unknown status and an empty queue do not authenticate non-admission.
 				// Also escalate terminal_uncertain and ambiguous authority holds after unresolvedHoldMs (#772).
-				if (await this.#escalateUnresolvedHold(turn, undefined, decision.reason)) return;
+				if (await this.#escalateUnresolvedHold(turn, undefined, decision.holdKind)) return;
 				this.#logRecoveryHoldOnce(turn, decision.reason);
 				return;
 			}

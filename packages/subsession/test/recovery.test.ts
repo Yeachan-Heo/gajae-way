@@ -150,9 +150,21 @@ describe("decideRecovery: uncertainty wins over everything", () => {
 			"terminal_missing_receipt",
 			{ status: "terminal_ok" as const, supervisorState: "terminal_missing_receipt" as const },
 		],
-	])("%s holds and freezes", (_label, operation) => {
+	])("% hold and freeze", (_label, operation) => {
 		const decision = decideRecovery(input({ operation }));
 		expect(decision).toMatchObject({ action: "operator_hold", freezeMutations: true });
+	});
+
+	test("terminal_uncertain hold has structured holdKind", () => {
+		const decision = decideRecovery(
+			input({ operation: { status: "unknown" as const, supervisorState: "terminal_uncertain" as const } }),
+		);
+		expect(decision.holdKind).toBe("operation_uncertain");
+	});
+
+	test("ambiguous authority hold has structured holdKind", () => {
+		const decision = decideRecovery(input({ session: { ambiguous: true }, operation: terminalOk }));
+		expect(decision.holdKind).toBe("ambiguous_authority");
 	});
 
 	test("ambiguous authority holds even with a perfect terminal op", () => {
