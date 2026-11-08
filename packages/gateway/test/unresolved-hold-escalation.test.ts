@@ -553,7 +553,7 @@ test("relay unavailable escalation measures time from the first failure, not the
 	try {
 		await f.manager.recover();
 
-		let escalationNotices = f.notices.length;
+		const escalationNotices = f.notices.length;
 		const status = f.port.status.bind(f.port);
 		const relayUnavailableMs = 30_000; // Probe every 30 seconds to make test ~5s on darwin
 		// With 11 minute duration and 30s intervals: ~22 reconciles, proving relay unavailable
@@ -611,7 +611,7 @@ test("a dead relay (onRelayDead) followed only by CLI-only status probes still e
 		const relayHandles = f.port.getTailHandles(f.binding.sessionId);
 		const handle = [...relayHandles][0] as ScriptedTailHandle | undefined;
 		expect(handle).toBeDefined();
-		let escalationNotices = f.notices.length;
+		const escalationNotices = f.notices.length;
 
 		// Trigger the relay death callback; this sets bound.detached and records relay unavailable evidence.
 		handle!.die();
@@ -741,6 +741,46 @@ test("a terminal_uncertain hold held past unresolvedHoldMs emits exactly one rec
 		expect(escalationLogs[0]).toContain('evidence="status=terminal_ok holdKind=operation_uncertain live=false');
 	} finally {
 		await f.manager.stop();
+	}
+});
+
+test("a terminal_uncertain hold persisted as escalated but not adopted before a crash is adopted again on restart (#772)", async () => {
+	const f = await heldOrigin("escalated-crash-window", { heldForMs: 11 * MINUTE, live: false });
+	await f.manager.stop();
+	// The escalation transaction committed (fresh epoch + marker), then the process
+	// died before #adoptRecoveredTurn registered the held turn.
+	f.db.transaction((tx) => f.db.bindings.rotateEpoch(tx, f.originKey));
+	f.db.core.metaSet(`escalated-hold:${f.heldOpRef}`, "1");
+	const status = f.port.status.bind(f.port);
+	let uncertain = true;
+	f.port.status = async (input) => {
+		const result = await status(input);
+		if (input.opRef !== f.heldOpRef || !uncertain) return result;
+		// terminal_ok with an unknown receipt projects to an operation_uncertain operator hold.
+		return { ...result, status: { status: "terminal_ok" as const, receiptState: "unknown" as const } };
+	};
+	const restarted = f.startManager();
+	try {
+		await restarted.recover();
+		expect(
+			f.logs.some((line) => line.includes(`opRef=${f.heldOpRef}`) && line.includes("reason=unresolved_hold_readopted")),
+		).toBe(true);
+		// Re-adoption is not a second escalation: no fresh epoch, no second notice.
+		expect(f.logs.some((line) => line.startsWith("recovery_hold_escalated"))).toBe(false);
+		expect(f.db.bindings.getSessionRecord(f.originKey)?.epoch).toBe(1);
+		// The held op later settles; the periodic reconcile observes the adopted
+		// turn and delivers the answer the escalation notice promised.
+		uncertain = false;
+		f.port.setSessionState(f.binding.sessionId, { live: true });
+		f.port.seedAcceptedSend({ sessionId: f.binding.sessionId, repo: "", text: "", opRef: f.heldOpRef });
+		f.port.complete(f.heldOpRef, "late answer after crash");
+		await restarted.reconcile(f.originKey);
+		await until(() => f.db.inbox.turnRow(f.heldOpRef)?.turn_state === "done");
+		expect(f.answers).toContainEqual({ opRef: f.heldOpRef, text: "late answer after crash" });
+		expect(f.port.sendAttempts.filter((send) => send.opRef === f.heldOpRef)).toHaveLength(1);
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBeUndefined();
+	} finally {
+		await restarted.stop();
 	}
 });
 

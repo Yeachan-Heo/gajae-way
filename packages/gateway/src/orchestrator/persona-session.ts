@@ -1745,7 +1745,20 @@ class OriginActor {
 		// A live BoundTurn is always on the current epoch; only a recovered row can be retired.
 		if (retiredEpoch && bound) return false;
 		const database = this.#manager.database;
-		if (database.core.metaGet(escalatedHoldKey(turn.opRef)) !== undefined) return false;
+		if (database.core.metaGet(escalatedHoldKey(turn.opRef)) !== undefined) {
+			// Already escalated: a crash between the durable escalation and its adoption
+			// leaves the held op unobserved, so a recovered row is adopted again here.
+			const heldSession = turn.sessionId;
+			if (bound || !heldSession) return false;
+			if (this.#current?.turn.opRef === turn.opRef || this.#retired.has(retiredKey({ epoch: turn.epoch, turn })))
+				return false;
+			if (!(await this.#adoptEscalatedHold(turn, heldSession))) return false;
+			this.#manager.log(
+				`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=unresolved_hold_readopted`,
+				"warn",
+			);
+			return true;
+		}
 		// The hold starts at the send. A row stamped by the schema 39 backfill
 		// ('pre-migration-39') or bound before dispatch was recorded falls back to
 		// its bind and then its arrival, so an old stranded row is still bounded (#705).
@@ -1845,22 +1858,8 @@ class OriginActor {
 			await bound.lifecycle.onRetired?.(bound);
 			this.#scheduleRetiredReattach(bound);
 		} else {
-			try {
-				// Adopted without a relay: the host is gone. Periodic reconcile reads
-				// its status; a reattach is tried on the bounded retired schedule.
-				const adopted = await this.#adoptRecoveredTurn(turn, sessionId, true, true);
-				// No bounded-cadence rechecks for an escalated hold: the sweep reads it (#715).
-				adopted.tailEvidenceUnavailable = false;
-				this.#clearStallReconciliation(adopted);
-				adopted.detached = true;
-				this.#scheduleRetiredReattach(adopted);
-			} catch (error) {
-				// Still durable: the next recovery scan treats it as a retired-epoch turn.
-				this.#manager.log(
-					`retired_hold_adopt_failed origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
-					"warn",
-				);
-			}
+			// On failure the escalation marker stays durable: the next recovery scan re-adopts it.
+			await this.#adoptEscalatedHold(turn, sessionId);
 		}
 		this.#manager.log(
 			`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=unresolved_hold_escalated`,
@@ -1868,6 +1867,31 @@ class OriginActor {
 		);
 		await this.#emitEscalationNotices();
 		return true;
+	}
+
+	/**
+	 * Adopts an escalated hold's recovered row as a detached retired turn so the
+	 * periodic sweep reads its status and a late answer is still delivered. Used
+	 * by the escalation itself and by recovery after a restart that lost it.
+	 */
+	async #adoptEscalatedHold(turn: InboundTurn, sessionId: string): Promise<boolean> {
+		try {
+			// Adopted without a relay: the host is gone. Periodic reconcile reads
+			// its status; a reattach is tried on the bounded retired schedule.
+			const adopted = await this.#adoptRecoveredTurn(turn, sessionId, true, true);
+			// No bounded-cadence rechecks for an escalated hold: the sweep reads it (#715).
+			adopted.tailEvidenceUnavailable = false;
+			this.#clearStallReconciliation(adopted);
+			adopted.detached = true;
+			this.#scheduleRetiredReattach(adopted);
+			return true;
+		} catch (error) {
+			this.#manager.log(
+				`retired_hold_adopt_failed origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
+				"warn",
+			);
+			return false;
+		}
 	}
 
 	/**
