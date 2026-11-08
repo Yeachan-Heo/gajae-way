@@ -679,11 +679,11 @@ test("a held op alternating between two reasons across scans logs recovery_hold 
 		};
 
 		// Call recover() three times: A (unknown), B (terminal_uncertain), A (unknown again)
-		await f.manager.recover();  // Call 1: unknown -> logs reason A
-		useUnknownStatus = false;    // Switch to terminal_uncertain
-		await f.manager.recover();  // Call 2: terminal_uncertain -> logs reason B (changed)
-		useUnknownStatus = true;     // Switch back to unknown
-		await f.manager.recover();  // Call 3: unknown -> dev logs reason A (changed), HEAD doesn't (A seen before)
+		await f.manager.recover(); // Call 1: unknown -> logs reason A
+		useUnknownStatus = false; // Switch to terminal_uncertain
+		await f.manager.recover(); // Call 2: terminal_uncertain -> logs reason B (changed)
+		useUnknownStatus = true; // Switch back to unknown
+		await f.manager.recover(); // Call 3: unknown -> dev logs reason A (changed), HEAD doesn't (A seen before)
 
 		// Extract logs from #logRecoveryHoldOnce, which are the ones affected by the dedup fix
 		const recoveryHolds = f.logs.filter((line) => {
