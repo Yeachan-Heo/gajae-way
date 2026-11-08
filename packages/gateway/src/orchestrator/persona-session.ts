@@ -7,9 +7,11 @@ import {
 	CLIENT_REF_CONFLICT_CODE,
 	decideRecovery,
 	GjcCliError,
+	type HoldKind,
 	isOpRefRejection,
 	isTerminalStatus,
 	OpRefRejectedError,
+	type PromptStatus,
 	projectOpState,
 	type StatusReport,
 } from "@gajae-gateway/subsession";
@@ -1642,7 +1644,10 @@ class OriginActor {
 		await this.#emitEscalationNotices();
 		const turns = this.#manager.database.inbox.nonterminalTurns(this.originKey);
 		const open = new Set(turns.map((turn) => turn.opRef));
-		for (const opRef of this.#recoveryHoldReasons.keys()) if (!open.has(opRef)) this.#recoveryHoldReasons.delete(opRef);
+		for (const key of this.#loggedRecoveryHolds) {
+			const opRef = key.split(":")[0];
+			if (opRef && !open.has(opRef)) this.#loggedRecoveryHolds.delete(key);
+		}
 		for (const turn of turns) {
 			if (this.#current?.turn.opRef === turn.opRef || this.#retired.has(retiredKey({ epoch: turn.epoch, turn })))
 				continue;
@@ -1729,14 +1734,31 @@ class OriginActor {
 	 * input fence, retired hold and one notice, without rotating an epoch the
 	 * origin has already left. The escalation marker makes it exactly once.
 	 */
-	async #escalateUnresolvedHold(turn: InboundTurn, bound: BoundTurn | undefined): Promise<boolean> {
+	async #escalateUnresolvedHold(
+		turn: InboundTurn,
+		bound: BoundTurn | undefined,
+		evidence: { readonly status?: PromptStatus | "unavailable"; readonly holdKind?: HoldKind } = {},
+	): Promise<boolean> {
 		if (this.#stopped || this.#manager.stopped || bound?.retired) return false;
 		if (bound && this.#current !== bound) return false;
 		const retiredEpoch = turn.epoch !== this.#epoch();
 		// A live BoundTurn is always on the current epoch; only a recovered row can be retired.
 		if (retiredEpoch && bound) return false;
 		const database = this.#manager.database;
-		if (database.core.metaGet(escalatedHoldKey(turn.opRef)) !== undefined) return false;
+		if (database.core.metaGet(escalatedHoldKey(turn.opRef)) !== undefined) {
+			// Already escalated: a crash between the durable escalation and its adoption
+			// leaves the held op unobserved, so a recovered row is adopted again here.
+			const heldSession = turn.sessionId;
+			if (bound || !heldSession) return false;
+			if (this.#current?.turn.opRef === turn.opRef || this.#retired.has(retiredKey({ epoch: turn.epoch, turn })))
+				return false;
+			if (!(await this.#adoptEscalatedHold(turn, heldSession))) return false;
+			this.#manager.log(
+				`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=unresolved_hold_readopted`,
+				"warn",
+			);
+			return true;
+		}
 		// The hold starts at the send. A row stamped by the schema 39 backfill
 		// ('pre-migration-39') or bound before dispatch was recorded falls back to
 		// its bind and then its arrival, so an old stranded row is still bounded (#705).
@@ -1762,8 +1784,23 @@ class OriginActor {
 		// A dead host is always evidence; a live unresponsive relay is if evidence spans long enough.
 		const host = await this.#bindingState(sessionId);
 		if (!hasRelayUnavailableEvidence && host.live !== false && host.disowned !== true) return false;
-		// A turn recovery never adopted carries no status verdict yet.
-		if (!bound && (await this.#statusForRecovery(sessionId, turn.opRef)).status.status !== "unknown") return false;
+		let status = evidence.status;
+		if (!bound) {
+			// A turn recovery never adopted carries no status verdict yet: read it fresh.
+			const report = await this.#statusForRecovery(sessionId, turn.opRef);
+			status = report.status.status;
+			// An accepted or in-flight op may still be mutating the workspace; no hold
+			// kind lifts that fence, whatever the broker liveness says (#772).
+			if (status === "accepted" || status === "in_flight") return false;
+			// Terminal-uncertain and ambiguous-authority holds escalate on a settled
+			// (terminal) status too; every other hold needs an unknown one (#772).
+			const settledEscalates =
+				evidence.holdKind === "operation_uncertain" || evidence.holdKind === "ambiguous_authority";
+			if (status !== "unknown" && !settledEscalates) return false;
+			// A settled status only speaks for the held op when the report names it:
+			// a mismatched or missing identity is an authority shift, never evidence (#772).
+			if (status !== "unknown" && report.operationRef !== turn.opRef) return false;
+		}
 		const trigger = database.inbox.turnRow(turn.opRef);
 		if (!trigger) return false;
 		// One transaction: the fresh epoch, the held op's answer-wanted
@@ -1788,7 +1825,10 @@ class OriginActor {
 			return { nextEpoch: epoch, closedInputs: closed };
 		});
 		this.#holdSweeps.delete(turn.opRef);
-		this.#recoveryHoldReasons.delete(turn.opRef);
+		// Clean up logged holds for this opRef when it's escalated
+		for (const key of this.#loggedRecoveryHolds) {
+			if (key.startsWith(`${turn.opRef}:`)) this.#loggedRecoveryHolds.delete(key);
+		}
 		for (const row of closedInputs) {
 			// Whether the model read it is unknown: release its ownership without a 👀.
 			await this.#manager.emitHeldSteerAccepted({ originKey: this.originKey, row, opRef: turn.opRef, abandoned: true });
@@ -1798,7 +1838,7 @@ class OriginActor {
 			);
 		}
 		this.#manager.log(
-			`recovery_hold_escalated origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} heldMs=${heldMs} evidence="status=unknown live=${host.live ?? "unknown"} disowned=${host.disowned ?? false}"`,
+			`recovery_hold_escalated origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} heldMs=${heldMs} evidence="status=${status ?? "unknown"} holdKind=${evidence.holdKind ?? "none"} live=${host.live ?? "unknown"} disowned=${host.disowned ?? false}"`,
 			"warn",
 		);
 		if (bound) {
@@ -1818,22 +1858,8 @@ class OriginActor {
 			await bound.lifecycle.onRetired?.(bound);
 			this.#scheduleRetiredReattach(bound);
 		} else {
-			try {
-				// Adopted without a relay: the host is gone. Periodic reconcile reads
-				// its status; a reattach is tried on the bounded retired schedule.
-				const adopted = await this.#adoptRecoveredTurn(turn, sessionId, true, true);
-				// No bounded-cadence rechecks for an escalated hold: the sweep reads it (#715).
-				adopted.tailEvidenceUnavailable = false;
-				this.#clearStallReconciliation(adopted);
-				adopted.detached = true;
-				this.#scheduleRetiredReattach(adopted);
-			} catch (error) {
-				// Still durable: the next recovery scan treats it as a retired-epoch turn.
-				this.#manager.log(
-					`retired_hold_adopt_failed origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
-					"warn",
-				);
-			}
+			// On failure the escalation marker stays durable: the next recovery scan re-adopts it.
+			await this.#adoptEscalatedHold(turn, sessionId);
 		}
 		this.#manager.log(
 			`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=unresolved_hold_escalated`,
@@ -1841,6 +1867,31 @@ class OriginActor {
 		);
 		await this.#emitEscalationNotices();
 		return true;
+	}
+
+	/**
+	 * Adopts an escalated hold's recovered row as a detached retired turn so the
+	 * periodic sweep reads its status and a late answer is still delivered. Used
+	 * by the escalation itself and by recovery after a restart that lost it.
+	 */
+	async #adoptEscalatedHold(turn: InboundTurn, sessionId: string): Promise<boolean> {
+		try {
+			// Adopted without a relay: the host is gone. Periodic reconcile reads
+			// its status; a reattach is tried on the bounded retired schedule.
+			const adopted = await this.#adoptRecoveredTurn(turn, sessionId, true, true);
+			// No bounded-cadence rechecks for an escalated hold: the sweep reads it (#715).
+			adopted.tailEvidenceUnavailable = false;
+			this.#clearStallReconciliation(adopted);
+			adopted.detached = true;
+			this.#scheduleRetiredReattach(adopted);
+			return true;
+		} catch (error) {
+			this.#manager.log(
+				`retired_hold_adopt_failed origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
+				"warn",
+			);
+			return false;
+		}
 	}
 
 	/**
@@ -2009,7 +2060,8 @@ class OriginActor {
 				return;
 			case "operator_hold": {
 				// Unknown status and an empty queue do not authenticate non-admission.
-				if (status.status.status === "unknown" && (await this.#escalateUnresolvedHold(turn, undefined))) return;
+				// Also escalate terminal_uncertain and ambiguous authority holds after unresolvedHoldMs (#772).
+				if (await this.#escalateUnresolvedHold(turn, undefined, { holdKind: decision.holdKind })) return;
 				this.#logRecoveryHoldOnce(turn, decision.reason);
 				return;
 			}
@@ -2020,10 +2072,11 @@ class OriginActor {
 	 * Recovery scans run every minute; an unchanged hold is logged once per
 	 * (op-ref, reason) and again only when its reason changes (#705).
 	 */
-	/** Logs a hold once per reason change; `extra` (e.g. `detail=…`) describes the first occurrence. */
+	/** Logs a hold once per reason; alternating reasons log once each per op-ref (#772, #705). */
 	#logRecoveryHoldOnce(turn: InboundTurn, reason: string, extra?: string): void {
-		if (this.#recoveryHoldReasons.get(turn.opRef) === reason) return;
-		this.#recoveryHoldReasons.set(turn.opRef, reason);
+		const key = `${turn.opRef}:${reason}`;
+		if (this.#loggedRecoveryHolds.has(key)) return;
+		this.#loggedRecoveryHolds.add(key);
 		this.#manager.log(
 			`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${reason}${extra ? ` ${extra}` : ""}`,
 			"warn",
@@ -2126,8 +2179,8 @@ class OriginActor {
 	}
 
 	readonly #holdSweeps = new Map<string, number>();
-	/** Last logged recovery-scan hold reason per op-ref (#705). */
-	readonly #recoveryHoldReasons = new Map<string, string>();
+	/** Logged recovery hold reasons to dedupe alternating reasons; keyed by "opRef:reason" (#772). */
+	readonly #loggedRecoveryHolds = new Set<string>();
 
 	/** Liveness of a binding from the raw broker envelope; the normalized inspect where the port has no raw read. */
 	async #bindingState(sessionId: string): Promise<{
@@ -4097,7 +4150,7 @@ class OriginActor {
 				await this.#closeTerminatedStalledTurn(bound);
 				return;
 			}
-			if (await this.#escalateUnresolvedHold(bound.turn, bound)) {
+			if (await this.#escalateUnresolvedHold(bound.turn, bound, { status: "unavailable" })) {
 				await this.#dispatchNext();
 				return;
 			}
@@ -4128,7 +4181,7 @@ class OriginActor {
 			}
 			// Neither a missing acknowledgement nor queue/session observations
 			// establish non-admission or authorize a new operation identity.
-			if (await this.#escalateUnresolvedHold(bound.turn, bound)) {
+			if (await this.#escalateUnresolvedHold(bound.turn, bound, { status: report.status.status })) {
 				await this.#dispatchNext();
 				return;
 			}
