@@ -1642,7 +1642,10 @@ class OriginActor {
 		await this.#emitEscalationNotices();
 		const turns = this.#manager.database.inbox.nonterminalTurns(this.originKey);
 		const open = new Set(turns.map((turn) => turn.opRef));
-		for (const opRef of this.#recoveryHoldReasons.keys()) if (!open.has(opRef)) this.#recoveryHoldReasons.delete(opRef);
+		for (const key of this.#loggedRecoveryHolds) {
+			const opRef = key.split(":")[0];
+			if (opRef && !open.has(opRef)) this.#loggedRecoveryHolds.delete(key);
+		}
 		for (const turn of turns) {
 			if (this.#current?.turn.opRef === turn.opRef || this.#retired.has(retiredKey({ epoch: turn.epoch, turn })))
 				continue;
@@ -1729,7 +1732,11 @@ class OriginActor {
 	 * input fence, retired hold and one notice, without rotating an epoch the
 	 * origin has already left. The escalation marker makes it exactly once.
 	 */
-	async #escalateUnresolvedHold(turn: InboundTurn, bound: BoundTurn | undefined): Promise<boolean> {
+	async #escalateUnresolvedHold(
+		turn: InboundTurn,
+		bound: BoundTurn | undefined,
+		holdReason?: string,
+	): Promise<boolean> {
 		if (this.#stopped || this.#manager.stopped || bound?.retired) return false;
 		if (bound && this.#current !== bound) return false;
 		const retiredEpoch = turn.epoch !== this.#epoch();
@@ -1763,7 +1770,18 @@ class OriginActor {
 		const host = await this.#bindingState(sessionId);
 		if (!hasRelayUnavailableEvidence && host.live !== false && host.disowned !== true) return false;
 		// A turn recovery never adopted carries no status verdict yet.
-		if (!bound && (await this.#statusForRecovery(sessionId, turn.opRef)).status.status !== "unknown") return false;
+		// For terminal_uncertain and ambiguous authority holds, escalate regardless of current status (#772).
+		const isTerminalUncertainOrAmbiguous =
+			holdReason &&
+			(holdReason.includes("terminal_uncertain") ||
+				holdReason.includes("terminal_missing_receipt") ||
+				holdReason.includes("broker authority is ambiguous"));
+		if (
+			!bound &&
+			!isTerminalUncertainOrAmbiguous &&
+			(await this.#statusForRecovery(sessionId, turn.opRef)).status.status !== "unknown"
+		)
+			return false;
 		const trigger = database.inbox.turnRow(turn.opRef);
 		if (!trigger) return false;
 		// One transaction: the fresh epoch, the held op's answer-wanted
@@ -1788,7 +1806,10 @@ class OriginActor {
 			return { nextEpoch: epoch, closedInputs: closed };
 		});
 		this.#holdSweeps.delete(turn.opRef);
-		this.#recoveryHoldReasons.delete(turn.opRef);
+		// Clean up logged holds for this opRef when it's escalated
+		for (const key of this.#loggedRecoveryHolds) {
+			if (key.startsWith(`${turn.opRef}:`)) this.#loggedRecoveryHolds.delete(key);
+		}
 		for (const row of closedInputs) {
 			// Whether the model read it is unknown: release its ownership without a 👀.
 			await this.#manager.emitHeldSteerAccepted({ originKey: this.originKey, row, opRef: turn.opRef, abandoned: true });
@@ -2009,7 +2030,8 @@ class OriginActor {
 				return;
 			case "operator_hold": {
 				// Unknown status and an empty queue do not authenticate non-admission.
-				if (status.status.status === "unknown" && (await this.#escalateUnresolvedHold(turn, undefined))) return;
+				// Also escalate terminal_uncertain and ambiguous authority holds after unresolvedHoldMs (#772).
+				if (await this.#escalateUnresolvedHold(turn, undefined, decision.reason)) return;
 				this.#logRecoveryHoldOnce(turn, decision.reason);
 				return;
 			}
@@ -2020,10 +2042,11 @@ class OriginActor {
 	 * Recovery scans run every minute; an unchanged hold is logged once per
 	 * (op-ref, reason) and again only when its reason changes (#705).
 	 */
-	/** Logs a hold once per reason change; `extra` (e.g. `detail=…`) describes the first occurrence. */
+	/** Logs a hold once per reason; alternating reasons log once each per op-ref (#772, #705). */
 	#logRecoveryHoldOnce(turn: InboundTurn, reason: string, extra?: string): void {
-		if (this.#recoveryHoldReasons.get(turn.opRef) === reason) return;
-		this.#recoveryHoldReasons.set(turn.opRef, reason);
+		const key = `${turn.opRef}:${reason}`;
+		if (this.#loggedRecoveryHolds.has(key)) return;
+		this.#loggedRecoveryHolds.add(key);
 		this.#manager.log(
 			`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${reason}${extra ? ` ${extra}` : ""}`,
 			"warn",
@@ -2126,8 +2149,8 @@ class OriginActor {
 	}
 
 	readonly #holdSweeps = new Map<string, number>();
-	/** Last logged recovery-scan hold reason per op-ref (#705). */
-	readonly #recoveryHoldReasons = new Map<string, string>();
+	/** Logged recovery hold reasons to dedupe alternating reasons; keyed by "opRef:reason" (#772). */
+	readonly #loggedRecoveryHolds = new Set<string>();
 
 	/** Liveness of a binding from the raw broker envelope; the normalized inspect where the port has no raw read. */
 	async #bindingState(sessionId: string): Promise<{
