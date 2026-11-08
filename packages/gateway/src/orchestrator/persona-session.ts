@@ -1774,7 +1774,8 @@ class OriginActor {
 		let status = evidence.status;
 		if (!bound) {
 			// A turn recovery never adopted carries no status verdict yet: read it fresh.
-			status = (await this.#statusForRecovery(sessionId, turn.opRef)).status.status;
+			const report = await this.#statusForRecovery(sessionId, turn.opRef);
+			status = report.status.status;
 			// An accepted or in-flight op may still be mutating the workspace; no hold
 			// kind lifts that fence, whatever the broker liveness says (#772).
 			if (status === "accepted" || status === "in_flight") return false;
@@ -1783,6 +1784,9 @@ class OriginActor {
 			const settledEscalates =
 				evidence.holdKind === "operation_uncertain" || evidence.holdKind === "ambiguous_authority";
 			if (status !== "unknown" && !settledEscalates) return false;
+			// A settled status only speaks for the held op when the report names it:
+			// a mismatched or missing identity is an authority shift, never evidence (#772).
+			if (status !== "unknown" && report.operationRef !== turn.opRef) return false;
 		}
 		const trigger = database.inbox.turnRow(turn.opRef);
 		if (!trigger) return false;

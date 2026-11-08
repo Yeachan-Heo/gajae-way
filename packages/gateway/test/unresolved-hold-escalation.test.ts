@@ -839,3 +839,54 @@ for (const active of ["accepted", "in_flight"] as const) {
 		}
 	});
 }
+
+for (const [label, operationRef] of [
+	["a mismatched", "other-op-ref"],
+	["a missing", ""],
+] as const) {
+	for (const kind of ["ambiguous_authority", "operation_uncertain"] as const) {
+		test(`a ${kind === "operation_uncertain" ? "receipt-uncertain" : "broker-identity-shifted"} hold whose fresh terminal report carries ${label} operation identity stays fenced on a dead host (#772)`, async () => {
+			const f = await heldOrigin(`${kind}-${operationRef || "missing"}-ref-fenced`, {
+				heldForMs: 11 * MINUTE,
+				live: false,
+			});
+			try {
+				if (kind === "ambiguous_authority") {
+					// Every recovery scan sees the broker identity shift between its two inspects.
+					const inspect = f.port.inspect.bind(f.port);
+					let calls = 0;
+					f.port.inspect = async (input) => {
+						const result = await inspect(input);
+						if (input.sessionId !== f.binding.sessionId || !result) return result;
+						calls++;
+						return calls % 2 === 1 ? { ...result, sessionId: "mismatched-session-id" } : result;
+					};
+				}
+				const status = f.port.status.bind(f.port);
+				f.port.status = async (input) => {
+					const result = await status(input);
+					if (input.opRef !== f.heldOpRef) return result;
+					return {
+						...result,
+						operationRef,
+						status:
+							kind === "operation_uncertain"
+								? { status: "terminal_ok" as const, receiptState: "unknown" as const }
+								: { status: "terminal_ok" as const },
+					};
+				};
+
+				for (let scan = 0; scan < 3; scan++) await f.manager.recover();
+
+				// A terminal report for another (or no) op says nothing about the held one:
+				// no rotation, no queued dispatch, no notice.
+				expect(f.port.sends).toHaveLength(0);
+				expect(f.db.bindings.getSessionRecord(f.originKey)?.epoch).toBe(0);
+				expect(f.notices).toHaveLength(0);
+				expect(f.logs.some((line) => line.startsWith("recovery_hold_escalated"))).toBe(false);
+			} finally {
+				await f.manager.stop();
+			}
+		});
+	}
+}
