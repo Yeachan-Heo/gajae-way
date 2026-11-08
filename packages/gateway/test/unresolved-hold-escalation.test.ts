@@ -737,8 +737,9 @@ test("a terminal_uncertain hold held past unresolvedHoldMs emits exactly one rec
 			await f.manager.reconcile(f.originKey);
 		}
 
-		// Only one escalation notice should exist
+		// Only one escalation notice should exist and notice count should not increase
 		expect(f.notices.filter((n) => n.reason === UNRESOLVED_HOLD_ESCALATED)).toHaveLength(1);
+		expect(f.notices.length).toBe(initialNoticeCount);
 	} finally {
 		await f.manager.stop();
 	}
