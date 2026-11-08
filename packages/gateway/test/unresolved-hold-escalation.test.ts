@@ -704,7 +704,10 @@ test("a held op alternating between two reasons across scans logs recovery_hold 
 
 		// Each unique reason should appear exactly once due to dedup logic (#705)
 		for (const [reason, count] of Object.entries(holdsByReason)) {
-			expect(count).toBe(1, `reason '${reason}' should log exactly once, got ${count}`);
+			expect(count).toBe(1);
+			if (count !== 1) {
+				throw new Error(`reason '${reason}' should log exactly once, got ${count}`);
+			}
 		}
 
 		// No escalation should occur since host is live and under the bound
