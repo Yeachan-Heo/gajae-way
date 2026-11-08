@@ -553,7 +553,7 @@ test("relay unavailable escalation measures time from the first failure, not the
 	try {
 		await f.manager.recover();
 
-		const escalationNotices = f.notices.length;
+		let escalationNotices = f.notices.length;
 		const status = f.port.status.bind(f.port);
 		const relayUnavailableMs = 30_000; // Probe every 30 seconds to make test ~5s on darwin
 		// With 11 minute duration and 30s intervals: ~22 reconciles, proving relay unavailable
@@ -611,7 +611,7 @@ test("a dead relay (onRelayDead) followed only by CLI-only status probes still e
 		const relayHandles = f.port.getTailHandles(f.binding.sessionId);
 		const handle = [...relayHandles][0] as ScriptedTailHandle | undefined;
 		expect(handle).toBeDefined();
-		const escalationNotices = f.notices.length;
+		let escalationNotices = f.notices.length;
 
 		// Trigger the relay death callback; this sets bound.detached and records relay unavailable evidence.
 		handle!.die();
@@ -664,31 +664,64 @@ test("a dead relay (onRelayDead) followed only by CLI-only status probes still e
 
 test("a held op alternating between two reasons across scans logs recovery_hold exactly once per reason (#772 regression)", async () => {
 	const f = await heldOrigin("alternating-reasons", { heldForMs: 2 * MINUTE, live: true });
-	f.port.seedAcceptedSend({ sessionId: f.binding.sessionId, repo: "", text: "", opRef: f.heldOpRef });
 	try {
-		await f.manager.recover();
+		// Mock status to toggle between unknown and terminal_uncertain
+		let useUnknownStatus = true;
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			const result = await status(input);
+			if (useUnknownStatus) {
+				return { ...result, status: { status: "unknown" } };
+			} else {
+				return { ...result, status: { status: "terminal_ok" as const, receiptState: "unknown" as const } };
+			}
+		};
 
-		// The fix adds #logRecoveryHoldOnce which deduplicates recovery_hold logs by opRef:reason
-		// In dev (pre-fix), recovery_hold would be logged multiple times for the same reason
-		// In the fix, it's logged exactly once per reason due to the #loggedRecoveryHolds set
-		const recoveryHolds = f.logs.filter(
-			(line) => line.startsWith("recovery_hold ") && line.includes(`opRef=${f.heldOpRef}`),
-		);
+		// Call recover() three times: A (unknown), B (terminal_uncertain), A (unknown again)
+		await f.manager.recover();  // Call 1: unknown -> logs reason A
+		useUnknownStatus = false;    // Switch to terminal_uncertain
+		await f.manager.recover();  // Call 2: terminal_uncertain -> logs reason B (changed)
+		useUnknownStatus = true;     // Switch back to unknown
+		await f.manager.recover();  // Call 3: unknown -> dev logs reason A (changed), HEAD doesn't (A seen before)
 
-		const holdsByReason: Record<string, number> = {};
-		for (const hold of recoveryHolds) {
-			const match = hold.match(/reason=([\w_]+)/);
+		// Extract logs from #logRecoveryHoldOnce, which are the ones affected by the dedup fix
+		const recoveryHolds = f.logs.filter((line) => {
+			if (!line.includes("recovery_hold ") || !line.includes("reason=") || !line.includes(`opRef=${f.heldOpRef}`)) {
+				return false;
+			}
+			// Exclude logs from direct recovery_hold calls (not from #logRecoveryHoldOnce)
+			const excludedReasons = [
+				"nonterminal_turn_owns_epoch",
+				"relay_dead",
+				"relay_lost_mid_turn",
+				"broker_authority_quarantined",
+				"session_binding_unavailable",
+				"retired_session_binding_unavailable",
+			];
+			return !excludedReasons.some((excluded) => line.includes(`reason=${excluded}`));
+		});
+
+		// Count how many times each reason appears in the logs
+		const reasonCounts = new Map<string, number>();
+		for (const log of recoveryHolds) {
+			const match = log.match(/reason=([\w_]+)/);
 			if (match) {
-				holdsByReason[match[1]!] = (holdsByReason[match[1]!] ?? 0) + 1;
+				const reason = match[1]!;
+				reasonCounts.set(reason, (reasonCounts.get(reason) ?? 0) + 1);
 			}
 		}
 
-		// Each unique reason should appear exactly once in the recovery_hold logs
-		// The #logRecoveryHoldOnce method uses key = `${turn.opRef}:${reason}`
-		// to ensure each reason is only logged once per opRef (#772)
-		for (const [reason, count] of Object.entries(holdsByReason)) {
-			if (count !== 1) {
-				throw new Error(`reason '${reason}' logged ${count} times, expected exactly 1 (dedup by opRef:reason)`);
+		// The fix uses #loggedRecoveryHolds Set to deduplicate by (opRef:reason) pair
+		// In dev, #recoveryHoldReasons Map only deduplicates consecutive changes
+		// To test the dedup works: verify that each reason in HEAD appears at most once
+		for (const [reason, count] of reasonCounts.entries()) {
+			if (count > 1) {
+				// This is the bug in dev (alternating reasons cause re-logs)
+				// In HEAD, each (opRef:reason) pair is only logged once, so count should always be 1
+				throw new Error(
+					`reason '${reason}' logged ${count} times; the fix should log each reason only once (dedup by opRef:reason) (#772)`,
+				);
 			}
 		}
 
@@ -757,8 +790,19 @@ test("an ambiguous authority hold held past unresolvedHoldMs emits exactly one r
 			return result;
 		};
 
-		// Ambiguous authority with a dead host should escalate after unresolvedHoldMs
-		// Both dev and fix escalate for dead hosts, but fix ensures holdKind is passed correctly
+		// Mock status to return terminal_ok (not unknown)
+		// This ensures dev does NOT escalate (dev requires status="unknown" for non-bound operations)
+		// But HEAD DOES escalate because holdKind="ambiguous_authority" overrides the status check (#772)
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			const result = await status(input);
+			return { ...result, status: { status: "terminal_ok" as const } };
+		};
+
+		// Dead host + ambiguous authority + status != unknown:
+		// - Dev does NOT escalate because status is not "unknown" (dev's check fails)
+		// - HEAD DOES escalate because ambiguous_authority holdKind overrides status check
 		await f.manager.recover();
 		await until(() => f.port.sends.length === 1);
 

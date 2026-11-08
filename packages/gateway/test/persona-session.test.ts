@@ -3552,7 +3552,7 @@ test("a stalled turn with a reply ending in stopReason stop does not post a fail
 
 	// Trigger stall without emitting agent_end
 	port.setActivity(send.sessionId, "tool", clock.now);
-	const statusReads = port.statusReads.length;
+	let statusReads = port.statusReads.length;
 	port.emitStall(send.sessionId);
 	await eventually(() => port.statusReads.length > statusReads, "stall did not check operation status");
 
@@ -3589,7 +3589,7 @@ test("a stalled turn with interim speech still posts a failure notice", async ()
 
 	// Trigger stall without emitting agent_end
 	port.setActivity(send.sessionId, "tool", clock.now);
-	const statusReads = port.statusReads.length;
+	let statusReads = port.statusReads.length;
 	port.emitStall(send.sessionId);
 	await eventually(() => port.statusReads.length > statusReads, "stall did not check operation status");
 
@@ -3627,7 +3627,7 @@ test("a stalled turn with a reply ending in stopReason error still posts a failu
 
 	// Trigger stall without emitting agent_end
 	port.setActivity(send.sessionId, "tool", clock.now);
-	const statusReads = port.statusReads.length;
+	let statusReads = port.statusReads.length;
 	port.emitStall(send.sessionId);
 	await eventually(() => port.statusReads.length > statusReads, "stall did not check operation status");
 
