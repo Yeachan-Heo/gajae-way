@@ -44,9 +44,9 @@ describe("release package workspace dependency guard", () => {
 
 	for (const fixture of PRIVATE_WORKSPACE_DEPENDENCY_FIXTURES) {
 		test(`rejects private workspace dependencies in ${fixture.section}`, () => {
-			expect(() => assertNoPrivateWorkspaceDeps(fixture.manifest, WORKSPACE_PACKAGES, RELEASE_PACKAGE_NAMES_WITH_PRIVATE)).toThrow(
-				"@gajae-gateway/home",
-			);
+			expect(() =>
+				assertNoPrivateWorkspaceDeps(fixture.manifest, WORKSPACE_PACKAGES, RELEASE_PACKAGE_NAMES_WITH_PRIVATE),
+			).toThrow("@gajae-gateway/home");
 		});
 	}
 
