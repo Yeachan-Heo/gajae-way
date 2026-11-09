@@ -2,8 +2,9 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DiscordImagePreparationError, type prepareDiscordImages } from "../src/attachments";
 import type { DiscordInboundMessage } from "../src/main";
-import { decideInbound, LruSet, monitorFailureDecision, ReconnectingGateway } from "../src/main";
+import { decideInbound, describeMessageEdit, LruSet, monitorFailureDecision, ReconnectingGateway } from "../src/main";
 import {
 	classifyRecoveryFailure,
 	loadRecoveryCursors,
@@ -542,6 +543,7 @@ function wiredGateway(
 	cursorPath: string,
 	channels: Record<string, Record<string, never>> = { "channel-1": {} },
 	getBotUser: () => unknown = () => bot,
+	prepareImages?: typeof prepareDiscordImages,
 ): ReconnectingGateway {
 	return new ReconnectingGateway(
 		"socket",
@@ -553,6 +555,9 @@ function wiredGateway(
 		getBotUser,
 		{ ...client, onChatMessage: () => () => {} } as never,
 		async () => {},
+		undefined,
+		undefined,
+		prepareImages,
 	);
 }
 
@@ -1047,6 +1052,179 @@ test("cross-pass accounting discards a message that alternates terminal and tran
 	expect(gateway.deadLetters[0].messageId).toBe(flaky.id);
 	expect(gateway.deadLetters[0].attempts).toBeGreaterThanOrEqual(RECOVERY_MAX_ATTEMPTS);
 	expect((await loadRecoveryCursors(cursorPath)).recoveredThrough["channel-1"]).toBe(good.id);
+});
+
+test("deterministic native image failures use bounded terminal recovery without a text-only send", async () => {
+	const cursorPath = join(home, "image-terminal", "recovery-cursor.json");
+	const base = Date.now() - 60 * 60 * 1000;
+	const rejected = message(snowflakeFromTimestamp(base), {
+		content: "",
+		attachments: [
+			{ name: "replacement.gif", contentType: "image/gif", url: "https://cdn.discordapp.com/image?sig=secret" },
+		],
+	});
+	const requests: Array<{ verb: string; params?: unknown }> = [];
+	const errors: string[] = [];
+	let prepareCalls = 0;
+	const originalError = console.error;
+	console.error = (line: unknown) => void errors.push(String(line));
+	try {
+		const rejectImages: typeof prepareDiscordImages = async () => {
+			prepareCalls++;
+			throw new DiscordImagePreparationError("terminal");
+		};
+		const gateway = wiredGateway(
+			fakeChannel([rejected]),
+			{
+				request: async (verb, params) => {
+					requests.push({ verb, params });
+					return { engaged: false };
+				},
+			},
+			cursorPath,
+			undefined,
+			() => bot,
+			rejectImages,
+		);
+		await gateway.recoverMissedMessages();
+		await gateway.cursorsFlushed;
+		const state = await loadRecoveryCursors(cursorPath);
+		expect(requests).toEqual([]);
+		expect(prepareCalls).toBe(1);
+		expect(state.deadLetters).toHaveLength(1);
+		expect(state.deadLetters[0]).toMatchObject({
+			messageId: rejected.id,
+			classification: "terminal-message",
+			summary: "image input rejected",
+		});
+		expect(state.recoveredThrough["channel-1"]).toBe(rejected.id);
+		expect(errors.some((line) => line.includes("dead-lettered without chat.send"))).toBe(true);
+		expect(errors.some((line) => line.includes("sig=secret"))).toBe(false);
+	} finally {
+		console.error = originalError;
+	}
+});
+
+test("transient image download failures keep recovery retryable without dispatching text", async () => {
+	const cursorPath = join(home, "image-retryable", "recovery-cursor.json");
+	const priorWatermark = snowflakeFromTimestamp(Date.now() - 2 * 24 * 60 * 60 * 1000);
+	await saveRecoveryCursors(cursorPath, cursorState({ "channel-1": priorWatermark }));
+	const inbound = message(snowflakeFromTimestamp(Date.now() - 60_000), {
+		content: "",
+		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo?sig=secret" }],
+	});
+	const requests: string[] = [];
+	let prepareCalls = 0;
+	const failDownload: typeof prepareDiscordImages = async () => {
+		prepareCalls++;
+		throw new DiscordImagePreparationError("retryable");
+	};
+	const gateway = wiredGateway(
+		fakeChannel([inbound]),
+		{
+			request: async (_verb, params) => {
+				requests.push((params as { messageId: string }).messageId);
+				return {};
+			},
+		},
+		cursorPath,
+		undefined,
+		() => bot,
+		failDownload,
+	);
+	await gateway.recoverMissedMessages();
+	const state = await loadRecoveryCursors(cursorPath);
+	expect(requests).toEqual([]);
+	expect(prepareCalls).toBe(RECOVERY_MAX_ATTEMPTS);
+	expect(state.deadLetters).toEqual([]);
+	expect(state.recoveredThrough["channel-1"]).toBe(priorWatermark);
+	expect(gateway.recoveryRetryPending).toBe(true);
+});
+
+test("recovered image resize notice is sent only for a fresh engaged acknowledgement", async () => {
+	const cursorPath = join(home, "image-notice", "recovery-cursor.json");
+	const inbound = message(snowflakeFromTimestamp(Date.now() - 60_000), {
+		content: "look",
+		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo?sig=secret" }],
+	});
+	const visibleNotices: unknown[] = [];
+	(inbound as unknown as { channel: { send: (payload: unknown) => Promise<void> } }).channel.send = async (payload) => {
+		visibleNotices.push(payload);
+	};
+	const requests: Array<{ verb: string; params?: unknown }> = [];
+	const gateway = wiredGateway(
+		fakeChannel([inbound]),
+		{
+			request: async (verb, params) => {
+				requests.push({ verb, params });
+				return { engaged: true };
+			},
+		},
+		cursorPath,
+		undefined,
+		() => bot,
+		async () => ({ images: [{ data: "AQ==", mimeType: "image/jpeg" }], notice: "Images resized/compressed." }),
+	);
+	await gateway.recoverMissedMessages();
+	const send = requests.find((request) => request.verb === "chat.send");
+	expect(send?.params).toMatchObject({
+		images: [{ data: "AQ==", mimeType: "image/jpeg" }],
+		text: expect.stringContaining("Image processing: Images resized/compressed."),
+	});
+	expect(visibleNotices).toEqual([
+		{
+			content: "Image processing: Images resized/compressed.",
+			reply: { messageReference: inbound.id, failIfNotExists: false },
+		},
+	]);
+	expect(
+		await gateway.requestRecovered(inbound.id, channelOrigin, "look", { mentioned: true } as never, [
+			{ data: "AQ==", mimeType: "image/jpeg" },
+		]),
+	).toEqual({ verdict: "duplicate" });
+	expect(visibleNotices).toHaveLength(1);
+});
+
+test("a declined recovered image does not post its resize notice", async () => {
+	const cursorPath = join(home, "image-notice-declined", "recovery-cursor.json");
+	const inbound = message(snowflakeFromTimestamp(Date.now() - 60_000), {
+		content: "look",
+		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo" }],
+	});
+	const visibleNotices: unknown[] = [];
+	(inbound as unknown as { channel: { send: (payload: unknown) => Promise<void> } }).channel.send = async (payload) => {
+		visibleNotices.push(payload);
+	};
+	const gateway = wiredGateway(
+		fakeChannel([inbound]),
+		{ request: async () => ({ engaged: false }) },
+		cursorPath,
+		undefined,
+		() => bot,
+		async () => ({ images: [{ data: "AQ==", mimeType: "image/jpeg" }], notice: "Images resized/compressed." }),
+	);
+	await gateway.recoverMissedMessages();
+	expect(visibleNotices).toEqual([]);
+});
+
+test("an edit that removes a prior image is rejected instead of retaining its old native bytes", () => {
+	const before = {
+		content: "look",
+		attachments: [{ name: "old.png", contentType: "image/png", url: "https://cdn.discordapp.com/old" }],
+		partial: false,
+	};
+	const after = message("edit-image-removal", {
+		content: "look, edited",
+		editedTimestamp: Date.now(),
+		attachments: [],
+	});
+	expect(describeMessageEdit(after, bot, { "channel-1": { engagement: "open" } }, before)).toBeUndefined();
+	const replacement = message("edit-image-replacement", {
+		content: "look, edited",
+		editedTimestamp: Date.now(),
+		attachments: [{ name: "new.png", contentType: "image/png", url: "https://cdn.discordapp.com/new" }],
+	});
+	expect(describeMessageEdit(replacement, bot, { "channel-1": { engagement: "open" } })).toBeUndefined();
 });
 
 test("dead-letter recording is idempotent per message id", async () => {

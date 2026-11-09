@@ -9,10 +9,12 @@ import {
 	type OriginRef,
 	OUTBOUND_FILE_MAX_BYTES,
 	originKey,
+	type PromptImage,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import {
 	describeInboundBody,
+	prepareTelegramImage,
 	pruneTelegramAttachments,
 	type TelegramAttachmentCarrier,
 	type TelegramAttachmentSaver,
@@ -788,6 +790,7 @@ export class TelegramAdapter {
 		readonly botUserId: string,
 		readonly config: Pick<LoadedTelegramAdapterConfig, "chats">,
 		readonly attachments: TelegramAttachmentSaver,
+		readonly replyBot: Pick<TelegramBotApi, "sendMessage">,
 	) {}
 
 	async handleUpdate(gateway: Pick<GatewayClientLike, "request">, update: TelegramUpdate): Promise<boolean> {
@@ -812,15 +815,47 @@ export class TelegramAdapter {
 			origin.kind !== "dm" && this.config.chats?.[origin.parentId ?? origin.conversationId]?.engagement === "open"
 				? { ...baseEngagement, mentioned: true }
 				: baseEngagement;
-		const stored = attachment
-			? await this.attachments.save(attachment, String(message.chat.id), message.message_id)
-			: undefined;
-		await gateway.request("chat.send", {
+		let stored: Awaited<ReturnType<TelegramAttachmentSaver["save"]>> | undefined;
+		let images: PromptImage[] | undefined;
+		let imageNotice = "";
+		if (attachment?.kind === "image") {
+			try {
+				stored = await this.attachments.save(attachment, String(message.chat.id), message.message_id);
+				if (!stored) throw new Error("image attachment was not saved");
+				const prepared = await prepareTelegramImage(stored);
+				if (prepared.images.length === 0) throw new Error("image preparation produced no images");
+				images = prepared.images;
+				imageNotice = prepared.notice;
+			} catch {
+				// Telegram has no local allowlist that proves a failure notice is authorized.
+				// Do not dispatch a text-only turn or post into a chat the gateway may reject.
+				console.error(
+					`Telegram inbound image rejected message=${telegramInboundMessageId(message.chat.id, message.message_id)}.`,
+				);
+				return true;
+			}
+		} else if (attachment) {
+			stored = await this.attachments.save(attachment, String(message.chat.id), message.message_id);
+		}
+		const body = describeInboundBody(content, attachment, stored, images !== undefined);
+		const imageContext = imageNotice ? `\n\nImage processing: ${imageNotice}` : "";
+		const accepted = await gateway.request<{ readonly engaged?: boolean }>("chat.send", {
 			origin,
-			text: describeInboundBody(content, attachment, stored),
+			text: `${body}${imageContext}`,
 			engagement,
 			messageId: telegramInboundMessageId(message.chat.id, message.message_id),
+			...(images ? { images } : {}),
 		});
+		if (accepted?.engaged && imageNotice) {
+			try {
+				for (const chunk of renderTelegramDelivery(`Image processing: ${imageNotice}`))
+					await sendTelegramHtml(this.replyBot, String(message.chat.id), chunk, message.message_thread_id);
+			} catch {
+				console.error(
+					`Telegram image processing notice failed message=${telegramInboundMessageId(message.chat.id, message.message_id)}.`,
+				);
+			}
+		}
 		return true;
 	}
 }
@@ -956,6 +991,7 @@ export async function startTelegramAdapter(config: LoadedTelegramAdapterConfig):
 		String(identity.id),
 		config,
 		new TelegramAttachmentStore(attachmentDirectory, bot),
+		bot,
 	);
 	const gateway = new ReconnectingGateway(config.gatewaySocket ?? defaultGatewaySocket(), bot, state);
 	await gateway.connectInitial();
@@ -1001,6 +1037,7 @@ class ReconnectingGateway implements GatewayClientLike {
 		try {
 			const options = {
 				clientName: "adapter-telegram",
+				requiredCapabilities: ["chat.images"],
 				onRetry: (attempt: number, delayMs: number, error: unknown) =>
 					console.warn(
 						`gateway_socket_waiting client=adapter-telegram path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${error instanceof Error ? error.message : String(error)}`,

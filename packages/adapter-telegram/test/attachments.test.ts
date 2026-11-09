@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, stat, truncate, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	describeInboundBody,
+	prepareTelegramImage,
 	pruneTelegramAttachments,
 	TELEGRAM_BOT_DOWNLOAD_LIMIT,
 	type TelegramAttachment,
@@ -56,7 +57,52 @@ test("renders the caption on its own line and the attachment after it", () => {
 	};
 	expect(describeInboundBody("", voice, { path: "/h/v.oga" })).toBe("[voice message · 1:15 · 2 KB · /h/v.oga]");
 	expect(describeInboundBody("look", photo, { path: "/h/p.jpg" })).toBe("look\n[image · /h/p.jpg]");
+	expect(describeInboundBody("look", photo, { path: "/h/p.jpg" }, true)).toBe(
+		"look\n[image · included as a native image input]",
+	);
 	expect(describeInboundBody("plain text", undefined, undefined)).toBe("plain text");
+});
+
+test("prepares only bytes read from the stored local image path and returns its notice", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-telegram-image-"));
+	try {
+		const path = join(home, "fresh.jpg");
+		const source = new Uint8Array([0xff, 0xd8, 0xff]);
+		await writeFile(path, source);
+		let received: number[][] = [];
+		const prepared = await prepareTelegramImage({ path }, async (sources) => {
+			received = sources.map((bytes) => [...bytes]);
+			return { images: [{ data: "prepared-data", mimeType: "image/jpeg" }], notice: "resized and compressed" };
+		});
+		expect(received).toEqual([[0xff, 0xd8, 0xff]]);
+		expect(prepared).toEqual({
+			images: [{ data: "prepared-data", mimeType: "image/jpeg" }],
+			notice: "resized and compressed",
+		});
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("rejects unavailable and oversized stored images before preparation", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-telegram-image-"));
+	try {
+		const path = join(home, "oversized.jpg");
+		await writeFile(path, new Uint8Array());
+		await truncate(path, TELEGRAM_BOT_DOWNLOAD_LIMIT + 1);
+		let called = false;
+		const prepare = async () => {
+			called = true;
+			return { images: [], notice: "" };
+		};
+		await expect(prepareTelegramImage({ unavailable: "download failed" }, prepare)).rejects.toThrow(
+			"image attachment is unavailable",
+		);
+		await expect(prepareTelegramImage({ path }, prepare)).rejects.toThrow("20 MB");
+		expect(called).toBe(false);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
 });
 
 test("stores the download owner-only under the chat directory with a sanitized name", async () => {

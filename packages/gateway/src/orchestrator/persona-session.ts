@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { LogLevel } from "@gajae-gateway/log";
+import type { PromptImage } from "@gajae-gateway/protocol";
 import {
 	assertControlAllowed,
 	assertValidOpRef,
@@ -426,6 +427,8 @@ export const PERSONA_RESTART_DRAIN_MAX_WAIT_MS = 300_000;
  */
 export interface PersonaTurnLifecycle {
 	readonly text: string;
+	/** Image inputs associated with the trigger; image rows cannot be consumed as text-only steers. */
+	readonly images?: readonly PromptImage[];
 	/**
 	 * Stable persona preamble. The actor puts it into a session's context on the
 	 * first send, after it changes, after the context shrank (compaction) or a
@@ -2688,6 +2691,7 @@ class OriginActor {
 				sessionId: binding.sessionId,
 				repo: this.#manager.repo,
 				text: lifecycle.text,
+				...(lifecycle.images ? { images: lifecycle.images } : {}),
 				opRef,
 				relay: tail,
 				busyStallMs: this.#manager.busyStallMs,
@@ -3108,6 +3112,8 @@ class OriginActor {
 	 * turn) or the session refused and is being recovered.
 	 */
 	async #steerRow(current: BoundTurn, row: InboundMessageRow): Promise<boolean> {
+		// turn.steer is text-only; uncertain persisted image data stays queued as well.
+		if (hasPersistedImages(row.images_json)) return false;
 		if (
 			this.#manager.database.bindings.isQuarantined("inbound", row.message_id) ||
 			this.#quarantinedTurn(current.turn.opRef)
@@ -5323,6 +5329,16 @@ export function steerDirectedAtPersona(row: InboundMessageRow): boolean {
 		readonly replyTo?: { readonly fromSelf?: boolean };
 	};
 	return engagement.group !== true || engagement.mentioned === true || engagement.replyTo?.fromSelf === true;
+}
+
+function hasPersistedImages(imagesJson: string | null): boolean {
+	if (imagesJson === null) return false;
+	try {
+		const parsed: unknown = JSON.parse(imagesJson);
+		return !Array.isArray(parsed) || parsed.length > 0;
+	} catch {
+		return true;
+	}
 }
 
 function laneSteerText(row: InboundMessageRow, lifecycle?: PersonaTurnLifecycle): string {

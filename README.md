@@ -48,6 +48,8 @@ Chat frontends are easy. What is hard is everything that happens when a real bot
 - Slack and Telegram replies upload files through the gateway: each standalone `MEDIA:/absolute/path` line naming a file inside the persona workspace (or a configured `outboundFileRoots` directory) becomes its own durable delivery in the same thread or forum topic as the reply, at most 5 files of 50 MiB each per reply. Telegram sends JPEG/PNG/WebP images up to 10 MB as photos and everything else (including GIFs and photos Telegram refuses) as documents.
 - Conversations and useful monitor output are captured under your own `$GAJAEWAY_HOME/memory` directory as readable Markdown, not hidden in a proprietary store.
 
+Discord, Slack, and Telegram can forward static PNG/JPEG attachments as native model image inputs. Images are resized and JPEG-compressed with a visible notice after gateway engagement; fine text and other detail may be lost. Each message supports up to four images, with a 20 MiB source limit per image and a 96 KiB combined prepared-image budget. Unsupported formats, unsafe downloads, and images that cannot fit are rejected rather than sent as a successful text-only turn. Preparation failures are recorded in sanitized adapter diagnostics, not posted to a conversation whose authorization the gateway has not confirmed. Prepared images are stored with their inbound message so a gateway restart or a busy session does not discard them. Image understanding still requires a vision-capable model. Adapters require the gateway's `chat.images` capability, refusing older gateways that could silently discard image payloads.
+
 ## Packages
 
 The Bun workspace under `packages/` is divided by responsibility:
@@ -63,6 +65,7 @@ The Bun workspace under `packages/` is divided by responsibility:
 | `@gajae-gateway/adapter-slack` | Slack ingress over Socket Mode, mrkdwn and file delivery, reactions, reaction-gradient working presence, opt-in live replies, and missed-message recovery. |
 | `@gajae-gateway/admin` | Local operator web console. |
 | `@gajae-gateway/home` | Shared home layout and process ownership leases. |
+| `@gajae-gateway/images` | Bounded image downloads, validation, and portable PNG/JPEG preparation. |
 | `@gajae-gateway/log` | Shared structured logging. |
 | `@gajae-gateway/subsession` | GJC session boundary. |
 | `@gajae-gateway/conformance` | Protocol conformance checks for CI/tests. |

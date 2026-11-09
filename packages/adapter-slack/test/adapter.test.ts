@@ -1,6 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ImageFetch } from "@gajae-gateway/images";
 import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajae-gateway/protocol";
 import { SlackApiError, type SlackHistoryPage, SlackWebApi } from "../src/api";
 import {
@@ -31,6 +32,13 @@ stopLiveGatewaysAfterEach();
 // The adapter defaults its recovery store to $GAJAEWAY_HOME; a test must never
 // be able to reach a real operator home, whatever a fixture forgets to pass.
 process.env.GAJAEWAY_HOME = join(tmpdir(), `slack-test-home-${crypto.randomUUID()}`);
+
+const ONE_PIXEL_PNG = Uint8Array.from(
+	Buffer.from(
+		"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGP4z8DAAMIM/4EAAB/uBfsL2WiLAAAAAElFTkSuQmCC",
+		"base64",
+	),
+);
 
 const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C1" };
 const engagement: EngagementContext = { mentioned: false, group: true, authorId: "U1" };
@@ -139,7 +147,7 @@ class Socket implements WebSocketLike {
 }
 async function fixture(
 	channels?: Record<string, { engagement: "open" | "mention-open" | "closed" }>,
-	options: { readonly autoRecover?: boolean; readonly now?: () => number } = {},
+	options: { readonly autoRecover?: boolean; readonly now?: () => number; readonly imageFetch?: ImageFetch } = {},
 ) {
 	const api = new Api();
 	const sockets: Socket[] = [];
@@ -166,6 +174,7 @@ async function fixture(
 			recoveryCursorPath,
 			now: options.now ?? (() => 1_700_000_100_000),
 			log: { log: (line) => logs.push(String(line)), error: (line) => logs.push(String(line)) },
+			...(options.imageFetch ? { imageFetch: options.imageFetch } : {}),
 			socketFactory: () => {
 				const socket = new Socket();
 				sockets.push(socket);
@@ -294,6 +303,115 @@ const appMention = (extra: Record<string, unknown> = {}) => ({
 });
 const chatSends = (gateway: Gateway) =>
 	gateway.requests.filter((r) => r.verb === "chat.send").map((r) => r.params as Record<string, unknown>);
+
+test("Slack forwards prepared native images and delivers resize notices only after an engaged chat.send", async () => {
+	const f = await fixture(undefined, {
+		imageFetch: async () => new Response(ONE_PIXEL_PNG, { status: 200, headers: { "content-type": "image/png" } }),
+	});
+	const file = {
+		id: "F123456",
+		name: "photo.png",
+		mimetype: "image/png",
+		url_private: "https://files.slack.com/files-pri/T1-F123456/photo.png",
+	};
+	try {
+		f.client.engaged = false;
+		await f.event({
+			...inbound({
+				ts: "1700000000.123456",
+				thread_ts: "1699999999.000001",
+				parent_user_id: "UBOT",
+				files: [file],
+			}),
+		});
+		expect(f.api.posts).toEqual([]);
+
+		f.client.engaged = true;
+		await f.event({
+			...inbound({
+				ts: "1700000001.123456",
+				thread_ts: "1699999999.000001",
+				parent_user_id: "UBOT",
+				files: [file],
+			}),
+		});
+		const sends = chatSends(f.client);
+		expect(sends).toHaveLength(2);
+		expect(sends[0]?.images).toHaveLength(1);
+		expect(sends[1]?.images).toHaveLength(1);
+		expect(sends[0]?.text).toContain(
+			"[Image preparation notice: Images resized/compressed for model input; fine detail may be lost.]",
+		);
+		expect(sends[0]?.text).not.toContain("files.slack.com");
+		expect(f.api.posts).toEqual([
+			[
+				"C1",
+				"Image adjustment: Images resized/compressed for model input; fine detail may be lost.",
+				"1699999999.000001",
+			],
+		]);
+		await f.event({
+			...inbound({
+				ts: "1700000001.123456",
+				thread_ts: "1699999999.000001",
+				parent_user_id: "UBOT",
+				files: [file],
+			}),
+		});
+		expect(chatSends(f.client)).toHaveLength(2);
+		expect(f.api.posts).toHaveLength(1);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("Slack image preparation failures skip chat.send and log no private URL", async () => {
+	const f = await fixture();
+	const privateUrl = "https://files.slack.com/files-pri/T1-F123456/private-image.png";
+	try {
+		await f.event({
+			...inbound({
+				files: [{ id: "F123456", name: "photo.png", mimetype: "image/png", permalink: privateUrl }],
+			}),
+		});
+		expect(chatSends(f.client)).toEqual([]);
+		expect(f.api.posts).toEqual([]);
+		expect(f.logs.join("\n")).toContain("Slack image input preparation failed; chat.send was not dispatched.");
+		expect(f.logs.join("\n")).not.toContain(privateUrl);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("Slack message edits that add or remove native images are rejected without chat.edit", async () => {
+	const f = await fixture();
+	try {
+		const imageFile = {
+			id: "F123456",
+			name: "photo.png",
+			mimetype: "image/png",
+			url_private: "https://files.slack.com/files-pri/T1-F123456/photo.png",
+		};
+		for (const [files, previousFiles] of [
+			[[], [imageFile]],
+			[[imageFile], []],
+		] as const) {
+			await f.event({
+				type: "message",
+				subtype: "message_changed",
+				channel: "C1",
+				ts: "1700000000.123456",
+				message: inbound({ text: "updated caption", files }),
+				previous_message: inbound({ text: "old caption", files: previousFiles }),
+			});
+		}
+		expect(f.client.requests.filter(({ verb }) => verb === "chat.edit" || verb === "chat.send")).toEqual([]);
+		expect(f.logs.filter((line) => line.includes("Slack image edit rejected"))).toHaveLength(2);
+		expect(f.logs.join("\n")).not.toContain("files.slack.com");
+	} finally {
+		f.socket.stop();
+	}
+});
 
 test("Slack app_mention alone (bot invited from the mention prompt) becomes exactly one threaded turn", async () => {
 	const f = await fixture();
@@ -1103,6 +1221,57 @@ test("Slack recovery keeps the watermark when the gateway is unavailable and qua
 		cursors = await loadRecoveryCursors(f.recoveryCursorPath);
 		expect(cursors.quarantined.C9?.failures).toBe(3);
 		expect(f.api.historyCalls.filter((channel) => channel === "C9")).toHaveLength(3);
+	} finally {
+		f.socket.stop();
+		f.recovery.stop();
+	}
+});
+
+test("Slack recovery retains image messages and the watermark after a transient download failure", async () => {
+	let imageAvailable = false;
+	const f = await fixture(
+		{ C1: { engagement: "open" } },
+		{
+			autoRecover: false,
+			imageFetch: async () =>
+				imageAvailable
+					? new Response(ONE_PIXEL_PNG, { status: 200, headers: { "content-type": "image/png" } })
+					: new Response("unavailable", { status: 503 }),
+		},
+	);
+	try {
+		f.api.history.C1 = [
+			{
+				type: "message",
+				user: "U1",
+				ts: "1700000040.000001",
+				text: "inspect this",
+				files: [
+					{
+						id: "F123456",
+						name: "photo.png",
+						mimetype: "image/png",
+						url_private: "https://files.slack.com/files-pri/T1-F123456/photo.png",
+					},
+				],
+			},
+		];
+
+		expect(await f.recoverMissedMessages()).toBe(false);
+		expect((await loadRecoveryCursors(f.recoveryCursorPath)).recoveredThrough.C1).toBeUndefined();
+		expect(f.client.requests.filter(({ verb }) => verb === "chat.send")).toEqual([]);
+		expect(f.api.posts).toEqual([]);
+
+		imageAvailable = true;
+		expect(await f.recoverMissedMessages()).toBe(true);
+		expect((await loadRecoveryCursors(f.recoveryCursorPath)).recoveredThrough.C1).toBe("1700000040.000001");
+		const sends = f.client.requests.filter(({ verb }) => verb === "chat.send");
+		expect(sends).toHaveLength(1);
+		expect(sends[0]?.params).toMatchObject({
+			text: expect.stringContaining("inspect this"),
+			images: [{ mimeType: "image/jpeg" }],
+		});
+		expect(f.api.posts).toHaveLength(1);
 	} finally {
 		f.socket.stop();
 		f.recovery.stop();

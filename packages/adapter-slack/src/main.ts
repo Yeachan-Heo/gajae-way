@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
+import { type ImageFetch, PromptImageDownloadError } from "@gajae-gateway/images";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import {
 	type ChannelEngagementPolicy,
@@ -12,11 +13,12 @@ import {
 	type FileRef,
 	type OriginRef,
 	OUTBOUND_FILE_MAX_BYTES,
+	type PromptImage,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 import { deliveryFailureIsAmbiguous, OutboundLimiter, SlackApiError, SlackWebApi } from "./api";
-import { describeInboundBody, type SlackFileCarrier } from "./attachments";
+import { describeInboundBody, isSlackImage, prepareSlackImages, type SlackFileCarrier } from "./attachments";
 import { SlackDirectory } from "./author";
 import { adapterHome, type LoadedSlackAdapterConfig, loadSlackAdapterConfig } from "./config";
 import { describePanelResponse, type SlackBlockAction } from "./interactions";
@@ -218,6 +220,7 @@ export function describeMessageEdit(
 	channels: Channels,
 ): DescribedMessageEdit | undefined {
 	if (event.subtype !== "message_changed" || !event.message) return undefined;
+	if (hasNativeImageEdit(event)) return undefined;
 	const message = { ...event.message, channel: event.channel };
 	const admitted = decideInbound(message, identity, names, channels);
 	if (!admitted) return undefined;
@@ -231,6 +234,10 @@ export function describeMessageEdit(
 		text,
 		receivedAt: timestamp(message.edited?.ts ?? event.ts),
 	};
+}
+
+function hasNativeImageEdit(event: SlackInboundMessage): boolean {
+	return (event.message?.files ?? []).some(isSlackImage) || (event.previous_message?.files ?? []).some(isSlackImage);
 }
 
 /** Bounded inbound identity memory prevents replay/reconnect duplicate turns. */
@@ -308,6 +315,29 @@ export function replyThreadTs(message: Pick<ChatMessagePayload, "origin" | "repl
 	if (target.channel !== channel)
 		throw new SlackApiError(0, "invalid_target", "Slack reply target belongs to a foreign channel");
 	return target.ts;
+}
+
+async function sendSlackImageNotice(
+	api: Pick<SlackWebApi, "postMessage">,
+	origin: OriginRef,
+	notice: string,
+	log: Pick<Console, "error">,
+	replyToMessageId?: string,
+): Promise<void> {
+	if (notice === "") return;
+	try {
+		await api.postMessage(
+			deliveryChannel(origin),
+			`Image adjustment: ${notice}`,
+			replyThreadTs({ origin, replyToMessageId }),
+		);
+	} catch {
+		log.error("Slack image preparation notice could not be delivered.");
+	}
+}
+
+function includeImageNotice(text: string, notice: string): string {
+	return notice === "" ? text : `${text}\n\n[Image preparation notice: ${notice}]`;
 }
 
 export async function settleSlackDelivery(
@@ -652,6 +682,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 		try {
 			const options = {
 				clientName: "adapter-slack",
+				requiredCapabilities: ["chat.images"],
 				onRetry: (attempt: number, delayMs: number, error: unknown) =>
 					console.warn(
 						`gateway_socket_waiting client=adapter-slack path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${errorText(error)}`,
@@ -695,8 +726,9 @@ export class ReconnectingGateway implements GatewayClientLike {
 		text: string,
 		engagement: EngagementContext,
 		receivedAt?: string,
+		images?: readonly PromptImage[],
 	): Promise<{ engaged?: boolean } | undefined> {
-		const sent = await this.requestRecovered(messageId, origin, text, engagement, receivedAt);
+		const sent = await this.requestRecovered(messageId, origin, text, engagement, receivedAt, images);
 		return sent.verdict === "acked" ? sent.result : undefined;
 	}
 
@@ -712,6 +744,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 		text: string,
 		engagement: EngagementContext,
 		receivedAt?: string,
+		images?: readonly PromptImage[],
 	): Promise<RecoveredSend> {
 		const pending = this.#pendingSends.get(messageId);
 		// Joining an in-flight send shares its verdict; a second caller never claims
@@ -731,6 +764,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 					messageId,
 					engagement,
 					...(receivedAt ? { receivedAt } : {}),
+					...(images && images.length > 0 ? { images } : {}),
 				});
 				this.#inbound.addIfAbsent(messageId);
 				// The gateway already decided engagement - including un-mentioned thread
@@ -758,8 +792,9 @@ export class ReconnectingGateway implements GatewayClientLike {
 		text: string,
 		engagement: EngagementContext,
 		receivedAt?: string,
+		images?: readonly PromptImage[],
 	): void {
-		void this.requestInbound(messageId, origin, text, engagement, receivedAt);
+		void this.requestInbound(messageId, origin, text, engagement, receivedAt, images);
 	}
 
 	/** Edits bypass inbound dedupe; the gateway owns idempotency by message + content. */
@@ -879,6 +914,7 @@ export async function startSlackAdapter(
 		api?: SlackWebApi;
 		socketFactory?: SocketModeOptions["factory"];
 		log?: Pick<Console, "log" | "error">;
+		imageFetch?: ImageFetch;
 		recoveryCursorPath?: string;
 		now?: () => number;
 		connectGateway?: (gateway: ReconnectingGateway) => Promise<void>;
@@ -1010,6 +1046,10 @@ export async function startSlackAdapter(
 				// id, so live traffic records the bounded set recovery will revisit.
 				await rememberDm(message);
 				if (envelope.subtype === "message_changed") {
+					if (hasNativeImageEdit(envelope)) {
+						log.error("Slack image edit rejected; native image edits are unsupported.");
+						return;
+					}
 					const edit = describeMessageEdit(envelope, identity, directory, config.channels);
 					if (edit) gateway.sendEdit(edit.messageId, edit.origin, edit.text, edit.engagement, edit.receivedAt);
 					return;
@@ -1025,14 +1065,27 @@ export async function startSlackAdapter(
 				const origin = inThread
 					? admitted.origin
 					: maybeThreadOnMention(admitted.origin, engagement.mentioned, message.ts);
+				let prepared: Awaited<ReturnType<typeof prepareSlackImages>>;
+				try {
+					prepared = await prepareSlackImages(message.files, config.botToken, ports.imageFetch);
+				} catch {
+					// Gateway authorization is authoritative and cannot be established locally. Do not
+					// post into a channel whose authorization is unknown, or send text without the image.
+					log.error("Slack image input preparation failed; chat.send was not dispatched.");
+					return;
+				}
 				const result = await gateway.requestInbound(
 					slackMessageId(message.channel, message.ts),
 					origin,
-					text,
+					includeImageNotice(text, prepared.notice),
 					engagement,
 					timestamp(message.ts),
+					prepared.images,
 				);
-				if (result?.engaged) await rememberThread(origin);
+				if (result?.engaged) {
+					await rememberThread(origin);
+					await sendSlackImageNotice(api, origin, prepared.notice, log, engagement.replyTo?.messageId);
+				}
 			});
 		} else if (event.type === "reaction_added" || event.type === "reaction_removed") {
 			const reaction = event as unknown as SlackReactionEvent;
@@ -1123,6 +1176,13 @@ export async function startSlackAdapter(
 			if (text === "") return "skip";
 			const messageId = slackMessageId(message.channel, message.ts);
 			const engagement = engagementForMessage(message, admitted.origin, identity, directory, config.channels);
+			let prepared: Awaited<ReturnType<typeof prepareSlackImages>>;
+			try {
+				prepared = await prepareSlackImages(message.files, config.botToken, ports.imageFetch);
+			} catch (error) {
+				log.error("Slack recovery image input preparation failed; chat.send was not dispatched.");
+				return error instanceof PromptImageDownloadError && error.retryable ? "unavailable" : "discard";
+			}
 			// A stale backfill (old, and the bot already posted after it in that
 			// conversation) is recorded so the persona's context is complete, but it
 			// never opens a turn: answering it now would re-answer something the room
@@ -1130,9 +1190,10 @@ export async function startSlackAdapter(
 			const sent = await gateway.requestRecovered(
 				messageId,
 				admitted.origin,
-				text,
+				includeImageNotice(text, prepared.notice),
 				stale ? { ...engagement, contextOnly: true } : engagement,
 				timestamp(message.ts),
+				prepared.images,
 			);
 			if (sent.verdict !== "unavailable") {
 				const postedAt = Number(message.ts) * 1000;
@@ -1148,7 +1209,11 @@ export async function startSlackAdapter(
 				// Keep the attempt record for messages within the grace period so we can re-evaluate
 				// after the grace period expires. Only clear once the grace period has passed.
 				if (!isWithinGrace) await mutate((state) => clearAttempt(state, messageId));
-				if (sent.verdict === "acked" && sent.result?.engaged) await rememberThread(admitted.origin);
+				if (sent.verdict === "acked" && sent.result?.engaged) {
+					await rememberThread(admitted.origin);
+					if (!stale)
+						await sendSlackImageNotice(api, admitted.origin, prepared.notice, log, engagement.replyTo?.messageId);
+				}
 				return sent.verdict;
 			}
 			// Only a payload-specific refusal burns this message's budget; a link outage

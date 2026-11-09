@@ -187,9 +187,16 @@ export interface EngagementContext {
 	readonly replyTo?: ReplyContext;
 }
 
+export interface PromptImage {
+	readonly data: string;
+	readonly mimeType: "image/jpeg";
+}
+
 export interface ChatSendParams {
 	readonly origin: OriginRef;
 	readonly text: string;
+	/** Prepared, bounded JPEG images attached to the prompt. */
+	readonly images?: readonly PromptImage[];
 	/** Stable platform message id for idempotent live/backfill ingestion. */
 	readonly messageId?: string;
 	/** Platform event time, when available; ordering and age policy use this value. */

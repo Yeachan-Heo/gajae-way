@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 41;
+export const LATEST_SCHEMA_VERSION = 42;
 
 export interface MigrationHost {
 	readonly database: {
@@ -918,6 +918,21 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(41, new Date().toISOString());
+		});
+	}
+	if (current < 42) {
+		host.withTransaction(() => {
+			const columns = new Set(
+				host.database
+					.statement<{ name: string }>("PRAGMA table_info(inbound_messages)")
+					.all()
+					.map((row) => row.name),
+			);
+			if (!columns.has("images_json"))
+				host.database.execute("ALTER TABLE inbound_messages ADD COLUMN images_json TEXT");
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(42, new Date().toISOString());
 		});
 	}
 }

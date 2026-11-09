@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { readFile, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
+import { validatePromptImages } from "@gajae-gateway/images";
 import {
 	CAPABILITIES,
 	type ChatMessagePayload,
@@ -30,6 +31,7 @@ import {
 	OUTBOUND_FILES_PER_TURN_CAP,
 	originKey,
 	PROFILE_VERSION,
+	type PromptImage,
 	ProtocolError,
 	parseFileReply,
 	parseOriginKey,
@@ -2522,17 +2524,41 @@ async function sendChat(
 		| {
 				origin?: unknown;
 				text?: unknown;
+				images?: unknown;
 				messageId?: unknown;
 				receivedAt?: unknown;
 				voice?: unknown;
 				engagement?: { mentioned?: unknown; group?: unknown; authorId?: unknown };
 		  }
 		| undefined;
-	if (!params || typeof params.text !== "string" || !params.text)
+	if (!params) throw new ProtocolError("invalid_params", "chat.send requires parameters");
+	let promptImages: PromptImage[];
+	try {
+		promptImages = validatePromptImages(params.images);
+	} catch (error) {
+		throw new ProtocolError(
+			"invalid_params",
+			error instanceof Error ? error.message : "chat.send requires valid prompt images",
+		);
+	}
+	if (typeof params.text !== "string" && !(params.text === undefined && promptImages.length > 0))
+		throw new ProtocolError("invalid_params", "chat.send requires text or prompt images");
+	if (!params.text && promptImages.length === 0)
 		throw new ProtocolError("invalid_params", "chat.send requires non-empty text");
 	if (typeof params.messageId === "string" && isInternalReportMessageId(params.messageId))
 		throw new ProtocolError("invalid_params", "internal report identifiers cannot be sent to chat");
-	const userText: string = params.text;
+	const userText: string =
+		params.text ||
+		`The user sent ${promptImages.length} image${promptImages.length === 1 ? "" : "s"} without accompanying text.`;
+	if (
+		promptImages.length > 0 &&
+		(userText === "/new" ||
+			userText === "/reset" ||
+			userText === "/restart" ||
+			userText === "/model" ||
+			userText.startsWith("/model "))
+	)
+		throw new ProtocolError("invalid_params", "chat.send cannot combine prompt images with control commands");
 	let origin: ReturnType<typeof validateOriginRef>;
 	try {
 		origin = validateOriginRef(params.origin as typeof LOOPBACK_ORIGIN);
@@ -2794,6 +2820,13 @@ async function sendChat(
 	const engaged = engagementDecision.engaged && !botAudienceGuardSpent;
 	const inboundMessageId = typeof params.messageId === "string" && params.messageId ? params.messageId : undefined;
 	const receivedAt = parseReceivedAt(params.receivedAt);
+	const imagesJson = promptImages.length > 0 ? JSON.stringify(promptImages) : undefined;
+	const expectedImagesJson = imagesJson ?? null;
+	if (engaged && inboundMessageId) {
+		const existingImagesJson = options.database.inbox.messageImagesJson(inboundMessageId, key);
+		if (existingImagesJson !== undefined && existingImagesJson !== expectedImagesJson)
+			throw new ProtocolError("invalid_params", "messageId was already accepted with different image content");
+	}
 	// Declined messages are still context, never commands (protocol contract): every
 	// platform message lands in the conversation-context ledger so the next engaged
 	// turn reads the full unread diff since the persona's last reply.
@@ -2901,6 +2934,7 @@ async function sendChat(
 				originKey: key,
 				originRefJson: JSON.stringify(origin),
 				body: userText,
+				imagesJson,
 				// The delivery-side gate needs the same bypass decision after a restart,
 				// so it travels with the durable row.
 				engagementJson: params.engagement
@@ -2910,8 +2944,18 @@ async function sendChat(
 			// The unmute commits with the addressed message it answers, so a crash can
 			// never leave an accepted unmute action behind a still-muted thread.
 			if (accepted && muteKey !== undefined && muteAddressed) options.database.inbox.unmuteThread(tx, muteKey);
-			if (!accepted || !nonLoopback || authorIsBot)
-				return { accepted, watchWakeOrigins: [] as string[], memoryIntentIds: [] as string[] };
+			if (!accepted) {
+				const existingImagesJson = options.database.inbox.messageImagesJson(messageId, key);
+				return {
+					accepted,
+					imageConflict:
+						existingImagesJson === undefined ? promptImages.length > 0 : existingImagesJson !== expectedImagesJson,
+					watchWakeOrigins: [] as string[],
+					memoryIntentIds: [] as string[],
+				};
+			}
+			if (!nonLoopback || authorIsBot)
+				return { accepted, imageConflict: false, watchWakeOrigins: [] as string[], memoryIntentIds: [] as string[] };
 
 			const matchedAt = new Date().toISOString();
 			const sourceAt = receivedAt ?? matchedAt;
@@ -2968,9 +3012,11 @@ async function sendChat(
 				watchWakeOrigins.push(watch.watcher_origin_key);
 				memoryIntentIds.push(intentId);
 			}
-			return { accepted, watchWakeOrigins, memoryIntentIds };
+			return { accepted, imageConflict: false, watchWakeOrigins, memoryIntentIds };
 		}),
 	);
+	if (admission.imageConflict)
+		throw new ProtocolError("invalid_params", "messageId was already accepted with different image content");
 	if (!admission.accepted) {
 		// Duplicate message id: already accepted once, so acknowledge without dispatching.
 		connection.write({
@@ -3066,6 +3112,9 @@ async function editChat(
 		declined();
 		return;
 	}
+	const originalImagesJson = options.database.inbox.messageImagesJson(params.messageId, key);
+	if (originalImagesJson !== undefined && originalImagesJson !== null)
+		throw new ProtocolError("invalid_params", "chat.edit cannot edit a message with prompt images");
 	// The recorded body now says what the message says now.
 	options.database.transaction((tx) =>
 		options.database.inbox.updateContextBody(tx, key, params.messageId as string, params.text as string),
@@ -3152,6 +3201,7 @@ async function createInboundTurnLifecycle(
 	const key = row.origin_key;
 	const origin = validateOriginRef(JSON.parse(row.origin_ref_json) as typeof LOOPBACK_ORIGIN);
 	const userText = row.body;
+	const promptImages = row.images_json === null ? [] : validatePromptImages(JSON.parse(row.images_json) as unknown);
 	const nonLoopback = origin.platform !== "loopback";
 	const engagement = row.engagement_json
 		? (JSON.parse(row.engagement_json) as {
@@ -4266,6 +4316,7 @@ async function createInboundTurnLifecycle(
 
 	return {
 		text: turnText,
+		...(promptImages.length > 0 ? { images: promptImages } : {}),
 		systemPreamble,
 		...(sessionBootstrap ? { sessionBootstrap } : {}),
 		...(effectiveModel ? { effectiveModel } : {}),

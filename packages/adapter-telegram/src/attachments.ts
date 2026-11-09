@@ -6,22 +6,24 @@
  * so every such message was dropped before it reached the gateway — the persona
  * never saw the image and the conversation-context ledger never recorded it.
  *
- * The fix follows the Discord adapter: attachments are rendered into the message
- * body as one bracketed text line, so no protocol field or schema migration is
- * needed and every downstream consumer (context ledger, memory capture, turn
- * header) sees the attachment because it is simply part of the text.
+ * Non-image attachments are rendered into the message body as one bracketed text
+ * line. Images are also described there, but their freshly downloaded bytes are
+ * separately prepared as native prompt input so the model can actually see them.
  *
  * Unlike Discord, a Telegram file url embeds the bot token
  * (`https://api.telegram.org/file/bot<token>/<path>`), so it must never be put
  * in the body: the body is persisted in the ledger and shown to the persona. The
- * adapter therefore downloads the file itself and renders the local path, which
- * the persona (running on the same host) can read directly. Files land under the
- * adapter home with owner-only permissions and are pruned after a retention
- * window, because the Bot API cannot re-serve a file path forever either.
+ * adapter therefore downloads files itself. Non-image files render their local
+ * path, while images are read from that freshly returned path and sent natively.
+ * Files land under the adapter home with owner-only permissions and are pruned
+ * after a retention window, because the Bot API cannot re-serve them forever.
  */
 
-import { mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdir, open, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { extname, join } from "node:path";
+import { preparePromptImages } from "@gajae-gateway/images";
+import type { PromptImage } from "@gajae-gateway/protocol";
 
 /** The Bot API refuses `getFile` for anything larger than this. */
 export const TELEGRAM_BOT_DOWNLOAD_LIMIT = 20 * 1024 * 1024;
@@ -92,6 +94,25 @@ export interface TelegramAttachmentSaver {
 	save(attachment: TelegramAttachment, chatId: string, messageId: number): Promise<StoredAttachment>;
 }
 
+export type TelegramImagePreparation = {
+	readonly images: PromptImage[];
+	readonly notice: string;
+};
+
+/**
+ * Reads the image from the freshly saved local attachment and prepares it for
+ * native prompt input. Paths are accepted only from the saver result, never
+ * from Telegram message fields or gateway payloads.
+ */
+export async function prepareTelegramImage(
+	stored: StoredAttachment,
+	prepare: typeof preparePromptImages = preparePromptImages,
+): Promise<TelegramImagePreparation> {
+	if (!("path" in stored)) throw new Error("image attachment is unavailable");
+	const bytes = await readStoredImage(stored.path);
+	return prepare([bytes]);
+}
+
 /**
  * The one attachment a message carries, normalized.
  *
@@ -140,16 +161,59 @@ export function describeInboundBody(
 	content: string,
 	attachment: TelegramAttachment | undefined,
 	stored: StoredAttachment | undefined,
+	/** Marks an image as native input instead of implying the model should read its local path. */
+	imageIncluded = false,
 ): string {
 	if (!attachment || !stored) return content;
-	const line = describeTelegramAttachment(attachment, stored);
+	const line =
+		imageIncluded && attachment.kind === "image"
+			? describeTelegramImage(attachment)
+			: describeTelegramAttachment(attachment, stored);
 	return content.trim() === "" ? line : `${content}\n${line}`;
+}
+
+function describeTelegramImage(attachment: TelegramAttachment): string {
+	const parts: string[] = [attachment.kind];
+	if (attachment.name) parts.push(attachment.name);
+	const size = formatSize(attachment.size);
+	if (size) parts.push(size);
+	parts.push("included as a native image input");
+	return `[${parts.join(" · ")}]`;
+}
+
+async function readStoredImage(path: string): Promise<Uint8Array> {
+	let handle: Awaited<ReturnType<typeof open>>;
+	try {
+		handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK | constants.O_NOCTTY);
+	} catch {
+		throw new Error("image attachment is unavailable");
+	}
+	try {
+		const info = await handle.stat();
+		if (!info.isFile() || info.size > TELEGRAM_BOT_DOWNLOAD_LIMIT)
+			throw new Error("image attachment exceeds the 20 MB limit or is not a regular file");
+		const bytes = Buffer.allocUnsafe(info.size + 1);
+		let length = 0;
+		while (length < bytes.length) {
+			const read = await handle.read(bytes, length, bytes.length - length, null);
+			if (read.bytesRead === 0) break;
+			length += read.bytesRead;
+		}
+		if (length > TELEGRAM_BOT_DOWNLOAD_LIMIT || length !== info.size)
+			throw new Error("image attachment changed or exceeds the 20 MB limit");
+		return bytes.subarray(0, length);
+	} catch (error) {
+		if (error instanceof Error && error.message.startsWith("image attachment ")) throw error;
+		throw new Error("image attachment could not be read");
+	} finally {
+		await handle.close().catch(() => {});
+	}
 }
 
 /**
  * Downloads inbound attachments into `directory/<chatId>/` with owner-only
- * permissions. Never throws: a failed download still produces a body line, so
- * the message reaches the persona even when the bytes do not.
+ * permissions. Never throws: a failed non-image download still produces a body
+ * line, while the adapter rejects an image that cannot be sent natively.
  */
 export class TelegramAttachmentStore implements TelegramAttachmentSaver {
 	constructor(

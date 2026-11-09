@@ -223,6 +223,11 @@ test("reacts to an inbound message by the chat-scoped id its turn was keyed with
 			"900",
 			{ chats: {} },
 			{ save: async () => Promise.reject(new Error("a text message never carries an attachment")) },
+			{
+				sendMessage: async () => {
+					throw new Error("text input must not emit an image notice");
+				},
+			},
 		);
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		await adapter.handleUpdate(mockGateway(requests), {
@@ -317,6 +322,11 @@ test("a reply to a forum topic message carries the chat-scoped id the persona ca
 			"900",
 			{ chats: {} },
 			{ save: async () => Promise.reject(new Error("a text message never carries an attachment")) },
+			{
+				sendMessage: async () => {
+					throw new Error("text input must not emit an image notice");
+				},
+			},
 		);
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		await adapter.handleUpdate(mockGateway(requests), {
@@ -422,6 +432,11 @@ test("handleUpdate reports an inbound reaction as engagement and never as a turn
 			"900",
 			{ chats: { "-100123": { engagement: "open" } } },
 			{ save: async () => Promise.reject(new Error("a reaction never carries an attachment")) },
+			{
+				sendMessage: async () => {
+					throw new Error("reactions must not emit an image notice");
+				},
+			},
 		);
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		const accepted = await adapter.handleUpdate(mockGateway(requests), {

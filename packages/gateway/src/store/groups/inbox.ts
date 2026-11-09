@@ -15,6 +15,7 @@ export interface InboundMessageRow {
 	readonly origin_ref_json: string;
 	readonly body: string;
 	readonly engagement_json: string | null;
+	readonly images_json: string | null;
 	readonly state: "pending" | "processing" | "done";
 	readonly received_at: string;
 	readonly turn_role: InboundTurnRole | null;
@@ -125,7 +126,7 @@ const REPLAYABLE_INBOUND =
 const ESCALATION_NOTICE_KEY_SQL =
 	"'escalation-notice:' || inbound_messages.origin_key || '#' || inbound_messages.turn_op_ref";
 const INBOUND_COLUMNS =
-	"message_id, source, origin_key, origin_ref_json, body, engagement_json, state, received_at, turn_role, turn_epoch, turn_state, turn_op_ref, bound_session_id, dispatched_at, terminal_delivery_id";
+	"message_id, source, origin_key, origin_ref_json, body, engagement_json, images_json, state, received_at, turn_role, turn_epoch, turn_state, turn_op_ref, bound_session_id, dispatched_at, terminal_delivery_id";
 
 /** Persistence for inbound queueing, turn lifecycle, conversation context, and recall. */
 export class InboxGroup {
@@ -223,6 +224,7 @@ export class InboxGroup {
 			readonly originRefJson: string;
 			readonly body: string;
 			readonly engagementJson?: string | null;
+			readonly imagesJson?: string | null;
 			readonly receivedAt?: string;
 			readonly source?: "platform" | "lane_report";
 		},
@@ -232,10 +234,23 @@ export class InboxGroup {
 		const source = row.source ?? "platform";
 		if (source === "lane_report" && row.engagementJson !== undefined && row.engagementJson !== null)
 			throw new Error("lane report inbound rows cannot carry engagement metadata");
+		let imagesJson = row.imagesJson ?? null;
+		if (imagesJson !== null) {
+			let images: unknown;
+			try {
+				images = JSON.parse(imagesJson);
+			} catch {
+				throw new Error("inbound imagesJson must be valid JSON");
+			}
+			if (!Array.isArray(images)) throw new Error("inbound imagesJson must contain a JSON array");
+			if (images.length === 0) imagesJson = null;
+		}
+		if (source === "lane_report" && imagesJson !== null)
+			throw new Error("lane report inbound rows cannot carry images");
 		return (
 			this.#db
 				.prepare(
-					"INSERT INTO inbound_messages (message_id, source, origin_key, origin_ref_json, body, engagement_json, state, received_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?) ON CONFLICT(message_id) DO NOTHING",
+					"INSERT INTO inbound_messages (message_id, source, origin_key, origin_ref_json, body, engagement_json, images_json, state, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?) ON CONFLICT(message_id) DO NOTHING",
 				)
 				.run(
 					tx,
@@ -245,6 +260,7 @@ export class InboxGroup {
 					row.originRefJson,
 					row.body,
 					row.engagementJson ?? null,
+					imagesJson,
 					receivedAt,
 				).changes > 0
 		);
@@ -618,7 +634,8 @@ export class InboxGroup {
 	 * Closes the origin's pending, unbound inbound rows whose exact message a
 	 * held op's prompt carried as context: they may already have been acted on
 	 * by that op, so they become its done input instead of a fresh trigger
-	 * (#686, #698 review). An edit row carries new text and stays pending.
+	 * (#686, #698 review). An edit row carries new text, and an image row carries
+	 * media absent from the text context; both stay pending.
 	 */
 	closeClaimedPending(
 		tx: WriteTx,
@@ -638,6 +655,7 @@ export class InboxGroup {
 				.get(messageId, input.originKey) as InboundMessageRow | null;
 			if (!row) continue;
 			this.#assertNotQuarantined(messageId);
+			if (row.images_json !== null) continue;
 			this.#db
 				.prepare(
 					"UPDATE inbound_messages SET state = 'done', turn_role = 'steer', turn_epoch = ?, turn_state = 'done', turn_op_ref = ? WHERE message_id = ? AND state = 'pending' AND turn_state IS NULL",
@@ -1287,6 +1305,14 @@ export class InboxGroup {
 
 	messageExists(messageId: string): boolean {
 		return this.#db.prepare("SELECT 1 FROM inbound_messages WHERE message_id = ?").get(messageId) !== null;
+	}
+
+	/** Undefined means absent in this origin; null means an existing text-only message. */
+	messageImagesJson(messageId: string, originKey: string): string | null | undefined {
+		const row = this.#db
+			.prepare("SELECT images_json FROM inbound_messages WHERE message_id = ? AND origin_key = ?")
+			.get(messageId, originKey) as { images_json: string | null } | null;
+		return row?.images_json;
 	}
 
 	hasQuarantinedTurn(opRef: string): boolean {

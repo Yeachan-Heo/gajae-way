@@ -208,6 +208,15 @@ const HELLO_TIMEOUT_MS = 15_000;
 const STREAM_REOPEN_GIVE_UP = 6;
 const REOPEN_BASE_BACKOFF_MS = 250;
 const UNKNOWN_KIND_DIAGNOSTIC_CAP = 20;
+export const MAX_RELAY_REQUEST_FRAME_BYTES = 262_144;
+
+/** Serializes one SDK request and rejects it before any stream write if it exceeds the wire limit. */
+export function serializeRelayRequestFrame(sessionId: string, frame: Record<string, unknown>): string {
+	const serialized = JSON.stringify(frame);
+	if (Buffer.byteLength(serialized, "utf8") > MAX_RELAY_REQUEST_FRAME_BYTES)
+		throw new RelayClosedError(sessionId, `request frame exceeds ${MAX_RELAY_REQUEST_FRAME_BYTES}-byte limit`, false);
+	return serialized;
+}
 
 export class TailCapacityError extends Error {
 	constructor() {
@@ -658,6 +667,7 @@ class ManagedTailHandle implements TailHandle {
 		const connectionId = this.#connectionId;
 		if (!stream || !connectionId) throw new RelayClosedError(this.sessionId, "relay not open", false);
 		const id = `gw-${this.brokerGeneration}-${++this.#requestSeq}`;
+		const serialized = serializeRelayRequestFrame(this.sessionId, { type, id, connectionId, ...body });
 		const timeoutMs = options?.timeoutMs ?? this.#runner.requestTimeoutMs;
 		return await new Promise<RelayResponse>((resolve, reject) => {
 			const timer = setTimeout(() => {
@@ -666,7 +676,7 @@ class ManagedTailHandle implements TailHandle {
 			}, timeoutMs);
 			this.#pending.set(id, { kind: responseType, resolve, reject, timer });
 			try {
-				stream.write(JSON.stringify({ type, id, connectionId, ...body }));
+				stream.write(serialized);
 			} catch (error) {
 				clearTimeout(timer);
 				this.#pending.delete(id);

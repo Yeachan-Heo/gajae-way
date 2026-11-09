@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
-import { containsSilenceToken, isSilenceToken } from "@gajae-gateway/protocol";
+import { containsSilenceToken, isSilenceToken, type PromptImage } from "@gajae-gateway/protocol";
 import {
 	assertControlAllowed,
 	assertValidOpRef,
@@ -50,6 +50,7 @@ import {
 	isRelayTransportFailure,
 	isUnwrittenRelayRequest,
 	type RelayResponse,
+	serializeRelayRequestFrame,
 	type TailAttachInput,
 	type TailHandle,
 	type TailRunner,
@@ -268,6 +269,7 @@ export interface SessionSendInput {
 	readonly sessionId: string;
 	readonly repo: string;
 	readonly text: string;
+	readonly images?: readonly PromptImage[];
 	readonly opRef: string;
 	/** Trusted bootstrap/policy material attached to this exact turn. */
 	readonly systemPreamble?: string;
@@ -1340,6 +1342,23 @@ export class BrokerSessionPort implements SessionPort {
 		this.#assertOwned(input);
 		assertValidOpRef(input.opRef);
 		if (input.text.trim().length === 0) throw new OpRefError("prompt text must not be empty");
+		const text = renderPrompt(input.systemPreamble, input.text);
+		const promptInput = {
+			text,
+			clientRef: input.opRef,
+			...(input.images?.length ? { images: input.images } : {}),
+		};
+		// Reject prompts that cannot fit even with an empty request id and
+		// connection id before writing a durable intent. TailRunner checks the
+		// exact frame again once the live relay envelope is known.
+		serializeRelayRequestFrame(input.sessionId, {
+			type: "control_request",
+			id: "",
+			connectionId: "",
+			operation: "turn.prompt",
+			input: promptInput,
+			confirm: false,
+		});
 		// `turn.prompt` is not idempotent at the broker (a reused clientRef is
 		// refused), so the gateway journals it: intent before the relay call,
 		// receipt after. Completed acceptance returns the stored receipt; only
@@ -1347,10 +1366,11 @@ export class BrokerSessionPort implements SessionPort {
 		// intents reconcile the same clientRef and never resend on unknown.
 		// The hash covers every field that shapes the turn, so an op ref reused
 		// with the same text but another preamble or model is a different prompt.
+		const promptIdentity = input.images?.length
+			? [input.text, input.systemPreamble ?? null, input.model ?? null, input.images]
+			: [input.text, input.systemPreamble ?? null, input.model ?? null];
 		const requestJson = JSON.stringify({
-			prompt: createHash("sha256")
-				.update(JSON.stringify([input.text, input.systemPreamble ?? null, input.model ?? null]))
-				.digest("hex"),
+			prompt: createHash("sha256").update(JSON.stringify(promptIdentity)).digest("hex"),
 		});
 		const intent = this.#beginOperation(
 			"turn.prompt",
@@ -1377,7 +1397,7 @@ export class BrokerSessionPort implements SessionPort {
 			const receipt =
 				intent.resumed && !isBrokerPromptBusyRefusal(intent)
 					? await this.#acceptedPrompt(input, relay)
-					: await this.#submitPrompt(input, relay, intent);
+					: await this.#submitPrompt(input, relay, intent, text);
 			return this.#completePromptOperation(intent, receipt);
 		} finally {
 			if (!input.relay) await relay.close();
@@ -1405,7 +1425,12 @@ export class BrokerSessionPort implements SessionPort {
 		};
 	}
 
-	async #submitPrompt(input: SessionSendInput, relay: TailHandle, intent: BrokerOperationRecord): Promise<SendReceipt> {
+	async #submitPrompt(
+		input: SessionSendInput,
+		relay: TailHandle,
+		intent: BrokerOperationRecord,
+		text: string,
+	): Promise<SendReceipt> {
 		if (input.model) {
 			try {
 				await this.setModel({ sessionId: input.sessionId, repo: input.repo, selection: input.model });
@@ -1415,8 +1440,7 @@ export class BrokerSessionPort implements SessionPort {
 				throw error;
 			}
 		}
-		const text = renderPrompt(input.systemPreamble, input.text);
-		// The prompt is submitted on the session's resident relay so that this
+		// The prompt is submitted on the session's resident relay so that the
 		// connection OWNS the turn: the host streams the turn's content only to
 		// the connection that submitted it. A caller without a relay gets one
 		// for the duration of the send.
@@ -1454,13 +1478,18 @@ export class BrokerSessionPort implements SessionPort {
 			}
 			let response: RelayResponse;
 			try {
-				response = await relay.control("turn.prompt", { text, clientRef: input.opRef });
+				response = await relay.control("turn.prompt", {
+					text,
+					clientRef: input.opRef,
+					...(input.images?.length ? { images: input.images } : {}),
+				});
 			} catch (error) {
 				// The retry never reached the host (relay gone before the frame was
 				// written, e.g. the host exited while we waited): the authenticated
 				// busy refusal still stands, so the op stays provably unadmitted (#689).
 				if (retryingBusy && isUnwrittenRelayRequest(error))
 					this.#completeOperation(submission, BROKER_PROMPT_BUSY_REFUSAL);
+				else if (isUnwrittenRelayRequest(error)) this.#releaseOperation(submission);
 				throw error;
 			}
 			this.#database.bindings.assertAuthority(this.#authority);
