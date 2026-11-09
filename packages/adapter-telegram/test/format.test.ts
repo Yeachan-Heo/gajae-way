@@ -145,3 +145,88 @@ test("crossing emphasis stays literal inside properly nested tags", () => {
 		expect(stack).toEqual([]);
 	}
 });
+
+test("whitespace-flanked or adjacent delimiters stay literal; real emphasis still renders", () => {
+	for (const literal of [
+		"2 * 3 * 4",
+		"O(n * m * k)",
+		"src/**/*.ts",
+		"5 * 4 = 20 and 3 * 2 = 6",
+		"* use *.ts files",
+		"a ** b ** c",
+		"x ~~ y ~~ z",
+		"**bold *",
+	]) {
+		expect(markdownToTelegramHtml(literal)).toBe(literal);
+	}
+	for (const [markdown, html] of [
+		["*bold*", "<i>bold</i>"],
+		["**bold**", "<b>bold</b>"],
+		["~~del~~", "<s>del</s>"],
+		["*a*", "<i>a</i>"],
+		["**two words**", "<b>two words</b>"],
+		["* item with *emphasis*", "* item with <i>emphasis</i>"],
+		["**bold ~~inner~~ text**", "<b>bold <s>inner</s> text</b>"],
+		["a*b*c", "a<i>b</i>c"],
+	] as const) {
+		expect(markdownToTelegramHtml(markdown)).toBe(html);
+	}
+});
+
+test("wide-table records keep body cells beyond the header width", () => {
+	const wide = "x".repeat(50);
+	expect(markdownToTelegramHtml(`| h1 | h2 |\n|---|---|\n| 1 | ${wide} | 3 |`)).toBe(
+		`<b>h1</b>: 1\n<b>h2</b>: ${wide}\n<b>Column 3</b>: 3`,
+	);
+});
+
+test("a reply made only of markup is posted as its literal text", () => {
+	expect(renderTelegramDelivery(">")).toEqual(["&gt;"]);
+	expect(renderTelegramDelivery("# ")).toEqual(["# "]);
+	expect(renderTelegramDelivery("> ", true)).toEqual(["[recovered - may be a duplicate] &gt; "]);
+	expect(renderTelegramDelivery("> <b>")).toEqual(["<blockquote>&lt;b&gt;</blockquote>"]);
+	expect(renderTelegramDelivery(">\n>")).toEqual(["&gt;\n&gt;"]);
+	expect(renderTelegramDelivery("# \n# ")).toEqual(["# \n# "]);
+	expect(renderTelegramDelivery(">\n# ")).toEqual(["&gt;\n# "]);
+});
+
+test("whitespace inside a long code block survives chunking", () => {
+	const body = `${"x".repeat(4060)}\n${" ".repeat(100)}\n${"y".repeat(10)}`;
+	const chunks = renderTelegramDelivery(`\`\`\`\n${body}\n\`\`\``);
+	expect(chunks.length).toBeGreaterThan(1);
+	expect(chunks.map(telegramHtmlToPlainText).join("")).toBe(`${body}\n`);
+});
+
+test("a very large table renders as bounded records without materializing a padded grid", () => {
+	const chunks = renderTelegramDelivery(`|h|\n|-|\n${"|x|\n".repeat(1_000_000)}`);
+	expect(chunks.every((chunk) => chunk.length <= 4096)).toBe(true);
+	expect(markdownToTelegramHtml(`| ${"h".repeat(200)} |\n|---|\n| a |\n| b |`)).toBe(
+		`<b>${"h".repeat(200)}</b>: a\n\n<b>${"h".repeat(200)}</b>: b`,
+	);
+});
+
+test("wide characters align by display width in compact tables", () => {
+	expect(markdownToTelegramHtml("| 한국 | b |\n|---|---|\n| x | y |")).toBe("<pre>한국 | b\n-----|--\nx    | y</pre>");
+});
+
+test("a table whose records would multiply its size is posted as its literal source", () => {
+	const source = `| ${"h".repeat(50_000)} |\n|---|\n${"| x |\n".repeat(10_000)}`.trimEnd();
+	const chunks = renderTelegramDelivery(source);
+	const visible = chunks.map(telegramHtmlToPlainText).join("");
+	expect(visible).toBe(source);
+	expect(chunks.every((chunk) => chunk.length <= 4096)).toBe(true);
+	expect(chunks.length).toBeLessThan(40);
+});
+
+test("a near-limit anchor that would be reopened per character degrades to label and URL", () => {
+	const url = `https://e.com/${"a".repeat(4033)}`;
+	for (const size of [100, 100_000, 1_000_000]) {
+		const label = "x".repeat(size);
+		const chunks = renderTelegramDelivery(`[${label}](${url})`);
+		expectSafeChunks(chunks, `${label} (${url})`);
+		expect(chunks.length).toBeLessThanOrEqual(Math.ceil((size + url.length + 3) / 4063) + 1);
+	}
+	// An anchor that fits whole on one chunk keeps its link even with a long href.
+	const fits = `https://e.com/${"a".repeat(2500)}`;
+	expect(renderTelegramDelivery(`[go](${fits})`)).toEqual([`<a href="${fits}">go</a>`]);
+});

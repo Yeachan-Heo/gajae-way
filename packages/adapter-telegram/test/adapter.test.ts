@@ -14,6 +14,7 @@ import {
 	TelegramAdapter,
 	TelegramApiError,
 	TelegramBotApi,
+	TelegramDeliveryProgress,
 	type TelegramUpdate,
 } from "../src/main";
 import { telegramMessageOrigin } from "../src/origin";
@@ -211,8 +212,9 @@ test("still forwards an attachment-only message when the download fails", async 
 	}
 });
 
-test("chunks at Telegram's 4096 character API limit", () => {
-	expect(renderTelegramDelivery("x".repeat(8_193)).map((chunk) => chunk.length)).toEqual([4_096, 4_096, 1]);
+test("chunks under Telegram's 4096 character limit, keeping room for the duplicate warning on any chunk", () => {
+	expect(renderTelegramDelivery("x".repeat(8_193)).map((chunk) => chunk.length)).toEqual([4_063, 4_063, 67]);
+	expect(renderTelegramDelivery("x".repeat(8_193), true).map((chunk) => chunk.length)).toEqual([4_096, 4_063, 67]);
 });
 
 test("chunks formatted replies without splitting a tag, closing and reopening it across chunks", () => {
@@ -578,3 +580,197 @@ function mockGateway(requests: Array<{ verb: string; params: unknown }>): Gatewa
 		onChatMessage: () => () => {},
 	};
 }
+
+const DUPLICATE_PREFIX = "[recovered - may be a duplicate] ";
+const threeChunks = `${"a".repeat(4096)}${"b".repeat(4096)}c`;
+
+async function chunkedSettlement(
+	respond: (call: number) => "ok" | "transport" | { retryAfter?: number },
+	run: (settle: (message: ChatMessagePayload) => Promise<void>) => Promise<void>,
+	sleeps: number[] = [],
+): Promise<{ calls: Array<Record<string, unknown>>; requests: Array<{ verb: string; params: unknown }> }> {
+	const home = await temporaryHome();
+	try {
+		const state = await TelegramAdapterState.load(home);
+		const origin = telegramMessageOrigin({ chat: { id: 22, type: "private" }, from: { id: 44 } });
+		await state.rememberOrigin(origin);
+		const calls: Array<Record<string, unknown>> = [];
+		const bot = new TelegramBotApi("not-a-real-token", async (_url, init) => {
+			calls.push(JSON.parse(String(init?.body)));
+			const response = respond(calls.length);
+			if (response === "ok") return Response.json({ ok: true, result: { message_id: calls.length } });
+			if (response === "transport") throw new Error("socket hang up");
+			return Response.json(
+				{
+					ok: false,
+					error_code: 429,
+					description: `Too Many Requests: retry after ${response.retryAfter ?? 0}`,
+					...(response.retryAfter === undefined ? {} : { parameters: { retry_after: response.retryAfter } }),
+				},
+				{ status: 429 },
+			);
+		});
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const progress = new TelegramDeliveryProgress();
+		await run((message) =>
+			settleTelegramDelivery(mockGateway(requests), bot, state, message, {
+				progress,
+				sleep: async (ms) => void sleeps.push(ms),
+			}),
+		);
+		return { calls, requests };
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+}
+
+const sentTexts = (calls: Array<Record<string, unknown>>) => calls.map((call) => call.text);
+const origin22 = telegramMessageOrigin({ chat: { id: 22, type: "private" }, from: { id: 44 } });
+
+test("a 429 with a short retry_after waits it out and resends only the refused chunk", async () => {
+	const chunks = renderTelegramDelivery(threeChunks);
+	expect(chunks).toHaveLength(3);
+	const sleeps: number[] = [];
+	const { calls, requests } = await chunkedSettlement(
+		(call) => (call === 2 ? { retryAfter: 3 } : "ok"),
+		(settle) => settle(delivery(origin22, threeChunks)),
+		sleeps,
+	);
+	expect(sleeps).toEqual([3_000]);
+	expect(sentTexts(calls)).toEqual([chunks[0], chunks[1], chunks[1], chunks[2]]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("a retry_after beyond the settlement wait budget fails at once without waiting", async () => {
+	const chunks = renderTelegramDelivery(threeChunks);
+	const sleeps: number[] = [];
+	const { calls, requests } = await chunkedSettlement(
+		(call) => (call === 2 ? { retryAfter: 31 } : "ok"),
+		(settle) => settle(delivery(origin22, threeChunks)),
+		sleeps,
+	);
+	expect(sleeps).toEqual([]);
+	expect(sentTexts(calls)).toEqual([chunks[0], chunks[1]]);
+	expect(requests).toEqual([
+		{
+			verb: "delivery.fail",
+			params: { deliveryId: "delivery-1", reason: "Too Many Requests: retry after 31", ambiguous: true },
+		},
+	]);
+});
+
+test("retries of a partly delivered reply resume at the refused chunk and turn definitive once they stall", async () => {
+	const chunks = renderTelegramDelivery(threeChunks);
+	const { calls, requests } = await chunkedSettlement(
+		(call) => (call === 1 ? "ok" : {}),
+		async (settle) => {
+			await settle(delivery(origin22, threeChunks));
+			for (let retry = 0; retry < 6; retry++)
+				await settle({ ...delivery(origin22, threeChunks), redelivered: true, duplicateWarning: true });
+		},
+	);
+	expect(sentTexts(calls)).toEqual([chunks[0], ...Array.from({ length: 7 }, () => chunks[1])]);
+	expect(requests.map((request) => (request.params as { ambiguous?: boolean }).ambiguous)).toEqual([
+		true,
+		true,
+		true,
+		true,
+		true,
+		false,
+		false,
+	]);
+});
+
+test("a transport failure after accepted chunks resumes at the uncertain chunk under the duplicate warning", async () => {
+	const chunks = renderTelegramDelivery(threeChunks);
+	const { calls, requests } = await chunkedSettlement(
+		(call) => (call === 2 ? "transport" : "ok"),
+		async (settle) => {
+			await settle(delivery(origin22, threeChunks));
+			await settle({ ...delivery(origin22, threeChunks), redelivered: true, duplicateWarning: true });
+		},
+	);
+	expect(sentTexts(calls)).toEqual([chunks[0], chunks[1], `${DUPLICATE_PREFIX}${chunks[1]}`, chunks[2]]);
+	expect(calls.every((call) => String(call.text).length <= 4096)).toBe(true);
+	expect(requests).toEqual([
+		{
+			verb: "delivery.fail",
+			params: {
+				deliveryId: "delivery-1",
+				reason: "Telegram sendMessage request failed: socket hang up",
+				ambiguous: true,
+			},
+		},
+		{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } },
+	]);
+});
+
+test("a delivery replayed after this adapter already posted it is confirmed again without reposting", async () => {
+	const chunks = renderTelegramDelivery(threeChunks);
+	const { calls, requests } = await chunkedSettlement(
+		() => "ok",
+		async (settle) => {
+			await settle(delivery(origin22, threeChunks));
+			await settle({ ...delivery(origin22, threeChunks), redelivered: true, duplicateWarning: true });
+		},
+	);
+	expect(sentTexts(calls)).toEqual(chunks);
+	expect(requests).toEqual([
+		{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } },
+		{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } },
+	]);
+});
+
+test("repeated retry_after: 0 answers are bounded by the wait budget instead of spinning", async () => {
+	const chunks = renderTelegramDelivery(threeChunks);
+	const sleeps: number[] = [];
+	const { calls, requests } = await chunkedSettlement(
+		(call) => (call === 1 ? "ok" : { retryAfter: 0 }),
+		(settle) => settle(delivery(origin22, threeChunks)),
+		sleeps,
+	);
+	expect(sleeps).toEqual(Array.from({ length: 30 }, () => 1_000));
+	expect(sentTexts(calls)).toEqual([chunks[0], ...Array.from({ length: 31 }, () => chunks[1])]);
+	expect(requests).toEqual([
+		{
+			verb: "delivery.fail",
+			params: { deliveryId: "delivery-1", reason: "Too Many Requests: retry after 0", ambiguous: true },
+		},
+	]);
+});
+
+test("progress eviction drops completed deliveries before a partly delivered one", () => {
+	const progress = new TelegramDeliveryProgress();
+	progress.remember("partial", { chunks: ["a", "b"], sent: 1, uncertain: false, stalls: 0 });
+	for (let index = 0; index < 300; index++)
+		progress.remember(`done-${index}`, { chunks: ["a"], sent: 1, uncertain: false, stalls: 0 });
+	expect(progress.get("partial")?.sent).toBe(1);
+	expect(progress.get("done-0")).toBeUndefined();
+	expect(progress.get("done-299")?.sent).toBe(1);
+});
+
+test("a redelivery with no remembered progress counts a definitive mid-reply refusal as definitive", async () => {
+	const chunks = renderTelegramDelivery(threeChunks, true);
+	const { calls, requests } = await chunkedSettlement(
+		(call) => (call === 1 ? "ok" : {}),
+		(settle) => settle({ ...delivery(origin22, threeChunks), redelivered: true, duplicateWarning: true }),
+	);
+	expect(sentTexts(calls)).toEqual([chunks[0], chunks[1]]);
+	expect(requests).toEqual([
+		{
+			verb: "delivery.fail",
+			params: { deliveryId: "delivery-1", reason: "Too Many Requests: retry after 0", ambiguous: false },
+		},
+	]);
+});
+
+test("a reply that cannot be rendered fails definitively without sending", async () => {
+	const { calls, requests } = await chunkedSettlement(
+		() => "ok",
+		(settle) => settle(delivery(origin22, undefined as unknown as string)),
+	);
+	expect(calls).toEqual([]);
+	expect(requests).toHaveLength(1);
+	expect(requests[0]).toMatchObject({ verb: "delivery.fail", params: { deliveryId: "delivery-1", ambiguous: false } });
+	expect((requests[0]?.params as { reason: string }).reason).toStartWith("Telegram rendering failed: ");
+});

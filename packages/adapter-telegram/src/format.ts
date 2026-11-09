@@ -5,6 +5,28 @@
  * local fixes for malformed Markdown and safe chunk boundaries. The persona
  * writes Markdown, Telegram receives `parse_mode: "HTML"`.
  *
+ * The adapted Gajae-Code source is distributed under the MIT License:
+ *
+ *   Copyright (c) 2025-2026 Yeachan-Heo and Gajae Code Contributors
+ *
+ *   Permission is hereby granted, free of charge, to any person obtaining a copy
+ *   of this software and associated documentation files (the "Software"), to deal
+ *   in the Software without restriction, including without limitation the rights
+ *   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ *   copies of the Software, and to permit persons to whom the Software is
+ *   furnished to do so, subject to the following conditions:
+ *
+ *   The above copyright notice and this permission notice shall be included in all
+ *   copies or substantial portions of the Software.
+ *
+ *   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *   SOFTWARE.
+ *
  * Discipline: escape first, tag second. Telegram only parses a small tag set
  * (b, i, u, s, code, pre, a, blockquote, tg-spoiler); a stray `<` or unbalanced
  * tag makes Telegram reject the whole message, so dynamic text is always
@@ -100,19 +122,20 @@ function parseAlign(cell: string): ColumnAlign {
 	return "left";
 }
 
+/** Column count and per-column display widths. Loops, not spreads: a table may have any number of rows. */
+function tableLayout(header: string[], body: string[][]): { cols: number; widths: number[] } {
+	let cols = header.length;
+	for (const row of body) cols = Math.max(cols, row.length);
+	const widths = Array.from({ length: cols }, () => 1);
+	for (const row of [header, ...body])
+		for (let c = 0; c < row.length; c++) widths[c] = Math.max(widths[c] ?? 1, Bun.stringWidth(row[c] ?? ""));
+	return { cols, widths };
+}
+
 /** Render parsed table parts as an aligned, monospace-friendly plain-text grid. */
-function renderTableText(header: string[], aligns: ColumnAlign[], body: string[][]): string {
-	const rows = [header, ...body];
-	const cols = Math.max(header.length, ...body.map((r) => r.length));
-	const widths: number[] = [];
-	for (let c = 0; c < cols; c++) {
-		let w = 1;
-		for (const row of rows) w = Math.max(w, (row[c] ?? "").length);
-		widths[c] = w;
-	}
+function renderTableText(header: string[], aligns: ColumnAlign[], body: string[][], widths: number[]): string {
 	const padCell = (value: string, c: number): string => {
-		const width = widths[c] ?? 1;
-		const pad = width - value.length;
+		const pad = (widths[c] ?? 1) - Bun.stringWidth(value);
 		if (pad <= 0) return value;
 		const align = aligns[c] ?? "left";
 		if (align === "right") return " ".repeat(pad) + value;
@@ -122,25 +145,36 @@ function renderTableText(header: string[], aligns: ColumnAlign[], body: string[]
 		}
 		return value + " ".repeat(pad);
 	};
-	const renderRow = (row: string[]): string =>
-		Array.from({ length: cols }, (_v, c) => padCell(row[c] ?? "", c)).join(" | ");
+	const renderRow = (row: string[]): string => widths.map((_w, c) => padCell(row[c] ?? "", c)).join(" | ");
 	const divider = widths.map((w) => "-".repeat(w)).join("-|-");
 	return [renderRow(header), divider, ...body.map(renderRow)].join("\n");
 }
 
-/** Render compact tables as a grid and wide tables as readable Telegram-native records. */
-function renderTelegramTable(header: string[], aligns: ColumnAlign[], body: string[][]): string {
-	const grid = renderTableText(header, aligns, body);
-	if (body.length === 0 || grid.split("\n").every((line) => Bun.stringWidth(line) <= 42)) return pre(grid);
+/**
+ * Records repeat every header label on every row. Past this multiple of the
+ * table's own source size (plus one message of slack) the table is posted as
+ * its literal source in a monospace block instead, so a long header over many
+ * rows cannot multiply into hundreds of messages.
+ */
+const TABLE_RECORDS_AMPLIFICATION_LIMIT = 8;
+
+/**
+ * Render compact tables as a grid and wide tables as readable Telegram-native
+ * records. The choice is made from the column widths before any padding, so a
+ * wide table never materializes its padded grid.
+ */
+function renderTelegramTable(header: string[], aligns: ColumnAlign[], body: string[][], source: string): string {
+	const { cols, widths } = tableLayout(header, body);
+	const gridWidth = widths.reduce((sum, w) => sum + w, 0) + 3 * (cols - 1);
+	if (body.length === 0 || gridWidth <= 42) return pre(renderTableText(header, aligns, body, widths));
+	const labels = Array.from({ length: cols }, (_v, column) =>
+		tag("b", escapeHtml(header[column] || `Column ${column + 1}`)),
+	);
+	const labelsSize = labels.reduce((sum, label) => sum + label.length + 3, 0);
+	if (body.length * labelsSize > TABLE_RECORDS_AMPLIFICATION_LIMIT * source.length + TELEGRAM_MESSAGE_LIMIT)
+		return pre(source);
 	return body
-		.map((row) =>
-			header
-				.map(
-					(label, column) =>
-						`${tag("b", escapeHtml(label || `Column ${column + 1}`))}: ${escapeHtml(row[column] ?? "")}`,
-				)
-				.join("\n"),
-		)
+		.map((row) => labels.map((label, column) => `${label}: ${escapeHtml(row[column] ?? "")}`).join("\n"))
 		.join("\n\n");
 }
 
@@ -165,7 +199,7 @@ function convertMarkdownTables(text: string, stash: (html: string) => string): s
 				if (!looksLikeTableRow(row) || isTableSeparator(row)) break;
 				body.push(splitTableRow(row));
 			}
-			out.push(stash(renderTelegramTable(header, aligns, body)));
+			out.push(stash(renderTelegramTable(header, aligns, body, lines.slice(i, j).join("\n"))));
 			i = j - 1;
 			continue;
 		}
@@ -254,9 +288,12 @@ export function markdownToTelegramHtml(markdown: string): string {
 
 	// 6. Match outer emphasis first, then its body, never across an emitted tag.
 	// This leaves crossing/unbalanced delimiters literal instead of crossing tags.
+	// A body starts and ends with a non-space character and its delimiters are
+	// not part of a longer run, so `2 * 3 * 4`, a `* item` bullet and the `**/*`
+	// in `src/**/*.ts` stay literal instead of losing their characters.
 	const emphasis = (value: string): string =>
 		value.replace(
-			/\*\*([^*\n<>]+)\*\*|\*([^*\n<>]+)\*|~~([^~\n<>]+)~~/g,
+			/(?<!\*)\*\*([^*\s<>](?:[^*\n<>]*[^*\s<>])?)\*\*(?!\*)|(?<!\*)\*([^*\s<>](?:[^*\n<>]*[^*\s<>])?)\*(?!\*)|(?<!~)~~([^~\s<>](?:[^~\n<>]*[^~\s<>])?)~~(?!~)/g,
 			(_m, bold: string | undefined, italic: string | undefined, strike: string | undefined) =>
 				tag(bold !== undefined ? "b" : italic !== undefined ? "i" : "s", emphasis(bold ?? italic ?? strike ?? "")),
 		);
@@ -320,11 +357,14 @@ interface OpenTag {
 	tag: string;
 }
 
+/** A formatting span whose reopened tags would grow it past this multiple of its own size loses its tags. */
+const REOPEN_AMPLIFICATION_LIMIT = 8;
+
 /** Split a finished Telegram HTML message into ordered chunks without splitting tags or entities. */
 export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT): string[] {
 	if (message.length <= max) return telegramHtmlToPlainText(message).length > 0 ? [message] : [];
 	const chunks: string[] = [];
-	const tokens = tokenize(message);
+	let tokens = tokenize(message);
 	const stack: OpenTag[] = [];
 	let out = "";
 	let chunkHasBody = false;
@@ -356,15 +396,26 @@ export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT)
 			let depth = 1;
 			let end = i + 1;
 			let bodyWidth = 0;
+			let bodyLength = 0;
 			for (; end < tokens.length; end++) {
 				const inner = tokens[end];
 				if (inner?.open === token.open) depth++;
 				if (inner?.close === token.open && --depth === 0) break;
+				if (inner) bodyLength += inner.value.length;
 				if (inner && !inner.open && !inner.close) bodyWidth = Math.max(bodyWidth, inner.value.length);
 			}
 			// Reserve the widest visible unit, not just one UTF-16 code unit. If
 			// formatting cannot fit even on a fresh chunk, preserve its text instead.
-			if (openersFor(nextStack).length + closersFor(nextStack).length + bodyWidth > max) {
+			// Likewise when reopening it across chunks would multiply its size:
+			// a long label under a near-limit href would otherwise fan out into
+			// one message per character.
+			const overhead = openersFor(nextStack).length + closersFor(nextStack).length;
+			const projected =
+				overhead + bodyWidth > max
+					? Number.POSITIVE_INFINITY
+					: Math.ceil(bodyLength / (max - overhead)) * overhead + bodyLength;
+			const spanLength = token.value.length + bodyLength + `</${token.open}>`.length;
+			if (projected > REOPEN_AMPLIFICATION_LIMIT * spanLength + max) {
 				if (token.open === "a") {
 					const label = tokens
 						.slice(i + 1, end)
@@ -372,7 +423,8 @@ export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT)
 						.join("");
 					const href = /\bhref="([^"]*)"/.exec(token.value)?.[1] ?? "";
 					const plain = `${telegramHtmlToPlainText(label)} (${telegramHtmlToPlainText(href)})`;
-					tokens.splice(i, Math.min(end + 1, tokens.length) - i, ...tokenize(escapeHtml(plain)));
+					// concat, not a spread splice: a long label has more tokens than a call takes arguments.
+					tokens = tokens.slice(0, i).concat(tokenize(escapeHtml(plain)), tokens.slice(end + 1));
 					i--;
 				} else if (end < tokens.length) {
 					tokens[end] = { value: "" };

@@ -7,6 +7,7 @@
 
 ### Features
 - **monitors**: Opt in to digest-seeded session rolls with per-monitor observed-usage threshold `contextRollTokens` to reduce carried-context cost; sampled after the turn only when configured, this is not a hard limit and a stale reading can still roll after native compaction. Persisted arms and handoffs survive restart, failure rolls take precedence, and internal diagnostics emit armed, disarmed, deferred, and rolled lifecycle logs. Size-retired saved results are harvested or held on their original session, and removing a monitor clears its size arms and handoffs while preserving pending retirement records.
+- **adapter-telegram**: Send persona Markdown as Telegram HTML, split without breaking tags or entities. A retried multi-chunk reply resumes after the chunks Telegram already accepted, waits out short flood-control `retry_after` pauses, and expires once Telegram keeps refusing the same chunk (#654)
 
 ## [0.4.2] - 2026-10-29
 
