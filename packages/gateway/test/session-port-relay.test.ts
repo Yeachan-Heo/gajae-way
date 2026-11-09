@@ -16,9 +16,13 @@ import {
 	sessionRequestStep,
 } from "../src/orchestrator/session-port";
 import {
+	isRelayTransportFailure,
 	isUnwrittenRelayRequest,
+	MAX_RELAY_REQUEST_FRAME_BYTES,
 	RelayClosedError,
 	RelayHelloError,
+	RelayPayloadTooLargeError,
+	serializeRelayRequestFrame,
 	TailRunner,
 } from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, Store } from "../src/store";
@@ -512,7 +516,25 @@ test("session send rejects a changed image set under a reused op ref", async () 
 	await f.handle.close();
 });
 
-test("session send does not leave an operation intent for a definitely oversized prompt", async () => {
+test("relay serializer accepts the literal 262144-byte boundary", () => {
+	const frame = {
+		type: "control_request",
+		id: "",
+		connectionId: "",
+		operation: "turn.prompt",
+		input: { text: "", clientRef: "gw-boundary" },
+		confirm: false,
+	};
+	const textBytes = 262144 - Buffer.byteLength(JSON.stringify(frame), "utf8");
+	const serialized = serializeRelayRequestFrame("sdk-1", {
+		...frame,
+		input: { ...frame.input, text: "x".repeat(textBytes) },
+	});
+	expect(MAX_RELAY_REQUEST_FRAME_BYTES).toBe(262144);
+	expect(Buffer.byteLength(serialized, "utf8")).toBe(262144);
+});
+
+test("session send records a typed local rejection before creating an operation intent for an oversized text-and-image prompt", async () => {
 	const f = await fixture({
 		mode: "answer",
 		relayReply: (request) => ({ ok: true, result: { accepted: true, clientRef: request.input.clientRef } }),
@@ -520,13 +542,22 @@ test("session send does not leave an operation intent for a definitely oversized
 			throw new Error("CLI must not run");
 		},
 	});
-	const input = { sessionId: "sdk-1", repo: f.repo, opRef: "gw-oversized-prompt" };
-	const failure = await f.port.send({ ...input, text: "x".repeat(300_000) }).catch((error: unknown) => error);
-	expect(failure).toBeInstanceOf(RelayClosedError);
+	const input = {
+		sessionId: "sdk-1",
+		repo: f.repo,
+		opRef: "gw-oversized-prompt",
+		text: "x".repeat(240_000),
+		images: [{ data: "AQ==".repeat(10_000), mimeType: "image/jpeg" as const }],
+	};
+	const failure = await f.port.send(input).catch((error: unknown) => error);
+	expect(failure).toBeInstanceOf(RelayPayloadTooLargeError);
+	expect(failure).not.toBeInstanceOf(RelayClosedError);
+	expect((failure as RelayPayloadTooLargeError).code).toBe("prompt_too_large");
+	expect((failure as RelayPayloadTooLargeError).frameBytes).toBeGreaterThan(262144);
+	expect(isRelayTransportFailure(failure)).toBe(false);
 	expect(isUnwrittenRelayRequest(failure)).toBe(true);
-	expect((failure as RelayClosedError).requestWritten).toBe(false);
 	expect(f.relay.requests).toEqual([]);
-	await f.port.send({ ...input, text: "small prompt" });
+	await f.port.send({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef, text: "small prompt" });
 	expect(f.relay.requests.map((request) => request.operation)).toEqual(["turn.prompt"]);
 	await f.handle.close();
 });

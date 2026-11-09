@@ -1349,8 +1349,9 @@ export class BrokerSessionPort implements SessionPort {
 			...(input.images?.length ? { images: input.images } : {}),
 		};
 		// Reject prompts that cannot fit even with an empty request id and
-		// connection id before writing a durable intent. TailRunner checks the
-		// exact frame again once the live relay envelope is known.
+		// connection id before writing a durable broker intent. This throws the
+		// typed local payload rejection; TailRunner checks the exact frame again
+		// once the live relay envelope is known and preserves the same classification.
 		serializeRelayRequestFrame(input.sessionId, {
 			type: "control_request",
 			id: "",

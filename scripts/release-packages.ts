@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 /**
  * Root-level release workflow for the npm-publishable packages
- * (@gajae-gateway/protocol, @gajae-gateway/sdk, @gajae-gateway/cli), in dependency order.
+ * (@gajae-gateway/protocol, @gajae-gateway/images, @gajae-gateway/sdk,
+ * @gajae-gateway/cli), in dependency order.
  *
  * Usage:
  *   bun scripts/release-packages.ts            # build + `bun pm pack` dry run (default, safe)
@@ -19,7 +20,7 @@
 import { mkdir, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
-const RELEASE_ORDER = ["protocol", "sdk", "cli"] as const;
+export const RELEASE_ORDER = ["protocol", "images", "sdk", "cli"] as const;
 
 function parseArgs(argv: string[]): { publish: boolean; tag?: string } {
 	let publish = false;

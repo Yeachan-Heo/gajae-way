@@ -39,6 +39,8 @@ class TelegramAttachmentHttpError extends Error {
 	}
 }
 
+class TelegramAttachmentSizeError extends Error {}
+
 export interface TelegramFileShape {
 	readonly file_id: string;
 	readonly file_unique_id: string;
@@ -83,7 +85,17 @@ export interface TelegramAttachment {
 }
 
 /** Where a downloaded attachment ended up, or why it is not on disk. */
-export type StoredAttachment = { readonly path: string } | { readonly unavailable: string };
+export type StoredAttachment =
+	| { readonly path: string }
+	| { readonly unavailable: string; readonly retryable?: boolean };
+
+/** A temporary download failure must leave its Telegram update unaccepted. */
+export class TelegramAttachmentRetryableError extends Error {
+	constructor() {
+		super("Telegram attachment download temporarily unavailable");
+		this.name = "TelegramAttachmentRetryableError";
+	}
+}
 
 export interface TelegramFileApi {
 	getFile(fileId: string, signal: AbortSignal): Promise<{ readonly file_path?: string; readonly file_size?: number }>;
@@ -110,6 +122,7 @@ export async function prepareTelegramImage(
 ): Promise<TelegramImagePreparation> {
 	if (!("path" in stored)) throw new Error("image attachment is unavailable");
 	const bytes = await readStoredImage(stored.path);
+	if (!isPng(bytes) && !isJpeg(bytes)) throw new Error("image attachment must be PNG or JPEG");
 	return prepare([bytes]);
 }
 
@@ -177,8 +190,25 @@ function describeTelegramImage(attachment: TelegramAttachment): string {
 	if (attachment.name) parts.push(attachment.name);
 	const size = formatSize(attachment.size);
 	if (size) parts.push(size);
-	parts.push("included as a native image input");
 	return `[${parts.join(" · ")}]`;
+}
+
+function isPng(bytes: Uint8Array): boolean {
+	return (
+		bytes.length >= 8 &&
+		bytes[0] === 0x89 &&
+		bytes[1] === 0x50 &&
+		bytes[2] === 0x4e &&
+		bytes[3] === 0x47 &&
+		bytes[4] === 0x0d &&
+		bytes[5] === 0x0a &&
+		bytes[6] === 0x1a &&
+		bytes[7] === 0x0a
+	);
+}
+
+function isJpeg(bytes: Uint8Array): boolean {
+	return bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
 }
 
 async function readStoredImage(path: string): Promise<Uint8Array> {
@@ -212,8 +242,8 @@ async function readStoredImage(path: string): Promise<Uint8Array> {
 
 /**
  * Downloads inbound attachments into `directory/<chatId>/` with owner-only
- * permissions. Never throws: a failed non-image download still produces a body
- * line, while the adapter rejects an image that cannot be sent natively.
+ * permissions. Never throws: deterministic failures retain a sanitized body
+ * diagnostic, while temporary failures are marked retryable for the adapter.
  */
 export class TelegramAttachmentStore implements TelegramAttachmentSaver {
 	constructor(
@@ -226,6 +256,7 @@ export class TelegramAttachmentStore implements TelegramAttachmentSaver {
 	async save(attachment: TelegramAttachment, chatId: string, messageId: number): Promise<StoredAttachment> {
 		if (attachment.size !== undefined && attachment.size > TELEGRAM_BOT_DOWNLOAD_LIMIT)
 			return { unavailable: "exceeds the 20 MB bot download limit" };
+		let stage: "getFile" | "download" | "store" = "getFile";
 		try {
 			const controller = new AbortController();
 			const timer = setTimeout(() => controller.abort(), this.timeoutMs);
@@ -234,7 +265,9 @@ export class TelegramAttachmentStore implements TelegramAttachmentSaver {
 				if (!file.file_path) return { unavailable: "Telegram returned no file path" };
 				if (validNumber(file.file_size) && file.file_size > TELEGRAM_BOT_DOWNLOAD_LIMIT)
 					return { unavailable: "exceeds the 20 MB bot download limit" };
+				stage = "download";
 				const bytes = await this.download(file.file_path, controller.signal);
+				stage = "store";
 				const directory = join(this.directory, safeSegment(chatId));
 				await mkdir(directory, { recursive: true, mode: 0o700 });
 				const extension = safeExtension(file.file_path) ?? safeExtension(attachment.name ?? "") ?? "";
@@ -252,7 +285,10 @@ export class TelegramAttachmentStore implements TelegramAttachmentSaver {
 			const detail =
 				error instanceof TelegramAttachmentHttpError ? `file download returned HTTP ${error.status}` : "request failed";
 			this.log.error(`Telegram attachment download failed: ${detail}`);
-			return { unavailable: "download failed" };
+			return {
+				unavailable: "download failed",
+				...(isRetryableAttachmentFailure(error, stage) ? { retryable: true } : {}),
+			};
 		}
 	}
 
@@ -270,7 +306,7 @@ export class TelegramAttachmentStore implements TelegramAttachmentSaver {
 				size += value.byteLength;
 				if (size > TELEGRAM_BOT_DOWNLOAD_LIMIT) {
 					await reader.cancel().catch(() => undefined);
-					throw new Error("file exceeds the bot download limit");
+					throw new TelegramAttachmentSizeError("file exceeds the bot download limit");
 				}
 				chunks.push(value);
 			}
@@ -285,6 +321,18 @@ export class TelegramAttachmentStore implements TelegramAttachmentSaver {
 		}
 		return bytes;
 	}
+}
+
+function isRetryableAttachmentFailure(error: unknown, stage: "getFile" | "download" | "store"): boolean {
+	if (stage === "store" || error instanceof TelegramAttachmentSizeError) return false;
+	const status =
+		error instanceof TelegramAttachmentHttpError
+			? error.status
+			: error instanceof Error && "status" in error && typeof error.status === "number"
+				? error.status
+				: undefined;
+	if (status !== undefined) return status === 408 || status === 429 || (status >= 500 && status <= 599);
+	return true;
 }
 
 /** Removes downloaded attachments older than `maxAgeMs`; missing directories are fine. */
@@ -345,7 +393,7 @@ function fromFile(kind: TelegramAttachmentKind, file: TelegramTimedFileShape | T
 
 function kindForMime(mimeType: string | undefined): TelegramAttachmentKind {
 	const mime = nonBlank(mimeType)?.toLowerCase() ?? "";
-	if (mime.startsWith("image/")) return "image";
+	if (mime === "image/png" || mime === "image/jpeg") return "image";
 	if (mime.startsWith("video/")) return "video";
 	if (mime.startsWith("audio/")) return "audio";
 	return "file";

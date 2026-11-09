@@ -52,6 +52,32 @@ test("Slack files name their file id so same-named attachments stay distinct", (
 		expect(describeSlackFile({ id, name: "image.png" })).toBe("[image · image.png]");
 });
 
+test("Slack image descriptions preserve unsupported image and PDF URLs while omitting native PNG URLs", async () => {
+	const files = [
+		{
+			name: "animation.gif",
+			mimetype: "image/gif",
+			url_private: "https://files.slack.com/animation.gif",
+			permalink: "https://slack-files.example/animation.gif",
+		},
+		{ name: "report.pdf", mimetype: "application/pdf", url_private: "https://files.slack.com/report.pdf" },
+		{ name: "native.png", mimetype: "image/png", url_private: "https://files.slack.com/native.png" },
+	];
+	expect(describeInboundBody({ text: "caption", files })).toBe(
+		"caption\n[image · animation.gif · https://files.slack.com/animation.gif]\n" +
+			"[file · report.pdf · https://files.slack.com/report.pdf]\n" +
+			"[image · native.png]",
+	);
+
+	const requested: string[] = [];
+	const prepared = await prepareSlackImages(files, "xoxb-slack-test", async (input) => {
+		requested.push(String(input));
+		return new Response(ONE_PIXEL_PNG);
+	});
+	expect(requested).toEqual(["https://files.slack.com/native.png"]);
+	expect(prepared.images).toHaveLength(1);
+});
+
 test("Slack inbound bodies retain captions, cap file rendering, and distinguish empty messages", () => {
 	expect(describeInboundBody({})).toBe("");
 	expect(describeInboundBody({ text: " untouched " })).toBe(" untouched ");
@@ -85,7 +111,50 @@ test("Slack native image preparation downloads only platform image private URLs 
 	expect(requests).toHaveLength(1);
 	expect(requests[0]?.url).toBe("https://files.slack.com/files-pri/T1-F123/image.png");
 	expect(new Headers(requests[0]?.init?.headers).get("Authorization")).toBe("Bearer xoxb-slack-test");
-	expect(requests[0]?.init?.redirect).toBe("error");
+	expect(requests[0]?.init?.redirect).toBe("manual");
+	expect(result.images).toHaveLength(1);
+});
+
+test("Slack follows a signed CDN redirect without forwarding Authorization or cookies", async () => {
+	const requests: { url: string; init?: RequestInit }[] = [];
+	let redirectBodyCancelled = false;
+	const result = await prepareSlackImages(
+		[
+			{
+				mimetype: "image/jpeg",
+				url_private: "https://files.slack.com/files-pri/T1-F123/photo.jpg",
+			},
+		],
+		"xoxb-slack-test",
+		async (input, init) => {
+			requests.push({ url: String(input), init });
+			if (requests.length === 1) {
+				const body = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(new Uint8Array([1]));
+					},
+					cancel() {
+						redirectBodyCancelled = true;
+					},
+				});
+				return new Response(body, {
+					status: 302,
+					headers: { location: "https://files-edge.slack.com/signed/image?token=temporary" },
+				});
+			}
+			return new Response(ONE_PIXEL_PNG, { status: 200, headers: { "content-type": "image/png" } });
+		},
+	);
+
+	expect(requests.map(({ url }) => url)).toEqual([
+		"https://files.slack.com/files-pri/T1-F123/photo.jpg",
+		"https://files-edge.slack.com/signed/image?token=temporary",
+	]);
+	expect(requests.map(({ init }) => init?.redirect)).toEqual(["manual", "manual"]);
+	expect(new Headers(requests[0]?.init?.headers).get("authorization")).toBe("Bearer xoxb-slack-test");
+	expect(new Headers(requests[1]?.init?.headers).get("authorization")).toBeNull();
+	expect(new Headers(requests[1]?.init?.headers).get("cookie")).toBeNull();
+	expect(redirectBodyCancelled).toBe(true);
 	expect(result.images).toHaveLength(1);
 });
 

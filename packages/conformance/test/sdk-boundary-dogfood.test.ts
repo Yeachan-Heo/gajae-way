@@ -7,10 +7,10 @@ import { join, relative } from "node:path";
  *
  * Every SDK-consumer package (owner CLI, platform adapters) must be
  * implementable by a third party: it may import ONLY the public packages
- * (@gajae-gateway/sdk, @gajae-gateway/protocol, @gajae-gateway/log), Bun/node builtins, its
- * own files, and its declared platform library. Any import that reaches into
- * the gateway's internals (or the legacy tree) is a privileged import and
- * fails this test.
+ * (@gajae-gateway/sdk, @gajae-gateway/protocol, @gajae-gateway/log,
+ * @gajae-gateway/images), Bun/node builtins, its own files, and its declared
+ * platform library. Any import that reaches into the gateway's internals (or
+ * the legacy tree) is a privileged import and fails this test.
  */
 
 const ROOT = join(import.meta.dir, "..", "..", "..");
@@ -28,7 +28,19 @@ const CONSUMER_PACKAGES: Record<string, readonly string[]> = {
 // @gajae-gateway/log is public for the same reason as the protocol: it is an
 // unprivileged, dependency-free service sink (console + fs only) that a
 // third-party adapter needs in order to produce windowable logs at all.
-const PUBLIC_IMPORTS = ["@gajae-gateway/sdk", "@gajae-gateway/protocol", "@gajae-gateway/log", "@gajae-gateway/home"];
+// @gajae-gateway/images is public as an unprivileged leaf: it handles bounded
+// image bytes and depends only on protocol values plus image codecs.
+const PUBLIC_IMPORTS = [
+	"@gajae-gateway/sdk",
+	"@gajae-gateway/protocol",
+	"@gajae-gateway/log",
+	"@gajae-gateway/home",
+	"@gajae-gateway/images",
+];
+
+// Keep the image package stricter than the general public import allowlist:
+// its only workspace dependency is the protocol value type.
+const IMAGE_PACKAGE_IMPORTS = ["@gajae-gateway/protocol", "image-size", "jimp"];
 
 const FORBIDDEN_PREFIXES = [
 	"@gajae-gateway/gateway",
@@ -114,6 +126,59 @@ describe("sdk-boundary-dogfood", () => {
 			expect(violations).toEqual([]);
 		});
 	}
+
+	test("images package is an unprivileged leaf", () => {
+		const pkgDir = join(ROOT, "packages/images");
+		const files = collectSourceFiles(join(pkgDir, "src"));
+		expect(files.length).toBeGreaterThan(0);
+		const violations: string[] = [];
+		for (const file of files) {
+			for (const spec of importsOf(file)) {
+				if (isBuiltin(spec)) continue;
+				if (spec.startsWith("./") || spec.startsWith("../")) {
+					const resolved = join(file, "..", spec);
+					if (!resolved.startsWith(pkgDir)) {
+						violations.push(`${relative(ROOT, file)} escapes package: ${spec}`);
+					}
+					continue;
+				}
+				const allowed = IMAGE_PACKAGE_IMPORTS.includes(spec);
+				if (!allowed || FORBIDDEN_PREFIXES.some((p) => spec.startsWith(p))) {
+					violations.push(`${relative(ROOT, file)} imports privileged module: ${spec}`);
+				}
+			}
+		}
+		expect(violations).toEqual([]);
+	});
+
+	test("images package has a public npm build contract", () => {
+		const pkgDir = join(ROOT, "packages/images");
+		const manifest = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8")) as {
+			private?: boolean;
+			main?: string;
+			types?: string;
+			exports?: Record<string, unknown>;
+			publishConfig?: { access?: string };
+			scripts?: Record<string, string>;
+			dependencies?: Record<string, string>;
+		};
+		expect(manifest.private).not.toBe(true);
+		expect(manifest.main).toBe("./dist/index.js");
+		expect(manifest.types).toBe("./src/index.ts");
+		expect(manifest.exports).toEqual({
+			".": { bun: "./src/index.ts", types: "./src/index.ts", default: "./dist/index.js" },
+		});
+		expect(manifest.publishConfig?.access).toBe("public");
+		expect(manifest.scripts?.build).toContain("bun build src/index.ts");
+		expect(manifest.scripts?.build).toContain("tsc -p tsconfig.build.json");
+		expect(manifest.scripts?.prepublishOnly).toBe("bun run build");
+		expect(statSync(join(pkgDir, "tsconfig.build.json")).isFile()).toBe(true);
+		expect(manifest.dependencies).toMatchObject({
+			"@gajae-gateway/protocol": "workspace:*",
+			"image-size": "2.1.0",
+			jimp: "1.6.1",
+		});
+	});
 
 	test("sdk package itself depends only on the protocol package", () => {
 		const files = collectSourceFiles(join(ROOT, "packages/sdk"));

@@ -21,6 +21,19 @@ async function makeJpeg(): Promise<Uint8Array> {
 	return new Jimp({ width: 32, height: 24, color: 0x4c83baff }).getBuffer("image/jpeg", { quality: 75 });
 }
 
+async function makeNoisyPng(width: number, height: number): Promise<Uint8Array> {
+	const image = new Jimp({ width, height, color: 0xffffffff });
+	let state = 0x12345678;
+	for (let offset = 0; offset < image.bitmap.data.length; offset += 4) {
+		state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+		image.bitmap.data[offset] = state & 0xff;
+		image.bitmap.data[offset + 1] = (state >>> 8) & 0xff;
+		image.bitmap.data[offset + 2] = (state >>> 16) & 0xff;
+		image.bitmap.data[offset + 3] = 0xff;
+	}
+	return image.getBuffer("image/png");
+}
+
 function setUInt32BE(bytes: Uint8Array, offset: number, value: number): void {
 	new DataView(bytes.buffer, bytes.byteOffset + offset, 4).setUint32(0, value, false);
 }
@@ -94,6 +107,18 @@ describe("prompt image preparation", () => {
 		expect(result.images.reduce((sum, image) => sum + Buffer.from(image.data, "base64").length, 0)).toBeLessThanOrEqual(
 			MAX_IMAGE_TOTAL_BYTES,
 		);
+	});
+
+	test("resizes and compresses a large noisy PNG within literal prompt limits", async () => {
+		const source = await makeNoisyPng(1400, 1000);
+		expect(source.length).toBeGreaterThan(96 * 1024);
+		expect(source.length).toBeLessThanOrEqual(20 * 1024 * 1024);
+
+		const prepared = await preparePromptImages([source]);
+		const jpeg = Buffer.from(prepared.images[0].data, "base64");
+		const decoded = await Jimp.read(jpeg);
+		expect(jpeg.length).toBeLessThanOrEqual(96 * 1024);
+		expect(Math.max(decoded.bitmap.width, decoded.bitmap.height)).toBeLessThanOrEqual(1280);
 	});
 
 	test("flattens transparent pixels against white before JPEG encoding", async () => {
@@ -233,6 +258,137 @@ describe("trusted image downloads", () => {
 				fetch: async () => new Response(null, { status: 302, headers: { location: "https://elsewhere.test" } }),
 			}),
 		).rejects.toThrow("Image download failed.");
+	});
+
+	test("manually follows a relative same-host redirect and retains its authorization", async () => {
+		const requests: { url: string; authorization: string | null; redirect: RequestInit["redirect"] }[] = [];
+		const downloaded = await downloadPromptImage("https://files.slack.com/files/image", {
+			allowedHosts: ["files.slack.com"],
+			redirectPolicy: { allowedHosts: ["files.slack.com", "files-edge.slack.com"] },
+			headers: { Authorization: "Bearer secret" },
+			fetch: async (input, init) => {
+				requests.push({
+					url: String(input),
+					authorization: new Headers(init?.headers).get("authorization"),
+					redirect: init?.redirect,
+				});
+				if (requests.length === 1) {
+					return new Response(null, { status: 302, headers: { location: "../signed/image" } });
+				}
+				return new Response(new Uint8Array([1, 2, 3]));
+			},
+		});
+		expect([...downloaded]).toEqual([1, 2, 3]);
+		expect(requests.map(({ url }) => url)).toEqual([
+			"https://files.slack.com/files/image",
+			"https://files.slack.com/signed/image",
+		]);
+		expect(requests.map(({ authorization }) => authorization)).toEqual(["Bearer secret", "Bearer secret"]);
+		expect(requests.map(({ redirect }) => redirect)).toEqual(["manual", "manual"]);
+	});
+
+	test("strips authorization and cookies before a trusted CDN redirect request", async () => {
+		const requests: { host: string; authorization: string | null; cookie: string | null }[] = [];
+		await downloadPromptImage("https://files.slack.com/image", {
+			allowedHosts: ["files.slack.com"],
+			redirectPolicy: { allowedHosts: ["files.slack.com", "files-edge.slack.com"] },
+			headers: { Authorization: "Bearer secret", Cookie: "session=secret" },
+			fetch: async (input, init) => {
+				const headers = new Headers(init?.headers);
+				requests.push({
+					host: new URL(String(input)).hostname,
+					authorization: headers.get("authorization"),
+					cookie: headers.get("cookie"),
+				});
+				if (requests.length === 1) {
+					return new Response(null, {
+						status: 302,
+						headers: { location: "https://files-edge.slack.com/signed/image" },
+					});
+				}
+				return new Response(new Uint8Array([1]));
+			},
+		});
+		expect(requests).toEqual([
+			{ host: "files.slack.com", authorization: "Bearer secret", cookie: "session=secret" },
+			{ host: "files-edge.slack.com", authorization: null, cookie: null },
+		]);
+	});
+
+	test("rejects unsafe redirect targets before fetching them", async () => {
+		for (const location of [
+			"https://files-edge.slack.com.evil.test/image",
+			"http://files-edge.slack.com/image",
+			"https://user@files-edge.slack.com/image",
+			"https://files-edge.slack.com:443/image",
+			"https://files-edge.slack.com/image#fragment",
+		]) {
+			let calls = 0;
+			const error = await downloadPromptImage("https://files.slack.com/image", {
+				allowedHosts: ["files.slack.com"],
+				redirectPolicy: { allowedHosts: ["files.slack.com", "files-edge.slack.com"] },
+				fetch: async () => {
+					calls += 1;
+					return new Response(null, { status: 302, headers: { location } });
+				},
+			}).catch((error: unknown) => error);
+			expect(error).toBeInstanceOf(PromptImageDownloadError);
+			expect((error as PromptImageDownloadError).retryable).toBe(false);
+			expect(calls).toBe(1);
+		}
+	});
+
+	test("cancels redirect bodies and bounds both redirect cycles and hop count", async () => {
+		let cancelled = 0;
+		let calls = 0;
+		const loopError = await downloadPromptImage("https://files.slack.com/start", {
+			allowedHosts: ["files.slack.com"],
+			redirectPolicy: { allowedHosts: ["files.slack.com", "files-edge.slack.com"] },
+			fetch: async (input) => {
+				calls += 1;
+				const next = String(input).endsWith("/start") ? "/next" : "/start";
+				const body = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(new Uint8Array([1]));
+					},
+					cancel() {
+						cancelled += 1;
+					},
+				});
+				return new Response(body, { status: 302, headers: { location: next } });
+			},
+		}).catch((error: unknown) => error);
+		expect(loopError).toBeInstanceOf(PromptImageDownloadError);
+		expect(calls).toBe(2);
+		expect(cancelled).toBe(2);
+
+		calls = 0;
+		const capError = await downloadPromptImage("https://files.slack.com/0", {
+			allowedHosts: ["files.slack.com"],
+			redirectPolicy: { allowedHosts: ["files.slack.com", "files-edge.slack.com"] },
+			fetch: async (input) => {
+				calls += 1;
+				const hop = Number(new URL(String(input)).pathname.slice(1));
+				return new Response(null, { status: 302, headers: { location: `/${hop + 1}` } });
+			},
+		}).catch((error: unknown) => error);
+		expect(capError).toBeInstanceOf(PromptImageDownloadError);
+		expect(calls).toBe(4);
+	});
+
+	test("rejects HTML success responses and oversized Content-Length values", async () => {
+		for (const response of [
+			new Response("<html>login</html>", { headers: { "content-type": "text/html" } }),
+			new Response("<!doctype html><html>login</html>", { headers: { "content-type": "image/png" } }),
+			new Response(new Uint8Array(), { headers: { "content-length": String(20 * 1024 * 1024 + 1) } }),
+		]) {
+			const error = await downloadPromptImage("https://cdn.example.test/image", {
+				allowedHosts: ["cdn.example.test"],
+				fetch: async () => response,
+			}).catch((error: unknown) => error);
+			expect(error).toBeInstanceOf(PromptImageDownloadError);
+			expect((error as PromptImageDownloadError).retryable).toBe(false);
+		}
 	});
 
 	test("classifies permanent and transient HTTP failures without leaking response data", async () => {

@@ -15,6 +15,7 @@ export interface SlackFileLike {
 export type SlackFileCarrier = { readonly text?: string | null; readonly files?: readonly SlackFileLike[] | null };
 
 const SLACK_IMAGE_HOSTS = ["files.slack.com"] as const;
+const SLACK_IMAGE_REDIRECT_HOSTS = ["files.slack.com", "files-edge.slack.com"] as const;
 const SLACK_IMAGE_LIMIT = 4;
 
 export function isSlackImage(file: SlackFileLike): boolean {
@@ -25,13 +26,21 @@ export function isSlackImage(file: SlackFileLike): boolean {
 	);
 }
 
+/** PNG and JPEG are the only Slack image formats normalized for native model input. */
+export function isSlackNativeImage(file: SlackFileLike): boolean {
+	const mime = nonBlank(file.mimetype)?.toLowerCase();
+	if (mime) return mime === "image/png" || mime === "image/jpeg";
+	const name = nonBlank(file.name) ?? nonBlank(file.title) ?? "";
+	return /\.(?:jpe?g|png)$/i.test(name);
+}
+
 /** Downloads native images only from Slack's private file URL before normalizing them for chat.send. */
 export async function prepareSlackImages(
 	files: readonly SlackFileLike[] | null | undefined,
 	botToken: string,
 	fetchImpl?: ImageFetch,
 ): Promise<{ readonly images: PromptImage[]; readonly notice: string }> {
-	const images = (files ?? []).filter(isSlackImage);
+	const images = (files ?? []).filter(isSlackNativeImage);
 	if (images.length === 0) return { images: [], notice: "" };
 	if (images.length > SLACK_IMAGE_LIMIT) throw new Error("Slack messages can include at most four images");
 	const sources = await Promise.all(
@@ -41,6 +50,7 @@ export async function prepareSlackImages(
 			return downloadPromptImage(url, {
 				allowedHosts: SLACK_IMAGE_HOSTS,
 				headers: { Authorization: `Bearer ${botToken}` },
+				redirectPolicy: { allowedHosts: SLACK_IMAGE_REDIRECT_HOSTS },
 				...(fetchImpl ? { fetch: fetchImpl } : {}),
 			});
 		}),
@@ -64,6 +74,7 @@ export function describeSlackFile(file: SlackFileLike): string {
 	const kind = isSlackImage(file)
 		? "image"
 		: (["video", "audio"].find((kind) => mime.startsWith(`${kind}/`)) ?? "file");
+	const nativeImage = isSlackNativeImage(file);
 	const id =
 		typeof file.id === "string" && file.id.trim() === file.id && SLACK_FILE_ID.test(file.id)
 			? `id ${file.id}`
@@ -73,7 +84,7 @@ export function describeSlackFile(file: SlackFileLike): string {
 		nonBlank(file.name) ?? nonBlank(file.title),
 		id,
 		formatSize(file.size),
-		kind === "image" ? undefined : (nonBlank(file.url_private) ?? nonBlank(file.permalink)),
+		nativeImage ? undefined : (nonBlank(file.url_private) ?? nonBlank(file.permalink)),
 	];
 	return `[${parts.filter((part) => part !== undefined).join(" · ")}]`;
 }

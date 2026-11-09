@@ -375,11 +375,10 @@ test("chat.send persists and rehydrates only trigger images, supports image-only
 	await waitFrame(client.frames, "image-only-trigger");
 	expect(turnIdFor("image-only-trigger")).toBeString();
 	await waitForCompletedSend(database, sessionPort, 0);
-	expect(sessionPort.sends[0]).toMatchObject({
-		images: [image],
-		text: expect.stringContaining("The user sent 1 image without accompanying text."),
-	});
+	expect(sessionPort.sends[0]?.images).toEqual([image]);
+	expect(sessionPort.sends[0]?.text).toContain("The user sent 1 image without accompanying text.");
 	expect(database.inbox.messageImagesJson("image-only-trigger", key)).toBe(JSON.stringify([image]));
+	expect(sessionPort.sends[0]?.text).toContain("Current message: 1 native image(s) attached");
 
 	send("image-duplicate", origin, "", [image], "image-only-trigger");
 	await waitFrame(client.frames, "image-duplicate");
@@ -416,6 +415,7 @@ test("chat.send persists and rehydrates only trigger images, supports image-only
 	expect(turnIdFor("text-after-image")).toBeString();
 	await waitForCompletedSend(database, sessionPort, 1);
 	expect(sessionPort.sends[1]?.images).toBeUndefined();
+	expect(sessionPort.sends[1]?.text).not.toContain("Current message: 1 native image(s) attached");
 	expect(sessionPort.sends[1]?.text).not.toContain(image.data);
 	expect(database.inbox.messageImagesJson("text-after-image", key)).toBeNull();
 	send("text-duplicate", origin, "ordinary text", undefined, "text-after-image");
@@ -437,10 +437,13 @@ test("chat.send persists and rehydrates only trigger images, supports image-only
 });
 
 test("declined image messages remain text context without durable image payloads", async () => {
-	const { client, database, sessionPort } = await startDeliveryServer();
+	const { client, database, sessionPort } = await startDeliveryServer({
+		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "owner", peerId: "owner" } },
+	});
 	const image = await makePromptImage();
 	const origin = { platform: "discord", kind: "channel", conversationId: "declined-image" } as const;
 	const key = originKey(origin);
+	const body = "not addressed to the persona\n[image · picture.png · 12 KB]";
 	client.send({
 		v: "0.1",
 		type: "request",
@@ -448,7 +451,7 @@ test("declined image messages remain text context without durable image payloads
 		verb: "chat.send",
 		params: {
 			origin,
-			text: "not addressed to the persona",
+			text: body,
 			messageId: "declined-image",
 			engagement: { mentioned: false, group: true, authorId: "stranger" },
 			images: [image],
@@ -461,9 +464,29 @@ test("declined image messages remain text context without durable image payloads
 	});
 	expect(database.inbox.messageImagesJson("declined-image", key)).toBeUndefined();
 	expect(database.inbox.recentInbound(key, 10, new Date(0).toISOString())).toContainEqual(
-		expect.objectContaining({ id: "declined-image", body: "not addressed to the persona" }),
+		expect.objectContaining({ id: "declined-image", body }),
 	);
 	expect(sessionPort.sends).toHaveLength(0);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "after-declined-image",
+		verb: "chat.send",
+		params: {
+			origin,
+			text: "hello @agent",
+			messageId: "after-declined-image",
+			engagement: { mentioned: true, group: true, authorId: "owner" },
+		},
+	});
+	await waitFrame(client.frames, "after-declined-image");
+	expect(client.frames.find((frame) => frame.id === "after-declined-image")?.result.engaged).toBe(true);
+	await waitForCompletedSend(database, sessionPort, 0);
+	expect(sessionPort.sends[0]?.images).toBeUndefined();
+	expect(sessionPort.sends[0]?.text).toContain(
+		"[image · picture.png · 12 KB · past attachment; not part of this message, do not fetch]",
+	);
+	expect(sessionPort.sends[0]?.text).not.toContain("native image(s) attached");
 	client.close();
 });
 

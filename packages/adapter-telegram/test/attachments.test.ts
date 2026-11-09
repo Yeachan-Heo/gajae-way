@@ -41,6 +41,16 @@ test("normalizes each Telegram media field to one attachment kind", () => {
 	expect(telegramAttachment({ document: { file_id: "d", file_unique_id: "ud", mime_type: "IMAGE/PNG" } })?.kind).toBe(
 		"image",
 	);
+	expect(
+		telegramAttachment({
+			document: { file_id: "g", file_unique_id: "ug", file_name: "loop.gif", mime_type: "image/gif" },
+		})?.kind,
+	).toBe("file");
+	expect(
+		telegramAttachment({
+			document: { file_id: "w", file_unique_id: "uw", file_name: "loop.webp", mime_type: "image/webp" },
+		})?.kind,
+	).toBe("file");
 	expect(telegramAttachment({ document: { file_id: "d", file_unique_id: "ud", file_name: "a.pdf" } })?.kind).toBe(
 		"file",
 	);
@@ -57,8 +67,18 @@ test("renders the caption on its own line and the attachment after it", () => {
 	};
 	expect(describeInboundBody("", voice, { path: "/h/v.oga" })).toBe("[voice message · 1:15 · 2 KB · /h/v.oga]");
 	expect(describeInboundBody("look", photo, { path: "/h/p.jpg" })).toBe("look\n[image · /h/p.jpg]");
-	expect(describeInboundBody("look", photo, { path: "/h/p.jpg" }, true)).toBe(
-		"look\n[image · included as a native image input]",
+	expect(describeInboundBody("look", photo, { path: "/h/p.jpg" }, true)).toBe("look\n[image]");
+	const gif = telegramAttachment({
+		document: { file_id: "g", file_unique_id: "ug", file_name: "loop.gif", mime_type: "image/gif" },
+	});
+	expect(describeInboundBody("animate this", gif, { path: "/h/loop.gif" })).toBe(
+		"animate this\n[file · loop.gif · /h/loop.gif]",
+	);
+	const webp = telegramAttachment({
+		document: { file_id: "w", file_unique_id: "uw", file_name: "loop.webp", mime_type: "image/webp" },
+	});
+	expect(describeInboundBody("webp caption", webp, { path: "/h/loop.webp" })).toBe(
+		"webp caption\n[file · loop.webp · /h/loop.webp]",
 	);
 	expect(describeInboundBody("plain text", undefined, undefined)).toBe("plain text");
 });
@@ -79,6 +99,10 @@ test("prepares only bytes read from the stored local image path and returns its 
 			images: [{ data: "prepared-data", mimeType: "image/jpeg" }],
 			notice: "resized and compressed",
 		});
+		await writeFile(path, new Uint8Array([0x52, 0x49, 0x46, 0x46]));
+		await expect(prepareTelegramImage({ path }, async () => ({ images: [], notice: "" }))).rejects.toThrow(
+			"must be PNG or JPEG",
+		);
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
@@ -162,6 +186,14 @@ test("reports a failed download as unavailable and logs no url", async () => {
 	expect(logged).toEqual(["Telegram attachment download failed: file download returned HTTP 404"]);
 });
 
+test.each([408, 429, 500, 503])("marks HTTP %i attachment failures as retryable", async (status) => {
+	const store = new TelegramAttachmentStore("/nonexistent", {
+		getFile: async () => ({ file_path: "photos/p.jpg" }),
+		downloadFile: async () => new Response("unavailable", { status }),
+	});
+	expect(await store.save(photo, "1", 1)).toEqual({ unavailable: "download failed", retryable: true });
+});
+
 test("does not log a token-bearing URL from a rejected download", async () => {
 	const logged: string[] = [];
 	const store = new TelegramAttachmentStore(
@@ -174,7 +206,7 @@ test("does not log a token-bearing URL from a rejected download", async () => {
 		},
 		{ error: (line: string) => void logged.push(line) },
 	);
-	expect(await store.save(photo, "1", 1)).toEqual({ unavailable: "download failed" });
+	expect(await store.save(photo, "1", 1)).toEqual({ unavailable: "download failed", retryable: true });
 	expect(logged).toEqual(["Telegram attachment download failed: request failed"]);
 	expect(logged.join("\n")).not.toContain("secret-token");
 });
@@ -214,7 +246,7 @@ test("aborts a download that outlives the timeout", async () => {
 		{ error: () => {} },
 		10,
 	);
-	expect(await store.save(photo, "1", 1)).toEqual({ unavailable: "download failed" });
+	expect(await store.save(photo, "1", 1)).toEqual({ unavailable: "download failed", retryable: true });
 });
 
 test("aborts a getFile request that outlives the timeout", async () => {
@@ -227,7 +259,7 @@ test("aborts a getFile request that outlives the timeout", async () => {
 			}),
 	);
 	const store = new TelegramAttachmentStore("/nonexistent", bot, { error: () => {} }, 10);
-	expect(await store.save(photo, "1", 1)).toEqual({ unavailable: "download failed" });
+	expect(await store.save(photo, "1", 1)).toEqual({ unavailable: "download failed", retryable: true });
 });
 
 test("prunes attachments past retention and drops emptied chat directories", async () => {

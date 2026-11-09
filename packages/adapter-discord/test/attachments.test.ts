@@ -9,6 +9,7 @@ import {
 	isVoiceMessageAttachment,
 	prepareDiscordImages,
 	selectImageAttachments,
+	selectNativeImageAttachments,
 } from "../src/attachments";
 
 const VOICE = {
@@ -59,15 +60,66 @@ test("image descriptions identify the native attachment without exposing its sig
 	expect(describeAttachment({ name: "archive.bin", contentType: "application/octet-stream", url })).toContain(url);
 });
 
-test("image sources are selected by MIME type rather than filename", () => {
+test("native image sources are limited to PNG/JPEG, with filename inference only when MIME is missing", () => {
 	const message = {
 		attachments: [
 			{ name: "photo.data", contentType: " IMAGE/JPEG ", url: "https://cdn.discordapp.com/photo" },
+			{ name: "inferred.jpeg", url: "https://cdn.discordapp.com/inferred" },
+			{ name: "native.png", contentType: "image/png", url: "https://cdn.discordapp.com/native" },
+			{ name: "animated.gif", contentType: "image/gif", url: "https://cdn.discordapp.com/gif" },
+			{ name: "preview.webp", contentType: "image/webp", url: "https://cdn.discordapp.com/webp" },
 			{ name: "looks-like-image.png", contentType: "application/octet-stream", url: "https://cdn.discordapp.com/file" },
 			{ name: "clip.mp4", contentType: "video/mp4", url: "https://cdn.discordapp.com/video" },
 		],
 	};
-	expect(selectImageAttachments(message)).toEqual([message.attachments[0]]);
+	expect(selectNativeImageAttachments(message)).toEqual([
+		message.attachments[0],
+		message.attachments[1],
+		message.attachments[2],
+	]);
+	expect(selectImageAttachments(message)).toEqual(message.attachments.slice(0, 5));
+});
+
+test("unsupported images retain their URLs and captions beside ordinary attachments", async () => {
+	const message = {
+		content: "Please look at these",
+		attachments: [
+			{
+				name: "animation.gif",
+				contentType: "image/gif",
+				url: "https://cdn.discordapp.com/animation.gif?sig=gif-secret",
+			},
+			{
+				name: "preview.webp",
+				contentType: "image/webp",
+				url: "https://cdn.discordapp.com/preview.webp?sig=webp-secret",
+			},
+			{
+				name: "notes.txt",
+				contentType: "text/plain",
+				url: "https://cdn.discordapp.com/notes.txt?sig=file-secret",
+			},
+		],
+	};
+	let downloads = 0;
+	expect(describeInboundBody(message)).toBe(
+		[
+			"Please look at these",
+			"[image · animation.gif · https://cdn.discordapp.com/animation.gif?sig=gif-secret]",
+			"[image · preview.webp · https://cdn.discordapp.com/preview.webp?sig=webp-secret]",
+			"[file · notes.txt · https://cdn.discordapp.com/notes.txt?sig=file-secret]",
+		].join("\n"),
+	);
+	expect(
+		await prepareDiscordImages(message, {
+			download: async () => {
+				downloads++;
+				return Uint8Array.of(1);
+			},
+			prepare: async () => ({ images: [], notice: "" }),
+		}),
+	).toEqual({ images: [], notice: "" });
+	expect(downloads).toBe(0);
 });
 
 test("Discord image downloads preserve signed URLs and pass only the approved hosts to the helper", async () => {

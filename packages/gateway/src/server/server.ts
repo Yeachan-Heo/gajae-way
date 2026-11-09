@@ -3265,7 +3265,7 @@ async function createInboundTurnLifecycle(
 		contextOmissionRevision = prepared.omissionRevision;
 		const lines = prepared.rows.map(
 			(entry) =>
-				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${clipContextBody(entry.body, 4000)}`,
+				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${clipContextBody(redactHistoricalAttachments(entry.body), 4000)}`,
 		);
 		const omitted = prepared.expiredCount + prepared.truncatedCount;
 		const omittedRange =
@@ -3306,6 +3306,9 @@ async function createInboundTurnLifecycle(
 					: ""
 		}`;
 		turnText = `${header}${laneReport ? internalTriggerText() : `${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`}`;
+	}
+	if (promptImages.length > 0) {
+		turnText += `\n\n[Current message: ${promptImages.length} native image(s) attached, resized/JPEG-compressed for model input; fine detail may be lost. Images mentioned only in earlier messages are not attached.]`;
 	}
 
 	const bootstrap = bootstrapPending

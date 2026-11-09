@@ -307,7 +307,7 @@ test("RT-SLACK-06b same-named image-only messages in two threads reach the gatew
 		imageFetch: (async (input, init) => {
 			const url = String(input);
 			downloaded.push(url);
-			expect(init?.redirect).toBe("error");
+			expect(init?.redirect).toBe("manual");
 			expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer xoxb-test");
 			return new Response(
 				Buffer.from(

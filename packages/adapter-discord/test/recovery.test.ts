@@ -1060,7 +1060,7 @@ test("deterministic native image failures use bounded terminal recovery without 
 	const rejected = message(snowflakeFromTimestamp(base), {
 		content: "",
 		attachments: [
-			{ name: "replacement.gif", contentType: "image/gif", url: "https://cdn.discordapp.com/image?sig=secret" },
+			{ name: "replacement.png", contentType: "image/png", url: "https://cdn.discordapp.com/image?sig=secret" },
 		],
 	});
 	const requests: Array<{ verb: string; params?: unknown }> = [];
@@ -1157,7 +1157,7 @@ test("recovered image resize notice is sent only for a fresh engaged acknowledge
 		{
 			request: async (verb, params) => {
 				requests.push({ verb, params });
-				return { engaged: true };
+				return { engaged: true, turnId: "turn-image-accepted" };
 			},
 		},
 		cursorPath,
@@ -1169,8 +1169,9 @@ test("recovered image resize notice is sent only for a fresh engaged acknowledge
 	const send = requests.find((request) => request.verb === "chat.send");
 	expect(send?.params).toMatchObject({
 		images: [{ data: "AQ==", mimeType: "image/jpeg" }],
-		text: expect.stringContaining("Image processing: Images resized/compressed."),
+		text: "look\n[image · photo.png]",
 	});
+	expect((send?.params as { text: string }).text).not.toContain("Image processing:");
 	expect(visibleNotices).toEqual([
 		{
 			content: "Image processing: Images resized/compressed.",
@@ -1183,6 +1184,72 @@ test("recovered image resize notice is sent only for a fresh engaged acknowledge
 		]),
 	).toEqual({ verdict: "duplicate" });
 	expect(visibleNotices).toHaveLength(1);
+});
+
+test("unsupported images and ordinary attachments reach chat.send as captioned text", async () => {
+	const cursorPath = join(home, "unsupported-image-text", "recovery-cursor.json");
+	const inbound = message(snowflakeFromTimestamp(Date.now() - 60_000), {
+		content: "look at these",
+		attachments: [
+			{
+				name: "animation.gif",
+				contentType: "image/gif",
+				url: "https://cdn.discordapp.com/animation.gif?sig=gif-secret",
+			},
+			{
+				name: "notes.txt",
+				contentType: "text/plain",
+				url: "https://cdn.discordapp.com/notes.txt?sig=file-secret",
+			},
+		],
+	});
+	const requests: Array<{ verb: string; params?: unknown }> = [];
+	const gateway = wiredGateway(
+		fakeChannel([inbound]),
+		{
+			request: async (verb, params) => {
+				requests.push({ verb, params });
+				return { engaged: true, turnId: "turn-text-attachments" };
+			},
+		},
+		cursorPath,
+	);
+	await gateway.recoverMissedMessages();
+	const send = requests.find((request) => request.verb === "chat.send");
+	expect(send?.params).toMatchObject({
+		text: [
+			"look at these",
+			"[image · animation.gif · https://cdn.discordapp.com/animation.gif?sig=gif-secret]",
+			"[file · notes.txt · https://cdn.discordapp.com/notes.txt?sig=file-secret]",
+		].join("\n"),
+	});
+	expect(send?.params).not.toHaveProperty("images");
+});
+
+test("a duplicate backfill acknowledgement with a null turn id does not repeat its notice", async () => {
+	const cursorPath = join(home, "image-notice-duplicate", "recovery-cursor.json");
+	const priorWatermark = snowflakeFromTimestamp(Date.now() - 2 * 24 * 60 * 60 * 1000);
+	const inbound = message(snowflakeFromTimestamp(Date.now() - 60_000), {
+		content: "look",
+		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo?sig=secret" }],
+	});
+	await saveRecoveryCursors(cursorPath, cursorState({ "channel-1": priorWatermark }));
+	const visibleNotices: unknown[] = [];
+	(inbound as unknown as { channel: { send: (payload: unknown) => Promise<void> } }).channel.send = async (payload) => {
+		visibleNotices.push(payload);
+	};
+	const gateway = wiredGateway(
+		fakeChannel([inbound]),
+		{
+			request: async () => ({ engaged: true, turnId: null }),
+		},
+		cursorPath,
+		undefined,
+		() => bot,
+		async () => ({ images: [{ data: "AQ==", mimeType: "image/jpeg" }], notice: "Images resized/compressed." }),
+	);
+	await gateway.recoverMissedMessages();
+	expect(visibleNotices).toEqual([]);
 });
 
 test("a declined recovered image does not post its resize notice", async () => {

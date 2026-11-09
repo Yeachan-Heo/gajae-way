@@ -4,6 +4,7 @@ import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gaja
 
 import {
 	type ChatMessagePayload,
+	type ChatSendResult,
 	type EngagementContext,
 	type FileRef,
 	type OriginRef,
@@ -17,6 +18,7 @@ import {
 	prepareTelegramImage,
 	pruneTelegramAttachments,
 	type TelegramAttachmentCarrier,
+	TelegramAttachmentRetryableError,
 	type TelegramAttachmentSaver,
 	TelegramAttachmentStore,
 	type TelegramFileApi,
@@ -794,20 +796,21 @@ export class TelegramAdapter {
 	) {}
 
 	async handleUpdate(gateway: Pick<GatewayClientLike, "request">, update: TelegramUpdate): Promise<boolean> {
-		if (!(await this.state.acceptUpdate(update.update_id))) return false;
+		if (!Number.isSafeInteger(update.update_id)) throw new Error("Telegram update_id must be a safe integer");
+		if (this.state.updateId !== undefined && update.update_id <= this.state.updateId) return false;
 		// An inbound reaction is engagement metadata, never a turn: it is reported via
 		// engagement.reaction and must never reach chat.send.
 		const reaction = describeTelegramReaction(update.message_reaction, this.botUserId);
 		if (reaction) {
 			await gateway.request("engagement.reaction", reaction);
-			return true;
+			return this.state.acceptUpdate(update.update_id);
 		}
 		const message = update.message;
-		if (!message?.from) return true;
+		if (!message?.from) return this.state.acceptUpdate(update.update_id);
 		// A photo or file has no `text`; forwarding text alone dropped it without a trace.
 		const content = message.text ?? message.caption ?? "";
 		const attachment = telegramAttachment(message);
-		if (content === "" && !attachment) return true;
+		if (content === "" && !attachment) return this.state.acceptUpdate(update.update_id);
 		const origin = telegramMessageOrigin(message);
 		await this.state.rememberOrigin(origin, origin.kind === "topic" ? message.message_thread_id : undefined);
 		const baseEngagement = engagementForMessage(message, origin, this.botUsername, this.botUserId);
@@ -822,31 +825,33 @@ export class TelegramAdapter {
 			try {
 				stored = await this.attachments.save(attachment, String(message.chat.id), message.message_id);
 				if (!stored) throw new Error("image attachment was not saved");
+				if (!("path" in stored) && stored.retryable) throw new TelegramAttachmentRetryableError();
 				const prepared = await prepareTelegramImage(stored);
 				if (prepared.images.length === 0) throw new Error("image preparation produced no images");
 				images = prepared.images;
 				imageNotice = prepared.notice;
-			} catch {
+			} catch (error) {
+				if (error instanceof TelegramAttachmentRetryableError) throw error;
 				// Telegram has no local allowlist that proves a failure notice is authorized.
 				// Do not dispatch a text-only turn or post into a chat the gateway may reject.
 				console.error(
 					`Telegram inbound image rejected message=${telegramInboundMessageId(message.chat.id, message.message_id)}.`,
 				);
-				return true;
+				return this.state.acceptUpdate(update.update_id);
 			}
 		} else if (attachment) {
 			stored = await this.attachments.save(attachment, String(message.chat.id), message.message_id);
+			if (!("path" in stored) && stored.retryable) throw new TelegramAttachmentRetryableError();
 		}
 		const body = describeInboundBody(content, attachment, stored, images !== undefined);
-		const imageContext = imageNotice ? `\n\nImage processing: ${imageNotice}` : "";
-		const accepted = await gateway.request<{ readonly engaged?: boolean }>("chat.send", {
+		const accepted = await gateway.request<ChatSendResult>("chat.send", {
 			origin,
-			text: `${body}${imageContext}`,
+			text: body,
 			engagement,
 			messageId: telegramInboundMessageId(message.chat.id, message.message_id),
 			...(images ? { images } : {}),
 		});
-		if (accepted?.engaged && imageNotice) {
+		if (accepted.engaged && accepted.turnId !== null && imageNotice) {
 			try {
 				for (const chunk of renderTelegramDelivery(`Image processing: ${imageNotice}`))
 					await sendTelegramHtml(this.replyBot, String(message.chat.id), chunk, message.message_thread_id);
@@ -856,7 +861,7 @@ export class TelegramAdapter {
 				);
 			}
 		}
-		return true;
+		return this.state.acceptUpdate(update.update_id);
 	}
 }
 

@@ -73,11 +73,12 @@ class Gateway implements GatewayClientLike {
 	readonly requests: { verb: string; params: unknown }[] = [];
 	readonly handlers = new Set<(message: ChatMessagePayload) => void>();
 	engaged = true;
+	turnId: string | null = "accepted-turn";
 	failure?: Error;
 	async request<T = unknown>(verb: string, params?: unknown): Promise<T> {
 		this.requests.push({ verb, params });
 		if (this.failure) throw this.failure;
-		return { engaged: this.engaged } as T;
+		return { engaged: this.engaged, turnId: this.engaged ? this.turnId : null } as T;
 	}
 	onChatMessage(handler: (message: ChatMessagePayload) => void) {
 		this.handlers.add(handler);
@@ -339,9 +340,7 @@ test("Slack forwards prepared native images and delivers resize notices only aft
 		expect(sends).toHaveLength(2);
 		expect(sends[0]?.images).toHaveLength(1);
 		expect(sends[1]?.images).toHaveLength(1);
-		expect(sends[0]?.text).toContain(
-			"[Image preparation notice: Images resized/compressed for model input; fine detail may be lost.]",
-		);
+		expect(sends[0]?.text).not.toContain("Image preparation notice");
 		expect(sends[0]?.text).not.toContain("files.slack.com");
 		expect(f.api.posts).toEqual([
 			[
@@ -359,6 +358,12 @@ test("Slack forwards prepared native images and delivers resize notices only aft
 			}),
 		});
 		expect(chatSends(f.client)).toHaveLength(2);
+		expect(f.api.posts).toHaveLength(1);
+		f.client.turnId = null;
+		await f.event({
+			...inbound({ ts: "1700000002.123456", thread_ts: "1699999999.000001", parent_user_id: "UBOT", files: [file] }),
+		});
+		expect(chatSends(f.client)).toHaveLength(3);
 		expect(f.api.posts).toHaveLength(1);
 	} finally {
 		f.socket.stop();

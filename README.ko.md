@@ -47,7 +47,7 @@ Discord / Telegram / Slack ──> gajaeway gateway ──> your persona (gjc)
 - 회신은 견고한 전달 기록으로 보호됩니다. 충돌 후 결과가 불확실한 전송은 다시 발행될 수 있습니다; 그럴 경우 조용히 그런 일이 없었던 척하는 대신 명확하게 중복으로 표시됩니다.
 - 대화와 유용한 모니터 출력은 소유권 `$GAJAEWAY_HOME/memory` 디렉토리 아래에 Markdown으로 캡처되며, 소유 스토어에 숨겨진 것이 아닙니다.
 
-Discord·Slack·Telegram의 정적 PNG/JPEG 첨부파일을 모델의 이미지 입력으로 직접 전달합니다. 이미지는 크기 조절과 JPEG 압축을 거치며 게이트웨이가 참여를 승인한 뒤 대화에 안내합니다. 작은 글자나 세부 묘사는 손실될 수 있습니다. 메시지당 최대 4개, 원본 파일당 20 MiB, 변환된 이미지 합계 96 KiB까지 지원합니다. 미지원 형식, 안전하지 않은 다운로드, 제한에 맞출 수 없는 이미지는 텍스트만 성공한 것처럼 전달하지 않고 거부합니다. 준비 실패는 민감 정보를 제외한 어댑터 진단 로그에 남기며, 게이트웨이가 권한을 확인하지 않은 대화에는 실패 안내를 게시하지 않습니다. 변환된 이미지는 수신 메시지와 함께 저장하므로 게이트웨이 재시작이나 진행 중인 다른 턴 때문에 사라지지 않습니다. 이미지 이해에는 비전 지원 모델이 필요합니다. 어댑터는 `chat.images` 기능을 요구하므로 이미지 데이터를 무시할 수 있는 구버전 게이트웨이에 연결하지 않습니다.
+Discord·Slack·Telegram의 정적 PNG/JPEG 첨부파일을 모델의 이미지 입력으로 전달합니다. 이미지는 크기 조절과 JPEG 압축을 거치므로 작은 글자나 세부 묘사는 손실될 수 있습니다. 메시지당 최대 4개, 원본 파일당 20 MiB, 16메가픽셀, 변환된 이미지 합계 96 KiB까지 지원합니다. GIF·WebP 등 네이티브 이미지 입력이 아닌 형식은 첨부파일 설명으로 보존하며, 캡션과 같은 메시지의 다른 파일도 유지합니다. 안전하지 않은 다운로드는 거부합니다. 지원되는 PNG/JPEG 준비가 실패해도 텍스트만 성공한 것으로 처리하지 않습니다. 민감 정보를 제외한 어댑터 진단 로그에 기록하며, 권한이 확인되지 않은 대화에는 안내를 게시하지 않습니다. 이미 승인된 프롬프트가 SDK 프레임 크기 제한을 초과한 경우에는 실패 안내를 보냅니다. 준비된 이미지와 플랫폼 중립 메타데이터는 수신 메시지와 함께 저장하며, 기록의 이미지 표식에는 원본 URL을 넣지 않습니다. 네이티브 이미지 데이터는 해당 메시지의 현재 턴에만 포함됩니다. 이미지 이해에는 비전 지원 모델이 필요합니다. 어댑터는 `chat.images`를 요구하므로 구버전 게이트웨이는 텍스트 메시지까지 포함해 새 어댑터의 연결을 거부합니다. 어댑터보다 게이트웨이를 먼저 업그레이드하고 `chat.images` 기능을 확인하세요.
 
 ## 패키지
 
@@ -58,12 +58,13 @@ Discord·Slack·Telegram의 정적 PNG/JPEG 첨부파일을 모델의 이미지 
 | [`@gajae-gateway/protocol`](packages/protocol) | 버전 NDJSON 프레임, 협상, 동사/이벤트 카탈로그, 정규 출처. |
 | [`@gajae-gateway/sdk`](packages/sdk) | 게이트웨이의 Unix 도메인 소켓 또는 stdio 전송을 위한 클라이언트. |
 | [`@gajae-gateway/cli`](packages/cli) | 게이트웨이 소켓 위의 소유자 명령. |
+| [`@gajae-gateway/images`](packages/images) | 제한된 이미지 다운로드·검증과 PNG/JPEG 준비. |
 | `@gajae-gateway/gateway` | 데몬: 구성, SQLite 상태, 세션, 전달, 기억, 모니터, 및 `gjc` 경계. |
 | `@gajae-gateway/adapter-discord` | Discord 수신 및 아웃바운드 전달, 입력 힌트 및 반응-그래디언트 존재 포함. |
 | `@gajae-gateway/adapter-telegram` | Telegram 수신 및 아웃바운드 전달. |
 | `@gajae-gateway/adapter-slack` | Socket Mode를 통한 Slack 수신, mrkdwn 전달, 반응, 반응-그래디언트 작업 존재, 선택적 라이브 회신, 및 놓친 메시지 복구. |
 
-`@gajae-gateway/protocol`, `@gajae-gateway/sdk`, 및 `@gajae-gateway/cli`는 `@gajae-gateway` 범위 아래에서 npm으로 게시 가능합니다 — 아래 [패키지 게시](#패키지-게시) 섹션을 참고하세요. 게이트웨이, 어댑터, 관리 콘솔, 및 `@gajae-gateway/subsession`은 개인 애플리케이션 코드로 유지되며 아래 컴파일된 바이너리로만 배송됩니다; `@gajae-gateway/conformance`는 개인, 미배송 CI/테스트 전용 패키지입니다.
+`@gajae-gateway/protocol`, `@gajae-gateway/images`, `@gajae-gateway/sdk`, 및 `@gajae-gateway/cli`는 `@gajae-gateway` 범위 아래에서 npm으로 게시 가능한 독립 패키지입니다 — 아래 [패키지 게시](#패키지-게시) 섹션을 참고하세요. 게이트웨이, 어댑터, 관리 콘솔, `home`, `log`, 및 `subsession`은 개인 애플리케이션 패키지로 남아 런타임 바이너리에 포함됩니다; `@gajae-gateway/conformance`는 개인 CI/테스트 전용 패키지입니다.
 
 메모리, 모니터, 및 게이트웨이가 어떻게 끝에서 끝까지 작동하는지는 [문서](docs/)를 참고하세요.
 
@@ -137,24 +138,26 @@ bun test packages # 전체 패키지 테스트 스위트를 실행합니다
 
 ### 패키지 게시
 
-`@gajae-gateway/protocol`, `@gajae-gateway/sdk`, 및 `@gajae-gateway/cli`는 `@gajae-gateway` 범위 아래에서 npm으로 게시 가능합니다 — 릴리스 워크플로우는 아래 [패키지 게시](#패키지-게시) 섹션을 참고하세요. 게이트웨이, 어댑터, 관리 콘솔, 및 `@gajae-gateway/subsession`은 개인 애플리케이션 코드로 유지되며 아래 컴파일된 바이너리로만 배송됩니다; `@gajae-gateway/conformance`는 개인, 미배송 CI/테스트 전용 패키지입니다.
+`@gajae-gateway/protocol`, `@gajae-gateway/images`, `@gajae-gateway/sdk`, 및 `@gajae-gateway/cli`는 `@gajae-gateway` 범위 아래에서 npm으로 게시 가능한 독립 패키지입니다 — 아래 [패키지 게시](#패키지-게시) 섹션을 참고하세요. 게이트웨이, 어댑터, 관리 콘솔, `home`, `log`, 및 `subsession`은 개인 애플리케이션 패키지로 남아 런타임 바이너리에 포함됩니다; `@gajae-gateway/conformance`는 개인 CI/테스트 전용 패키지입니다.
 
 각 패키지는 `src/`를 Bun으로 단일 Node-ESM 해석 가능한 `dist/*.js`에 번들하고, `tsc`(`emitDeclarationOnly`)로 `.d.ts` 선언을 내보내며, 게시가 항상 현재 컴파일된 출력을 배송하도록 하는 `prepublishOnly` 스크립트를 가집니다. 게시된 타볼은 `dist/` (비-Bun 소비자에 대해 `main`/`types`/기본 내보내기 조건으로 해석됨) 및 `src/` (설치된 Bun 소비자가 컴파일된 빌드 대신 소스를 직접 가져오도록 `bun` 내보내기 조건으로 해석됨)를 포함합니다. `@gajae-gateway/protocol`은 영 런타임 의존성을 가집니다. 패킹은 순수 npm이 아닌 Bun을 통해야 합니다: `npm pack --dry-run`은 패키지의 내용만 나열하며 의존성을 다시 쓰지 않습니다 — 패키지 디렉토리의 순수 `npm pack`/`npm publish`는 `workspace:*`를 패키징된 매니페스트에 남깁니다, 실제 npm 소비자는 해석할 수 없습니다. `bun pm pack`은 게시되는 각 패키지의 `@gajae-gateway/protocol`/`@gajae-gateway/sdk`에 대한 `workspace:*` 의존성을 패킹되는 정확한 버전으로 다시 씁니다, 레지스트리 유효 매니페스트를 생성합니다 — `bun pm pack`으로 패킹, 스크래치 프로젝트에 타볼 `npm install`, 및 설치된 패키지에 대해 실제 `node --input-type=module -e "import('@gajae-gateway/sdk')"` 실행으로 확인됩니다 (기록: [`artifacts/ultragoal-npm-clean-install-verification.txt`](artifacts/ultragoal-npm-clean-install-verification.txt)).
 
-`scripts/release-packages.ts`는 필요한 의존성 순서(`protocol` → `sdk` → `cli`, `sdk`와 `cli`는 먼저 게시된 버전에 의존하므로)로 전체 릴리스를 실행합니다:
+images 패키지는 Node용 ESM 번들, `.d.ts` 선언, `build`, `prepublishOnly`를 제공하며 protocol, `image-size`, `jimp`에 의존합니다.
+
+`scripts/release-packages.ts`는 의존성 순서(`protocol` → `images` → `sdk` → `cli`)로 릴리스를 진행합니다. images와 SDK는 protocol에 의존하고 CLI는 SDK에 의존합니다:
 
 ```sh
 bun run release:dry-run   # 각 패키지를 빌드한 다음 dist-packed/로 `bun pm pack`합니다 — 레지스트리를 건드리지 않습니다
 bun run release:publish   # 각 패키지를 빌드하고 패킹한 다음 해당 타볼을 `npm publish`합니다 (비-`latest` dist-tag에 대해 --tag <name> 추가)
 ```
 
-드라이 런에서 `dist-packed/*.tgz`를 검사한 다음 `release:publish`를 실행하세요. Bun은 워크스페이스 항목에서 다시 쓰인 버전을 `bun.lock`에서 가져오며, `package.json` 버전 범프 후 `bun install`은 새로 고치지 않습니다; 스크립트는 피어 패키지를 릴리스되는 버전 이외의 버전에 고정하는 타볼을 거부하므로 매니페스트와 함께 `bun.lock` 항목을 범프하세요. 업로드 자체는 npm CLI를 사용합니다, 신뢰할 수 있는 게시를 지원하는 것은 npm뿐이기 때문입니다. `@gajae-gateway/sdk`와 `@gajae-gateway/cli`는 `@gajae-gateway/protocol`/`@gajae-gateway/sdk`이 먼저 게시되어야 하므로 스크립트가 그 순서로 릴리스합니다. 각 패키지의 `publishConfig`는 범위 지정된 이름에 대한 공개 npm 접근을 설정합니다.
+드라이 런에서 `dist-packed/*.tgz`를 검사한 다음 `release:publish`를 실행하세요. Bun은 워크스페이스 항목에서 다시 쓰인 버전을 `bun.lock`에서 가져오며, `bun install`은 `package.json` 버전 범프 후 이를 갱신하지 않습니다. 스크립트는 잘못 고정된 의존성이 든 타볼을 거부하므로 매니페스트와 함께 `bun.lock` 항목도 갱신하세요. 업로드는 npm 신뢰 게시를 지원하는 npm CLI로 실행합니다. 각 패키지의 `publishConfig`는 공개 접근을 설정합니다.
 
 ### CI/CD
 
 [`build.yml`](.github/workflows/build.yml)은 모든 푸시 및 풀 요청에서 실행됩니다: Biome, `tsc --noEmit`, `bun test packages/`, 및 냉동 코퍼스 벤치마크 게이트, 각각 macOS arm64, Linux x64, 및 Linux arm64에 걸쳐.
 
-[`release.yml`](.github/workflows/release.yml)은 `v*.*.*` 태그 푸시 (또는 선택적 `npm_tag` 입력으로 수동 `workflow_dispatch` 통해, 비-`latest` dist-tag의 경우) 때 실행됩니다. 이는 먼저 전체 `verify` 매트릭스를 다시 실행하고, 녹색일 때만: 의존성 순서로 npm에 `@gajae-gateway/protocol`, `@gajae-gateway/sdk`, 및 `@gajae-gateway/cli`를 게시 (`bun run release:publish` 통해), 각 플랫폼에 대해 여섯 독립형 바이너리를 빌드하고 보관하고, 첨부된 보관 및 자동 생성 노트와 함께 GitHub 릴리스를 생성합니다. 게시는 토큰이 아닌 npm 신뢰 게시 (OIDC)를 사용합니다: 세 패키지 각각은 저장소 `Yeachan-Heo/gajae-way`와 워크플로우 `release.yml`에 대해 npmjs.com의 GitHub 액션 신뢰할 수 있는 게시자를 가지며, 작업은 `id-token: write`를 유지합니다. 게시는 GitHub 호스팅 러너에서만, `release.yml`에서만 작동합니다; 워크플로우 파일 이름 변경은 세 패키지 모두에서 신뢰할 수 있는 게시자를 업데이트해야 합니다.
+[`release.yml`](.github/workflows/release.yml)은 `v*.*.*` 태그 푸시 (또는 비-`latest` dist-tag를 위한 선택적 `npm_tag` 입력으로 수동 실행) 때 실행됩니다. `verify` 매트릭스가 통과하면 `bun run release:publish`로 네 패키지 `@gajae-gateway/protocol`, `@gajae-gateway/images`, `@gajae-gateway/sdk`, `@gajae-gateway/cli`를 의존성 순서대로 게시하고, 각 플랫폼의 여섯 독립형 바이너리를 빌드·보관한 뒤 GitHub 릴리스를 생성합니다. npm 신뢰 게시(OIDC)를 사용하며 토큰은 사용하지 않습니다. 게시 전에 네 패키지마다 저장소 `Yeachan-Heo/gajae-way`와 워크플로우 `release.yml`에 맞는 GitHub Actions 신뢰 게시자가 npmjs.com에 설정되어야 합니다. 특히 images 게시자는 코드가 설정해 주지 않으므로 첫 게시 전에 npm에서 직접 설정해야 합니다. 게시는 GitHub 호스팅 러너에서만 동작하며, 워크플로우 파일 이름을 바꾸면 네 패키지 모두의 신뢰 게시자 설정도 갱신해야 합니다.
 
 ## 라이선스
 

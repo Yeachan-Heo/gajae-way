@@ -1336,8 +1336,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			// A voice message carries no text at all, so without a transcript the
 			// history shows a url and nothing about what was said. Doing this in the
 			// runtime rather than the persona is a standing owner instruction.
-			const imageContext = preparedImages.notice ? `\n\nImage processing: ${preparedImages.notice}` : "";
-			const body = `${withTranscript(rendered, await transcribeIfVoice(message, config.voice))}${imageContext}`;
+			const body = withTranscript(rendered, await transcribeIfVoice(message, config.voice));
 			// The modality of the question decides the modality of the answer: a
 			// spoken message is answered in voice and text both, without the
 			// persona having to ask for it.
@@ -1356,7 +1355,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 				messageChannelId,
 				preparedImages.images,
 			);
-			if (accepted?.engaged && preparedImages.notice)
+			if (accepted?.engaged && accepted.turnId != null && preparedImages.notice)
 				await sendDiscordInboundNotice(message, `Image processing: ${preparedImages.notice}`);
 		});
 	});
@@ -1603,7 +1602,7 @@ export async function handleSlashCommand(
 
 /** Outcome of one recovery send; every failure carries its classification. */
 export type RecoveredSendResult =
-	| { readonly verdict: "acked"; readonly engaged?: boolean }
+	| { readonly verdict: "acked"; readonly engaged?: boolean; readonly turnId?: string | null }
 	| { readonly verdict: "duplicate" }
 	| { readonly verdict: "unavailable"; readonly failure: RecoveryFailureClass; readonly summary: string };
 
@@ -1872,7 +1871,6 @@ export class ReconnectingGateway {
 							);
 						}
 					}
-					const imageContext = preparedImages?.notice ? `\n\nImage processing: ${preparedImages.notice}` : "";
 					const result = imageFailure
 						? {
 								verdict: "unavailable" as const,
@@ -1880,16 +1878,10 @@ export class ReconnectingGateway {
 									imageFailure.disposition === "terminal" ? ("terminal-message" as const) : ("retryable" as const),
 								summary: imageFailure.disposition === "terminal" ? "image input rejected" : "image download failed",
 							}
-						: await this.requestRecovered(
-								message.id,
-								origin,
-								`${text}${imageContext}`,
-								engagement,
-								preparedImages?.images,
-							);
+						: await this.requestRecovered(message.id, origin, text, engagement, preparedImages?.images);
 					if (result.verdict !== "unavailable") {
 						this.forgetAttempts(message.id);
-						if (result.verdict === "acked" && result.engaged && preparedImages?.notice)
+						if (result.verdict === "acked" && result.engaged && result.turnId != null && preparedImages?.notice)
 							await sendDiscordInboundNotice(message, `Image processing: ${preparedImages.notice}`);
 						return result.verdict;
 					}
@@ -2285,12 +2277,12 @@ export class ReconnectingGateway {
 		 */
 		messageChannelId?: string,
 		images?: readonly PromptImage[],
-	): Promise<{ engaged?: boolean } | undefined> {
+	): Promise<{ engaged?: boolean; turnId?: string | null } | undefined> {
 		if (origin.platform === "discord" && origin.kind === "dm") {
 			await this.ensureCursors();
 			if (this.#cursors) this.persist(rememberKnownDm(this.#cursors, origin.conversationId, Date.now()));
 		}
-		let result: { engaged?: boolean } | undefined;
+		let result: { engaged?: boolean; turnId?: string | null } | undefined;
 		const verdict = await this.#inbound.join(messageId, async () => {
 			const client = this.#client;
 			if (!client) {
@@ -2300,7 +2292,7 @@ export class ReconnectingGateway {
 			try {
 				// The gateway acknowledges engagement before running the turn, so typing starts only for
 				// turns that will actually produce a reply and never outlives the delivery that clears it.
-				result = await client.request<{ engaged?: boolean }>("chat.send", {
+				result = await client.request<{ engaged?: boolean; turnId?: string | null }>("chat.send", {
 					origin,
 					text,
 					engagement,
@@ -2352,7 +2344,7 @@ export class ReconnectingGateway {
 	): Promise<RecoveredSendResult> {
 		let failure: RecoveryFailureClass | undefined;
 		let summary: string | undefined;
-		let response: { engaged?: boolean } | undefined;
+		let response: { engaged?: boolean; turnId?: string | null } | undefined;
 		const verdict = await this.#inbound.join(messageId, async () => {
 			const client = this.#client;
 			if (!client) {
@@ -2361,7 +2353,7 @@ export class ReconnectingGateway {
 				return "unavailable";
 			}
 			try {
-				response = await client.request<{ engaged?: boolean }>("chat.send", {
+				response = await client.request<{ engaged?: boolean; turnId?: string | null }>("chat.send", {
 					origin,
 					text,
 					engagement,
@@ -2375,7 +2367,12 @@ export class ReconnectingGateway {
 				return "unavailable";
 			}
 		});
-		if (verdict === "acked") return { verdict, ...(response?.engaged ? { engaged: true } : {}) };
+		if (verdict === "acked")
+			return {
+				verdict,
+				...(response?.engaged ? { engaged: true } : {}),
+				...(response?.turnId !== undefined ? { turnId: response.turnId } : {}),
+			};
 		if (verdict === "duplicate") return { verdict };
 		return {
 			verdict,

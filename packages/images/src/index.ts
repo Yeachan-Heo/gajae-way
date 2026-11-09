@@ -245,17 +245,29 @@ export interface DownloadPromptImageOptions {
 	readonly allowedHosts: readonly string[];
 	readonly headers?: Readonly<Record<string, string>>;
 	readonly fetch?: ImageFetch;
+	/** Explicit manual redirect allowlist. Redirects are limited to three hops. */
+	readonly redirectPolicy?: { readonly allowedHosts: readonly string[] };
 }
 
-function validateImageUrl(value: string, allowedHosts: readonly string[]): URL {
-	const authority = /^https:\/\/([^/?#]*)/i.exec(value)?.[1];
-	if (!authority || authority.includes(":") || authority.includes("@") || !/^[A-Za-z0-9.-]+$/.test(authority)) {
+const MAX_IMAGE_REDIRECTS = 3;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+function validateImageUrl(value: string, allowedHosts: readonly string[], base?: URL): URL {
+	const hasScheme = /^[A-Za-z][A-Za-z0-9+.-]*:/.test(value);
+	const authority = /^https:\/\/([^/?#]*)/i.exec(value)?.[1] ?? /^\/\/([^/?#]*)/.exec(value)?.[1];
+	if (
+		value.includes("#") ||
+		(!base && !/^https:\/\//i.test(value)) ||
+		(base && hasScheme && !/^https:\/\//i.test(value)) ||
+		(authority !== undefined &&
+			(authority === "" || authority.includes(":") || authority.includes("@") || !/^[A-Za-z0-9.-]+$/.test(authority)))
+	) {
 		throw new PromptImageDownloadError(false, URL_NOT_ALLOWED);
 	}
 
 	let url: URL;
 	try {
-		url = new URL(value);
+		url = base ? new URL(value, base) : new URL(value);
 	} catch {
 		throw new PromptImageDownloadError(false, URL_NOT_ALLOWED);
 	}
@@ -272,6 +284,28 @@ function validateImageUrl(value: string, allowedHosts: readonly string[]): URL {
 	return url;
 }
 
+function headersForImageRequest(headers: Readonly<Record<string, string>> | undefined, url: URL, initialHost: string) {
+	if (!headers) return undefined;
+	const result = new Headers(headers);
+	if (url.hostname !== initialHost) {
+		result.delete("authorization");
+		result.delete("proxy-authorization");
+		result.delete("cookie");
+		result.delete("cookie2");
+	}
+	return result;
+}
+
+function isHtmlResponse(response: Response): boolean {
+	const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+	return contentType === "text/html" || contentType === "application/xhtml+xml";
+}
+
+function looksLikeHtml(bytes: Uint8Array): boolean {
+	const prefix = new TextDecoder().decode(bytes.subarray(0, Math.min(bytes.length, 512)));
+	return /^\uFEFF?\s*(?:<!doctype\s+html\b|<html\b|<head\b|<body\b)/i.test(prefix);
+}
+
 async function cancelResponse(response: Response): Promise<void> {
 	try {
 		await response.body?.cancel();
@@ -283,59 +317,92 @@ async function cancelResponse(response: Response): Promise<void> {
 /** Download a bounded image from an explicitly trusted HTTPS host. */
 export async function downloadPromptImage(url: string, options: DownloadPromptImageOptions): Promise<Uint8Array> {
 	const trustedUrl = validateImageUrl(url, options.allowedHosts);
+	if (
+		options.redirectPolicy &&
+		!options.redirectPolicy.allowedHosts.some((host) => host.toLowerCase() === trustedUrl.hostname)
+	) {
+		throw new PromptImageDownloadError(false, URL_NOT_ALLOWED);
+	}
 	const fetcher = options.fetch ?? fetch;
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), 30_000);
 
 	try {
-		const response = await fetcher(trustedUrl, {
-			method: "GET",
-			headers: options.headers,
-			redirect: "error",
-			signal: controller.signal,
-		});
-		if (!response.ok) {
-			await cancelResponse(response);
-			throw new PromptImageDownloadError(response.status >= 500 || response.status === 408 || response.status === 429);
-		}
-		const contentLength = Number(response.headers.get("content-length"));
-		if (Number.isFinite(contentLength) && contentLength > MAX_SOURCE_IMAGE_BYTES) {
-			await cancelResponse(response);
-			throw new PromptImageDownloadError(false);
-		}
-		if (!response.body) throw new PromptImageDownloadError(false);
-
-		const reader = response.body.getReader();
-		const chunks: Uint8Array[] = [];
-		let totalBytes = 0;
-		try {
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
-				totalBytes += value.length;
-				if (totalBytes > MAX_SOURCE_IMAGE_BYTES) {
-					throw new PromptImageDownloadError(false);
-				}
-				chunks.push(value);
+		let currentUrl = trustedUrl;
+		let redirects = 0;
+		const visited = new Set([currentUrl.href]);
+		while (true) {
+			const response = await fetcher(currentUrl, {
+				method: "GET",
+				headers: headersForImageRequest(options.headers, currentUrl, trustedUrl.hostname),
+				redirect: options.redirectPolicy ? "manual" : "error",
+				signal: controller.signal,
+			});
+			if (response.redirected) {
+				await cancelResponse(response);
+				throw new PromptImageDownloadError(false);
 			}
-		} catch (error) {
+			if (options.redirectPolicy && REDIRECT_STATUSES.has(response.status)) {
+				const location = response.headers.get("location");
+				await cancelResponse(response);
+				if (!location || redirects >= MAX_IMAGE_REDIRECTS) throw new PromptImageDownloadError(false);
+				const nextUrl = validateImageUrl(location, options.redirectPolicy.allowedHosts, currentUrl);
+				if (visited.has(nextUrl.href)) throw new PromptImageDownloadError(false, URL_NOT_ALLOWED);
+				visited.add(nextUrl.href);
+				currentUrl = nextUrl;
+				redirects += 1;
+				continue;
+			}
+			if (!response.ok) {
+				await cancelResponse(response);
+				throw new PromptImageDownloadError(
+					response.status >= 500 || response.status === 408 || response.status === 429,
+				);
+			}
+			if (isHtmlResponse(response)) {
+				await cancelResponse(response);
+				throw new PromptImageDownloadError(false);
+			}
+			const contentLength = Number(response.headers.get("content-length"));
+			if (Number.isFinite(contentLength) && contentLength > MAX_SOURCE_IMAGE_BYTES) {
+				await cancelResponse(response);
+				throw new PromptImageDownloadError(false);
+			}
+			if (!response.body) throw new PromptImageDownloadError(false);
+
+			const reader = response.body.getReader();
+			const chunks: Uint8Array[] = [];
+			let totalBytes = 0;
 			try {
-				await reader.cancel();
-			} catch {
-				// Cancellation is best effort after a failed or aborted read.
+				while (true) {
+					const { done, value } = await reader.read();
+					if (done) break;
+					totalBytes += value.length;
+					if (totalBytes > MAX_SOURCE_IMAGE_BYTES) {
+						throw new PromptImageDownloadError(false);
+					}
+					chunks.push(value);
+				}
+			} catch (error) {
+				try {
+					await reader.cancel();
+				} catch {
+					// Cancellation is best effort after a failed or aborted read.
+				}
+				throw error;
+			} finally {
+				reader.releaseLock();
 			}
-			throw error;
-		} finally {
-			reader.releaseLock();
-		}
 
-		const result = new Uint8Array(totalBytes);
-		let offset = 0;
-		for (const chunk of chunks) {
-			result.set(chunk, offset);
-			offset += chunk.length;
+			const result = new Uint8Array(totalBytes);
+			let offset = 0;
+			for (const chunk of chunks) {
+				result.set(chunk, offset);
+				offset += chunk.length;
+			}
+			if (looksLikeHtml(result)) throw new PromptImageDownloadError(false);
+			return result;
 		}
-		return result;
 	} catch (error) {
 		throw error instanceof PromptImageDownloadError ? error : new PromptImageDownloadError(true);
 	} finally {

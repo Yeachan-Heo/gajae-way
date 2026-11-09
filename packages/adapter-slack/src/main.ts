@@ -336,10 +336,6 @@ async function sendSlackImageNotice(
 	}
 }
 
-function includeImageNotice(text: string, notice: string): string {
-	return notice === "" ? text : `${text}\n\n[Image preparation notice: ${notice}]`;
-}
-
 export async function settleSlackDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	api: Pick<SlackWebApi, "postMessage" | "addReaction" | "removeReaction"> & Partial<Pick<SlackWebApi, "uploadFile">>,
@@ -727,7 +723,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 		engagement: EngagementContext,
 		receivedAt?: string,
 		images?: readonly PromptImage[],
-	): Promise<{ engaged?: boolean } | undefined> {
+	): Promise<{ engaged?: boolean; turnId?: string | null } | undefined> {
 		const sent = await this.requestRecovered(messageId, origin, text, engagement, receivedAt, images);
 		return sent.verdict === "acked" ? sent.result : undefined;
 	}
@@ -758,7 +754,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 		if (this.#inbound.has(messageId)) return { verdict: "duplicate" };
 		const attempt = (async (): Promise<RecoveredSend> => {
 			try {
-				const result = await this.request<{ engaged?: boolean } | undefined>("chat.send", {
+				const result = await this.request<{ engaged?: boolean; turnId?: string | null } | undefined>("chat.send", {
 					origin,
 					text,
 					messageId,
@@ -1077,14 +1073,15 @@ export async function startSlackAdapter(
 				const result = await gateway.requestInbound(
 					slackMessageId(message.channel, message.ts),
 					origin,
-					includeImageNotice(text, prepared.notice),
+					text,
 					engagement,
 					timestamp(message.ts),
 					prepared.images,
 				);
 				if (result?.engaged) {
 					await rememberThread(origin);
-					await sendSlackImageNotice(api, origin, prepared.notice, log, engagement.replyTo?.messageId);
+					if (typeof result.turnId === "string")
+						await sendSlackImageNotice(api, origin, prepared.notice, log, engagement.replyTo?.messageId);
 				}
 			});
 		} else if (event.type === "reaction_added" || event.type === "reaction_removed") {
@@ -1190,7 +1187,7 @@ export async function startSlackAdapter(
 			const sent = await gateway.requestRecovered(
 				messageId,
 				admitted.origin,
-				includeImageNotice(text, prepared.notice),
+				text,
 				stale ? { ...engagement, contextOnly: true } : engagement,
 				timestamp(message.ts),
 				prepared.images,
@@ -1211,7 +1208,7 @@ export async function startSlackAdapter(
 				if (!isWithinGrace) await mutate((state) => clearAttempt(state, messageId));
 				if (sent.verdict === "acked" && sent.result?.engaged) {
 					await rememberThread(admitted.origin);
-					if (!stale)
+					if (!stale && typeof sent.result.turnId === "string")
 						await sendSlackImageNotice(api, admitted.origin, prepared.notice, log, engagement.replyTo?.messageId);
 				}
 				return sent.verdict;
@@ -1566,7 +1563,7 @@ export function slashCommandAck(command: string, sent: Pick<RecoveredSend, "verd
 /** Outcome of one gateway send, classified for recovery; `failure` carries the raw error for classification. */
 export interface RecoveredSend {
 	readonly verdict: RecoveryDelivery;
-	readonly result?: { engaged?: boolean };
+	readonly result?: { engaged?: boolean; turnId?: string | null };
 	readonly failure?: unknown;
 }
 

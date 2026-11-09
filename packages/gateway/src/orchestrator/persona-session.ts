@@ -48,6 +48,8 @@ import {
 import {
 	deterministicInterimDeliveryId,
 	isRelayTransportFailure,
+	MAX_RELAY_REQUEST_FRAME_BYTES,
+	RelayPayloadTooLargeError,
 	TailCapacityError,
 	type TailFrame,
 	type TailHandle,
@@ -96,7 +98,17 @@ const SUBMISSION_RETRY_DELAY_MS = 3_000;
 const STEER_REPLAY_ATTEMPTS = 2;
 /** Bind failures back off exponentially from DISPATCH_FAILURE_RETRY_MS up to this ceiling. */
 const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
-/** Identical bind failures before the broker's own discovery file is judged. */
+const LOCAL_PREFLIGHT_REJECTION_PREFIX = "persona-local-preflight-rejection:";
+const PROMPT_TOO_LARGE_CODE = "prompt_too_large";
+
+function localPreflightRejectionKey(opRef: string): string {
+	return `${LOCAL_PREFLIGHT_REJECTION_PREFIX}${opRef}`;
+}
+
+function localPreflightRejection(store: Store, opRef: string): string | undefined {
+	const code = store.core.metaGet(localPreflightRejectionKey(opRef));
+	return code === PROMPT_TOO_LARGE_CODE ? code : undefined;
+}
 
 function freshTurnMetaKey(originKey: string, epoch: number, triggerMessageId: string): string {
 	return `fresh_turn_attempt:${originKey}:${epoch}:${triggerMessageId}`;
@@ -1679,6 +1691,51 @@ class OriginActor {
 		return true;
 	}
 
+	async #settleLocalPreflightRejection(bound: BoundTurn, code: string): Promise<void> {
+		if (code !== PROMPT_TOO_LARGE_CODE) return;
+		const opRef = bound.turn.opRef;
+		const key = localPreflightRejectionKey(opRef);
+		if (localPreflightRejection(this.#manager.database, opRef) !== code) return;
+		const message = `the prompt exceeded the ${MAX_RELAY_REQUEST_FRAME_BYTES}-byte request limit before it was sent; reduce the text or number of images and send again`;
+		const error = new GjcRuntimeError(`${code}: ${message}`, { code, message });
+		this.#manager.log(
+			`persona_send_preflight_rejected origin=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} opRef=${opRef} reason=${code}`,
+			"warn",
+		);
+		bound.tail?.setTurnRunning(false);
+		try {
+			await bound.tail?.close();
+		} catch (closeError) {
+			this.#manager.log(
+				`send_preflight_tail_close_failed origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(closeError)}`,
+				"warn",
+			);
+		}
+		bound.tail = undefined;
+		if (!bound.retired || bound.answerWanted) {
+			try {
+				await bound.lifecycle.onFailure?.({ ...bound, error, forceFailureNotice: true });
+			} catch (noticeError) {
+				this.#manager.log(
+					`send_preflight_failure_notice_failed origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(noticeError)}`,
+					"error",
+				);
+				this.#scheduleStatusRecheck(bound);
+				throw noticeError;
+			}
+		}
+		const unlinkedReason: TerminalUnlinkedReason = bound.retired && !bound.answerWanted ? "retired" : "turn_failed";
+		const completed = this.#manager.database.transaction((tx) => {
+			const changed = completeInboundTurn(this.#manager.database, tx, opRef, unlinkedReason);
+			if (changed === 1 || this.#manager.database.inbox.turnRow(opRef)?.turn_state === "done")
+				this.#manager.database.core.metaDelete(key);
+			return changed;
+		});
+		await this.#notifySettled(bound);
+		if (completed > 0 || this.#manager.database.inbox.turnRow(opRef)?.turn_state === "done")
+			await this.#settleAfterTerminal(bound);
+	}
+
 	/**
 	 * Why a bound trigger provably never reached the host (#685): no durable send
 	 * intent was stamped before `port.send`, or the port holds an authenticated
@@ -1928,6 +1985,22 @@ class OriginActor {
 		if (this.#quarantinedTurn(turn.opRef)) return;
 		const currentEpoch = this.#epoch();
 		const retired = turn.epoch < currentEpoch;
+		const localRejection = localPreflightRejection(this.#manager.database, turn.opRef);
+		if (localRejection) {
+			const sessionId = turn.sessionId;
+			if (!sessionId) {
+				this.#manager.log(
+					`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=local_preflight_session_unavailable`,
+					"warn",
+				);
+				return;
+			}
+			// The durable gateway-side rejection is authoritative for this op-ref;
+			// recovery must not ask the broker about a prompt that was never issued.
+			const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, true);
+			await this.#settleLocalPreflightRejection(bound, localRejection);
+			return;
+		}
 		if (turn.state === "bound" && this.#releaseUnadmittedTurn(turn, retired, "recovery")) return;
 		const sessionId = turn.sessionId;
 		if (!sessionId) {
@@ -2706,6 +2779,15 @@ class OriginActor {
 			this.#bindEpochPoisoned = false;
 			this.#clearBindWedgeProbe();
 		} catch (error) {
+			if (error instanceof RelayPayloadTooLargeError) {
+				// The serializer's typed rejection proves this prompt was not written.
+				// Persist the local decision under the original op-ref so a restart can
+				// deliver its failure instead of interpreting unknown broker status as
+				// an ambiguous accepted prompt.
+				this.#manager.database.core.metaSet(localPreflightRejectionKey(opRef), PROMPT_TOO_LARGE_CODE);
+				await this.#settleLocalPreflightRejection(current, PROMPT_TOO_LARGE_CODE);
+				return;
+			}
 			if (error instanceof ModelNotSelectedError && error.opRef === opRef) {
 				const refusal = new GjcRuntimeError(
 					"model_not_selected: request was not admitted because no model is selected",
@@ -2880,6 +2962,7 @@ class OriginActor {
 	#preSendFailures = 0;
 	/** A terminal_uncertain bind poisons this epoch's idempotency key; retries cannot make that key decidable. */
 	#bindEpochPoisoned = false;
+	/** Identical bind failures before the broker's own discovery file is judged. */
 	#sameDetailBindFailures = 0;
 	#lastBindDetail: string | undefined;
 	#bindHoldProbed = false;
@@ -4137,6 +4220,11 @@ class OriginActor {
 	async #reconcileBound(bound: BoundTurn, knownReport?: StatusReport): Promise<void> {
 		if (this.#stopped || this.#manager.stopped) return;
 		if (this.#quarantinedTurn(bound.turn.opRef)) return;
+		const localRejection = localPreflightRejection(this.#manager.database, bound.turn.opRef);
+		if (localRejection) {
+			await this.#settleLocalPreflightRejection(bound, localRejection);
+			return;
+		}
 		bound.stallHostTerminated = confirmedStalledExit(this.#manager.database, {
 			opRef: bound.turn.opRef,
 			originKey: this.originKey,

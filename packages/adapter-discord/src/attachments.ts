@@ -78,17 +78,22 @@ const DEFAULT_IMAGE_PREPARATION_PORTS: DiscordImagePreparationPorts = {
 	prepare: preparePromptImages,
 };
 
-/** Attachments whose declared MIME type identifies them as images. */
+/** All image attachments, including formats that are not accepted as native prompt inputs. */
 export function selectImageAttachments(message: AttachmentCarrier): AttachmentLike[] {
 	return collectAttachments(message).filter(isImageAttachment);
 }
 
-/** Prepare Discord image attachments for a native prompt, never fetching non-image attachments. */
+/** PNG/JPEG attachments accepted as native prompt inputs, never fetching other formats. */
+export function selectNativeImageAttachments(message: AttachmentCarrier): AttachmentLike[] {
+	return collectAttachments(message).filter(isNativeImageAttachment);
+}
+
+/** Prepare supported Discord image attachments for a native prompt. */
 export async function prepareDiscordImages(
 	message: AttachmentCarrier,
 	ports: DiscordImagePreparationPorts = DEFAULT_IMAGE_PREPARATION_PORTS,
 ): Promise<{ readonly images: PromptImage[]; readonly notice: string }> {
-	const attachments = selectImageAttachments(message);
+	const attachments = selectNativeImageAttachments(message);
 	if (attachments.length === 0) return { images: [], notice: "" };
 	if (attachments.length > 4)
 		throw new DiscordImagePreparationError("terminal", "Discord messages support at most 4 images.");
@@ -122,7 +127,23 @@ async function downloadDiscordImage(url: string, ports: DiscordImagePreparationP
 }
 
 function isImageAttachment(attachment: AttachmentLike): boolean {
-	return nonBlank(attachment.contentType)?.trim().toLowerCase().startsWith("image/") ?? false;
+	const contentType = normalizedContentType(attachment);
+	return contentType ? contentType.startsWith("image/") : hasImageFilename(attachment);
+}
+
+function isNativeImageAttachment(attachment: AttachmentLike): boolean {
+	const contentType = normalizedContentType(attachment);
+	if (contentType) return contentType === "image/png" || contentType === "image/jpeg";
+	return /\.(?:png|jpe?g)$/i.test(nonBlank(attachment.name) ?? "");
+}
+
+function normalizedContentType(attachment: AttachmentLike): string | undefined {
+	const contentType = nonBlank(attachment.contentType);
+	return contentType?.split(";", 1)[0]?.trim().toLowerCase();
+}
+
+function hasImageFilename(attachment: AttachmentLike): boolean {
+	return /\.(?:apng|avif|bmp|gif|heic|heif|jpe?g|png|svg|tiff?|webp)$/i.test(nonBlank(attachment.name) ?? "");
 }
 
 /** A voice message is the one attachment kind that carries duration and waveform. */
@@ -164,9 +185,9 @@ export function describeAttachment(attachment: AttachmentLike): string {
 	}
 	const size = formatSize(attachment.size);
 	if (size) parts.push(size);
-	// Image bytes are sent natively; exposing their signed CDN URL in prompt text
-	// would be both misleading and an unnecessary credential leak.
-	if (url && !isImageAttachment(attachment)) parts.push(url);
+	// Native PNG/JPEG bytes are sent separately. Keep links to other image formats
+	// visible because they remain ordinary text attachments rather than prompt images.
+	if (url && !isNativeImageAttachment(attachment)) parts.push(url);
 	return `[${parts.join(" · ")}]`;
 }
 
@@ -204,8 +225,8 @@ export function collectAttachments(message: AttachmentCarrier): AttachmentLike[]
 }
 
 function attachmentKind(attachment: AttachmentLike): string {
-	const contentType = nonBlank(attachment.contentType)?.trim().toLowerCase() ?? "";
-	if (contentType.startsWith("image/")) return "image";
+	const contentType = normalizedContentType(attachment) ?? "";
+	if (isImageAttachment(attachment)) return "image";
 	if (contentType.startsWith("video/")) return "video";
 	if (contentType.startsWith("audio/")) return "audio";
 	return "file";

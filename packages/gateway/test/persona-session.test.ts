@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { PromptImage } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import {
 	AGENT_RUN_GRACE_MS,
@@ -23,7 +24,12 @@ import {
 	type SessionCompactionStatus,
 	type SessionContextUsage,
 } from "../src/orchestrator/session-port";
-import type { TailAttachInput, TailFrame } from "../src/orchestrator/tail-runner";
+import {
+	RelayPayloadTooLargeError,
+	serializeRelayRequestFrame,
+	type TailAttachInput,
+	type TailFrame,
+} from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, Store } from "../src/store";
 import { BROKER_PROMPT_BUSY_REFUSAL } from "../src/store/groups/bindings";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
@@ -112,6 +118,7 @@ async function harness(
 		failure?: (message: string, forceFailureNotice?: boolean) => void;
 		failureError?: (error: Error) => void;
 		modelRefusal?: (input: PersonaFailureInput) => void;
+		imagesFor?: (triggerMessageId: string) => readonly PromptImage[] | undefined;
 		onFrame?: (frame: TailFrame) => boolean | void;
 		contextMessageIds?: readonly string[];
 	} = {},
@@ -142,8 +149,10 @@ async function harness(
 		...extra,
 		onTurnStart: ({ trigger, turn }) => {
 			latestOpRef = turn.opRef;
+			const images = hooks.imagesFor?.(trigger.message_id);
 			return {
 				text: trigger.body,
+				...(images ? { images } : {}),
 				...(hooks.contextMessageIds ? { contextMessageIds: new Set(hooks.contextMessageIds) } : {}),
 				...(hooks.onFrame ? { onFrame: (input) => hooks.onFrame?.(input.frame) } : {}),
 				onTerminal: ({ text, alreadyPosted }) => hooks.terminal?.(text, alreadyPosted),
@@ -453,6 +462,72 @@ test("actor immediately dispatches durable inbound with one deterministic caller
 	await eventually(() => terminal.length === 2, "reused session turn did not complete");
 	expect(port.sends).toHaveLength(2);
 	expect(sessionCreateSuccesses).toHaveLength(2);
+});
+
+test("oversized text plus images is a local terminal failure and does not hold an unknown-status live host", async () => {
+	class PayloadLimitSessionPort extends ScriptedSessionPort {
+		readonly oversizedAttempts: Array<Parameters<ScriptedSessionPort["send"]>[0]> = [];
+
+		override async send(input: Parameters<ScriptedSessionPort["send"]>[0]) {
+			try {
+				serializeRelayRequestFrame(input.sessionId, {
+					type: "control_request",
+					id: "",
+					connectionId: "",
+					operation: "turn.prompt",
+					input: {
+						text: input.text,
+						clientRef: input.opRef,
+						...(input.images?.length ? { images: input.images } : {}),
+					},
+					confirm: false,
+				});
+			} catch (error) {
+				if (error instanceof RelayPayloadTooLargeError) this.oversizedAttempts.push(input);
+				throw error;
+			}
+			return await super.send(input);
+		}
+	}
+	const port = new PayloadLimitSessionPort();
+	const notices: string[] = [];
+	const logs: string[] = [];
+	await harness(
+		port,
+		{
+			failureError: (error) => notices.push(formatFailureNotice(error)),
+			imagesFor: (messageId) =>
+				messageId === "oversized" ? [{ data: "AQ==".repeat(20_000), mimeType: "image/jpeg" }] : undefined,
+		},
+		(line) => logs.push(line),
+	);
+	enqueue("oversized", "x".repeat(220_000));
+	enqueue("after-oversized", "next pending message");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "the pending message after the local rejection did not dispatch");
+	const rejected = port.oversizedAttempts[0]!;
+	const rejectedOpRef = rejected.opRef;
+	expect(rejected.text).toBe("x".repeat(220_000));
+	expect(rejected.images?.length).toBe(1);
+	expect((await port.liveness({ sessionId: rejected.sessionId, repo: rejected.repo })).live).toBe(true);
+	expect(port.statusReads).toEqual([]);
+	expect(port.sends.map((send) => send.text)).toEqual(["next pending message"]);
+	expect(port.sends.map((send) => send.opRef)).not.toContain(rejectedOpRef);
+	expect(database!.inbox.turnRow(rejectedOpRef)).toMatchObject({
+		state: "done",
+		turn_state: "done",
+		terminal_delivery_id: JSON.stringify({ none: "turn_failed" }),
+	});
+	expect(database!.core.metaGet(`persona-local-preflight-rejection:${rejectedOpRef}`)).toBeUndefined();
+	expect(notices).toHaveLength(1);
+	expect(notices[0]).toContain("prompt_too_large");
+	expect(notices[0]).toContain("before it was sent");
+	expect(notices[0]).toContain("reduce the text or number of images");
+	expect(logs.some((line) => line.includes(`persona_send_preflight_rejected`) && line.includes(rejectedOpRef))).toBe(
+		true,
+	);
+	port.complete(port.sends[0]!.opRef, "next reply");
+	await manager!.tick(KEY);
 });
 
 for (const outcome of ["complete", "incomplete", "in_flight"] as const)
@@ -3552,7 +3627,7 @@ test("a stalled turn with a reply ending in stopReason stop does not post a fail
 
 	// Trigger stall without emitting agent_end
 	port.setActivity(send.sessionId, "tool", clock.now);
-	let statusReads = port.statusReads.length;
+	const statusReads = port.statusReads.length;
 	port.emitStall(send.sessionId);
 	await eventually(() => port.statusReads.length > statusReads, "stall did not check operation status");
 
@@ -3589,7 +3664,7 @@ test("a stalled turn with interim speech still posts a failure notice", async ()
 
 	// Trigger stall without emitting agent_end
 	port.setActivity(send.sessionId, "tool", clock.now);
-	let statusReads = port.statusReads.length;
+	const statusReads = port.statusReads.length;
 	port.emitStall(send.sessionId);
 	await eventually(() => port.statusReads.length > statusReads, "stall did not check operation status");
 
@@ -3627,7 +3702,7 @@ test("a stalled turn with a reply ending in stopReason error still posts a failu
 
 	// Trigger stall without emitting agent_end
 	port.setActivity(send.sessionId, "tool", clock.now);
-	let statusReads = port.statusReads.length;
+	const statusReads = port.statusReads.length;
 	port.emitStall(send.sessionId);
 	await eventually(() => port.statusReads.length > statusReads, "stall did not check operation status");
 

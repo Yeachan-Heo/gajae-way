@@ -213,8 +213,9 @@ export const MAX_RELAY_REQUEST_FRAME_BYTES = 262_144;
 /** Serializes one SDK request and rejects it before any stream write if it exceeds the wire limit. */
 export function serializeRelayRequestFrame(sessionId: string, frame: Record<string, unknown>): string {
 	const serialized = JSON.stringify(frame);
-	if (Buffer.byteLength(serialized, "utf8") > MAX_RELAY_REQUEST_FRAME_BYTES)
-		throw new RelayClosedError(sessionId, `request frame exceeds ${MAX_RELAY_REQUEST_FRAME_BYTES}-byte limit`, false);
+	const frameBytes = Buffer.byteLength(serialized, "utf8");
+	if (frameBytes > MAX_RELAY_REQUEST_FRAME_BYTES)
+		throw new RelayPayloadTooLargeError(sessionId, frameBytes, MAX_RELAY_REQUEST_FRAME_BYTES);
 	return serialized;
 }
 
@@ -236,9 +237,26 @@ export class RelayClosedError extends Error {
 	}
 }
 
+/** A request exceeded the frame limit and was conclusively never submitted. */
+export class RelayPayloadTooLargeError extends Error {
+	readonly code = "prompt_too_large";
+	constructor(
+		readonly sessionId: string,
+		readonly frameBytes: number,
+		readonly maxBytes = MAX_RELAY_REQUEST_FRAME_BYTES,
+	) {
+		super(`relay request frame is ${frameBytes} bytes; limit is ${maxBytes}`);
+		this.name = "RelayPayloadTooLargeError";
+	}
+}
+
 /** The relay failed before the request frame was written, so the host never saw it. */
 export function isUnwrittenRelayRequest(error: unknown): boolean {
-	return (error instanceof RelayClosedError && !error.requestWritten) || error instanceof RelayHelloError;
+	return (
+		error instanceof RelayPayloadTooLargeError ||
+		(error instanceof RelayClosedError && !error.requestWritten) ||
+		error instanceof RelayHelloError
+	);
 }
 
 /** A relay never completed its hello handshake before a prompt could be sent. */
