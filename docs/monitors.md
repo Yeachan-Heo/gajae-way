@@ -2,6 +2,16 @@
 
 A monitor turns an external or scheduled signal into a Gajae-authored event. It has a name, one trigger, a non-empty list of declared event types, an optional burst policy, and at most one external channel-delivery target. A cron is simply a monitor whose trigger is periodic.
 
+## Default memory monitors
+
+By default, boot seeds `memory-canonicalize`, `memory-audit`, and `memory-debloat` once per database. To skip this before the first boot, put the following in `$GAJAEWAY_HOME/config.json`:
+
+```json
+{ "schemaVersion": 1, "memory": { "seedDefaultMonitors": false } }
+```
+
+This restart-required boolean skips only default creation, not the monitor runtime. It does not disable, delete, or otherwise change existing monitors (including previously seeded defaults and custom monitors). With a fresh database, no default monitors or seed markers are created, including on subsequent boots. Set it to `true` or omit it and restart to seed normally later. Existing seed markers still apply: removed defaults are never resurrected and disabled defaults stay disabled.
+
 ## MonitorSpec and triggers
 
 `gajaeway monitors add --json` accepts the `MonitorSpec` shape from `@gajae-gateway/protocol`:
