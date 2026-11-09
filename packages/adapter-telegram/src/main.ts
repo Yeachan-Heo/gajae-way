@@ -21,12 +21,19 @@ import {
 	telegramAttachment,
 } from "./attachments";
 import { adapterHome, type LoadedTelegramAdapterConfig, loadTelegramAdapterConfig } from "./config";
+import {
+	escapeHtml,
+	markdownToTelegramHtml,
+	splitTelegramHtml,
+	TELEGRAM_MESSAGE_LIMIT,
+	TELEGRAM_PARSE_MODE,
+	telegramHtmlToPlainText,
+} from "./format";
 import { type TelegramMessageOriginShape, telegramMessageOrigin } from "./origin";
 import { telegramReactionFor } from "./reactions";
 import { resolveTelegramReplyContext, type TelegramReplyMessageShape } from "./reply";
 import { TelegramAdapterState } from "./state";
 
-const TELEGRAM_MESSAGE_LIMIT = 4_096;
 /**
  * sendPhoto refuses photos over 10 MB (https://core.telegram.org/bots/api#sendphoto).
  * Decimal megabytes keep us under the limit whichever unit Telegram means;
@@ -97,6 +104,8 @@ export class TelegramApiError extends Error {
 	constructor(
 		readonly status: number,
 		message: string,
+		/** Telegram's flood-control `parameters.retry_after`, in seconds, when it sent one. */
+		readonly retryAfterSeconds?: number,
 	) {
 		super(message);
 		this.name = "TelegramApiError";
@@ -225,7 +234,12 @@ export class TelegramBotApi implements TelegramFileApi {
 		if (isObject(body) && body.ok === false) {
 			const description =
 				typeof body.description === "string" ? this.#redact(body.description) : `Telegram ${method} failed`;
-			throw new TelegramApiError(response.status, description);
+			const retryAfter = isObject(body.parameters) ? body.parameters.retry_after : undefined;
+			throw new TelegramApiError(
+				response.status,
+				description,
+				typeof retryAfter === "number" && Number.isFinite(retryAfter) && retryAfter >= 0 ? retryAfter : undefined,
+			);
 		}
 		if (response.ok && isTelegramResult(body)) return body.result as T;
 		const detail = `Telegram ${method} returned an invalid response (HTTP ${response.status})`;
@@ -250,11 +264,17 @@ export class TelegramBotApi implements TelegramFileApi {
 		);
 	}
 
-	sendMessage(chatId: string, text: string, messageThreadId?: number): Promise<unknown> {
+	sendMessage(
+		chatId: string,
+		text: string,
+		messageThreadId?: number,
+		parseMode?: typeof TELEGRAM_PARSE_MODE,
+	): Promise<unknown> {
 		return this.call("sendMessage", {
 			chat_id: chatId,
 			text,
 			...(messageThreadId === undefined ? {} : { message_thread_id: messageThreadId }),
+			...(parseMode === undefined ? {} : { parse_mode: parseMode }),
 		});
 	}
 
@@ -285,12 +305,49 @@ function withTimeout(timeoutMs: number, signal?: AbortSignal): AbortSignal {
 	return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
-export function chunkTelegramMessage(text: string): string[] {
-	if (text.length === 0) return [""];
-	const chunks: string[] = [];
-	for (let offset = 0; offset < text.length; offset += TELEGRAM_MESSAGE_LIMIT)
-		chunks.push(text.slice(offset, offset + TELEGRAM_MESSAGE_LIMIT));
-	return chunks;
+const DUPLICATE_WARNING_PREFIX = `${escapeHtml("[recovered - may be a duplicate]")} `;
+
+/**
+ * Renders a persona reply the way GJC's Telegram notifier does: Markdown becomes
+ * Telegram HTML, then the result is split without breaking a tag or entity (open
+ * tags are closed and reopened across chunks). Every chunk leaves room for the
+ * duplicate-warning prefix, so a resumed delivery can warn on whichever chunk
+ * it resends first. A reply that renders to markup with no visible text (`>`,
+ * `# `) is posted as its literal text instead of not at all.
+ */
+function telegramDeliveryChunks(text: string): string[] {
+	const max = TELEGRAM_MESSAGE_LIMIT - DUPLICATE_WARNING_PREFIX.length;
+	const html = markdownToTelegramHtml(text);
+	const markupOnly = telegramHtmlToPlainText(html).trim() === "" && text.trim() !== "";
+	// The literal fallback drops NUL just as the renderer does: it must never reach Telegram.
+	return splitTelegramHtml(markupOnly ? escapeHtml(text.replaceAll("\u0000", "")) : html, max);
+}
+
+/** The Telegram HTML messages one delivery posts, in order. */
+export function renderTelegramDelivery(text: string, duplicateWarning = false): string[] {
+	const chunks = telegramDeliveryChunks(text);
+	return duplicateWarning
+		? chunks.map((chunk, index) => (index === 0 ? DUPLICATE_WARNING_PREFIX + chunk : chunk))
+		: chunks;
+}
+
+/** Telegram's HTML parser rejects the chunk itself; resending it unformatted is safe. */
+function isEntityParseError(error: unknown): boolean {
+	return error instanceof TelegramApiError && error.status === 400 && /can't parse entities/i.test(error.message);
+}
+
+async function sendTelegramHtml(
+	bot: Pick<TelegramBotApi, "sendMessage">,
+	chatId: string,
+	html: string,
+	messageThreadId: number | undefined,
+): Promise<void> {
+	try {
+		await bot.sendMessage(chatId, html, messageThreadId, TELEGRAM_PARSE_MODE);
+	} catch (error) {
+		if (!isEntityParseError(error)) throw error;
+		await bot.sendMessage(chatId, telegramHtmlToPlainText(html), messageThreadId);
+	}
 }
 
 export function deliveryFailureIsAmbiguous(error: unknown): boolean {
@@ -298,26 +355,176 @@ export function deliveryFailureIsAmbiguous(error: unknown): boolean {
 	return !(error instanceof TelegramApiError);
 }
 
+/**
+ * A partly delivered reply ends ambiguous so the ledger keeps it (and warns on a
+ * replay after restart), but a retry whose next chunk Telegram refuses again
+ * gets no further: the stall that reaches this count reports definitive
+ * non-delivery, so the ledger's definitive-failure cap ends the delivery instead
+ * of retrying it for the whole freshness window. A transport failure stays
+ * ambiguous (the chunk may have landed) and is resent alone, under the
+ * duplicate warning, until the freshness window ends.
+ */
+const TELEGRAM_PARTIAL_STALL_LIMIT = 5;
+/**
+ * Longest total flood-control wait one settlement honors; a longer `retry_after`
+ * fails the attempt and leaves the wait to the ledger's retry backoff. A
+ * settlement that outlasts the gateway's 60-second ack window is replayed onto
+ * the same per-chat queue and finds its progress, so it resumes rather than
+ * reposting.
+ */
+const TELEGRAM_RETRY_AFTER_BUDGET_MS = 30_000;
+/** Bounds the in-memory progress kept for deliveries this process settled. */
+const TELEGRAM_PROGRESS_LIMIT = 256;
+
+interface TelegramChunkProgress {
+	/**
+	 * The chunks rendered on first sight; a resume never re-renders, so boundaries
+	 * cannot shift. A fully posted delivery drops them (0 of 0 sent).
+	 */
+	readonly chunks: readonly string[];
+	/** Chunks Telegram accepted, in order. `sent === chunks.length` means posted in full. */
+	sent: number;
+	/** The chunk at `sent` may have been posted (transport failure), so its resend carries the warning. */
+	uncertain: boolean;
+	/** Retries that got no further chunk accepted. */
+	stalls: number;
+}
+
+/**
+ * What this process already posted for each delivery, so a ledger retry resumes
+ * at the first chunk Telegram has not accepted instead of reposting the reply
+ * from its first chunk, and a delivery replayed after it was posted in full
+ * (a lost confirm, an ack-timeout replay) is confirmed without reposting. The
+ * gateway ledger never re-dispatches a confirmed delivery on its own, so a
+ * completed entry is only ever hit by such a replay. Memory only: after an
+ * adapter restart (or an eviction) the ledger replays the reply from its first
+ * chunk under the duplicate warning, and a definitive refusal of such a replay
+ * counts toward the ledger's definitive-failure cap.
+ */
+export class TelegramDeliveryProgress {
+	readonly #entries = new Map<string, TelegramChunkProgress>();
+
+	get(deliveryId: string): TelegramChunkProgress | undefined {
+		return this.#entries.get(deliveryId);
+	}
+
+	remember(deliveryId: string, entry: TelegramChunkProgress): void {
+		this.#entries.delete(deliveryId);
+		this.#entries.set(deliveryId, entry);
+		// Completed entries only absorb replays; unresolved ones hold a resume point,
+		// so they are evicted last.
+		for (const evictUnresolved of [false, true])
+			for (const [id, oldest] of this.#entries) {
+				if (this.#entries.size <= TELEGRAM_PROGRESS_LIMIT) return;
+				if (evictUnresolved || oldest.sent === oldest.chunks.length) this.#entries.delete(id);
+			}
+	}
+}
+
+export interface TelegramSettleOptions {
+	/** Shared across settlements so retries resume; a fresh one remembers nothing. */
+	readonly progress?: TelegramDeliveryProgress;
+	readonly sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * A flood-control refusal posted nothing, so the chunk may be resent after its
+ * wait. At least one second per wait, so a `retry_after: 0` answer cannot spin
+ * inside the wait budget.
+ */
+function floodWaitMs(error: unknown): number | undefined {
+	return error instanceof TelegramApiError && error.status === 429 && error.retryAfterSeconds !== undefined
+		? Math.max(1, error.retryAfterSeconds) * 1_000
+		: undefined;
+}
+
 export async function settleTelegramDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	bot: Pick<TelegramBotApi, "sendMessage">,
 	state: TelegramAdapterState,
 	message: ChatMessagePayload,
+	options: TelegramSettleOptions = {},
 ): Promise<void> {
 	if (message.origin.platform !== "telegram" || !message.deliveryId) return;
 	const deliveryId = message.deliveryId;
+	const progress = options.progress ?? new TelegramDeliveryProgress();
+	const sleep = options.sleep ?? Bun.sleep;
+	const known = progress.get(deliveryId);
+	if (known && known.sent === known.chunks.length) {
+		await gateway.request("delivery.confirm", { deliveryId });
+		return;
+	}
+	let chunks: readonly string[];
+	try {
+		chunks = known?.chunks ?? telegramDeliveryChunks(message.text);
+	} catch (error) {
+		// Nothing was sent, so a reply that cannot be rendered is definitively not
+		// delivered; the ledger's definitive-failure cap ends it.
+		await gateway.request("delivery.fail", {
+			deliveryId,
+			reason: `Telegram rendering failed: ${error instanceof Error ? error.message : String(error)}`,
+			ambiguous: false,
+		});
+		return;
+	}
+	// A known entry already knows what Telegram accepted, so the gateway's
+	// duplicate flag (raised for any ambiguous retry) does not apply to it.
+	const entry: TelegramChunkProgress = known ?? {
+		chunks,
+		sent: 0,
+		uncertain: message.duplicateWarning === true,
+		stalls: 0,
+	};
+	const startedAt = entry.sent;
+	let waitedMs = 0;
 	try {
 		const route = state.routeFor(message.origin);
 		if (!route)
 			throw new TelegramApiError(400, `No persisted Telegram reply route for ${message.origin.conversationId}`);
-		const text = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text;
-		for (const chunk of chunkTelegramMessage(text)) await bot.sendMessage(route.chatId, chunk, route.messageThreadId);
+		while (entry.sent < entry.chunks.length) {
+			const chunk = entry.chunks[entry.sent] ?? "";
+			try {
+				await sendTelegramHtml(
+					bot,
+					route.chatId,
+					entry.uncertain ? DUPLICATE_WARNING_PREFIX + chunk : chunk,
+					route.messageThreadId,
+				);
+			} catch (error) {
+				const waitMs = floodWaitMs(error);
+				if (waitMs === undefined || waitedMs + waitMs > TELEGRAM_RETRY_AFTER_BUDGET_MS) throw error;
+				waitedMs += waitMs;
+				await sleep(waitMs);
+				continue;
+			}
+			entry.sent++;
+			entry.uncertain = false;
+			progress.remember(deliveryId, entry);
+		}
+		// A fully posted reply only absorbs replays: keep a chunkless marker
+		// (0 of 0 sent) instead of up to a megabyte of rendered text.
+		if (entry.chunks.length > 0) progress.remember(deliveryId, { chunks: [], sent: 0, uncertain: false, stalls: 0 });
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
+		const transport = deliveryFailureIsAmbiguous(error);
+		const posted = entry.sent === entry.chunks.length;
+		if (!posted && entry.sent > 0) {
+			// A definitive refusal only proves this attempt did not land; an earlier
+			// uncertain send of the same chunk still may have, so its label stays.
+			entry.uncertain ||= transport;
+			// Only consecutive retries that get no further count: a chunk that
+			// finally landed must not charge its stalls to the next one.
+			entry.stalls = entry.sent === startedAt ? entry.stalls + 1 : 0;
+		}
+		// A redelivery this process holds no progress for (adapter restart, evicted
+		// entry) has lost its resume point and just reposted the prefix, so a
+		// definitive refusal is counted definitive: the ledger's attempt cap then
+		// bounds such replays exactly as it bounded base's from-the-start resends.
+		const resumable = known !== undefined || message.redelivered !== true;
 		await gateway.request("delivery.fail", {
 			deliveryId,
 			reason: error instanceof Error ? error.message : String(error),
-			ambiguous: deliveryFailureIsAmbiguous(error),
+			ambiguous: transport || posted || (entry.sent > 0 && resumable && entry.stalls < TELEGRAM_PARTIAL_STALL_LIMIT),
 		});
 	}
 }
@@ -558,6 +765,7 @@ export function subscribeTelegramDeliveries(
 		Partial<Pick<TelegramBotApi, "sendPhoto" | "sendDocument">>,
 	state: TelegramAdapterState,
 	order: TelegramDeliveryOrder = new TelegramDeliveryOrder(),
+	progress: TelegramDeliveryProgress = new TelegramDeliveryProgress(),
 ): () => void {
 	return gateway.onChatMessage((message) => {
 		if (message.origin.platform !== "telegram" || !message.deliveryId) return;
@@ -568,7 +776,7 @@ export function subscribeTelegramDeliveries(
 				? settleTelegramReaction(gateway, bot, state, message)
 				: message.file
 					? settleTelegramFile(gateway, bot, state, message)
-					: settleTelegramDelivery(gateway, bot, state, message),
+					: settleTelegramDelivery(gateway, bot, state, message, { progress }),
 		);
 	});
 }
@@ -770,6 +978,9 @@ class ReconnectingGateway implements GatewayClientLike {
 	// Shared across reconnects so a delivery replayed on a new connection still
 	// waits behind the conversation's in-flight settlement.
 	readonly #deliveryOrder = new TelegramDeliveryOrder();
+	// Shared across reconnects so a retry replayed on a new connection resumes
+	// after the chunks this process already posted.
+	readonly #deliveryProgress = new TelegramDeliveryProgress();
 	#handlers = new Set<(message: ChatMessagePayload) => void>();
 
 	constructor(
@@ -801,7 +1012,13 @@ class ReconnectingGateway implements GatewayClientLike {
 			this.#client = client;
 			this.#attempt = 0;
 			this.#deliveryOff?.();
-			this.#deliveryOff = subscribeTelegramDeliveries(client, this.bot, this.state, this.#deliveryOrder);
+			this.#deliveryOff = subscribeTelegramDeliveries(
+				client,
+				this.bot,
+				this.state,
+				this.#deliveryOrder,
+				this.#deliveryProgress,
+			);
 			this.monitor(client);
 		} catch {
 			this.scheduleReconnect();

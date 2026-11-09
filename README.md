@@ -59,7 +59,7 @@ The Bun workspace under `packages/` is divided by responsibility:
 | [`@gajae-gateway/cli`](packages/cli) | Owner commands over the gateway socket. |
 | `@gajae-gateway/gateway` | Daemon: configuration, SQLite state, sessions, delivery, memory, monitors, and the `gjc` boundary. |
 | `@gajae-gateway/adapter-discord` | Discord ingress and outbound delivery, including typing hints and the reaction-gradient presence. |
-| `@gajae-gateway/adapter-telegram` | Telegram ingress and outbound delivery. |
+| `@gajae-gateway/adapter-telegram` | Telegram ingress and outbound delivery (Markdown sent as Telegram HTML, renderer adapted from GJC with local fixes). |
 | `@gajae-gateway/adapter-slack` | Slack ingress over Socket Mode, mrkdwn and file delivery, reactions, reaction-gradient working presence, opt-in live replies, and missed-message recovery. |
 | `@gajae-gateway/admin` | Local operator web console. |
 | `@gajae-gateway/home` | Shared home layout and process ownership leases. |
