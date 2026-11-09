@@ -6,11 +6,12 @@ import type { ChatMessagePayload } from "@gajae-gateway/protocol";
 import { type TelegramAttachmentSaver, TelegramAttachmentStore } from "../src/attachments";
 import { loadTelegramAdapterConfig, TelegramAdapterStartupError } from "../src/config";
 import {
-	chunkTelegramMessage,
 	type GatewayClientLike,
+	renderTelegramDelivery,
 	settleTelegramDelivery,
 	subscribeTelegramDeliveries,
 	TelegramAdapter,
+	TelegramApiError,
 	TelegramBotApi,
 	type TelegramUpdate,
 } from "../src/main";
@@ -210,7 +211,107 @@ test("still forwards an attachment-only message when the download fails", async 
 });
 
 test("chunks at Telegram's 4096 character API limit", () => {
-	expect(chunkTelegramMessage("x".repeat(8_193)).map((chunk) => chunk.length)).toEqual([4_096, 4_096, 1]);
+	expect(renderTelegramDelivery("x".repeat(8_193)).map((chunk) => chunk.length)).toEqual([4_096, 4_096, 1]);
+});
+
+test("chunks formatted replies without splitting a tag, closing and reopening it across chunks", () => {
+	const chunks = renderTelegramDelivery(`**${"y".repeat(5_000)}**`);
+	expect(chunks).toHaveLength(2);
+	for (const chunk of chunks) {
+		expect(chunk.length).toBeLessThanOrEqual(4_096);
+		expect(chunk.startsWith("<b>")).toBe(true);
+		expect(chunk.endsWith("</b>")).toBe(true);
+	}
+	expect(chunks.join("").replace(/<\/?b>/g, "")).toBe("y".repeat(5_000));
+});
+
+test("sends Markdown replies as Telegram HTML, escaping the duplicate prefix and literal text", async () => {
+	const home = await temporaryHome();
+	try {
+		const state = await TelegramAdapterState.load(home);
+		const origin = telegramMessageOrigin({ chat: { id: 22, type: "private" }, from: { id: 44 } });
+		await state.rememberOrigin(origin);
+		const calls: Array<Record<string, unknown>> = [];
+		const bot = new TelegramBotApi("not-a-real-token", async (_url, init) => {
+			calls.push(JSON.parse(String(init?.body)));
+			return Response.json({ ok: true, result: { message_id: 1 } });
+		});
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		await settleTelegramDelivery(mockGateway(requests), bot, state, {
+			...delivery(origin, "## 요약\n**굵게** a < b & `x<y>`\n[문서](https://example.com/?a=1&b=2)"),
+			duplicateWarning: true,
+		});
+		expect(calls).toEqual([
+			{
+				chat_id: "22",
+				text: '[recovered - may be a duplicate] <b>요약</b>\n<b>굵게</b> a &lt; b &amp; <code>x&lt;y&gt;</code>\n<a href="https://example.com/?a=1&amp;b=2">문서</a>',
+				parse_mode: "HTML",
+			},
+		]);
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("resends a chunk as plain text when Telegram cannot parse its entities", async () => {
+	const home = await temporaryHome();
+	try {
+		const state = await TelegramAdapterState.load(home);
+		const origin = telegramMessageOrigin({ chat: { id: 22, type: "private" }, from: { id: 44 } });
+		await state.rememberOrigin(origin);
+		const calls: Array<Record<string, unknown>> = [];
+		const bot = new TelegramBotApi("not-a-real-token", async (_url, init) => {
+			const body = JSON.parse(String(init?.body));
+			calls.push(body);
+			return body.parse_mode
+				? Response.json(
+						{ ok: false, description: "Bad Request: can't parse entities: unexpected end tag" },
+						{ status: 400 },
+					)
+				: Response.json({ ok: true, result: { message_id: 2 } });
+		});
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		await settleTelegramDelivery(mockGateway(requests), bot, state, delivery(origin, "**hi** & <tag>"));
+		expect(calls).toEqual([
+			{ chat_id: "22", text: "<b>hi</b> &amp; &lt;tag&gt;", parse_mode: "HTML" },
+			{ chat_id: "22", text: "hi & <tag>" },
+		]);
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("fails delivery definitively on any other Telegram rejection without a plain-text resend", async () => {
+	const home = await temporaryHome();
+	try {
+		const state = await TelegramAdapterState.load(home);
+		const origin = telegramMessageOrigin({ chat: { id: 22, type: "private" }, from: { id: 44 } });
+		await state.rememberOrigin(origin);
+		const sent: Array<{ text: string; parseMode?: string }> = [];
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		await settleTelegramDelivery(
+			mockGateway(requests),
+			{
+				sendMessage: async (_chatId, text, _thread, parseMode) => {
+					sent.push({ text, ...(parseMode ? { parseMode } : {}) });
+					throw new TelegramApiError(403, "Forbidden: bot was blocked by the user");
+				},
+			},
+			state,
+			delivery(origin, "**hi**"),
+		);
+		expect(sent).toEqual([{ text: "<b>hi</b>", parseMode: "HTML" }]);
+		expect(requests).toEqual([
+			{
+				verb: "delivery.fail",
+				params: { deliveryId: "delivery-1", reason: "Forbidden: bot was blocked by the user", ambiguous: false },
+			},
+		]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
 });
 
 test("prefixes recovered delivery and settles via injected fake fetch", async () => {
@@ -231,6 +332,7 @@ test("prefixes recovered delivery and settles via injected fake fetch", async ()
 		});
 		expect(calls.map((call) => String(call.body.text).length)).toEqual([4_096, 27]);
 		expect(calls[0]?.body.text).toBe(`[recovered - may be a duplicate] ${"x".repeat(4_090)}`.slice(0, 4_096));
+		expect(calls.every((call) => call.body.parse_mode === "HTML")).toBe(true);
 		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
 	} finally {
 		await rm(home, { recursive: true, force: true });

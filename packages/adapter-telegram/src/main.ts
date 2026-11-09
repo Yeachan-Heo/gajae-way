@@ -21,12 +21,18 @@ import {
 	telegramAttachment,
 } from "./attachments";
 import { adapterHome, type LoadedTelegramAdapterConfig, loadTelegramAdapterConfig } from "./config";
+import {
+	escapeHtml,
+	markdownToTelegramHtml,
+	splitTelegramHtml,
+	TELEGRAM_PARSE_MODE,
+	telegramHtmlToPlainText,
+} from "./format";
 import { type TelegramMessageOriginShape, telegramMessageOrigin } from "./origin";
 import { telegramReactionFor } from "./reactions";
 import { resolveTelegramReplyContext, type TelegramReplyMessageShape } from "./reply";
 import { TelegramAdapterState } from "./state";
 
-const TELEGRAM_MESSAGE_LIMIT = 4_096;
 /**
  * sendPhoto refuses photos over 10 MB (https://core.telegram.org/bots/api#sendphoto).
  * Decimal megabytes keep us under the limit whichever unit Telegram means;
@@ -250,11 +256,17 @@ export class TelegramBotApi implements TelegramFileApi {
 		);
 	}
 
-	sendMessage(chatId: string, text: string, messageThreadId?: number): Promise<unknown> {
+	sendMessage(
+		chatId: string,
+		text: string,
+		messageThreadId?: number,
+		parseMode?: typeof TELEGRAM_PARSE_MODE,
+	): Promise<unknown> {
 		return this.call("sendMessage", {
 			chat_id: chatId,
 			text,
 			...(messageThreadId === undefined ? {} : { message_thread_id: messageThreadId }),
+			...(parseMode === undefined ? {} : { parse_mode: parseMode }),
 		});
 	}
 
@@ -285,12 +297,36 @@ function withTimeout(timeoutMs: number, signal?: AbortSignal): AbortSignal {
 	return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
-export function chunkTelegramMessage(text: string): string[] {
-	if (text.length === 0) return [""];
-	const chunks: string[] = [];
-	for (let offset = 0; offset < text.length; offset += TELEGRAM_MESSAGE_LIMIT)
-		chunks.push(text.slice(offset, offset + TELEGRAM_MESSAGE_LIMIT));
-	return chunks;
+const DUPLICATE_WARNING = "[recovered - may be a duplicate]";
+
+/**
+ * Renders a persona reply the way GJC's Telegram notifier does: Markdown becomes
+ * Telegram HTML, then the result is split at Telegram's 4096-character limit
+ * without breaking a tag or entity (open tags are closed and reopened across
+ * chunks).
+ */
+export function renderTelegramDelivery(text: string, duplicateWarning = false): string[] {
+	const html = markdownToTelegramHtml(text);
+	return splitTelegramHtml(duplicateWarning ? `${escapeHtml(DUPLICATE_WARNING)} ${html}` : html);
+}
+
+/** Telegram's HTML parser rejects the chunk itself; resending it unformatted is safe. */
+function isEntityParseError(error: unknown): boolean {
+	return error instanceof TelegramApiError && error.status === 400 && /can't parse entities/i.test(error.message);
+}
+
+async function sendTelegramHtml(
+	bot: Pick<TelegramBotApi, "sendMessage">,
+	chatId: string,
+	html: string,
+	messageThreadId: number | undefined,
+): Promise<void> {
+	try {
+		await bot.sendMessage(chatId, html, messageThreadId, TELEGRAM_PARSE_MODE);
+	} catch (error) {
+		if (!isEntityParseError(error)) throw error;
+		await bot.sendMessage(chatId, telegramHtmlToPlainText(html), messageThreadId);
+	}
 }
 
 export function deliveryFailureIsAmbiguous(error: unknown): boolean {
@@ -310,8 +346,8 @@ export async function settleTelegramDelivery(
 		const route = state.routeFor(message.origin);
 		if (!route)
 			throw new TelegramApiError(400, `No persisted Telegram reply route for ${message.origin.conversationId}`);
-		const text = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text;
-		for (const chunk of chunkTelegramMessage(text)) await bot.sendMessage(route.chatId, chunk, route.messageThreadId);
+		for (const chunk of renderTelegramDelivery(message.text, message.duplicateWarning === true))
+			await sendTelegramHtml(bot, route.chatId, chunk, route.messageThreadId);
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
 		await gateway.request("delivery.fail", {
