@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { ChatMessagePayload } from "@gajae-gateway/protocol";
 import { type TelegramAttachmentSaver, TelegramAttachmentStore } from "../src/attachments";
 import { loadTelegramAdapterConfig, TelegramAdapterStartupError } from "../src/config";
+import { telegramHtmlToPlainText } from "../src/format";
 import {
 	type GatewayClientLike,
 	renderTelegramDelivery,
@@ -278,6 +279,112 @@ test("resends a chunk as plain text when Telegram cannot parse its entities", as
 			{ chat_id: "22", text: "hi & <tag>" },
 		]);
 		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("multi-chunk entity fallback preserves order and forum topic without resending accepted chunks", async () => {
+	const home = await temporaryHome();
+	try {
+		const state = await TelegramAdapterState.load(home);
+		const origin = telegramMessageOrigin(topicMessage);
+		await state.rememberOrigin(origin, 99);
+		const text = `**${"a".repeat(4089)}${"b".repeat(4084)}& tail**`;
+		const chunks = renderTelegramDelivery(text);
+		expect(chunks).toHaveLength(3);
+		const calls: Array<Record<string, unknown>> = [];
+		const bot = new TelegramBotApi("not-a-real-token", async (_url, init) => {
+			calls.push(JSON.parse(String(init?.body)));
+			return calls.length === 2
+				? Response.json({ ok: false, description: "Bad Request: can't parse entities" }, { status: 400 })
+				: Response.json({ ok: true, result: { message_id: calls.length } });
+		});
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		await settleTelegramDelivery(mockGateway(requests), bot, state, delivery(origin, text));
+		expect(calls).toEqual([
+			{ chat_id: "-100123", message_thread_id: 99, text: chunks[0], parse_mode: "HTML" },
+			{ chat_id: "-100123", message_thread_id: 99, text: chunks[1], parse_mode: "HTML" },
+			{ chat_id: "-100123", message_thread_id: 99, text: telegramHtmlToPlainText(chunks[1] ?? "") },
+			{ chat_id: "-100123", message_thread_id: 99, text: chunks[2], parse_mode: "HTML" },
+		]);
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test.each<{ name: string; responses: Array<"ok" | "reject" | "entity" | "transport">; ambiguous: boolean }>([
+	{
+		name: "an accepted chunk followed by a Telegram 429 is ambiguous",
+		responses: ["ok", "reject"],
+		ambiguous: true,
+	},
+	{
+		name: "a Telegram rejection of the first chunk is definitive",
+		responses: ["reject"],
+		ambiguous: false,
+	},
+	{
+		name: "a second-chunk entity fallback transport failure is ambiguous",
+		responses: ["ok", "entity", "transport"],
+		ambiguous: true,
+	},
+	{
+		name: "an accepted plain-text fallback followed by a Telegram rejection is ambiguous",
+		responses: ["entity", "ok", "reject"],
+		ambiguous: true,
+	},
+])("$name", async ({ responses, ambiguous }) => {
+	const home = await temporaryHome();
+	try {
+		const state = await TelegramAdapterState.load(home);
+		const origin = telegramMessageOrigin(topicMessage);
+		await state.rememberOrigin(origin, 99);
+		const text = `${"a".repeat(4096)}${"b".repeat(4096)}c`;
+		const chunks = renderTelegramDelivery(text);
+		const calls: Array<Record<string, unknown>> = [];
+		const bot = new TelegramBotApi("not-a-real-token", async (_url, init) => {
+			calls.push(JSON.parse(String(init?.body)));
+			switch (responses[calls.length - 1]) {
+				case "reject":
+					return Response.json({ ok: false, description: "Too Many Requests" }, { status: 429 });
+				case "entity":
+					return Response.json({ ok: false, description: "Bad Request: can't parse entities" }, { status: 400 });
+				case "transport":
+					throw new Error("fallback transport failed");
+				case "ok":
+					return Response.json({ ok: true, result: { message_id: calls.length } });
+				default:
+					throw new Error("unexpected extra send");
+			}
+		});
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		await settleTelegramDelivery(mockGateway(requests), bot, state, delivery(origin, text));
+		expect(calls).toHaveLength(responses.length);
+		let chunkIndex = 0;
+		for (const [index, response] of responses.entries()) {
+			const fallback = index > 0 && responses[index - 1] === "entity";
+			expect(calls[index]).toEqual({
+				chat_id: "-100123",
+				message_thread_id: 99,
+				text: chunks[chunkIndex],
+				...(fallback ? {} : { parse_mode: "HTML" }),
+			});
+			if (response === "ok") chunkIndex++;
+		}
+		expect(requests).toEqual([
+			{
+				verb: "delivery.fail",
+				params: {
+					deliveryId: "delivery-1",
+					reason: responses.includes("transport")
+						? "Telegram sendMessage request failed: fallback transport failed"
+						: "Too Many Requests",
+					ambiguous,
+				},
+			},
+		]);
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}

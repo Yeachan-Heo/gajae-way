@@ -1,9 +1,9 @@
 /**
  * Telegram HTML formatting for outbound gateway deliveries.
  *
- * Ported from Gajae-Code's Telegram notifier (`sdk/bus/html-format.ts`) so a
- * reply looks the same whether GJC or gajae-way posts it: the persona writes
- * Markdown, Telegram receives `parse_mode: "HTML"`.
+ * Adapted from Gajae-Code's Telegram notifier (`sdk/bus/html-format.ts`), with
+ * local fixes for malformed Markdown and safe chunk boundaries. The persona
+ * writes Markdown, Telegram receives `parse_mode: "HTML"`.
  *
  * Discipline: escape first, tag second. Telegram only parses a small tag set
  * (b, i, u, s, code, pre, a, blockquote, tg-spoiler); a stray `<` or unbalanced
@@ -179,21 +179,35 @@ function convertMarkdownTables(text: string, stash: (html: string) => string): s
  * inline code, `**bold**`, `*italic*`, `~~strikethrough~~`, `[text](url)`
  * (safe schemes only), `#` headers, `>` blockquotes, and GFM tables (rendered
  * as a monospace block).
- * Unsupported or malformed markdown is left as escaped literal text — never
+ * Unsupported or malformed markdown is left as escaped literal text, never
  * emitted as unbalanced tags.
  */
 export function markdownToTelegramHtml(markdown: string): string {
 	const placeholders: string[] = [];
+	const placeholderPattern = new RegExp(`${PLACEHOLDER_PREFIX}(\\d+)${PLACEHOLDER_SUFFIX}`, "g");
 	const stash = (html: string): string => {
 		const token = `${PLACEHOLDER_PREFIX}${placeholders.length}${PLACEHOLDER_SUFFIX}`;
-		placeholders.push(html);
+		// A table can contain previously protected code. Resolve it before this
+		// fragment is protected in turn, keeping restoration single-pass and literal.
+		placeholders.push(
+			html.replace(placeholderPattern, (_m, i: string) =>
+				escapeHtml(telegramHtmlToPlainText(placeholders[Number(i)] ?? "")),
+			),
+		);
 		return token;
 	};
+	const restorePlain = (value: string): string =>
+		value.replace(placeholderPattern, (_m, i: string) => telegramHtmlToPlainText(placeholders[Number(i)] ?? ""));
 
-	let text = markdown;
+	// NUL is reserved for internal placeholders and must never reach Telegram.
+	let text = markdown.replaceAll("\u0000", "");
 
 	// 1. Fenced code blocks (protect literal content before any other transform).
-	text = text.replace(/```[^\n]*\n?([\s\S]*?)```/g, (_m, body: string) => stash(pre(body)));
+	text = text.replace(
+		/(^|\n)```[^\n`]*\n([\s\S]*?)(?:```|$)/g,
+		(_m, prefix: string, body: string) => prefix + stash(pre(body)),
+	);
+	text = text.replace(/```([^`\n]*)```/g, (_m, body: string) => stash(code(body)));
 
 	// 1b. GFM tables -> aligned monospace <pre> block (no native table primitive).
 	text = convertMarkdownTables(text, stash);
@@ -203,8 +217,9 @@ export function markdownToTelegramHtml(markdown: string): string {
 
 	// 3. Links (capture raw URL before escaping). Unsafe/malformed links stay literal.
 	text = text.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (whole, label: string, url: string) => {
+		url = restorePlain(url);
 		if (!isSafeUrl(url)) return whole;
-		return stash(`<a href="${escapeAttr(url)}">${escapeHtml(label)}</a>`);
+		return stash(`<a href="${escapeAttr(url)}">${escapeHtml(restorePlain(label))}</a>`);
 	});
 
 	// 4. Escape everything that remains (placeholders contain no escapable chars).
@@ -236,16 +251,18 @@ export function markdownToTelegramHtml(markdown: string): string {
 	flushQuote();
 	text = out.join("\n");
 
-	// 6. Inline emphasis (bold before italic; unbalanced markers stay literal).
-	text = text.replace(/\*\*([^*\n]+)\*\*/g, (_m, body: string) => tag("b", body));
-	text = text.replace(/\*([^*\n]+)\*/g, (_m, body: string) => tag("i", body));
-	text = text.replace(/~~([^~\n]+)~~/g, (_m, body: string) => tag("s", body));
+	// 6. Match outer emphasis first, then its body, never across an emitted tag.
+	// This leaves crossing/unbalanced delimiters literal instead of crossing tags.
+	const emphasis = (value: string): string =>
+		value.replace(
+			/\*\*([^*\n<>]+)\*\*|\*([^*\n<>]+)\*|~~([^~\n<>]+)~~/g,
+			(_m, bold: string | undefined, italic: string | undefined, strike: string | undefined) =>
+				tag(bold !== undefined ? "b" : italic !== undefined ? "i" : "s", emphasis(bold ?? italic ?? strike ?? "")),
+		);
+	text = emphasis(text);
 
 	// 7. Restore protected placeholders.
-	text = text.replace(
-		new RegExp(`${PLACEHOLDER_PREFIX}(\\d+)${PLACEHOLDER_SUFFIX}`, "g"),
-		(_m, i: string) => placeholders[Number(i)] ?? "",
-	);
+	text = text.replace(placeholderPattern, (_m, i: string) => placeholders[Number(i)] ?? "");
 
 	return text;
 }
@@ -260,12 +277,12 @@ interface Token {
 	close?: string;
 }
 
-/** Tokenize HTML into tags, entities, and single characters (never splits them). */
+/** Tokenize HTML into tags, entities, and Unicode code points (never splits them). */
 function tokenize(html: string): Token[] {
 	const tokens: Token[] = [];
 	let i = 0;
 	while (i < html.length) {
-		const ch = html.charAt(i);
+		const ch = String.fromCodePoint(html.codePointAt(i) ?? 0);
 		if (ch === "<") {
 			const end = html.indexOf(">", i);
 			if (end !== -1) {
@@ -292,7 +309,7 @@ function tokenize(html: string): Token[] {
 			}
 		}
 		tokens.push({ value: ch });
-		i++;
+		i += ch.length;
 	}
 	return tokens;
 }
@@ -304,7 +321,7 @@ interface OpenTag {
 
 /** Split a finished Telegram HTML message into ordered chunks without splitting tags or entities. */
 export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT): string[] {
-	if (message.length <= max) return [message];
+	if (message.length <= max) return telegramHtmlToPlainText(message).length > 0 ? [message] : [];
 	const chunks: string[] = [];
 	const tokens = tokenize(message);
 	const stack: OpenTag[] = [];
@@ -317,10 +334,8 @@ export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT)
 			.reverse()
 			.join("");
 	const openersFor = (s: OpenTag[]): string => s.map((t) => t.tag).join("");
-	const minimumChunkLengthFor = (s: OpenTag[]): number => openersFor(s).length + closersFor(s).length + 1;
 	const flush = (): void => {
-		if (!chunkHasBody) return;
-		chunks.push(out + closersFor(stack));
+		if (chunkHasBody) chunks.push(out + closersFor(stack));
 		out = openersFor(stack);
 		chunkHasBody = false;
 	};
@@ -332,14 +347,39 @@ export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT)
 		return true;
 	};
 
-	for (const token of tokens) {
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i];
+		if (!token || !token.value) continue;
 		if (token.open) {
 			const nextStack = [...stack, { name: token.open, tag: token.openTag ?? token.value }];
-			if (minimumChunkLengthFor(nextStack) > max) continue;
-			if (chunkHasBody && out.length + token.value.length + closersFor(nextStack).length > max) flush();
-			if (out.length + token.value.length + closersFor(nextStack).length > max) continue;
+			let depth = 1;
+			let end = i + 1;
+			let bodyWidth = 0;
+			for (; end < tokens.length; end++) {
+				const inner = tokens[end];
+				if (inner?.open === token.open) depth++;
+				if (inner?.close === token.open && --depth === 0) break;
+				if (inner && !inner.open && !inner.close) bodyWidth = Math.max(bodyWidth, inner.value.length);
+			}
+			// Reserve the widest visible unit, not just one UTF-16 code unit. If
+			// formatting cannot fit even on a fresh chunk, preserve its text instead.
+			if (openersFor(nextStack).length + closersFor(nextStack).length + bodyWidth > max) {
+				if (token.open === "a") {
+					const label = tokens
+						.slice(i + 1, end)
+						.map((inner) => inner.value)
+						.join("");
+					const href = /\bhref="([^"]*)"/.exec(token.value)?.[1] ?? "";
+					const plain = `${telegramHtmlToPlainText(label)} (${telegramHtmlToPlainText(href)})`;
+					tokens.splice(i, Math.min(end + 1, tokens.length) - i, ...tokenize(escapeHtml(plain)));
+					i--;
+				} else if (end < tokens.length) {
+					tokens[end] = { value: "" };
+				}
+				continue;
+			}
+			if (out.length + token.value.length + closersFor(nextStack).length + bodyWidth > max) flush();
 			out += token.value;
-			chunkHasBody = true;
 			stack.push({ name: token.open, tag: token.openTag ?? token.value });
 			continue;
 		}
@@ -354,12 +394,13 @@ export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT)
 				continue;
 			}
 			out += token.value;
-			chunkHasBody = true;
 			updateStackForClose(token.close);
 			continue;
 		}
 
-		if (chunkHasBody && out.length + token.value.length + closersFor(stack).length > max) flush();
+		if (out.length + token.value.length + closersFor(stack).length > max) flush();
+		if (out.length + token.value.length + closersFor(stack).length > max)
+			throw new RangeError("Telegram chunk limit cannot fit a visible text unit");
 		out += token.value;
 		chunkHasBody = true;
 	}

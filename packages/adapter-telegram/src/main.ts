@@ -342,18 +342,21 @@ export async function settleTelegramDelivery(
 ): Promise<void> {
 	if (message.origin.platform !== "telegram" || !message.deliveryId) return;
 	const deliveryId = message.deliveryId;
+	let acceptedChunks = 0;
 	try {
 		const route = state.routeFor(message.origin);
 		if (!route)
 			throw new TelegramApiError(400, `No persisted Telegram reply route for ${message.origin.conversationId}`);
-		for (const chunk of renderTelegramDelivery(message.text, message.duplicateWarning === true))
+		for (const chunk of renderTelegramDelivery(message.text, message.duplicateWarning === true)) {
 			await sendTelegramHtml(bot, route.chatId, chunk, route.messageThreadId);
+			acceptedChunks++;
+		}
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
 		await gateway.request("delivery.fail", {
 			deliveryId,
 			reason: error instanceof Error ? error.message : String(error),
-			ambiguous: deliveryFailureIsAmbiguous(error),
+			ambiguous: acceptedChunks > 0 || deliveryFailureIsAmbiguous(error),
 		});
 	}
 }
