@@ -189,8 +189,12 @@ function convertMarkdownTables(text: string, stash: (html: string) => string): s
 	for (let i = 0; i < lines.length; i++) {
 		const headerLine = lines[i] ?? "";
 		const separatorLine = lines[i + 1];
-		if (looksLikeTableRow(headerLine) && separatorLine !== undefined && isTableSeparator(separatorLine)) {
-			const header = splitTableRow(headerLine);
+		const header = looksLikeTableRow(headerLine) ? splitTableRow(headerLine) : [];
+		if (
+			separatorLine !== undefined &&
+			isTableSeparator(separatorLine) &&
+			splitTableRow(separatorLine).length === header.length
+		) {
 			const aligns = splitTableRow(separatorLine).map(parseAlign);
 			const body: string[][] = [];
 			let j = i + 2;
@@ -208,52 +212,254 @@ function convertMarkdownTables(text: string, stash: (html: string) => string): s
 	return out.join("\n");
 }
 
+/** Characters a backslash keeps from being syntax (CommonMark: any ASCII punctuation). */
+const ESCAPABLE = new Set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~");
+
+/** One line of a fenced code block's opening or closing fence. */
+const FENCE_OPEN = /^([ \t]*)(`{3,}|~{3,})(.*)$/;
+const FENCE_CLOSE = /^[ \t]*(`{3,}|~{3,})[ \t]*$/;
+
 /**
- * Convert a bounded markdown subset into Telegram HTML. Supported: fenced code,
- * inline code, `**bold**`, `*italic*`, `~~strikethrough~~`, `[text](url)`
- * (safe schemes only), `#` headers, `>` blockquotes, and GFM tables (rendered
- * as a monospace block).
- * Unsupported or malformed markdown is left as escaped literal text, never
- * emitted as unbalanced tags.
+ * Replace fenced code blocks with stashed `<pre>` blocks. A fence opens on its
+ * own line (any indentation, so fences inside list items count) with three or
+ * more backticks or tildes, and closes only on a line holding nothing but a run
+ * of the same character at least as long. An unclosed fence runs to the end of
+ * the message; a fence with no body stays literal.
+ */
+function convertFences(text: string, stash: (html: string) => string): string {
+	const lines = text.split("\n");
+	const out: string[] = [];
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i] ?? "";
+		const open = FENCE_OPEN.exec(line);
+		const indent = open?.[1] ?? "";
+		const fence = open?.[2] ?? "";
+		if (!open || i + 1 >= lines.length || (fence.startsWith("`") && (open[3] ?? "").includes("`"))) {
+			out.push(line);
+			continue;
+		}
+		let end = i + 1;
+		for (; end < lines.length; end++) {
+			const close = FENCE_CLOSE.exec(lines[end] ?? "")?.[1];
+			if (close && close[0] === fence[0] && close.length >= fence.length) break;
+		}
+		const closed = end < lines.length;
+		const body = lines.slice(i + 1, end).map((bodyLine) => {
+			let strip = 0;
+			while (strip < indent.length && (bodyLine[strip] === " " || bodyLine[strip] === "\t")) strip++;
+			return bodyLine.slice(strip);
+		});
+		const code = body.join("\n") + (closed ? "\n" : "");
+		if (code.trim() === "") {
+			out.push(line);
+			continue;
+		}
+		out.push(stash(pre(code)));
+		i = closed ? end : lines.length;
+	}
+	return out.join("\n");
+}
+
+/** Start offsets of every maximal backtick run, grouped by run length. */
+function backtickRuns(text: string): Map<number, number[]> {
+	const runs = new Map<number, number[]>();
+	for (let i = 0; i < text.length; ) {
+		if (text[i] !== "`") {
+			i++;
+			continue;
+		}
+		let end = i;
+		while (text[end] === "`") end++;
+		const list = runs.get(end - i);
+		if (list) list.push(i);
+		else runs.set(end - i, [i]);
+		i = end;
+	}
+	return runs;
+}
+
+/**
+ * Stash backslash escapes and code spans in one left-to-right pass, the way
+ * CommonMark reads them: an escaped character is not syntax, a backtick run opens
+ * a code span closed by the next run of exactly the same length on the same
+ * line, and a run with no closer is literal. Linear: each run length keeps a
+ * cursor that only moves forward.
+ */
+function convertInlineCode(text: string, stash: (html: string, raw: string) => string): string {
+	const runs = backtickRuns(text);
+	const cursors = new Map<number, number>();
+	let out = "";
+	let lineEnd = -1;
+	for (let i = 0; i < text.length; ) {
+		const ch = text.charAt(i);
+		if (ch === "\\" && ESCAPABLE.has(text.charAt(i + 1))) {
+			// The backslash stays visible: in prose it is as often a path or regex
+			// (`C:\*name*`, `\.ssh`) as a Markdown escape, so dropping it could lose
+			// a character. A link destination still reads the escaped character.
+			out += stash(escapeHtml(text.slice(i, i + 2)), text.charAt(i + 1));
+			i += 2;
+			continue;
+		}
+		if (ch !== "`") {
+			out += ch;
+			i++;
+			continue;
+		}
+		let runEnd = i;
+		while (text[runEnd] === "`") runEnd++;
+		const length = runEnd - i;
+		if (lineEnd < i) {
+			lineEnd = text.indexOf("\n", i);
+			if (lineEnd === -1) lineEnd = text.length;
+		}
+		const starts = runs.get(length) ?? [];
+		let cursor = cursors.get(length) ?? 0;
+		while (cursor < starts.length && (starts[cursor] ?? 0) < runEnd) cursor++;
+		cursors.set(length, cursor);
+		const close = starts[cursor];
+		if (close === undefined || close >= lineEnd) {
+			out += text.slice(i, runEnd);
+			i = runEnd;
+			continue;
+		}
+		let body = text.slice(runEnd, close);
+		if (body.length > 2 && body.startsWith(" ") && body.endsWith(" ") && body.trim() !== "") body = body.slice(1, -1);
+		out += stash(code(body), text.slice(i, close + length));
+		i = close + length;
+	}
+	return out;
+}
+
+/** CommonMark link-destination terminators: whitespace and ASCII control characters (NUL marks placeholders). */
+function endsDestination(code: number): boolean {
+	return code === 0x20 || code === 0x7f || (code < 0x20 && code !== 0);
+}
+
+/**
+ * Replace `[label](destination)` with whatever `render` returns. The label is
+ * the text after the last `[` before a `]` on the same line; the destination
+ * runs from `(` to its balanced `)` and may not contain whitespace. Matching
+ * parentheses are paired once up front, so the scan is linear. `render` also
+ * receives the construct's whole source (including an image's `!`) so it can
+ * keep a link it refuses literal as one unit; unbalanced destinations are not
+ * links at all.
+ */
+function convertLinks(
+	text: string,
+	render: (label: string, destination: string, source: string, image: boolean) => string,
+): string {
+	const closing = new Int32Array(text.length).fill(-1);
+	const stack: number[] = [];
+	for (let i = 0; i < text.length; i++) {
+		const ch = text.charAt(i);
+		if (endsDestination(text.charCodeAt(i))) stack.length = 0;
+		else if (ch === "(") stack.push(i);
+		else if (ch === ")" && stack.length > 0) closing[stack.pop() ?? 0] = i;
+	}
+	let out = "";
+	let copied = 0;
+	let open = -1;
+	for (let i = 0; i < text.length; i++) {
+		const ch = text.charAt(i);
+		if (ch === "\n") open = -1;
+		else if (ch === "[") open = i;
+		else if (ch === "]" && open !== -1) {
+			const start = open;
+			open = -1;
+			const end = text[i + 1] === "(" ? (closing[i + 1] ?? -1) : -1;
+			if (end === -1 || i === start + 1) continue;
+			const first = text[start - 1] === "!" ? start - 1 : start;
+			out +=
+				text.slice(copied, first) +
+				render(text.slice(start + 1, i), text.slice(i + 2, end), text.slice(first, end + 1), first < start);
+			copied = end + 1;
+			i = end;
+		}
+	}
+	return out + text.slice(copied);
+}
+
+/**
+ * An emphasis opener may not sit between an ASCII letter or digit and
+ * punctuation (`a*(`), nor a closer between punctuation and an ASCII letter or
+ * digit (`)*d`): CommonMark's flanking rule. Non-ASCII letters are exempt so
+ * Korean or Japanese text that ends a bold span with punctuation and continues
+ * without a space (`**설명(예)**은`) still renders.
+ */
+function emphasisSpan(char: string, count: number, body: string): string {
+	const delimiter = char.repeat(count);
+	const open = `(?:(?<![A-Za-z0-9])${delimiter}|${delimiter}(?![\\p{P}\\p{S}]))`;
+	const close = `(?:(?<![\\p{P}\\p{S}])${delimiter}|${delimiter}(?![A-Za-z0-9]))`;
+	return `(?<!${char})${open}(${body})${close}(?!${char})`;
+}
+
+const EMPHASIS_PATTERN = [
+	emphasisSpan("\\*", 3, "[^*\\s<>](?:[^*\\n<>]*[^*\\s<>])?"),
+	emphasisSpan("\\*", 2, "[^*\\s<>](?:(?:[^*\\n<>]|(?<!\\*)\\*(?!\\*))*[^*\\s<>])?"),
+	emphasisSpan("\\*", 1, "[^*\\s<>](?:[^*\\n<>]*[^*\\s<>])?"),
+	emphasisSpan("~", 2, "[^~\\s<>](?:[^~\\n<>]*[^~\\s<>])?"),
+].join("|");
+
+/** `# Title ##` -> `Title`: an ATX header line's content, or undefined when the line is not a header or is empty. */
+function headerContent(line: string): string | undefined {
+	const match = /^ {0,3}#{1,6}[ \t]+(.*)$/.exec(line);
+	if (!match) return undefined;
+	let content = (match[1] ?? "").trimEnd();
+	let hashes = content.length;
+	while (hashes > 0 && content[hashes - 1] === "#") hashes--;
+	if (hashes < content.length && (hashes === 0 || content[hashes - 1] === " " || content[hashes - 1] === "\t"))
+		content = content.slice(0, hashes).trimEnd();
+	return content === "" ? undefined : content;
+}
+
+/**
+ * Convert a bounded markdown subset into Telegram HTML. Supported: fenced code
+ * (backtick or tilde), inline code spans of any backtick length, backslash
+ * escapes (the backslash stays visible), `***bold italic***`, `**bold**` (which may hold `*italic*`),
+ * `*italic*`, `~~strikethrough~~`, `[text](url)` (safe schemes, balanced
+ * parentheses), `#` headers, `>` blockquotes, and GFM tables (rendered as a
+ * monospace block or records).
+ * Unsupported or malformed markdown (images, link titles, `_underscore_`
+ * emphasis, indented code without a fence) is left as escaped literal text,
+ * never emitted as unbalanced tags.
  */
 export function markdownToTelegramHtml(markdown: string): string {
 	const placeholders: string[] = [];
+	/** What each placeholder stood for in the source, for link destinations. */
+	const sources: string[] = [];
 	const placeholderPattern = new RegExp(`${PLACEHOLDER_PREFIX}(\\d+)${PLACEHOLDER_SUFFIX}`, "g");
-	const stash = (html: string): string => {
+	const stash = (html: string, raw = ""): string => {
 		const token = `${PLACEHOLDER_PREFIX}${placeholders.length}${PLACEHOLDER_SUFFIX}`;
-		// A table can contain previously protected code. Resolve it before this
-		// fragment is protected in turn, keeping restoration single-pass and literal.
-		placeholders.push(
-			html.replace(placeholderPattern, (_m, i: string) =>
-				escapeHtml(telegramHtmlToPlainText(placeholders[Number(i)] ?? "")),
-			),
-		);
+		placeholders.push(html);
+		sources.push(raw);
 		return token;
 	};
 	const restorePlain = (value: string): string =>
 		value.replace(placeholderPattern, (_m, i: string) => telegramHtmlToPlainText(placeholders[Number(i)] ?? ""));
+	const restoreSource = (value: string): string =>
+		value.replace(placeholderPattern, (_m, i: string) => sources[Number(i)] ?? "");
 
 	// NUL is reserved for internal placeholders and must never reach Telegram.
-	let text = markdown.replaceAll("\u0000", "");
+	let text = markdown.replaceAll("\u0000", "").replaceAll("\r\n", "\n");
 
 	// 1. Fenced code blocks (protect literal content before any other transform).
-	text = text.replace(
-		/(^|\n)( {0,3})```[^\n`]*\n([\s\S]*?)(?:```|$)/g,
-		(_m, prefix: string, indent: string, body: string) =>
-			prefix + stash(pre(indent ? body.replace(new RegExp(`^ {0,${indent.length}}`, "gm"), "") : body)),
-	);
-	text = text.replace(/```([^`\n]*)```/g, (_m, body: string) => stash(code(body)));
+	text = convertFences(text, stash);
 
 	// 1b. GFM tables -> aligned monospace <pre> block (no native table primitive).
 	text = convertMarkdownTables(text, stash);
 
-	// 2. Inline code.
-	text = text.replace(/`([^`\n]+)`/g, (_m, body: string) => stash(code(body)));
+	// 2. Backslash escapes and inline code spans.
+	text = convertInlineCode(text, stash);
 
-	// 3. Links (capture raw URL before escaping). Unsafe/malformed links stay literal.
-	text = text.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (whole, label: string, url: string) => {
-		url = restorePlain(url);
-		if (!isSafeUrl(url)) return whole;
+	// 3. Links (destination read from the source before escaping). Images,
+	// unsafe schemes and destinations that are not one URL stay literal as a
+	// unit, so no later pass reformats part of them.
+	text = convertLinks(text, (label, destination, source, image) => {
+		const url = restoreSource(destination);
+		// Raw control characters already ended the destination; a code span's
+		// source can still bring whitespace back.
+		if (image || !isSafeUrl(url) || /\s/.test(url))
+			return stash(escapeHtml(source).replace(placeholderPattern, (_m, i: string) => placeholders[Number(i)] ?? ""));
 		return stash(`<a href="${escapeAttr(url)}">${escapeHtml(restorePlain(label))}</a>`);
 	});
 
@@ -261,27 +467,29 @@ export function markdownToTelegramHtml(markdown: string): string {
 	text = escapeHtml(text);
 
 	// 5. Line-level transforms on escaped text: headers and merged blockquotes.
+	// A header or blockquote with no content stays literal rather than emitting
+	// an empty tag.
 	const lines = text.split("\n");
 	const out: string[] = [];
-	let quoteBuffer: string[] | null = null;
+	let quoteLines: string[] = [];
+	let quoteBody: string[] = [];
 	const flushQuote = () => {
-		if (quoteBuffer) {
-			out.push(tag("blockquote", quoteBuffer.join("\n")));
-			quoteBuffer = null;
-		}
+		if (quoteLines.length === 0) return;
+		if (quoteBody.some((line) => line.trim() !== "")) out.push(tag("blockquote", quoteBody.join("\n")));
+		else out.push(...quoteLines);
+		quoteLines = [];
+		quoteBody = [];
 	};
 	for (const line of lines) {
-		const quote = /^&gt;\s?(.*)$/.exec(line);
+		const quote = /^ {0,3}&gt;[ \t]?(.*)$/.exec(line);
 		if (quote) {
-			if (!quoteBuffer) {
-				quoteBuffer = [];
-			}
-			quoteBuffer.push(quote[1] ?? "");
+			quoteLines.push(line);
+			quoteBody.push(quote[1] ?? "");
 			continue;
 		}
 		flushQuote();
-		const header = /^(#{1,6})\s+(.*)$/.exec(line);
-		out.push(header ? tag("b", header[2] ?? "") : line);
+		const header = headerContent(line);
+		out.push(header === undefined ? line : tag("b", header));
 	}
 	flushQuote();
 	text = out.join("\n");
@@ -290,12 +498,26 @@ export function markdownToTelegramHtml(markdown: string): string {
 	// This leaves crossing/unbalanced delimiters literal instead of crossing tags.
 	// A body starts and ends with a non-space character and its delimiters are
 	// not part of a longer run, so `2 * 3 * 4`, a `* item` bullet and the `**/*`
-	// in `src/**/*.ts` stay literal instead of losing their characters.
+	// in `src/**/*.ts` stay literal instead of losing their characters. A bold
+	// body may hold single `*` (so `**a *b* c**` nests); no body holds a `**`.
+	// Delimiters also follow CommonMark flanking against ASCII letters and
+	// digits, so `a*(b+c)*d` stays literal.
 	const emphasis = (value: string): string =>
 		value.replace(
-			/(?<!\*)\*\*([^*\s<>](?:[^*\n<>]*[^*\s<>])?)\*\*(?!\*)|(?<!\*)\*([^*\s<>](?:[^*\n<>]*[^*\s<>])?)\*(?!\*)|(?<!~)~~([^~\s<>](?:[^~\n<>]*[^~\s<>])?)~~(?!~)/g,
-			(_m, bold: string | undefined, italic: string | undefined, strike: string | undefined) =>
-				tag(bold !== undefined ? "b" : italic !== undefined ? "i" : "s", emphasis(bold ?? italic ?? strike ?? "")),
+			new RegExp(EMPHASIS_PATTERN, "gu"),
+			(
+				_m,
+				both: string | undefined,
+				bold: string | undefined,
+				italic: string | undefined,
+				strike: string | undefined,
+			) => {
+				if (both !== undefined) return tag("b", tag("i", emphasis(both)));
+				return tag(
+					bold !== undefined ? "b" : italic !== undefined ? "i" : "s",
+					emphasis(bold ?? italic ?? strike ?? ""),
+				);
+			},
 		);
 	text = emphasis(text);
 
@@ -304,7 +526,6 @@ export function markdownToTelegramHtml(markdown: string): string {
 
 	return text;
 }
-
 interface Token {
 	value: string;
 	/** Tag name if this token opens a tag, else undefined. */
@@ -322,8 +543,10 @@ function tokenize(html: string): Token[] {
 	while (i < html.length) {
 		const ch = String.fromCodePoint(html.codePointAt(i) ?? 0);
 		if (ch === "<") {
-			const end = html.indexOf(">", i);
-			if (end !== -1) {
+			// A tag ends at the next `>`; a `<` met first means this one is text.
+			let end = i + 1;
+			while (end < html.length && html[end] !== ">" && html[end] !== "<") end++;
+			if (html[end] === ">") {
 				const raw = html.slice(i, end + 1);
 				const close = /^<\/([a-z-]+)>$/i.exec(raw)?.[1]?.toLowerCase();
 				const open = /^<([a-z-]+)(?:\s[^>]*)?>$/i.exec(raw)?.[1]?.toLowerCase();
@@ -339,8 +562,8 @@ function tokenize(html: string): Token[] {
 			}
 		}
 		if (ch === "&") {
-			const end = html.indexOf(";", i);
-			if (end !== -1 && end - i <= 10) {
+			const end = html.slice(i, i + 11).indexOf(";") + i;
+			if (end > i) {
 				tokens.push({ value: html.slice(i, end + 1) });
 				i = end + 1;
 				continue;
@@ -364,7 +587,7 @@ const REOPEN_AMPLIFICATION_LIMIT = 8;
 export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT): string[] {
 	if (message.length <= max) return telegramHtmlToPlainText(message).length > 0 ? [message] : [];
 	const chunks: string[] = [];
-	let tokens = tokenize(message);
+	const tokens = tokenize(message);
 	const stack: OpenTag[] = [];
 	let out = "";
 	let chunkHasBody = false;
@@ -386,6 +609,14 @@ export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT)
 		if (idx === -1) return false;
 		stack.splice(idx, 1);
 		return true;
+	};
+
+	const pushText = (value: string): void => {
+		if (out.length + value.length + closersFor(stack).length > max) flush();
+		if (out.length + value.length + closersFor(stack).length > max)
+			throw new RangeError("Telegram chunk limit cannot fit a visible text unit");
+		out += value;
+		chunkHasBody = true;
 	};
 
 	for (let i = 0; i < tokens.length; i++) {
@@ -423,9 +654,10 @@ export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT)
 						.join("");
 					const href = /\bhref="([^"]*)"/.exec(token.value)?.[1] ?? "";
 					const plain = `${telegramHtmlToPlainText(label)} (${telegramHtmlToPlainText(href)})`;
-					// concat, not a spread splice: a long label has more tokens than a call takes arguments.
-					tokens = tokens.slice(0, i).concat(tokenize(escapeHtml(plain)), tokens.slice(end + 1));
-					i--;
+					// Emit the replacement text in place; rebuilding the token array per
+					// degraded anchor would make many long anchors quadratic.
+					for (const unit of tokenize(escapeHtml(plain))) pushText(unit.value);
+					i = end;
 				} else if (end < tokens.length) {
 					tokens[end] = { value: "" };
 				}
@@ -451,11 +683,7 @@ export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT)
 			continue;
 		}
 
-		if (out.length + token.value.length + closersFor(stack).length > max) flush();
-		if (out.length + token.value.length + closersFor(stack).length > max)
-			throw new RangeError("Telegram chunk limit cannot fit a visible text unit");
-		out += token.value;
-		chunkHasBody = true;
+		pushText(token.value);
 	}
 	if (chunkHasBody) chunks.push(out + closersFor(stack));
 	return chunks;
@@ -468,7 +696,7 @@ export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT)
  */
 export function telegramHtmlToPlainText(html: string): string {
 	return html
-		.replace(/<[^>]*>/g, "")
+		.replace(/<[^<>]*>/g, "")
 		.replace(/&lt;/g, "<")
 		.replace(/&gt;/g, ">")
 		.replace(/&quot;/g, '"')

@@ -319,7 +319,8 @@ function telegramDeliveryChunks(text: string): string[] {
 	const max = TELEGRAM_MESSAGE_LIMIT - DUPLICATE_WARNING_PREFIX.length;
 	const html = markdownToTelegramHtml(text);
 	const markupOnly = telegramHtmlToPlainText(html).trim() === "" && text.trim() !== "";
-	return splitTelegramHtml(markupOnly ? escapeHtml(text) : html, max);
+	// The literal fallback drops NUL just as the renderer does: it must never reach Telegram.
+	return splitTelegramHtml(markupOnly ? escapeHtml(text.replaceAll("\u0000", "")) : html, max);
 }
 
 /** The Telegram HTML messages one delivery posts, in order. */
@@ -376,7 +377,10 @@ const TELEGRAM_RETRY_AFTER_BUDGET_MS = 30_000;
 const TELEGRAM_PROGRESS_LIMIT = 256;
 
 interface TelegramChunkProgress {
-	/** The chunks rendered on first sight; a resume never re-renders, so boundaries cannot shift. */
+	/**
+	 * The chunks rendered on first sight; a resume never re-renders, so boundaries
+	 * cannot shift. A fully posted delivery drops them (0 of 0 sent).
+	 */
 	readonly chunks: readonly string[];
 	/** Chunks Telegram accepted, in order. `sent === chunks.length` means posted in full. */
 	sent: number;
@@ -497,13 +501,20 @@ export async function settleTelegramDelivery(
 			entry.uncertain = false;
 			progress.remember(deliveryId, entry);
 		}
+		// A fully posted reply only absorbs replays: keep a chunkless marker
+		// (0 of 0 sent) instead of up to a megabyte of rendered text.
+		if (entry.chunks.length > 0) progress.remember(deliveryId, { chunks: [], sent: 0, uncertain: false, stalls: 0 });
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
 		const transport = deliveryFailureIsAmbiguous(error);
 		const posted = entry.sent === entry.chunks.length;
 		if (!posted && entry.sent > 0) {
-			entry.uncertain = transport;
-			if (entry.sent === startedAt) entry.stalls++;
+			// A definitive refusal only proves this attempt did not land; an earlier
+			// uncertain send of the same chunk still may have, so its label stays.
+			entry.uncertain ||= transport;
+			// Only consecutive retries that get no further count: a chunk that
+			// finally landed must not charge its stalls to the next one.
+			entry.stalls = entry.sent === startedAt ? entry.stalls + 1 : 0;
 		}
 		// A redelivery this process holds no progress for (adapter restart, evicted
 		// entry) has lost its resume point and just reposted the prefix, so a

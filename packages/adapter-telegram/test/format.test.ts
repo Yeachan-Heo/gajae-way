@@ -75,7 +75,8 @@ test("link labels resolve protected inline code without leaking placeholders", (
 	for (const [markdown, html] of [
 		["[`code`](https://example.com)", '<a href="https://example.com">code</a>'],
 		["[a `x<&` b](https://example.com)", '<a href="https://example.com">a x&lt;&amp; b</a>'],
-		["[code](https://example.com/`path`)", '<a href="https://example.com/path">code</a>'],
+		// Backticks in a destination are URL characters, not a code span.
+		["[code](https://example.com/`path`)", '<a href="https://example.com/`path`">code</a>'],
 		["\u0000ph0\u0000 [`code`](https://example.com)", 'ph0 <a href="https://example.com">code</a>'],
 	] as const) {
 		const rendered = markdownToTelegramHtml(markdown);
@@ -229,4 +230,197 @@ test("a near-limit anchor that would be reopened per character degrades to label
 	// An anchor that fits whole on one chunk keeps its link even with a long href.
 	const fits = `https://e.com/${"a".repeat(2500)}`;
 	expect(renderTelegramDelivery(`[go](${fits})`)).toEqual([`<a href="${fits}">go</a>`]);
+});
+
+test("link destinations keep balanced parentheses; unbalanced or unsafe links stay literal", () => {
+	for (const [markdown, html] of [
+		["[Foo](https://en.wikipedia.org/wiki/Foo_(bar))", '<a href="https://en.wikipedia.org/wiki/Foo_(bar)">Foo</a>'],
+		["[a](https://ex.com/p?q=(1)) next", '<a href="https://ex.com/p?q=(1)">a</a> next'],
+		["([a](https://ex.com/x))", '(<a href="https://ex.com/x">a</a>)'],
+		[
+			"[a](https://ex.com/x) and [b](https://ex.com/y)",
+			'<a href="https://ex.com/x">a</a> and <a href="https://ex.com/y">b</a>',
+		],
+		["[a](https://ex.com/(x)", "[a](https://ex.com/(x)"],
+		["[a](https://ex.com/(x) y)", "[a](https://ex.com/(x) y)"],
+		["[x](javascript:alert(1))", "[x](javascript:alert(1))"],
+		["[x](javascript:alert(1)) [y](https://ok.example)", '[x](javascript:alert(1)) <a href="https://ok.example">y</a>'],
+	] as const) {
+		expect(markdownToTelegramHtml(markdown)).toBe(html);
+	}
+});
+
+test("a fence closes only on its own line with a run at least as long as the opener", () => {
+	for (const [markdown, html] of [
+		["```\nuse ``` for code\n```", "<pre>use ``` for code\n</pre>"],
+		["````\n```\ninner\n```\n````\nafter", "<pre>```\ninner\n```\n</pre>\nafter"],
+		["```\na\n``` trailing\n```", "<pre>a\n``` trailing\n</pre>"],
+		["~~~\nconst a = **b** ~~c~~;\n~~~", "<pre>const a = **b** ~~c~~;\n</pre>"],
+	] as const) {
+		expect(markdownToTelegramHtml(markdown)).toBe(html);
+	}
+});
+
+test("the markup-only fallback never forwards NUL", () => {
+	for (const chunk of [...renderTelegramDelivery("> \u0000"), ...renderTelegramDelivery("\u0000# \u0000", true)])
+		expect(chunk).not.toContain("\u0000");
+	expect(renderTelegramDelivery("> \u0000")).toEqual(["&gt; "]);
+});
+
+test("pathological bracket, backtick and delimiter runs render in linear time", () => {
+	for (const unit of [
+		"[",
+		"[a](",
+		"[x](https://x/",
+		"](",
+		"(",
+		"`",
+		"``x",
+		"` `` ",
+		"*a ",
+		"**a *",
+		"~~a ",
+		"[a](b ",
+		"\\[",
+		"> [",
+		"| [",
+		"```\n",
+		"~~~x\n",
+		"# a ",
+		"# a #  ",
+	]) {
+		const time = (size: number): number => {
+			const input = unit.repeat(Math.ceil(size / unit.length));
+			const started = performance.now();
+			const html = markdownToTelegramHtml(input);
+			const elapsed = performance.now() - started;
+			expect(html).not.toContain("\u0000");
+			return elapsed;
+		};
+		time(1_000);
+		// A quadratic scan takes seconds at 200k characters; a linear one, milliseconds.
+		expect(time(200_000)).toBeLessThan(1_500);
+	}
+});
+
+test("code spans pair backtick runs of equal length; escaped or unmatched runs stay literal", () => {
+	for (const [markdown, html] of [
+		["``a`b``", "<code>a`b</code>"],
+		["``abc``", "<code>abc</code>"],
+		["` a `", "<code>a</code>"],
+		["`  `", "<code>  </code>"],
+		["````x```", "````x```"],
+		["\\`x`", "\\`x`"],
+		["`a\nb`", "`a\nb`"],
+		["``", "``"],
+	] as const) {
+		expect(markdownToTelegramHtml(markdown)).toBe(html);
+	}
+});
+
+test("backslash escapes keep their backslash and their character out of the syntax", () => {
+	for (const [markdown, html] of [
+		["\\*not italic\\*", "\\*not italic\\*"],
+		["C:\\*name*\\file", "C:\\*name*\\file"],
+		["\\[x](https://x)", "\\[x](https://x)"],
+		["\\# not a header", "\\# not a header"],
+		["C:\\Users\\me\\.ssh", "C:\\Users\\me\\.ssh"],
+		["[a\\]b](https://x)", '<a href="https://x">a\\]b</a>'],
+		["[x](https://x/a\\)b)", '<a href="https://x/a)b">x</a>'],
+	] as const) {
+		expect(markdownToTelegramHtml(markdown)).toBe(html);
+	}
+});
+
+test("images, link titles and code-span destinations stay literal without losing characters", () => {
+	for (const [markdown, visible] of [
+		["![alt](https://x/i.png)", "![alt](https://x/i.png)"],
+		['[x](https://x "title")', '[x](https://x "title")'],
+		["[x](`https://x`)", "[x](https://x)"],
+		["[](https://x)", "[](https://x)"],
+	] as const) {
+		const html = markdownToTelegramHtml(markdown);
+		expect(html).not.toContain("<a ");
+		expect(telegramHtmlToPlainText(html)).toBe(visible);
+	}
+	expect(markdownToTelegramHtml("[a[b](https://x)")).toBe('[a<a href="https://x">b</a>');
+});
+
+test("headers and blockquotes follow CommonMark markers and never emit empty tags", () => {
+	for (const [markdown, html] of [
+		["# Title ###", "<b>Title</b>"],
+		["# C#", "<b>C#</b>"],
+		["# ###", "# ###"],
+		["   # Title", "<b>Title</b>"],
+		["#\u00a0no", "#\u00a0no"],
+		["####### x", "####### x"],
+		["  > text", "<blockquote>text</blockquote>"],
+		[">", "&gt;"],
+		["> a\n>\n> b", "<blockquote>a\n\nb</blockquote>"],
+		["# Title\r\n> a\r\n> b\r\n", "<b>Title</b>\n<blockquote>a\nb</blockquote>\n"],
+	] as const) {
+		expect(markdownToTelegramHtml(markdown)).toBe(html);
+	}
+});
+
+test("bold may hold italic; triple delimiters render bold italic", () => {
+	for (const [markdown, html] of [
+		["**bold *italic* text**", "<b>bold <i>italic</i> text</b>"],
+		["***both***", "<b><i>both</i></b>"],
+		["**a * b**", "<b>a * b</b>"],
+	] as const) {
+		expect(markdownToTelegramHtml(markdown)).toBe(html);
+	}
+	for (const literal of ["src/**/*.ts", "**bold *", "a ** b ** c", "***"])
+		expect(markdownToTelegramHtml(literal)).toBe(literal);
+});
+
+test("a table needs as many separator cells as header cells", () => {
+	for (const markdown of ["a | b\n--- | --- | ---\nx | y", "a | b | c\n--- | ---\nx | y | z"])
+		expect(markdownToTelegramHtml(markdown)).toBe(markdown);
+});
+
+test("indented and tilde fences protect their body; a fence with no body stays literal", () => {
+	for (const [markdown, html] of [
+		["- step\n    ```\n    *raw*\n    ```", "- step\n<pre>*raw*\n</pre>"],
+		["\t```\n\t*raw*\n\t```", "<pre>*raw*\n</pre>"],
+		["```\na\n    ```\nb", "<pre>a\n</pre>\nb"],
+		["```\n```", "```\n```"],
+		["```ts\n", "```ts\n"],
+	] as const) {
+		expect(markdownToTelegramHtml(markdown)).toBe(html);
+	}
+});
+
+test("many oversized anchors degrade in linear time", () => {
+	const time = (count: number): number => {
+		const html = markdownToTelegramHtml(`[x](https://x/${"a".repeat(4100)}) `.repeat(count));
+		const started = performance.now();
+		const chunks = splitTelegramHtml(html);
+		const elapsed = performance.now() - started;
+		expect(chunks.every((chunk) => chunk.length <= 4096 && !chunk.includes("<a "))).toBe(true);
+		return elapsed;
+	};
+	time(4);
+	// Rebuilding the token array per degraded anchor took seconds at this size.
+	expect(time(480)).toBeLessThan(1_500);
+});
+
+test("emphasis delimiters squeezed between ASCII words and punctuation stay literal", () => {
+	for (const literal of ["a*(b+c)*d", 'a*"b"*c', 'a**"b"**c', "x~~(y)~~z"])
+		expect(markdownToTelegramHtml(literal)).toBe(literal);
+	expect(markdownToTelegramHtml("a*&*b")).toBe("a*&amp;*b");
+	for (const [markdown, html] of [
+		["*(note)*", "<i>(note)</i>"],
+		['"**bold**"', '"<b>bold</b>"'],
+		["**설명(예)**은", "<b>설명(예)</b>은"],
+	] as const) {
+		expect(markdownToTelegramHtml(markdown)).toBe(html);
+	}
+});
+
+test("a refused link stays literal as a unit", () => {
+	for (const markdown of ["[x](javascript:**foo**)", "![**alt**](https://x/i.png)"])
+		expect(markdownToTelegramHtml(markdown)).toBe(markdown);
+	expect(markdownToTelegramHtml("[`a`](javascript:x)")).toBe("[<code>a</code>](javascript:x)");
 });

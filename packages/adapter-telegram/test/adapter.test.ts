@@ -588,7 +588,11 @@ async function chunkedSettlement(
 	respond: (call: number) => "ok" | "transport" | { retryAfter?: number },
 	run: (settle: (message: ChatMessagePayload) => Promise<void>) => Promise<void>,
 	sleeps: number[] = [],
-): Promise<{ calls: Array<Record<string, unknown>>; requests: Array<{ verb: string; params: unknown }> }> {
+): Promise<{
+	calls: Array<Record<string, unknown>>;
+	requests: Array<{ verb: string; params: unknown }>;
+	progress: TelegramDeliveryProgress;
+}> {
 	const home = await temporaryHome();
 	try {
 		const state = await TelegramAdapterState.load(home);
@@ -618,7 +622,7 @@ async function chunkedSettlement(
 				sleep: async (ms) => void sleeps.push(ms),
 			}),
 		);
-		return { calls, requests };
+		return { calls, requests, progress };
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
@@ -705,6 +709,57 @@ test("a transport failure after accepted chunks resumes at the uncertain chunk u
 	]);
 });
 
+test("a chunk Telegram finally accepts resets the stall count for the next chunk", async () => {
+	const chunks = renderTelegramDelivery(threeChunks);
+	const { calls, requests } = await chunkedSettlement(
+		(call) => (call === 1 || call === 7 || call === 10 ? "ok" : {}),
+		async (settle) => {
+			await settle(delivery(origin22, threeChunks));
+			for (let retry = 0; retry < 7; retry++)
+				await settle({ ...delivery(origin22, threeChunks), redelivered: true, duplicateWarning: true });
+		},
+	);
+	// Four stalled retries on chunk 2, then it lands; chunk 3's own refusals start a fresh count.
+	expect(sentTexts(calls)).toEqual([
+		chunks[0],
+		...Array.from({ length: 6 }, () => chunks[1]),
+		chunks[2],
+		chunks[2],
+		chunks[2],
+	]);
+	expect(requests.map((request) => (request.params as { ambiguous?: boolean }).ambiguous)).toEqual([
+		true,
+		true,
+		true,
+		true,
+		true,
+		true,
+		true,
+		undefined,
+	]);
+	expect(requests.at(-1)?.verb).toBe("delivery.confirm");
+});
+
+test("a chunk that may have landed keeps the duplicate warning after a later definitive refusal", async () => {
+	const chunks = renderTelegramDelivery(threeChunks);
+	const { calls } = await chunkedSettlement(
+		(call) => (call === 2 ? "transport" : call === 3 ? { retryAfter: 600 } : "ok"),
+		async (settle) => {
+			await settle(delivery(origin22, threeChunks));
+			await settle({ ...delivery(origin22, threeChunks), redelivered: true, duplicateWarning: true });
+			await settle({ ...delivery(origin22, threeChunks), redelivered: true, duplicateWarning: true });
+		},
+	);
+	// The refusal only proves the labelled resend did not land; the first send still may have.
+	expect(sentTexts(calls)).toEqual([
+		chunks[0],
+		chunks[1],
+		`${DUPLICATE_PREFIX}${chunks[1]}`,
+		`${DUPLICATE_PREFIX}${chunks[1]}`,
+		chunks[2],
+	]);
+});
+
 test("a delivery replayed after this adapter already posted it is confirmed again without reposting", async () => {
 	const chunks = renderTelegramDelivery(threeChunks);
 	const { calls, requests } = await chunkedSettlement(
@@ -719,6 +774,19 @@ test("a delivery replayed after this adapter already posted it is confirmed agai
 		{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } },
 		{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } },
 	]);
+});
+
+test("a fully posted delivery is remembered without its rendered chunks", async () => {
+	const { calls, requests, progress } = await chunkedSettlement(
+		() => "ok",
+		async (settle) => {
+			await settle(delivery(origin22, threeChunks));
+			await settle({ ...delivery(origin22, threeChunks), redelivered: true, duplicateWarning: true });
+		},
+	);
+	expect(progress.get("delivery-1")?.chunks).toEqual([]);
+	expect(calls).toHaveLength(3);
+	expect(requests.map((request) => request.verb)).toEqual(["delivery.confirm", "delivery.confirm"]);
 });
 
 test("repeated retry_after: 0 answers are bounded by the wait budget instead of spinning", async () => {
