@@ -204,8 +204,9 @@ export function markdownToTelegramHtml(markdown: string): string {
 
 	// 1. Fenced code blocks (protect literal content before any other transform).
 	text = text.replace(
-		/(^|\n)```[^\n`]*\n([\s\S]*?)(?:```|$)/g,
-		(_m, prefix: string, body: string) => prefix + stash(pre(body)),
+		/(^|\n)( {0,3})```[^\n`]*\n([\s\S]*?)(?:```|$)/g,
+		(_m, prefix: string, indent: string, body: string) =>
+			prefix + stash(pre(indent ? body.replace(new RegExp(`^ {0,${indent.length}}`, "gm"), "") : body)),
 	);
 	text = text.replace(/```([^`\n]*)```/g, (_m, body: string) => stash(code(body)));
 

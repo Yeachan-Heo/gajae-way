@@ -97,6 +97,8 @@ test("same-line and unclosed fences preserve their literal code content", () => 
 		["```<hello & goodbye>```", "<code>&lt;hello &amp; goodbye&gt;</code>"],
 		["```ts\nconst x = **raw** & <tag>;", "<pre>const x = **raw** &amp; &lt;tag&gt;;</pre>"],
 		["```hello", "```hello"],
+		["  ```ts\n  const x = **raw** < y;\n  ```", "<pre>const x = **raw** &lt; y;\n</pre>"],
+		["   ```\n   a & b\n    c\n   ```", "<pre>a &amp; b\n c\n</pre>"],
 	] as const) {
 		const rendered = markdownToTelegramHtml(markdown);
 		expect(rendered).toBe(html);
