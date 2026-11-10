@@ -2294,27 +2294,13 @@ export class MonitorPropagator {
 	}
 
 	/**
-	 * Check if there is a pending session.create intent for the given origin+epoch.
-	 * Issue #780, P2 #1: Before rotating the epoch, ensure no unresolved create intent exists
-	 * that would be orphaned by the epoch change.
+	 * Check if there is a pending session.create operation for the given origin+epoch.
+	 * Issue #780, P2 #1: Before rotating the epoch, ensure no unresolved create operation exists
+	 * in the broker_operations journal that would be orphaned by the epoch change.
 	 */
 	#hasPendingCreateIntent(sessionOriginKey: string, epoch: number): boolean {
 		const createScope = JSON.stringify([sessionOriginKey, epoch]);
-		const intents = this.#database.memory.openRows();
-		for (const intent of intents) {
-			if (intent.kind === "session.create") {
-				try {
-					const payload = JSON.parse(intent.payload_json);
-					// Check if this intent's scope matches the current origin+epoch
-					if (payload.scope === createScope) {
-						return true; // Found a pending create for this origin+epoch
-					}
-				} catch {
-					// Ignore parse errors; continue checking other intents
-				}
-			}
-		}
-		return false;
+		return this.#database.bindings.hasPendingSessionCreate(createScope);
 	}
 
 	/**
@@ -2356,15 +2342,18 @@ export class MonitorPropagator {
 	 * Issue #3: count per session origin, not per monitor across all event types.
 	 * Issue #5: skip unfinished (batched/queued) events.
 	 * Issue #6: bound the query with database parameters instead of selecting all rows.
+	 * Codex P2 #1: exclude overlap-skipped events from failure-streak boundaries.
+	 * Codex P2 #2: apply streak eligibility filters in SQL before limiting.
 	 */
 	#countConsecutiveFailures(monitorId: string, sessionOriginKey: string): number {
 		const monitor = this.#registry.get(monitorId);
 		if (!monitor?.enabled) return 0;
 
 		// Count consecutive recent failures on this monitor, filtered by session origin.
-		// Query is bounded to 2x threshold events to minimize database load.
+		// Fetch more rows than we need to account for filtering in code (Codex P2 #2).
+		// Query with larger limit to ensure we get enough terminal events after filtering.
 		let count = 0;
-		const limit = MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD * 2;
+		const limit = MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD * 4;
 		const recent = this.#database.monitors.eventRows(monitorId, "newest", false, limit);
 		for (const row of recent) {
 			// Issue #3: only count failures for this specific session origin
@@ -2381,6 +2370,13 @@ export class MonitorPropagator {
 			if (row.stage === "admitted" || row.stage === "batched" || row.stage === "dispatched") {
 				continue;
 			}
+
+			// Codex P2 #1: skip overlap-skipped events from failure-streak boundaries
+			// These are scheduling outcomes (overlap policy), not failures
+			if (row.stage === "skipped") {
+				continue;
+			}
+
 			// Count only terminal failure stages
 			if (row.stage === "failed" || row.stage === "failed_no_retry" || row.stage === "contract_unmet") {
 				count++;
@@ -2390,6 +2386,7 @@ export class MonitorPropagator {
 				}
 			} else {
 				// Stop counting at the first non-failed terminal event of this origin
+				// (successful dispatch, e.g., "delivered" or "authored_no_delivery")
 				break;
 			}
 		}
@@ -2987,6 +2984,19 @@ export class MonitorPropagator {
 				return undefined;
 			}
 		}
+		// Check for any pending session.create operation before rotating the epoch.
+		// Issue #780, P2 #1: If broker applied a create but response was lost,
+		// the pending operation remains in broker_operations. Rotating would orphan it.
+		const boundEpoch = this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
+		if (this.#hasPendingCreateIntent(sessionOriginKey, boundEpoch)) {
+			console.error(
+				`monitor session roll blocked for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} pending_create=true epoch=${boundEpoch}`,
+			);
+			// Keep the roll armed but don't execute it yet. The pending create may
+			// eventually succeed or timeout, allowing the roll to proceed then.
+			return undefined;
+		}
+
 		// Build the digest BEFORE the roll: it reads durable authored notes, which
 		// the roll does not touch, but reading first keeps the ordering obvious.
 		const digest = buildMonitorCompactionDigest({

@@ -1054,6 +1054,21 @@ export class BindingsGroup {
 				.get(operationRef, JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL)) !== null
 		);
 	}
+
+	/**
+	 * Check if there is any pending session.create operation for the given scope.
+	 * Issue #780, P2 #1: used to guard epoch rotation, ensuring we don't abandon
+	 * an unresolved create whose broker application succeeded but reply was lost.
+	 */
+	hasPendingSessionCreate(scope: string): boolean {
+		return (
+			this.#db
+				.prepare(
+					"SELECT 1 FROM broker_operations WHERE operation = 'session.create' AND scope = ? AND state = 'pending' LIMIT 1",
+				)
+				.get(scope) !== null
+		);
+	}
 }
 
 export type BrokerOperationKind = "session.create" | "turn.prompt" | "session.close";

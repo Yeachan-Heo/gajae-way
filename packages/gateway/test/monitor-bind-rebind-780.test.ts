@@ -237,6 +237,7 @@ test("a successful dispatch after failures clears the failure streak (issue #780
 			burstPolicy: "serialize",
 		});
 
+		let requestCount = 0;
 		const sessionPort: Partial<SessionPort> = {
 			bind: async (input) => {
 				return {
@@ -246,6 +247,19 @@ test("a successful dispatch after failures clears the failure streak (issue #780
 					repo: input.repo,
 					startupModelApplied: false,
 				};
+			},
+			// Issue #780 P3: mock authoring to return success for at least one event
+			request: async (input) => {
+				requestCount++;
+				// Third dispatch should succeed (after 2 failures) to test streak clearing
+				if (requestCount === 3) {
+					return {
+						receipt: { sessionId: input.sessionId, operationRef: input.opRef },
+						assistant: { text: JSON.stringify([{ eventId: input.text.match(/"eventId":"([^"]+)"/)?.[1] ?? "unknown", note: "[author note: success]" }]) },
+					} as never;
+				}
+				// First two should fail for streak
+				throw new Error("authoring failed (simulated failure)");
 			},
 			runExclusive: async (_, fn) => fn(),
 		};
@@ -265,35 +279,35 @@ test("a successful dispatch after failures clears the failure streak (issue #780
 
 		const originKey = `monitor/eventtype/test.success_clear/parent=${monitor.monitorId}`;
 
-		// Submit first event - will fail because authoring is not mocked
-		const eventId1 = await pipeline.submitAwaitable(monitor.monitorId, "test.success_clear", {});
+		// Submit events: first two will fail (creating a streak), third succeeds to test streak clearing
+		const eventIds: string[] = [];
+		for (let i = 0; i < 3; i++) {
+			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.success_clear", {});
+			eventIds.push(eventId);
 
-		// Wait for dispatch attempt
-		for (let i = 0; i < 100; i++) {
-			const row = database.monitors.eventRows().find((r) => r.event_id === eventId1);
-			if (row?.stage === "failed") break;
-			await Bun.sleep(10);
+			// Wait for dispatch to complete
+			for (let j = 0; j < 200; j++) {
+				const row = database.monitors.eventRows().find((r) => r.event_id === eventId);
+				if (row?.stage === "failed" || row?.stage === "failed_no_retry" || row?.stage === "delivered" || row?.stage === "authored_no_delivery") {
+					break;
+				}
+				await Bun.sleep(10);
+			}
 		}
 
-		let safetyState = pipeline.sessionSafetyState(originKey);
+		// After three events (2 failed + 1 successful), check that streak is cleared
+		const rows = database.monitors.eventRows();
+		const successRow = rows.find((r) => r.event_id === eventIds[2]);
+		const failureRows = rows.filter((r) => (r.event_id === eventIds[0] || r.event_id === eventIds[1]) && (r.stage === "failed" || r.stage === "failed_no_retry"));
 
-		// A successful dispatch should clear the streak
-		// Note: In this test setup, all events will fail because authoring is not mocked,
-		// but the streak-clearing logic should still be tested through the failure counting.
-		const currentFailureCount =
-			database.monitors
-				.eventRows()
-				.filter((row) => row.monitor_id === monitor.monitorId)
-				.sort((a, b) => Date.parse(b.fired_at) - Date.parse(a.fired_at))
-				.findIndex(
-					(row) => !(row.stage === "failed" || row.stage === "failed_no_retry" || row.stage === "contract_unmet"),
-				) ?? -1;
+		// Verify streak was created
+		expect(failureRows.length).toBe(2);
+		// Verify successful dispatch happened
+		expect(successRow?.stage).toMatch(/delivered|authored/);
 
-		// Just verify the escalation flag is reset when streak is broken
-		if (currentFailureCount > 0) {
-			safetyState = pipeline.sessionSafetyState(originKey);
-			expect(safetyState.escalatedForCurrentStreak).toBe(false);
-		}
+		// Verify that successful dispatch cleared the escalation flag
+		const safetyState = pipeline.sessionSafetyState(originKey);
+		expect(safetyState.escalatedForCurrentStreak).toBe(false);
 
 		database.close();
 	} finally {
@@ -377,17 +391,22 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-restart-escalation-"));
 	try {
 		const dbPath = join(home, "gateway.db");
+		let persistedMonitorId: string | undefined;
 
 		// First boot: reach escalation threshold
 		{
 			const database = await Store.open(dbPath);
 			const registry = new MonitorRegistry(database);
-			const monitor = registry.add({
-				name: "restart-escalation-test",
-				trigger: { kind: "cron", schedule: "* * * * *" },
-				eventTypes: ["test.restart_escalation"],
-				burstPolicy: "serialize",
-			});
+			let monitor = registry.get("restart-escalation-test");
+			if (!monitor) {
+				monitor = registry.add({
+					name: "restart-escalation-test",
+					trigger: { kind: "cron", schedule: "* * * * *" },
+					eventTypes: ["test.restart_escalation"],
+					burstPolicy: "serialize",
+				});
+			}
+			persistedMonitorId = monitor.monitorId; // Issue #780 P3: reuse persisted monitor ID across restart
 
 			const sessionPort: Partial<SessionPort> = {
 				bind: async (_input) => {
@@ -416,7 +435,7 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 
 			// Submit events until escalation threshold is reached
 			for (let i = 0; i < 3; i++) {
-				const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.restart_escalation", {});
+				const eventId = await pipeline.submitAwaitable(persistedMonitorId!, "test.restart_escalation", {});
 
 				// Wait for dispatch attempt
 				for (let j = 0; j < 100; j++) {
@@ -437,12 +456,8 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 		{
 			const database = await Store.open(dbPath);
 			const registry = new MonitorRegistry(database);
-			const monitor = registry.add({
-				name: "restart-escalation-test",
-				trigger: { kind: "cron", schedule: "* * * * *" },
-				eventTypes: ["test.restart_escalation"],
-				burstPolicy: "serialize",
-			});
+			const monitor = registry.get(persistedMonitorId!);
+			if (!monitor) throw new Error("failed to load persisted monitor on restart (Issue #780 P3)");
 
 			const sessionPort: Partial<SessionPort> = {
 				bind: async (_input) => {
@@ -470,7 +485,7 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 			});
 
 			// Submit another event to trigger the already-escalated streak check
-			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.restart_escalation", {});
+			const eventId = await pipeline.submitAwaitable(persistedMonitorId!, "test.restart_escalation", {});
 
 			// Wait for dispatch attempt
 			for (let j = 0; j < 100; j++) {
