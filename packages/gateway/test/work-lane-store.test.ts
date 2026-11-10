@@ -1289,8 +1289,8 @@ test("#778: settles and validates force-retired attempt with operator_abandoned 
 
 	// Verify settlement succeeded
 	expect(result).toBeDefined();
-	// Settlement should succeed with either reported or fallback depending on delivery feasibility
-	expect(result?.runtime.decision).toMatch(/^(reported|fallback)$/);
+	// This fixture has no deliverable persona target, so the report settles as fallback
+	expect(result?.runtime.decision).toBe("fallback");
 	// Verify the terminal reason code is preserved
 	expect(result?.runtime.terminal?.reasonCode).toBe("operator_abandoned");
 
