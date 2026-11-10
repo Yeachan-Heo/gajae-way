@@ -85,7 +85,7 @@ export interface SweepNomination {
 	readonly now: number;
 }
 
-export type LaneForceRetireReason = "session_dead" | "session_disowned" | "operator_retired";
+export type LaneForceRetireReason = "session_dead" | "session_disowned" | "operator_retired" | "operator_abandoned";
 type ForceRetireSettlement = (name: string, opRef: string, reason: LaneForceRetireReason, endedAt: string) => boolean;
 
 export interface LaneGovernorOptions {
@@ -437,9 +437,19 @@ export class LaneGovernor {
 				}
 				repo = process.cwd();
 			}
-			// For force retire, we must have broker liveness proof that the session is dead or disowned.
+			// For force retire, we must have broker liveness proof that the session is dead or disowned,
+			// OR the session must be live but idle with an open attempt (operator abandonment).
 			const liveness = await this.#safeLiveness(lane.sessionId, repo);
-			if (liveness.live !== false && !liveness.disowned) {
+			const isIdleEnough = lane.idleMs >= this.idleRetireMs;
+			const isOpenAttempt = lane.attemptOpen;
+
+			// Allow retiring if:
+			// 1. Session is dead/disowned (normal case), OR
+			// 2. Session is live but idle with open attempt (operator abandonment)
+			const sessionIsDeadOrDisowned = liveness.live === false || liveness.disowned;
+			const canRetireAsAbandonment = liveness.live !== false && !liveness.disowned && isIdleEnough && isOpenAttempt;
+
+			if (!sessionIsDeadOrDisowned && !canRetireAsAbandonment) {
 				this.#log(`lane_force_retire_rejected name=${name} session=${lane.sessionId} reason=session_still_live`);
 				return {
 					retired: false,
@@ -447,15 +457,24 @@ export class LaneGovernor {
 					reason: "session is still live; cannot force retire",
 				};
 			}
-			// Session is confirmed dead or disowned; the attempt owner closes the
-			// history and runtime row together before we retire the binding. A
-			// completed attempt may also own an unresolved checks cycle that must end
+
+			// Session is confirmed dead, disowned, or idle+open (operator abandonment).
+			// The attempt owner closes the history and runtime row together before we retire the binding.
+			// A completed attempt may also own an unresolved checks cycle that must end
 			// when its lane is force-retired.
 			const lastAttempt = record?.attempts.at(-1);
 			if (lastAttempt && (!lastAttempt.endedAt || record?.state === "awaiting_checks")) {
-				const reason: LaneForceRetireReason = liveness.disowned ? "session_disowned" : "session_dead";
+				let settleReason: LaneForceRetireReason;
+				if (canRetireAsAbandonment) {
+					// Operator force-retired an idle open attempt (broker status unknown)
+					settleReason = "operator_abandoned";
+				} else if (liveness.disowned) {
+					settleReason = "session_disowned";
+				} else {
+					settleReason = "session_dead";
+				}
 				const endedAt = new Date(this.#now()).toISOString();
-				if (!this.#forceRetireSettlement?.(name, lastAttempt.opRef, reason, endedAt)) {
+				if (!this.#forceRetireSettlement?.(name, lastAttempt.opRef, settleReason, endedAt)) {
 					const detail = "work attempt could not be settled";
 					this.#log(`lane_force_retire_failed name=${name} opRef=${lastAttempt.opRef} reason=${detail}`);
 					return { retired: false, sessionKey, reason: detail };
@@ -474,7 +493,8 @@ export class LaneGovernor {
 				// For force retire, we proceed even if close fails since we have liveness proof.
 			}
 			this.#database.transaction((tx) => this.#database.bindings.rotateEpoch(tx, sessionKey));
-			this.#log(`lane_retired name=${name} session=${lane.sessionId} reason=operator_force closed=${closed}`);
+			const logReason = canRetireAsAbandonment ? "operator_abandoned" : "operator_force";
+			this.#log(`lane_retired name=${name} session=${lane.sessionId} reason=${logReason} closed=${closed}`);
 			return { retired: true, sessionKey, sessionId: lane.sessionId, closed, forced: true };
 		});
 	}

@@ -910,3 +910,74 @@ test("#360: retireAllDead retires only dead lanes, skipping live and quarantined
 	expect(port.closes.length).toBe(2);
 	expect(port.closes.map((c) => c.sessionId).sort()).toEqual(["sess-dead1", "sess-dead2"]);
 });
+
+test("#778: forceRetire settles an open idle attempt on a live session as operator abandonment", async () => {
+	database = await Store.open(":memory:");
+	// Stuck lane: session is live but idle, attempt is open (broker status unknown)
+	bind("stuck", NOW - 120_000, SESSION_ID); // idle for 120s, use proper session ID format
+	
+	// Create a job record with an open attempt (no endedAt)
+	const identity = laneJobIdentity("stuck");
+	let record: LaneJobRecord = createLaneJobRecord({
+		jobId: identity.jobId,
+		branch: "work/test",
+		worktreePath: "/tmp/worker-repo",
+		sessionId: SESSION_ID,
+		now: () => new Date(NOW - 120_000),
+	});
+	// Append an open attempt (no endedAt means broker status is uncertain)
+	record = appendAttempt(record, {
+		opRef: "op-stuck-1",
+		sessionId: SESSION_ID,
+		startedAt: new Date(NOW - 120_000).toISOString(),
+		// NO endedAt: attempt is open with uncertain broker status
+	});
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }),
+	);
+
+	const port = new ScriptedSessionPort();
+	const logs: string[] = [];  
+	const settledAttempts: Array<{ name: string; opRef: string; reason: string; endedAt: string }> = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		idleRetireMs: 60_000, // 60s idle threshold
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	// Set up settlement callback to track settled attempts
+	governor.setForceRetireSettlement((name, opRef, reason, endedAt) => {
+		settledAttempts.push({ name, opRef, reason, endedAt });
+		return true;
+	});
+
+	// Without the fix, this should refuse to retire (session is live, attempt is open).
+	// With the fix, it should retire as operator abandonment since:
+	// - Session is live but idle >= idleRetireMs (120s >= 60s)
+	// - Attempt is open (uncertain broker status)
+	// - Operator explicitly requests force retirement
+	port.setSessionState(SESSION_ID, { live: true }); // Session is live, not dead/disowned
+	const result = await governor.forceRetire("stuck");
+
+	// Should succeed with the fix
+	expect(result.retired).toBe(true);
+	if (result.retired) {
+		expect(result.forced).toBe(true);
+	}
+
+	// Verify the attempt was settled as operator abandonment
+	expect(settledAttempts).toHaveLength(1);
+	expect(settledAttempts[0]).toMatchObject({
+		name: "stuck",
+		opRef: "op-stuck-1",
+		reason: "operator_abandoned", // New reason for idle abandonment
+	});
+
+	// Verify session was closed
+	expect(port.closes).toContainEqual({ sessionId: SESSION_ID, repo: "/tmp/worker-repo" });
+
+	// Verify retirement was logged
+	expect(logs.some((line) => line.includes("lane_retired name=stuck") && line.includes("reason=operator_abandoned"))).toBe(true);
+});
