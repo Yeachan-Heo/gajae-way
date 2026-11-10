@@ -443,11 +443,53 @@ export class LaneGovernor {
 			const isIdleEnough = lane.idleMs >= this.idleRetireMs;
 			const isOpenAttempt = lane.attemptOpen;
 
+			// For abandonment, we need broker evidence:
+			// 1. Session activity state is idle
+			// 2. Op status from broker is unknown with receiptState unknown (not in_flight, not accepted)
+			const lastAttempt = record?.attempts.at(-1);
+			let canRetireAsAbandonment = false;
+			let brokerActivityIdle = false;
+			let opStatusUnknown = false;
+			if (liveness.live !== false && !liveness.disowned && isIdleEnough && isOpenAttempt && lastAttempt) {
+				// Check broker activity state
+				try {
+					const brokerSession = await this.#port.inspect({ sessionId: lane.sessionId, repo });
+					if (brokerSession) {
+						brokerActivityIdle = !brokerSession.activityState || brokerSession.activityState === "idle";
+					}
+				} catch (error) {
+					const detail = sanitizeDiagnostic(diagnostic(error));
+					this.#log(`lane_broker_inspect_failed name=${name} session=${lane.sessionId} reason=${detail}`);
+					// Conservative: cannot confirm idle, refuse abandonment
+					brokerActivityIdle = false;
+				}
+
+				// Check op status from broker
+				try {
+					const status = await this.#port.status({
+						sessionId: lane.sessionId,
+						repo,
+						opRef: lastAttempt.opRef,
+					});
+					const promptStatus = status.status.status;
+					const receiptState = status.status.receiptState;
+					// Unknown status with unknown receipt = safe to abandon
+					opStatusUnknown = promptStatus === "unknown" && (receiptState === undefined || receiptState === "unknown");
+				} catch (error) {
+					const detail = sanitizeDiagnostic(diagnostic(error));
+					this.#log(`lane_status_check_failed name=${name} opRef=${lastAttempt.opRef} reason=${detail}`);
+					// Conservative: cannot confirm status unknown, refuse abandonment
+					opStatusUnknown = false;
+				}
+
+				// Allow abandonment only if both broker conditions are met
+				canRetireAsAbandonment = brokerActivityIdle && opStatusUnknown;
+			}
+
 			// Allow retiring if:
 			// 1. Session is dead/disowned (normal case), OR
-			// 2. Session is live but idle with open attempt (operator abandonment)
+			// 2. Session is live but idle with broker confirmation (operator abandonment)
 			const sessionIsDeadOrDisowned = liveness.live === false || liveness.disowned;
-			const canRetireAsAbandonment = liveness.live !== false && !liveness.disowned && isIdleEnough && isOpenAttempt;
 
 			if (!sessionIsDeadOrDisowned && !canRetireAsAbandonment) {
 				this.#log(`lane_force_retire_rejected name=${name} session=${lane.sessionId} reason=session_still_live`);
@@ -462,7 +504,6 @@ export class LaneGovernor {
 			// The attempt owner closes the history and runtime row together before we retire the binding.
 			// A completed attempt may also own an unresolved checks cycle that must end
 			// when its lane is force-retired.
-			const lastAttempt = record?.attempts.at(-1);
 			if (lastAttempt && (!lastAttempt.endedAt || record?.state === "awaiting_checks")) {
 				let settleReason: LaneForceRetireReason;
 				if (canRetireAsAbandonment) {
