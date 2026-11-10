@@ -2343,58 +2343,35 @@ export class MonitorPropagator {
 	 * Issue #5: skip unfinished (batched/queued) events.
 	 * Issue #6: bound the query with database parameters instead of selecting all rows.
 	 * Codex P2 #1: exclude overlap-skipped events from failure-streak boundaries.
-	 * Codex P2 #2: fetch enough rows to find threshold same-origin failures despite interleaved other-origin events.
+	 * Codex P2 #2: page through rows so interleaved other-origin events cannot hide a same-origin streak.
 	 */
 	#countConsecutiveFailures(monitorId: string, sessionOriginKey: string): number {
 		const monitor = this.#registry.get(monitorId);
 		if (!monitor?.enabled) return 0;
 
 		// Count consecutive recent failures on this monitor, filtered by session origin.
-		// Fetch a large batch to account for filtering: with N event types and balanced distribution,
-		// we may need 100x the threshold to ensure threshold same-origin failures are not hidden.
+		// Other origins' rows are skipped, so read newest-first in pages until the streak ends,
+		// reaches the threshold, or the history runs out: interleaved events never hide a streak.
+		const pageSize = MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD * 4;
 		let count = 0;
-		const limit = Math.max(MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD * 100, 500);
-		const recent = this.#database.monitors.eventRows(monitorId, "newest", false, limit);
-
-		for (const row of recent) {
-			// Issue #3: only count failures for this specific session origin
-			const eventOrigin = monitorOriginForEvent(monitor, row.event_type);
-			const eventOriginKey = originKey(eventOrigin);
-
-			if (eventOriginKey !== sessionOriginKey) {
-				// Different session origin, skip this row and continue searching
-				// (a monitor with multiple event types may have A/B/A sequence)
-				continue;
-			}
-
-			// Skip events that are still in-flight (unfinished) - Issue #5
-			// Codex P2 #2: these must not break the streak
-			if (row.stage === "admitted" || row.stage === "batched" || row.stage === "dispatched") {
-				continue;
-			}
-
-			// Codex P2 #1: skip overlap-skipped events from failure-streak boundaries
-			// These are scheduling outcomes (overlap policy), not failures
-			if (row.stage === "skipped") {
-				continue;
-			}
-
-			// Count only terminal failure stages
-			if (row.stage === "failed" || row.stage === "failed_no_retry" || row.stage === "contract_unmet") {
-				count++;
-				// If we've counted enough origin-specific failures, stop
-				if (count >= MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD) {
-					break;
+		for (let offset = 0; ; offset += pageSize) {
+			const page = this.#database.monitors.eventRows(monitorId, "newest", false, pageSize, offset);
+			for (const row of page) {
+				// Issue #3: only count failures for this specific session origin
+				if (originKey(monitorOriginForEvent(monitor, row.event_type)) !== sessionOriginKey) continue;
+				// Issue #5: in-flight events do not break the streak
+				if (row.stage === "admitted" || row.stage === "batched" || row.stage === "dispatched") continue;
+				// Codex P2 #1: overlap-skipped events are scheduling outcomes, not failures
+				if (row.stage === "skipped") continue;
+				if (row.stage !== "failed" && row.stage !== "failed_no_retry" && row.stage !== "contract_unmet") {
+					// The first non-failed terminal event of this origin ends the streak
+					return count;
 				}
-			} else {
-				// Stop counting at the first non-failed terminal event of this origin
-				// (successful dispatch, e.g., "delivered" or "authored_no_delivery")
-				// This breaks the streak and resets the counter
-				break;
+				count++;
+				if (count >= MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD) return count;
 			}
+			if (page.length < pageSize) return count;
 		}
-
-		return count;
 	}
 
 	/**

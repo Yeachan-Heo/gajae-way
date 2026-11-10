@@ -463,3 +463,35 @@ test("fix #5 & #6: failure counting skips unfinished events and uses bounded que
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+test("eventRows pages newest-first with limit and offset (issue #780, P2 per-origin pagination)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-event-rows-page-"));
+	try {
+		const database = await Store.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "event-rows-page-test",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.page"],
+			burstPolicy: "serialize",
+		});
+		database.transaction((tx) => {
+			for (let i = 0; i < 5; i++) {
+				database.monitors.eventCreate(tx, {
+					eventId: `page-${i}`,
+					monitorId: monitor.monitorId,
+					eventType: "test.page",
+					payloadJson: "{}",
+					firedAt: new Date(1_000 + i).toISOString(),
+				});
+			}
+		});
+		const pages = [0, 2, 4].map((offset) =>
+			database.monitors.eventRows(monitor.monitorId, "newest", false, 2, offset).map((row) => row.event_id),
+		);
+		expect(pages).toEqual([["page-4", "page-3"], ["page-2", "page-1"], ["page-0"]]);
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});

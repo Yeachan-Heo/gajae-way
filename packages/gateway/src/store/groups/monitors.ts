@@ -779,6 +779,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		order: "newest" | "oldest" = "newest",
 		includeQuarantined = false,
 		limit?: number,
+		offset = 0,
 	): MonitorEventDbRow[] {
 		const direction = order === "oldest" ? "ASC" : "DESC";
 		const terms = [
@@ -787,10 +788,10 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		];
 		const where = terms.filter((term) => term !== undefined).join(" AND ") || "1=1";
 		const params: Array<string | number> = monitorId === undefined ? [] : [monitorId];
-		if (limit !== undefined) params.push(limit);
+		if (limit !== undefined) params.push(limit, offset);
 		return this.#db
 			.prepare(
-				`SELECT * FROM monitor_events WHERE ${where} ORDER BY fired_at ${direction}, rowid ${direction}${limit === undefined ? "" : " LIMIT ?"}`,
+				`SELECT * FROM monitor_events WHERE ${where} ORDER BY fired_at ${direction}, rowid ${direction}${limit === undefined ? "" : " LIMIT ? OFFSET ?"}`,
 			)
 			.all(...params) as MonitorEventDbRow[];
 	}
