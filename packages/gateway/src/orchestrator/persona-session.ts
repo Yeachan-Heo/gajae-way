@@ -74,6 +74,15 @@ const STATUS_TERMINAL_GRACE_MS = 250;
 /** `turn.result` recheck cadence for a running turn whose end no relay will announce: 250 ms doubling to 5 s. */
 const STATUS_RECHECK_MIN_MS = 250;
 const STATUS_RECHECK_MAX_MS = 5_000;
+/**
+ * A decidable-terminal turn whose text neither the owned relay nor the original
+ * result produced must not hold forever: keep probing briefly for a late
+ * receipt, then post one notice so the conversation is never left silent.
+ */
+const TERMINAL_TEXT_RECOVERY_WINDOW_MS = 60_000;
+const TERMINAL_TEXT_RECOVERY_MAX_ATTEMPTS = 12;
+const TERMINAL_TEXT_UNRECOVERABLE_NOTICE =
+	"[turn completed] The session finished but its result text was not recoverable. Send the request again if you need the answer.";
 const HOST_TERMINATION_RECHECK_MS = 1_000;
 /**
  * A transcript row is judged against the turn's dispatch floor with this much
@@ -1298,6 +1307,10 @@ type BoundTurn = PersonaTurnIdentity & {
 	statusRechecks: number;
 	/** A live tail stalled; keep reconciling status until it emits another frame or reaches terminal state. */
 	statusRecheckAfterStall: boolean;
+	/** Terminal status is decidable, but neither the tail nor the original result produced text. */
+	terminalTextMisses: number;
+	/** First terminal-text miss for this turn; bounds how long a late receipt is awaited. */
+	terminalTextFirstMissAtMs?: number;
 	/** First live-tail stall timestamp; only a nonterminal operation can expire against this deadline. */
 	stallStartedAtMs?: number;
 	/** Tail activity version captured when the current stall began. */
@@ -2078,6 +2091,7 @@ class OriginActor {
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
 			statusRecheckAfterStall: false,
+			terminalTextMisses: 0,
 			stallStartedAtMs: undefined,
 			providerRetryAttempt,
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
@@ -2527,6 +2541,7 @@ class OriginActor {
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
 			statusRecheckAfterStall: false,
+			terminalTextMisses: 0,
 			stallStartedAtMs: undefined,
 			providerRetryAttempt,
 			agentErrorRetryScheduled: false,
@@ -4190,12 +4205,29 @@ class OriginActor {
 					}
 				}
 				if (text === undefined) {
-					this.#logRecoveryHoldOnce(
-						bound.turn,
-						notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal",
+					const now = this.#manager.now();
+					bound.terminalTextMisses += 1;
+					bound.terminalTextFirstMissAtMs ??= now;
+					const exhausted =
+						bound.terminalTextMisses >= TERMINAL_TEXT_RECOVERY_MAX_ATTEMPTS ||
+						now - bound.terminalTextFirstMissAtMs >= TERMINAL_TEXT_RECOVERY_WINDOW_MS;
+					if (!exhausted) {
+						this.#logRecoveryHoldOnce(
+							bound.turn,
+							notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal",
+						);
+						// A missing receipt can arrive late; keep probing on the bounded cadence
+						// instead of waiting for the 60 s recovery sweep.
+						this.#scheduleStatusRecheck(bound);
+						return;
+					}
+					this.#manager.log(
+						`terminal_text_unrecoverable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} misses=${bound.terminalTextMisses} heldMs=${now - bound.terminalTextFirstMissAtMs}`,
+						"warn",
 					);
-					if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
-					return;
+					// The operation completed, so silence is not a valid answer: settle its
+					// trigger with one notice instead of holding the turn forever.
+					text = TERMINAL_TEXT_UNRECOVERABLE_NOTICE;
 				}
 				await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
 			} else if (!bound.retired || bound.answerWanted) {
