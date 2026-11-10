@@ -19,6 +19,7 @@ import {
 	type OriginRef,
 	OUTBOUND_FILE_MAX_BYTES,
 	type PromptImage,
+	ProtocolError,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
@@ -919,7 +920,18 @@ export class ReconnectingGateway implements GatewayClientLike {
 	}
 
 	async sendPanelResponse(response: EngagementPanelResponseParams): Promise<void> {
-		await this.request("engagement.panel_response", response);
+		const client = this.#client;
+		if (!client) throw new Error("Slack gateway is not connected");
+		try {
+			await client.request("engagement.panel_response", response);
+		} catch (error) {
+			if (error instanceof ProtocolError && (error.code === "unauthorized" || error.code === "invalid_params")) {
+				console.warn(`Slack panel response rejected: ${error.code}`);
+				return;
+			}
+			if (this.#client === client) this.scheduleReconnect();
+			throw error;
+		}
 	}
 
 	private monitor(client: GatewayClientLike, strikes = 0): void {

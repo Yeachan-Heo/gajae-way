@@ -2,7 +2,12 @@ import { expect, spyOn, test } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ImageFetch } from "@gajae-gateway/images";
-import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajae-gateway/protocol";
+import {
+	type ChatMessagePayload,
+	type EngagementContext,
+	type OriginRef,
+	ProtocolError,
+} from "@gajae-gateway/protocol";
 import { SlackApiError, type SlackHistoryPage, SlackWebApi } from "../src/api";
 import { panelAction } from "../src/interactions";
 import {
@@ -510,14 +515,8 @@ async function fixture(
 	};
 }
 
-test("Slack panel clicks remain unacknowledged until the gateway accepts after reconnect", async () => {
-	const f = await fixture(undefined, { autoRecover: false });
-	const acknowledgements: string[] = [];
-	const socket = f.sockets[0] as WebSocketLike;
-	socket.send = (data) => {
-		acknowledgements.push(data);
-	};
-	const frame = {
+function panelClickEnvelope() {
+	return {
 		envelope_id: "panel-click",
 		type: "interactive",
 		payload: {
@@ -528,13 +527,30 @@ test("Slack panel clicks remain unacknowledged until the gateway accepts after r
 			actions: [{ type: "button", ...panelAction("ask_user", "pending_panel", "choice_1", origin, "option_selected") }],
 		},
 	};
+}
+
+test.each([
+	["closed connection", new Error("gateway connection lost")],
+	["local request timeout", new ProtocolError("verb_failed", "request timed out after 30ms")],
+	[
+		"uncertain coordinator failure",
+		new ProtocolError("verb_failed", "Failed to submit panel response: response_error"),
+	],
+] as const)("Slack panel clicks retry %s without ACK until gateway acceptance", async (_reason, failure) => {
+	const f = await fixture(undefined, { autoRecover: false });
+	const acknowledgements: string[] = [];
+	const socket = f.sockets[0] as WebSocketLike;
+	socket.send = (data) => {
+		acknowledgements.push(data);
+	};
+	const frame = panelClickEnvelope();
 	const click = async () => {
 		socket.onmessage?.({ data: JSON.stringify(frame) });
 		await flush();
 	};
 	const requests = () => f.client.requests.filter((request) => request.verb === "engagement.panel_response");
 	try {
-		f.client.failure = new Error("gateway connection lost");
+		f.client.failure = failure;
 		await click();
 		expect(requests()).toHaveLength(1);
 		expect(f.gateway.connected).toBe(false);
@@ -557,6 +573,43 @@ test("Slack panel clicks remain unacknowledged until the gateway accepts after r
 		await click();
 		expect(requests()).toHaveLength(2);
 		expect(acknowledgements).toHaveLength(2);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test.each([
+	["unauthorized", "Failed to submit panel response: unauthorized_responder"],
+	["invalid_params", "Failed to submit panel response: panel_not_found"],
+] as const)("Slack %s panel rejection is ACKed without reconnect or replay", async (code, message) => {
+	const f = await fixture(undefined, { autoRecover: false });
+	const acknowledgements: string[] = [];
+	const socket = f.sockets[0] as WebSocketLike;
+	socket.send = (data) => {
+		acknowledgements.push(data);
+	};
+	let disconnects = 0;
+	f.gateway.onDisconnected = () => {
+		disconnects++;
+	};
+	const frame = panelClickEnvelope();
+	const click = async () => {
+		socket.onmessage?.({ data: JSON.stringify(frame) });
+		await flush();
+	};
+	try {
+		f.client.failure = new ProtocolError(code, message);
+		await click();
+		expect(acknowledgements).toEqual([JSON.stringify({ envelope_id: "panel-click" })]);
+		expect(f.gateway.connected).toBe(true);
+		expect(disconnects).toBe(0);
+		f.client.failure = undefined;
+		await click();
+		expect(acknowledgements).toHaveLength(2);
+		expect(f.client.requests.filter((request) => request.verb === "engagement.panel_response")).toHaveLength(1);
+		await f.gateway.request("gateway.status");
+		expect(f.client.requests.at(-1)?.verb).toBe("gateway.status");
+		expect(disconnects).toBe(0);
 	} finally {
 		f.socket.stop();
 	}

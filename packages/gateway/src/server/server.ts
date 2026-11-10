@@ -2467,33 +2467,41 @@ async function handleRequest(
 				(params?.responseKind as string) === "option_selected"
 					? ((params?.selectedOptionId as string) || "").trim().slice(0, 256)
 					: undefined;
-			const authorId = (engagement?.authorId as string) || "";
-			const actor = typeof engagement?.authorName === "string" ? (engagement.authorName as string) : undefined;
+			let rejection: Awaited<ReturnType<typeof runtime.permissionPanels.respond>>;
+			try {
+				rejection = await runtime.permissionPanels.respond({
+					panelId,
+					responderId,
+					responseKind: responseKind as PanelResponseKind,
+					selectedOptionId,
+				});
+			} catch (error) {
+				throw new ProtocolError("verb_failed", `Failed to submit panel response: ${diagnostic(error)}`);
+			}
+			if (rejection) {
+				console.error(
+					`panel_response_rejected reason=${rejection} panel=${JSON.stringify(panelId)} responder=${JSON.stringify(responderId)}`,
+				);
+				throw new ProtocolError(
+					rejection === "unauthorized_responder" ? "unauthorized" : "invalid_params",
+					`Failed to submit panel response: ${rejection}`,
+				);
+			}
 
-			const coordinatorError = await runtime.permissionPanels
-				.respond({ panelId, responderId, responseKind: responseKind as PanelResponseKind, selectedOptionId })
-				.catch((error: unknown) => `response_error: ${diagnostic(error)}`);
-
-			// Record the panel response in the context ledger (audit trail)
+			// Record only accepted responses in model-visible context.
 			const responseBody =
 				responseKind === "option_selected"
-					? `[panel] answered question ${panelId} with option ${selectedOptionId}${coordinatorError ? ` (error: ${coordinatorError})` : ""}`
-					: `[panel] ${responseKind} panel ${panelId}${coordinatorError ? ` (error: ${coordinatorError})` : ""}`;
+					? `[panel] answered question ${panelId} with option ${selectedOptionId}`
+					: `[panel] ${responseKind} panel ${panelId}`;
 
 			options.database.transaction((tx) =>
 				options.database.inbox.contextRecord(tx, {
 					messageId: `panel/${responseKind}/${panelId}/${responderId}/${new Date().toISOString()}/${crypto.randomUUID().slice(0, 8)}`,
 					originKey: originKey(origin),
-					authorId,
-					...(actor ? { authorName: actor } : {}),
+					authorId: responderId,
 					body: responseBody,
 				}),
 			);
-
-			// Report result to adapter
-			if (coordinatorError) {
-				throw new ProtocolError("verb_failed", `Failed to submit panel response: ${coordinatorError}`);
-			}
 
 			connection.write({
 				v: PROFILE_VERSION,

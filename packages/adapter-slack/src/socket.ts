@@ -39,7 +39,7 @@ export interface WebSocketLike {
 }
 
 export interface SocketModeHandlers {
-	/** For block actions, resolve only after gateway acceptance; rejection leaves the envelope retryable. */
+	/** For block actions, resolve after acceptance or definitive rejection; throw for an uncertain handoff. */
 	onEvent(event: Record<string, unknown>, envelope: SlackEnvelope): void | Promise<void>;
 	onSlashCommand(command: SlackSlashCommand, envelope: SlackEnvelope): void | Promise<void>;
 	onConnected?(): void;
