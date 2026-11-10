@@ -2,6 +2,12 @@ import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
+import {
+	type ImageFetch,
+	ImagePreparationBudget,
+	ImagePreparationBudgetError,
+	PromptImageDownloadError,
+} from "@gajae-gateway/images";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import {
 	type ChannelEngagementPolicy,
@@ -12,11 +18,12 @@ import {
 	type FileRef,
 	type OriginRef,
 	OUTBOUND_FILE_MAX_BYTES,
+	type PromptImage,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 import { deliveryFailureIsAmbiguous, OutboundLimiter, SlackApiError, SlackWebApi } from "./api";
-import { describeInboundBody, type SlackFileCarrier } from "./attachments";
+import { describeInboundBody, isSlackNativeImage, prepareSlackImages, type SlackFileCarrier } from "./attachments";
 import { SlackDirectory } from "./author";
 import { adapterHome, type LoadedSlackAdapterConfig, loadSlackAdapterConfig } from "./config";
 import { describePanelResponse, type SlackBlockAction } from "./interactions";
@@ -218,6 +225,7 @@ export function describeMessageEdit(
 	channels: Channels,
 ): DescribedMessageEdit | undefined {
 	if (event.subtype !== "message_changed" || !event.message) return undefined;
+	if (hasNativeImageEdit(event)) return undefined;
 	const message = { ...event.message, channel: event.channel };
 	const admitted = decideInbound(message, identity, names, channels);
 	if (!admitted) return undefined;
@@ -231,6 +239,13 @@ export function describeMessageEdit(
 		text,
 		receivedAt: timestamp(message.edited?.ts ?? event.ts),
 	};
+}
+
+function hasNativeImageEdit(event: SlackInboundMessage): boolean {
+	return (
+		(event.message?.files ?? []).some(isSlackNativeImage) ||
+		(event.previous_message?.files ?? []).some(isSlackNativeImage)
+	);
 }
 
 /** Bounded inbound identity memory prevents replay/reconnect duplicate turns. */
@@ -308,6 +323,25 @@ export function replyThreadTs(message: Pick<ChatMessagePayload, "origin" | "repl
 	if (target.channel !== channel)
 		throw new SlackApiError(0, "invalid_target", "Slack reply target belongs to a foreign channel");
 	return target.ts;
+}
+
+async function sendSlackImageNotice(
+	api: Pick<SlackWebApi, "postMessage">,
+	origin: OriginRef,
+	notice: string,
+	log: Pick<Console, "error">,
+	replyToMessageId?: string,
+): Promise<void> {
+	if (notice === "") return;
+	try {
+		await api.postMessage(
+			deliveryChannel(origin),
+			`Image adjustment: ${notice}`,
+			replyThreadTs({ origin, replyToMessageId }),
+		);
+	} catch {
+		log.error("Slack image preparation notice could not be delivered.");
+	}
 }
 
 export async function settleSlackDelivery(
@@ -652,6 +686,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 		try {
 			const options = {
 				clientName: "adapter-slack",
+				requiredCapabilities: ["chat.images"],
 				onRetry: (attempt: number, delayMs: number, error: unknown) =>
 					console.warn(
 						`gateway_socket_waiting client=adapter-slack path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${errorText(error)}`,
@@ -695,8 +730,9 @@ export class ReconnectingGateway implements GatewayClientLike {
 		text: string,
 		engagement: EngagementContext,
 		receivedAt?: string,
-	): Promise<{ engaged?: boolean } | undefined> {
-		const sent = await this.requestRecovered(messageId, origin, text, engagement, receivedAt);
+		images?: readonly PromptImage[],
+	): Promise<{ engaged?: boolean; turnId?: string | null } | undefined> {
+		const sent = await this.requestRecovered(messageId, origin, text, engagement, receivedAt, images);
 		return sent.verdict === "acked" ? sent.result : undefined;
 	}
 
@@ -712,6 +748,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 		text: string,
 		engagement: EngagementContext,
 		receivedAt?: string,
+		images?: readonly PromptImage[],
 	): Promise<RecoveredSend> {
 		const pending = this.#pendingSends.get(messageId);
 		// Joining an in-flight send shares its verdict; a second caller never claims
@@ -725,12 +762,13 @@ export class ReconnectingGateway implements GatewayClientLike {
 		if (this.#inbound.has(messageId)) return { verdict: "duplicate" };
 		const attempt = (async (): Promise<RecoveredSend> => {
 			try {
-				const result = await this.request<{ engaged?: boolean } | undefined>("chat.send", {
+				const result = await this.request<{ engaged?: boolean; turnId?: string | null } | undefined>("chat.send", {
 					origin,
 					text,
 					messageId,
 					engagement,
 					...(receivedAt ? { receivedAt } : {}),
+					...(images && images.length > 0 ? { images } : {}),
 				});
 				this.#inbound.addIfAbsent(messageId);
 				// The gateway already decided engagement - including un-mentioned thread
@@ -758,8 +796,9 @@ export class ReconnectingGateway implements GatewayClientLike {
 		text: string,
 		engagement: EngagementContext,
 		receivedAt?: string,
+		images?: readonly PromptImage[],
 	): void {
-		void this.requestInbound(messageId, origin, text, engagement, receivedAt);
+		void this.requestInbound(messageId, origin, text, engagement, receivedAt, images);
 	}
 
 	/** Edits bypass inbound dedupe; the gateway owns idempotency by message + content. */
@@ -879,6 +918,7 @@ export async function startSlackAdapter(
 		api?: SlackWebApi;
 		socketFactory?: SocketModeOptions["factory"];
 		log?: Pick<Console, "log" | "error">;
+		imageFetch?: ImageFetch;
 		recoveryCursorPath?: string;
 		now?: () => number;
 		connectGateway?: (gateway: ReconnectingGateway) => Promise<void>;
@@ -928,6 +968,11 @@ export async function startSlackAdapter(
 		live,
 	);
 	const ingress = new OrderedIngress();
+	const imageBudget = new ImagePreparationBudget();
+	const prepareImages = (files: SlackFileCarrier["files"]) =>
+		(files ?? []).some(isSlackNativeImage)
+			? imageBudget.run(() => prepareSlackImages(files, config.botToken, ports.imageFetch))
+			: prepareSlackImages(files, config.botToken, ports.imageFetch);
 	const now = ports.now ?? Date.now;
 	const cursorPath = ports.recoveryCursorPath ?? recoveryCursorPath();
 	let cursors: RecoveryCursorState | undefined;
@@ -1010,6 +1055,10 @@ export async function startSlackAdapter(
 				// id, so live traffic records the bounded set recovery will revisit.
 				await rememberDm(message);
 				if (envelope.subtype === "message_changed") {
+					if (hasNativeImageEdit(envelope)) {
+						log.error("Slack image edit rejected; native image edits are unsupported.");
+						return;
+					}
 					const edit = describeMessageEdit(envelope, identity, directory, config.channels);
 					if (edit) gateway.sendEdit(edit.messageId, edit.origin, edit.text, edit.engagement, edit.receivedAt);
 					return;
@@ -1025,14 +1074,28 @@ export async function startSlackAdapter(
 				const origin = inThread
 					? admitted.origin
 					: maybeThreadOnMention(admitted.origin, engagement.mentioned, message.ts);
+				let prepared: Awaited<ReturnType<typeof prepareSlackImages>>;
+				try {
+					prepared = await prepareImages(message.files);
+				} catch {
+					// Gateway authorization is authoritative and cannot be established locally. Do not
+					// post into a channel whose authorization is unknown, or send text without the image.
+					log.error("Slack image input preparation failed; chat.send was not dispatched.");
+					return;
+				}
 				const result = await gateway.requestInbound(
 					slackMessageId(message.channel, message.ts),
 					origin,
 					text,
 					engagement,
 					timestamp(message.ts),
+					prepared.images,
 				);
-				if (result?.engaged) await rememberThread(origin);
+				if (result?.engaged) {
+					await rememberThread(origin);
+					if (typeof result.turnId === "string")
+						await sendSlackImageNotice(api, origin, prepared.notice, log, engagement.replyTo?.messageId);
+				}
 			});
 		} else if (event.type === "reaction_added" || event.type === "reaction_removed") {
 			const reaction = event as unknown as SlackReactionEvent;
@@ -1123,6 +1186,42 @@ export async function startSlackAdapter(
 			if (text === "") return "skip";
 			const messageId = slackMessageId(message.channel, message.ts);
 			const engagement = engagementForMessage(message, admitted.origin, identity, directory, config.channels);
+			const recordFailure = async (
+				classification: ReturnType<typeof classifyRecoveryFailure>,
+				reason: string,
+			): Promise<RecoveryDelivery> => {
+				let exhausted = false;
+				await mutate((state) => {
+					const recorded = recordAttempt(state, messageId, message.channel, classification, reason, nowMs);
+					exhausted = recorded.exhausted;
+					return recorded.state;
+				});
+				if (!exhausted) return "unavailable";
+				log.error(`Slack recovery discarded ${messageId} after repeated ${classification} failures: ${reason}`);
+				await mutate((state) =>
+					recordDeadLetter(state, {
+						messageId,
+						conversationId: message.channel,
+						classification,
+						attempts: RECOVERY_MAX_ATTEMPTS,
+						reason,
+						at: new Date(nowMs).toISOString(),
+					}),
+				);
+				return "discard";
+			};
+			let prepared: Awaited<ReturnType<typeof prepareSlackImages>>;
+			try {
+				prepared = await prepareImages(message.files);
+			} catch (error) {
+				log.error("Slack recovery image input preparation failed; chat.send was not dispatched.");
+				if (
+					error instanceof ImagePreparationBudgetError ||
+					(error instanceof PromptImageDownloadError && error.retryable)
+				)
+					return "unavailable";
+				return recordFailure("terminal-message", "Slack image input preparation failed.");
+			}
 			// A stale backfill (old, and the bot already posted after it in that
 			// conversation) is recorded so the persona's context is complete, but it
 			// never opens a turn: answering it now would re-answer something the room
@@ -1133,6 +1232,7 @@ export async function startSlackAdapter(
 				text,
 				stale ? { ...engagement, contextOnly: true } : engagement,
 				timestamp(message.ts),
+				prepared.images,
 			);
 			if (sent.verdict !== "unavailable") {
 				const postedAt = Number(message.ts) * 1000;
@@ -1148,32 +1248,18 @@ export async function startSlackAdapter(
 				// Keep the attempt record for messages within the grace period so we can re-evaluate
 				// after the grace period expires. Only clear once the grace period has passed.
 				if (!isWithinGrace) await mutate((state) => clearAttempt(state, messageId));
-				if (sent.verdict === "acked" && sent.result?.engaged) await rememberThread(admitted.origin);
+				if (sent.verdict === "acked" && sent.result?.engaged) {
+					await rememberThread(admitted.origin);
+					if (!stale && typeof sent.result.turnId === "string")
+						await sendSlackImageNotice(api, admitted.origin, prepared.notice, log, engagement.replyTo?.messageId);
+				}
 				return sent.verdict;
 			}
 			// Only a payload-specific refusal burns this message's budget; a link outage
 			// says nothing about the message and leaves the cursor exactly where it is.
 			const classification = classifyRecoveryFailure(sent.failure);
 			const reason = errorText(sent.failure);
-			let exhausted = false;
-			await mutate((state) => {
-				const recorded = recordAttempt(state, messageId, message.channel, classification, reason, nowMs);
-				exhausted = recorded.exhausted;
-				return recorded.state;
-			});
-			if (!exhausted) return "unavailable";
-			log.error(`Slack recovery discarded ${messageId} after repeated ${classification} failures: ${reason}`);
-			await mutate((state) =>
-				recordDeadLetter(state, {
-					messageId,
-					conversationId: message.channel,
-					classification,
-					attempts: RECOVERY_MAX_ATTEMPTS,
-					reason,
-					at: new Date(nowMs).toISOString(),
-				}),
-			);
-			return "discard";
+			return recordFailure(classification, reason);
 		};
 		for (const channel of channels) {
 			if ((current().quarantined[channel]?.failures ?? 0) >= RECOVERY_UNREADABLE_QUARANTINE_ATTEMPTS) continue;
@@ -1501,7 +1587,7 @@ export function slashCommandAck(command: string, sent: Pick<RecoveredSend, "verd
 /** Outcome of one gateway send, classified for recovery; `failure` carries the raw error for classification. */
 export interface RecoveredSend {
 	readonly verdict: RecoveryDelivery;
-	readonly result?: { engaged?: boolean };
+	readonly result?: { engaged?: boolean; turnId?: string | null };
 	readonly failure?: unknown;
 }
 

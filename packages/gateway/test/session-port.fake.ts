@@ -305,6 +305,7 @@ export class ScriptedSessionPort implements SessionPort {
 
 	async send(input: SessionSendInput): Promise<SendReceipt> {
 		this.sendAttempts.push(input);
+		input.beforeWrite?.();
 		if (this.#operations.has(input.opRef))
 			throw new OpRefRejectedError(input.opRef, "client_ref_conflict", { code: "client_ref_conflict" });
 		this.sends.push(input);
@@ -843,6 +844,7 @@ export class ScriptedSessionPort implements SessionPort {
 
 	seedAcceptedSend(input: SessionSendInput, state: Operation["state"] = "in_flight", text = ""): void {
 		this.sendAttempts.push(input);
+		input.beforeWrite?.();
 		this.sends.push(input);
 		const now = Date.now();
 		this.#operations.set(input.opRef, {

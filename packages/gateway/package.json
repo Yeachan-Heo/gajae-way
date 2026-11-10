@@ -12,6 +12,7 @@
 	},
 	"dependencies": {
 		"@gajae-gateway/home": "workspace:*",
+		"@gajae-gateway/images": "workspace:*",
 		"@gajae-gateway/log": "workspace:*",
 		"@gajae-gateway/protocol": "workspace:*",
 		"@gajae-gateway/subsession": "workspace:*",

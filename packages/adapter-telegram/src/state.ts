@@ -9,15 +9,23 @@ interface PersistedRoute {
 
 interface PersistedState {
 	readonly updateId?: number;
+	readonly lastRejection?: TelegramUpdateRejection;
 	readonly topics?: Readonly<Record<string, { readonly parentId: string; readonly messageThreadId: number }>>;
 	readonly routes?: Readonly<Record<string, PersistedRoute>>;
 }
 
 export interface TelegramReplyRoute extends PersistedRoute {}
 
+export interface TelegramUpdateRejection {
+	readonly updateId: number;
+	readonly verb: "chat.send" | "engagement.reaction";
+	readonly code: "invalid_params";
+}
+
 /** Durable data Telegram cannot resolve again through its Bot API after restart. */
 export class TelegramAdapterState {
 	#updateId: number | undefined;
+	#lastRejection: TelegramUpdateRejection | undefined;
 	#topics = new Map<string, { parentId: string; messageThreadId: number }>();
 	#routes = new Map<string, TelegramReplyRoute>();
 
@@ -28,6 +36,17 @@ export class TelegramAdapterState {
 		try {
 			const parsed = JSON.parse(await readFile(state.path, "utf8")) as PersistedState;
 			if (Number.isSafeInteger(parsed.updateId) && (parsed.updateId as number) >= 0) state.#updateId = parsed.updateId;
+			const rejection = parsed.lastRejection;
+			if (
+				rejection &&
+				Number.isSafeInteger(rejection.updateId) &&
+				rejection.updateId >= 0 &&
+				state.#updateId !== undefined &&
+				rejection.updateId <= state.#updateId &&
+				(rejection.verb === "chat.send" || rejection.verb === "engagement.reaction") &&
+				rejection.code === "invalid_params"
+			)
+				state.#lastRejection = { updateId: rejection.updateId, verb: rejection.verb, code: rejection.code };
 			for (const [key, topic] of Object.entries(parsed.topics ?? {})) {
 				if (typeof topic.parentId === "string" && Number.isSafeInteger(topic.messageThreadId))
 					state.#topics.set(key, { ...topic });
@@ -50,11 +69,32 @@ export class TelegramAdapterState {
 		return this.#updateId;
 	}
 
+	get lastRejection(): TelegramUpdateRejection | undefined {
+		return this.#lastRejection;
+	}
+
 	async acceptUpdate(updateId: number): Promise<boolean> {
+		return this.#commitUpdate(updateId);
+	}
+
+	async rejectUpdate(updateId: number, verb: TelegramUpdateRejection["verb"]): Promise<boolean> {
+		return this.#commitUpdate(updateId, { updateId, verb, code: "invalid_params" });
+	}
+
+	async #commitUpdate(updateId: number, rejection?: TelegramUpdateRejection): Promise<boolean> {
 		if (!Number.isSafeInteger(updateId)) throw new Error("Telegram update_id must be a safe integer");
 		if (this.#updateId !== undefined && updateId <= this.#updateId) return false;
+		const previousUpdateId = this.#updateId;
+		const previousRejection = this.#lastRejection;
 		this.#updateId = updateId;
-		await this.save();
+		if (rejection) this.#lastRejection = rejection;
+		try {
+			await this.save();
+		} catch (error) {
+			this.#updateId = previousUpdateId;
+			this.#lastRejection = previousRejection;
+			throw error;
+		}
 		return true;
 	}
 
@@ -84,6 +124,7 @@ export class TelegramAdapterState {
 		await mkdir(dirname(this.path), { recursive: true });
 		const payload: PersistedState = {
 			...(this.#updateId === undefined ? {} : { updateId: this.#updateId }),
+			...(this.#lastRejection === undefined ? {} : { lastRejection: this.#lastRejection }),
 			topics: Object.fromEntries(this.#topics),
 			routes: Object.fromEntries(this.#routes),
 		};

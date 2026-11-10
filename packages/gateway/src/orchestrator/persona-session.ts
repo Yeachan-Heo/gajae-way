@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { LogLevel } from "@gajae-gateway/log";
+import type { PromptImage } from "@gajae-gateway/protocol";
 import {
 	assertControlAllowed,
 	assertValidOpRef,
@@ -26,6 +27,7 @@ import {
 } from "../config";
 import { BrokerAuthorityError, type Store } from "../store";
 import {
+	editedOriginalId,
 	type InboundMessageRow,
 	type InboundTurn,
 	type TerminalUnlinkedReason,
@@ -47,6 +49,7 @@ import {
 import {
 	deterministicInterimDeliveryId,
 	isRelayTransportFailure,
+	MAX_RELAY_REQUEST_FRAME_BYTES,
 	TailCapacityError,
 	type TailFrame,
 	type TailHandle,
@@ -95,7 +98,19 @@ const SUBMISSION_RETRY_DELAY_MS = 3_000;
 const STEER_REPLAY_ATTEMPTS = 2;
 /** Bind failures back off exponentially from DISPATCH_FAILURE_RETRY_MS up to this ceiling. */
 const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
-/** Identical bind failures before the broker's own discovery file is judged. */
+const LOCAL_PREFLIGHT_REJECTION_PREFIX = "persona-local-preflight-rejection:";
+const PROMPT_TOO_LARGE_CODE = "prompt_too_large";
+
+class SendTurnNoLongerBoundError extends Error {}
+
+function localPreflightRejectionKey(opRef: string): string {
+	return `${LOCAL_PREFLIGHT_REJECTION_PREFIX}${opRef}`;
+}
+
+function localPreflightRejection(store: Store, opRef: string): string | undefined {
+	const code = store.core.metaGet(localPreflightRejectionKey(opRef));
+	return code === PROMPT_TOO_LARGE_CODE ? code : undefined;
+}
 
 function freshTurnMetaKey(originKey: string, epoch: number, triggerMessageId: string): string {
 	return `fresh_turn_attempt:${originKey}:${epoch}:${triggerMessageId}`;
@@ -426,6 +441,8 @@ export const PERSONA_RESTART_DRAIN_MAX_WAIT_MS = 300_000;
  */
 export interface PersonaTurnLifecycle {
 	readonly text: string;
+	/** Image inputs associated with the trigger; image rows cannot be consumed as text-only steers. */
+	readonly images?: readonly PromptImage[];
 	/**
 	 * Stable persona preamble. The actor puts it into a session's context on the
 	 * first send, after it changes, after the context shrank (compaction) or a
@@ -488,8 +505,8 @@ export interface PersonaTurnStartInput extends PersonaTurnIdentity {
 	/** The trigger row; the one prompt body of this turn. */
 	readonly trigger: InboundMessageRow;
 	/**
-	 * Present only for a settlement lifecycle of an already sent turn (adopted
-	 * after a restart or escalation): the context its prompt durably claimed.
+	 * Present only for a settlement lifecycle: the context an already sent prompt
+	 * durably claimed, or only the failed trigger for a local preflight rejection.
 	 * No new context window is prepared or committed for it (#686).
 	 */
 	readonly sentContextIds?: readonly string[];
@@ -1676,9 +1693,64 @@ class OriginActor {
 		return true;
 	}
 
+	async #settleLocalPreflightRejection(bound: BoundTurn, code: string): Promise<void> {
+		if (code !== PROMPT_TOO_LARGE_CODE) return;
+		const opRef = bound.turn.opRef;
+		const key = localPreflightRejectionKey(opRef);
+		if (localPreflightRejection(this.#manager.database, opRef) !== code) return;
+		const message = `the prompt exceeded the ${MAX_RELAY_REQUEST_FRAME_BYTES}-byte request limit before it was sent; reduce the text or number of images and send again`;
+		const error = new GjcRuntimeError(`${code}: ${message}`, { code, message });
+		this.#manager.log(
+			`persona_send_preflight_rejected origin=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} opRef=${opRef} reason=${code}`,
+			"warn",
+		);
+		bound.tail?.setTurnRunning(false);
+		try {
+			await bound.tail?.close();
+		} catch (closeError) {
+			this.#manager.log(
+				`send_preflight_tail_close_failed origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(closeError)}`,
+				"warn",
+			);
+		}
+		bound.tail = undefined;
+		if (!bound.retired || bound.answerWanted) {
+			try {
+				await bound.lifecycle.onFailure?.({ ...bound, error, forceFailureNotice: true });
+			} catch (noticeError) {
+				this.#manager.log(
+					`send_preflight_failure_notice_failed origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(noticeError)}`,
+					"error",
+				);
+				this.#scheduleStatusRecheck(bound);
+				throw noticeError;
+			}
+		}
+		const unlinkedReason: TerminalUnlinkedReason = bound.retired && !bound.answerWanted ? "retired" : "turn_failed";
+		const completed = this.#manager.database.transaction((tx) => {
+			const prompt = ownedTurnPrompt(this.#manager.database, opRef);
+			const authority = this.#manager.database.bindings.authority;
+			const changed = completeInboundTurn(this.#manager.database, tx, opRef, unlinkedReason);
+			if (changed === 1 && prompt && authority)
+				this.#manager.database.bindings.releaseBrokerOperation(
+					tx,
+					authority,
+					"turn.prompt",
+					JSON.stringify([prompt.sessionId, opRef]),
+					opRef,
+				);
+			if (changed === 1 || this.#manager.database.inbox.turnRow(opRef)?.turn_state === "done")
+				this.#manager.database.core.metaDelete(key);
+			return changed;
+		});
+		await this.#notifySettled(bound);
+		if (completed > 0 || this.#manager.database.inbox.turnRow(opRef)?.turn_state === "done")
+			await this.#settleAfterTerminal(bound);
+	}
+
 	/**
 	 * Why a bound trigger provably never reached the host (#685): no durable send
-	 * intent was stamped before `port.send`, or the port holds an authenticated
+	 * intent was stamped before the relay stream write, or the port holds an authenticated
 	 * `busy` refusal for its op-ref. Undefined means the prompt may have landed.
 	 */
 	#unadmittedReason(opRef: string, sessionId: string | null): "send_not_attempted" | "prompt_busy_refused" | undefined {
@@ -1706,6 +1778,7 @@ class OriginActor {
 	 * A turn whose prompt may have landed is left for reconcile; it is never resent.
 	 */
 	#releaseUnadmittedTurn(turn: InboundTurn, retired: boolean, source: "recovery" | "dispatch"): boolean {
+		if (localPreflightRejection(this.#manager.database, turn.opRef)) return false;
 		const reason = this.#unadmittedReason(turn.opRef, turn.sessionId);
 		if (!reason) return false;
 		const attempt = this.#manager.database.transaction((tx) => {
@@ -1925,6 +1998,22 @@ class OriginActor {
 		if (this.#quarantinedTurn(turn.opRef)) return;
 		const currentEpoch = this.#epoch();
 		const retired = turn.epoch < currentEpoch;
+		const localRejection = localPreflightRejection(this.#manager.database, turn.opRef);
+		if (localRejection) {
+			const sessionId = turn.sessionId;
+			if (!sessionId) {
+				this.#manager.log(
+					`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=local_preflight_session_unavailable`,
+					"warn",
+				);
+				return;
+			}
+			// The durable gateway-side rejection is authoritative for this op-ref;
+			// recovery must not ask the broker about a prompt that was never issued.
+			const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, true);
+			await this.#settleLocalPreflightRejection(bound, localRejection);
+			return;
+		}
 		if (turn.state === "bound" && this.#releaseUnadmittedTurn(turn, retired, "recovery")) return;
 		const sessionId = turn.sessionId;
 		if (!sessionId) {
@@ -2098,7 +2187,13 @@ class OriginActor {
 			sessionId,
 			turn,
 			trigger,
-			sentContextIds: this.#manager.database.inbox.sentContextIds(turn.opRef),
+			// A locally rejected, unfenced prompt never acquired a send-context claim.
+			// Settle its trigger without selecting or consuming other unread context.
+			sentContextIds:
+				localPreflightRejection(this.#manager.database, turn.opRef) &&
+				!this.#manager.database.inbox.sendAttempted(turn.opRef)
+					? [editedOriginalId(trigger.message_id) ?? trigger.message_id]
+					: this.#manager.database.inbox.sentContextIds(turn.opRef),
 		});
 		let tail: TailHandle | undefined;
 		let detached = false;
@@ -2439,6 +2534,10 @@ class OriginActor {
 		const unresolved = this.#manager.database.inbox
 			.nonterminalTurns(this.originKey)
 			.find((turn) => turn.epoch === epoch);
+		if (unresolved && localPreflightRejection(this.#manager.database, unresolved.opRef)) {
+			await this.#recoverTurn(unresolved);
+			return;
+		}
 		if (
 			unresolved &&
 			!(
@@ -2667,32 +2766,29 @@ class OriginActor {
 			return;
 		}
 		const preamble = this.#preambleForSend(binding.sessionId, epoch, lifecycle, context);
-		// Durable send intent (#685) and the context rows this prompt rendered
-		// (#686): from here on the prompt may land, so recovery must reconcile
-		// this turn instead of requeueing it, and its inputs belong to it.
-		if (
-			!this.#manager.database.transaction((tx) =>
-				this.#manager.database.inbox.markSendAttempted(tx, opRef, [...(lifecycle.contextMessageIds ?? [])]),
-			)
-		) {
-			// The row left `bound` underneath this actor; nothing was sent for it.
-			this.#current = undefined;
-			this.#state = "idle";
-			await tail.close();
-			await this.#notifyReleased(current);
-			this.#manager.log(`persona_send_skipped origin=${this.originKey} opRef=${opRef} reason=turn_not_bound`, "warn");
-			return;
-		}
 		try {
 			const receipt = await this.#manager.port.send({
 				sessionId: binding.sessionId,
 				repo: this.#manager.repo,
 				text: lifecycle.text,
+				...(lifecycle.images ? { images: lifecycle.images } : {}),
 				opRef,
 				relay: tail,
 				busyStallMs: this.#manager.busyStallMs,
 				...(preamble.text ? { systemPreamble: preamble.text } : {}),
 				...(lifecycle.sendModelFallback ? { model: lifecycle.sendModelFallback } : {}),
+				beforeWrite: () => {
+					// The exact frame is already validated; persist intent and context before it can land.
+					if (
+						!this.#manager.database.transaction((tx) =>
+							this.#manager.database.inbox.markSendAttempted(tx, opRef, [...(lifecycle.contextMessageIds ?? [])]),
+						)
+					)
+						throw new SendTurnNoLongerBoundError();
+				},
+				onPayloadTooLarge: () => {
+					this.#manager.database.core.metaSet(localPreflightRejectionKey(opRef), PROMPT_TOO_LARGE_CODE);
+				},
 			});
 			tail.correlate(opRef, receipt);
 			this.#manager.database.transaction((tx) => this.#manager.database.inbox.turnAccept(tx, opRef));
@@ -2702,6 +2798,18 @@ class OriginActor {
 			this.#bindEpochPoisoned = false;
 			this.#clearBindWedgeProbe();
 		} catch (error) {
+			if (error instanceof SendTurnNoLongerBoundError) {
+				this.#current = undefined;
+				this.#state = "idle";
+				await tail.close();
+				await this.#notifyReleased(current);
+				this.#manager.log(`persona_send_skipped origin=${this.originKey} opRef=${opRef} reason=turn_not_bound`, "warn");
+				return;
+			}
+			if (localPreflightRejection(this.#manager.database, opRef)) {
+				await this.#settleLocalPreflightRejection(current, PROMPT_TOO_LARGE_CODE);
+				return;
+			}
 			if (error instanceof ModelNotSelectedError && error.opRef === opRef) {
 				const refusal = new GjcRuntimeError(
 					"model_not_selected: request was not admitted because no model is selected",
@@ -2876,6 +2984,7 @@ class OriginActor {
 	#preSendFailures = 0;
 	/** A terminal_uncertain bind poisons this epoch's idempotency key; retries cannot make that key decidable. */
 	#bindEpochPoisoned = false;
+	/** Identical bind failures before the broker's own discovery file is judged. */
 	#sameDetailBindFailures = 0;
 	#lastBindDetail: string | undefined;
 	#bindHoldProbed = false;
@@ -3108,6 +3217,8 @@ class OriginActor {
 	 * turn) or the session refused and is being recovered.
 	 */
 	async #steerRow(current: BoundTurn, row: InboundMessageRow): Promise<boolean> {
+		// turn.steer is text-only; uncertain persisted image data stays queued as well.
+		if (hasPersistedImages(row.images_json)) return false;
 		if (
 			this.#manager.database.bindings.isQuarantined("inbound", row.message_id) ||
 			this.#quarantinedTurn(current.turn.opRef)
@@ -4131,6 +4242,11 @@ class OriginActor {
 	async #reconcileBound(bound: BoundTurn, knownReport?: StatusReport): Promise<void> {
 		if (this.#stopped || this.#manager.stopped) return;
 		if (this.#quarantinedTurn(bound.turn.opRef)) return;
+		const localRejection = localPreflightRejection(this.#manager.database, bound.turn.opRef);
+		if (localRejection) {
+			await this.#settleLocalPreflightRejection(bound, localRejection);
+			return;
+		}
 		bound.stallHostTerminated = confirmedStalledExit(this.#manager.database, {
 			opRef: bound.turn.opRef,
 			originKey: this.originKey,
@@ -5323,6 +5439,16 @@ export function steerDirectedAtPersona(row: InboundMessageRow): boolean {
 		readonly replyTo?: { readonly fromSelf?: boolean };
 	};
 	return engagement.group !== true || engagement.mentioned === true || engagement.replyTo?.fromSelf === true;
+}
+
+function hasPersistedImages(imagesJson: string | null): boolean {
+	if (imagesJson === null) return false;
+	try {
+		const parsed: unknown = JSON.parse(imagesJson);
+		return !Array.isArray(parsed) || parsed.length > 0;
+	} catch {
+		return true;
+	}
 }
 
 function laneSteerText(row: InboundMessageRow, lifecycle?: PersonaTurnLifecycle): string {

@@ -15,7 +15,16 @@ import {
 	SessionTerminalError,
 	sessionRequestStep,
 } from "../src/orchestrator/session-port";
-import { RelayHelloError, TailRunner } from "../src/orchestrator/tail-runner";
+import {
+	isRelayTransportFailure,
+	isUnwrittenRelayRequest,
+	MAX_RELAY_REQUEST_FRAME_BYTES,
+	RelayClosedError,
+	RelayHelloError,
+	RelayPayloadTooLargeError,
+	serializeRelayRequestFrame,
+	TailRunner,
+} from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, Store } from "../src/store";
 import {
 	createOwnedSessionFixture,
@@ -457,6 +466,114 @@ test("session request preserves local prompt fingerprint rejection instead of re
 	expect(f.relay.streams).toHaveLength(2);
 	expect(f.relay.streams[0]!.closed).toBe(false);
 	expect(f.relay.streams[1]!.closed).toBe(true);
+	await f.handle.close();
+});
+
+test("session send carries image bytes on its existing resident turn.prompt frame", async () => {
+	const f = await fixture({
+		mode: "answer",
+		relayReply: (request) => ({ ok: true, result: { accepted: true, clientRef: request.input.clientRef } }),
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
+	});
+	const images = [{ data: "AAECAwQFBgcICQ==", mimeType: "image/jpeg" as const }];
+	await f.port.send({
+		sessionId: "sdk-1",
+		repo: f.repo,
+		text: "describe this",
+		images,
+		opRef: "gw-image-frame",
+		relay: f.handle,
+	});
+	const frame = f.relay.streams[0]!.written.find((candidate) => candidate.type === "control_request");
+	expect(frame).toMatchObject({
+		type: "control_request",
+		operation: "turn.prompt",
+		input: { text: "describe this", clientRef: "gw-image-frame", images },
+	});
+	expect(JSON.stringify(frame)).toContain(`"data":"${images[0]!.data}"`);
+	expect(f.relay.requests.map((request) => request.operation)).toEqual(["turn.prompt"]);
+	await f.handle.close();
+});
+
+test("session send rejects a changed image set under a reused op ref", async () => {
+	const f = await fixture({
+		mode: "answer",
+		relayReply: (request) => ({ ok: true, result: { accepted: true, clientRef: request.input.clientRef } }),
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
+	});
+	const input = { sessionId: "sdk-1", repo: f.repo, text: "describe this", opRef: "gw-image-fingerprint" };
+	await f.port.send({ ...input, images: [{ data: "AQ==", mimeType: "image/jpeg" }] });
+	const failure = await f.port
+		.send({ ...input, images: [{ data: "Ag==", mimeType: "image/jpeg" }] })
+		.catch((error: unknown) => error);
+	expect(failure).toBeInstanceOf(OpRefError);
+	expect((failure as Error).message).toContain("already used for a different prompt");
+	expect(f.relay.requests.map((request) => request.operation)).toEqual(["turn.prompt"]);
+	await f.handle.close();
+});
+
+test("relay serializer accepts the literal 262144-byte boundary", () => {
+	const frame = {
+		type: "control_request",
+		id: "",
+		connectionId: "",
+		operation: "turn.prompt",
+		input: { text: "", clientRef: "gw-boundary" },
+		confirm: false,
+	};
+	const textBytes = 262144 - Buffer.byteLength(JSON.stringify(frame), "utf8");
+	const serialized = serializeRelayRequestFrame("sdk-1", {
+		...frame,
+		input: { ...frame.input, text: "x".repeat(textBytes) },
+	});
+	expect(MAX_RELAY_REQUEST_FRAME_BYTES).toBe(262144);
+	expect(Buffer.byteLength(serialized, "utf8")).toBe(262144);
+});
+
+test("session send records a typed local rejection before creating an operation intent for an oversized text-and-image prompt", async () => {
+	const f = await fixture({
+		mode: "answer",
+		relayReply: (request) => ({ ok: true, result: { accepted: true, clientRef: request.input.clientRef } }),
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
+	});
+	const input = {
+		sessionId: "sdk-1",
+		repo: f.repo,
+		opRef: "gw-oversized-prompt",
+		text: "x".repeat(240_000),
+		images: [{ data: "AQ==".repeat(10_000), mimeType: "image/jpeg" as const }],
+	};
+	const failure = await f.port.send(input).catch((error: unknown) => error);
+	expect(failure).toBeInstanceOf(RelayPayloadTooLargeError);
+	expect(failure).not.toBeInstanceOf(RelayClosedError);
+	expect((failure as RelayPayloadTooLargeError).code).toBe("prompt_too_large");
+	expect((failure as RelayPayloadTooLargeError).frameBytes).toBeGreaterThan(262144);
+	expect(isRelayTransportFailure(failure)).toBe(false);
+	expect(isUnwrittenRelayRequest(failure)).toBe(true);
+	expect(f.relay.requests).toEqual([]);
+	await f.port.send({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef, text: "small prompt" });
+	expect(f.relay.requests.map((request) => request.operation)).toEqual(["turn.prompt"]);
+	await f.handle.close();
+});
+
+test("an ambiguous prompt send is reconciled without replaying turn.prompt", async () => {
+	const f = await fixture({
+		mode: "tear",
+		relayReply: () => ({ ok: true, result: {} }),
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
+	});
+	const input = { sessionId: "sdk-1", repo: f.repo, text: "do not duplicate", opRef: "gw-ambiguous-image-prompt" };
+	await f.port.send({ ...input, images: [{ data: "AQ==", mimeType: "image/jpeg" }] }).catch(() => undefined);
+	await f.port.send({ ...input, images: [{ data: "AQ==", mimeType: "image/jpeg" }] }).catch(() => undefined);
+	expect(f.relay.requests.map((request) => request.operation)).toEqual(["turn.prompt", "turn.result"]);
 	await f.handle.close();
 });
 

@@ -139,7 +139,7 @@ class Api extends SlackWebApi {
 }
 async function fixture(
 	channels?: Record<string, { engagement: "open" }>,
-	options: { nested?: boolean; keepRecovery?: boolean; now?: () => number } = {},
+	options: { nested?: boolean; keepRecovery?: boolean; now?: () => number; imageFetch?: typeof fetch } = {},
 ) {
 	const home = await mkdtemp(join(tmpdir(), "slack-recovery-"));
 	const cursorPath = options.nested ? join(home, "adapters/slack/recovery-cursor.json") : join(home, "cursor.json");
@@ -157,6 +157,7 @@ async function fixture(
 		},
 		{
 			api,
+			imageFetch: options.imageFetch,
 			connectGateway: async () => {},
 			recoveryCursorPath: cursorPath,
 			now: options.now ?? (() => 10_000),
@@ -301,7 +302,23 @@ test("RT-SLACK-06b same-named image-only messages in two threads reach the gatew
 	// Live (sandoh, 2026-10-13): thread A's image.png (F0C8P71RK54) was downloaded by
 	// a turn that then failed; thread B's image.png (F0C8PPGAV7G) was answered with
 	// thread A's file. Each forwarded body must name the file it carries.
-	const f = await fixture();
+	const downloaded: string[] = [];
+	const f = await fixture(undefined, {
+		imageFetch: (async (input, init) => {
+			const url = String(input);
+			downloaded.push(url);
+			expect(init?.redirect).toBe("manual");
+			expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer xoxb-test");
+			return new Response(
+				Buffer.from(
+					url.includes("F0C8P71RK54")
+						? "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGP4z8DAAMIM/4EAAB/uBfsL2WiLAAAAAElFTkSuQmCC"
+						: "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR4nGNgQAYAAA4AAamRc7EAAAAASUVORK5CYII=",
+					"base64",
+				),
+			);
+		}) as typeof fetch,
+	});
 	const image = (id: string) => ({
 		id,
 		name: "image.png",
@@ -311,21 +328,27 @@ test("RT-SLACK-06b same-named image-only messages in two threads reach the gatew
 	});
 	await f.event({ ts: "2.0", thread_ts: "1.0", text: "", files: [image("F0C8P71RK54")] });
 	await f.event({ ts: "4.0", thread_ts: "3.0", text: "", files: [image("F0C8PPGAV7G")] });
-	// A partial file object (`file_access: check_file_info`) has no url: the id is the only handle.
+	// An identified image without a private URL cannot fall back to text-only input.
 	await f.event({
 		ts: "6.0",
 		thread_ts: "5.0",
 		text: "",
-		files: [{ id: "F0C8PARTIAL", file_access: "check_file_info" }],
+		files: [{ id: "F0C8PARTIAL", mimetype: "image/png", file_access: "check_file_info" }],
 	});
-	const texts = f.client.calls.filter((c) => c.verb === "chat.send").map((c) => String(c.params.text));
-	expect(texts).toHaveLength(3);
-	expect(texts[0]).toBe(
-		"[image · image.png · id F0C8P71RK54 · 120 KB · https://files.slack.com/files-pri/T1-F0C8P71RK54/image.png]",
-	);
+	const sends = f.client.calls.filter((c) => c.verb === "chat.send");
+	const texts = sends.map((c) => String(c.params.text));
+	expect(texts).toHaveLength(2);
+	expect(texts[0]).toContain("id F0C8P71RK54");
 	expect(texts[1]).toContain("id F0C8PPGAV7G");
 	expect(texts[1]).not.toContain("F0C8P71RK54");
-	expect(texts[2]).toBe("[file · id F0C8PARTIAL]");
+	expect(texts.join("\n")).not.toContain("https://");
+	expect(sends[0]!.params.images).toHaveLength(1);
+	expect(sends[1]!.params.images).toHaveLength(1);
+	expect(sends[0]!.params.images[0].data).not.toBe(sends[1]!.params.images[0].data);
+	expect(sends[0]!.params.origin.conversationId).toBe("C1:1.0");
+	expect(sends[1]!.params.origin.conversationId).toBe("C1:3.0");
+	expect(downloaded).toHaveLength(2);
+	expect(f.api.posts).toEqual([]);
 });
 
 test("RT-SLACK-07 own, hidden, every skipped subtype, unchanged/empty edits and duplicate app_mention never send", async () => {

@@ -65,6 +65,7 @@ export {
 	type OpsSloWindow,
 	type OriginHoldReason,
 	PROTOCOL_FAILURE_REASONS,
+	type PromptImage,
 	type PromptStatusBody,
 	type ProtocolFailureReason,
 	type RecallSnippet,

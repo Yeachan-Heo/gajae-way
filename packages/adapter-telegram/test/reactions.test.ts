@@ -3,7 +3,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatMessagePayload, ReactionRef } from "@gajae-gateway/protocol";
-import { platformSupportsReaction, REACTION_ALLOWLIST, reactionAllowlistFor } from "@gajae-gateway/protocol";
+import {
+	ProtocolError,
+	platformSupportsReaction,
+	REACTION_ALLOWLIST,
+	reactionAllowlistFor,
+} from "@gajae-gateway/protocol";
 import {
 	describeTelegramReaction,
 	type GatewayClientLike,
@@ -223,6 +228,11 @@ test("reacts to an inbound message by the chat-scoped id its turn was keyed with
 			"900",
 			{ chats: {} },
 			{ save: async () => Promise.reject(new Error("a text message never carries an attachment")) },
+			{
+				sendMessage: async () => {
+					throw new Error("text input must not emit an image notice");
+				},
+			},
 		);
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		await adapter.handleUpdate(mockGateway(requests), {
@@ -317,6 +327,11 @@ test("a reply to a forum topic message carries the chat-scoped id the persona ca
 			"900",
 			{ chats: {} },
 			{ save: async () => Promise.reject(new Error("a text message never carries an attachment")) },
+			{
+				sendMessage: async () => {
+					throw new Error("text input must not emit an image notice");
+				},
+			},
 		);
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		await adapter.handleUpdate(mockGateway(requests), {
@@ -422,6 +437,11 @@ test("handleUpdate reports an inbound reaction as engagement and never as a turn
 			"900",
 			{ chats: { "-100123": { engagement: "open" } } },
 			{ save: async () => Promise.reject(new Error("a reaction never carries an attachment")) },
+			{
+				sendMessage: async () => {
+					throw new Error("reactions must not emit an image notice");
+				},
+			},
 		);
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		const accepted = await adapter.handleUpdate(mockGateway(requests), {
@@ -437,6 +457,75 @@ test("handleUpdate reports an inbound reaction as engagement and never as a turn
 			action: "add",
 			engagement: { mentioned: false, group: true, authorId: "42", authorName: "reader", channelLabel: "war room" },
 		});
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("a rejected reaction is recorded durably and later reactions remain processable", async () => {
+	const home = await temporaryHome();
+	try {
+		const state = await TelegramAdapterState.load(home);
+		const adapter = new TelegramAdapter(
+			state,
+			"agent",
+			"900",
+			{ chats: {} },
+			{
+				save: async () => {
+					throw new Error("unexpected attachment");
+				},
+			},
+			{
+				sendMessage: async () => {
+					throw new Error("unexpected notice");
+				},
+			},
+		);
+		const first = { update_id: 5, message_reaction: reactionUpdate([], [{ type: "emoji", emoji: "👍" }]) };
+		const failure = new ProtocolError("invalid_params", "secret reaction text", { token: "secret-token" });
+		expect(
+			await adapter.handleUpdate(
+				{
+					request: async () => {
+						throw failure;
+					},
+				},
+				first,
+			),
+		).toBe(true);
+		const reloaded = await TelegramAdapterState.load(home);
+		expect(reloaded.updateId).toBe(5);
+		expect(reloaded.lastRejection).toEqual({ updateId: 5, verb: "engagement.reaction", code: "invalid_params" });
+		const restarted = new TelegramAdapter(
+			reloaded,
+			"agent",
+			"900",
+			{ chats: {} },
+			adapter.attachments,
+			adapter.replyBot,
+		);
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		expect(await restarted.handleUpdate(mockGateway(requests), first)).toBe(false);
+		const second = { update_id: 6, message_reaction: reactionUpdate([], [{ type: "emoji", emoji: "🔥" }]) };
+		const transient = new ProtocolError("verb_failed", "request timed out");
+		await expect(
+			restarted.handleUpdate(
+				{
+					request: async () => {
+						throw transient;
+					},
+				},
+				second,
+			),
+		).rejects.toBe(transient);
+		expect((await TelegramAdapterState.load(home)).updateId).toBe(5);
+		expect(await restarted.handleUpdate(mockGateway(requests), second)).toBe(true);
+		expect(requests.map(({ verb }) => verb)).toEqual(["engagement.reaction"]);
+		expect((requests[0]?.params as { emoji: string }).emoji).toBe("🔥");
+		const finalState = await TelegramAdapterState.load(home);
+		expect(finalState.updateId).toBe(6);
+		expect(finalState.lastRejection).toEqual({ updateId: 5, verb: "engagement.reaction", code: "invalid_params" });
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}

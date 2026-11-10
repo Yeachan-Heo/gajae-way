@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { assertNoPrivateWorkspaceDeps } from "./release-packages";
+import { assertNoPrivateWorkspaceDeps, RELEASE_ORDER } from "./release-packages";
 
-const RELEASE_PACKAGE_NAMES = new Set(["@gajae-gateway/protocol", "@gajae-gateway/sdk"]);
+const RELEASE_PACKAGE_NAMES = new Set(["@gajae-gateway/protocol", "@gajae-gateway/images", "@gajae-gateway/sdk"]);
 const RELEASE_PACKAGE_NAMES_WITH_PRIVATE = new Set([...RELEASE_PACKAGE_NAMES, "@gajae-gateway/home"]);
 
 const WORKSPACE_PACKAGES = new Map([
 	["@gajae-gateway/protocol", { name: "@gajae-gateway/protocol", private: false }],
+	["@gajae-gateway/images", { name: "@gajae-gateway/images", private: false }],
 	["@gajae-gateway/sdk", { name: "@gajae-gateway/sdk", private: false }],
 	["@gajae-gateway/home", { name: "@gajae-gateway/home", private: true }],
 	["@gajae-gateway/log", { name: "@gajae-gateway/log", private: false }],
@@ -27,11 +28,16 @@ const PRIVATE_WORKSPACE_DEPENDENCY_FIXTURES = [
 ] as const;
 
 describe("release package workspace dependency guard", () => {
+	test("releases images after protocol and before dependent packages", () => {
+		expect(RELEASE_ORDER).toEqual(["protocol", "images", "sdk", "cli"]);
+	});
+
 	test("allows dependencies on released workspace packages and external packages", () => {
 		const manifest = {
 			name: "@gajae-gateway/cli",
 			dependencies: {
 				"@gajae-gateway/protocol": "0.1.8",
+				"@gajae-gateway/images": "0.1.0",
 				"@gajae-gateway/sdk": "0.1.8",
 				kleur: "^4.1.5",
 			},
