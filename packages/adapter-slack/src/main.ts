@@ -1153,12 +1153,17 @@ export async function startSlackAdapter(
 				// session (a thread under the bot's own message keeps the channel one), and re-rooting it
 				// at the reply would open a new thread and a new session.
 				const inThread = message.thread_ts !== undefined && message.thread_ts !== message.ts;
-				const origin = rememberOrigin(
-					slackMessageId(message.channel, message.ts),
-					inThread
-						? admitted.origin
-						: maybeThreadOnMention(admitted.origin, engagement.mentioned, message.ts),
-				);
+				const baseOrigin = inThread ? admitted.origin : admitted.origin;
+				const threadOrigin =
+					!inThread && engagement.mentioned && message.ts
+						? {
+								platform: "slack" as const,
+								kind: "thread" as const,
+								conversationId: slackMessageId(message.channel, message.ts),
+								parentId: message.channel,
+							}
+						: baseOrigin;
+				const origin = rememberOrigin(slackMessageId(message.channel, message.ts), threadOrigin);
 				let prepared: Awaited<ReturnType<typeof prepareSlackImages>>;
 				try {
 					prepared = await prepareImages(message.files);
