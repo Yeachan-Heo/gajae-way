@@ -90,8 +90,8 @@ async function startBotTurn(claimTerminal: boolean) {
 	const guard = new BotAudienceTurnGuard(database.core);
 	const messageId = "bot-trigger";
 	expect(
-		database?.transaction((tx) =>
-			database?.inbox.enqueue(tx, {
+		database!.transaction((tx) =>
+			database!.inbox.enqueue(tx, {
 				messageId,
 				originKey: ORIGIN,
 				originRefJson: JSON.stringify(ORIGIN_REF),

@@ -71,7 +71,7 @@ async function harness(directory: string) {
 			scripted.complete(
 				input.opRef,
 				JSON.stringify(
-					(JSON.parse(input.text.match(/\[.*\]$/s)?.[0]) as Array<{ eventId: string }>).map(({ eventId }) => ({
+					(JSON.parse(input.text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>).map(({ eventId }) => ({
 						eventId,
 						note: "recorded",
 					})),
@@ -159,7 +159,7 @@ test("a monitor without an instruction gets no task segment", async () => {
 		// No instruction and no maintenance guidance for this event type: no
 		// task segment at all.
 		expect(
-			prompts[0]?.startsWith(
+			prompts[0]!.startsWith(
 				`${MONITOR_AUTHORING_HEADER}\n${MONITOR_AUTHORING_REPORT_RULE}\nRespond ONLY with a JSON array`,
 			),
 		).toBe(true);
@@ -279,8 +279,8 @@ test("#180/#369: typed targets survive restart and echoed instructions retain ap
 			sessionPort: new ScriptedSessionPort({
 				onSend: (input, scripted) => {
 					prompts.push(input.text);
-					const [event] = JSON.parse(input.text.match(/\[.*\]$/s)?.[0]) as Array<{ eventId: string }>;
-					scripted.complete(input.opRef, JSON.stringify([{ eventId: event?.eventId, note }]));
+					const [event] = JSON.parse(input.text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>;
+					scripted.complete(input.opRef, JSON.stringify([{ eventId: event!.eventId, note }]));
 				},
 			}),
 			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
@@ -290,11 +290,11 @@ test("#180/#369: typed targets survive restart and echoed instructions retain ap
 		});
 		pipeline.submit(monitorId, "gajaeway.runtime-feedback.daily", { at: "2026-09-07T11:00:00.000Z" });
 		await Bun.sleep(250);
-		expect(prompts[0]?.startsWith(`${MONITOR_AUTHORING_HEADER}\nTask: ${instruction}\n`)).toBe(true);
+		expect(prompts[0]!.startsWith(`${MONITOR_AUTHORING_HEADER}\nTask: ${instruction}\n`)).toBe(true);
 		expect(delivered).toHaveLength(1);
-		expect(delivered[0]?.origin).toEqual(channelTarget.origin);
+		expect(delivered[0]!.origin).toEqual(channelTarget.origin);
 		// The mention comes from the typed field, not from the author remembering it.
-		expect(delivered[0]?.text).toBe(`<@1468532331001413743> ${note}`);
+		expect(delivered[0]!.text).toBe(`<@1468532331001413743> ${note}`);
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
@@ -322,8 +322,8 @@ test("memory.debloat: the authoring turn sees the oversized memory files scanned
 			sessionPort: new ScriptedSessionPort({
 				onSend: (input, scripted) => {
 					prompts.push(input.text);
-					const [event] = JSON.parse(input.text.match(/\[\{.*\]$/s)?.[0]) as Array<{ eventId: string }>;
-					scripted.complete(input.opRef, JSON.stringify([{ eventId: event?.eventId, note: "[SILENT]" }]));
+					const [event] = JSON.parse(input.text.match(/\[\{.*\]$/s)![0]) as Array<{ eventId: string }>;
+					scripted.complete(input.opRef, JSON.stringify([{ eventId: event!.eventId, note: "[SILENT]" }]));
 				},
 			}),
 			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
@@ -333,8 +333,8 @@ test("memory.debloat: the authoring turn sees the oversized memory files scanned
 		});
 		pipeline.submit(monitor.monitorId, "memory.debloat", { at: "2026-10-22T04:15:00.000Z" });
 		for (let i = 0; i < 100 && prompts.length === 0; i++) await Bun.sleep(10);
-		const [event] = JSON.parse(prompts[0]?.match(/\[\{.*\]$/s)?.[0]) as Array<{ payload: unknown }>;
-		expect(event?.payload).toEqual({
+		const [event] = JSON.parse(prompts[0]!.match(/\[\{.*\]$/s)![0]) as Array<{ payload: unknown }>;
+		expect(event!.payload).toEqual({
 			at: "2026-10-22T04:15:00.000Z",
 			thresholdBytes: 500,
 			oversized: [{ path: "people/big.md", bytes: 501 }],

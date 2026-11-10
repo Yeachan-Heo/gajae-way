@@ -29,7 +29,7 @@ test("coalesce preserves every event identity while using one authoring turn", a
 			respond: async (_id: string, text: string) => {
 				turns++;
 				return JSON.stringify(
-					(JSON.parse(text.match(/\[.*\]$/s)?.[0]) as Array<{ eventId: string }>).map(({ eventId }) => ({
+					(JSON.parse(text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>).map(({ eventId }) => ({
 						eventId,
 						note: "recorded",
 					})),

@@ -171,14 +171,14 @@ test("session.create success without an ID retains its key so retry recovers the
 	await expect(port.bind({ originKey: "lane/a", epoch: 0, repo })).rejects.toThrow(
 		"session.create succeeded without a sessionId",
 	);
-	expect(database?.bindings.brokerOperation(authority, "session.create", scope)).toMatchObject({ state: "pending" });
+	expect(database!.bindings.brokerOperation(authority, "session.create", scope)).toMatchObject({ state: "pending" });
 	const binding = await port.bind({ originKey: "lane/a", epoch: 0, repo });
 
 	expect(createKeys).toHaveLength(2);
 	expect(createKeys[1]).toBe(createKeys[0]);
 	expect(sessions.size).toBe(1);
 	expect(binding.sessionId).toBe("sdk-created-once");
-	expect(database?.bindings.brokerOperation(authority, "session.create", scope)).toBeUndefined();
+	expect(database!.bindings.brokerOperation(authority, "session.create", scope)).toBeUndefined();
 });
 
 for (const retry of ["same request", "changed repository", "changed model"] as const) {
@@ -228,10 +228,10 @@ for (const retry of ["same request", "changed repository", "changed model"] as c
 			if (!(error instanceof GjcCliError)) throw new Error("expected a safe GjcCliError");
 			expect(error.diagnostics).toEqual(["lifecycle_legacy_history_ambiguous"]);
 			expect(error.message).not.toContain("untrusted diagnostic text");
-			expect(database?.bindings.getSessionRecord(originKey)).toBeUndefined();
-			expect(database?.core.metaGet(`create_rotation:${originKey}`)).toBeUndefined();
+			expect(database!.bindings.getSessionRecord(originKey)).toBeUndefined();
+			expect(database!.core.metaGet(`create_rotation:${originKey}`)).toBeUndefined();
 			expect(
-				database?.bindings.brokerOperation(authority, "session.create", JSON.stringify([originKey, 1])),
+				database!.bindings.brokerOperation(authority, "session.create", JSON.stringify([originKey, 1])),
 			).toBeUndefined();
 		};
 
@@ -239,7 +239,7 @@ for (const retry of ["same request", "changed repository", "changed model"] as c
 		const originalKey = required(createKeys[0], "original create key");
 		const originalRequest = required(createInputs[0], "original create request");
 		const originalIntent = required(
-			database?.bindings.brokerOperation(authority, "session.create", scope),
+			database!.bindings.brokerOperation(authority, "session.create", scope),
 			"original pending create intent",
 		);
 		expect(createKeys).toEqual([originalKey]);
@@ -257,7 +257,7 @@ for (const retry of ["same request", "changed repository", "changed model"] as c
 		});
 		expect(createKeys).toEqual([originalKey, originalKey]);
 		expect(createInputs).toEqual([originalRequest, originalRequest]);
-		expect(database?.bindings.brokerOperation(authority, "session.create", scope)).toEqual(originalIntent);
+		expect(database!.bindings.brokerOperation(authority, "session.create", scope)).toEqual(originalIntent);
 	});
 }
 
@@ -388,7 +388,7 @@ test("bind of a persisted binding surfaces an unavailable broker instead of reus
 	await expect(port.bind({ originKey: "lane/a", epoch: 0, repo })).rejects.toBeInstanceOf(GjcCliUnavailableError);
 	expect(calls).toEqual(["sdk session inspect sdk-1", "sdk session inspect sdk-1"]);
 	// Neither a replacement create nor an epoch rotation happened.
-	expect(database?.bindings.getSessionRecord("lane/a")).toMatchObject({ sessionId: "sdk-1", epoch: 0 });
+	expect(database!.bindings.getSessionRecord("lane/a")).toMatchObject({ sessionId: "sdk-1", epoch: 0 });
 });
 
 test("bind preserves thrown and enveloped broker outages from saved-session resume liveness", async () => {
@@ -433,8 +433,8 @@ test("bind preserves thrown and enveloped broker outages from saved-session resu
 		"sdk session inspect sdk-envelope",
 		"sdk session inspect sdk-envelope",
 	]);
-	expect(database?.bindings.getSessionRecord("lane/throw")).toMatchObject({ sessionId: "sdk-throw", epoch: 0 });
-	expect(database?.bindings.getSessionRecord("lane/envelope")).toMatchObject({
+	expect(database!.bindings.getSessionRecord("lane/throw")).toMatchObject({ sessionId: "sdk-throw", epoch: 0 });
+	expect(database!.bindings.getSessionRecord("lane/envelope")).toMatchObject({
 		sessionId: "sdk-envelope",
 		epoch: 0,
 	});
@@ -476,12 +476,12 @@ test("cold-create readiness keeps the create intent until Router indexing catche
 	});
 
 	await expect(port.bind({ originKey: "lane/cold", epoch: 0, repo })).rejects.toBeInstanceOf(GjcCliUnavailableError);
-	expect(database?.bindings.getSessionRecord("lane/cold")).toMatchObject({
+	expect(database!.bindings.getSessionRecord("lane/cold")).toMatchObject({
 		sessionId: "cold-created-session",
 		epoch: 0,
 	});
 	expect(
-		database?.bindings.brokerOperation(authority, "session.create", JSON.stringify(["lane/cold", 0])),
+		database!.bindings.brokerOperation(authority, "session.create", JSON.stringify(["lane/cold", 0])),
 	).toMatchObject({ state: "pending" });
 	await expect(port.bind({ originKey: "lane/cold", epoch: 0, repo })).resolves.toMatchObject({
 		sessionId: "cold-created-session",
@@ -489,9 +489,9 @@ test("cold-create readiness keeps the create intent until Router indexing catche
 	});
 	expect(creates).toBe(1);
 	expect(inspects).toBe(3);
-	expect(database?.bindings.getSessionRecord("lane/cold")).toMatchObject({ epoch: 0 });
+	expect(database!.bindings.getSessionRecord("lane/cold")).toMatchObject({ epoch: 0 });
 	expect(
-		database?.bindings.brokerOperation(authority, "session.create", JSON.stringify(["lane/cold", 0])),
+		database!.bindings.brokerOperation(authority, "session.create", JSON.stringify(["lane/cold", 0])),
 	).toBeUndefined();
 });
 
@@ -558,7 +558,7 @@ test("a changed startup model retires a pending cold binding before rotating its
 	expect(createInputs.map((input) => JSON.parse(input).modelId)).toEqual([originalModel, "openai/gpt-4"]);
 	expect(createInputs.map((input) => JSON.parse(input).cwd)).toEqual([repo, changedRepo]);
 	expect(inspections).toBe(2);
-	expect(database?.bindings.getSessionRecord("lane/cold-model")).toMatchObject({
+	expect(database!.bindings.getSessionRecord("lane/cold-model")).toMatchObject({
 		epoch: 1,
 		sessionId: binding.sessionId,
 	});
@@ -595,7 +595,7 @@ test("resuming a session invalidates pending and completed closes before a later
 		}
 		if (args.includes("session.resume")) {
 			const request = JSON.parse(args[args.indexOf("--json-input") + 1] ?? "{}") as { sessionId?: string };
-			expect(database?.bindings.brokerOperation(authority, "session.close", request.sessionId ?? "")).toBeUndefined();
+			expect(database!.bindings.brokerOperation(authority, "session.close", request.sessionId ?? "")).toBeUndefined();
 			if (request.sessionId) live.set(request.sessionId, true);
 			return ok({ resumed: true });
 		}
@@ -624,11 +624,11 @@ test("resuming a session invalidates pending and completed closes before a later
 	for (const { sessionId, originKey, replyLost } of cases) {
 		if (replyLost) await expect(port.close({ sessionId, repo })).rejects.toBeInstanceOf(GjcCliUnavailableError);
 		else await port.close({ sessionId, repo });
-		expect(database?.bindings.brokerOperation(authority, "session.close", sessionId)).toMatchObject({
+		expect(database!.bindings.brokerOperation(authority, "session.close", sessionId)).toMatchObject({
 			state: replyLost ? "pending" : "complete",
 		});
 		await expect(port.resume({ sessionId, repo, originKey, epoch: 0 })).resolves.toMatchObject({ sessionId });
-		expect(database?.bindings.brokerOperation(authority, "session.close", sessionId)).toBeUndefined();
+		expect(database!.bindings.brokerOperation(authority, "session.close", sessionId)).toBeUndefined();
 		await port.close({ sessionId, repo });
 		const keys = closeKeys.get(sessionId) ?? [];
 		expect(keys).toHaveLength(2);
@@ -644,8 +644,8 @@ test("resume removes a close intent before a broker-side resume can lose its rep
 	const transcriptDir = join(home, "agent", "sessions", "v2-scope");
 	await mkdir(transcriptDir, { recursive: true });
 	await writeFile(join(transcriptDir, `2026-10-01T00-00-00-000Z_${sessionId}.jsonl`), "{}\n");
-	database?.transaction((tx) =>
-		database?.bindings.beginBrokerOperation(tx, authority, {
+	database!.transaction((tx) =>
+		database!.bindings.beginBrokerOperation(tx, authority, {
 			operation: "session.close",
 			scope: sessionId,
 			operationRef: "gw-close-stale",
@@ -659,7 +659,7 @@ test("resume removes a close intent before a broker-side resume can lose its rep
 	const cli: CliRunner = async (args) => {
 		if (args.includes("session.resume")) {
 			resumeAttempts++;
-			expect(database?.bindings.brokerOperation(authority, "session.close", sessionId)).toBeUndefined();
+			expect(database!.bindings.brokerOperation(authority, "session.close", sessionId)).toBeUndefined();
 			live = true;
 			throw new GjcCliUnavailableError("broker restarted after applying resume");
 		}
@@ -698,7 +698,7 @@ test("resume removes a close intent before a broker-side resume can lose its rep
 
 	await expect(new BrokerSessionPort(options).resume(input)).rejects.toBeInstanceOf(GjcCliUnavailableError);
 	expect(resumeAttempts).toBe(1);
-	expect(database?.bindings.brokerOperation(authority, "session.close", sessionId)).toBeUndefined();
+	expect(database!.bindings.brokerOperation(authority, "session.close", sessionId)).toBeUndefined();
 	await expect(new BrokerSessionPort(options).resume(input)).resolves.toMatchObject({ sessionId });
 	await new BrokerSessionPort(options).close({ sessionId, repo });
 	expect(resumeAttempts).toBe(1);
@@ -711,8 +711,8 @@ test("bind clears a stale pending close when inspection confirms a resumed host 
 	const sessionId = "sdk-live-after-resume";
 	const originKey = "lane/live-after-resume";
 	await createOwnedSessionFixture(database!, authority, { sessionId, repo, originKey, epoch: 0 });
-	database?.transaction((tx) =>
-		database?.bindings.beginBrokerOperation(tx, authority, {
+	database!.transaction((tx) =>
+		database!.bindings.beginBrokerOperation(tx, authority, {
 			operation: "session.close",
 			scope: sessionId,
 			operationRef: "gw-close-stale",
@@ -738,7 +738,7 @@ test("bind clears a stale pending close when inspection confirms a resumed host 
 	});
 
 	await expect(port.bind({ originKey, epoch: 0, repo })).resolves.toMatchObject({ sessionId, epoch: 0 });
-	expect(database?.bindings.brokerOperation(authority, "session.close", sessionId)).toBeUndefined();
+	expect(database!.bindings.brokerOperation(authority, "session.close", sessionId)).toBeUndefined();
 	await port.close({ sessionId, repo });
 	expect(closeKeys).toHaveLength(1);
 	expect(closeKeys[0]).not.toBe("gw-close-stale");
@@ -850,10 +850,10 @@ test("a fresh prompt intent is released when relay attachment fails before submi
 	const scope = JSON.stringify([send.sessionId, send.opRef]);
 
 	await expect(port.send(send)).rejects.toThrow("relay attachment failed");
-	expect(database?.bindings.brokerOperation(authority, "turn.prompt", scope)).toBeUndefined();
+	expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toBeUndefined();
 	await expect(port.send(send)).resolves.toMatchObject({ operationRef: send.opRef, commandId: "cmd-1" });
 	expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
-	expect(database?.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({ state: "complete" });
+	expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({ state: "complete" });
 });
 
 test("a fresh prompt intent is released when model selection fails before submission", async () => {
@@ -900,12 +900,12 @@ test("a fresh prompt intent is released when model selection fails before submis
 	const scope = JSON.stringify([send.sessionId, send.opRef]);
 
 	await expect(port.send(send)).rejects.toThrow("broker_unavailable");
-	expect(database?.bindings.brokerOperation(authority, "turn.prompt", scope)).toBeUndefined();
+	expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toBeUndefined();
 	expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(0);
 	await expect(port.send(send)).resolves.toMatchObject({ operationRef: send.opRef, commandId: "cmd-1" });
 	expect(modelSetAttempts).toBe(2);
 	expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
-	expect(database?.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({ state: "complete" });
+	expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({ state: "complete" });
 });
 
 test("audit: restart after definitive busy refusal preserves safe prompt retry", async () => {
@@ -944,7 +944,7 @@ test("audit: restart after definitive busy refusal preserves safe prompt retry",
 	await expect(first.send(send)).rejects.toThrow("fixture interruption during busy wait");
 	expect(accepted).toBe(0);
 	expect(
-		database?.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef])),
+		database!.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef])),
 	).toMatchObject({ state: "complete", resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL) });
 	busy = false;
 	const restarted = await openGateway(path, authority, broker, relay.spawn);
@@ -986,7 +986,7 @@ test("busy-refused prompt fingerprint conflicts retain safe proof and the origin
 	const send = { sessionId: "sdk-1", repo, text: "original text", opRef: "gw-busy-fingerprint" };
 	const scope = JSON.stringify([send.sessionId, send.opRef]);
 	await expect(first.send(send)).rejects.toThrow("busy sleep interrupted");
-	const proof = database?.bindings.brokerOperation(authority, "turn.prompt", scope);
+	const proof = database!.bindings.brokerOperation(authority, "turn.prompt", scope);
 	expect(proof).toMatchObject({ state: "complete", resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL) });
 	const restarted = await openGateway(path, authority, broker, relay.spawn);
 	const before = relay.requests.length;
@@ -1032,14 +1032,14 @@ for (const preflight of ["attachment", "model"] as const) {
 			if (request.operation === "turn.prompt") {
 				prompts++;
 				if (prompts === 1) return { ok: false, error: { code: "busy", message: "prior turn running" } };
-				expect(database?.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({ state: "pending" });
+				expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({ state: "pending" });
 				return { ok: true, result: { accepted: true, clientRef: send.opRef, commandId: "cmd-preflight" } };
 			}
 			return { ok: true, result: { status: "unknown" } };
 		});
 		const cli: CliRunner = async (args) => {
 			if (args.includes("model.set")) {
-				if (proof) expect(database?.bindings.brokerOperation(authority, "turn.prompt", scope)).toEqual(proof);
+				if (proof) expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toEqual(proof);
 				if (preflight === "model" && failPreflight) {
 					failPreflight = false;
 					throw new Error("fixture model preflight interrupted");
@@ -1058,13 +1058,13 @@ for (const preflight of ["attachment", "model"] as const) {
 			},
 		});
 		await expect(first.send(send)).rejects.toThrow("busy sleep interrupted");
-		proof = database?.bindings.brokerOperation(authority, "turn.prompt", scope);
+		proof = database!.bindings.brokerOperation(authority, "turn.prompt", scope);
 		expect(proof).toMatchObject({ state: "complete", resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL) });
-		database?.close();
+		database!.close();
 		database = await Store.open(path);
 		failPreflight = true;
 		const stream: TailStreamSpawner = (sessionId) => {
-			expect(database?.bindings.brokerOperation(authority, "turn.prompt", scope)).toEqual(proof);
+			expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toEqual(proof);
 			if (preflight === "attachment" && failPreflight) {
 				failPreflight = false;
 				throw new Error("fixture attachment preflight interrupted");
@@ -1117,7 +1117,7 @@ test("busy refusal at an exhausted deadline persists safe proof without sleeping
 	await expect(first.send(send)).rejects.toThrow("busy");
 	expect(sleeps).toBe(0);
 	expect(
-		database?.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef])),
+		database!.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef])),
 	).toMatchObject({ state: "complete", resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL) });
 	const restarted = await openGateway(path, authority, broker, relay.spawn);
 	await expect(restarted.port.send(send)).resolves.toMatchObject({
@@ -1145,8 +1145,8 @@ for (const status of ["unknown", "in_flight"] as const) {
 				prompts++;
 				if (prompts === 1) return { ok: false, error: { code: "busy" } };
 				// Before the next outbound effect, the refusal must already be pending.
-				expect(database?.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({ state: "pending" });
-				expect(database?.bindings.brokerOperation(authority, "turn.prompt", scope)?.resultJson).toBeUndefined();
+				expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({ state: "pending" });
+				expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)?.resultJson).toBeUndefined();
 				effects++;
 				return new Promise(() => {});
 			}
@@ -1172,7 +1172,7 @@ for (const status of ["unknown", "in_flight"] as const) {
 			cli: broker.cli,
 			tailRunner: new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 50 }),
 			sleep: async () => {
-				expect(database?.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({
+				expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({
 					state: "complete",
 					resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL),
 				});
@@ -1181,7 +1181,7 @@ for (const status of ["unknown", "in_flight"] as const) {
 		await expect(first.send(send)).rejects.toThrow();
 		expect(prompts).toBe(2);
 		expect(effects).toBe(1);
-		expect(database?.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({ state: "pending" });
+		expect(database!.bindings.brokerOperation(authority, "turn.prompt", scope)).toMatchObject({ state: "pending" });
 		const restarted = await openGateway(path, authority, broker, relay.spawn);
 		if (status === "unknown") {
 			await expect(restarted.port.send(send)).rejects.toThrow("status is unknown; refusing to resend");
@@ -1374,7 +1374,7 @@ for (const observed of ["unknown", "in_flight", "identity_conflict"] as const) {
 			if (observed === "unknown") {
 				await expect(original).rejects.toThrow("status is unknown; refusing to resend");
 				expect(
-					database?.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef])),
+					database!.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef])),
 				).toMatchObject({ state: "pending" });
 			} else {
 				canonical = await original;
@@ -1388,7 +1388,7 @@ for (const observed of ["unknown", "in_flight", "identity_conflict"] as const) {
 			else expect(await competing).toEqual(required(canonical, "canonical accepted receipt"));
 			if (canonical)
 				expect(
-					database?.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef]))
+					database!.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef]))
 						?.resultJson,
 				).toBe(JSON.stringify(canonical));
 			expect(relay.requests.map((request) => request.operation)).toEqual(["turn.prompt", "turn.prompt", "turn.result"]);
@@ -1524,7 +1524,7 @@ for (const order of ["status first", "ACK first"] as const) {
 				const canonical = accepted.receipt;
 				expect(canonical.acceptedAt).toBe(new Date(order === "status first" ? 1_000 : 2_000).toISOString());
 				expect(canonical).toMatchObject(order === "status first" ? scenario.statusIds : scenario.ackIds);
-				const persisted = database?.bindings.brokerOperation(
+				const persisted = database!.bindings.brokerOperation(
 					authority,
 					"turn.prompt",
 					JSON.stringify([send.sessionId, send.opRef]),
@@ -1543,7 +1543,7 @@ for (const order of ["status first", "ACK first"] as const) {
 					expect(completed).toEqual({ receipt: canonical });
 				}
 				expect(
-					database?.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef]))
+					database!.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef]))
 						?.resultJson,
 				).toBe(persisted?.resultJson);
 				expect(relay.requests.map((request) => request.operation)).toEqual([
@@ -1587,10 +1587,10 @@ test("failure to persist a busy refusal prevents sleep and retry and leaves the 
 		expect(sleeps).toBe(0);
 		expect(relay.requests.map((request) => request.operation)).toEqual(["turn.prompt"]);
 		expect(
-			database?.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef])),
+			database!.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef])),
 		).toMatchObject({ state: "pending" });
 		expect(
-			database?.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef]))
+			database!.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([send.sessionId, send.opRef]))
 				?.resultJson,
 		).toBeUndefined();
 	} finally {
@@ -1830,9 +1830,9 @@ async function abandonedBusyFixture(originKey = "discord/channel/abandoned") {
 		operationRef: owner.opRef,
 		requestJson: '{"text":"original fingerprint"}',
 	};
-	database?.transaction((tx) => {
-		database?.bindings.beginBrokerOperation(tx, authority, intent);
-		database?.bindings.completeBrokerOperation(
+	database!.transaction((tx) => {
+		database!.bindings.beginBrokerOperation(tx, authority, intent);
+		database!.bindings.completeBrokerOperation(
 			tx,
 			authority,
 			intent.operation,
@@ -1861,11 +1861,11 @@ test("explicit abandoned busy owner release rolls back and survives restart with
 	expect(database.bindings.brokerOperation(authority, "turn.prompt", intent.scope)).toEqual(proof);
 	expect(
 		database.transaction((tx) =>
-			database?.bindings.abandonBrokerPromptBusyRefusal(tx, { ...owner, opRef: "another-prompt" }),
+			database!.bindings.abandonBrokerPromptBusyRefusal(tx, { ...owner, opRef: "another-prompt" }),
 		),
 	).toBe(0);
-	expect(database.transaction((tx) => database?.bindings.abandonBrokerPromptBusyRefusal(tx, owner))).toBe(1);
-	expect(database.transaction((tx) => database?.bindings.abandonBrokerPromptBusyRefusal(tx, owner))).toBe(0);
+	expect(database.transaction((tx) => database!.bindings.abandonBrokerPromptBusyRefusal(tx, owner))).toBe(1);
+	expect(database.transaction((tx) => database!.bindings.abandonBrokerPromptBusyRefusal(tx, owner))).toBe(0);
 	expect(database.bindings.brokerOperation(authority, "turn.prompt", intent.scope)).toBeUndefined();
 });
 

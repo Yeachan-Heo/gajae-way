@@ -314,7 +314,7 @@ test("maxPerTurn 0: 5 interim + final → assert 0 interim + 1 terminal delivery
 
 	// With maxPerTurn: 0, should have exactly 1 message: the final answer (terminal)
 	expect(messages.length).toBe(1);
-	expect(messages[0]?.payload.text).toBe("final-answer-maxperturn-0");
+	expect(messages[0]!.payload.text).toBe("final-answer-maxperturn-0");
 });
 
 test("boot path: config.json with interimSpeech {maxPerTurn:0} starts via boot.ts, scripted turn runs, 0 interim deliveries", async () => {
@@ -421,5 +421,5 @@ test("boot path: config.json with interimSpeech {maxPerTurn:0} starts via boot.t
 
 	// With config-based maxPerTurn: 0, should have exactly 1 message: the final answer (terminal)
 	expect(messages.length).toBe(1);
-	expect(messages[0]?.payload.text).toBe("final-boot-answer");
+	expect(messages[0]!.payload.text).toBe("final-boot-answer");
 });

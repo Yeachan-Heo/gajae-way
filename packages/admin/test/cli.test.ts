@@ -104,8 +104,8 @@ test("serve waits for a gateway socket that appears after startup", async () => 
 			});
 		});
 		await new Promise<void>((resolve, reject) => {
-			socketServer?.once("error", reject);
-			socketServer?.listen(socketPath, resolve);
+			socketServer!.once("error", reject);
+			socketServer!.listen(socketPath, resolve);
 		});
 		await waitFor(() => stderr.includes("gajaeway console on"));
 
@@ -122,7 +122,7 @@ test("serve waits for a gateway socket that appears after startup", async () => 
 			await child.exited;
 		}
 		await stderrDone;
-		if (socketServer) await new Promise<void>((resolve) => socketServer?.close(() => resolve()));
+		if (socketServer) await new Promise<void>((resolve) => socketServer!.close(() => resolve()));
 		await rm(home, { recursive: true, force: true });
 	}
 }, 30_000);

@@ -28,7 +28,7 @@ test("event-type sessions persist until their explicit epoch is bumped", async (
 			},
 			respond: async (_id: string, text: string) =>
 				JSON.stringify([
-					{ eventId: (JSON.parse(text.match(/\[.*\]$/s)?.[0]) as Array<{ eventId: string }>)[0]?.eventId, note: "ok" },
+					{ eventId: (JSON.parse(text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>)[0]!.eventId, note: "ok" },
 				]),
 		});
 		const pipeline = new MonitorPropagator({
@@ -56,7 +56,7 @@ test("event-type sessions persist until their explicit epoch is bumped", async (
 		);
 		pipeline.submit(monitor.monitorId, "build", {});
 		await Bun.sleep(20);
-		expect(calls[2]?.epoch).toBe(1);
+		expect(calls[2]!.epoch).toBe(1);
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });

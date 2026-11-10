@@ -357,7 +357,7 @@ test("a turn that never announced progress still emits exactly one final chat.pr
 		);
 		await eventually(() => port.sends.length === 1, "turn was not sent");
 		// The model answers with silence: no delivery, no progress ever announced.
-		port.complete(port.sends[0]?.opRef, "[SILENT]");
+		port.complete(port.sends[0]!.opRef, "[SILENT]");
 		await eventually(
 			() => frames.filter((frame) => frame.event === "chat.progress").length === 1,
 			"no final chat.progress after a silent turn",

@@ -237,7 +237,7 @@ for (const stage of ["start_turn", "attach"] as const) {
 			const retry = timers.find((timer) => timer.delay > 0);
 			expect(retry).toBeDefined();
 			timers.splice(timers.indexOf(retry!), 1);
-			retry?.work();
+			retry!.work();
 			await until(() => port.sendAttempts.length === 1);
 			expect(port.sendAttempts[0]?.text).toContain("still answer me");
 		} finally {

@@ -347,7 +347,7 @@ function redactBracketedCredentials(text: string): string {
 			index++;
 		}
 		const consumed = (index >= text.length ? text.length : index) - start;
-		result += `${text.slice(copied, match.index)}${match[1]}[redacted]`;
+		result += text.slice(copied, match.index) + `${match[1]}[redacted]`;
 		copied = consumed >= text.length ? text.length : start + consumed;
 		open.lastIndex = copied;
 	}

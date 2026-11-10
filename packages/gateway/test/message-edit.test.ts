@@ -143,20 +143,20 @@ test("an edit during the running turn is steered into it as a [MESSAGE POINTER] 
 			}),
 		]);
 		expect(port.sends).toHaveLength(1);
-		expect(port.steers[0]?.text).toContain("[MESSAGE POINTER: m-1]");
-		expect(port.steers[0]?.text).toContain("book a table for 4");
+		expect(port.steers[0]!.text).toContain("[MESSAGE POINTER: m-1]");
+		expect(port.steers[0]!.text).toContain("book a table for 4");
 		await eventually(() => client.response("e1") !== undefined, "edit response was not received");
 		expect(client.response("e1")?.result).toMatchObject({ engaged: true });
 		expect(client.response("e1")?.result.turnId).toBeString();
 		// The edit is attributed to the running turn, and the context ledger now
 		// carries the new body under the original message id.
-		const turn = database?.inbox.nonterminalTurns(ORIGIN_KEY)[0]!;
-		expect(database?.inbox.turnRows(turn.opRef).map((row) => [row.message_id, row.turn_role])).toEqual([
+		const turn = database!.inbox.nonterminalTurns(ORIGIN_KEY)[0]!;
+		expect(database!.inbox.turnRows(turn.opRef).map((row) => [row.message_id, row.turn_role])).toEqual([
 			["m-1", "trigger"],
 			[messageEditId("m-1", "book a table for 4"), "steer"],
 		]);
 		release();
-		await eventually(() => database?.inbox.pendingCount(ORIGIN_KEY) === 0, "turn did not complete");
+		await eventually(() => database!.inbox.pendingCount(ORIGIN_KEY) === 0, "turn did not complete");
 	} finally {
 		if (steerTimeout !== undefined) clearTimeout(steerTimeout);
 		release();
@@ -172,7 +172,7 @@ test("an edit while idle is sent as the next turn, pointing at the original mess
 	});
 	send("s1", "m-1", "what is 2+2");
 	await eventually(() => turns.length === 1, "original was not sent");
-	await eventually(() => database?.inbox.pendingCount(ORIGIN_KEY) === 0, "first turn did not complete");
+	await eventually(() => database!.inbox.pendingCount(ORIGIN_KEY) === 0, "first turn did not complete");
 	edit("e1", "m-1", "what is 2+3");
 	await eventually(() => turns.length === 2, "edit was not sent as the next turn");
 	// The speaker header is prepended like any DM turn; the body is the pointer update.
@@ -193,7 +193,7 @@ test("an edit of a message the gateway never ingested is dropped", async () => {
 	expect(client.response("e1")?.result).toEqual({ turnId: null, engaged: false });
 	await Bun.sleep(50);
 	expect(turns).toEqual([]);
-	expect(database?.inbox.pendingCount(ORIGIN_KEY)).toBe(0);
+	expect(database!.inbox.pendingCount(ORIGIN_KEY)).toBe(0);
 	client.close();
 });
 
@@ -205,10 +205,10 @@ test("the same edit event delivered twice is one update; a further edit is a sec
 	});
 	send("s1", "m-1", "v1");
 	await eventually(() => turns.length === 1, "original was not sent");
-	await eventually(() => database?.inbox.pendingCount(ORIGIN_KEY) === 0, "first turn did not complete");
+	await eventually(() => database!.inbox.pendingCount(ORIGIN_KEY) === 0, "first turn did not complete");
 	edit("e1", "m-1", "v2");
 	await eventually(() => turns.length === 2, "edit was not sent");
-	await eventually(() => database?.inbox.pendingCount(ORIGIN_KEY) === 0, "edit turn did not complete");
+	await eventually(() => database!.inbox.pendingCount(ORIGIN_KEY) === 0, "edit turn did not complete");
 	edit("e1-replay", "m-1", "v2");
 	await eventually(() => client.response("e1-replay") !== undefined, "no response to the replayed edit");
 	expect(client.response("e1-replay")?.result).toEqual({ turnId: null, engaged: true });
@@ -268,10 +268,10 @@ test("a steered edit of a context-only message consumes the ORIGINAL message's c
 	await eventually(() => client.response("s2")?.result?.engaged === false, "bob's post was not recorded as context");
 	editIn("e1", "m-2", "@bot right ping", "bob");
 	await eventually(() => port.steers.length === 1, "bob's edit was not steered");
-	expect(port.steers[0]?.text).toContain("[MESSAGE POINTER: m-2]");
-	expect(port.steers[0]?.text).toContain("@bot right ping");
+	expect(port.steers[0]!.text).toContain("[MESSAGE POINTER: m-2]");
+	expect(port.steers[0]!.text).toContain("@bot right ping");
 	release();
-	await eventually(() => database?.inbox.pendingCount("discord/channel/c1") === 0, "first turn did not complete");
+	await eventually(() => database!.inbox.pendingCount("discord/channel/c1") === 0, "first turn did not complete");
 	post("s3", "m-3", "@bot next", "alice", true);
 	await eventually(() => turns.length === 2, "next turn was not sent");
 	// m-2 was read inside turn 1 (as the pointer update): the next turn must
@@ -340,18 +340,18 @@ test("a held steer accepted at the old turn's terminal consumes its context row:
 	await eventually(() => port.sends.length === 1, "first turn was not sent");
 	dm(client, "s2", "m-2", "torn follow-up");
 	await eventually(() => port.attempts >= 3, "steer was not replayed and held");
-	expect(database?.inbox.steersHeld(port.sends[0]?.opRef).map((r) => r.message_id)).toEqual(["m-2"]);
+	expect(database!.inbox.steersHeld(port.sends[0]!.opRef).map((r) => r.message_id)).toEqual(["m-2"]);
 	// The runtime had recorded it: the replay at terminal returns acceptance.
 	port.torn = false;
-	port.complete(port.sends[0]?.opRef, "answer one");
-	await eventually(() => database?.inbox.turnRow(port.sends[0]?.opRef)?.turn_state === "done", "turn did not complete");
-	expect(database?.inbox.steersHeld(port.sends[0]?.opRef)).toEqual([]);
+	port.complete(port.sends[0]!.opRef, "answer one");
+	await eventually(() => database!.inbox.turnRow(port.sends[0]!.opRef)?.turn_state === "done", "turn did not complete");
+	expect(database!.inbox.steersHeld(port.sends[0]!.opRef)).toEqual([]);
 	dm(client, "s3", "m-3", "next");
 	await eventually(() => port.sends.length === 2, "next turn was not sent");
-	expect(port.sends[1]?.text).not.toContain("torn follow-up");
-	expect(port.sends[1]?.text).toContain("next");
-	port.complete(port.sends[1]?.opRef, "answer two");
-	await eventually(() => database?.inbox.pendingCount(ORIGIN_KEY) === 0, "next turn did not complete");
+	expect(port.sends[1]!.text).not.toContain("torn follow-up");
+	expect(port.sends[1]!.text).toContain("next");
+	port.complete(port.sends[1]!.opRef, "answer two");
+	await eventually(() => database!.inbox.pendingCount(ORIGIN_KEY) === 0, "next turn did not complete");
 	client.close();
 });
 
@@ -360,12 +360,12 @@ test("a held steer accepted after a gateway restart consumes its context row: th
 	let client = await startWith(port);
 	dm(client, "s1", "m-1", "first");
 	await eventually(() => port.sends.length === 1, "first turn was not sent");
-	const opRef = port.sends[0]?.opRef;
+	const opRef = port.sends[0]!.opRef;
 	dm(client, "s2", "m-2", "torn follow-up");
 	await eventually(() => port.attempts >= 3, "steer was not replayed and held");
 	port.complete(opRef, "answer one");
-	await eventually(() => database?.inbox.turnRow(opRef)?.turn_state === "done", "turn did not complete");
-	expect(database?.inbox.steersHeld(opRef).map((r) => r.message_id)).toEqual(["m-2"]);
+	await eventually(() => database!.inbox.turnRow(opRef)?.turn_state === "done", "turn did not complete");
+	expect(database!.inbox.steersHeld(opRef).map((r) => r.message_id)).toEqual(["m-2"]);
 	// Restart the gateway on the same home; the transport is healthy again and
 	// the runtime reports the recorded acceptance on the same clientRef.
 	client.close();
@@ -375,15 +375,15 @@ test("a held steer accepted after a gateway restart consumes its context row: th
 	client = await startWith(port, directory);
 	dm(client, "s3", "m-3", "next");
 	await eventually(() => port.sends.length === 2, "next turn was not sent after restart");
-	expect(database?.inbox.steersHeld(opRef)).toEqual([]);
-	expect(database?.inbox.turnRows(opRef).map((r) => [r.message_id, r.turn_state])).toEqual([
+	expect(database!.inbox.steersHeld(opRef)).toEqual([]);
+	expect(database!.inbox.turnRows(opRef).map((r) => [r.message_id, r.turn_state])).toEqual([
 		["m-1", "done"],
 		["m-2", "done"],
 	]);
-	expect(port.sends[1]?.text).not.toContain("torn follow-up");
-	expect(port.sends[1]?.text).toContain("next");
-	port.complete(port.sends[1]?.opRef, "answer two");
-	await eventually(() => database?.inbox.pendingCount(ORIGIN_KEY) === 0, "next turn did not complete");
+	expect(port.sends[1]!.text).not.toContain("torn follow-up");
+	expect(port.sends[1]!.text).toContain("next");
+	port.complete(port.sends[1]!.opRef, "answer two");
+	await eventually(() => database!.inbox.pendingCount(ORIGIN_KEY) === 0, "next turn did not complete");
 	client.close();
 });
 
@@ -414,12 +414,12 @@ test("a crash between steer acceptance and the lifecycle hook cannot leave the m
 		},
 	});
 	const record = (messageId: string, body: string) => {
-		database?.transaction((tx) =>
-			database?.inbox.contextRecord(tx, { messageId, originKey: ORIGIN_KEY, authorId: "owner", body }),
+		database!.transaction((tx) =>
+			database!.inbox.contextRecord(tx, { messageId, originKey: ORIGIN_KEY, authorId: "owner", body }),
 		);
 		expect(
-			database?.transaction((tx) =>
-				database?.inbox.enqueue(tx, { messageId, originKey: ORIGIN_KEY, originRefJson: JSON.stringify(ORIGIN), body }),
+			database!.transaction((tx) =>
+				database!.inbox.enqueue(tx, { messageId, originKey: ORIGIN_KEY, originRefJson: JSON.stringify(ORIGIN), body }),
 			),
 		).toBe(true);
 	};
@@ -427,7 +427,7 @@ test("a crash between steer acceptance and the lifecycle hook cannot leave the m
 		record("m-1", "first");
 		await manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 1, "first turn was not sent");
-		const opRef = port.sends[0]?.opRef;
+		const opRef = port.sends[0]!.opRef;
 		record("m-2", "steered then crash");
 		await manager.notifyInbound(ORIGIN_KEY).catch(() => {});
 		await eventually(() => logs.some((line) => line.includes("simulated crash")), "crash hook did not fire");
@@ -439,8 +439,8 @@ test("a crash between steer acceptance and the lifecycle hook cannot leave the m
 		// transaction as the acceptance, before the crash.
 		// (m-1 is the running turn's own trigger; it is committed at that turn's terminal.)
 		expect(
-			database
-				?.transaction((tx) => database?.inbox.contextWindow(tx, ORIGIN_KEY, "probe"))
+			database!
+				.transaction((tx) => database!.inbox.contextWindow(tx, ORIGIN_KEY, "probe"))
 				.rows.map((r) => r.message_id),
 		).toEqual(["m-1"]);
 	} finally {

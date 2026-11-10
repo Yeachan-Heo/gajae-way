@@ -250,7 +250,7 @@ test("transcript.list pages over the relay with the host's continuationCursor as
 		complete: true,
 	});
 	expect(f.relay.requests.map((request) => request.cursor)).toEqual([undefined, "c-1"]);
-	const written = f.relay.streams[0]?.written.filter((frame) => frame.type === "query_request");
+	const written = f.relay.streams[0]!.written.filter((frame) => frame.type === "query_request");
 	expect(written[1]).toMatchObject({ query: "transcript.list", input: {}, cursor: "c-1" });
 	await f.handle.close();
 });
@@ -361,8 +361,8 @@ for (const reason of ["cancelled", "refusal", "max_tokens", "max_turn_requests",
 		expect(f.relay.requests.map((request) => request.operation)).toEqual(["turn.prompt", "turn.result"]);
 		expect(f.cli).toEqual([]);
 		expect(f.relay.streams).toHaveLength(2);
-		expect(f.relay.streams[0]?.closed).toBe(false);
-		expect(f.relay.streams[1]?.closed).toBe(true);
+		expect(f.relay.streams[0]!.closed).toBe(false);
+		expect(f.relay.streams[1]!.closed).toBe(true);
 		await f.handle.close();
 	});
 }
@@ -399,8 +399,8 @@ for (const receiptState of ["missing", "unknown"] as const) {
 		expect((failure as SessionTerminalError).status.status.receiptState).toBe(receiptState);
 		expect(f.relay.requests.map((request) => request.operation)).toEqual(["turn.prompt", "turn.result"]);
 		expect(f.relay.streams).toHaveLength(2);
-		expect(f.relay.streams[0]?.closed).toBe(false);
-		expect(f.relay.streams[1]?.closed).toBe(true);
+		expect(f.relay.streams[0]!.closed).toBe(false);
+		expect(f.relay.streams[1]!.closed).toBe(true);
 		await f.handle.close();
 	});
 }
@@ -464,8 +464,8 @@ test("session request preserves local prompt fingerprint rejection instead of re
 	expect(f.relay.requests.map((request) => request.operation)).toEqual(["turn.prompt"]);
 	expect(f.cli).toEqual([]);
 	expect(f.relay.streams).toHaveLength(2);
-	expect(f.relay.streams[0]?.closed).toBe(false);
-	expect(f.relay.streams[1]?.closed).toBe(true);
+	expect(f.relay.streams[0]!.closed).toBe(false);
+	expect(f.relay.streams[1]!.closed).toBe(true);
 	await f.handle.close();
 });
 
@@ -486,13 +486,13 @@ test("session send carries image bytes on its existing resident turn.prompt fram
 		opRef: "gw-image-frame",
 		relay: f.handle,
 	});
-	const frame = f.relay.streams[0]?.written.find((candidate) => candidate.type === "control_request");
+	const frame = f.relay.streams[0]!.written.find((candidate) => candidate.type === "control_request");
 	expect(frame).toMatchObject({
 		type: "control_request",
 		operation: "turn.prompt",
 		input: { text: "describe this", clientRef: "gw-image-frame", images },
 	});
-	expect(JSON.stringify(frame)).toContain(`"data":"${images[0]?.data}"`);
+	expect(JSON.stringify(frame)).toContain(`"data":"${images[0]!.data}"`);
 	expect(f.relay.requests.map((request) => request.operation)).toEqual(["turn.prompt"]);
 	await f.handle.close();
 });
@@ -616,8 +616,8 @@ test("session request still reconciles native client-ref conflict without anothe
 	]);
 	expect(f.relay.requests[1]?.input).toEqual({ kind: "prompt", clientRef: "gw-native-conflict" });
 	expect(f.relay.streams).toHaveLength(2);
-	expect(f.relay.streams[0]?.closed).toBe(false);
-	expect(f.relay.streams[1]?.closed).toBe(true);
+	expect(f.relay.streams[0]!.closed).toBe(false);
+	expect(f.relay.streams[1]!.closed).toBe(true);
 	await f.handle.close();
 });
 
@@ -664,7 +664,7 @@ for (const scenario of [
 				throw new Error("CLI must not run");
 			},
 		});
-		closeContextRelay = () => f.relay.streams[1]?.close();
+		closeContextRelay = () => f.relay.streams[1]!.close();
 		const result = await f.port.request({
 			sessionId: "sdk-1",
 			repo: f.repo,

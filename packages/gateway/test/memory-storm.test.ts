@@ -71,8 +71,8 @@ test("a failing memory intent is contained at the worker and later intents still
 	await queue.initialize();
 
 	const broken = crypto.randomUUID();
-	database?.transaction((tx) =>
-		database?.memory.createIntent(tx, { id: broken, kind: "daily_capture", payloadJson: "{}" }),
+	database!.transaction((tx) =>
+		database!.memory.createIntent(tx, { id: broken, kind: "daily_capture", payloadJson: "{}" }),
 	);
 	queue.enqueueExistingId(broken);
 	const good = queue.enqueue({ kind: "daily_capture", originRefJson: "{}", userText: "u", replyText: "r" });

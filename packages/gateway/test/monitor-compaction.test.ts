@@ -1998,7 +1998,7 @@ for (const restart of [false, true]) {
 					respond: (prompt, index) => {
 						const response = echoNotes(prompt);
 						const entries = JSON.parse(response) as Array<{ eventId: string }>;
-						if (index === 0) originalEventId = entries[0]?.eventId;
+						if (index === 0) originalEventId = entries[0]!.eventId;
 						if (entries.some((entry) => entry.eventId === originalEventId)) sideEffects++;
 						if (index === 0 && !lateFailure) throw new Error("counted side effect committed before operation failed");
 						return response;
@@ -2196,7 +2196,7 @@ for (const evidence of [
 					await sessionPort.fetchWorkerOutput({
 						...saved,
 						repo: directory,
-						notBeforeMs: Date.parse(database.monitors.eventGet(event)?.fired_at),
+						notBeforeMs: Date.parse(database.monitors.eventGet(event)!.fired_at),
 						terminalIdentity: (await sessionPort.status({ ...saved, repo: directory })).status,
 					}),
 				).toEqual({ status: "unavailable", code: expectedCode });
@@ -2265,7 +2265,7 @@ for (const restart of [false, true]) {
 				respond: (prompt, index) => {
 					const response = echoNotes(prompt);
 					const entries = JSON.parse(response) as Array<{ eventId: string }>;
-					if (index === 0) originalEventId = entries[0]?.eventId;
+					if (index === 0) originalEventId = entries[0]!.eventId;
 					if (entries.some((entry) => entry.eventId === originalEventId)) sideEffects++;
 					if (index === 0) throw new Error("counted side effect committed before operation failed");
 					return response;
@@ -4115,7 +4115,7 @@ test("consecutive context failures with native compaction unavailable roll, and 
 		for (const eventId of healthyIds) expect(rolled.prompt).toContain(`note for ${eventId}`);
 		// The response contract is still the last thing in the prompt.
 		expect(rolled.prompt).toContain('Respond ONLY with a JSON array containing exactly one {"eventId","note"}');
-		const rolledEventId = rolled.prompt.match(/"eventId":"([^"]+)"/)?.[1]!;
+		const rolledEventId = rolled.prompt.match(/"eventId":"([^"]+)"/)![1]!;
 		expect(database.monitors.authoredOutput(rolledEventId)).toBe(`note for ${rolledEventId}`);
 		// Armed state consumed exactly once: the next healthy turn does not roll again.
 		const after = pipeline.sessionSafetyState(sessionKey);
@@ -4123,8 +4123,8 @@ test("consecutive context failures with native compaction unavailable roll, and 
 		expect(after.lastRoll).toBe("context_failures_native_compaction_unavailable");
 		expect(after.contextFailures).toBe(0);
 		await pipeline.submitAwaitable(monitor.monitorId, "digest.tick", { tick: 201 });
-		expect(turns.at(-1)?.sessionId).toBe("event-session-e1");
-		expect(turns.at(-1)?.prompt).not.toContain("Context compaction");
+		expect(turns.at(-1)!.sessionId).toBe("event-session-e1");
+		expect(turns.at(-1)!.prompt).not.toContain("Context compaction");
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
@@ -4318,7 +4318,7 @@ test("a monitor with no instruction has no task segment, and rolls with a digest
 		await pipeline.submitAwaitable(monitor.monitorId, "plain.tick", { tick: 0 });
 		// No task segment and no digest for an instruction-less monitor.
 		expect(
-			turns[0]?.prompt.startsWith(
+			turns[0]!.prompt.startsWith(
 				`${MONITOR_AUTHORING_HEADER}\n${MONITOR_AUTHORING_REPORT_RULE}\nRespond ONLY with a JSON array`,
 			),
 		).toBe(true);

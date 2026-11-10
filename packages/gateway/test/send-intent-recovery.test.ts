@@ -145,7 +145,7 @@ for (const stage of [
 		const bound = f.db.inbox.nonterminalTurns(f.originKey);
 		expect(bound).toHaveLength(1);
 		expect(bound[0]?.state).toBe("bound");
-		expect(f.db.inbox.sendAttempted(bound[0]?.opRef)).toBe(false);
+		expect(f.db.inbox.sendAttempted(bound[0]!.opRef)).toBe(false);
 		expect(f.port.sendAttempts).toHaveLength(0);
 
 		// The process died there. A fresh process recovers from the database alone.
@@ -157,13 +157,13 @@ for (const stage of [
 			await until(() => f.port.sendAttempts.length === 1);
 			const sent = f.port.sendAttempts[0]!;
 			expect(sent.text).toContain("answer me exactly once");
-			expect(sent.opRef).not.toBe(bound[0]?.opRef);
+			expect(sent.opRef).not.toBe(bound[0]!.opRef);
 			await until(() => f.db.inbox.turnRow(sent.opRef)?.turn_state === "done");
 			expect(
 				f.logs.some(
 					(line) =>
 						line.startsWith("recovery_requeue_unsent") &&
-						line.includes(`opRef=${bound[0]?.opRef}`) &&
+						line.includes(`opRef=${bound[0]!.opRef}`) &&
 						line.includes("reason=send_not_attempted"),
 				),
 			).toBe(true);
@@ -183,7 +183,7 @@ test("a crash after the send intent is stamped goes through reconcile and is nev
 	void crashed.recover();
 	await until(() => f.port.reached.has("send"));
 	const [bound] = f.db.inbox.nonterminalTurns(f.originKey);
-	expect(f.db.inbox.sendAttempted(bound?.opRef)).toBe(true);
+	expect(f.db.inbox.sendAttempted(bound!.opRef)).toBe(true);
 
 	f.port.hang = undefined;
 	const restarted = f.startManager();
@@ -191,11 +191,11 @@ test("a crash after the send intent is stamped goes through reconcile and is nev
 		await restarted.recover();
 		await restarted.tick();
 		// The accepted op is reconciled under its original op-ref, never resubmitted.
-		expect(f.port.sendAttempts.map((input) => input.opRef)).toEqual([bound?.opRef]);
+		expect(f.port.sendAttempts.map((input) => input.opRef)).toEqual([bound!.opRef]);
 		expect(f.logs.some((line) => line.startsWith("recovery_requeue_unsent"))).toBe(false);
-		f.port.complete(bound?.opRef, "late answer");
+		f.port.complete(bound!.opRef, "late answer");
 		await restarted.reconcile(f.originKey);
-		await until(() => f.db.inbox.turnRow(bound?.opRef)?.turn_state === "done");
+		await until(() => f.db.inbox.turnRow(bound!.opRef)?.turn_state === "done");
 		expect(f.port.sendAttempts).toHaveLength(1);
 	} finally {
 		await restarted.stop();
@@ -258,8 +258,8 @@ test("a host that stays busy without progress during pre-send wait is ended and 
 		await manager.recover();
 		await until(() => port.sendAttempts.length === 2);
 		const [wedged, retried] = port.sendAttempts;
-		expect(retried?.opRef).not.toBe(wedged?.opRef);
-		expect(retried?.text).toContain("answer me exactly once");
+		expect(retried!.opRef).not.toBe(wedged!.opRef);
+		expect(retried!.text).toContain("answer me exactly once");
 		// The wedged host was ended and the stored binding resumed, not replaced.
 		expect(port.closes.map((close) => close.sessionId)).toEqual([f.binding.sessionId]);
 		expect(port.resumes.map((resume) => resume.sessionId)).toEqual([f.binding.sessionId]);
@@ -269,8 +269,8 @@ test("a host that stays busy without progress during pre-send wait is ended and 
 		expect(
 			f.logs.some((line) => line.startsWith("session_busy_host_terminated") && line.includes("outcome=terminated")),
 		).toBe(true);
-		await until(() => f.db.inbox.turnRow(retried?.opRef)?.turn_state === "done");
-		expect(f.db.inbox.turnRow(wedged?.opRef)).toBeUndefined();
+		await until(() => f.db.inbox.turnRow(retried!.opRef)?.turn_state === "done");
+		expect(f.db.inbox.turnRow(wedged!.opRef)).toBeUndefined();
 	} finally {
 		await manager.stop();
 	}
@@ -323,7 +323,7 @@ test("upgrading to schema 39 stamps legacy bound/accepted turns so recovery reco
 	database = await Store.open(path);
 	const upgraded = database;
 	expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
-	const received = upgraded.inbox.turnRow(boundOpRef)?.received_at;
+	const received = upgraded.inbox.turnRow(boundOpRef)!.received_at;
 	expect(upgraded.inbox.sendAttemptedAt(boundOpRef)).toBe(received);
 	expect(upgraded.inbox.sendAttemptedAt(acceptedOpRef)).toBe("2026-10-26T06:00:05.000Z");
 	// Idempotent: a rerun keeps the existing stamps.
@@ -438,7 +438,7 @@ for (const outcome of ["refused", "thrown", "terminating"] as const) {
 			// The host was not proven gone: no immediate redispatch onto it.
 			expect(port.sendAttempts).toHaveLength(1);
 			expect(port.resumes).toHaveLength(0);
-			const wedged = port.sendAttempts[0]?.opRef;
+			const wedged = port.sendAttempts[0]!.opRef;
 			expect(f.db.inbox.turnRow(wedged)).toBeUndefined();
 			expect(f.db.inbox.pendingOldest(f.originKey)?.message_id).toBe("m-1");
 			expect(
@@ -517,9 +517,9 @@ test("a busy-stalled host already gone is not waited on: the trigger is answered
 		await manager.recover();
 		await until(() => f.port.sendAttempts.length === 2);
 		const [wedged, answered] = f.port.sendAttempts;
-		expect(answered?.opRef).not.toBe(wedged?.opRef);
+		expect(answered!.opRef).not.toBe(wedged!.opRef);
 		expect(f.port.resumes.map((resume) => resume.sessionId)).toEqual([f.binding.sessionId]);
-		await until(() => f.db.inbox.turnRow(answered?.opRef)?.turn_state === "done");
+		await until(() => f.db.inbox.turnRow(answered!.opRef)?.turn_state === "done");
 		expect(f.port.sendAttempts).toHaveLength(2);
 	} finally {
 		await manager.stop();

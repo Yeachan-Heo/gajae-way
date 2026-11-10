@@ -140,73 +140,73 @@ test("deduplicates update ids durably after successfully sending an inbound turn
 	}
 });
 
-test.each(["image/png", "image/jpeg"] as const)(
-	"persists a rejected %s control-command image and continues with a later message",
-	async (mimeType) => {
-		const home = await temporaryHome();
-		try {
-			const bytes =
-				mimeType === "image/png"
-					? testImage
-					: Buffer.from((await preparePromptImages([testImage])).images[0]?.data, "base64");
-			const path = join(home, "input-image");
-			await writeFile(path, bytes);
-			const state = await TelegramAdapterState.load(home);
-			const adapter = new TelegramAdapter(
-				state,
-				"agent",
-				"900",
-				{ chats: {} },
-				{ save: async () => ({ path }) },
-				noImageNotice,
-			);
-			const requests: Array<{ verb: string; params: unknown }> = [];
-			const gateway = mockGateway(requests);
-			gateway.request = async <T>(verb: string, params?: unknown) => {
-				requests.push({ verb, params });
-				const sent = params as ChatSendParams;
-				if (sent.images?.length && sent.text?.startsWith("/model "))
-					throw new ProtocolError("invalid_params", "chat.send cannot combine prompt images with control commands", {
-						data: "private-image-data secret-token",
-					});
-				return { engaged: false, turnId: null } as T;
-			};
-			const update: TelegramUpdate = {
-				update_id: 81,
-				message: {
-					message_id: 1,
-					chat: { id: 22, type: "private" },
-					from: { id: 44 },
-					caption: "/model private-caption",
-					document: { file_id: "secret-token", file_unique_id: "u", mime_type: mimeType },
-				},
-			};
-			expect(await adapter.handleUpdate(gateway, update)).toBe(true);
-			expect((requests[0]?.params as ChatSendParams).images).toHaveLength(1);
-			const disk = await readFile(state.path, "utf8");
-			expect(disk).not.toContain("private");
-			expect(disk).not.toContain("secret-token");
-			expect(disk).not.toContain((requests[0]?.params as ChatSendParams).images?.[0]?.data);
-			const reloaded = await TelegramAdapterState.load(home);
-			expect(reloaded.updateId).toBe(81);
-			expect(reloaded.lastRejection).toEqual({ updateId: 81, verb: "chat.send", code: "invalid_params" });
-			const restarted = new TelegramAdapter(reloaded, "agent", "900", { chats: {} }, noAttachments, noImageNotice);
-			expect(await restarted.handleUpdate(gateway, update)).toBe(false);
-			expect(
-				await restarted.handleUpdate(gateway, {
-					update_id: 82,
-					message: { message_id: 2, chat: { id: 22, type: "private" }, from: { id: 44 }, text: "later" },
-				}),
-			).toBe(true);
-			expect(requests.map(({ verb }) => verb)).toEqual(["chat.send", "chat.send"]);
-			const finalState = await TelegramAdapterState.load(home);
-			expect(finalState.updateId).toBe(82);
-			expect(finalState.lastRejection).toEqual({ updateId: 81, verb: "chat.send", code: "invalid_params" });
-		} finally {
-			await rm(home, { recursive: true, force: true });
-		}
-	},
-);
+test.each([
+	"image/png",
+	"image/jpeg",
+] as const)("persists a rejected %s control-command image and continues with a later message", async (mimeType) => {
+	const home = await temporaryHome();
+	try {
+		const bytes =
+			mimeType === "image/png"
+				? testImage
+				: Buffer.from((await preparePromptImages([testImage])).images[0]!.data, "base64");
+		const path = join(home, "input-image");
+		await writeFile(path, bytes);
+		const state = await TelegramAdapterState.load(home);
+		const adapter = new TelegramAdapter(
+			state,
+			"agent",
+			"900",
+			{ chats: {} },
+			{ save: async () => ({ path }) },
+			noImageNotice,
+		);
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const gateway = mockGateway(requests);
+		gateway.request = async <T>(verb: string, params?: unknown) => {
+			requests.push({ verb, params });
+			const sent = params as ChatSendParams;
+			if (sent.images?.length && sent.text?.startsWith("/model "))
+				throw new ProtocolError("invalid_params", "chat.send cannot combine prompt images with control commands", {
+					data: "private-image-data secret-token",
+				});
+			return { engaged: false, turnId: null } as T;
+		};
+		const update: TelegramUpdate = {
+			update_id: 81,
+			message: {
+				message_id: 1,
+				chat: { id: 22, type: "private" },
+				from: { id: 44 },
+				caption: "/model private-caption",
+				document: { file_id: "secret-token", file_unique_id: "u", mime_type: mimeType },
+			},
+		};
+		expect(await adapter.handleUpdate(gateway, update)).toBe(true);
+		expect((requests[0]?.params as ChatSendParams).images).toHaveLength(1);
+		const disk = await readFile(state.path, "utf8");
+		expect(disk).not.toContain("private");
+		expect(disk).not.toContain("secret-token");
+		expect(disk).not.toContain((requests[0]?.params as ChatSendParams).images![0]!.data);
+		const reloaded = await TelegramAdapterState.load(home);
+		expect(reloaded.updateId).toBe(81);
+		expect(reloaded.lastRejection).toEqual({ updateId: 81, verb: "chat.send", code: "invalid_params" });
+		const restarted = new TelegramAdapter(reloaded, "agent", "900", { chats: {} }, noAttachments, noImageNotice);
+		expect(await restarted.handleUpdate(gateway, update)).toBe(false);
+		expect(
+			await restarted.handleUpdate(gateway, {
+				update_id: 82,
+				message: { message_id: 2, chat: { id: 22, type: "private" }, from: { id: 44 }, text: "later" },
+			}),
+		).toBe(true);
+		expect(requests.map(({ verb }) => verb)).toEqual(["chat.send", "chat.send"]);
+		const finalState = await TelegramAdapterState.load(home);
+		expect(finalState.updateId).toBe(82);
+		expect(finalState.lastRejection).toEqual({ updateId: 81, verb: "chat.send", code: "invalid_params" });
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
 
 test("transient and unknown gateway errors do not advance the persisted cursor", async () => {
 	const home = await temporaryHome();
@@ -359,8 +359,8 @@ test("forwards a captioned photo natively without exposing its local path or tok
 		expect(params.text).not.toContain("Image processing:");
 		expect(params.text).not.toContain(path);
 		expect(params.images).toHaveLength(1);
-		expect(params.images?.[0]?.mimeType).toBe("image/jpeg");
-		expect(Buffer.from(params.images?.[0]?.data, "base64").subarray(0, 2)).toEqual(Buffer.from([0xff, 0xd8]));
+		expect(params.images![0]!.mimeType).toBe("image/jpeg");
+		expect(Buffer.from(params.images![0]!.data, "base64").subarray(0, 2)).toEqual(Buffer.from([0xff, 0xd8]));
 		expect(notices).toHaveLength(1);
 		expect(notices[0]?.chatId).toBe("-20");
 		expect(notices[0]?.text).toMatch(/compress/i);

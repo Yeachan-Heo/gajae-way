@@ -711,7 +711,7 @@ test("Slack presence: explicit clear removes all markers exactly once", async ()
 	const f = fixture();
 	f.status.arm(origin, "C1:1.000");
 	await flush();
-	const _initialAdds = f.adds.length;
+	const initialAdds = f.adds.length;
 	const initialRemoves = f.removes.length;
 
 	// Send a progress signal to reset stale timer

@@ -58,12 +58,12 @@ const KEY = "loopback/loopback/persona";
 
 async function establishStoredSession(port: ScriptedSessionPort, messageId: string) {
 	enqueue(messageId, "seed turn");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const stored = port.sends.at(-1)!;
 	port.complete(stored.opRef, "seed answer");
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	await eventually(
-		() => database?.inbox.turnRow(stored.opRef)?.turn_state === "done",
+		() => database!.inbox.turnRow(stored.opRef)?.turn_state === "done",
 		"seed turn did not settle before the stored session was exercised",
 	);
 	return stored;
@@ -71,7 +71,7 @@ async function establishStoredSession(port: ScriptedSessionPort, messageId: stri
 
 function trackRecoveryCalls(): () => number {
 	let calls = 0;
-	const recover = manager?.recover.bind(manager!);
+	const recover = manager!.recover.bind(manager!);
 	Object.defineProperty(manager, "recover", {
 		value: async () => {
 			calls++;
@@ -123,7 +123,7 @@ async function harness(
 		failureError?: (error: Error) => void;
 		modelRefusal?: (input: PersonaFailureInput) => void;
 		imagesFor?: (triggerMessageId: string) => readonly PromptImage[] | undefined;
-		onFrame?: (frame: TailFrame) => boolean | undefined;
+		onFrame?: (frame: TailFrame) => boolean | void;
 		contextMessageIds?: readonly string[];
 	} = {},
 	log?: (line: string) => void,
@@ -222,21 +222,21 @@ test("retryInboundTurn removes only the abandoned persona busy proof and rolls i
 	const port = new ScriptedSessionPort();
 	await harness(port);
 	enqueue("retry-busy-proof", "retry this turn");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
 	const proof = seedPersonaPrompt(first);
-	const before = database?.inbox.turnRow(first.opRef);
+	const before = database!.inbox.turnRow(first.opRef);
 	expect(() =>
-		database?.transaction((tx) => {
+		database!.transaction((tx) => {
 			expect(retryInboundTurn(database!, tx, first.opRef)).toBe(1);
 			expect(proof()).toBeUndefined();
 			throw new Error("rollback busy release");
 		}),
 	).toThrow("rollback busy release");
-	expect(database?.inbox.turnRow(first.opRef)).toEqual(before);
+	expect(database!.inbox.turnRow(first.opRef)).toEqual(before);
 	expect(proof()).toMatchObject({ state: "complete", resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL) });
-	expect(database?.transaction((tx) => retryInboundTurn(database!, tx, first.opRef))).toBe(1);
-	expect(database?.inbox.pendingOldest(KEY)).toMatchObject({ turn_state: null, bound_session_id: null });
+	expect(database!.transaction((tx) => retryInboundTurn(database!, tx, first.opRef))).toBe(1);
+	expect(database!.inbox.pendingOldest(KEY)).toMatchObject({ turn_state: null, bound_session_id: null });
 	expect(proof()).toBeUndefined();
 });
 
@@ -245,15 +245,15 @@ for (const result of ["busy", "pending", "accepted"] as const)
 		const port = new ScriptedSessionPort();
 		await harness(port);
 		enqueue(`terminal-proof-${result}`, "finish this turn");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const first = port.sends[0]!;
 		const proof = seedPersonaPrompt(first, result);
-		await manager?.tick(KEY);
-		expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+		await manager!.tick(KEY);
+		expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
 		expect(proof()).toBeDefined();
 		port.complete(first.opRef, "finished");
-		await manager?.tick(KEY);
-		await eventually(() => database?.inbox.turnRow(first.opRef)?.turn_state === "done", "terminal did not settle");
+		await manager!.tick(KEY);
+		await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "done", "terminal did not settle");
 		if (result === "busy") expect(proof()).toBeUndefined();
 		else expect(proof()).toMatchObject({ state: result === "pending" ? "pending" : "complete" });
 	});
@@ -286,25 +286,25 @@ for (const mismatch of ["session", "origin", "epoch", "ref", "authority"] as con
 		const port = new ScriptedSessionPort();
 		await harness(port);
 		enqueue(`mismatch-${mismatch}`, "retry without deleting unrelated proof");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const first = port.sends[0]!;
-		const authority = database?.bindings.authority!;
+		const authority = database!.bindings.authority!;
 		const proof = seedPersonaPrompt({
 			sessionId: mismatch === "session" ? "unrelated-session" : first.sessionId,
 			opRef: mismatch === "ref" ? "unrelated-ref" : first.opRef,
 		});
 		if (mismatch === "origin" || mismatch === "epoch") {
-			database?.transaction((tx) => {
-				database?.inbox.turnRequeue(tx, first.opRef);
-				if (mismatch === "epoch") database?.bindings.rotateEpoch(tx, KEY);
+			database!.transaction((tx) => {
+				database!.inbox.turnRequeue(tx, first.opRef);
+				if (mismatch === "epoch") database!.bindings.rotateEpoch(tx, KEY);
 				if (mismatch === "origin")
-					database?.inbox.enqueue(tx, {
+					database!.inbox.enqueue(tx, {
 						messageId: "other-origin-trigger",
 						originKey: "loopback/loopback/other",
 						originRefJson: JSON.stringify({ ...ORIGIN, conversationId: "other" }),
 						body: "unrelated origin",
 					});
-				database?.inbox.bindTurn(tx, {
+				database!.inbox.bindTurn(tx, {
 					messageId: mismatch === "origin" ? "other-origin-trigger" : `mismatch-${mismatch}`,
 					originKey: mismatch === "origin" ? "loopback/loopback/other" : KEY,
 					epoch: mismatch === "epoch" ? 1 : 0,
@@ -314,14 +314,14 @@ for (const mismatch of ["session", "origin", "epoch", "ref", "authority"] as con
 			});
 		}
 		if (mismatch === "authority")
-			database?.transaction((tx) =>
-				database?.bindings.setAuthority(tx, { ...authority, identity: "revoked-persona-owner" }),
+			database!.transaction((tx) =>
+				database!.bindings.setAuthority(tx, { ...authority, identity: "revoked-persona-owner" }),
 			);
 		try {
-			database?.transaction((tx) => retryInboundTurn(database!, tx, first.opRef));
+			database!.transaction((tx) => retryInboundTurn(database!, tx, first.opRef));
 			expect(proof()).toBeDefined();
 		} finally {
-			if (mismatch === "authority") database?.transaction((tx) => database?.bindings.setAuthority(tx, authority));
+			if (mismatch === "authority") database!.transaction((tx) => database!.bindings.setAuthority(tx, authority));
 		}
 	});
 
@@ -344,18 +344,18 @@ test("ambiguous busy send retains its identity and proof despite an unobserved t
 	const port = new BusySendPort();
 	await harness(port);
 	enqueue("bound-busy-proof", "do not abandon an unresolved send");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const first = port.sendAttempts[0]!;
-	const authority = database?.bindings.authority!;
+	const authority = database!.bindings.authority!;
 	const proof = () =>
-		database?.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([first.sessionId, first.opRef]));
-	expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("bound");
+		database!.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([first.sessionId, first.opRef]));
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("bound");
 	expect(proof()).toBeDefined();
 	port.setActivity(first.sessionId, "idle");
 	port.appendAssistant(first.sessionId, "recovered transcript answer");
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	expect(port.queueEmptyReads).toBe(0);
-	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({
+	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
 		state: "pending",
 		turn_state: "bound",
 		turn_op_ref: first.opRef,
@@ -370,23 +370,23 @@ test("persona terminal failed completion CAS retains its busy proof", async () =
 	const port = new ScriptedSessionPort();
 	await harness(port);
 	enqueue("failed-completion-cas", "hold on failed CAS");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
 	const proof = seedPersonaPrompt(first);
-	const complete = database?.inbox.turnComplete.bind(database?.inbox);
+	const complete = database!.inbox.turnComplete.bind(database!.inbox);
 	let attempts = 0;
-	database?.inbox.turnComplete = () => {
+	database!.inbox.turnComplete = () => {
 		attempts++;
 		return 0;
 	};
 	try {
 		port.complete(first.opRef, "finished but not committed");
-		await manager?.tick(KEY);
+		await manager!.tick(KEY);
 		await eventually(() => attempts > 0, "terminal completion CAS was not attempted");
-		expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+		expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
 		expect(proof()).toBeDefined();
 	} finally {
-		database?.inbox.turnComplete = complete;
+		database!.inbox.turnComplete = complete;
 	}
 });
 
@@ -394,12 +394,12 @@ test("persona failure completion releases its abandoned busy proof", async () =>
 	const port = new ScriptedSessionPort();
 	await harness(port);
 	enqueue("failed-busy-proof", "fail this turn");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
 	const proof = seedPersonaPrompt(first);
 	port.fail(first.opRef, "terminal failure");
-	await manager?.tick(KEY);
-	await eventually(() => database?.inbox.turnRow(first.opRef)?.turn_state === "done", "failure did not settle");
+	await manager!.tick(KEY);
+	await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "done", "failure did not settle");
 	expect(proof()).toBeUndefined();
 });
 
@@ -416,7 +416,7 @@ test("persona bind failures are emitted to the SLO recorder", async () => {
 		onBindFailure: (input) => readinessFailures.push(input),
 	});
 	enqueue("bind-failure", "exercise the failed bind path");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(() => failures.length > 0, "bind failure did not reach the SLO recorder");
 	expect(failures[0]?.code).toBe("persona_bind_failed");
 	expect(Number.isFinite(failures[0]?.at)).toBe(true);
@@ -433,7 +433,7 @@ test("readiness observes bind failures even when the durable SLO recorder throws
 		onBindFailure: (input) => readinessFailures.push(input),
 	});
 
-	expect(() => manager?.recordBindFailure(KEY, "broker unavailable")).toThrow("SLO storage unavailable");
+	expect(() => manager!.recordBindFailure(KEY, "broker unavailable")).toThrow("SLO storage unavailable");
 	expect(readinessFailures).toHaveLength(1);
 	expect(readinessFailures[0]).toMatchObject({ originKey: KEY, detail: "broker unavailable" });
 });
@@ -511,7 +511,7 @@ test("oversized text plus images is a local terminal failure and does not hold a
 	);
 	enqueue("oversized", "x".repeat(220_000));
 	enqueue("after-oversized", "next pending message");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "the pending message after the local rejection did not dispatch");
 	const rejected = port.oversizedAttempts[0]!;
 	const rejectedOpRef = rejected.opRef;
@@ -521,12 +521,12 @@ test("oversized text plus images is a local terminal failure and does not hold a
 	expect(port.statusReads).toEqual([]);
 	expect(port.sends.map((send) => send.text)).toEqual(["next pending message"]);
 	expect(port.sends.map((send) => send.opRef)).not.toContain(rejectedOpRef);
-	expect(database?.inbox.turnRow(rejectedOpRef)).toMatchObject({
+	expect(database!.inbox.turnRow(rejectedOpRef)).toMatchObject({
 		state: "done",
 		turn_state: "done",
 		terminal_delivery_id: JSON.stringify({ none: "turn_failed" }),
 	});
-	expect(database?.core.metaGet(`persona-local-preflight-rejection:${rejectedOpRef}`)).toBeUndefined();
+	expect(database!.core.metaGet(`persona-local-preflight-rejection:${rejectedOpRef}`)).toBeUndefined();
 	expect(notices).toHaveLength(1);
 	expect(notices[0]).toContain("prompt_too_large");
 	expect(notices[0]).toContain("before it was sent");
@@ -534,8 +534,8 @@ test("oversized text plus images is a local terminal failure and does not hold a
 	expect(logs.some((line) => line.includes(`persona_send_preflight_rejected`) && line.includes(rejectedOpRef))).toBe(
 		true,
 	);
-	port.complete(port.sends[0]?.opRef, "next reply");
-	await manager?.tick(KEY);
+	port.complete(port.sends[0]!.opRef, "next reply");
+	await manager!.tick(KEY);
 });
 
 test("actual relay envelope rejection is durable before actor error handling and survives restart", async () => {
@@ -562,10 +562,10 @@ test("actual relay envelope rejection is durable before actor error handling and
 					...input,
 					onPayloadTooLarge: () => {
 						input.onPayloadTooLarge?.();
-						markerAtDecision = database?.core.metaGet(`persona-local-preflight-rejection:${input.opRef}`);
-						fencedAtDecision = database?.inbox.sendAttempted(input.opRef);
-						pendingRequestAtDecision = database?.bindings.brokerOperation(
-							database?.bindings.authority!,
+						markerAtDecision = database!.core.metaGet(`persona-local-preflight-rejection:${input.opRef}`);
+						fencedAtDecision = database!.inbox.sendAttempted(input.opRef);
+						pendingRequestAtDecision = database!.bindings.brokerOperation(
+							database!.bindings.authority!,
 							"turn.prompt",
 							JSON.stringify([input.sessionId, input.opRef]),
 						)?.requestJson;
@@ -583,7 +583,7 @@ test("actual relay envelope rejection is durable before actor error handling and
 	await harness(port);
 	runner = new TailRunner({ stream: relay.spawn, repo: join(home, "workspace") });
 	broker = new BrokerSessionPort({
-		authority: database?.bindings.authority!,
+		authority: database!.bindings.authority!,
 		database: database!,
 		cli: async () => {
 			throw new Error("unexpected CLI call");
@@ -605,28 +605,28 @@ test("actual relay envelope rejection is durable before actor error handling and
 	).toBe(MAX_RELAY_REQUEST_FRAME_BYTES - 5);
 	enqueue("near-limit", text);
 	enqueue("after-crash", "continue after rejection");
-	void manager?.notifyInbound(KEY);
+	void manager!.notifyInbound(KEY);
 	await eventually(() => rejected, "actual relay envelope did not reject the near-limit prompt");
 	expect(latestOpRef).toBe(opRef);
 	expect(markerAtDecision).toBe("prompt_too_large");
 	expect(fencedAtDecision).toBe(false);
 	expect(pendingRequestAtDecision).toBeDefined();
 	expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toEqual([]);
-	expect(database?.core.metaGet(`persona-local-preflight-rejection:${opRef}`)).toBe("prompt_too_large");
+	expect(database!.core.metaGet(`persona-local-preflight-rejection:${opRef}`)).toBe("prompt_too_large");
 
 	// Restore the journal state captured inside the callback, before the port's
 	// unwritten-request cleanup, to model a crash at that exact boundary.
 	const scope = JSON.stringify(["session-1", opRef]);
-	database?.transaction((tx) =>
-		database?.bindings.beginBrokerOperation(tx, database?.bindings.authority!, {
+	database!.transaction((tx) =>
+		database!.bindings.beginBrokerOperation(tx, database!.bindings.authority!, {
 			operation: "turn.prompt",
 			scope,
 			operationRef: opRef,
 			requestJson: pendingRequestAtDecision!,
 		}),
 	);
-	await originalTail?.close();
-	database?.close();
+	await originalTail!.close();
+	database!.close();
 	database = await Store.open(join(home, "gateway.db"));
 	realTransport = false;
 	registerFixtureBindings(port);
@@ -661,10 +661,10 @@ test("a fitting real relay request commits its send fence before the write", asy
 	const port = new ScriptedSessionPort();
 	await harness(port);
 	await establishStoredSession(port, "fence-fixture");
-	const binding = database?.bindings.getSessionRecord(KEY)!;
+	const binding = database!.bindings.getSessionRecord(KEY)!;
 	enqueue("fence-write", "fits");
-	database?.transaction((tx) =>
-		database?.inbox.bindTurn(tx, {
+	database!.transaction((tx) =>
+		database!.inbox.bindTurn(tx, {
 			messageId: "fence-write",
 			originKey: KEY,
 			epoch: binding.epoch,
@@ -674,12 +674,12 @@ test("a fitting real relay request commits its send fence before the write", asy
 	);
 	let fenceAtWrite = false;
 	const relay = scriptedRelay(() => {
-		fenceAtWrite = database?.inbox.sendAttempted("gw-real-fence");
+		fenceAtWrite = database!.inbox.sendAttempted("gw-real-fence");
 		return { ok: true, result: {} };
 	});
 	const runner = new TailRunner({ stream: relay.spawn, repo: join(home, "workspace") });
 	const broker = new BrokerSessionPort({
-		authority: database?.bindings.authority!,
+		authority: database!.bindings.authority!,
 		database: database!,
 		cli: async () => {
 			throw new Error("unexpected CLI call");
@@ -701,7 +701,7 @@ test("a fitting real relay request commits its send fence before the write", asy
 			relay: tail,
 			beforeWrite: () => {
 				expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toEqual([]);
-				expect(database?.transaction((tx) => database?.inbox.markSendAttempted(tx, "gw-real-fence"))).toBe(true);
+				expect(database!.transaction((tx) => database!.inbox.markSendAttempted(tx, "gw-real-fence"))).toBe(true);
 				fenced = true;
 			},
 		});
@@ -720,25 +720,25 @@ test("dispatch settles a locally rejected unfenced turn even after recovery was 
 	const stored = await establishStoredSession(port, "dispatch-rejection-fixture");
 	const opRef = personaTurnOpRef("instance-test", KEY, 0, "dispatch-rejection");
 	enqueue("dispatch-rejection", "rejected before write");
-	database?.transaction((tx) => {
-		database?.inbox.bindTurn(tx, {
+	database!.transaction((tx) => {
+		database!.inbox.bindTurn(tx, {
 			messageId: "dispatch-rejection",
 			originKey: KEY,
 			epoch: 0,
 			opRef,
 			sessionId: stored.sessionId,
 		});
-		database?.core.metaSet(`persona-local-preflight-rejection:${opRef}`, "prompt_too_large");
+		database!.core.metaSet(`persona-local-preflight-rejection:${opRef}`, "prompt_too_large");
 	});
 	enqueue("dispatch-after-rejection", "later message");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(() => port.sends.some((send) => send.text === "later message"), "later message did not dispatch");
 	expect(notices).toHaveLength(1);
 	expect(notices[0]).toContain("prompt_too_large");
 	expect(port.sends.some((send) => send.opRef === opRef)).toBe(false);
 	expect(port.statusReads.filter((read) => read.opRef === opRef)).toEqual([]);
-	expect(database?.inbox.turnRow(opRef)).toMatchObject({ state: "done", turn_state: "done" });
-	expect(database?.core.metaGet(`persona-local-preflight-rejection:${opRef}`)).toBeUndefined();
+	expect(database!.inbox.turnRow(opRef)).toMatchObject({ state: "done", turn_state: "done" });
+	expect(database!.core.metaGet(`persona-local-preflight-rejection:${opRef}`)).toBeUndefined();
 });
 
 test("a size-shaped error after acceptance remains ambiguous without local rejection evidence", async () => {
@@ -752,12 +752,12 @@ test("a size-shaped error after acceptance remains ambiguous without local rejec
 	const notices: string[] = [];
 	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) });
 	enqueue("post-write-size-error", "accepted before error");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const sent = port.sends[0]!;
-	expect(database?.inbox.sendAttempted(sent.opRef)).toBe(true);
-	expect(database?.core.metaGet(`persona-local-preflight-rejection:${sent.opRef}`)).toBeUndefined();
+	expect(database!.inbox.sendAttempted(sent.opRef)).toBe(true);
+	expect(database!.core.metaGet(`persona-local-preflight-rejection:${sent.opRef}`)).toBeUndefined();
 	expect(notices).toEqual([]);
-	await manager?.stop();
+	await manager!.stop();
 	manager = new PersonaSessionManager({
 		database: database!,
 		port,
@@ -768,7 +768,7 @@ test("a size-shaped error after acceptance remains ambiguous without local rejec
 	await manager.recover();
 	expect(port.sends).toHaveLength(1);
 	expect(port.statusReads.some((read) => read.opRef === sent.opRef)).toBe(true);
-	expect(database?.inbox.turnRow(sent.opRef)?.turn_state).not.toBe("done");
+	expect(database!.inbox.turnRow(sent.opRef)?.turn_state).not.toBe("done");
 });
 
 for (const outcome of ["complete", "incomplete", "in_flight"] as const)
@@ -776,9 +776,9 @@ for (const outcome of ["complete", "incomplete", "in_flight"] as const)
 		const port = new ScriptedSessionPort();
 		await harness(port);
 		enqueue("recover-without-tail", "execute only once");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const send = port.sends[0]!;
-		await manager?.stop();
+		await manager!.stop();
 		if (outcome !== "in_flight") port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "original result");
 		if (outcome === "incomplete") {
 			const report = await port.status(send);
@@ -837,7 +837,7 @@ for (const outcome of ["complete", "incomplete", "in_flight"] as const)
 			).toBe(true);
 		}
 		expect(terminals).toEqual(outcome === "complete" ? ["original result"] : []);
-		expect(database?.inbox.turnRow(send.opRef)?.turn_state).toBe(outcome === "complete" ? "done" : "accepted");
+		expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe(outcome === "complete" ? "done" : "accepted");
 		if (outcome === "incomplete") expect(logs.some((line) => line.includes("reason=incomplete_body"))).toBe(true);
 	});
 
@@ -847,7 +847,7 @@ for (const answer of ["owned original answer", ""])
 		const terminal: string[] = [];
 		await harness(port, { terminal: (text) => terminal.push(text) });
 		enqueue("original", "execute once");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const send = port.sends[0]!;
 		port.fetchAssistantSince = async () => {
 			throw new Error("transcript.list returned no page items");
@@ -859,17 +859,17 @@ for (const answer of ["owned original answer", ""])
 		};
 		port.seedOperation(send.opRef, send.sessionId, "terminal_ok", answer);
 		port.seedOperation("unrelated-newer-op", send.sessionId, "terminal_ok", "WRONG_LATEST_OPERATION");
-		await manager?.reconcile(KEY);
+		await manager!.reconcile(KEY);
 		await eventually(() => terminal.length === 1, "original output was not recovered");
-		await manager?.reconcile(KEY);
+		await manager!.reconcile(KEY);
 		expect(terminal).toEqual([answer]);
 		expect(latestReads).toBe(0);
 		expect(port.workerOutputReads).toHaveLength(1);
 		expect(port.workerOutputReads[0]).toMatchObject({ sessionId: send.sessionId, opRef: send.opRef });
-		expect(port.workerOutputReads[0]?.notBeforeMs).toBeGreaterThanOrEqual(
-			Date.parse(database?.inbox.turnDispatchedAt(send.opRef)!),
+		expect(port.workerOutputReads[0]!.notBeforeMs).toBeGreaterThanOrEqual(
+			Date.parse(database!.inbox.turnDispatchedAt(send.opRef)!),
 		);
-		expect(database?.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
+		expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
 		expect(port.sends).toHaveLength(1);
 	});
 
@@ -880,7 +880,7 @@ for (const evidence of ["missing", "truncated", "mismatch"] as const)
 		const logs: string[] = [];
 		await harness(port, { terminal: (text) => terminal.push(text) }, (line) => logs.push(line));
 		enqueue("held-original", "execute once");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const send = port.sends[0]!;
 		port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "owned answer");
 		const status = (await port.status(send)).status;
@@ -913,15 +913,15 @@ for (const evidence of ["missing", "truncated", "mismatch"] as const)
 			return { text: "WRONG_LATEST_OPERATION", pages: 1, complete: true };
 		};
 		port.fetchAssistantSince = port.fetchLastAssistant;
-		await manager?.reconcile(KEY);
+		await manager!.reconcile(KEY);
 		await eventually(() => port.workerOutputReads.length > 0, "original result was not queried");
-		await manager?.reconcile(KEY);
+		await manager!.reconcile(KEY);
 		expect(terminal).toEqual([]);
 		expect(alternateReads).toBe(0);
 		const reason =
 			evidence === "missing" ? "output_pending" : evidence === "truncated" ? "incomplete_body" : "identity_mismatch";
 		expect(logs.some((line) => line.includes(`reason=${reason}`))).toBe(true);
-		expect(database?.inbox.turnRow(send.opRef)?.turn_state).toBe("accepted");
+		expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("accepted");
 		expect(port.sends).toHaveLength(1);
 	});
 
@@ -930,7 +930,7 @@ test("stop fences a pending original-result callback before delivery or database
 	const terminal: string[] = [];
 	await harness(port, { terminal: (text) => terminal.push(text) });
 	enqueue("stop-original", "execute once");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const send = port.sends[0]!;
 	const fetch = port.fetchWorkerOutput.bind(port);
 	let release!: () => void;
@@ -946,14 +946,14 @@ test("stop fences a pending original-result callback before delivery or database
 		return result;
 	};
 	port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "late original answer");
-	await manager?.reconcile(KEY);
+	await manager!.reconcile(KEY);
 	await eventually(() => entered, "original result read did not begin");
-	const before = database?.inbox.turnRow(send.opRef);
-	const stopping = manager?.stop();
+	const before = database!.inbox.turnRow(send.opRef);
+	const stopping = manager!.stop();
 	release();
 	await stopping;
 	expect(terminal).toEqual([]);
-	expect(database?.inbox.turnRow(send.opRef)).toEqual(before);
+	expect(database!.inbox.turnRow(send.opRef)).toEqual(before);
 	expect(port.sends).toHaveLength(1);
 });
 
@@ -968,8 +968,8 @@ test("a message admitted while a persistent turn is running becomes an operator-
 	await manager?.notifyInbound(KEY);
 
 	expect(port.steers).toHaveLength(1);
-	expect(port.steers[0]).toMatchObject({ sessionId: port.sends[0]?.sessionId });
-	expect(port.steers[0]?.text.endsWith("\ncorrection")).toBe(true);
+	expect(port.steers[0]).toMatchObject({ sessionId: port.sends[0]!.sessionId });
+	expect(port.steers[0]!.text.endsWith("\ncorrection")).toBe(true);
 	expect(database?.inbox.turnRows(latestOpRef)).toEqual(
 		expect.arrayContaining([
 			expect.objectContaining({
@@ -980,7 +980,7 @@ test("a message admitted while a persistent turn is running becomes an operator-
 			}),
 		]),
 	);
-	port.complete(port.sends[0]?.opRef, "done");
+	port.complete(port.sends[0]!.opRef, "done");
 	await eventually(
 		() => database?.inbox.turnRow(latestOpRef)?.turn_state === "done",
 		"accepted turn did not reconcile terminal",
@@ -997,11 +997,11 @@ test("a held turn in recovery_hold must not absorb new inbound as steers; new in
 	enqueue("first-msg", "initial message");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sendAttempts.length === 1, "first send attempt did not start");
-	const _firstOpRef = port.sendAttempts[0]?.opRef;
+	const firstOpRef = port.sendAttempts[0]!.opRef;
 
 	// The first send failed with ambiguous error (timeout)
 	expect(port.sends).toHaveLength(0);
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 
 	// Wait for recovery_hold to be logged with operation_state_unknown
 	await eventually(
@@ -1037,14 +1037,14 @@ test("a post-start prompt failure delivers the runtime's code and logs its bound
 	const logs: string[] = [];
 	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) }, (line) => logs.push(line));
 	enqueue("post-start-failure", "work that failed after it started");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
 	port.fail(first.opRef, "Agent run failed after execution started.", {
 		code: "prompt_failed",
 		outcome: { kind: "failed", phase: "post_start", category: "agent_runtime", provenance: "agent_failed" },
 	});
 
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	await eventually(() => notices.length === 1, "post-start failure did not reach the lifecycle");
 	expect(notices[0]).toBe("[turn failed] prompt_failed: Agent run failed after execution started.");
 	expect(port.sends).toHaveLength(1);
@@ -1102,10 +1102,10 @@ test("a turn that fails with a tool still running names the tool and hands over 
 	port.fail(first.opRef, "Agent run failed after execution started.", { code: "prompt_failed" });
 	await eventually(() => failures.length === 1, "failure did not reach the lifecycle");
 
-	expect(failures[0]?.notice).toBe(
+	expect(failures[0]!.notice).toBe(
 		"[turn failed] prompt_failed: Agent run failed after execution started. (a bash call had been running for 300s without finishing)",
 	);
-	expect(failures[0]?.recovered).toBe("the answer written before the tool hung");
+	expect(failures[0]!.recovered).toBe("the answer written before the tool hung");
 	expect(probes).toHaveLength(1);
 	const terminalLine2 = logs.find((line) => line.startsWith("terminal_failure "));
 	expect(terminalLine2).toContain(
@@ -1156,15 +1156,15 @@ test("a rebindable post-start code keeps its /new hint, and a codeless failure s
 	const notices: string[] = [];
 	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) });
 	enqueue("rebindable-failure", "first");
-	await manager?.notifyInbound(KEY);
-	port.fail(port.sends[0]?.opRef, "Agent run failed after execution started.", { code: "spawn_failed" });
+	await manager!.notifyInbound(KEY);
+	port.fail(port.sends[0]!.opRef, "Agent run failed after execution started.", { code: "spawn_failed" });
 	await eventually(() => notices.length === 1, "rebindable failure did not reach the lifecycle");
 	expect(notices[0]).toBe(
 		"[turn failed] spawn_failed: Agent run failed after execution started. Send /new to rebind this conversation.",
 	);
 
 	enqueue("codeless-failure", "second");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const second = port.sends[1]!;
 	// A child killed mid-write reports neither code nor message.
 	port.fail(second.opRef, "");
@@ -1178,7 +1178,7 @@ test("post-start failure captures real error message in terminal_failure log (#4
 	const logs: string[] = [];
 	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) }, (line) => logs.push(line));
 	enqueue("boom-failure", "work that throws an error");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
 	// Failure with error.code and outcome with failureCauseDiagnostic to test real cause capture (#408)
 	port.fail(first.opRef, "boom", {
@@ -1212,27 +1212,27 @@ test("failed notice must persist before reset completion and may retry without r
 		},
 	});
 	enqueue("failed-notice", "work that must not run twice");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
 	port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
 	port.fail(first.opRef);
 	await eventually(() => notices === 1, "notice callback did not run");
-	expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
-	await manager?.tick(KEY);
-	await eventually(() => manager?.state(KEY) === "idle", "retrying notice did not settle failure");
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	await manager!.tick(KEY);
+	await eventually(() => manager!.state(KEY) === "idle", "retrying notice did not settle failure");
 	expect(notices).toBe(2);
 	expect(port.sends).toHaveLength(1);
-	expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
 });
 
 test("reset consumes only the failed trigger context, preserving unrelated unread input", async () => {
 	const port = new ScriptedSessionPort();
 	await harness(port);
 	for (const messageId of ["failed-context", "unrelated-context"]) {
-		database?.transaction((tx) =>
-			database?.inbox.contextRecord(tx, {
+		database!.transaction((tx) =>
+			database!.inbox.contextRecord(tx, {
 				messageId,
 				originKey: KEY,
 				body: messageId,
@@ -1241,15 +1241,15 @@ test("reset consumes only the failed trigger context, preserving unrelated unrea
 		);
 	}
 	enqueue("failed-context", "failed-context");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
 	port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
 	port.fail(first.opRef);
-	await eventually(() => manager?.state(KEY) === "idle", "failed trigger did not settle");
-	expect(database?.inbox.contextDiagnostics(KEY).unread).toBe(1);
+	await eventually(() => manager!.state(KEY) === "idle", "failed trigger did not settle");
+	expect(database!.inbox.contextDiagnostics(KEY).unread).toBe(1);
 	expect(
-		database
-			?.transaction((tx) => database?.inbox.contextWindow(tx, KEY, "later-message"))
+		database!
+			.transaction((tx) => database!.inbox.contextWindow(tx, KEY, "later-message"))
 			.rows.map((row) => row.message_id),
 	).toEqual(["unrelated-context"]);
 });
@@ -1262,33 +1262,33 @@ for (const reason of ["unsupported_input_status", "context_exhausted"] as const)
 		const released: string[] = [];
 		await harness(port, {
 			failure: (message) => {
-				expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+				expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 				failures.push(message);
 			},
 			released: (opRef) => released.push(opRef),
 		});
 		enqueue("failed", "original work");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const first = port.sends[0]!;
 		port.emitTool(first.sessionId);
 		port.emitToolEnd(first.sessionId, "tool");
 		port.emitAssistant(first.sessionId, "partial answer", "partial", first.opRef);
 		port.setFailedTurnEvidence(first.sessionId, reason);
 		port.fail(first.opRef, "failed once");
-		await eventually(() => manager?.state(KEY) === "idle", "failed turn did not settle");
+		await eventually(() => manager!.state(KEY) === "idle", "failed turn did not settle");
 		expect(port.sends).toHaveLength(1);
-		expect(database?.inbox.turnRow(first.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+		expect(database!.inbox.turnRow(first.opRef)).toMatchObject({ state: "done", turn_state: "done" });
 		expect(failures).toEqual(["failed once"]);
-		expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
+		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
 		expect(released).toEqual([]);
 		port.fail(first.opRef, "duplicate callback");
-		await manager?.tick(KEY);
+		await manager!.tick(KEY);
 		expect(failures).toHaveLength(1);
 		enqueue("next", "new user message");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		expect(port.sends.map((send) => send.text)).toEqual(["original work", "new user message"]);
-		expect(port.sends[1]?.sessionId).toBe("session-e1");
-		expect(port.sends[1]?.opRef).toBe(personaTurnOpRef("instance-test", KEY, 1, "next"));
+		expect(port.sends[1]!.sessionId).toBe("session-e1");
+		expect(port.sends[1]!.opRef).toBe(personaTurnOpRef("instance-test", KEY, 1, "next"));
 	});
 
 test("provider quota exhaustion gives a safe notice and does not reset or rebind the session", async () => {
@@ -1537,18 +1537,18 @@ test("#424: a prompt that failed in its submission phase is re-sent once and ans
 		(line) => logs.push(line),
 	);
 	enqueue("busy-1", "hello while busy");
-	await manager?.notifyInbound(KEY);
-	await eventually(() => terminal.length === 1 && manager?.state(KEY) === "idle", "retried turn was not answered");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => terminal.length === 1 && manager!.state(KEY) === "idle", "retried turn was not answered");
 
 	expect(terminal).toEqual(["answer after retry"]);
 	expect(failures).toEqual([]);
 	expect(port.sends).toHaveLength(2);
 	const [first, retry] = port.sends;
-	expect(retry?.opRef).not.toBe(first?.opRef);
-	expect(retry?.sessionId).toBe(first?.sessionId);
-	expect(retry?.text).toBe("hello while busy");
-	expect(database?.inbox.turnRow(retry?.opRef)).toMatchObject({ state: "done", turn_state: "done" });
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(retry!.opRef).not.toBe(first!.opRef);
+	expect(retry!.sessionId).toBe(first!.sessionId);
+	expect(retry!.text).toBe("hello while busy");
+	expect(database!.inbox.turnRow(retry!.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	expect(logs.filter((line) => line.startsWith("submission_retry "))).toHaveLength(1);
 });
 
@@ -1562,7 +1562,7 @@ test("#424: a prompt that fails its submission phase twice gets exactly one fail
 
 	expect(port.sends.map((send) => send.text)).toEqual(["busy-twice", "busy-twice"]);
 	expect(failures).toHaveLength(1);
-	expect(database?.inbox.turnRow(last.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+	expect(database!.inbox.turnRow(last.opRef)).toMatchObject({ state: "done", turn_state: "done" });
 });
 
 test("#424: a failure outside the submission phase is reported without a re-send", async () => {
@@ -1587,14 +1587,14 @@ for (const restart of [false, true])
 		const failures: string[] = [];
 		await harness(port, { failure: (message) => failures.push(message) });
 		enqueue("first", "first failed message");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const first = port.sends[0]!;
 		port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
 		port.fail(first.opRef);
-		await eventually(() => manager?.state(KEY) === "idle", "first reset did not settle");
+		await eventually(() => manager!.state(KEY) === "idle", "first reset did not settle");
 		if (restart) {
-			await manager?.stop();
-			database?.close();
+			await manager!.stop();
+			database!.close();
 			database = await Store.open(join(home, "gateway.db"));
 			registerFixtureBindings(port);
 			manager = new PersonaSessionManager({
@@ -1613,15 +1613,15 @@ for (const restart of [false, true])
 			expect(port.sends).toHaveLength(1);
 		}
 		enqueue("second", "different failed message");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const second = port.sends[1]!;
 		port.setFailedTurnEvidence(second.sessionId, "unsupported_input_status");
 		port.fail(second.opRef, "second failure");
-		await eventually(() => manager?.state(KEY) === "idle", "capped failure did not settle");
-		expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
+		await eventually(() => manager!.state(KEY) === "idle", "capped failure did not settle");
+		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
 		expect(port.sends).toHaveLength(2);
 		expect(failures[1]).toBe("second failure");
-		expect(database?.inbox.turnRow(second.opRef)?.turn_state).toBe("done");
+		expect(database!.inbox.turnRow(second.opRef)?.turn_state).toBe("done");
 	});
 
 for (const held of [false, true])
@@ -1634,23 +1634,23 @@ for (const held of [false, true])
 		});
 		await harness(port);
 		enqueue("failed", "original");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const first = port.sends[0]!;
 		enqueue("steer", "additional accepted or uncertain work");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		enqueue("pending", "unrelated next input");
 		port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
 		port.fail(first.opRef);
 		await eventually(() => port.sends.length === 2, "pending input was not dispatched after reset");
-		await manager?.tick(KEY);
+		await manager!.tick(KEY);
 		expect(port.sends.map((send) => send.text)).toEqual(["original", "unrelated next input"]);
-		expect(port.sends[1]?.sessionId).toBe("session-e1");
-		expect(database?.inbox.turnRows(first.opRef).find((row) => row.message_id === "steer")).toMatchObject({
+		expect(port.sends[1]!.sessionId).toBe("session-e1");
+		expect(database!.inbox.turnRows(first.opRef).find((row) => row.message_id === "steer")).toMatchObject({
 			turn_role: "steer",
 			turn_op_ref: first.opRef,
 			turn_state: held ? "bound" : "done",
 		});
-		if (held) expect(database?.inbox.steersHeld(first.opRef).map((row) => row.message_id)).toEqual(["steer"]);
+		if (held) expect(database!.inbox.steersHeld(first.opRef).map((row) => row.message_id)).toEqual(["steer"]);
 	});
 
 for (const evidence of ["missing", "throws"] as const)
@@ -1665,11 +1665,11 @@ for (const evidence of ["missing", "throws"] as const)
 		const failures: string[] = [];
 		await harness(port, { failure: (message) => failures.push(message) });
 		enqueue("rate-limit", "original");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const first = port.sends[0]!;
 		port.fail(first.opRef, "429 rate limited");
-		await eventually(() => manager?.state(KEY) === "idle", "ordinary failure did not settle");
-		expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+		await eventually(() => manager!.state(KEY) === "idle", "ordinary failure did not settle");
+		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 		expect(port.sends).toHaveLength(1);
 		expect(failures).toEqual(["429 rate limited"]);
 	});
@@ -1689,31 +1689,31 @@ test("a wedged submission resets the next binding once without transcript eviden
 	const logs: string[] = [];
 	await harness(port, { failure: (message) => failures.push(message) }, (line) => logs.push(line));
 	enqueue("wedged", "first");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
 	port.fail(first.opRef, "Prompt submission failed.", { code: "internal", outcome: WEDGED_SUBMISSION });
 	// #424 re-sends a never-started prompt once on the same session; only a wedge that survives it resets.
 	await eventually(() => port.sends.length === 2, "wedged submission was not re-sent");
 	const retry = port.sends[1]!;
 	expect(retry).toMatchObject({ text: "first", sessionId: "session-e0" });
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	expect(failures).toEqual([]);
 	port.fail(retry.opRef, "Prompt submission failed.", { code: "internal", outcome: WEDGED_SUBMISSION });
-	await eventually(() => manager?.state(KEY) === "idle", "wedged submission did not settle");
+	await eventually(() => manager!.state(KEY) === "idle", "wedged submission did not settle");
 	expect(port.failureEvidenceProbes).toEqual([]);
 	expect(failures).toEqual(["internal: Prompt submission failed."]);
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
 	expect(logs.some((line) => line.includes("reason=submission_wedged"))).toBe(true);
 	enqueue("next", "second");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	expect(port.sends.map((send) => send.text)).toEqual(["first", "first", "second"]);
-	expect(port.sends[2]?.sessionId).toBe("session-e1");
+	expect(port.sends[2]!.sessionId).toBe("session-e1");
 	// The cap holds until a healthy turn: a second wedge on the fresh session stays put.
-	port.fail(port.sends[2]?.opRef, "Prompt submission failed.", { code: "internal", outcome: WEDGED_SUBMISSION });
+	port.fail(port.sends[2]!.opRef, "Prompt submission failed.", { code: "internal", outcome: WEDGED_SUBMISSION });
 	await eventually(() => port.sends.length === 4, "capped wedge was not re-sent");
-	port.fail(port.sends[3]?.opRef, "Prompt submission failed.", { code: "internal", outcome: WEDGED_SUBMISSION });
-	await eventually(() => manager?.state(KEY) === "idle", "capped wedge did not settle");
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
+	port.fail(port.sends[3]!.opRef, "Prompt submission failed.", { code: "internal", outcome: WEDGED_SUBMISSION });
+	await eventually(() => manager!.state(KEY) === "idle", "capped wedge did not settle");
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
 });
 
 for (const [label, detail] of [
@@ -1728,15 +1728,15 @@ for (const [label, detail] of [
 		const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
 		await harness(port);
 		enqueue("kept", "original");
-		await manager?.notifyInbound(KEY);
-		port.fail(port.sends[0]?.opRef, "failed", detail);
+		await manager!.notifyInbound(KEY);
+		port.fail(port.sends[0]!.opRef, "failed", detail);
 		// A submission-phase failure is re-sent once (#424); fail the re-send the same way.
 		if (detail.outcome.phase === "submission") {
 			await eventually(() => port.sends.length === 2, "submission failure was not re-sent");
-			port.fail(port.sends[1]?.opRef, "failed", detail);
+			port.fail(port.sends[1]!.opRef, "failed", detail);
 		}
-		await eventually(() => manager?.state(KEY) === "idle", "failure did not settle");
-		expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+		await eventually(() => manager!.state(KEY) === "idle", "failure did not settle");
+		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	});
 
 for (const missing of ["start", "terminal", "nan", "reversed", "future", "op-ref"] as const)
@@ -1766,30 +1766,30 @@ for (const missing of ["start", "terminal", "nan", "reversed", "future", "op-ref
 		const port = new InvalidStatusPort();
 		await harness(port);
 		enqueue("invalid-status", "fail closed");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const first = port.sends[0]!;
 		port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
 		port.fail(first.opRef);
-		await eventually(() => manager?.state(KEY) === "idle", "failure did not settle");
+		await eventually(() => manager!.state(KEY) === "idle", "failure did not settle");
 		expect(port.failureEvidenceProbes).toEqual([]);
-		expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	});
 
 test("retired exact failure never resets the replacement binding", async () => {
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
 	await harness(port);
 	enqueue("old", "old");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
-	await manager?.reset(KEY, JSON.stringify(ORIGIN));
+	await manager!.reset(KEY, JSON.stringify(ORIGIN));
 	enqueue("current", "current");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
 	port.fail(first.opRef);
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	expect(port.failureEvidenceProbes).toEqual([]);
 	expect(port.sends.map((send) => send.text)).toEqual(["old", "current"]);
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
 });
 
 test("/new with nothing in flight ends the previous session's host at once", async () => {
@@ -1797,13 +1797,13 @@ test("/new with nothing in flight ends the previous session's host at once", asy
 	const logs: string[] = [];
 	await harness(port, undefined, (line) => logs.push(line));
 	enqueue("first", "first");
-	await manager?.notifyInbound(KEY);
-	port.complete(port.sends[0]?.opRef, "answered");
-	await manager?.tick(KEY);
+	await manager!.notifyInbound(KEY);
+	port.complete(port.sends[0]!.opRef, "answered");
+	await manager!.tick(KEY);
 	expect(port.closes).toEqual([]);
 	// Idle now. /new rotates the epoch; the old host has no reason to live.
-	await manager?.reset(KEY, JSON.stringify(ORIGIN));
-	await manager?.tick(KEY);
+	await manager!.reset(KEY, JSON.stringify(ORIGIN));
+	await manager!.tick(KEY);
 	// The just-completed turn is still tracked as retired at /new time, so the
 	// host is ended by that turn's reconcile rather than by reset() itself -
 	// either way, exactly once, and only after nothing can still need it.
@@ -1811,7 +1811,7 @@ test("/new with nothing in flight ends the previous session's host at once", asy
 	expect(port.closes.map((c) => c.sessionId)).toEqual(["session-e0"]);
 	// The replacement is untouched and answers the next message.
 	enqueue("second", "second");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	expect(port.sends.at(-1)?.sessionId).toBe("session-e1");
 	expect(port.closes).toHaveLength(1);
 });
@@ -1821,13 +1821,13 @@ test("#41: ending a retired host that still runs an async sub-lane leaves a jobs
 	const logs: string[] = [];
 	await harness(port, undefined, (line) => logs.push(line));
 	enqueue("review", "start a background review");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	// The turn ends normally while the sub-lane it started keeps running in the host.
 	port.hostJobs.set("session-e0", [{ id: "0-ArchitectReview", type: "task", label: "review #61" }]);
-	port.complete(port.sends[0]?.opRef, "started the review");
-	await manager?.tick(KEY);
-	await manager?.reset(KEY, JSON.stringify(ORIGIN));
-	await manager?.tick(KEY);
+	port.complete(port.sends[0]!.opRef, "started the review");
+	await manager!.tick(KEY);
+	await manager!.reset(KEY, JSON.stringify(ORIGIN));
+	await manager!.tick(KEY);
 	expect(port.closes.map((c) => c.sessionId)).toEqual(["session-e0"]);
 	const lost = logs.filter((l) => l.startsWith("retired_session_host_jobs_lost"));
 	expect(lost).toHaveLength(1);
@@ -1841,12 +1841,12 @@ test("#41: an unreadable job list is recorded as unknown, never as no jobs", asy
 	const logs: string[] = [];
 	await harness(port, undefined, (line) => logs.push(line));
 	enqueue("first", "first");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	port.hostJobs.set("session-e0", new Error("broker_unavailable"));
-	port.complete(port.sends[0]?.opRef, "answered");
-	await manager?.tick(KEY);
-	await manager?.reset(KEY, JSON.stringify(ORIGIN));
-	await manager?.tick(KEY);
+	port.complete(port.sends[0]!.opRef, "answered");
+	await manager!.tick(KEY);
+	await manager!.reset(KEY, JSON.stringify(ORIGIN));
+	await manager!.tick(KEY);
 	const lost = logs.filter((l) => l.startsWith("retired_session_host_jobs_lost"));
 	expect(lost).toHaveLength(1);
 	expect(lost[0]).toContain("count=unknown");
@@ -1858,11 +1858,11 @@ test("#41: a retired host with no running jobs ends without a jobs-lost record",
 	const logs: string[] = [];
 	await harness(port, undefined, (line) => logs.push(line));
 	enqueue("first", "first");
-	await manager?.notifyInbound(KEY);
-	port.complete(port.sends[0]?.opRef, "answered");
-	await manager?.tick(KEY);
-	await manager?.reset(KEY, JSON.stringify(ORIGIN));
-	await manager?.tick(KEY);
+	await manager!.notifyInbound(KEY);
+	port.complete(port.sends[0]!.opRef, "answered");
+	await manager!.tick(KEY);
+	await manager!.reset(KEY, JSON.stringify(ORIGIN));
+	await manager!.tick(KEY);
 	expect(port.closes.map((c) => c.sessionId)).toEqual(["session-e0"]);
 	expect(logs.some((l) => l.startsWith("retired_session_host_jobs_lost"))).toBe(false);
 });
@@ -1872,14 +1872,14 @@ test("/new with a turn in flight ends the old host only after that turn is recon
 	const logs2: string[] = [];
 	await harness(port, undefined, (line) => logs2.push(line));
 	enqueue("slow", "slow");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
-	await manager?.reset(KEY, JSON.stringify(ORIGIN));
-	await manager?.tick(KEY);
+	await manager!.reset(KEY, JSON.stringify(ORIGIN));
+	await manager!.tick(KEY);
 	// The retired turn may still deliver its answer: the host must stay up for it.
 	expect(port.closes).toEqual([]);
 	port.complete(first.opRef, "late answer");
-	for (let i = 0; i < 4; i++) await manager?.tick(KEY);
+	for (let i = 0; i < 4; i++) await manager!.tick(KEY);
 	expect(port.closes.map((c) => c.sessionId)).toEqual(["session-e0"]);
 });
 
@@ -1915,11 +1915,11 @@ for (const restart of [false, true])
 			const failures: string[] = [];
 			await harness(port, { terminal: (text) => terminal.push(text), failure: (text) => failures.push(text) });
 			enqueue("admitted", "execute exactly once");
-			await manager?.notifyInbound(KEY);
+			await manager!.notifyInbound(KEY);
 			const first = port.sends[0]!;
 			if (restart) {
-				await manager?.stop();
-				database?.close();
+				await manager!.stop();
+				database!.close();
 				database = await Store.open(join(home, "gateway.db"));
 				registerFixtureBindings(port);
 				manager = new PersonaSessionManager({
@@ -1939,16 +1939,16 @@ for (const restart of [false, true])
 				});
 			}
 			enqueue("admitted-queued", "remain queued", "lane_report");
-			await manager?.notifyInbound(KEY);
+			await manager!.notifyInbound(KEY);
 			for (let sweep = 0; sweep < 3; sweep++) {
-				await manager?.recover();
-				await manager?.tick(KEY);
+				await manager!.recover();
+				await manager!.tick(KEY);
 			}
 			expect(
 				(await port.nativeStatus({ sessionId: first.sessionId, repo: join(home, "workspace"), opRef: first.opRef }))
 					.status.status,
 			).toBe("in_flight");
-			expect(database?.inbox.turnRow(first.opRef)).toMatchObject({
+			expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
 				state: "pending",
 				turn_state: "bound",
 				turn_op_ref: first.opRef,
@@ -1956,7 +1956,7 @@ for (const restart of [false, true])
 				turn_epoch: 0,
 				terminal_delivery_id: null,
 			});
-			expect(database?.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: first.sessionId });
+			expect(database!.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: first.sessionId });
 			expect(port.sends).toHaveLength(1);
 			expect(port.binds).toHaveLength(1);
 			expect(port.resumes).toHaveLength(0);
@@ -1966,18 +1966,18 @@ for (const restart of [false, true])
 			expect(failures).toEqual([]);
 			port.unknown = false;
 			port.complete(first.opRef, "exact admitted native result");
-			await manager?.recover();
-			await manager?.tick(KEY);
+			await manager!.recover();
+			await manager!.tick(KEY);
 			await eventually(
-				() => database?.inbox.turnRow(first.opRef)?.turn_state === "done",
+				() => database!.inbox.turnRow(first.opRef)?.turn_state === "done",
 				"admitted native terminal did not settle",
 			);
-			await manager?.recover();
-			await manager?.tick(KEY);
+			await manager!.recover();
+			await manager!.tick(KEY);
 			expect(terminal).toEqual(["exact admitted native result"]);
 			expect(failures).toEqual([]);
 			expect(port.sends.filter((send) => send.opRef === first.opRef)).toHaveLength(1);
-			expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+			expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 		});
 
 /** Structured prompt-command error used to exercise the ambiguous post-send path. */
@@ -2019,7 +2019,7 @@ for (const acceptedBeforeError of [false, true] as const)
 		const recoveryCalls = trackRecoveryCalls();
 		const text = "possibly accepted";
 		enqueue(`session-not-found-${acceptedBeforeError}`, text);
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		if (acceptedBeforeError)
 			await eventually(() => acceptedPrompts.length === 1, "accepted prompt was not recorded before the command error");
 
@@ -2027,14 +2027,14 @@ for (const acceptedBeforeError of [false, true] as const)
 		expect(attempted).toHaveLength(1);
 		expect(port.sends.filter((send) => send.text === text)).toHaveLength(acceptedBeforeError ? 1 : 0);
 		expect(acceptedPrompts).toHaveLength(acceptedBeforeError ? 1 : 0);
-		expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 		expect(port.binds).toHaveLength(1);
 		expect(recoveryCalls()).toBe(0);
-		expect(logs.some((line) => line.startsWith("persona_send_ambiguous") && line.includes(attempted[0]?.opRef))).toBe(
+		expect(logs.some((line) => line.startsWith("persona_send_ambiguous") && line.includes(attempted[0]!.opRef))).toBe(
 			true,
 		);
 		expect(logs.some((line) => line.startsWith("send_session_disowned action=inline_rebind"))).toBe(false);
-		expect(database?.inbox.turnRow(attempted[0]?.opRef)?.turn_state).toBe(acceptedBeforeError ? "accepted" : "bound");
+		expect(database!.inbox.turnRow(attempted[0]!.opRef)?.turn_state).toBe(acceptedBeforeError ? "accepted" : "bound");
 	});
 
 for (const proof of [
@@ -2063,14 +2063,14 @@ for (const proof of [
 		port.storedSessionId = stored.sessionId;
 		const recoveryCalls = trackRecoveryCalls();
 		enqueue(`retry-${proof.name.replaceAll(" ", "-")}`, "one delivery");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		await eventually(() => port.sends.length === 2, "liveness-proven dead binding did not dispatch on replacement");
 
 		expect(port.sends[1]).toMatchObject({ sessionId: "session-e1", text: "one delivery" });
 		expect(
 			port.sendAttempts.filter((attempt) => attempt.text === "one delivery").map((attempt) => attempt.sessionId),
 		).toEqual(["session-e1"]);
-		expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
+		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
 		expect(recoveryCalls()).toBe(0);
 		expect(logs.some((line) => line.startsWith("recovery_requeue_unaccepted"))).toBe(false);
 		expect(
@@ -2112,14 +2112,14 @@ for (const behavior of ["no_probe", "live", "unknown", "failed_probe", "attach_a
 		port.storedSessionId = stored.sessionId;
 		if (behavior === "no_probe") Object.defineProperty(port, "liveness", { value: undefined });
 		enqueue(`unproven-retry-${behavior}`, "do not replay");
-		const failure = await manager?.notifyInbound(KEY).catch((error: unknown) => error);
+		const failure = await manager!.notifyInbound(KEY).catch((error: unknown) => error);
 
 		if (behavior === "attach_authority" || behavior === "probe_authority")
 			expect(failure).toBeInstanceOf(BrokerAuthorityError);
 		else {
 			// No prompt was sent (#675): the trigger returns to pending for a backoff retry.
 			expect(failure).toBeUndefined();
-			expect(database?.inbox.pendingOldest(KEY)).toMatchObject({
+			expect(database!.inbox.pendingOldest(KEY)).toMatchObject({
 				message_id: `unproven-retry-${behavior}`,
 				turn_state: null,
 			});
@@ -2127,7 +2127,7 @@ for (const behavior of ["no_probe", "live", "unknown", "failed_probe", "attach_a
 		}
 		expect(port.sends).toHaveLength(1);
 		expect(port.binds).toHaveLength(1);
-		expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 		expect(logs.some((line) => line.startsWith("send_session_disowned action=inline_rebind"))).toBe(false);
 	});
 
@@ -2146,18 +2146,18 @@ test("session_not_found text without the broker error code remains ambiguous and
 	const logs: string[] = [];
 	await harness(port, {}, (line) => logs.push(line));
 	enqueue("ambiguous-session-seed", "seed turn");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const stored = port.sends[0]!;
 	port.complete(stored.opRef, "seed answer");
-	await manager?.tick(KEY);
-	await eventually(() => database?.inbox.turnRow(stored.opRef)?.turn_state === "done", "seed turn did not settle");
+	await manager!.tick(KEY);
+	await eventually(() => database!.inbox.turnRow(stored.opRef)?.turn_state === "done", "seed turn did not settle");
 	port.rejectAmbiguous = true;
 	enqueue("ambiguous-session-text", "do not duplicate");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 
 	expect(port.sendAttempts).toHaveLength(2);
 	expect(port.sends).toHaveLength(1);
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	expect(logs.some((line) => line.startsWith("persona_send_ambiguous"))).toBe(true);
 	expect(logs.some((line) => line.startsWith("send_session_disowned action=inline_rebind"))).toBe(false);
 });
@@ -2180,29 +2180,29 @@ for (const authorityFailure of ["direct", "probe"] as const)
 		const port = new AuthorityFailurePort({ onBind: (input) => `session-e${input.epoch}` });
 		await harness(port);
 		enqueue(`held-steer-authority-${authorityFailure}`, "original");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const first = port.sends[0]!;
 		enqueue(`held-steer-${authorityFailure}`, "uncertain steer");
-		await manager?.notifyInbound(KEY);
-		expect(database?.inbox.steersHeld(first.opRef).map((row) => row.message_id)).toEqual([
+		await manager!.notifyInbound(KEY);
+		expect(database!.inbox.steersHeld(first.opRef).map((row) => row.message_id)).toEqual([
 			`held-steer-${authorityFailure}`,
 		]);
 
 		port.complete(first.opRef, "answer");
-		await manager?.tick(KEY);
+		await manager!.tick(KEY);
 		await eventually(
-			() => database?.inbox.turnRow(first.opRef)?.turn_state === "done",
+			() => database!.inbox.turnRow(first.opRef)?.turn_state === "done",
 			"trigger did not become terminal before the stale steer replay",
 		);
 		mode = authorityFailure;
 		const priorSteers = port.steers.length;
-		const failure = await manager?.tick(KEY).catch((error: unknown) => error);
+		const failure = await manager!.tick(KEY).catch((error: unknown) => error);
 
 		expect(failure).toBeInstanceOf(BrokerAuthorityError);
 		expect(port.steers).toHaveLength(priorSteers + 1);
 		expect(port.sends).toHaveLength(1);
 		expect(port.binds).toHaveLength(1);
-		expect(database?.inbox.steersHeld(first.opRef).map((row) => row.message_id)).toEqual([
+		expect(database!.inbox.steersHeld(first.opRef).map((row) => row.message_id)).toEqual([
 			`held-steer-${authorityFailure}`,
 		]);
 	});
@@ -2212,9 +2212,9 @@ for (const exact of [false, true])
 		const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
 		await harness(port);
 		enqueue("recover", "original");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const first = port.sends[0]!;
-		await manager?.stop();
+		await manager!.stop();
 		port.seedOperation(first.opRef, first.sessionId, "failed");
 		let attaches = 0;
 		port.attachTail = async () => {
@@ -2230,11 +2230,11 @@ for (const exact of [false, true])
 		});
 		await manager.recover();
 		await manager.tick(KEY);
-		await eventually(() => manager?.state(KEY) === "idle", "recovered terminal did not settle");
+		await eventually(() => manager!.state(KEY) === "idle", "recovered terminal did not settle");
 		expect(port.sends).toHaveLength(1);
 		expect(attaches).toBe(0);
-		expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
-		expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(exact ? 1 : 0);
+		expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(exact ? 1 : 0);
 	});
 
 for (const resetBy of ["healthy", "new"] as const)
@@ -2242,24 +2242,24 @@ for (const resetBy of ["healthy", "new"] as const)
 		const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
 		await harness(port);
 		enqueue("failed-1", "first");
-		await manager?.notifyInbound(KEY);
-		port.setFailedTurnEvidence(port.sends[0]?.sessionId, "unsupported_input_status");
-		port.fail(port.sends[0]?.opRef);
-		await eventually(() => manager?.state(KEY) === "idle", "first reset incomplete");
+		await manager!.notifyInbound(KEY);
+		port.setFailedTurnEvidence(port.sends[0]!.sessionId, "unsupported_input_status");
+		port.fail(port.sends[0]!.opRef);
+		await eventually(() => manager!.state(KEY) === "idle", "first reset incomplete");
 		if (resetBy === "healthy") {
 			enqueue("healthy", "healthy");
-			await manager?.notifyInbound(KEY);
-			port.complete(port.sends[1]?.opRef, "healthy answer");
-			await eventually(() => manager?.state(KEY) === "idle", "healthy completion incomplete");
-		} else await manager?.reset(KEY, JSON.stringify(ORIGIN));
-		const before = database?.bindings.getSessionRecord(KEY)?.epoch;
+			await manager!.notifyInbound(KEY);
+			port.complete(port.sends[1]!.opRef, "healthy answer");
+			await eventually(() => manager!.state(KEY) === "idle", "healthy completion incomplete");
+		} else await manager!.reset(KEY, JSON.stringify(ORIGIN));
+		const before = database!.bindings.getSessionRecord(KEY)!.epoch;
 		enqueue("failed-2", "second");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const last = port.sends.at(-1)!;
 		port.setFailedTurnEvidence(last.sessionId, "unsupported_input_status");
 		port.fail(last.opRef);
-		await eventually(() => manager?.state(KEY) === "idle", "second failure incomplete");
-		expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(before + 1);
+		await eventually(() => manager!.state(KEY) === "idle", "second failure incomplete");
+		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(before + 1);
 	});
 
 for (const stop of ["cancelled", "refusal"] as const)
@@ -2275,20 +2275,20 @@ for (const stop of ["cancelled", "refusal"] as const)
 		const port = new StopPort({ onBind: (input) => `session-e${input.epoch}` });
 		await harness(port);
 		enqueue("first", "first");
-		await manager?.notifyInbound(KEY);
-		port.setFailedTurnEvidence(port.sends[0]?.sessionId, "unsupported_input_status");
-		port.fail(port.sends[0]?.opRef);
-		await eventually(() => manager?.state(KEY) === "idle", "initial failure incomplete");
+		await manager!.notifyInbound(KEY);
+		port.setFailedTurnEvidence(port.sends[0]!.sessionId, "unsupported_input_status");
+		port.fail(port.sends[0]!.opRef);
+		await eventually(() => manager!.state(KEY) === "idle", "initial failure incomplete");
 		enqueue("stopped", "stopped");
-		await manager?.notifyInbound(KEY);
-		port.complete(port.sends[1]?.opRef, "stopped output");
-		await eventually(() => manager?.state(KEY) === "idle", "stopped completion incomplete");
+		await manager!.notifyInbound(KEY);
+		port.complete(port.sends[1]!.opRef, "stopped output");
+		await eventually(() => manager!.state(KEY) === "idle", "stopped completion incomplete");
 		enqueue("third", "third");
-		await manager?.notifyInbound(KEY);
-		port.setFailedTurnEvidence(port.sends[2]?.sessionId, "unsupported_input_status");
-		port.fail(port.sends[2]?.opRef);
-		await eventually(() => manager?.state(KEY) === "idle", "capped failure incomplete");
-		expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
+		await manager!.notifyInbound(KEY);
+		port.setFailedTurnEvidence(port.sends[2]!.sessionId, "unsupported_input_status");
+		port.fail(port.sends[2]!.opRef);
+		await eventually(() => manager!.state(KEY) === "idle", "capped failure incomplete");
+		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
 	});
 
 test("broker generation change during evidence lookup fences reset", async () => {
@@ -2303,11 +2303,11 @@ test("broker generation change during evidence lookup fences reset", async () =>
 	const port = new GenerationPort();
 	await harness(port, {}, undefined, { brokerGeneration: () => generation });
 	enqueue("generation", "fenced");
-	await manager?.notifyInbound(KEY);
-	port.setFailedTurnEvidence(port.sends[0]?.sessionId, "unsupported_input_status");
-	port.fail(port.sends[0]?.opRef);
-	await eventually(() => manager?.state(KEY) === "idle", "failure incomplete");
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	await manager!.notifyInbound(KEY);
+	port.setFailedTurnEvidence(port.sends[0]!.sessionId, "unsupported_input_status");
+	port.fail(port.sends[0]!.opRef);
+	await eventually(() => manager!.state(KEY) === "idle", "failure incomplete");
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 });
 
 for (const value of ["1", "garbage", "-1", ""])
@@ -2315,15 +2315,15 @@ for (const value of ["1", "garbage", "-1", ""])
 		const port = new ScriptedSessionPort();
 		await harness(port);
 		enqueue("cap", "original");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const first = port.sends[0]!;
 		const key = `failed-turn-reset-cap:${createHash("sha256")
 			.update(JSON.stringify([KEY]))
 			.digest("hex")}`;
-		database?.core.metaSet(key, value);
-		const before = database?.inbox.turnRow(first.opRef);
+		database!.core.metaSet(key, value);
+		const before = database!.inbox.turnRow(first.opRef);
 		expect(
-			database?.transaction((tx) =>
+			database!.transaction((tx) =>
 				resetFailedTurn(database!, tx, {
 					originKey: KEY,
 					epoch: 0,
@@ -2333,15 +2333,15 @@ for (const value of ["1", "garbage", "-1", ""])
 				}),
 			),
 		).toBeUndefined();
-		expect(database?.inbox.turnRow(first.opRef)).toEqual(before);
-		expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+		expect(database!.inbox.turnRow(first.opRef)).toEqual(before);
+		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	});
 
 test("atomic reset rolls completion and markers back when epoch advancement fails", async () => {
 	const port = new ScriptedSessionPort();
 	await harness(port);
 	enqueue("rollback", "original");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
 	const proof = seedPersonaPrompt(first);
 	const input = {
@@ -2351,22 +2351,22 @@ test("atomic reset rolls completion and markers back when epoch advancement fail
 		opRef: first.opRef,
 		triggerMessageId: "rollback",
 	};
-	const before = database?.inbox.turnRow(first.opRef);
-	const original = database?.bindings.rotateEpoch.bind(database?.bindings);
-	database?.bindings.rotateEpoch = () => {
+	const before = database!.inbox.turnRow(first.opRef);
+	const original = database!.bindings.rotateEpoch.bind(database!.bindings);
+	database!.bindings.rotateEpoch = () => {
 		throw new Error("injected transaction failure");
 	};
-	expect(() => database?.transaction((tx) => resetFailedTurn(database!, tx, input))).toThrow(
+	expect(() => database!.transaction((tx) => resetFailedTurn(database!, tx, input))).toThrow(
 		"injected transaction failure",
 	);
-	expect(database?.inbox.turnRow(first.opRef)).toEqual(before);
+	expect(database!.inbox.turnRow(first.opRef)).toEqual(before);
 	expect(proof()).toMatchObject({ state: "complete", resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL) });
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
-	database?.bindings.rotateEpoch = original;
-	expect(database?.transaction((tx) => resetFailedTurn(database!, tx, input))).toBe(1);
-	expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	database!.bindings.rotateEpoch = original;
+	expect(database!.transaction((tx) => resetFailedTurn(database!, tx, input))).toBe(1);
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
 	expect(proof()).toBeUndefined();
-	expect(database?.transaction((tx) => resetFailedTurn(database!, tx, input))).toBeUndefined();
+	expect(database!.transaction((tx) => resetFailedTurn(database!, tx, input))).toBeUndefined();
 });
 
 test("bounded shutdown reconciliation leaves a nonterminal accepted turn durable", async () => {
@@ -2392,10 +2392,10 @@ test("stop drains an admitted generation callback and fences queued and delayed 
 	const logs: string[] = [];
 	await harness(port, { terminal: (text) => terminal.push(text) }, (line) => logs.push(line));
 	enqueue("stop-generation", "keep accepted work durable");
-	await manager?.notifyInbound(KEY);
-	await manager?.drain(0);
+	await manager!.notifyInbound(KEY);
+	await manager!.drain(0);
 	expect(logs.some((line) => line.startsWith("shutdown_hold "))).toBe(true);
-	const before = database?.inbox.turnRow(latestOpRef);
+	const before = database!.inbox.turnRow(latestOpRef);
 	let release!: () => void;
 	const blocked = new Promise<void>((resolve) => {
 		release = resolve;
@@ -2412,16 +2412,16 @@ test("stop drains an admitted generation callback and fences queued and delayed 
 		await blocked;
 		return status(input);
 	};
-	const generation = manager?.onBrokerGeneration(1);
+	const generation = manager!.onBrokerGeneration(1);
 	await started;
-	const queuedGeneration = manager?.onBrokerGeneration(2);
-	const queuedTail = tailInput?.onStall?.({
-		sessionId: port.sends[0]?.sessionId,
+	const queuedGeneration = manager!.onBrokerGeneration(2);
+	const queuedTail = tailInput!.onStall?.({
+		sessionId: port.sends[0]!.sessionId,
 		brokerGeneration: 0,
 		elapsedMs: 100_000,
 	});
 	let stopped = false;
-	const stopping = manager?.stop().then(() => {
+	const stopping = manager!.stop().then(() => {
 		stopped = true;
 	});
 	await Promise.resolve();
@@ -2429,14 +2429,14 @@ test("stop drains an admitted generation callback and fences queued and delayed 
 	release();
 	await Promise.all([generation, queuedGeneration, queuedTail, stopping]);
 	expect(statusCalls).toBe(1);
-	expect(database?.inbox.turnRow(latestOpRef)).toEqual(before);
-	database?.close();
+	expect(database!.inbox.turnRow(latestOpRef)).toEqual(before);
+	database!.close();
 	database = undefined;
 	const callbacks = tailInput!;
-	await manager?.onBrokerGeneration(3);
-	await manager?.tick(KEY);
-	await manager?.reconcile(KEY);
-	await callbacks.onStall?.({ sessionId: port.sends[0]?.sessionId, brokerGeneration: 0, elapsedMs: 100_000 });
+	await manager!.onBrokerGeneration(3);
+	await manager!.tick(KEY);
+	await manager!.reconcile(KEY);
+	await callbacks.onStall?.({ sessionId: port.sends[0]!.sessionId, brokerGeneration: 0, elapsedMs: 100_000 });
 	// A saved callback can outlive the tail handle and database.
 	await callbacks.onFrame?.({
 		kind: "message_end",
@@ -2446,7 +2446,7 @@ test("stop drains an admitted generation callback and fences queued and delayed 
 		steerEcho: false,
 		idle: false,
 	});
-	await callbacks.onRelayLost?.({ sessionId: port.sends[0]?.sessionId, brokerGeneration: 0 });
+	await callbacks.onRelayLost?.({ sessionId: port.sends[0]!.sessionId, brokerGeneration: 0 });
 	expect(statusCalls).toBe(1);
 	expect(port.sends).toHaveLength(1);
 	expect(port.steers).toHaveLength(0);
@@ -2468,7 +2468,7 @@ test("/new retires an accepted turn, fences its late output, and preserves turn 
 	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
 	expect(database?.inbox.turnRow(latestOpRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
 	port.complete(first.opRef, "stale output");
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	await eventually(() => database?.inbox.turnRow(latestOpRef)?.turn_state === "done", "retired turn did not reconcile");
 	expect(terminal).toEqual([]);
 });
@@ -2508,7 +2508,7 @@ test("a /new-retired turn survives broker registry loss until its original nativ
 	const closesBeforeLoss = port.closes.length;
 
 	port.dropped.add(old.sessionId);
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	expect(database?.inbox.turnRow(old.opRef)).toMatchObject({
 		state: "pending",
 		turn_state: "accepted",
@@ -2526,7 +2526,7 @@ test("a /new-retired turn survives broker registry loss until its original nativ
 		(await port.status({ sessionId: old.sessionId, repo: join(home, "workspace"), opRef: old.opRef })).status.status,
 	).toBe("in_flight");
 	port.complete(old.opRef, "original retired result");
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	await eventually(
 		() => database?.inbox.turnRow(old.opRef)?.turn_state === "done",
 		"retired native terminal did not settle",
@@ -2565,14 +2565,14 @@ for (const restart of [false, true])
 				const failures: string[] = [];
 				await harness(port, { terminal: (text) => terminal.push(text), failure: (text) => failures.push(text) });
 				enqueue("registry-original", "execute exactly once");
-				await manager?.notifyInbound(KEY);
+				await manager!.notifyInbound(KEY);
 				await eventually(() => port.sends.length === 1, "accepted turn did not start");
 				const first = port.sends[0]!;
-				expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+				expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
 				port.lost = true;
 				if (restart) {
-					await manager?.stop();
-					database?.close();
+					await manager!.stop();
+					database!.close();
 					database = await Store.open(join(home, "gateway.db"));
 					registerFixtureBindings(port);
 					manager = new PersonaSessionManager({
@@ -2592,16 +2592,16 @@ for (const restart of [false, true])
 					});
 				}
 				enqueue("registry-queued", "do not dispatch while original runs", "lane_report");
-				await manager?.notifyInbound(KEY);
+				await manager!.notifyInbound(KEY);
 				for (let sweep = 0; sweep < 3; sweep++) {
-					await manager?.recover();
-					await manager?.tick(KEY);
+					await manager!.recover();
+					await manager!.tick(KEY);
 				}
 				expect(
 					(await port.nativeStatus({ sessionId: first.sessionId, repo: join(home, "workspace"), opRef: first.opRef }))
 						.status.status,
 				).toBe("in_flight");
-				expect(database?.inbox.turnRow(first.opRef)).toMatchObject({
+				expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
 					state: "pending",
 					turn_state: "accepted",
 					turn_op_ref: first.opRef,
@@ -2609,7 +2609,7 @@ for (const restart of [false, true])
 					turn_epoch: 0,
 					terminal_delivery_id: null,
 				});
-				expect(database?.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: first.sessionId });
+				expect(database!.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: first.sessionId });
 				expect(port.sends).toHaveLength(1);
 				expect(port.binds).toHaveLength(1);
 				expect(port.resumes).toHaveLength(0);
@@ -2619,18 +2619,18 @@ for (const restart of [false, true])
 				expect(failures).toEqual([]);
 				port.lost = false;
 				port.complete(first.opRef, "exact original native output");
-				await manager?.recover();
-				await manager?.tick(KEY);
+				await manager!.recover();
+				await manager!.tick(KEY);
 				await eventually(
-					() => database?.inbox.turnRow(first.opRef)?.turn_state === "done",
+					() => database!.inbox.turnRow(first.opRef)?.turn_state === "done",
 					"same native terminal did not settle",
 				);
-				await manager?.recover();
-				await manager?.tick(KEY);
+				await manager!.recover();
+				await manager!.tick(KEY);
 				expect(terminal).toEqual(["exact original native output"]);
 				expect(failures).toEqual([]);
 				expect(port.sends.filter((send) => send.opRef === first.opRef)).toHaveLength(1);
-				expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+				expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 			});
 
 test("an ACCEPTED turn whose status is endpoint_stale but whose liveness is unanswerable is held, never closed or re-sent", async () => {
@@ -2648,7 +2648,7 @@ test("an ACCEPTED turn whose status is endpoint_stale but whose liveness is unan
 	await eventually(() => port.sends.length === 1, "turn did not start");
 	const first = port.sends[0]!;
 	port.dropped.add(first.sessionId);
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	await eventually(
 		() => logs.some((line) => line.startsWith("recovery_hold") && line.includes(first.opRef)),
 		"unanswerable liveness did not hold the turn",
@@ -2679,25 +2679,25 @@ test("broker registry loss never fabricates a cutoff notice even when its persis
 	const first = port.sends[0]!;
 	port.dropped.add(first.sessionId);
 
-	await manager?.tick(KEY).catch(() => {});
+	await manager!.tick(KEY).catch(() => {});
 	// Registry loss cannot even attempt a cutoff notice or complete the trigger.
 	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
 	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	expect(logs.some((line) => line.startsWith("accepted_turn_closed"))).toBe(false);
 
 	failNotice = false;
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
 	expect(notices).toHaveLength(0);
 	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	port.dropped.delete(first.sessionId);
 	port.complete(first.opRef, "original native result");
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	await eventually(
 		() => database?.inbox.turnRow(first.opRef)?.turn_state === "done",
 		"original native terminal did not settle",
 	);
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	expect(notices).toHaveLength(0);
 	expect(port.sends).toHaveLength(1);
 });
@@ -2770,15 +2770,15 @@ for (const lostAck of [false, true])
 		const terminal: string[] = [];
 		await harness(port, { terminal: (text) => terminal.push(text) });
 		enqueue("stalled-original", "execute once");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const first = port.sends[0]!;
-		await manager?.tick(KEY);
+		await manager!.tick(KEY);
 		port.emitStall(first.sessionId);
-		await manager?.reconcile(KEY);
-		expect(manager?.state(KEY)).toBe("turn-running");
+		await manager!.reconcile(KEY);
+		expect(manager!.state(KEY)).toBe("turn-running");
 		expect(port.tailsOf(first.sessionId)).toHaveLength(1);
 		expect(port.closes).toHaveLength(0);
-		expect(database?.inbox.turnRow(first.opRef)).toMatchObject({
+		expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
 			state: "pending",
 			turn_state: lostAck ? "bound" : "accepted",
 			bound_session_id: first.sessionId,
@@ -2786,9 +2786,9 @@ for (const lostAck of [false, true])
 		});
 		port.unknown = false;
 		port.complete(first.opRef, "original result after observation recovered");
-		await manager?.tick(KEY);
+		await manager!.tick(KEY);
 		await eventually(
-			() => database?.inbox.turnRow(first.opRef)?.turn_state === "done",
+			() => database!.inbox.turnRow(first.opRef)?.turn_state === "done",
 			"stall orphaned original operation",
 		);
 		expect(terminal).toEqual(["original result after observation recovered"]);
@@ -2807,20 +2807,20 @@ test("an unknown observation followed by native terminal before the first stall 
 	const terminal: string[] = [];
 	await harness(port, { terminal: (text) => terminal.push(text) });
 	enqueue("terminal-before-stall", "execute once");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
-	await manager?.reconcile(KEY);
+	await manager!.reconcile(KEY);
 	port.unknown = false;
 	port.seedOperation(first.opRef, first.sessionId, "terminal_ok", "original answer without a terminal frame");
 	port.emitStall(first.sessionId);
-	await manager?.reconcile(KEY);
+	await manager!.reconcile(KEY);
 	await eventually(
-		() => database?.inbox.turnRow(first.opRef)?.turn_state === "done",
+		() => database!.inbox.turnRow(first.opRef)?.turn_state === "done",
 		"original terminal remained held",
 	);
 	expect(terminal).toEqual(["original answer without a terminal frame"]);
-	expect(database?.inbox.turnRow(first.opRef)?.terminal_delivery_id).not.toBe(JSON.stringify({ none: "retired" }));
-	expect(database?.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: first.sessionId });
+	expect(database!.inbox.turnRow(first.opRef)?.terminal_delivery_id).not.toBe(JSON.stringify({ none: "retired" }));
+	expect(database!.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: first.sessionId });
 	expect(port.sends).toHaveLength(1);
 });
 
@@ -2848,15 +2848,15 @@ for (const outcome of ["refused", "terminating", "error", "resumed_activity"] as
 			};
 		}
 		clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
-		await manager?.tick(KEY);
-		expect(database?.inbox.turnRow(first.opRef)).toMatchObject({
+		await manager!.tick(KEY);
+		expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
 			state: "pending",
 			turn_state: "accepted",
 			turn_op_ref: first.opRef,
 			bound_session_id: first.sessionId,
 			turn_epoch: 0,
 		});
-		expect(database?.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: first.sessionId });
+		expect(database!.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: first.sessionId });
 		expect(terminal).toEqual([]);
 		expect(failures).toEqual([]);
 		expect(terminationAttempts).toBe(0);
@@ -2873,7 +2873,7 @@ test("case A: stale status and old idle registry retain accepted identity until 
 	// Before the bound: the ordinary hold, nothing released or killed.
 	for (const offset of [0, 5 * MINUTE, OLD_IDLE_REGISTRY_AGE_MS - MINUTE]) {
 		clock.offsetMs = offset;
-		await manager?.tick(KEY);
+		await manager!.tick(KEY);
 	}
 	expect(logs.some((line) => line.includes("reason=status_unavailable") && line.includes(first.opRef))).toBe(true);
 	expect(logs.some((line) => line.startsWith("wedged_turn_released"))).toBe(false);
@@ -2882,8 +2882,8 @@ test("case A: stale status and old idle registry retain accepted identity until 
 	expect(terminal).toEqual([]);
 
 	clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
-	await manager?.tick(KEY);
-	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({
+	await manager!.tick(KEY);
+	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
 		state: "pending",
 		turn_state: "accepted",
 		turn_op_ref: first.opRef,
@@ -2897,14 +2897,14 @@ test("case A: stale status and old idle registry retain accepted identity until 
 	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	port.stale.delete(first.sessionId);
 	port.complete(first.opRef, "native final answer");
-	await manager?.tick(KEY);
-	await eventually(() => database?.inbox.turnRow(first.opRef)?.turn_state === "done", "native terminal did not settle");
+	await manager!.tick(KEY);
+	await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "done", "native terminal did not settle");
 	expect(terminal).toEqual(["native final answer"]);
 	enqueue("m-2", "next question");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 2, "next message was not dispatched");
-	expect(port.sends[1]?.text).toBe("next question");
-	expect(port.sends[1]?.sessionId).toBe(first.sessionId);
+	expect(port.sends[1]!.text).toBe("next question");
+	expect(port.sends[1]!.sessionId).toBe(first.sessionId);
 });
 
 test("case A with an empty transcript and old idle registry remains held without a cut-off notice", async () => {
@@ -2913,8 +2913,8 @@ test("case A with an empty transcript and old idle registry remains held without
 	port.stale.add(first.sessionId);
 	port.setActivity(first.sessionId, "idle");
 	clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
-	await manager?.tick(KEY);
-	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({
+	await manager!.tick(KEY);
+	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
 		state: "pending",
 		turn_state: "accepted",
 		turn_op_ref: first.opRef,
@@ -2933,8 +2933,8 @@ test("in_flight status is not overridden by old idle registry or transcript text
 	port.appendAssistant(first.sessionId, "answered");
 	port.setActivity(first.sessionId, "idle");
 	clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
-	await manager?.tick(KEY);
-	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({
+	await manager!.tick(KEY);
+	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
 		state: "pending",
 		turn_state: "accepted",
 		turn_op_ref: first.opRef,
@@ -2952,7 +2952,7 @@ async function caseB(port: WedgedSessionPort) {
 	port.pending.add(first.opRef);
 	port.seedOperation(first.opRef, first.sessionId, "terminal_ok", "");
 	port.setActivity(first.sessionId, "idle");
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	await eventually(
 		() => logs.some((line) => line.includes("reason=no_assistant_text_for_terminal") && line.includes(first.opRef)),
 		`terminal_ok with pending output was not held:\n${logs.join("\n")}`,
@@ -2967,13 +2967,13 @@ test("case B: terminal_ok with pending output holds despite spoken and silent tr
 	port.appendAssistant(first.sessionId, "[SILENT]");
 
 	clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS - MINUTE;
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	expect(logs.some((line) => line.startsWith("wedged_turn_released"))).toBe(false);
 	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
 
 	clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
-	await manager?.tick(KEY);
-	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({
+	await manager!.tick(KEY);
+	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
 		state: "pending",
 		turn_state: "accepted",
 		turn_op_ref: first.opRef,
@@ -2987,8 +2987,8 @@ test("case B: terminal_ok with pending output holds despite spoken and silent tr
 	expect(logs.some((line) => line.startsWith("accepted_turn_closed"))).toBe(false);
 	port.pending.delete(first.opRef);
 	port.seedOperation(first.opRef, first.sessionId, "terminal_ok", "exact original result");
-	await manager?.tick(KEY);
-	await eventually(() => database?.inbox.turnRow(first.opRef)?.turn_state === "done", "exact output did not settle");
+	await manager!.tick(KEY);
+	await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "done", "exact output did not settle");
 	expect(terminal).toEqual(["exact original result"]);
 	expect(port.sends).toHaveLength(1);
 });
@@ -2998,8 +2998,8 @@ test("case B with only [SILENT] in the transcript remains held without a silent 
 	const { clock, logs, terminal, failures, first } = await caseB(port);
 	port.appendAssistant(first.sessionId, "[SILENT]");
 	clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
-	await manager?.tick(KEY);
-	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({
+	await manager!.tick(KEY);
+	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
 		state: "pending",
 		turn_state: "accepted",
 		turn_op_ref: first.opRef,
@@ -3015,18 +3015,18 @@ test("an unrelated confirmed delivery cannot settle a terminal operation with pe
 	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
 	const { clock, logs, terminal, recorded, failures, first } = await caseB(port);
 	port.appendAssistant(first.sessionId, "already posted");
-	database?.transaction((tx) => {
-		database?.outbox.create(tx, {
+	database!.transaction((tx) => {
+		database!.outbox.create(tx, {
 			deliveryId: "delivery-earlier",
 			turnId: "turn-earlier",
 			originKey: KEY,
 			payloadJson: JSON.stringify({ origin: ORIGIN, role: "assistant", text: "already posted", final: true }),
 		});
-		database?.outbox.confirm(tx, "delivery-earlier");
+		database!.outbox.confirm(tx, "delivery-earlier");
 	});
 	clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
-	await manager?.tick(KEY);
-	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({
+	await manager!.tick(KEY);
+	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
 		state: "pending",
 		turn_state: "accepted",
 		turn_op_ref: first.opRef,
@@ -3042,8 +3042,8 @@ test("case B with no transcript remains held instead of inferring output failure
 	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
 	const { clock, logs, terminal, failures, first } = await caseB(port);
 	clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
-	await manager?.tick(KEY);
-	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({
+	await manager!.tick(KEY);
+	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
 		state: "pending",
 		turn_state: "accepted",
 		turn_op_ref: first.opRef,
@@ -3068,7 +3068,7 @@ test("a live session that is busy (not idle) past the bound is never released", 
 		12 * OLD_IDLE_REGISTRY_AGE_MS,
 	]) {
 		clock.offsetMs = offset;
-		await manager?.tick(KEY);
+		await manager!.tick(KEY);
 	}
 	expect(logs.some((line) => line.startsWith("wedged_turn_released"))).toBe(false);
 	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
@@ -3096,36 +3096,36 @@ test("a silent in-flight turn is failed after the stall deadline and releases a 
 		{ now: () => clock.now },
 	);
 	enqueue("stalled-trigger", "start the lane");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "persona turn did not start");
 	const first = port.sends[0]!;
 	port.emitAssistant(first.sessionId, "The lane is running", "lane-running", first.opRef);
 	await eventually(() => interimSeen, "mid-work frame was not observed before the stall");
-	await manager?.reconcile(KEY);
+	await manager!.reconcile(KEY);
 	enqueue("stalled-lane-report", "[lane child] complete", "lane_report");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	expect(port.steers).toHaveLength(0);
-	expect(database?.inbox.pendingCount(KEY)).toBe(2);
+	expect(database!.inbox.pendingCount(KEY)).toBe(2);
 	port.setActivity(first.sessionId, "tool", clock.now);
 
 	const readsBeforeStall = port.statusReads.length;
 	port.emitStall(first.sessionId);
 	await eventually(() => port.statusReads.length > readsBeforeStall, "stall did not check operation status");
-	expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
 	expect(port.closes).toHaveLength(0);
 
 	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS - 1;
-	await manager?.tick(KEY);
-	expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+	await manager!.tick(KEY);
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
 	expect(port.closes).toHaveLength(0);
 	expect(failures).toEqual([]);
 
 	clock.now += 1;
-	await manager?.tick(KEY);
-	await eventually(() => database?.inbox.turnRow(first.opRef)?.turn_state === "done", "stalled turn did not close");
+	await manager!.tick(KEY);
+	await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "done", "stalled turn did not close");
 	await eventually(() => port.sends.length === 2, "queued lane report did not start after cutoff");
-	expect(database?.inbox.turnRow(first.opRef)?.terminal_delivery_id).toBe(JSON.stringify({ none: "turn_failed" }));
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(database!.inbox.turnRow(first.opRef)?.terminal_delivery_id).toBe(JSON.stringify({ none: "turn_failed" }));
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
 	expect(port.closes.map((close) => close.sessionId)).toEqual([first.sessionId]);
 	expect(port.sends[1]?.text).toContain("[lane child] complete");
 	expect(failures).toEqual([
@@ -3135,8 +3135,8 @@ test("a silent in-flight turn is failed after the stall deadline and releases a 
 		},
 	]);
 	expect(logs.some((line) => line.startsWith("stalled_turn_cutoff ") && line.includes(first.opRef))).toBe(true);
-	port.complete(port.sends[1]?.opRef, "report received");
-	await eventually(() => database?.inbox.pendingCount(KEY) === 0, "lane report did not settle after cutoff");
+	port.complete(port.sends[1]!.opRef, "report received");
+	await eventually(() => database!.inbox.pendingCount(KEY) === 0, "lane report did not settle after cutoff");
 });
 
 function stalledExitProofKey(opRef: string): string {
@@ -3174,11 +3174,11 @@ async function durableExitFixture(outcome: "terminated" | "already_gone" | "asyn
 		timing,
 	);
 	enqueue("durable-exit-original", "execute exactly once");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
 	port.setActivity(first.sessionId, "tool", clock.now);
 	port.emitStall(first.sessionId);
-	await manager?.reconcile(KEY);
+	await manager!.reconcile(KEY);
 	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
 	let terminationAttempts = 0;
 	port.terminateHost = async (input) => {
@@ -3187,35 +3187,35 @@ async function durableExitFixture(outcome: "terminated" | "already_gone" | "asyn
 		if (outcome === "async" && terminationAttempts === 1) return { outcome: "terminating", pid: 123 };
 		return outcome === "already_gone" ? { outcome: "already_gone" } : { outcome: "terminated", pid: 123 };
 	};
-	await manager?.tick(KEY).catch(() => {});
+	await manager!.tick(KEY).catch(() => {});
 	if (outcome === "async") {
 		expect(noticeAttempts).toBe(0);
-		expect(database?.core.metaGet(stalledExitProofKey(first.opRef))).toBeUndefined();
+		expect(database!.core.metaGet(stalledExitProofKey(first.opRef))).toBeUndefined();
 		const recheck = [...timers].find(([, timer]) => timer.delay === 1_000);
 		expect(recheck).toBeDefined();
-		timers.delete(recheck?.[0]);
-		recheck?.[1].work();
-		await manager?.reconcile(KEY).catch(() => {});
+		timers.delete(recheck![0]);
+		recheck![1].work();
+		await manager!.reconcile(KEY).catch(() => {});
 	}
 	expect(noticeAttempts).toBeGreaterThan(0);
-	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({
+	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
 		state: "pending",
 		turn_state: "accepted",
 		bound_session_id: first.sessionId,
 		turn_epoch: 0,
 	});
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	const proofKey = stalledExitProofKey(first.opRef);
-	const proof = database?.core.metaGet(proofKey);
+	const proof = database!.core.metaGet(proofKey);
 	expect(proof, "confirmed exit must be durable before onFailure can throw").toBeDefined();
 	const failures: string[] = [];
 	const terminal: string[] = [];
 	const status = port.status.bind(port);
 	async function reopen(observation: "unknown" | "unavailable" | "terminal" = "unknown") {
 		// stop() only tears down actor resources: no drain or completion is allowed here.
-		await manager?.stop();
-		expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
-		database?.close();
+		await manager!.stop();
+		expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+		database!.close();
 		database = await Store.open(join(home, "gateway.db"));
 		registerFixtureBindings(port);
 		port.status = async (input) => {
@@ -3260,16 +3260,16 @@ for (const outcome of ["terminated", "already_gone", "async"] as const)
 			const resumes = f.port.resumes.length;
 			const binds = f.port.binds.length;
 			await f.reopen(observation);
-			await manager?.recover();
-			await manager?.tick(KEY);
-			expect(database?.inbox.turnRow(f.first.opRef)).toMatchObject({
+			await manager!.recover();
+			await manager!.tick(KEY);
+			expect(database!.inbox.turnRow(f.first.opRef)).toMatchObject({
 				turn_state: "done",
 				terminal_delivery_id: JSON.stringify({ none: "turn_failed" }),
 			});
-			expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
-			expect(database?.core.metaGet(f.proofKey)).toBeUndefined();
-			await manager?.recover();
-			await manager?.tick(KEY);
+			expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
+			expect(database!.core.metaGet(f.proofKey)).toBeUndefined();
+			await manager!.recover();
+			await manager!.tick(KEY);
 			expect(f.failures).toHaveLength(1);
 			expect(f.terminal).toEqual([]);
 			expect(f.terminationAttempts()).toBe(attempts);
@@ -3277,18 +3277,18 @@ for (const outcome of ["terminated", "already_gone", "async"] as const)
 			expect(f.port.binds).toHaveLength(binds);
 			expect(f.port.sends).toHaveLength(1);
 			enqueue("durable-exit-next", "new work after confirmed exit");
-			await manager?.notifyInbound(KEY);
+			await manager!.notifyInbound(KEY);
 			expect(f.port.sends).toHaveLength(2);
 			expect(f.port.sends[1]).toMatchObject({ sessionId: "session-e1", text: "new work after confirmed exit" });
 		});
 
 test("durable stalled-host exit retry preserves native submission retry and consumes the old proof after Store reopen", async () => {
 	const f = await durableExitFixture("terminated");
-	await manager?.stop();
+	await manager!.stop();
 	f.port.fail(f.first.opRef, "Prompt submission failed.", SUBMISSION_BUSY);
 	await f.reopen("terminal");
-	await manager?.recover();
-	expect(database?.inbox.pendingOldest(KEY)).toMatchObject({
+	await manager!.recover();
+	expect(database!.inbox.pendingOldest(KEY)).toMatchObject({
 		message_id: "durable-exit-original",
 		state: "pending",
 		turn_state: null,
@@ -3296,10 +3296,10 @@ test("durable stalled-host exit retry preserves native submission retry and cons
 		turn_epoch: null,
 		bound_session_id: null,
 	});
-	expect(database?.inbox.turnRow(f.first.opRef)).toBeUndefined();
+	expect(database!.inbox.turnRow(f.first.opRef)).toBeUndefined();
 	expect(freshTurnAttempt(database!, KEY, 0, "durable-exit-original")).toBe(1);
-	expect(database?.core.metaGet(f.proofKey)).toBeUndefined();
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(database!.core.metaGet(f.proofKey)).toBeUndefined();
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	expect(f.failures).toEqual([]);
 	expect(f.terminal).toEqual([]);
 	expect(f.port.sends).toHaveLength(1);
@@ -3307,30 +3307,30 @@ test("durable stalled-host exit retry preserves native submission retry and cons
 
 test("durable stalled-host exit retry rolls back proof, trigger and attempt together before commit", async () => {
 	const f = await durableExitFixture("terminated");
-	await manager?.stop();
-	const before = database?.inbox.turnRow(f.first.opRef);
+	await manager!.stop();
+	const before = database!.inbox.turnRow(f.first.opRef);
 	expect(freshTurnAttempt(database!, KEY, 0, "durable-exit-original")).toBe(0);
 	expect(() =>
-		database?.transaction((tx) => {
+		database!.transaction((tx) => {
 			expect(retryInboundTurn(database!, tx, f.first.opRef)).toBe(1);
-			expect(database?.inbox.turnRow(f.first.opRef)).toBeUndefined();
+			expect(database!.inbox.turnRow(f.first.opRef)).toBeUndefined();
 			expect(freshTurnAttempt(database!, KEY, 0, "durable-exit-original")).toBe(1);
-			expect(database?.core.metaGet(f.proofKey)).toBeUndefined();
+			expect(database!.core.metaGet(f.proofKey)).toBeUndefined();
 			throw new Error("rollback exit retry");
 		}),
 	).toThrow("rollback exit retry");
-	expect(database?.inbox.turnRow(f.first.opRef)).toEqual(before);
+	expect(database!.inbox.turnRow(f.first.opRef)).toEqual(before);
 	expect(freshTurnAttempt(database!, KEY, 0, "durable-exit-original")).toBe(0);
-	expect(database?.core.metaGet(f.proofKey)).toBe(f.proof);
-	expect(database?.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toBe(1);
-	expect(database?.inbox.pendingOldest(KEY)).toMatchObject({
+	expect(database!.core.metaGet(f.proofKey)).toBe(f.proof);
+	expect(database!.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toBe(1);
+	expect(database!.inbox.pendingOldest(KEY)).toMatchObject({
 		state: "pending",
 		turn_state: null,
 		turn_op_ref: null,
 		bound_session_id: null,
 	});
 	expect(freshTurnAttempt(database!, KEY, 0, "durable-exit-original")).toBe(1);
-	expect(database?.core.metaGet(f.proofKey)).toBeUndefined();
+	expect(database!.core.metaGet(f.proofKey)).toBeUndefined();
 });
 
 for (const mismatch of [
@@ -3346,83 +3346,83 @@ for (const mismatch of [
 ] as const)
 	test(`durable stalled-host exit retry preserves ${mismatch} proof`, async () => {
 		const f = await durableExitFixture("terminated");
-		await manager?.stop();
+		await manager!.stop();
 		const proof = JSON.parse(f.proof);
 		if (mismatch === "authority") proof.authority = { ...proof.authority, identity: "foreign-broker" };
 		else if (mismatch === "version" || mismatch === "epoch") proof[mismatch] = 99;
 		else if (mismatch !== "malformed") proof[mismatch] = "foreign-or-unconfirmed";
 		const poisoned = mismatch === "malformed" ? "{broken-json" : JSON.stringify(proof);
-		database?.transaction(() => database?.core.metaSet(f.proofKey, poisoned));
-		expect(database?.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toBe(1);
-		expect(database?.inbox.turnRow(f.first.opRef)).toBeUndefined();
-		expect(database?.core.metaGet(f.proofKey)).toBe(poisoned);
+		database!.transaction(() => database!.core.metaSet(f.proofKey, poisoned));
+		expect(database!.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toBe(1);
+		expect(database!.inbox.turnRow(f.first.opRef)).toBeUndefined();
+		expect(database!.core.metaGet(f.proofKey)).toBe(poisoned);
 	});
 
 test("durable stalled-host exit retry preserves proof after persisted broker authority changes", async () => {
 	const f = await durableExitFixture("terminated");
-	await manager?.stop();
-	const authority = database?.bindings.authority!;
-	database?.transaction((tx) => database?.bindings.setAuthority(tx, { ...authority, identity: "replacement-broker" }));
-	expect(database?.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toBe(1);
-	expect(database?.inbox.turnRow(f.first.opRef)).toBeUndefined();
-	expect(database?.core.metaGet(f.proofKey)).toBe(f.proof);
+	await manager!.stop();
+	const authority = database!.bindings.authority!;
+	database!.transaction((tx) => database!.bindings.setAuthority(tx, { ...authority, identity: "replacement-broker" }));
+	expect(database!.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toBe(1);
+	expect(database!.inbox.turnRow(f.first.opRef)).toBeUndefined();
+	expect(database!.core.metaGet(f.proofKey)).toBe(f.proof);
 });
 
 test("durable stalled-host exit retry rejects quarantine without changing proof, trigger or attempt", async () => {
 	const f = await durableExitFixture("terminated");
-	await manager?.stop();
-	const before = database?.inbox.turnRow(f.first.opRef);
-	const authority = database?.bindings.authority!;
-	database?.transaction((tx) =>
-		database?.bindings.cutoverBrokerAuthority(tx, {
+	await manager!.stop();
+	const before = database!.inbox.turnRow(f.first.opRef);
+	const authority = database!.bindings.authority!;
+	database!.transaction((tx) =>
+		database!.bindings.cutoverBrokerAuthority(tx, {
 			expectedAuthority: authority,
 			targetAuthority: { ...authority, identity: "cutover-broker" },
 			evidence: "test-only verified cutover snapshot",
 			disposition: "quarantine",
 		}),
 	);
-	expect(database?.bindings.isQuarantined("inbound", "durable-exit-original")).toBe(true);
-	expect(() => database?.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toThrow(
+	expect(database!.bindings.isQuarantined("inbound", "durable-exit-original")).toBe(true);
+	expect(() => database!.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toThrow(
 		BrokerAuthorityError,
 	);
-	expect(database?.inbox.turnRow(f.first.opRef)).toEqual(before);
+	expect(database!.inbox.turnRow(f.first.opRef)).toEqual(before);
 	expect(freshTurnAttempt(database!, KEY, 0, "durable-exit-original")).toBe(0);
-	expect(database?.core.metaGet(f.proofKey)).toBe(f.proof);
+	expect(database!.core.metaGet(f.proofKey)).toBe(f.proof);
 });
 
 test("durable stalled-host exit retry preserves proof when requeue changes zero rows", async () => {
 	const f = await durableExitFixture("terminated");
-	await manager?.stop();
-	const before = database?.inbox.turnRow(f.first.opRef);
-	const requeue = database?.inbox.turnRequeue;
+	await manager!.stop();
+	const before = database!.inbox.turnRow(f.first.opRef);
+	const requeue = database!.inbox.turnRequeue;
 	let calls = 0;
-	database?.inbox.turnRequeue = (_tx, opRef) => {
+	database!.inbox.turnRequeue = (_tx, opRef) => {
 		calls++;
 		expect(opRef).toBe(f.first.opRef);
 		return 0;
 	};
 	try {
-		expect(database?.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toBe(1);
+		expect(database!.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toBe(1);
 	} finally {
-		database?.inbox.turnRequeue = requeue;
+		database!.inbox.turnRequeue = requeue;
 	}
 	expect(calls).toBe(1);
-	expect(database?.inbox.turnRow(f.first.opRef)).toEqual(before);
-	expect(database?.core.metaGet(f.proofKey)).toBe(f.proof);
+	expect(database!.inbox.turnRow(f.first.opRef)).toEqual(before);
+	expect(database!.core.metaGet(f.proofKey)).toBe(f.proof);
 });
 
 test("durable stalled-host exit yields to exact original readable native terminal and consumes proof", async () => {
 	const f = await durableExitFixture("terminated");
 	f.port.seedOperation(f.first.opRef, f.first.sessionId, "terminal_ok", "exact original output after crash");
 	await f.reopen("terminal");
-	await manager?.recover();
-	await manager?.tick(KEY);
-	await manager?.recover();
+	await manager!.recover();
+	await manager!.tick(KEY);
+	await manager!.recover();
 	expect(f.terminal).toEqual(["exact original output after crash"]);
 	expect(f.failures).toEqual([]);
-	expect(database?.inbox.turnRow(f.first.opRef)?.turn_state).toBe("done");
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
-	expect(database?.core.metaGet(f.proofKey)).toBeUndefined();
+	expect(database!.inbox.turnRow(f.first.opRef)?.turn_state).toBe("done");
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(database!.core.metaGet(f.proofKey)).toBeUndefined();
 	expect(f.port.sends).toHaveLength(1);
 });
 
@@ -3444,14 +3444,14 @@ for (const mismatch of [
 		else if (mismatch === "version" || mismatch === "epoch") proof[mismatch] = 99;
 		else if (mismatch !== "malformed") proof[mismatch] = "foreign-or-unconfirmed";
 		const poisoned = mismatch === "malformed" ? "{broken-json" : JSON.stringify(proof);
-		database?.transaction(() => database?.core.metaSet(f.proofKey, poisoned));
+		database!.transaction(() => database!.core.metaSet(f.proofKey, poisoned));
 		const attempts = f.terminationAttempts();
 		await f.reopen("unavailable");
-		await manager?.recover();
-		await manager?.tick(KEY);
-		expect(database?.inbox.turnRow(f.first.opRef)?.turn_state).toBe("accepted");
-		expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
-		expect(database?.core.metaGet(f.proofKey)).toBe(poisoned);
+		await manager!.recover();
+		await manager!.tick(KEY);
+		expect(database!.inbox.turnRow(f.first.opRef)?.turn_state).toBe("accepted");
+		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+		expect(database!.core.metaGet(f.proofKey)).toBe(poisoned);
 		expect(f.failures).toEqual([]);
 		expect(f.terminal).toEqual([]);
 		expect(f.terminationAttempts()).toBe(attempts);
@@ -3478,11 +3478,11 @@ for (const outcome of ["refused", "terminating", "throw"] as const)
 			},
 		);
 		enqueue("durable-exit-unconfirmed", "do not infer producer death");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const first = port.sends[0]!;
 		port.setActivity(first.sessionId, "tool", clock.now);
 		port.emitStall(first.sessionId);
-		await manager?.reconcile(KEY);
+		await manager!.reconcile(KEY);
 		clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
 		let attempts = 0;
 		port.terminateHost = async (input) => {
@@ -3493,24 +3493,24 @@ for (const outcome of ["refused", "terminating", "throw"] as const)
 				? { outcome: "terminating", pid: 123 }
 				: { outcome: "refused", reason: "process_identity_changed" };
 		};
-		await manager?.tick(KEY);
+		await manager!.tick(KEY);
 		expect(attempts).toBe(1);
-		expect(database?.core.metaGet(stalledExitProofKey(first.opRef))).toBeUndefined();
-		expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
-		expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+		expect(database!.core.metaGet(stalledExitProofKey(first.opRef))).toBeUndefined();
+		expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 		expect(failures).toEqual([]);
 	});
 
 test("durable stalled-host exit rejects proof when persisted broker authority changes", async () => {
 	const f = await durableExitFixture("terminated");
 	await f.reopen("unavailable");
-	const authority = database?.bindings.authority!;
-	database?.transaction((tx) => database?.bindings.setAuthority(tx, { ...authority, identity: "replacement-broker" }));
-	await manager?.recover().catch(() => {});
-	await manager?.tick(KEY).catch(() => {});
-	expect(database?.inbox.turnRow(f.first.opRef)?.turn_state).toBe("accepted");
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
-	expect(database?.core.metaGet(f.proofKey)).toBe(f.proof);
+	const authority = database!.bindings.authority!;
+	database!.transaction((tx) => database!.bindings.setAuthority(tx, { ...authority, identity: "replacement-broker" }));
+	await manager!.recover().catch(() => {});
+	await manager!.tick(KEY).catch(() => {});
+	expect(database!.inbox.turnRow(f.first.opRef)?.turn_state).toBe("accepted");
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(database!.core.metaGet(f.proofKey)).toBe(f.proof);
 	expect(f.failures).toEqual([]);
 	expect(f.port.sends).toHaveLength(1);
 });
@@ -3518,20 +3518,20 @@ test("durable stalled-host exit rejects proof when persisted broker authority ch
 test("durable stalled-host exit stays quarantined after broker cutover", async () => {
 	const f = await durableExitFixture("terminated");
 	await f.reopen("unavailable");
-	const authority = database?.bindings.authority!;
-	database?.transaction((tx) =>
-		database?.bindings.cutoverBrokerAuthority(tx, {
+	const authority = database!.bindings.authority!;
+	database!.transaction((tx) =>
+		database!.bindings.cutoverBrokerAuthority(tx, {
 			expectedAuthority: authority,
 			targetAuthority: { ...authority, identity: "cutover-broker" },
 			evidence: "test-only verified cutover snapshot",
 			disposition: "quarantine",
 		}),
 	);
-	expect(database?.bindings.isQuarantined("inbound", "durable-exit-original")).toBe(true);
-	await manager?.recover();
-	await manager?.tick(KEY);
-	expect(database?.inbox.turnRow(f.first.opRef)?.turn_state).toBe("accepted");
-	expect(database?.core.metaGet(f.proofKey)).toBe(f.proof);
+	expect(database!.bindings.isQuarantined("inbound", "durable-exit-original")).toBe(true);
+	await manager!.recover();
+	await manager!.tick(KEY);
+	expect(database!.inbox.turnRow(f.first.opRef)?.turn_state).toBe("accepted");
+	expect(database!.core.metaGet(f.proofKey)).toBe(f.proof);
 	expect(f.failures).toEqual([]);
 	expect(f.terminal).toEqual([]);
 	expect(f.port.sends).toHaveLength(1);
@@ -3540,39 +3540,39 @@ test("durable stalled-host exit stays quarantined after broker cutover", async (
 test("durable stalled-host exit completion, rotation and proof consumption roll back together", async () => {
 	const f = await durableExitFixture("already_gone");
 	await f.reopen();
-	const rotate = database?.bindings.rotateEpoch.bind(database?.bindings);
-	database?.bindings.rotateEpoch = () => {
+	const rotate = database!.bindings.rotateEpoch.bind(database!.bindings);
+	database!.bindings.rotateEpoch = () => {
 		throw new Error("injected exit rotation failure");
 	};
-	await manager?.recover().catch(() => {});
-	await manager?.tick(KEY).catch(() => {});
-	expect(database?.inbox.turnRow(f.first.opRef)?.turn_state).toBe("accepted");
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
-	expect(database?.core.metaGet(f.proofKey)).toBe(f.proof);
-	database?.bindings.rotateEpoch = rotate;
-	await manager?.recover();
-	await manager?.tick(KEY);
-	expect(database?.inbox.turnRow(f.first.opRef)?.turn_state).toBe("done");
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
-	expect(database?.core.metaGet(f.proofKey)).toBeUndefined();
+	await manager!.recover().catch(() => {});
+	await manager!.tick(KEY).catch(() => {});
+	expect(database!.inbox.turnRow(f.first.opRef)?.turn_state).toBe("accepted");
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(database!.core.metaGet(f.proofKey)).toBe(f.proof);
+	database!.bindings.rotateEpoch = rotate;
+	await manager!.recover();
+	await manager!.tick(KEY);
+	expect(database!.inbox.turnRow(f.first.opRef)?.turn_state).toBe("done");
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(database!.core.metaGet(f.proofKey)).toBeUndefined();
 });
 
 test("durable stalled-host exit from reset-retired epoch cannot rotate or close its replacement", async () => {
 	const f = await durableExitFixture("terminated");
-	await manager?.stop();
-	database?.transaction((tx) => database?.bindings.rotateEpoch(tx, KEY));
+	await manager!.stop();
+	database!.transaction((tx) => database!.bindings.rotateEpoch(tx, KEY));
 	await f.reopen();
-	await manager?.recover();
-	await manager?.tick(KEY);
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
+	await manager!.recover();
+	await manager!.tick(KEY);
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
 	enqueue("durable-exit-replacement", "replacement epoch");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const replacement = f.port.sends[1]!;
 	expect(replacement).toMatchObject({ sessionId: "session-e1", text: "replacement epoch" });
-	await manager?.recover();
-	await manager?.tick(KEY);
-	expect(database?.inbox.turnRow(replacement.opRef)?.turn_state).toBe("accepted");
-	expect(database?.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 1, sessionId: replacement.sessionId });
+	await manager!.recover();
+	await manager!.tick(KEY);
+	expect(database!.inbox.turnRow(replacement.opRef)?.turn_state).toBe("accepted");
+	expect(database!.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 1, sessionId: replacement.sessionId });
 	expect(f.port.sends.filter((send) => send.opRef === f.first.opRef)).toHaveLength(1);
 });
 
@@ -3603,12 +3603,12 @@ test("durable stalled-host exit confirms reset-retired original before cleanup a
 		timing,
 	);
 	enqueue("retired-confirm-original", "original producer");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
 	const tail = port.tailsOf(first.sessionId)[0]!;
 	port.setActivity(first.sessionId, "tool", clock.now);
 	port.emitStall(first.sessionId);
-	await manager?.reconcile(KEY);
+	await manager!.reconcile(KEY);
 	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
 	let confirmed = false;
 	let attempts = 0;
@@ -3621,10 +3621,10 @@ test("durable stalled-host exit confirms reset-retired original before cleanup a
 		}
 		return { outcome: "already_gone" };
 	};
-	await manager?.tick(KEY);
-	await manager?.reset(KEY, JSON.stringify(ORIGIN));
+	await manager!.tick(KEY);
+	await manager!.reset(KEY, JSON.stringify(ORIGIN));
 	enqueue("retired-confirm-replacement", "replacement remains running");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	// A signalled-but-unconfirmed host intentionally holds replacement admission.
 	expect(port.sends).toHaveLength(1);
 	const proofKey = stalledExitProofKey(first.opRef);
@@ -3632,7 +3632,7 @@ test("durable stalled-host exit confirms reset-retired original before cleanup a
 	let interrupted = false;
 	tail.close = async () => {
 		interrupted = true;
-		expect(database?.core.metaGet(proofKey), "retired confirmation must precede cleanup").toBeDefined();
+		expect(database!.core.metaGet(proofKey), "retired confirmation must precede cleanup").toBeDefined();
 		throw new Error("injected retired cleanup crash");
 	};
 	const status = port.status.bind(port);
@@ -3643,15 +3643,15 @@ test("durable stalled-host exit confirms reset-retired original before cleanup a
 	confirmed = true;
 	const recheck = [...timers].find(([, timer]) => timer.delay === 1_000);
 	expect(recheck).toBeDefined();
-	timers.delete(recheck?.[0]);
-	recheck?.[1].work();
-	await manager?.reconcile(KEY).catch(() => {});
-	expect(database?.core.metaGet(proofKey), "reset must not discard original positive exit").toBeDefined();
+	timers.delete(recheck![0]);
+	recheck![1].work();
+	await manager!.reconcile(KEY).catch(() => {});
+	expect(database!.core.metaGet(proofKey), "reset must not discard original positive exit").toBeDefined();
 	expect(interrupted).toBe(true);
-	expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
 	tail.close = close;
-	await manager?.stop();
-	database?.close();
+	await manager!.stop();
+	database!.close();
 	database = await Store.open(join(home, "gateway.db"));
 	registerFixtureBindings(port);
 	manager = new PersonaSessionManager({
@@ -3661,18 +3661,18 @@ test("durable stalled-host exit confirms reset-retired original before cleanup a
 		repo: join(home, "workspace"),
 		...timing,
 	});
-	await manager?.recover();
-	await manager?.tick(KEY);
-	await manager?.recover();
-	expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
-	expect(database?.core.metaGet(proofKey)).toBeUndefined();
-	await manager?.notifyInbound(KEY);
+	await manager!.recover();
+	await manager!.tick(KEY);
+	await manager!.recover();
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+	expect(database!.core.metaGet(proofKey)).toBeUndefined();
+	await manager!.notifyInbound(KEY);
 	const replacement = port.sends[1]!;
 	expect(replacement).toMatchObject({ sessionId: "session-e1", text: "replacement remains running" });
-	await manager?.recover();
-	await manager?.tick(KEY);
-	expect(database?.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 1, sessionId: replacement.sessionId });
-	expect(database?.inbox.turnRow(replacement.opRef)?.turn_state).toBe("accepted");
+	await manager!.recover();
+	await manager!.tick(KEY);
+	expect(database!.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 1, sessionId: replacement.sessionId });
+	expect(database!.inbox.turnRow(replacement.opRef)?.turn_state).toBe("accepted");
 	expect(attempts).toBe(2);
 	expect(failures).toEqual([]);
 	expect(port.sends).toHaveLength(2);
@@ -3698,11 +3698,11 @@ for (const foreignStatus of ["unknown", "in_flight"] as const)
 			{ now: () => clock.now, setTimeout: () => ({}), clearTimeout: () => {} },
 		);
 		enqueue("foreign-confirm-original", "original output only");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const first = port.sends[0]!;
 		port.setActivity(first.sessionId, "tool", clock.now);
 		port.emitStall(first.sessionId);
-		await manager?.reconcile(KEY);
+		await manager!.reconcile(KEY);
 		clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
 		let exited = false;
 		const status = port.status.bind(port);
@@ -3715,20 +3715,20 @@ for (const foreignStatus of ["unknown", "in_flight"] as const)
 			exited = true;
 			return { outcome: "terminated", pid: 123 };
 		};
-		await manager?.tick(KEY);
+		await manager!.tick(KEY);
 		expect(exited).toBe(true);
-		expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
-		expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
-		expect(database?.core.metaGet(stalledExitProofKey(first.opRef))).toBeDefined();
+		expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+		expect(database!.core.metaGet(stalledExitProofKey(first.opRef))).toBeDefined();
 		expect(failures).toEqual([]);
 		port.status = status;
 		port.seedOperation(first.opRef, first.sessionId, "terminal_ok", "exact original terminal after foreign report");
-		await manager?.tick(KEY);
-		await manager?.tick(KEY);
+		await manager!.tick(KEY);
+		await manager!.tick(KEY);
 		expect(terminal).toEqual(["exact original terminal after foreign report"]);
 		expect(failures).toEqual([]);
-		expect(database?.core.metaGet(stalledExitProofKey(first.opRef))).toBeUndefined();
-		expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+		expect(database!.core.metaGet(stalledExitProofKey(first.opRef))).toBeUndefined();
+		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 		expect(port.sends).toHaveLength(1);
 	});
 
@@ -3740,7 +3740,7 @@ test("a terminal operation found after host exit is not failed", async () => {
 		now: () => clock.now,
 	});
 	enqueue("terminal-before-cutoff", "finish the current turn");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "persona turn did not start");
 	const send = port.sends[0]!;
 	port.setActivity(send.sessionId, "tool", clock.now);
@@ -3753,14 +3753,14 @@ test("a terminal operation found after host exit is not failed", async () => {
 		port.seedOperation(send.opRef, sessionId, "terminal_ok", "completed during host inspection");
 		port.setSessionState(sessionId, { live: false });
 	};
-	await manager?.tick(KEY);
-	expect(database?.inbox.turnRow(send.opRef)?.turn_state).toBe("accepted");
+	await manager!.tick(KEY);
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("accepted");
 	expect(port.closes).toHaveLength(0);
 	expect(failures).toEqual([]);
 
 	port.complete(send.opRef, "the operation completed before the cutoff");
 	await eventually(
-		() => database?.inbox.turnRow(send.opRef)?.turn_state === "done",
+		() => database!.inbox.turnRow(send.opRef)?.turn_state === "done",
 		"terminal operation was not reconciled",
 	);
 	expect(port.closes).toHaveLength(0);
@@ -3784,7 +3784,7 @@ test("tail activity that resumes after the stall deadline cancels the cutoff", a
 		{ now: () => clock.now },
 	);
 	enqueue("stall-resumed", "continue working");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "persona turn did not start");
 	const send = port.sends[0]!;
 	port.setActivity(send.sessionId, "tool", clock.now);
@@ -3797,14 +3797,14 @@ test("tail activity that resumes after the stall deadline cancels the cutoff", a
 		port.emitAssistant(sessionId, "The tool is still making progress", "resumed-work", send.opRef);
 		await Bun.sleep(5);
 	};
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	await eventually(() => assistantFrames === 1, "resumed tail frame was not delivered");
-	await manager?.reconcile(KEY);
-	expect(database?.inbox.turnRow(send.opRef)?.turn_state).toBe("accepted");
+	await manager!.reconcile(KEY);
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("accepted");
 	expect(port.closes).toHaveLength(0);
 
 	port.complete(send.opRef, "finished normally");
-	await eventually(() => database?.inbox.turnRow(send.opRef)?.turn_state === "done", "resumed turn did not finish");
+	await eventually(() => database!.inbox.turnRow(send.opRef)?.turn_state === "done", "resumed turn did not finish");
 	expect(port.closes).toHaveLength(0);
 });
 
@@ -3825,7 +3825,7 @@ test("resumed activity clears an unknown-status recovery hold before a later sta
 		},
 	});
 	enqueue("unknown-stall-trigger", "keep working");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "persona turn did not start");
 	const first = port.sends[0]!;
 	port.unknown = true;
@@ -3834,17 +3834,17 @@ test("resumed activity clears an unknown-status recovery hold before a later sta
 	port.emitStall(first.sessionId);
 	await eventually(() => port.statusReads.length > statusReads, "first stall did not reconcile unknown status");
 	enqueue("unknown-stall-queued", "wait for the current turn", "lane_report");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	port.emitAssistant(first.sessionId, "The operation resumed", "unknown-resumed", first.opRef);
 	await eventually(() => assistantFrames === 1, "resumed tail activity was not delivered");
 
 	statusReads = port.statusReads.length;
 	port.emitStall(first.sessionId);
 	await eventually(() => port.statusReads.length > statusReads, "second stall did not reconcile the current turn");
-	expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
 	expect(port.sends).toHaveLength(1);
 	expect(port.closes).toHaveLength(0);
-	expect(database?.inbox.pendingCount(KEY)).toBe(2);
+	expect(database!.inbox.pendingCount(KEY)).toBe(2);
 });
 
 test("a stalled turn with a reply ending in stopReason stop does not post a failure notice (#768)", async () => {
@@ -3862,13 +3862,13 @@ test("a stalled turn with a reply ending in stopReason stop does not post a fail
 		{ now: () => clock.now },
 	);
 	enqueue("stall-stop-reply", "answer with a proper conclusion");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "persona turn did not start");
 	const send = port.sends[0]!;
 	// Set up the transcript with a reply that ended with stopReason "stop"
 	port.appendAssistant(send.sessionId, "Here is my answer", clock.now, "stop");
 	port.emitAssistant(send.sessionId, "Here is my answer", "answer-frame", send.opRef);
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 
 	// Trigger stall without emitting agent_end
 	port.setActivity(send.sessionId, "tool", clock.now);
@@ -3878,11 +3878,11 @@ test("a stalled turn with a reply ending in stopReason stop does not post a fail
 
 	// Advance time to trigger stall cutoff
 	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 
 	// Verify no failure notice was posted
 	expect(failureNoticePosted).toBe(false);
-	expect(database?.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
 });
 
 test("a stalled turn with interim speech still posts a failure notice", async () => {
@@ -3900,12 +3900,12 @@ test("a stalled turn with interim speech still posts a failure notice", async ()
 		{ now: () => clock.now },
 	);
 	enqueue("stall-interim-speech", "start working with interim updates");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "persona turn did not start");
 	const send = port.sends[0]!;
 	// Emit interim speech without final answer (no stopReason)
 	port.emitAssistant(send.sessionId, "Still thinking...", "interim-1", send.opRef);
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 
 	// Trigger stall without emitting agent_end
 	port.setActivity(send.sessionId, "tool", clock.now);
@@ -3915,11 +3915,11 @@ test("a stalled turn with interim speech still posts a failure notice", async ()
 
 	// Advance time to trigger stall cutoff
 	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 
 	// Verify failure notice was posted (interim speech did not answer the question)
 	expect(failureNoticePosted).toBe(true);
-	expect(database?.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
 });
 
 test("a stalled turn with a reply ending in stopReason error still posts a failure notice", async () => {
@@ -3937,13 +3937,13 @@ test("a stalled turn with a reply ending in stopReason error still posts a failu
 		{ now: () => clock.now },
 	);
 	enqueue("stall-error-reply", "fail with an error");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "persona turn did not start");
 	const send = port.sends[0]!;
 	// Set up the transcript with a reply that ended with stopReason "error"
 	port.appendAssistant(send.sessionId, "An error occurred", clock.now, "error");
 	port.emitAssistant(send.sessionId, "An error occurred", "error-frame", send.opRef);
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 
 	// Trigger stall without emitting agent_end
 	port.setActivity(send.sessionId, "tool", clock.now);
@@ -3953,11 +3953,11 @@ test("a stalled turn with a reply ending in stopReason error still posts a failu
 
 	// Advance time to trigger stall cutoff
 	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 
 	// Verify failure notice was posted (error stopReason is not "stop")
 	expect(failureNoticePosted).toBe(true);
-	expect(database?.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
 });
 
 test("an uncorrelated idle broadcast does not retire a turn with stalled-status polling", async () => {
@@ -3977,7 +3977,7 @@ test("an uncorrelated idle broadcast does not retire a turn with stalled-status 
 		},
 	});
 	enqueue("idle-unknown-stall-trigger", "keep working");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "persona turn did not start");
 	const first = port.sends[0]!;
 	port.unknown = true;
@@ -3986,23 +3986,23 @@ test("an uncorrelated idle broadcast does not retire a turn with stalled-status 
 	port.emitStall(first.sessionId);
 	await eventually(() => port.statusReads.length > statusReads, "first stall did not reconcile unknown status");
 	enqueue("idle-unknown-stall-lane", "remain queued", "lane_report");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 
 	statusReads = port.statusReads.length;
 	for (const tail of port.tailsOf(first.sessionId))
 		tail.emit({ kind: "activity", rawKind: "activity", payload: { state: "idle" }, steerEcho: false, idle: true });
 	await eventually(() => idleFrameSeen, "uncorrelated idle broadcast was not delivered");
-	await manager?.reconcile(KEY);
+	await manager!.reconcile(KEY);
 	expect(port.statusReads.length).toBeGreaterThan(statusReads);
 
 	statusReads = port.statusReads.length;
 	port.emitStall(first.sessionId);
 	await eventually(() => port.statusReads.length > statusReads, "second stall did not reconcile the current turn");
-	await manager?.reconcile(KEY);
-	expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
+	await manager!.reconcile(KEY);
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
 	expect(port.sends).toHaveLength(1);
 	expect(port.closes).toHaveLength(0);
-	expect(database?.inbox.pendingCount(KEY)).toBe(2);
+	expect(database!.inbox.pendingCount(KEY)).toBe(2);
 });
 
 test("an unanswerable liveness probe is not wedge evidence: the turn stays held", async () => {
@@ -4019,7 +4019,7 @@ test("an unanswerable liveness probe is not wedge evidence: the turn stays held"
 	port.appendAssistant(first.sessionId, "answer");
 	port.setActivity(first.sessionId, "idle");
 	clock.offsetMs = 3 * OLD_IDLE_REGISTRY_AGE_MS;
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	expect(logs.some((line) => line.startsWith("wedged_turn_released"))).toBe(false);
 	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
 	expect(port.closes).toHaveLength(0);
@@ -4031,15 +4031,15 @@ test("a throwing liveness probe on a terminal_ok turn with pending output keeps 
 	port.appendAssistant(first.sessionId, "the real answer");
 	port.livenessFails = true;
 	clock.offsetMs = 3 * OLD_IDLE_REGISTRY_AGE_MS;
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	expect(logs.some((line) => line.startsWith("wedged_turn_released"))).toBe(false);
 	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
 	expect(terminal).toEqual([]);
 	// A recovered liveness probe still cannot supply the operation's output.
 	port.livenessFails = false;
 	clock.offsetMs = 3 * OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
-	await manager?.tick(KEY);
-	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({
+	await manager!.tick(KEY);
+	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
 		state: "pending",
 		turn_state: "accepted",
 		turn_op_ref: first.opRef,
@@ -4047,9 +4047,9 @@ test("a throwing liveness probe on a terminal_ok turn with pending output keeps 
 	expect(terminal).toEqual([]);
 	port.pending.delete(first.opRef);
 	port.seedOperation(first.opRef, first.sessionId, "terminal_ok", "original output restored");
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	await eventually(
-		() => database?.inbox.turnRow(first.opRef)?.turn_state === "done",
+		() => database!.inbox.turnRow(first.opRef)?.turn_state === "done",
 		"restored original output did not settle",
 	);
 	expect(terminal).toEqual(["original output restored"]);
@@ -4072,11 +4072,11 @@ test("a retired stalled turn terminates its producer and summarizes discarded fr
 	const opRef = latestOpRef;
 	await manager?.reset(KEY, JSON.stringify(ORIGIN));
 	enqueue("m-2", "new turn");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 2 && terminal.length === 1, "replacement turn did not settle");
 	const replacement = port.sends[1]!;
 	expect(replacement.sessionId).not.toBe(send.sessionId);
-	expect(database?.bindings.getSessionRecord(KEY)?.sessionId).toBe(replacement.sessionId);
+	expect(database!.bindings.getSessionRecord(KEY)?.sessionId).toBe(replacement.sessionId);
 	await eventually(() => port.tailsOf(send.sessionId).length === 1, "retired turn did not reattach its tail");
 	const tail = port.tailsOf(send.sessionId)[0]!;
 	for (let index = 0; index < 3; index++)
@@ -4116,13 +4116,13 @@ test("a retired stalled turn terminates its producer and summarizes discarded fr
 	expect(await port.inspect({ sessionId: replacement.sessionId, repo: join(home, "workspace") })).toMatchObject({
 		live: true,
 	});
-	expect(database?.inbox.turnRow(opRef)?.turn_state).toBe("accepted");
+	expect(database!.inbox.turnRow(opRef)?.turn_state).toBe("accepted");
 	expect(port.sends).toHaveLength(2);
 	expect(
 		logs.filter((line) => line.includes(`retired_hold originKey=${KEY}`) && line.includes("reason=stall")),
 	).toHaveLength(1);
 	port.complete(send.opRef, "must remain fenced");
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	await eventually(
 		() => database?.inbox.turnRow(opRef)?.turn_state === "done",
 		"retired hold did not reconcile terminal",
@@ -4180,15 +4180,15 @@ for (const restart of [false, true])
 			const port = new LostAckPort({ onBind: (input) => `session-e${input.epoch}` });
 			await harness(port);
 			enqueue("lost-ack", "execute exactly once");
-			await manager?.notifyInbound(KEY);
+			await manager!.notifyInbound(KEY);
 			const first = port.sends[0]!;
 			if (evidence === "transcript_only") {
 				port.appendAssistant(first.sessionId, "not an operation receipt");
 				port.setActivity(first.sessionId, "idle");
 			}
 			if (restart) {
-				await manager?.stop();
-				database?.close();
+				await manager!.stop();
+				database!.close();
 				database = await Store.open(join(home, "gateway.db"));
 				registerFixtureBindings(port);
 				manager = new PersonaSessionManager({
@@ -4200,19 +4200,19 @@ for (const restart of [false, true])
 				port.tailDisownedStatus = evidence === "tail_disowned";
 			}
 			for (let sweep = 0; sweep < 3; sweep++) {
-				if (restart) await manager?.recover();
-				await manager?.tick(KEY);
+				if (restart) await manager!.recover();
+				await manager!.tick(KEY);
 			}
 			expect(port.sends).toHaveLength(1);
 			expect(port.binds).toHaveLength(1);
-			expect(database?.inbox.turnRow(first.opRef)).toMatchObject({
+			expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
 				state: "pending",
 				turn_state: restart && evidence === "tail_disowned" ? "accepted" : "bound",
 				turn_op_ref: first.opRef,
 				bound_session_id: first.sessionId,
 				turn_epoch: 0,
 			});
-			expect(database?.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: first.sessionId });
+			expect(database!.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: first.sessionId });
 			// Same-operation native terminal proof still settles the original prompt.
 			port.unknown = false;
 			expect(
@@ -4220,10 +4220,10 @@ for (const restart of [false, true])
 					.status,
 			).toBe("in_flight");
 			port.complete(first.opRef, "original result");
-			await manager?.recover();
-			await manager?.tick(KEY);
+			await manager!.recover();
+			await manager!.tick(KEY);
 			await eventually(
-				() => database?.inbox.turnRow(first.opRef)?.turn_state === "done",
+				() => database!.inbox.turnRow(first.opRef)?.turn_state === "done",
 				"original native terminal did not settle",
 			);
 			expect(port.sends).toHaveLength(1);
@@ -4321,16 +4321,16 @@ test("authenticated model_not_selected refusal requeues plain pending, notices o
 		{
 			modelRefusal: (input) => {
 				notices.push(input);
-				noticeStates.push(database?.inbox.pendingOldest(KEY)?.state);
+				noticeStates.push(database!.inbox.pendingOldest(KEY)?.state);
 			},
 		},
 		(line) => logs.push(line),
 	);
 	enqueue("model-not-selected", "keep this trigger pending");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const refusedOpRef = latestOpRef;
-	expect(database?.inbox.turnRow(refusedOpRef)).toBeUndefined();
-	expect(database?.inbox.pendingOldest(KEY)).toMatchObject({
+	expect(database!.inbox.turnRow(refusedOpRef)).toBeUndefined();
+	expect(database!.inbox.pendingOldest(KEY)).toMatchObject({
 		message_id: "model-not-selected",
 		state: "pending",
 		turn_role: null,
@@ -4343,29 +4343,29 @@ test("authenticated model_not_selected refusal requeues plain pending, notices o
 	expect(freshTurnAttempt(database!, KEY, 0, "model-not-selected")).toBe(1);
 	expect(port.sendAttempts).toHaveLength(1);
 	expect(port.sends).toHaveLength(0);
-	expect(manager?.state(KEY)).toBe("idle");
-	expect(database?.inbox.nonterminalTurns(KEY)).toEqual([]);
-	expect(database?.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
+	expect(manager!.state(KEY)).toBe("idle");
+	expect(database!.inbox.nonterminalTurns(KEY)).toEqual([]);
+	expect(database!.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
 	expect(notices).toHaveLength(1);
 	expect(noticeStates).toEqual(["pending"]);
 	expect(notices[0]?.error).toMatchObject({
 		code: "model_not_selected",
 		runtimeMessage: "request was not admitted because no model is selected",
 	});
-	expect(`${formatFailureNotice(notices[0]?.error)} Send /model <id> or /new`).toBe(
+	expect(`${formatFailureNotice(notices[0]!.error)} Send /model <id> or /new`).toBe(
 		"[turn failed] model_not_selected: request was not admitted because no model is selected Send /model <id> or /new",
 	);
 
 	enqueue("later-message", "wait behind the paused refusal");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	for (let sweep = 0; sweep < 3; sweep++) {
-		await manager?.tick(KEY);
-		await manager?.recover();
+		await manager!.tick(KEY);
+		await manager!.recover();
 	}
 	expect(port.sendAttempts).toHaveLength(1);
 	expect(port.steers).toHaveLength(0);
-	expect(database?.inbox.pendingOldest(KEY)?.message_id).toBe("model-not-selected");
-	expect(database?.inbox.pendingCount(KEY)).toBe(2);
+	expect(database!.inbox.pendingOldest(KEY)?.message_id).toBe("model-not-selected");
+	expect(database!.inbox.pendingCount(KEY)).toBe(2);
 	expect(notices).toHaveLength(1);
 	expect(
 		logs.some((line) => line.includes(`opRef=${refusedOpRef}`) && line.includes("reason=model_not_selected")),
@@ -4390,23 +4390,23 @@ test("failed refusal-notice persistence propagates while the pause prevents retr
 			released: (opRef) => released.push(opRef),
 			modelRefusal: () => {
 				noticeAttempts++;
-				expect(database?.inbox.pendingOldest(KEY)?.message_id).toBe("notice-persist-failure");
+				expect(database!.inbox.pendingOldest(KEY)?.message_id).toBe("notice-persist-failure");
 				throw new Error("notice persistence failed");
 			},
 		},
 		(line) => logs.push(line),
 	);
 	enqueue("notice-persist-failure", "do not lose the refusal notice");
-	await expect(manager?.notifyInbound(KEY)).rejects.toThrow("notice persistence failed");
+	await expect(manager!.notifyInbound(KEY)).rejects.toThrow("notice persistence failed");
 	const refusedOpRef = latestOpRef;
 	port.repaired = true;
 	for (let sweep = 0; sweep < 3; sweep++) {
-		await manager?.notifyInbound(KEY);
-		await manager?.tick(KEY);
+		await manager!.notifyInbound(KEY);
+		await manager!.tick(KEY);
 	}
-	expect(database?.inbox.turnRow(refusedOpRef)).toBeUndefined();
-	expect(database?.inbox.pendingOldest(KEY)?.message_id).toBe("notice-persist-failure");
-	expect(manager?.state(KEY)).toBe("idle");
+	expect(database!.inbox.turnRow(refusedOpRef)).toBeUndefined();
+	expect(database!.inbox.pendingOldest(KEY)?.message_id).toBe("notice-persist-failure");
+	expect(manager!.state(KEY)).toBe("idle");
 	expect(port.sendAttempts).toHaveLength(1);
 	expect(port.sends).toHaveLength(0);
 	expect(noticeAttempts).toBe(1);
@@ -4442,17 +4442,17 @@ test("tail-close failure keeps the refusal pending and still persists its notice
 			released: (opRef) => released.push(opRef),
 			modelRefusal: (input) => {
 				notices.push(input);
-				expect(database?.inbox.pendingOldest(KEY)?.message_id).toBe("tail-close-failure");
+				expect(database!.inbox.pendingOldest(KEY)?.message_id).toBe("tail-close-failure");
 			},
 		},
 		(line) => logs.push(line),
 	);
 	enqueue("tail-close-failure", "keep the refusal trigger pending");
-	await expect(manager?.notifyInbound(KEY)).rejects.toThrow("tail close failed");
+	await expect(manager!.notifyInbound(KEY)).rejects.toThrow("tail close failed");
 	const refusedOpRef = latestOpRef;
-	expect(database?.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "tail-close-failure", state: "pending" });
-	expect(database?.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
-	expect(manager?.state(KEY)).toBe("idle");
+	expect(database!.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "tail-close-failure", state: "pending" });
+	expect(database!.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
+	expect(manager!.state(KEY)).toBe("idle");
 	expect(notices).toHaveLength(1);
 	expect(released).toEqual([refusedOpRef]);
 	expect(
@@ -4468,9 +4468,9 @@ test("successful /model resumes the refused trigger on its existing session", as
 	const notices: PersonaFailureInput[] = [];
 	await harness(port, { terminal: (text) => terminal.push(text), modelRefusal: (input) => notices.push(input) });
 	enqueue("refused-before-model", "replay after model selection");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const refusedOpRef = latestOpRef;
-	await manager?.rebindModel(KEY, "provider/model");
+	await manager!.rebindModel(KEY, "provider/model");
 	await eventually(() => terminal.length === 1, "successful model selection did not resume the pending trigger");
 	expect(port.models).toContainEqual({
 		sessionId: "session-e0",
@@ -4482,8 +4482,8 @@ test("successful /model resumes the refused trigger on its existing session", as
 	expect(port.sends[0]).toMatchObject({ sessionId: "session-e0", text: "replay after model selection" });
 	expect(port.sends[0]?.opRef).not.toBe(refusedOpRef);
 	expect(terminal).toEqual(["fresh reply"]);
-	expect(database?.inbox.turnRow(port.sends[0]?.opRef)).toMatchObject({ state: "done", turn_state: "done" });
-	expect(database?.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
+	expect(database!.inbox.turnRow(port.sends[0]!.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+	expect(database!.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
 	expect(notices).toHaveLength(1);
 	expect(port.steers).toHaveLength(0);
 });
@@ -4510,16 +4510,16 @@ test("an accepted turn resumed after an authenticated refusal reports its submis
 		(line) => logs.push(line),
 	);
 	enqueue("refused-then-submission", "refusal spends the shared retry budget");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const refusedOpRef = latestOpRef;
 	expect(freshTurnAttempt(database!, KEY, 0, "refused-then-submission")).toBe(1);
 	expect(port.sendAttempts).toHaveLength(1);
 	expect(port.sends).toHaveLength(0);
 	expect(notices).toHaveLength(1);
 
-	await manager?.rebindModel(KEY, "provider/model");
+	await manager!.rebindModel(KEY, "provider/model");
 	await eventually(
-		() => failures.length === 1 && manager?.state(KEY) === "idle",
+		() => failures.length === 1 && manager!.state(KEY) === "idle",
 		"resumed submission failure did not settle through the ordinary failure path",
 	);
 
@@ -4535,10 +4535,10 @@ test("an accepted turn resumed after an authenticated refusal reports its submis
 	expect(accepted).toMatchObject({ sessionId: "session-e0", text: "refusal spends the shared retry budget" });
 	expect(failures).toEqual(["internal: Prompt submission failed."]);
 	expect(terminal).toEqual([]);
-	expect(database?.inbox.turnRow(accepted.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+	expect(database!.inbox.turnRow(accepted.opRef)).toMatchObject({ state: "done", turn_state: "done" });
 	expect(freshTurnAttempt(database!, KEY, 0, "refused-then-submission")).toBe(1);
-	expect(database?.inbox.pendingCount(KEY)).toBe(0);
-	expect(database?.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
+	expect(database!.inbox.pendingCount(KEY)).toBe(0);
+	expect(database!.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
 	expect(notices).toHaveLength(1);
 	expect(
 		logs.some(
@@ -4557,16 +4557,16 @@ test("failed /model keeps the pending refusal paused", async () => {
 	const notices: PersonaFailureInput[] = [];
 	await harness(port, { modelRefusal: (input) => notices.push(input) });
 	enqueue("failed-model-selection", "must stay pending");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const refusedOpRef = latestOpRef;
-	await expect(manager?.rebindModel(KEY, "provider/model")).rejects.toThrow("selection unavailable");
+	await expect(manager!.rebindModel(KEY, "provider/model")).rejects.toThrow("selection unavailable");
 	port.modelFailure = undefined;
 	port.repaired = true;
 	enqueue("after-failed-model", "also waits");
-	await manager?.notifyInbound(KEY);
-	for (let sweep = 0; sweep < 3; sweep++) await manager?.tick(KEY);
-	expect(database?.inbox.pendingOldest(KEY)?.message_id).toBe("failed-model-selection");
-	expect(database?.inbox.turnRow(refusedOpRef)).toBeUndefined();
+	await manager!.notifyInbound(KEY);
+	for (let sweep = 0; sweep < 3; sweep++) await manager!.tick(KEY);
+	expect(database!.inbox.pendingOldest(KEY)?.message_id).toBe("failed-model-selection");
+	expect(database!.inbox.turnRow(refusedOpRef)).toBeUndefined();
 	expect(port.models).toEqual([]);
 	expect(port.sendAttempts).toHaveLength(1);
 	expect(port.sends).toHaveLength(0);
@@ -4582,13 +4582,13 @@ test("process restart clears the in-memory refusal pause and retries the pending
 	const notices: PersonaFailureInput[] = [];
 	await harness(port, { terminal: (text) => terminal.push(text), modelRefusal: (input) => notices.push(input) });
 	enqueue("restart-model-refusal", "retry after restart");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const rejectedOpRef = latestOpRef;
-	expect(database?.inbox.pendingOldest(KEY)?.message_id).toBe("restart-model-refusal");
-	await manager?.stop();
+	expect(database!.inbox.pendingOldest(KEY)?.message_id).toBe("restart-model-refusal");
+	await manager!.stop();
 	manager = undefined;
 	port.repaired = true;
-	database?.close();
+	database!.close();
 	database = await Store.open(join(home, "gateway.db"));
 	registerFixtureBindings(port);
 	manager = new PersonaSessionManager({
@@ -4607,7 +4607,7 @@ test("process restart clears the in-memory refusal pause and retries the pending
 	await eventually(() => terminal.length === 1, "released trigger did not deliver");
 	expect(port.sendAttempts).toHaveLength(2);
 	expect(port.sends).toHaveLength(1);
-	expect(port.sends[0]?.opRef).not.toBe(rejectedOpRef);
+	expect(port.sends[0]!.opRef).not.toBe(rejectedOpRef);
 	expect(port.sends[0]).toMatchObject({ sessionId: "session-e0", text: "retry after restart" });
 	expect(terminal).toEqual(["only reply"]);
 	expect(database.inbox.pendingCount(KEY)).toBe(0);
@@ -4622,22 +4622,22 @@ test("/new discards the paused trigger and admits fresh input in the next epoch"
 	const terminal: string[] = [];
 	await harness(port, { terminal: (text) => terminal.push(text) });
 	enqueue("discard-refused", "discard this refused prompt");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const refusedOpRef = latestOpRef;
-	await manager?.reset(KEY, JSON.stringify(ORIGIN), new Date(Date.now() + 1_000).toISOString());
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
-	expect(database?.inbox.turnRow(refusedOpRef)).toBeUndefined();
-	expect(database?.inbox.pendingOldest(KEY)).toBeUndefined();
+	await manager!.reset(KEY, JSON.stringify(ORIGIN), new Date(Date.now() + 1_000).toISOString());
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(database!.inbox.turnRow(refusedOpRef)).toBeUndefined();
+	expect(database!.inbox.pendingOldest(KEY)).toBeUndefined();
 	port.repaired = true;
 	enqueue("fresh-after-new", "fresh traffic after /new");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(() => terminal.length === 1, "fresh post-/new traffic did not dispatch");
 	expect(port.sendAttempts).toHaveLength(2);
 	expect(port.sends).toHaveLength(1);
 	expect(port.sends[0]).toMatchObject({ sessionId: "session-e1", text: "fresh traffic after /new" });
 	expect(port.sends[0]?.opRef).not.toBe(refusedOpRef);
 	expect(terminal).toEqual(["new session reply"]);
-	expect(database?.inbox.pendingCount(KEY)).toBe(0);
+	expect(database!.inbox.pendingCount(KEY)).toBe(0);
 });
 
 for (const fixture of [
@@ -4660,12 +4660,12 @@ for (const fixture of [
 		const logs: string[] = [];
 		await harness(port, { modelRefusal: (input) => notices.push(input) }, (line) => logs.push(line));
 		enqueue("unproven-model-refusal", "never duplicate uncertain input");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const opRef = latestOpRef;
-		await manager?.tick(KEY);
-		await manager?.recover();
-		expect(database?.inbox.turnRow(opRef)).toMatchObject({ state: "pending", turn_state: "bound" });
-		expect(manager?.state(KEY)).toBe("turn-running");
+		await manager!.tick(KEY);
+		await manager!.recover();
+		expect(database!.inbox.turnRow(opRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+		expect(manager!.state(KEY)).toBe("turn-running");
 		expect(port.sendAttempts).toHaveLength(1);
 		expect(port.sends).toHaveLength(0);
 		expect(notices).toHaveLength(0);
@@ -4680,23 +4680,23 @@ test("a refused running steer waits without rotating or retrying, then sends on 
 	});
 	await harness(port);
 	enqueue("m-1", "first");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
 	enqueue("m-2", "next turn");
-	await manager?.notifyInbound(KEY);
-	for (let tick = 0; tick < 3; tick++) await manager?.tick(KEY);
+	await manager!.notifyInbound(KEY);
+	for (let tick = 0; tick < 3; tick++) await manager!.tick(KEY);
 	expect(port.steers).toHaveLength(1);
 	expect(port.binds).toHaveLength(1);
 	expect(port.sends).toHaveLength(1);
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
-	expect(database?.inbox.pendingOldest(KEY)?.message_id).toBe("m-2");
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(database!.inbox.pendingOldest(KEY)?.message_id).toBe("m-2");
 	port.complete(first.opRef, "first answer");
 	await eventually(() => port.sends.length === 2, "pending message did not dispatch after terminal");
 	expect(port.sends[1]).toMatchObject({ sessionId: first.sessionId, text: "next turn" });
 	expect(port.binds).toHaveLength(1);
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
-	port.complete(port.sends[1]?.opRef, "second answer");
-	await eventually(() => database?.inbox.pendingCount(KEY) === 0, "input was lost or left pending");
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	port.complete(port.sends[1]!.opRef, "second answer");
+	await eventually(() => database!.inbox.pendingCount(KEY) === 0, "input was lost or left pending");
 });
 
 for (const details of [{ code: "receipt_identity_mismatch" }, { code: "unknown_receipt", refused: true }])
@@ -4709,13 +4709,13 @@ for (const details of [{ code: "receipt_identity_mismatch" }, { code: "unknown_r
 		});
 		await harness(port);
 		enqueue("m-1", "first");
-		await manager?.notifyInbound(KEY);
+		await manager!.notifyInbound(KEY);
 		const first = port.sends[0]!;
 		enqueue("m-2", "held input");
-		await manager?.notifyInbound(KEY);
-		const clientRef = port.steers[0]?.clientRef;
-		expect(database?.inbox.steersHeld(first.opRef).map((row) => row.message_id)).toEqual(["m-2"]);
-		await manager?.stop();
+		await manager!.notifyInbound(KEY);
+		const clientRef = port.steers[0]!.clientRef;
+		expect(database!.inbox.steersHeld(first.opRef).map((row) => row.message_id)).toEqual(["m-2"]);
+		await manager!.stop();
 		manager = new PersonaSessionManager({
 			database: database!,
 			port,
@@ -4727,17 +4727,17 @@ for (const details of [{ code: "receipt_identity_mismatch" }, { code: "unknown_r
 		await manager.tick(KEY);
 		port.complete(first.opRef, "first answer");
 		await manager.tick(KEY);
-		await eventually(() => database?.inbox.turnRow(first.opRef)?.turn_state === "done", "terminal not recovered");
+		await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "done", "terminal not recovered");
 		await manager.tick(KEY);
-		expect(database?.inbox.steersHeld(first.opRef).map((row) => row.message_id)).toEqual(["m-2"]);
-		expect(database?.inbox.pendingOldest(KEY)).toBeUndefined();
+		expect(database!.inbox.steersHeld(first.opRef).map((row) => row.message_id)).toEqual(["m-2"]);
+		expect(database!.inbox.pendingOldest(KEY)).toBeUndefined();
 		expect(port.sends).toHaveLength(1);
 		expect(port.binds).toHaveLength(1);
-		expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 		expect(new Set(port.steers.map((steer) => steer.clientRef))).toEqual(new Set([clientRef]));
 		accepted = true;
 		await manager.tick(KEY);
-		expect(database?.inbox.turnRows(first.opRef).find((row) => row.message_id === "m-2")).toMatchObject({
+		expect(database!.inbox.turnRows(first.opRef).find((row) => row.message_id === "m-2")).toMatchObject({
 			turn_state: "done",
 			turn_role: "steer",
 		});
@@ -4766,7 +4766,7 @@ test("startup recovery preserves a bound operation whose running status is known
 	database?.transaction((tx) =>
 		database?.inbox.bindTurn(tx, { messageId: "m-1", originKey: KEY, epoch: 0, opRef, sessionId: orphan.sessionId }),
 	);
-	database?.transaction((tx) => database?.inbox.markSendAttempted(tx, opRef));
+	database!.transaction((tx) => database!.inbox.markSendAttempted(tx, opRef));
 	expect(database?.inbox.turnRow(opRef)).toMatchObject({ turn_state: "bound" });
 
 	const logs: string[] = [];
@@ -4793,7 +4793,7 @@ test("startup recovery preserves a bound operation whose running status is known
 	await manager.recover();
 	expect(logs.some((line) => line.startsWith("recovery_turn_failed") && line.includes(opRef))).toBe(true);
 	expect(disowning.sends).toHaveLength(0);
-	expect(database?.inbox.turnRow(opRef)).toMatchObject({
+	expect(database!.inbox.turnRow(opRef)).toMatchObject({
 		state: "pending",
 		turn_state: "accepted",
 		turn_op_ref: opRef,
@@ -4804,7 +4804,7 @@ test("startup recovery preserves a bound operation whose running status is known
 	// Native status/result recovery does not require an unavailable tail.
 	disowning.seedOperation(opRef, orphan.sessionId, "terminal_ok", "original operation result");
 	await manager.recover();
-	expect(database?.inbox.turnRow(opRef)?.turn_state).toBe("done");
+	expect(database!.inbox.turnRow(opRef)?.turn_state).toBe("done");
 	expect(disowning.sends).toHaveLength(0);
 });
 
@@ -4852,7 +4852,7 @@ test("startup recovery preserves a retired ambiguous bound turn after the broker
 	).toBe(true);
 	expect(released).toEqual([]);
 	expect(port.sends).toHaveLength(1);
-	expect(database?.inbox.turnRow(ghostOpRef)).toMatchObject({
+	expect(database!.inbox.turnRow(ghostOpRef)).toMatchObject({
 		state: "pending",
 		turn_state: "bound",
 		turn_op_ref: ghostOpRef,
@@ -4944,7 +4944,7 @@ async function idleClosedHarness() {
 	const terminal: string[] = [];
 	await harness(port, { terminal: (text) => terminal.push(text) }, (line) => logs.push(line));
 	enqueue("before-idle", "earlier conversation");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "first turn did not start");
 	const first = port.sends[0]!;
 	port.complete(first.opRef, "earlier answer");
@@ -4958,13 +4958,13 @@ async function idleClosedHarness() {
 test("가8: the first message after the host closed itself resumes the same session before sending", async () => {
 	const { port, logs, terminal, sessionId } = await idleClosedHarness();
 	enqueue("after-idle", "결론?");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 2, "message after idle was not sent");
 	expect(port.resumeCalls).toBe(1);
 	expect(port.sends[1]).toMatchObject({ sessionId, text: "결론?" });
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	expect(logs.some((line) => line.startsWith("session_resumed") && line.includes(`session=${sessionId}`))).toBe(true);
-	port.complete(port.sends[1]?.opRef, "이어서 답");
+	port.complete(port.sends[1]!.opRef, "이어서 답");
 	await eventually(() => terminal.length === 2, "resumed turn did not deliver");
 	expect(terminal).toEqual(["earlier answer", "이어서 답"]);
 });
@@ -4973,22 +4973,22 @@ test("가8: an attach failure after a closed host requeues the trigger without r
 	const { port, logs, terminal, sessionId } = await idleClosedHarness();
 	port.staleLive = true;
 	enqueue("after-idle", "작업다됨?");
-	await manager?.notifyInbound(KEY).catch(() => undefined);
+	await manager!.notifyInbound(KEY).catch(() => undefined);
 	expect(port.sends).toHaveLength(1);
 	const opRef = latestOpRef;
-	expect(database?.inbox.turnRow(opRef)).toBeUndefined();
+	expect(database!.inbox.turnRow(opRef)).toBeUndefined();
 
-	await manager?.recover();
-	await manager?.tick(KEY);
+	await manager!.recover();
+	await manager!.tick(KEY);
 	expect(port.sends).toHaveLength(1);
 	expect(port.resumeCalls).toBe(0);
 	// No prompt was sent (#675): the trigger is back to plain pending, never bound forever.
-	expect(database?.inbox.turnRow(opRef)).toBeUndefined();
-	expect(database?.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "after-idle", turn_state: null });
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(database!.inbox.turnRow(opRef)).toBeUndefined();
+	expect(database!.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "after-idle", turn_state: null });
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	expect(logs.some((line) => line.startsWith("recovery_requeue_unaccepted"))).toBe(false);
 	expect(terminal).toEqual(["earlier answer"]);
-	expect(database?.inbox.pendingCount(KEY)).toBe(1);
+	expect(database!.inbox.pendingCount(KEY)).toBe(1);
 });
 
 test("가8: a failed resume cannot authorize a resend or a resume", async () => {
@@ -4996,17 +4996,17 @@ test("가8: a failed resume cannot authorize a resend or a resume", async () => 
 	port.staleLive = true;
 	port.failResume(sessionId);
 	enqueue("after-idle", "결론");
-	await manager?.notifyInbound(KEY).catch(() => undefined);
+	await manager!.notifyInbound(KEY).catch(() => undefined);
 	const opRef = latestOpRef;
-	await manager?.recover();
-	await manager?.tick(KEY);
+	await manager!.recover();
+	await manager!.tick(KEY);
 	expect(port.sends).toHaveLength(1);
 	expect(port.resumeCalls).toBe(0);
 	expect(logs.some((line) => line.startsWith("recovery_requeue_unaccepted"))).toBe(false);
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	// No prompt was sent (#675): the trigger is back to plain pending, never bound forever.
-	expect(database?.inbox.turnRow(opRef)).toBeUndefined();
-	expect(database?.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "after-idle", turn_state: null });
+	expect(database!.inbox.turnRow(opRef)).toBeUndefined();
+	expect(database!.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "after-idle", turn_state: null });
 });
 
 test("가8: a deleted saved session is never resumed", async () => {
@@ -5014,23 +5014,23 @@ test("가8: a deleted saved session is never resumed", async () => {
 	port.staleLive = true;
 	port.deleted = true;
 	enqueue("after-idle", "로컬에놔둬");
-	await manager?.notifyInbound(KEY).catch(() => undefined);
+	await manager!.notifyInbound(KEY).catch(() => undefined);
 	const opRef = latestOpRef;
-	await manager?.recover();
-	await manager?.tick(KEY);
+	await manager!.recover();
+	await manager!.tick(KEY);
 	expect(port.sends).toHaveLength(1);
 	expect(port.resumeCalls).toBe(0);
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	// No prompt was sent (#675): the trigger is back to plain pending, never bound forever.
-	expect(database?.inbox.turnRow(opRef)).toBeUndefined();
-	expect(database?.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "after-idle", turn_state: null });
+	expect(database!.inbox.turnRow(opRef)).toBeUndefined();
+	expect(database!.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "after-idle", turn_state: null });
 });
 
 test("가8: a deleted closed binding is not resumed before the send either", async () => {
 	const { port } = await idleClosedHarness();
 	port.deleted = true;
 	enqueue("after-idle", "다음");
-	await manager?.notifyInbound(KEY).catch(() => undefined);
+	await manager!.notifyInbound(KEY).catch(() => undefined);
 	expect(port.resumeCalls).toBe(0);
 });
 
@@ -5041,7 +5041,7 @@ test("startup recovery reconstructs an accepted durable turn and reconciles stat
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "accepted turn did not start before restart");
 	const oldManager = manager!;
-	const opRef = port.sends[0]?.opRef;
+	const opRef = port.sends[0]!.opRef;
 	await oldManager.stop();
 	const terminal: string[] = [];
 	manager = new PersonaSessionManager({
@@ -5084,16 +5084,16 @@ test("lane_report steer uses lane framing, not user framing", async () => {
 	const port = new ScriptedSessionPort();
 	await harness(port);
 	enqueue("human-trigger", "first");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "initial persona turn did not start");
 	enqueue("lane-report-steer", "[lane child] completed: result", "lane_report");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(() => port.steers.length === 1, "lane report was not steered into the running turn");
 	expect(port.steers[0]?.text).toBe(
 		"[Internal report that arrived while you were working. Absorb it; mention it to the conversation only if useful.]\n\n[lane child] completed: result",
 	);
 	expect(port.steers[0]?.text).not.toContain("Additional message from the user");
-	expect(database?.inbox.turnRows(latestOpRef)).toEqual(
+	expect(database!.inbox.turnRows(latestOpRef)).toEqual(
 		expect.arrayContaining([
 			expect.objectContaining({ message_id: "lane-report-steer", source: "lane_report", turn_role: "steer" }),
 		]),
@@ -5105,9 +5105,9 @@ test("/new keeps pending lane_report rows while discarding platform rows", async
 	await harness(port);
 	enqueue("platform-before-new", "old human", "platform");
 	enqueue("internal-before-new", "[lane child] attempt_ended", "lane_report");
-	await manager?.reset(KEY, JSON.stringify(ORIGIN), "2030-09-01T00:00:00.000Z");
+	await manager!.reset(KEY, JSON.stringify(ORIGIN), "2030-09-01T00:00:00.000Z");
 	await eventually(() => port.sends.length === 1, "pending lane report was not admitted after /new");
-	expect(database?.inbox.turnRow(latestOpRef)).toMatchObject({
+	expect(database!.inbox.turnRow(latestOpRef)).toMatchObject({
 		message_id: "internal-before-new",
 		source: "lane_report",
 		state: "pending",
@@ -5119,19 +5119,19 @@ test("admissionHold reports a quarantined nonterminal persona turn", async () =>
 	const port = new ScriptedSessionPort();
 	await harness(port);
 	enqueue("quarantined-trigger", "original request");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "persona turn did not start");
-	const authority = database?.inspectBrokerAuthority().authority;
+	const authority = database!.inspectBrokerAuthority().authority;
 	if (!authority) throw new Error("fixture broker authority missing");
-	database?.transaction((tx) =>
-		database?.bindings.cutoverBrokerAuthority(tx, {
+	database!.transaction((tx) =>
+		database!.bindings.cutoverBrokerAuthority(tx, {
 			expectedAuthority: authority,
 			targetAuthority: { canonicalAgentDir: join(home, "next-agent"), identity: "next-owner" },
 			evidence: "test quarantine for admission hold",
 			disposition: "quarantine",
 		}),
 	);
-	expect(manager?.admissionHold(KEY)).toBe("quarantined_turn");
+	expect(manager!.admissionHold(KEY)).toBe("quarantined_turn");
 });
 test("two messages 50ms apart start one turn and steer the second", async () => {
 	const port = new ScriptedSessionPort();
@@ -5166,7 +5166,7 @@ test("two messages 50ms apart start one turn and steer the second", async () => 
 	expect(port.sends).toEqual([expect.objectContaining({ text: "first fragment", opRef: latestOpRef })]);
 	expect(port.steers).toEqual([
 		expect.objectContaining({
-			sessionId: port.sends[0]?.sessionId,
+			sessionId: port.sends[0]!.sessionId,
 			text: expect.stringMatching(/^\[Additional message[^\n]*\]\nsecond fragment$/),
 		}),
 	]);
@@ -5383,12 +5383,12 @@ test("recovery and stop never scan or delete unrelated shared broker sessions", 
 	const logs: string[] = [];
 	await harness(port, {}, (line) => logs.push(line));
 	enqueue("m-1", "recover my pending message");
-	await manager?.recover();
+	await manager!.recover();
 	await eventually(() => port.sends.length === 1, "pending recovery did not dispatch");
 	const send = port.sends[0]!;
 	expect(port.indexScans).toBe(0);
 	expect(port.deleted).toEqual([]);
-	await manager?.stop();
+	await manager!.stop();
 	expect(port.indexScans).toBe(0);
 	expect(port.deleted).toEqual([]);
 
@@ -5470,12 +5470,12 @@ async function preambleHarness(
 async function sendTurn(port: ScriptedSessionPort, body: string): Promise<string | undefined> {
 	const before = port.sends.length;
 	enqueue(`m-${before}-${body}`, body);
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	await eventually(
-		() => port.sends.length === before + 1 && manager?.state(KEY) === "idle",
+		() => port.sends.length === before + 1 && manager!.state(KEY) === "idle",
 		`turn ${body} did not settle`,
 	);
-	return port.sends[before]?.systemPreamble;
+	return port.sends[before]!.systemPreamble;
 }
 
 test("persona preamble rides the first send only while the context keeps growing", async () => {
@@ -5549,7 +5549,7 @@ test("a provider retry re-sends a preamble that the failed call may not have com
 	await preambleHarness(port, { persona: () => PERSONA });
 
 	enqueue("provider-preamble-retry", "retry with persona");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0];
 	if (!first) throw new Error("initial preamble-bearing request was not dispatched");
 	expect(first.systemPreamble).toBe(PERSONA);
@@ -5559,13 +5559,13 @@ test("a provider retry re-sends a preamble that the failed call may not have com
 	});
 
 	await new Promise((resolve) => setTimeout(resolve, 1_500));
-	await manager?.tick(KEY);
+	await manager!.tick(KEY);
 	const retry = port.sends[1];
 	if (!retry) throw new Error("provider retry was not dispatched");
 	expect(retry.systemPreamble).toBe(PERSONA);
 	port.complete(retry.opRef, "completed after provider retry");
-	await manager?.tick(KEY);
-	await eventually(() => manager?.state(KEY) === "idle", "provider retry did not settle");
+	await manager!.tick(KEY);
+	await eventually(() => manager!.state(KEY) === "idle", "provider retry did not settle");
 });
 
 test("persona preamble is refreshed after the bounded number of sends without it", async () => {
@@ -5653,17 +5653,17 @@ test("messages arriving while the actor compacts wait for the compacted send ins
 	await preambleHarness(port, { persona: () => PERSONA });
 	port.percent = COMPACTION_PERCENT + 1;
 	enqueue("m-full", "lands after compaction");
-	void manager?.notifyInbound(KEY);
+	void manager!.notifyInbound(KEY);
 	await eventually(() => port.compactedAfterSends.length === 1, "compaction did not start");
 	enqueue("m-during", "arrives during compaction");
-	void manager?.notifyInbound(KEY);
+	void manager!.notifyInbound(KEY);
 	await Bun.sleep(20);
 	expect(port.sends).toHaveLength(0);
 	expect(port.steers).toHaveLength(0);
 
 	releaseCompaction();
 	await eventually(
-		() => port.sends.length + port.steers.length === 2 && manager?.state(KEY) === "idle",
+		() => port.sends.length + port.steers.length === 2 && manager!.state(KEY) === "idle",
 		"queued messages did not follow the compacted send",
 	);
 	expect(port.sends[0]).toMatchObject({ text: "lands after compaction", systemPreamble: PERSONA });
@@ -5679,7 +5679,7 @@ test("status-settled predecessor frames cannot affect its reused relay's delayed
 		},
 	});
 	enqueue("status-predecessor", "first question");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
 	const tail = port.tailsOf(first.sessionId)[0]!;
 	const emit = tail.emit.bind(tail);
@@ -5687,8 +5687,8 @@ test("status-settled predecessor frames cannot affect its reused relay's delayed
 	// arrives. Keep the same live relay so the successor truly reuses it.
 	tail.emit = () => {};
 	port.complete(first.opRef, "first status answer");
-	await manager?.tick(KEY);
-	await eventually(() => manager?.state(KEY) === "idle", "status predecessor did not settle");
+	await manager!.tick(KEY);
+	await eventually(() => manager!.state(KEY) === "idle", "status predecessor did not settle");
 	tail.emit = emit;
 	let entered = () => {};
 	let release = () => {};
@@ -5706,7 +5706,7 @@ test("status-settled predecessor frames cannot affect its reused relay's delayed
 		},
 	});
 	enqueue("status-successor", "second question");
-	const dispatch = manager?.notifyInbound(KEY);
+	const dispatch = manager!.notifyInbound(KEY);
 	await started;
 	port.emitAssistant(first.sessionId, "late first answer", "old-event", first.opRef);
 	port.completeWithoutAnswerFrame(first.opRef, "first status answer");
@@ -5715,10 +5715,10 @@ test("status-settled predecessor frames cannot affect its reused relay's delayed
 	await Bun.sleep(10);
 	const second = port.sends[1]!;
 	expect(port.tailsOf(first.sessionId)[0]).toBe(tail);
-	expect(database?.inbox.turnRow(second.opRef)?.turn_state).toBe("accepted");
+	expect(database!.inbox.turnRow(second.opRef)!.turn_state).toBe("accepted");
 	expect(terminal).toHaveLength(1);
 	port.complete(second.opRef, "second answer");
-	await eventually(() => manager?.state(KEY) === "idle", "successor did not finish");
+	await eventually(() => manager!.state(KEY) === "idle", "successor did not finish");
 	expect(terminal).toEqual(["first status answer", "second answer"]);
 });
 
@@ -5744,12 +5744,12 @@ async function agentObserverFixture() {
 		},
 	});
 	enqueue("observer-seed", "start background work");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	const send = port.sends[0]!;
 	port.complete(send.opRef, "working");
-	await eventually(() => manager?.state(KEY) === "idle", "seed did not settle");
+	await eventually(() => manager!.state(KEY) === "idle", "seed did not settle");
 	port.setActivity(send.sessionId, "idle", now);
-	database?.transaction((tx) => database?.bindings.touch(tx, KEY, JSON.stringify(ORIGIN)));
+	database!.transaction((tx) => database!.bindings.touch(tx, KEY, JSON.stringify(ORIGIN)));
 	const end = () => {
 		const tail = port.tailsOf(send.sessionId)[0]!;
 		tail.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
@@ -5764,7 +5764,7 @@ async function agentObserverFixture() {
 		advance: (ms: number) => {
 			now += ms;
 		},
-		sweep: async () => await manager?.sweepIdleHosts(now),
+		sweep: async () => await manager!.sweepIdleHosts(now),
 		fireNotice: () => {
 			const work = [...noticeTimers];
 			noticeTimers.clear();
@@ -5828,7 +5828,7 @@ for (const outcome of ["terminated", "already_gone"] as const)
 		await active.reconcile(KEY);
 		expect(exited).toBe(true);
 		expect(f.logs.some((line) => line.startsWith("stalled_turn_post_stop_status_unavailable "))).toBe(true);
-		expect(database?.inbox.turnRow(joined.opRef)).toMatchObject({
+		expect(database!.inbox.turnRow(joined.opRef)).toMatchObject({
 			turn_state: "done",
 			terminal_delivery_id: JSON.stringify({ none: "turn_failed" }),
 		});
@@ -5841,7 +5841,7 @@ for (const outcome of ["terminated", "already_gone"] as const)
 		expect(attaches).toBe(0);
 		expect(f.port.tailsOf(joined.sessionId)).toHaveLength(0);
 		expect(f.logs.filter((line) => line.startsWith("agent_run_notice_enqueued "))).toHaveLength(0);
-		expect(database?.inbox.hasPendingAgentRunNotice(KEY)).toBe(false);
+		expect(database!.inbox.hasPendingAgentRunNotice(KEY)).toBe(false);
 		expect(f.port.sends).toHaveLength(2);
 		expect(f.port.steers).toHaveLength(0);
 		expect(releases).toBe(1);
@@ -5896,7 +5896,7 @@ for (const guard of ["notice", "sweep"] as const)
 		).toBe(true);
 		expect(attaches).toBe(0);
 		expect(f.noticeTimers.size).toBe(0);
-		expect(database?.inbox.hasPendingAgentRunNotice(KEY)).toBe(false);
+		expect(database!.inbox.hasPendingAgentRunNotice(KEY)).toBe(false);
 		expect(f.logs.some((line) => line.startsWith("agent_run_notice_enqueued "))).toBe(false);
 		expect(active.liveHostCount()).toBe(1);
 		expect(f.port.sends).toHaveLength(2);
@@ -5920,15 +5920,15 @@ test("observer with background jobs protects an otherwise idle host against capa
 	const f = await agentObserverFixture();
 	f.port.hostJobs.set(f.send.sessionId, [{ id: "async-job", type: "task", label: "background work" }]);
 	const other = "loopback/loopback/other-persona";
-	database?.transaction((tx) =>
-		database?.inbox.enqueue(tx, {
+	database!.transaction((tx) =>
+		database!.inbox.enqueue(tx, {
 			messageId: "other-host",
 			originKey: other,
 			originRefJson: JSON.stringify({ ...ORIGIN, conversationId: "other-persona" }),
 			body: "new work",
 		}),
 	);
-	await manager?.notifyInbound(other);
+	await manager!.notifyInbound(other);
 	expect(f.port.binds).toHaveLength(1);
 	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(1);
 	expect(f.logs.some((line) => line.startsWith("persona_host_retired "))).toBe(false);
@@ -5943,7 +5943,7 @@ test("pending notice decision prevents grace retirement until its debounce finis
 	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(1);
 	f.fireNotice();
 	await eventually(() => f.port.sends.length === 2, "notice did not dispatch");
-	expect(f.port.sends[1]?.text).toContain("[Gateway notice]");
+	expect(f.port.sends[1]!.text).toContain("[Gateway notice]");
 });
 
 test("running jobs and unavailable reports extend grace only up to the six-hour cap", async () => {
@@ -5963,7 +5963,7 @@ test("running jobs and unavailable reports extend grace only up to the six-hour 
 
 test("capacity-evicted observer warns and sweep reattaches within grace", async () => {
 	const f = await agentObserverFixture();
-	await f.port.tailsOf(f.send.sessionId)[0]?.close();
+	await f.port.tailsOf(f.send.sessionId)[0]!.close();
 	expect(f.logs.some((line) => line.startsWith("agent_run_observer_lost "))).toBe(true);
 	await f.sweep();
 	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(1);
@@ -5975,8 +5975,8 @@ test("capacity-evicted observer warns and sweep reattaches within grace", async 
 test("an autonomous run starting with no jobs retains observation past grace and ends in one notice", async () => {
 	const f = await agentObserverFixture();
 	f.port
-		.tailsOf(f.send.sessionId)[0]
-		?.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
+		.tailsOf(f.send.sessionId)[0]!
+		.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
 	// Drain the tail's serialized callback before evaluating expiry; even a stale
 	// idle liveness report must not override an observed unfinished autonomous run.
 	await Bun.sleep(10);
@@ -6007,7 +6007,7 @@ test("an active autonomous observer lost across its terminal infers completion f
 
 test("a start missed during observer loss is inferred from working liveness without a gateway owner", async () => {
 	const f = await agentObserverFixture();
-	await f.port.tailsOf(f.send.sessionId)[0]?.close();
+	await f.port.tailsOf(f.send.sessionId)[0]!.close();
 	f.port.setActivity(f.send.sessionId, "working");
 	await f.sweep();
 	const recovered = f.port.tailsOf(f.send.sessionId)[0]!;
@@ -6022,14 +6022,14 @@ test("a start missed during observer loss is inferred from working liveness with
 
 test("notice enqueue refusal retains its batch for retry", async () => {
 	const f = await agentObserverFixture();
-	const enqueue = database?.inbox.enqueue.bind(database?.inbox);
-	database?.inbox.enqueue = () => false;
+	const enqueue = database!.inbox.enqueue.bind(database!.inbox);
+	database!.inbox.enqueue = () => false;
 	f.end();
 	await eventually(() => f.noticeTimers.size === 1, "no notice timer");
 	f.fireNotice();
 	await eventually(() => f.logs.some((line) => line.includes("reason=notice_failed")), "refusal was not reported");
 	expect(f.logs.some((line) => line.startsWith("agent_run_notice_enqueued "))).toBe(false);
-	database?.inbox.enqueue = enqueue;
+	database!.inbox.enqueue = enqueue;
 	await f.sweep();
 	await eventually(() => f.port.sends.length === 2, "failed notice was not retried");
 	expect(f.logs.filter((line) => line.startsWith("agent_run_notice_enqueued "))).toHaveLength(1);
@@ -6040,8 +6040,8 @@ test("persistent notice enqueue refusal cannot retain observer or retirement gua
 	f.port.liveness = async () => {
 		throw new Error("liveness temporarily unavailable");
 	};
-	const enqueueNotice = database?.inbox.enqueue.bind(database?.inbox);
-	database?.inbox.enqueue = () => false;
+	const enqueueNotice = database!.inbox.enqueue.bind(database!.inbox);
+	database!.inbox.enqueue = () => false;
 	f.end();
 	await eventually(() => f.noticeTimers.size === 1, "no notice timer");
 	f.fireNotice();
@@ -6061,17 +6061,17 @@ test("persistent notice enqueue refusal cannot retain observer or retirement gua
 	expect(
 		f.logs.some((line) => line.startsWith("agent_run_observer_closed ") && line.includes("reason=grace_expired")),
 	).toBe(true);
-	database?.inbox.enqueue = enqueueNotice;
+	database!.inbox.enqueue = enqueueNotice;
 	// A completed but undeliverable notice must no longer hold host admission.
-	database?.transaction((tx) =>
-		database?.inbox.enqueue(tx, {
+	database!.transaction((tx) =>
+		database!.inbox.enqueue(tx, {
 			messageId: "after-refusal",
 			originKey: "loopback/loopback/after-refusal",
 			originRefJson: JSON.stringify({ ...ORIGIN, conversationId: "after-refusal" }),
 			body: "new origin",
 		}),
 	);
-	await manager?.notifyInbound("loopback/loopback/after-refusal");
+	await manager!.notifyInbound("loopback/loopback/after-refusal");
 	expect(f.port.sends).toHaveLength(2);
 	expect(f.port.closes.some((close) => close.sessionId === f.send.sessionId)).toBe(true);
 });
@@ -6097,7 +6097,7 @@ test("reset cancels a pending notice and closes the observer", async () => {
 	const f = await agentObserverFixture();
 	f.end();
 	await eventually(() => f.noticeTimers.size === 1, "no notice timer");
-	await manager?.reset(KEY, JSON.stringify(ORIGIN));
+	await manager!.reset(KEY, JSON.stringify(ORIGIN));
 	expect(f.noticeTimers.size).toBe(0);
 	expect(f.port.tailsOf(f.send.sessionId)).toHaveLength(0);
 	expect(f.logs.some((line) => line.includes("agent_run_observer_closed") && line.includes("reason=reset"))).toBe(true);
@@ -6107,7 +6107,7 @@ test("external epoch rotation fences the observer before it can enqueue a notice
 	const f = await agentObserverFixture();
 	f.end();
 	await eventually(() => f.noticeTimers.size === 1, "no notice timer");
-	database?.transaction((tx) => database?.bindings.rotateEpoch(tx, KEY));
+	database!.transaction((tx) => database!.bindings.rotateEpoch(tx, KEY));
 	f.fireNotice();
 	await eventually(() => f.port.tailsOf(f.send.sessionId).length === 0, "rotated observer did not close");
 	expect(f.logs.some((line) => line.startsWith("agent_run_notice_enqueued "))).toBe(false);
@@ -6116,11 +6116,11 @@ test("external epoch rotation fences the observer before it can enqueue a notice
 test("a notice during a gateway turn steers its gateway framing without lane-report wording", async () => {
 	const f = await agentObserverFixture();
 	enqueue("platform-successor", "current user question");
-	await manager?.notifyInbound(KEY);
+	await manager!.notifyInbound(KEY);
 	f.end();
 	await eventually(() => f.noticeTimers.size === 1, "no notice timer");
 	f.fireNotice();
 	await eventually(() => f.port.steers.length === 1, "notice was not steered");
-	expect(f.port.steers[0]?.text).toContain("[Gateway notice]");
-	expect(f.port.steers[0]?.text).not.toContain("Internal lane report");
+	expect(f.port.steers[0]!.text).toContain("[Gateway notice]");
+	expect(f.port.steers[0]!.text).not.toContain("Internal lane report");
 });

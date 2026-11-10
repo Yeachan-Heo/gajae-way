@@ -169,31 +169,31 @@ test("a held ambiguous turn on a dead host past the bound moves to a retired hol
 		await f.manager.recover();
 		await until(() => f.port.sends.length === 1);
 		const [next] = f.port.sends;
-		expect(next?.text).toContain("a newer message");
-		expect(next?.sessionId).toBe("session-1");
+		expect(next!.text).toContain("a newer message");
+		expect(next!.sessionId).toBe("session-1");
 		// The held op is never resent.
 		expect(f.port.sends.some((send) => send.opRef === f.heldOpRef)).toBe(false);
 		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).toBe("bound");
 		expect(f.db.bindings.getSessionRecord(f.originKey)?.epoch).toBe(1);
 		expect(f.notices).toHaveLength(1);
 		expect(f.notices[0]).toMatchObject({ originKey: f.originKey, reason: UNRESOLVED_HOLD_ESCALATED });
-		expect(f.notices[0]?.trigger.message_id).toBe("m-held");
+		expect(f.notices[0]!.trigger.message_id).toBe("m-held");
 		const escalated = f.logs.find((line) => line.startsWith("recovery_hold_escalated"));
 		expect(escalated).toContain(`opRef=${f.heldOpRef}`);
 		expect(escalated).toContain("nextEpoch=1");
 		expect(escalated).toMatch(/heldMs=\d+/);
 		expect(escalated).toContain("live=false");
-		await until(() => f.db.inbox.turnRow(next?.opRef)?.turn_state === "done");
+		await until(() => f.db.inbox.turnRow(next!.opRef)?.turn_state === "done");
 
 		// The late outcome of the held op is still reconciled, never dropped or resent.
 		f.port.setSessionState(f.binding.sessionId, { live: true });
 		// (the seed below records the broker-side acceptance as a scripted send entry)
-		f.port.seedAcceptedSend({ sessionId: f.binding.sessionId, repo: next?.repo, text: "", opRef: f.heldOpRef });
+		f.port.seedAcceptedSend({ sessionId: f.binding.sessionId, repo: next!.repo, text: "", opRef: f.heldOpRef });
 		f.port.complete(f.heldOpRef, "late answer");
 		await f.manager.reconcile(f.originKey);
 		await until(() => f.db.inbox.turnRow(f.heldOpRef)?.turn_state === "done");
 		await f.manager.tick();
-		expect(f.port.sends.map((send) => send.opRef)).toEqual([next?.opRef, f.heldOpRef]);
+		expect(f.port.sends.map((send) => send.opRef)).toEqual([next!.opRef, f.heldOpRef]);
 		expect(f.port.sendAttempts.filter((send) => send.opRef === f.heldOpRef)).toHaveLength(1);
 		expect(f.notices).toHaveLength(1);
 		// The late answer reaches the origin, as the hold notice promised.
@@ -246,8 +246,8 @@ test("an adopted turn swept as unknown escalates once its host dies past the bou
 		f.enqueue("m-later", "a message after the host died", new Date().toISOString());
 		await f.manager.reconcile(f.originKey);
 		await until(() => gatewaySends().length === 1);
-		expect(gatewaySends()[0]?.text).toContain("a message after the host died");
-		expect(gatewaySends()[0]?.sessionId).toBe("session-1");
+		expect(gatewaySends()[0]!.text).toContain("a message after the host died");
+		expect(gatewaySends()[0]!.sessionId).toBe("session-1");
 		expect(f.port.sendAttempts.filter((send) => send.opRef === f.heldOpRef)).toHaveLength(1);
 		expect(f.notices.map((notice) => notice.reason)).toEqual([UNRESOLVED_HOLD_ESCALATED]);
 		expect(f.logs.some((line) => line.startsWith("recovery_hold_escalated"))).toBe(true);
@@ -288,7 +288,7 @@ test("a failed escalation notice is durable and posted by the next recovery swee
 		expect(f.logs.some((line) => line.startsWith("persona_bind_hold_notice_failed"))).toBe(true);
 		await f.manager.recover();
 		expect(f.notices.map((notice) => notice.reason)).toEqual([UNRESOLVED_HOLD_ESCALATED]);
-		expect(f.notices[0]?.trigger.message_id).toBe("m-held");
+		expect(f.notices[0]!.trigger.message_id).toBe("m-held");
 		await f.manager.recover();
 		expect(f.notices).toHaveLength(1);
 	} finally {
@@ -388,7 +388,7 @@ test("a retired-epoch unresolved turn past the bound is escalated once, without 
 		await f.manager.recover();
 		await until(() => f.notices.length === 1);
 		expect(f.notices[0]).toMatchObject({ originKey: f.originKey, reason: UNRESOLVED_HOLD_ESCALATED });
-		expect(f.notices[0]?.trigger.message_id).toBe("m-held");
+		expect(f.notices[0]!.trigger.message_id).toBe("m-held");
 		const escalated = f.logs.filter((line) => line.startsWith("recovery_hold_escalated"));
 		expect(escalated).toHaveLength(1);
 		expect(escalated[0]).toContain(`opRef=${f.heldOpRef}`);
@@ -396,7 +396,7 @@ test("a retired-epoch unresolved turn past the bound is escalated once, without 
 		expect(f.db.bindings.getSessionRecord(f.originKey)?.epoch).toBe(1);
 		// The origin already moved on: the newer message is answered there.
 		await until(() => f.port.sends.length === 1);
-		expect(f.port.sends[0]?.text).toContain("a newer message");
+		expect(f.port.sends[0]!.text).toContain("a newer message");
 		expect(f.port.sends.some((send) => send.opRef === f.heldOpRef)).toBe(false);
 		// Further sweeps and a restart never post a second notice or resend the op.
 		await f.manager.recover();
@@ -443,7 +443,7 @@ test("a backfilled send marker does not exempt a retired unresolved turn from th
 	try {
 		await f.manager.recover();
 		await until(() => f.notices.length === 1);
-		expect(f.notices[0]?.trigger.message_id).toBe("m-held");
+		expect(f.notices[0]!.trigger.message_id).toBe("m-held");
 		expect(f.port.sendAttempts.filter((send) => send.opRef === f.heldOpRef)).toHaveLength(0);
 	} finally {
 		await f.manager.stop();
@@ -614,7 +614,7 @@ test("a dead relay (onRelayDead) followed only by CLI-only status probes still e
 		const escalationNotices = f.notices.length;
 
 		// Trigger the relay death callback; this sets bound.detached and records relay unavailable evidence.
-		handle?.die();
+		handle!.die();
 		await clock.advance(0); // Let async work settle
 
 		// After relay death, only CLI-only status probes can check the operation.

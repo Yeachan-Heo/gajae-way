@@ -55,7 +55,7 @@ async function fixture(jobs = 0, noticeReply = "비교표", maxTailProcesses = 1
 	const db = database;
 	const authority = initializeTestBrokerAuthority(db, broker.agentDir);
 	const tailRunner = new TailRunner({
-		stream: (sessionId) => broker?.openStream(sessionId),
+		stream: (sessionId) => broker!.openStream(sessionId),
 		repo: join(home, "workspace"),
 		sleep: async () => {},
 		maxTailProcesses,
@@ -100,7 +100,7 @@ async function fixture(jobs = 0, noticeReply = "비교표", maxTailProcesses = 1
 		});
 	chat("seed");
 	await until(() => !!db.bindings.getSessionRecord(KEY)?.sessionId);
-	const sessionId = db.bindings.getSessionRecord(KEY)?.sessionId;
+	const sessionId = db.bindings.getSessionRecord(KEY)!.sessionId;
 	host.setRunningJobs(sessionId, jobs);
 	await until(
 		() =>
@@ -115,7 +115,7 @@ async function fixture(jobs = 0, noticeReply = "비교표", maxTailProcesses = 1
 			.all(KEY) as Array<{ message_id: string; source: string; body: string; turn_state: string }>;
 	const replies = () => db.outbox.rows().filter((row) => JSON.parse(row.payload_json).text === noticeReply);
 	const restart = async () => {
-		await server?.stop();
+		await server!.stop();
 		server = undefined;
 		await start();
 	};
@@ -143,13 +143,13 @@ test("autonomous end with jobs=0 enqueues one internal report and re-prompts thr
 	f.wake();
 	await until(() => f.replies().length === 1);
 	expect(f.notices()).toHaveLength(1);
-	expect(f.notices()[0]?.source).toBe("lane_report");
-	expect(f.notices()[0]?.body).toContain(
+	expect(f.notices()[0]!.source).toBe("lane_report");
+	expect(f.notices()[0]!.body).toContain(
 		"Text you wrote in those runs was NOT delivered, except replies you gave to user messages",
 	);
-	expect(f.replies()[0]?.origin_key).toBe(KEY);
-	expect(f.replies()[0]?.delivery_id.startsWith("gw-ar-")).toBe(false);
-	const prompt = f.host.submitted.find((entry) => entry.text.includes("[Gateway notice]"))?.text;
+	expect(f.replies()[0]!.origin_key).toBe(KEY);
+	expect(f.replies()[0]!.delivery_id.startsWith("gw-ar-")).toBe(false);
+	const prompt = f.host.submitted.find((entry) => entry.text.includes("[Gateway notice]"))!.text;
 	expect(prompt).not.toContain("from your work lane");
 	expect(prompt).toContain("send it now in full; otherwise reply [SILENT]");
 	expect(f.logs.filter((line) => line.startsWith("agent_run_autonomous_end "))).toHaveLength(1);
@@ -273,7 +273,7 @@ test("an autonomous run joined by a gateway prompt ends correlated but still sch
 	// needs a notice despite the now-correlated terminal from the gateway turn.
 	await until(() => f.replies().length === 1);
 	expect(f.notices()).toHaveLength(1);
-	expect(f.notices()[0]?.body).toContain("except replies you gave to user messages");
+	expect(f.notices()[0]!.body).toContain("except replies you gave to user messages");
 	expect(f.logs.filter((line) => line.startsWith("agent_run_autonomous_end "))).toHaveLength(1);
 });
 
@@ -304,7 +304,7 @@ test("one real tail slot permits a same-origin successor during an active autono
 	await until(() => f.host.submitted.length >= 2);
 	await until(() => f.replies().length === 1);
 	expect(f.host.relayCount(f.sessionId)).toBe(1);
-	await server?.stop();
+	await server!.stop();
 	server = undefined;
 });
 
@@ -320,7 +320,7 @@ test("a complete autonomous run received during delayed successor preparation pr
 	});
 	// Delay a real pre-send port operation while lifecycle frames are received
 	// on the retained connection and admitted behind the dispatch mailbox item.
-	const usage = f.port.contextUsage?.bind(f.port);
+	const usage = f.port.contextUsage!.bind(f.port);
 	f.port.contextUsage = async (input) => {
 		entered();
 		await resume;
@@ -346,7 +346,7 @@ test("late predecessor content queued during successor preparation cannot delive
 	const resume = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	const usage = f.port.contextUsage?.bind(f.port);
+	const usage = f.port.contextUsage!.bind(f.port);
 	f.port.contextUsage = async (input) => {
 		entered();
 		await resume;
@@ -421,7 +421,7 @@ test("a cross-origin tail waiter already blocked before settlement dispatches wh
 		true,
 	);
 	expect(f.tailRunner.activeCount).toBe(1);
-	await server?.stop();
+	await server!.stop();
 	server = undefined;
 	expect(f.tailRunner.activeCount).toBe(0);
 });
