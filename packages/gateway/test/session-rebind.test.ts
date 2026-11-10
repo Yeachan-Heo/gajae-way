@@ -123,6 +123,69 @@ test("the chat notice says nothing was answered and what to do, keeping the reda
 	);
 	expect(leaky).not.toContain(secret);
 });
+
+test("a provider code under a generic runtime code earns its own remedy and rides the diagnosis", () => {
+	// The live ChatGPT sign-in expiry: `code=agent_error provider_code=token_expired phase=post_start`.
+	const expired = new GjcRuntimeError("agent_error: Agent run failed after execution started.", {
+		code: "agent_error",
+		message: "Agent run failed after execution started.",
+		providerCode: "token_expired",
+	});
+	const expiredNotice = formatFailureChatNotice(expired);
+	expect(expiredNotice).toBe(
+		"[turn failed] This message was not answered. The model sign-in (e.g. ChatGPT) has expired. The owner needs to sign in again for the profile the gateway actually uses (for the broker-agent snapshot: sign in on the source profile, re-run `gajaeway setup --broker-agent` with the broker stopped, then restart the broker), then resend this message.\n(diagnosis: agent_error [provider: token_expired]: Agent run failed after execution started.)",
+	);
+	expect(expiredNotice).not.toContain("send it again in a moment");
+	// The operator log line is unchanged; terminal_failure already carries provider_code.
+	expect(formatFailureNotice(expired)).toBe("[turn failed] agent_error: Agent run failed after execution started.");
+
+	const limited = formatFailureChatNotice(
+		new GjcRuntimeError("wrapped", {
+			code: "agent_error",
+			message: "Agent run failed.",
+			providerCode: "usage_limit_reached",
+		}),
+	);
+	expect(limited).toContain("usage limit has been reached. Wait until the limit resets");
+	expect(limited).toContain(
+		"switch the model or account in the profile the gateway actually uses (for the broker-agent snapshot: re-run `gajaeway setup --broker-agent` with the broker stopped, then restart the broker)",
+	);
+	expect(limited).not.toContain("launcher");
+	expect(limited).not.toContain("send it again in a moment");
+	expect(limited).toContain("(diagnosis: agent_error [provider: usage_limit_reached]: Agent run failed.)");
+
+	// The provider remedy outranks /new: a fresh session cannot renew a sign-in.
+	expect(
+		formatFailureChatNotice(
+			new GjcRuntimeError("wrapped", { code: "spawn_failed", message: "x", providerCode: "token_expired" }),
+		),
+	).not.toContain("/new");
+
+	// An unmapped provider code keeps the generic remedy but is still shown; one
+	// equal to the runtime code is not repeated.
+	expect(
+		formatFailureChatNotice(
+			new GjcRuntimeError("wrapped", { code: "agent_error", message: "m", providerCode: "overloaded" }),
+		),
+	).toBe(
+		"[turn failed] This message was not answered. Please send it again in a moment.\n(diagnosis: agent_error [provider: overloaded]: m)",
+	);
+	expect(
+		formatFailureChatNotice(
+			new GjcRuntimeError("wrapped", { code: "prompt_failed", message: "m", providerCode: "prompt_failed" }),
+		),
+	).toBe(
+		"[turn failed] This message was not answered. Please send it again in a moment.\n(diagnosis: prompt_failed: m)",
+	);
+
+	// A provider code is normalized and redacted like the runtime code.
+	const secret = "sk-live-0123456789abcdef";
+	const hostile = formatFailureChatNotice(
+		new GjcRuntimeError("wrapped", { code: "agent_error", message: "m", providerCode: `\u0000${secret}` }),
+	);
+	expect(hostile).not.toContain(secret);
+	expect(hostile).toContain("Please send it again in a moment.");
+});
 async function until(check: () => boolean): Promise<void> {
 	for (let i = 0; i < 200 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 5));
 	expect(check()).toBe(true);

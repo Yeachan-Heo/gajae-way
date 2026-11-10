@@ -810,3 +810,33 @@ test("a stalled turn that delivered a reply with stopReason stop does not post a
 		client.close();
 	}
 });
+
+test("a post-start failure under agent_error tells the room the provider's remedy, not a resend", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
+	const { client } = await startGateway(port);
+	try {
+		sendChannelMessage(client, "expired-sign-in", "summarize the thread");
+		await eventually(() => port.sends.length === 1, "persona turn was not sent");
+		const send = port.sends.at(0);
+		if (!send) throw new Error("persona send disappeared");
+		// The live ChatGPT sign-in expiry, as gajae-code reports it.
+		port.fail(send.opRef, "Agent run failed after execution started.", {
+			code: "agent_error",
+			outcome: {
+				kind: "failed",
+				phase: "post_start",
+				category: "agent_runtime",
+				provenance: "agent_failed",
+				providerCode: "token_expired",
+			},
+		});
+		await eventually(() => messages(client).length === 1, "failure notice was not delivered");
+		const notice = messages(client)[0]!.payload.text as string;
+		expect(notice).toBe(
+			"[turn failed] This message was not answered. The model sign-in (e.g. ChatGPT) has expired. The owner needs to sign in again for the profile the gateway actually uses (for the broker-agent snapshot: sign in on the source profile, re-run `gajaeway setup --broker-agent` with the broker stopped, then restart the broker), then resend this message.\n(diagnosis: agent_error [provider: token_expired]: Agent run failed after execution started.)",
+		);
+		expect(notice).not.toContain("send it again in a moment");
+	} finally {
+		client.close();
+	}
+});

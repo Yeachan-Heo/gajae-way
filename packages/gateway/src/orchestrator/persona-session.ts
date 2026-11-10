@@ -5326,6 +5326,9 @@ function terminalError(
 	const failure = status.status.error;
 	const outcome = status.status.outcome;
 	const code = sanitizeDiagnostic(failure?.code ?? outcome?.code ?? "") || undefined;
+	// Under a generic `agent_error` the provider's code is the actionable cause
+	// (`token_expired` needs a fresh sign-in, not a resend).
+	const providerCode = sanitizeDiagnostic(outcome?.providerCode ?? "") || undefined;
 	const reported =
 		sanitizeDiagnostic(failure?.message ?? outcome?.message ?? "") ||
 		// Never empty: a code-only failure still reports the code as its diagnosis,
@@ -5339,6 +5342,7 @@ function terminalError(
 		: reported;
 	return new GjcRuntimeError(`${code ? `${code}: ` : ""}${message}`, {
 		...(code ? { code } : {}),
+		...(providerCode ? { providerCode } : {}),
 		message,
 	});
 }

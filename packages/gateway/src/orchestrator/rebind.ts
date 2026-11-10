@@ -58,6 +58,8 @@ const MESSAGE_LIMIT = 240;
 export interface RuntimeErrorDetail {
 	readonly code?: string;
 	readonly message?: string;
+	/** The model provider's own code under a generic runtime code (`agent_error` → `token_expired`). */
+	readonly providerCode?: string;
 }
 
 /** A gjc failure that carries the runtime's own structured code. */
@@ -66,12 +68,15 @@ export class GjcRuntimeError extends Error {
 	readonly code: string | undefined;
 	/** The runtime's own message, unwrapped from any gateway framing. */
 	readonly runtimeMessage: string | undefined;
+	/** The model provider's code, when the runtime's terminal outcome reported one. */
+	readonly providerCode: string | undefined;
 
 	constructor(message: string, detail: RuntimeErrorDetail = {}) {
 		super(message);
 		this.name = "GjcRuntimeError";
 		this.code = detail.code;
 		this.runtimeMessage = detail.message;
+		this.providerCode = detail.providerCode;
 	}
 }
 
@@ -572,6 +577,10 @@ function describeFailure(error: unknown): RuntimeErrorDetail & { readonly text: 
 	// characters must not be able to smuggle it past the redactor.
 	const normalizedCode = error instanceof GjcRuntimeError ? normalizeCode(error.code) : undefined;
 	const code = normalizedCode ? redactSecrets(normalizedCode) : undefined;
+	const normalizedProvider = error instanceof GjcRuntimeError ? normalizeCode(error.providerCode) : undefined;
+	// A provider code equal to the runtime code adds nothing to the diagnosis.
+	const providerCode =
+		normalizedProvider && normalizedProvider !== normalizedCode ? redactSecrets(normalizedProvider) : undefined;
 	const message =
 		firstDiagnosis(
 			error instanceof GjcRuntimeError ? error.runtimeMessage : undefined,
@@ -580,10 +589,28 @@ function describeFailure(error: unknown): RuntimeErrorDetail & { readonly text: 
 	const truncated = message.length > MESSAGE_LIMIT ? `${message.slice(0, MESSAGE_LIMIT).trimEnd()}…` : message;
 	return {
 		...(code ? { code } : {}),
+		...(providerCode ? { providerCode } : {}),
 		message: truncated,
 		text: code ? `${code}: ${truncated}` : truncated,
 	};
 }
+
+/**
+ * What the owner can do about a provider failure the runtime reports under a
+ * generic code. `agent_error provider_code=token_expired` used to be told to
+ * resend in a moment, which can never work: the owner has to sign in again.
+ * Keys are exact provider codes; a Map keeps lookup off the prototype chain.
+ */
+const PROVIDER_CODE_REMEDIES = new Map<string, string>([
+	[
+		"token_expired",
+		"The model sign-in (e.g. ChatGPT) has expired. The owner needs to sign in again for the profile the gateway actually uses (for the broker-agent snapshot: sign in on the source profile, re-run `gajaeway setup --broker-agent` with the broker stopped, then restart the broker), then resend this message.",
+	],
+	[
+		"usage_limit_reached",
+		"The model account's usage limit has been reached. Wait until the limit resets, or the owner can switch the model or account in the profile the gateway actually uses (for the broker-agent snapshot: re-run `gajaeway setup --broker-agent` with the broker stopped, then restart the broker), then resend this message.",
+	],
+]);
 
 /**
  * The single string used for BOTH the operator log and the delivered chat
@@ -614,13 +641,20 @@ export type RebindStore = Pick<Store, "bindings" | "core" | "transaction">;
 export function formatFailureChatNotice(error: unknown): string {
 	const described = describeFailure(error);
 	const remediable = isRebindableCode(described.code) || described.code === "rebind_cap_exceeded";
-	// A quota diagnosis is already the instruction; resending cannot help it.
-	const remedy = remediable
-		? " Send /new to start a fresh conversation, then send it again."
-		: described.code === "provider_quota_exhausted"
-			? ""
-			: " Please send it again in a moment.";
-	return `[turn failed] This message was not answered.${remedy}\n(diagnosis: ${described.text})`;
+	// The provider's code names the actual cause, so its remedy outranks the
+	// generic ones. A quota diagnosis is already the instruction; resending cannot help it.
+	const providerRemedy = described.providerCode ? PROVIDER_CODE_REMEDIES.get(described.providerCode) : undefined;
+	const remedy = providerRemedy
+		? ` ${providerRemedy}`
+		: remediable
+			? " Send /new to start a fresh conversation, then send it again."
+			: described.code === "provider_quota_exhausted"
+				? ""
+				: " Please send it again in a moment.";
+	const provider = described.providerCode ? `[provider: ${described.providerCode}]` : "";
+	const head = [described.code, provider].filter(Boolean).join(" ");
+	const diagnosis = head ? `${head}: ${described.message}` : described.message;
+	return `[turn failed] This message was not answered.${remedy}\n(diagnosis: ${diagnosis})`;
 }
 
 /**
