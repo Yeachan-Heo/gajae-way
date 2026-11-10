@@ -114,7 +114,6 @@ test("fix #2: escalation payload includes deliveryId (issue #780, codex finding 
 		// Simulate 3 failed events to trigger escalation
 		for (let i = 0; i < 3; i++) {
 			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.escalation", {});
-			const row = database.monitors.eventRows(monitor.monitorId, "newest", false, 1)[0];
 			database.transaction((tx) => {
 				database.monitors.eventFencedFail(
 					tx,
@@ -140,7 +139,7 @@ test("fix #2: escalation payload includes deliveryId (issue #780, codex finding 
 			// Verify deliveryId is present in the payload
 			expect(escalationMsg.deliveryId).toBeDefined();
 			expect(typeof escalationMsg.deliveryId).toBe("string");
-			expect(escalationMsg.deliveryId!.length).toBeGreaterThan(0);
+			expect(escalationMsg.deliveryId?.length).toBeGreaterThan(0);
 		}
 
 		database.close();
@@ -231,9 +230,7 @@ test("fix #3: per-origin failure counting across multiple event types (issue #78
 
 		// The safety state should show that we're tracking typeA failures correctly
 		// even though typeB events are interspersed
-		const safetyState = pipeline.sessionSafetyState(
-			`monitor/eventtype/test.typeA/parent=${monitor.monitorId}`,
-		);
+		const safetyState = pipeline.sessionSafetyState(`monitor/eventtype/test.typeA/parent=${monitor.monitorId}`);
 		// Safety state exists (doesn't crash on multi-type monitors)
 		expect(safetyState).toBeDefined();
 
@@ -255,10 +252,8 @@ test("fix #2: bind timeout counter persists across gateway restarts (issue #780,
 			burstPolicy: "serialize",
 		});
 
-		let bindAttempt = 0;
 		const sessionPort: Partial<SessionPort> = {
 			bind: async (input) => {
-				bindAttempt++;
 				// Always timeout on epoch 0 to trigger restart scenario
 				if (input.epoch === 0) {
 					throw new GjcCliUnavailableError("timeout");
@@ -293,9 +288,8 @@ test("fix #2: bind timeout counter persists across gateway restarts (issue #780,
 			await Bun.sleep(50);
 		}
 
-		const safetyBeforeRestart = pipeline.sessionSafetyState(
-			`monitor/eventtype/test.restart/parent=${monitor.monitorId}`,
-		);
+		// Store safety state before restart (for reference if needed)
+		pipeline.sessionSafetyState(`monitor/eventtype/test.restart/parent=${monitor.monitorId}`);
 
 		// Simulate gateway restart by creating a new propagator
 		pipeline = new MonitorPropagator({
@@ -315,8 +309,9 @@ test("fix #2: bind timeout counter persists across gateway restarts (issue #780,
 			`monitor/eventtype/test.restart/parent=${monitor.monitorId}`,
 		);
 
-		// Counter should be restored (even if 0 because epoch rotation reset it)
+		// After restart, the safety state should be available (counter may be reset if epoch changed)
 		expect(safetyAfterRestart).toBeDefined();
+		expect(safetyAfterRestart.bindTimeoutEpoch).toBeDefined();
 
 		database.close();
 	} finally {

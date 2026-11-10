@@ -1406,31 +1406,31 @@ export class MonitorPropagator {
 									`monitor bind timeout for ${sessionOriginKey}: count=${safety.bindTimeoutFailures}/${MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD} epoch=${boundEpoch}`,
 								);
 
-							// If threshold reached, rebind to a fresh epoch (issue #780).
-							if (safety.bindTimeoutFailures >= MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD) {
-								// Before rotating, check for any pending session.create intent.
-								// If session.create succeeded in the broker but SessionPort hasn't recorded it yet,
-								// the create intent will still be pending. Rotate only if there's no pending create
-								// for the current origin+epoch (issue #780: ambiguous session.create).
-								const pendingCreate = this.#hasPendingCreateIntent(sessionOriginKey, boundEpoch);
-								if (pendingCreate) {
-									console.error(
-										`monitor bind timeout but pending session.create exists for ${sessionOriginKey} epoch=${boundEpoch}, waiting for create to resolve`,
-									);
-									// A pending create may eventually succeed; don't rotate the epoch yet.
-									// Reset the timeout counter and persist it (issue #780, P2 #2)
-									safety.bindTimeoutFailures = 0;
-									this.#safety.set(sessionOriginKey, safety);
-									this.#persistBindTimeoutCounter(sessionOriginKey, 0, boundEpoch);
-									throw bindError; // Propagate the error to retry at this epoch
-								}
+								// If threshold reached, rebind to a fresh epoch (issue #780).
+								if (safety.bindTimeoutFailures >= MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD) {
+									// Before rotating, check for any pending session.create intent.
+									// If session.create succeeded in the broker but SessionPort hasn't recorded it yet,
+									// the create intent will still be pending. Rotate only if there's no pending create
+									// for the current origin+epoch (issue #780: ambiguous session.create).
+									const pendingCreate = this.#hasPendingCreateIntent(sessionOriginKey, boundEpoch);
+									if (pendingCreate) {
+										console.error(
+											`monitor bind timeout but pending session.create exists for ${sessionOriginKey} epoch=${boundEpoch}, waiting for create to resolve`,
+										);
+										// A pending create may eventually succeed; don't rotate the epoch yet.
+										// Reset the timeout counter and persist it (issue #780, P2 #2)
+										safety.bindTimeoutFailures = 0;
+										this.#safety.set(sessionOriginKey, safety);
+										this.#persistBindTimeoutCounter(sessionOriginKey, 0, boundEpoch);
+										throw bindError; // Propagate the error to retry at this epoch
+									}
 
-								// Check if a session was already created.
-								// If session.create succeeded in parallel, preserve and reconcile the created session
-								// instead of rotating (issue #780: ambiguous session.create).
-								const currentSession = this.#database.bindings.getSessionRecord(sessionOriginKey);
-								const sessionExists =
-									currentSession && currentSession.epoch === boundEpoch && currentSession.sessionId;
+									// Check if a session was already created.
+									// If session.create succeeded in parallel, preserve and reconcile the created session
+									// instead of rotating (issue #780: ambiguous session.create).
+									const currentSession = this.#database.bindings.getSessionRecord(sessionOriginKey);
+									const sessionExists =
+										currentSession && currentSession.epoch === boundEpoch && currentSession.sessionId;
 
 									if (sessionExists) {
 										console.error(
@@ -2370,13 +2370,13 @@ export class MonitorPropagator {
 			// Issue #3: only count failures for this specific session origin
 			const eventOrigin = monitorOriginForEvent(monitor, row.event_type);
 			const eventOriginKey = originKey(eventOrigin);
-			
+
 			if (eventOriginKey !== sessionOriginKey) {
 				// Different session origin, skip this row and continue counting other origins
 				// (a monitor with multiple event types may have A/B/A sequence)
 				continue;
 			}
-			
+
 			// Skip events that are still in-flight (unfinished) - Issue #5
 			if (row.stage === "admitted" || row.stage === "batched" || row.stage === "dispatched") {
 				continue;
@@ -2476,12 +2476,12 @@ export class MonitorPropagator {
 				}
 				return enqueued;
 			});
-			
+
 			// Only deliver to live adapters if persistence succeeded
 			if (!admitted) {
 				return false;
 			}
-			
+
 			// Persistence succeeded; now deliver to live adapters
 			this.#delivery.markInflight(deliveryId);
 			try {
