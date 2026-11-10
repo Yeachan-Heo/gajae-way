@@ -1116,6 +1116,12 @@ export async function startSlackAdapter(
 			const admitted = decideInbound(message, identity, directory, config.channels);
 			if (!admitted) return;
 			const messageId = slackMessageId(message.channel, message.ts);
+			if (envelope.subtype === "message_changed") {
+				if (hasNativeImageEdit(envelope)) {
+					log.error("Slack image edit rejected; native image edits are unsupported.");
+					return;
+				}
+			}
 			const edit =
 				envelope.subtype === "message_changed"
 					? describeMessageEdit(envelope, identity, directory, config.channels, messageOrigins.get(messageId))
@@ -1128,20 +1134,22 @@ export async function startSlackAdapter(
 				// id, so live traffic records the bounded set recovery will revisit.
 				await rememberDm(message);
 				if (envelope.subtype === "message_changed") {
-					if (hasNativeImageEdit(envelope)) {
-						log.error("Slack image edit rejected; native image edits are unsupported.");
-						return;
-					}
-					const edit = describeMessageEdit(
+					const editToSend = describeMessageEdit(
 						envelope,
 						identity,
 						directory,
 						config.channels,
 						messageOrigins.get(messageId),
 					);
-					if (edit) {
-						rememberOrigin(messageId, edit.origin);
-						gateway.sendEdit(edit.messageId, edit.origin, edit.text, edit.engagement, edit.receivedAt);
+					if (editToSend) {
+						rememberOrigin(messageId, editToSend.origin);
+						gateway.sendEdit(
+							editToSend.messageId,
+							editToSend.origin,
+							editToSend.text,
+							editToSend.engagement,
+							editToSend.receivedAt,
+						);
 					}
 					return;
 				}

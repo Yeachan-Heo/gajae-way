@@ -75,12 +75,12 @@ class Gateway implements GatewayClientLike {
 	readonly requests: { verb: string; params: unknown }[] = [];
 	readonly handlers = new Set<(message: ChatMessagePayload) => void>();
 	engaged = true;
-	turnId: string | null | undefined;
+	turnId: string | null = "accepted-turn";
 	failure?: Error;
 	async request<T = unknown>(verb: string, params?: unknown): Promise<T> {
 		this.requests.push({ verb, params });
 		if (this.failure) throw this.failure;
-		return { engaged: this.engaged, ...(this.turnId === undefined ? {} : { turnId: this.turnId }) } as T;
+		return { engaged: this.engaged, turnId: this.engaged ? this.turnId : null } as T;
 	}
 	onChatMessage(handler: (message: ChatMessagePayload) => void) {
 		this.handlers.add(handler);
