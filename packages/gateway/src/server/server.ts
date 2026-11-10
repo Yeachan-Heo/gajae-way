@@ -640,6 +640,7 @@ function notifyOwnerRestartCancelled(
 	requestId: string,
 	origin: OriginRef,
 	reason = "a persona reply was not confirmed as delivered before the drain deadline",
+	replyToMessageId?: string,
 ): void {
 	const payload = {
 		turnId: crypto.randomUUID(),
@@ -647,12 +648,13 @@ function notifyOwnerRestartCancelled(
 		role: "assistant" as const,
 		text: `Restart cancelled: ${reason}.`,
 		final: true,
+		...(replyToMessageId ? { replyToMessageId } : {}),
 	};
 	if (origin.platform === "loopback") {
 		connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: requestId, payload });
 		return;
 	}
-	const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
+	const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text, replyToMessageId);
 	if (!delivery) return;
 	runtime.delivery.markInflight(delivery.deliveryId as string);
 	broadcastDelivery(runtime, delivery);
@@ -2465,33 +2467,41 @@ async function handleRequest(
 				(params?.responseKind as string) === "option_selected"
 					? ((params?.selectedOptionId as string) || "").trim().slice(0, 256)
 					: undefined;
-			const authorId = (engagement?.authorId as string) || "";
-			const actor = typeof engagement?.authorName === "string" ? (engagement.authorName as string) : undefined;
+			let rejection: Awaited<ReturnType<typeof runtime.permissionPanels.respond>>;
+			try {
+				rejection = await runtime.permissionPanels.respond({
+					panelId,
+					responderId,
+					responseKind: responseKind as PanelResponseKind,
+					selectedOptionId,
+				});
+			} catch (error) {
+				throw new ProtocolError("verb_failed", `Failed to submit panel response: ${diagnostic(error)}`);
+			}
+			if (rejection) {
+				console.error(
+					`panel_response_rejected reason=${rejection} panel=${JSON.stringify(panelId)} responder=${JSON.stringify(responderId)}`,
+				);
+				throw new ProtocolError(
+					rejection === "unauthorized_responder" ? "unauthorized" : "invalid_params",
+					`Failed to submit panel response: ${rejection}`,
+				);
+			}
 
-			const coordinatorError = await runtime.permissionPanels
-				.respond({ panelId, responderId, responseKind: responseKind as PanelResponseKind, selectedOptionId })
-				.catch((error: unknown) => `response_error: ${diagnostic(error)}`);
-
-			// Record the panel response in the context ledger (audit trail)
+			// Record only accepted responses in model-visible context.
 			const responseBody =
 				responseKind === "option_selected"
-					? `[panel] answered question ${panelId} with option ${selectedOptionId}${coordinatorError ? ` (error: ${coordinatorError})` : ""}`
-					: `[panel] ${responseKind} panel ${panelId}${coordinatorError ? ` (error: ${coordinatorError})` : ""}`;
+					? `[panel] answered question ${panelId} with option ${selectedOptionId}`
+					: `[panel] ${responseKind} panel ${panelId}`;
 
 			options.database.transaction((tx) =>
 				options.database.inbox.contextRecord(tx, {
 					messageId: `panel/${responseKind}/${panelId}/${responderId}/${new Date().toISOString()}/${crypto.randomUUID().slice(0, 8)}`,
 					originKey: originKey(origin),
-					authorId,
-					...(actor ? { authorName: actor } : {}),
+					authorId: responderId,
 					body: responseBody,
 				}),
 			);
-
-			// Report result to adapter
-			if (coordinatorError) {
-				throw new ProtocolError("verb_failed", `Failed to submit panel response: ${coordinatorError}`);
-			}
 
 			connection.write({
 				v: PROFILE_VERSION,
@@ -2528,7 +2538,7 @@ async function sendChat(
 				messageId?: unknown;
 				receivedAt?: unknown;
 				voice?: unknown;
-				engagement?: { mentioned?: unknown; group?: unknown; authorId?: unknown };
+				engagement?: { mentioned?: unknown; group?: unknown; authorId?: unknown; replyTo?: { messageId?: unknown } };
 		  }
 		| undefined;
 	if (!params) throw new ProtocolError("invalid_params", "chat.send requires parameters");
@@ -2567,6 +2577,10 @@ async function sendChat(
 	}
 	const key = originKey(origin);
 	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database.inbox);
+	const replyToMessageId =
+		typeof params.engagement?.replyTo?.messageId === "string" && params.engagement.replyTo.messageId
+			? params.engagement.replyTo.messageId
+			: undefined;
 	// `/model` is a privileged control path. Apply the same direct-message and
 	// group authorisation policy as ordinary engagement before inspecting or
 	// mutating the durable override.
@@ -2592,6 +2606,7 @@ async function sendChat(
 			role: "assistant" as const,
 			text: outcome.text,
 			final: true,
+			...(replyToMessageId ? { replyToMessageId } : {}),
 		};
 		connection.write({
 			v: PROFILE_VERSION,
@@ -2602,7 +2617,7 @@ async function sendChat(
 		if (origin.platform === "loopback")
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: request.id, payload });
 		else {
-			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
+			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text, replyToMessageId);
 			if (delivery) {
 				runtime.delivery.markInflight(delivery.deliveryId as string);
 				for (const recipient of runtime.connections)
@@ -2637,6 +2652,7 @@ async function sendChat(
 			role: "assistant" as const,
 			text: "Restarting the gateway; back in a few seconds.",
 			final: true,
+			...(replyToMessageId ? { replyToMessageId } : {}),
 		};
 		connection.write({
 			v: PROFILE_VERSION,
@@ -2647,7 +2663,7 @@ async function sendChat(
 		if (origin.platform === "loopback")
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: request.id, payload });
 		else {
-			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
+			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text, replyToMessageId);
 			if (delivery) {
 				runtime.delivery.markInflight(delivery.deliveryId as string);
 				for (const recipient of runtime.connections)
@@ -2692,6 +2708,7 @@ async function sendChat(
 						request.id,
 						origin,
 						"the stack supervisor did not finish its current service command before the takeover deadline",
+						replyToMessageId,
 					);
 					return;
 				}
@@ -2711,7 +2728,7 @@ async function sendChat(
 			if (outcome === "timed_out") {
 				console.warn("owner restart cancelled; persona reply delivery was not confirmed before the drain deadline");
 				await runtime.personaSessions.cancelRestartDrain(ownerRestartId);
-				notifyOwnerRestartCancelled(connection, runtime, request.id, origin);
+				notifyOwnerRestartCancelled(connection, runtime, request.id, origin, undefined, replyToMessageId);
 				return;
 			}
 			// Exit non-zero on purpose: launchd KeepAlive=true and systemd
@@ -2748,6 +2765,7 @@ async function sendChat(
 			role: "assistant" as const,
 			text: "Started a fresh session.",
 			final: true,
+			...(replyToMessageId ? { replyToMessageId } : {}),
 		};
 		connection.write({
 			v: PROFILE_VERSION,
@@ -2758,7 +2776,7 @@ async function sendChat(
 		if (origin.platform === "loopback")
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: request.id, payload });
 		else {
-			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
+			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text, replyToMessageId);
 			if (delivery) {
 				runtime.delivery.markInflight(delivery.deliveryId as string);
 				for (const recipient of runtime.connections)
@@ -3390,7 +3408,7 @@ async function createInboundTurnLifecycle(
 			) !== deliveryId
 		)
 			return;
-		const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, text, undefined, deliveryId);
+		const payload = runtime.delivery.prepare(turnId, origin, text, undefined, deliveryId);
 		if (!payload) return;
 		deliveredParts.push(text);
 		assistantDeliveryStarted = true;
@@ -3629,7 +3647,7 @@ async function createInboundTurnLifecycle(
 	 */
 	const deliverFiles = async (paths: readonly string[], replyTo: string | undefined) => {
 		const notify = (deliveryId: string, text: string) => {
-			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, text, replyTo, deliveryId, false);
+			const payload = runtime.delivery.prepare(turnId, origin, text, replyTo, deliveryId, false);
 			if (!payload) return;
 			deliveredIds.push(payload.deliveryId as string);
 			assistantDeliveryStarted = true;
@@ -3658,7 +3676,7 @@ async function createInboundTurnLifecycle(
 				notify(`${deliveryId}-x`, `(file not sent: ${checked.name} - ${checked.reason})`);
 				continue;
 			}
-			const payload = runtime.delivery.prepareFile(crypto.randomUUID(), origin, checked.file, deliveryId, replyTo);
+			const payload = runtime.delivery.prepareFile(turnId, origin, checked.file, deliveryId, replyTo);
 			if (!payload) continue;
 			deliveredIds.push(payload.deliveryId as string);
 			assistantDeliveryStarted = true;
@@ -3715,7 +3733,7 @@ async function createInboundTurnLifecycle(
 						);
 						continue;
 					}
-					const payload = runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+					const payload = runtime.delivery.prepareReaction(turnId, origin, {
 						targetMessageId: wanted.targetMessageId,
 						emoji: wanted.emoji,
 						emojiName: wanted.emojiName,
@@ -3744,7 +3762,7 @@ async function createInboundTurnLifecycle(
 						);
 						continue;
 					}
-					const payload = runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+					const payload = runtime.delivery.prepareReaction(turnId, origin, {
 						targetMessageId,
 						emoji: wanted.emoji,
 						emojiName: wanted.emojiName,
@@ -3915,12 +3933,12 @@ async function createInboundTurnLifecycle(
 			// while the persona keeps streaming. Only the terminal reply - or the
 			// unconditional final progress tick - tears it down.
 			const payload = runtime.delivery.prepare(
-				crypto.randomUUID(),
+				turnId,
 				origin,
 				step.body,
 				step.replyTo,
 				deliveryId,
-				source === "terminal",
+				source === "terminal" && step === local.at(-1),
 			);
 			if (!payload) continue;
 			deliveredParts.push(step.body);
@@ -4520,7 +4538,7 @@ function acknowledgeSteer(runtime: Runtime, steered: InboundMessageRow, turnId: 
 		}
 		broadcastDelivery(
 			runtime,
-			runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+			runtime.delivery.prepareReaction(turnId ?? crypto.randomUUID(), origin, {
 				targetMessageId,
 				emoji: eyes.unicode,
 				emojiName: eyes.name,

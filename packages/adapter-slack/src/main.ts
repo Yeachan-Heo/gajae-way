@@ -19,6 +19,7 @@ import {
 	type OriginRef,
 	OUTBOUND_FILE_MAX_BYTES,
 	type PromptImage,
+	ProtocolError,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
@@ -33,8 +34,8 @@ import { type MentionDirectory, repairMentions } from "./mentions";
 import { chunkSlackMessage, markdownToMrkdwn } from "./mrkdwn";
 import {
 	isSlackDmChannel,
-	maybeThreadOnMention,
 	parseSlackMessageId,
+	resolveSlackMessageOrigin,
 	type SlackMessageOriginShape,
 	slackMessageId,
 	slackMessageOrigin,
@@ -179,6 +180,8 @@ export function decideInbound(
 	if (
 		!message.ts ||
 		!message.channel ||
+		!parseSlackMessageId(`${message.channel}:${message.ts}`) ||
+		(message.thread_ts !== undefined && !parseSlackMessageId(`${message.channel}:${message.thread_ts}`)) ||
 		message.user === identity.botUserId ||
 		(identity.botId && message.bot_id === identity.botId) ||
 		message.hidden === true ||
@@ -187,24 +190,32 @@ export function decideInbound(
 		!(message.user ?? message.bot_id)
 	)
 		return undefined;
-	// A reply threaded under the bot's own message continues the channel conversation rather than
-	// opening an isolated thread session: a human who clicks "reply" on the bot's answer expects the
-	// bot to remember that answer. `replyTo` still carries thread_ts, so the reply lands in the thread.
-	// Threads a human starts on their own message keep their own session.
-	const origin =
-		message.thread_ts && message.thread_ts !== message.ts && message.parent_user_id === identity.botUserId
-			? slackMessageOrigin({
-					channel: message.channel,
-					channel_type: message.channel_type,
-					user: message.user,
-					bot_id: message.bot_id,
-				})
-			: slackMessageOrigin(message);
-	return { origin, engagement: engagementForMessage(message, origin, identity, names, channels) };
+	const engagement = engagementForMessage(message, slackMessageOrigin(message), identity, names, channels);
+	const origin = resolveSlackMessageOrigin(
+		message,
+		identity.botUserId,
+		engagement.mentioned && !extractBotCommand(message, identity.botUserId),
+	);
+	return { origin, engagement };
 }
 
 export function renderInboundText(message: SlackInboundMessage, names: SlackNames): string {
 	return describeInboundBody({ text: normalizeSlackText(message.text ?? "", names), files: message.files });
+}
+
+/** Only a standalone raw command explicitly addressed to this bot is executable. */
+export function extractBotCommand(message: SlackInboundMessage, botUserId: string): string | undefined {
+	if (!message.user || message.bot_id || message.files?.length) return undefined;
+	const text = (message.text ?? "").trim();
+	const address = `<@${botUserId}>`;
+	if (!text.startsWith(address)) return undefined;
+	const rest = text.slice(address.length);
+	if (!/^[ \t]+/.test(rest)) return undefined;
+	const command = rest.trim();
+	if (/[\r\n`]/.test(command) || command.includes("<@")) return undefined;
+	return /^\/(?:new|reset|model|restart)(?:[ \t]+[^\r\n]*)?$/.test(command)
+		? command.replace(/^(\S+)[ \t]+/, "$1 ")
+		: undefined;
 }
 
 export interface PendingEdit {
@@ -223,18 +234,29 @@ export function describeMessageEdit(
 	identity: SlackIdentity,
 	names: SlackNames,
 	channels: Channels,
+	knownOrigin?: OriginRef,
 ): DescribedMessageEdit | undefined {
 	if (event.subtype !== "message_changed" || !event.message) return undefined;
 	if (hasNativeImageEdit(event)) return undefined;
 	const message = { ...event.message, channel: event.channel };
 	const admitted = decideInbound(message, identity, names, channels);
 	if (!admitted) return undefined;
+	// Without the previous snapshot, the original conversation cannot safely be inferred.
+	if (!event.previous_message) return undefined;
+	const previous = decideInbound(
+		{ ...message, ...event.previous_message, channel: event.channel },
+		identity,
+		names,
+		channels,
+	);
+	if (!previous) return undefined;
 	const text = renderInboundText(message, names);
 	// Link previews and other metadata changes are not edits of what the user said.
 	if (text === "" || (event.previous_message && renderInboundText(event.previous_message, names) === text))
 		return undefined;
 	return {
 		...admitted,
+		origin: knownOrigin ?? previous.origin,
 		messageId: slackMessageId(message.channel, message.ts),
 		text,
 		receivedAt: timestamp(message.edited?.ts ?? event.ts),
@@ -371,6 +393,7 @@ export async function settleSlackDelivery(
 		return;
 	}
 	const deliveryId = message.deliveryId;
+	let visibleTextPosted = false;
 	try {
 		const channel = deliveryChannel(message.origin);
 		// Routing is decided before any write, so a bad target never half-posts.
@@ -414,14 +437,17 @@ export async function settleSlackDelivery(
 			}
 		}
 		// Every chunk must stay in the same Slack thread, not just the first chunk.
-		for (const chunk of chunkSlackMessage(text)) await api.postMessage(channel, chunk, threadTs);
+		for (const chunk of chunkSlackMessage(text)) {
+			await api.postMessage(channel, chunk, threadTs);
+			visibleTextPosted = true;
+		}
 		// voiceText is intentionally ignored: Slack has no bot voice messages.
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
 		await gateway.request("delivery.fail", {
 			deliveryId,
 			reason: errorText(error),
-			ambiguous: deliveryFailureIsAmbiguous(error),
+			ambiguous: visibleTextPosted || deliveryFailureIsAmbiguous(error),
 		});
 	} finally {
 		await settleTurnPresence(message, status);
@@ -442,10 +468,10 @@ async function settleTurnPresence(
 	if (!status) return;
 	const conversationId = message.origin.conversationId;
 	if (!message.final) {
-		if (!message.reaction) await status.reassert(conversationId).catch(() => {});
+		if (!message.reaction) await status.reassert(conversationId, message.turnId).catch(() => {});
 		return;
 	}
-	await status.clear(conversationId).catch(() => {});
+	await status.clear(conversationId, message.turnId).catch(() => {});
 }
 
 export async function settleSlackFile(
@@ -539,6 +565,21 @@ export async function settleSlackReaction(
 	}
 }
 
+// Delivery and terminal progress callbacks share one queue: sealing a live reply
+// must not overtake a delivery that has not yet entered the tracker.
+const settlementQueues = new WeakMap<GatewayClientLike, OrderedIngress>();
+function settlementQueue(gateway: GatewayClientLike): OrderedIngress {
+	let queue = settlementQueues.get(gateway);
+	if (!queue) {
+		queue = new OrderedIngress();
+		settlementQueues.set(gateway, queue);
+	}
+	return queue;
+}
+function settlementKey(origin: OriginRef): string {
+	return JSON.stringify([origin.platform, origin.kind, origin.conversationId, origin.parentId, origin.peerId]);
+}
+
 export function subscribeSlackDeliveries(
 	gateway: GatewayClientLike,
 	api: Pick<SlackWebApi, "postMessage" | "addReaction" | "removeReaction">,
@@ -547,10 +588,14 @@ export function subscribeSlackDeliveries(
 	mentions?: MentionDirectory,
 	live?: LiveReplyTracker,
 ): () => void {
+	const queue = settlementQueue(gateway);
 	return gateway.onChatMessage((message) => {
-		void settleSlackDelivery(gateway, api, message, log, status, mentions, live).catch((error) =>
-			log.error(`Slack delivery settlement request failed: ${errorText(error)}`),
-		);
+		if (message.origin.platform !== "slack") return;
+		queue.run(settlementKey(message.origin), async () => {
+			await settleSlackDelivery(gateway, api, message, log, status, mentions, live).catch((error) =>
+				log.error(`Slack delivery settlement request failed: ${errorText(error)}`),
+			);
+		});
 	});
 }
 
@@ -561,17 +606,24 @@ export function subscribeSlackProgress(
 	live?: Pick<LiveReplyTracker, "close">,
 ): () => void {
 	if (!gateway.onChatProgress) return () => {};
+	const queue = settlementQueue(gateway);
 	return gateway.onChatProgress((progress) => {
 		if (progress.origin.platform !== "slack") return;
 		// Final arrives even when a turn delivers nothing; delivery-only cleanup leaves silent turns orphaned.
 		// It is also the authoritative end-of-turn signal, so a live reply entry
 		// closes here even when the turn ended without a terminal text delivery.
-		if (progress.final) live?.close(progress.turnId);
-		if (!status) return;
-		const action = progress.final ? status.clear(progress.origin.conversationId) : status.update(progress);
-		void action.catch((error) =>
-			log.error(`Slack working status ${progress.final ? "clear" : "update"} failed: ${errorText(error)}`),
-		);
+		const update = async () => {
+			if (progress.final) await live?.close(progress.turnId);
+			if (!status) return;
+			await (progress.final
+				? status.clear(progress.origin.conversationId, progress.turnId)
+				: status.update(progress)
+			).catch((error) =>
+				log.error(`Slack working status ${progress.final ? "clear" : "update"} failed: ${errorText(error)}`),
+			);
+		};
+		if (progress.final) queue.run(settlementKey(progress.origin), update);
+		else void update();
 	});
 }
 
@@ -598,6 +650,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 	 */
 	readonly #pendingSends = new Map<string, Promise<RecoveredSend>>();
 	readonly #editOutbox = new Map<string, PendingEdit>();
+	readonly #settlements = new OrderedIngress();
 	#editFlush: Promise<void> | undefined;
 	#reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	#monitorTimer: ReturnType<typeof setTimeout> | undefined;
@@ -635,6 +688,8 @@ export class ReconnectingGateway implements GatewayClientLike {
 		this.#client = client;
 		this.#attempt = 0;
 		this.#deliveryOff?.();
+		// Old in-flight Slack writes still own their place across a gateway reconnect.
+		settlementQueues.set(client, this.#settlements);
 		const off = subscribeSlackDeliveries(client, this.api, console, this.status, this.mentions, this.live);
 		const progressOff =
 			this.status || this.live ? subscribeSlackProgress(client, this.status, console, this.live) : undefined;
@@ -774,7 +829,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 				// The gateway already decided engagement - including un-mentioned thread
 				// follow-ups - so every accepted turn shows presence. Gating on the mention
 				// here left thread replies silent until the answer landed (live, 2026-09-17).
-				if (result?.engaged) this.status?.arm(origin, messageId);
+				if (result?.engaged && result.turnId) this.status?.arm(origin, messageId, result.turnId);
 				return { verdict: "acked", ...(result ? { result } : {}) };
 			} catch (error) {
 				console.error(`Slack chat.send failed: ${errorText(error)}`);
@@ -835,8 +890,11 @@ export class ReconnectingGateway implements GatewayClientLike {
 						return;
 					}
 					try {
-						const result = await client.request<{ engaged?: boolean } | undefined>("chat.edit", edit);
-						if (result?.engaged) this.status?.arm(edit.origin, edit.messageId);
+						const result = await client.request<{ engaged?: boolean; turnId?: string | null } | undefined>(
+							"chat.edit",
+							edit,
+						);
+						if (result?.engaged && result.turnId) this.status?.arm(edit.origin, edit.messageId, result.turnId);
 						// A superseding edit queued during the request must drain in this pass too.
 						if (this.#editOutbox.get(edit.messageId) === edit) this.#editOutbox.delete(edit.messageId);
 					} catch (error) {
@@ -861,10 +919,19 @@ export class ReconnectingGateway implements GatewayClientLike {
 			.catch((error) => console.error(`Slack engagement.reaction failed: ${errorText(error)}`));
 	}
 
-	sendPanelResponse(response: EngagementPanelResponseParams): void {
-		void this.#client
-			?.request("engagement.panel_response", response)
-			.catch((error) => console.error(`Slack engagement.panel_response failed: ${errorText(error)}`));
+	async sendPanelResponse(response: EngagementPanelResponseParams): Promise<void> {
+		const client = this.#client;
+		if (!client) throw new Error("Slack gateway is not connected");
+		try {
+			await client.request("engagement.panel_response", response);
+		} catch (error) {
+			if (error instanceof ProtocolError && (error.code === "unauthorized" || error.code === "invalid_params")) {
+				console.warn(`Slack panel response rejected: ${error.code}`);
+				return;
+			}
+			if (this.#client === client) this.scheduleReconnect();
+			throw error;
+		}
 	}
 
 	private monitor(client: GatewayClientLike, strikes = 0): void {
@@ -973,6 +1040,17 @@ export async function startSlackAdapter(
 		(files ?? []).some(isSlackNativeImage)
 			? imageBudget.run(() => prepareSlackImages(files, config.botToken, ports.imageFetch))
 			: prepareSlackImages(files, config.botToken, ports.imageFetch);
+	// Preserve the first observed routing decision across successive mention edits.
+	// This cache is bounded like inbound identity memory; previous_message supplies
+	// the original snapshot when the adapter did not observe the message live.
+	const messageOrigins = new Map<string, OriginRef>();
+	const rememberOrigin = (messageId: string, origin: OriginRef): OriginRef => {
+		const original = messageOrigins.get(messageId) ?? origin;
+		messageOrigins.delete(messageId);
+		messageOrigins.set(messageId, original);
+		if (messageOrigins.size > 10_000) messageOrigins.delete(messageOrigins.keys().next().value as string);
+		return original;
+	};
 	const now = ports.now ?? Date.now;
 	const cursorPath = ports.recoveryCursorPath ?? recoveryCursorPath();
 	let cursors: RecoveryCursorState | undefined;
@@ -1021,10 +1099,17 @@ export async function startSlackAdapter(
 		if (!isSlackDmChannel(message.channel, message.channel_type)) return Promise.resolve();
 		return mutate((state) => rememberKnownDm(state, message.channel, now()));
 	};
-	/** A thread the persona is answering in stays recoverable after its parent falls behind the watermark. */
-	const rememberThread = (origin: OriginRef): Promise<void> => {
-		if (origin.kind !== "thread") return Promise.resolve();
-		return mutate((state) => rememberParticipatedThread(state, origin.conversationId, now()));
+	/** Physical threads stay recoverable even when a bot-root reply uses the channel session. */
+	const rememberThread = (origin: OriginRef, message: SlackInboundMessage): Promise<void> => {
+		if (origin.kind === "dm") return Promise.resolve();
+		const threadId =
+			message.thread_ts && message.thread_ts !== message.ts
+				? slackMessageId(message.channel, message.thread_ts)
+				: origin.kind === "thread"
+					? origin.conversationId
+					: undefined;
+		if (!threadId) return Promise.resolve();
+		return mutate((state) => rememberParticipatedThread(state, threadId, now()));
 	};
 	const prime = async (message: SlackInboundMessage): Promise<void> => {
 		await Promise.all([
@@ -1049,31 +1134,48 @@ export async function startSlackAdapter(
 					: envelope;
 			const admitted = decideInbound(message, identity, directory, config.channels);
 			if (!admitted) return;
-			ingress.run(admitted.origin.conversationId, async () => {
+			const messageId = slackMessageId(message.channel, message.ts);
+			if (envelope.subtype === "message_changed") {
+				if (hasNativeImageEdit(envelope)) {
+					log.error("Slack image edit rejected; native image edits are unsupported.");
+					return;
+				}
+			}
+			const edit =
+				envelope.subtype === "message_changed"
+					? describeMessageEdit(envelope, identity, directory, config.channels, messageOrigins.get(messageId))
+					: undefined;
+			if (envelope.subtype === "message_changed" && !edit) return;
+			const routedOrigin = rememberOrigin(messageId, edit?.origin ?? admitted.origin);
+			ingress.run(routedOrigin.conversationId, async () => {
 				await prime(message);
 				// DMs cannot be enumerated from Slack's history API without a channel
 				// id, so live traffic records the bounded set recovery will revisit.
 				await rememberDm(message);
 				if (envelope.subtype === "message_changed") {
-					if (hasNativeImageEdit(envelope)) {
-						log.error("Slack image edit rejected; native image edits are unsupported.");
-						return;
+					const editToSend = describeMessageEdit(
+						envelope,
+						identity,
+						directory,
+						config.channels,
+						messageOrigins.get(messageId),
+					);
+					if (editToSend) {
+						rememberOrigin(messageId, editToSend.origin);
+						gateway.sendEdit(
+							editToSend.messageId,
+							editToSend.origin,
+							editToSend.text,
+							editToSend.engagement,
+							editToSend.receivedAt,
+						);
 					}
-					const edit = describeMessageEdit(envelope, identity, directory, config.channels);
-					if (edit) gateway.sendEdit(edit.messageId, edit.origin, edit.text, edit.engagement, edit.receivedAt);
 					return;
 				}
-				const text = renderInboundText(message, directory);
+				const text = extractBotCommand(message, identity.botUserId) ?? renderInboundText(message, directory);
 				if (text === "") return;
 				const engagement = engagementForMessage(message, admitted.origin, identity, directory, config.channels);
-				// Auto-thread on mention in channel (Hermes-like contract: channel mention → thread + new session).
-				// A reply inside a thread is never a fresh channel mention: decideInbound already chose its
-				// session (a thread under the bot's own message keeps the channel one), and re-rooting it
-				// at the reply would open a new thread and a new session.
-				const inThread = message.thread_ts !== undefined && message.thread_ts !== message.ts;
-				const origin = inThread
-					? admitted.origin
-					: maybeThreadOnMention(admitted.origin, engagement.mentioned, message.ts);
+				const origin = routedOrigin;
 				let prepared: Awaited<ReturnType<typeof prepareSlackImages>>;
 				try {
 					prepared = await prepareImages(message.files);
@@ -1092,7 +1194,7 @@ export async function startSlackAdapter(
 					prepared.images,
 				);
 				if (result?.engaged) {
-					await rememberThread(origin);
+					await rememberThread(origin, message);
 					if (typeof result.turnId === "string")
 						await sendSlackImageNotice(api, origin, prepared.notice, log, engagement.replyTo?.messageId);
 				}
@@ -1106,9 +1208,8 @@ export async function startSlackAdapter(
 			if (description) gateway.sendReaction(description);
 		} else if (event.type === "block_actions") {
 			const blockAction = event as unknown as SlackBlockAction;
-			const origin = slackMessageOrigin({ channel: blockAction.channel.id, user: blockAction.user.id });
-			const response = describePanelResponse(blockAction, origin);
-			if (response) gateway.sendPanelResponse(response);
+			const response = describePanelResponse(blockAction);
+			if (response) await gateway.sendPanelResponse(response);
 		}
 	};
 	const handleSlashCommand = async (command: SlackSlashCommand): Promise<void> => {
@@ -1182,9 +1283,10 @@ export async function startSlackAdapter(
 			const admitted = decideInbound(message, identity, directory, config.channels);
 			if (!admitted) return "skip";
 			await prime(message);
-			const text = renderInboundText(message, directory);
+			const text = extractBotCommand(message, identity.botUserId) ?? renderInboundText(message, directory);
 			if (text === "") return "skip";
 			const messageId = slackMessageId(message.channel, message.ts);
+			const origin = rememberOrigin(messageId, admitted.origin);
 			const engagement = engagementForMessage(message, admitted.origin, identity, directory, config.channels);
 			const recordFailure = async (
 				classification: ReturnType<typeof classifyRecoveryFailure>,
@@ -1228,7 +1330,7 @@ export async function startSlackAdapter(
 			// watched get answered hours ago (live, 2026-09-17).
 			const sent = await gateway.requestRecovered(
 				messageId,
-				admitted.origin,
+				origin,
 				text,
 				stale ? { ...engagement, contextOnly: true } : engagement,
 				timestamp(message.ts),
@@ -1249,9 +1351,9 @@ export async function startSlackAdapter(
 				// after the grace period expires. Only clear once the grace period has passed.
 				if (!isWithinGrace) await mutate((state) => clearAttempt(state, messageId));
 				if (sent.verdict === "acked" && sent.result?.engaged) {
-					await rememberThread(admitted.origin);
-					if (!stale && typeof sent.result.turnId === "string")
-						await sendSlackImageNotice(api, admitted.origin, prepared.notice, log, engagement.replyTo?.messageId);
+					await rememberThread(origin, message);
+					if (typeof sent.result.turnId === "string")
+						await sendSlackImageNotice(api, origin, prepared.notice, log, engagement.replyTo?.messageId);
 				}
 				return sent.verdict;
 			}

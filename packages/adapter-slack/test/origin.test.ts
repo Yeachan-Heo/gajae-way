@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import {
 	isSlackDmChannel,
-	maybeThreadOnMention,
 	parseSlackMessageId,
+	resolveSlackMessageOrigin,
 	slackMessageId,
 	slackMessageOrigin,
 } from "../src/origin";
@@ -49,38 +49,34 @@ test("Slack message identifiers round trip and reject malformed or unsafe parts"
 		expect(() => slackMessageId(channel as string, ts as string)).toThrow("Slack");
 });
 
-test("DM message stays flat with maybeThreadOnMention", () => {
-	const dmOrigin = slackMessageOrigin({ channel: "D1", user: "U1", ts: "1.2" });
-	// DM should never be threaded, even if mentioned
-	const result = maybeThreadOnMention(dmOrigin, true, "1.2");
-	expect(result.kind).toBe("dm");
-	expect(result).toEqual(dmOrigin);
-});
-
-test("channel mention converts to thread-rooted origin", () => {
-	const channelOrigin = slackMessageOrigin({ channel: "C1", user: "U1", ts: "1.2" });
-	expect(channelOrigin.kind).toBe("channel");
-	// When mentioned in a channel, convert to thread with message's own ts
-	const result = maybeThreadOnMention(channelOrigin, true, "1.2");
-	expect(result).toEqual({
+test("final origin threads a mentioned channel root but not a command or DM", () => {
+	const message = { channel: "C1", user: "U1", ts: "1.2" };
+	expect(resolveSlackMessageOrigin(message, "BOT", true)).toEqual({
 		platform: "slack",
 		kind: "thread",
 		conversationId: "C1:1.2",
 		parentId: "C1",
 	});
+	// The caller passes false for an extracted command, even when it mentioned the bot.
+	expect(resolveSlackMessageOrigin(message, "BOT", false)).toEqual(slackMessageOrigin(message));
+	const dm = { ...message, channel: "D1", thread_ts: "1.0" };
+	expect(resolveSlackMessageOrigin(dm, "BOT", true)).toEqual(slackMessageOrigin(dm));
 });
 
-test("channel message without mention stays as channel", () => {
-	const channelOrigin = slackMessageOrigin({ channel: "C1", user: "U1", ts: "1.2" });
-	// No mention, should stay as channel
-	const result = maybeThreadOnMention(channelOrigin, false, "1.2");
-	expect(result).toEqual(channelOrigin);
-});
-
-test("thread reply stays as thread", () => {
-	const threadOrigin = slackMessageOrigin({ channel: "C1", user: "U1", ts: "2.3", thread_ts: "1.2" });
-	expect(threadOrigin.kind).toBe("thread");
-	// Thread should never be re-threaded
-	const result = maybeThreadOnMention(threadOrigin, true, "2.3");
-	expect(result).toEqual(threadOrigin);
+test("final origin keeps bot-parent replies in the channel and other replies in their thread", () => {
+	const reply = { channel: "C1", user: "U1", ts: "2.3", thread_ts: "1.2" };
+	for (const mentioned of [true, false]) {
+		expect(resolveSlackMessageOrigin({ ...reply, parent_user_id: "BOT" }, "BOT", mentioned)).toEqual({
+			platform: "slack",
+			kind: "channel",
+			conversationId: "C1",
+		});
+		for (const parent_user_id of ["U2", undefined]) {
+			expect(resolveSlackMessageOrigin({ ...reply, parent_user_id }, "BOT", mentioned)).toEqual(
+				slackMessageOrigin(reply),
+			);
+		}
+	}
+	const root = { ...reply, ts: "1.2", parent_user_id: "BOT" };
+	expect(resolveSlackMessageOrigin(root, "BOT", true).kind).toBe("thread");
 });

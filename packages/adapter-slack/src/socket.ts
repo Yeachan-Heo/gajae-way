@@ -39,6 +39,7 @@ export interface WebSocketLike {
 }
 
 export interface SocketModeHandlers {
+	/** For block actions, resolve after acceptance or definitive rejection; throw for an uncertain handoff. */
 	onEvent(event: Record<string, unknown>, envelope: SlackEnvelope): void | Promise<void>;
 	onSlashCommand(command: SlackSlashCommand, envelope: SlackEnvelope): void | Promise<void>;
 	onConnected?(): void;
@@ -94,6 +95,7 @@ export class SlackSocketMode {
 	private connectedAt: number | undefined;
 	private lastEventAt: number | undefined;
 	private readonly seen = new Map<string, string | undefined>();
+	private readonly pendingActions = new Map<string, Promise<void>>();
 	private retryTimer?: ReturnType<typeof setTimeout>;
 	private readonly factory: (url: string) => WebSocketLike;
 	private readonly sleep: (ms: number) => Promise<void>;
@@ -302,6 +304,12 @@ export class SlackSocketMode {
 		ready();
 	}
 
+	private rememberEnvelope(id: string, eventId?: string): void {
+		this.seen.delete(id);
+		this.seen.set(id, eventId);
+		while (this.seen.size > 1024) this.seen.delete(this.seen.keys().next().value as string);
+	}
+
 	private async receive(socket: WebSocketLike, data: unknown, retire: (reason: string) => void): Promise<void> {
 		let frame: Record<string, unknown>;
 		try {
@@ -313,8 +321,13 @@ export class SlackSocketMode {
 			return;
 		}
 		try {
-			// Slack retries unacknowledged envelopes; ACK must precede any application work.
-			if (typeof frame.envelope_id === "string") socket.send(JSON.stringify({ envelope_id: frame.envelope_id }));
+			const payload = isObject(frame.payload) ? frame.payload : undefined;
+			const actionPayload = frame.type === "interactive" && payload?.type === "block_actions" ? payload : undefined;
+			const acknowledge = () => {
+				if (typeof frame.envelope_id === "string") socket.send(JSON.stringify({ envelope_id: frame.envelope_id }));
+			};
+			// Ordinary events are recovered from history; panel actions must reach the gateway first.
+			if (!actionPayload) acknowledge();
 			if (frame.type === "hello") {
 				this.failures = 0;
 				if (!this.isConnected) {
@@ -333,7 +346,28 @@ export class SlackSocketMode {
 				this.log.log("Slack socket ignored a non-envelope frame");
 				return;
 			}
-			const payload = isObject(frame.payload) ? frame.payload : undefined;
+			const envelope = frame as unknown as SlackEnvelope;
+			if (actionPayload) {
+				const id = frame.envelope_id;
+				if (this.seen.has(id)) {
+					this.rememberEnvelope(id);
+					acknowledge();
+					return;
+				}
+				let handoff = this.pendingActions.get(id);
+				if (!handoff) {
+					handoff = Promise.resolve().then(() => this.handlers.onEvent(actionPayload, envelope));
+					this.pendingActions.set(id, handoff);
+				}
+				try {
+					await handoff;
+					this.rememberEnvelope(id);
+					acknowledge();
+				} finally {
+					if (this.pendingActions.get(id) === handoff) this.pendingActions.delete(id);
+				}
+				return;
+			}
 			const eventId =
 				frame.type === "events_api" && typeof payload?.event_id === "string" ? payload.event_id : undefined;
 			let duplicate = this.seen.has(frame.envelope_id);
@@ -347,11 +381,8 @@ export class SlackSocketMode {
 					break;
 				}
 			}
-			this.seen.delete(frame.envelope_id);
-			this.seen.set(frame.envelope_id, eventId);
-			while (this.seen.size > 1024) this.seen.delete(this.seen.keys().next().value as string);
-			if (typeof frame.retry_attempt === "number" && frame.retry_attempt > 0 && duplicate) return;
-			const envelope = frame as unknown as SlackEnvelope;
+			this.rememberEnvelope(frame.envelope_id, eventId);
+			if (duplicate) return;
 			if (frame.type === "events_api" && isObject(payload?.event)) {
 				this.lastEventAt = this.now();
 				await this.handlers.onEvent(payload.event, envelope);

@@ -2,17 +2,19 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { LiveReplyTracker } from "../../adapter-slack/src/live-reply";
+import { ReconnectingGateway, settleSlackDelivery } from "../../adapter-slack/src/main";
 import type { GatewayConfig } from "../src/config";
 import { startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
-async function eventually(predicate: () => boolean, message: string): Promise<void> {
+async function eventually(predicate: () => boolean, message: string | (() => string)): Promise<void> {
 	for (let attempt = 0; attempt < 100; attempt++) {
 		if (predicate()) return;
 		await Bun.sleep(5);
 	}
-	expect(predicate(), message).toBe(true);
+	expect(predicate(), typeof message === "function" ? message() : message).toBe(true);
 }
 
 test("chat.progress emits periodically from turn start even before tail frames, with real counters from tail", async () => {
@@ -444,6 +446,146 @@ test("a turn retired by /new emits its final chat.progress and stops heartbeatin
 		expect(progressOf(turnId).filter((frame) => frame.payload.final === true)).toHaveLength(1);
 	} finally {
 		socket?.end();
+		await server.stop();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("real Slack turn deliveries share the progress turn and fold into a live reply", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-live-turn-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home,
+		gjc: { agentDir: join(home, "agent") },
+		configPath: join(home, "config.json"),
+		socketPath: join(home, "gateway.sock"),
+		dbPath: join(home, "gateway.db"),
+		logVerbosity: "info",
+		channels: { "slack:C1": { engagement: "mention-open" } },
+	};
+	const database = await Store.open(config.dbPath);
+	const port = new ScriptedSessionPort();
+	attachTestBrokerOwnership(database, port, join(home, "agent"));
+	const server = await startUnixServer({
+		config,
+		database,
+		sessionPort: port,
+		progress: { firstAfterMs: 0, intervalMs: 5 },
+		// Stream one finding, then exercise the final answer through the terminal path.
+		interimSpeech: { maxPerTurn: 1, minGapMs: 0 },
+		onStop: () => database.close(),
+	});
+	const posts: unknown[][] = [];
+	const updates: unknown[][] = [];
+	const api = {
+		async postMessage(channel: string, text: string, threadTs?: string) {
+			posts.push([channel, text, threadTs]);
+			return { channel, ts: "9.0" };
+		},
+		async updateMessage(channel: string, ts: string, text: string) {
+			updates.push([channel, ts, text]);
+		},
+		async addReaction(_channel: string, _ts: string, _name: string) {},
+		async removeReaction(_channel: string, _ts: string, _name: string) {},
+	};
+	const live = new LiveReplyTracker(api);
+	const adapter = new ReconnectingGateway(
+		config.socketPath,
+		api,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		live,
+	);
+	let socket: Awaited<ReturnType<typeof Bun.connect>> | undefined;
+	const frames: any[] = [];
+	try {
+		let buffered = "";
+		socket = await Bun.connect({
+			unix: config.socketPath,
+			socket: {
+				data(_socket, data) {
+					buffered += Buffer.from(data).toString();
+					const lines = buffered.split("\n");
+					buffered = lines.pop() ?? "";
+					for (const line of lines) if (line) frames.push(JSON.parse(line));
+				},
+			},
+		});
+		socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+		await eventually(() => frames.length >= 1, "observer did not negotiate");
+		await adapter.connect();
+		socket.write(
+			`${JSON.stringify({
+				v: "0.1",
+				type: "request",
+				id: "turn",
+				verb: "chat.send",
+				params: {
+					origin: { platform: "slack", kind: "channel", conversationId: "C1" },
+					messageId: "C1:1.0",
+					text: "investigate",
+					engagement: { mentioned: true, group: true, authorId: "U1" },
+				},
+			})}\n`,
+		);
+		await eventually(() => port.sends.length === 1, "turn was not sent");
+		const send = port.sends[0]!;
+		port.emitTool(send.sessionId);
+		port.emitAssistant(send.sessionId, "The first finding is a timeout", "finding", send.opRef);
+		await eventually(() => posts.length === 1, "first streamed part was not posted");
+		port.complete(send.opRef, "The fix is ready\n[BREAK]\nThe rollout is complete");
+		await eventually(
+			() => updates.length === 2,
+			() =>
+				`terminal parts were not folded: ${JSON.stringify({ posts, updates, events: frames.filter((frame) => frame.event === "chat.message" || (frame.event === "chat.progress" && frame.payload.final)) })}`,
+		);
+		await eventually(
+			() => frames.some((frame) => frame.event === "chat.progress" && frame.payload.final),
+			"final progress missing",
+		);
+		const messages = frames
+			.filter((frame) => frame.event === "chat.message" && frame.payload.text)
+			.map((frame) => frame.payload);
+		expect(messages.map((message) => message.text)).toEqual([
+			"The first finding is a timeout",
+			"The fix is ready",
+			"The rollout is complete",
+		]);
+		const turnId = frames.find((frame) => frame.event === "chat.progress" && frame.payload.final).payload.turnId;
+		expect(messages.map((message) => message.turnId)).toEqual([turnId, turnId, turnId]);
+		expect(new Set(messages.map((message) => message.deliveryId)).size).toBe(3);
+		expect(messages.map((message) => message.final)).toEqual([false, false, true]);
+		expect(posts).toEqual([["C1", "The first finding is a timeout", "1.0"]]);
+		expect(updates).toEqual([
+			["C1", "9.0", "The first finding is a timeout\n\nThe fix is ready"],
+			["C1", "9.0", "The first finding is a timeout\n\nThe fix is ready\n\nThe rollout is complete"],
+		]);
+		await live.close(turnId);
+		const requests: { verb: string; params: unknown }[] = [];
+		const replayGateway = {
+			async request<T = unknown>(verb: string, params?: unknown): Promise<T> {
+				requests.push({ verb, params });
+				return {} as T;
+			},
+		};
+		await settleSlackDelivery(
+			replayGateway,
+			api,
+			{ ...messages[0], duplicateWarning: true },
+			console,
+			undefined,
+			undefined,
+			live,
+		);
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: messages[0].deliveryId } }]);
+		expect(posts).toHaveLength(1);
+		expect(updates).toHaveLength(2);
+	} finally {
+		socket?.end();
+		adapter.stop();
 		await server.stop();
 		await rm(home, { recursive: true, force: true });
 	}
