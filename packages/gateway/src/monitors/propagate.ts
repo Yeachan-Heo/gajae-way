@@ -1399,15 +1399,21 @@ export class MonitorPropagator {
 								}
 								safety.bindTimeoutFailures++;
 								this.#safety.set(sessionOriginKey, safety);
-								console.error(
-									`monitor bind timeout for ${sessionOriginKey}: count=${safety.bindTimeoutFailures}/${MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD} epoch=${boundEpoch}`,
-								);
+								this.#recordReadinessFailure({
+									code: "monitor_bind_timeout",
+									detail: `bind timeout: count=${safety.bindTimeoutFailures}/${MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD} epoch=${boundEpoch}`,
+									originKey: sessionOriginKey,
+									at: this.#now(),
+								});
 
 								// If threshold reached, rebind to a fresh epoch (issue #780).
 								if (safety.bindTimeoutFailures >= MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD) {
-									console.error(
-										`monitor bind timeout rebind triggered for ${sessionOriginKey}: epoch=${boundEpoch} -> ${boundEpoch + 1}`,
-									);
+									this.#recordReadinessFailure({
+										code: "monitor_bind_timeout_rebind",
+										detail: `bind timeout rebind triggered: epoch=${boundEpoch} -> ${boundEpoch + 1}`,
+										originKey: sessionOriginKey,
+										at: this.#now(),
+									});
 									// Rebind to fresh epoch: increment it and try again.
 									boundEpoch++;
 									safety.bindTimeoutFailures = 0; // Reset counter for new epoch
@@ -2222,6 +2228,8 @@ export class MonitorPropagator {
 			escalatedForCurrentStreak: false,
 		};
 		this.#safety.set(sessionOriginKey, fresh);
+		// Note: escalatedForCurrentStreak is checked from durable storage in #trackConsecutiveFailedEvent,
+		// so in-memory state is just for tracking within a single boot cycle.
 		return fresh;
 	}
 	/**
@@ -2258,17 +2266,29 @@ export class MonitorPropagator {
 		const state = this.#safetyState(sessionOriginKey);
 		const consecutiveCount = this.#countConsecutiveFailures(monitorId);
 
-		console.error(
-			`monitor failed event for ${sessionOriginKey} (monitor ${monitorId}): count=${consecutiveCount}/${MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD}`,
-		);
+		this.#recordReadinessFailure({
+			code: "monitor_failed_event",
+			detail: `consecutive failures: count=${consecutiveCount}/${MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD}`,
+			originKey: sessionOriginKey,
+			at: this.#now(),
+		});
 
 		// Escalate when threshold reached and not yet escalated for this streak
 		if (consecutiveCount >= MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD && !state.escalatedForCurrentStreak) {
-			console.error(
-				`monitor failed event escalation for ${sessionOriginKey} (monitor ${monitorId}): consecutive_failures=${consecutiveCount}`,
-			);
-			state.escalatedForCurrentStreak = true;
-			this.#emitMonitorEscalation(sessionOriginKey, monitorId, consecutiveCount);
+			const escalationKey = monitorEscalationKey(sessionOriginKey, monitorId);
+			const alreadyEscalated = this.#database.core.metaGet(escalationKey) !== undefined;
+			if (!alreadyEscalated) {
+				this.#recordReadinessFailure({
+					code: "monitor_failed_event_escalation",
+					detail: `escalation triggered: consecutive_failures=${consecutiveCount}`,
+					originKey: sessionOriginKey,
+					at: this.#now(),
+				});
+				// Mark escalation as sent durably
+				this.#database.core.metaSet(escalationKey, JSON.stringify({ escalatedAt: this.#now(), monitorId }));
+				state.escalatedForCurrentStreak = true;
+				this.#emitMonitorEscalation(sessionOriginKey, monitorId, consecutiveCount);
+			}
 		}
 	}
 
@@ -2296,7 +2316,12 @@ export class MonitorPropagator {
 		try {
 			this.#deliver?.(payload);
 		} catch (error) {
-			console.error(`monitor escalation delivery failed: ${error}`);
+			this.#recordReadinessFailure({
+				code: "monitor_escalation_delivery_failed",
+				detail: `escalation delivery failed: ${failureDetail(error)}`,
+				originKey: originKey(target.origin),
+				at: this.#now(),
+			});
 		}
 
 		// Persist to outbox for durability
@@ -2318,7 +2343,12 @@ export class MonitorPropagator {
 				this.#delivery.markInflight(deliveryId);
 			}
 		} catch (error) {
-			console.error(`monitor escalation persistence failed: ${error}`);
+			this.#recordReadinessFailure({
+				code: "monitor_escalation_persistence_failed",
+				detail: `escalation persistence failed: ${failureDetail(error)}`,
+				originKey: originKey(target.origin),
+				at: this.#now(),
+			});
 		}
 	}
 
@@ -2331,7 +2361,15 @@ export class MonitorPropagator {
 		const consecutiveCount = this.#countConsecutiveFailures(monitorId);
 
 		if (consecutiveCount === 0) {
-			console.error(`monitor failed event streak cleared for ${sessionOriginKey}: previous failures now recovered`);
+			this.#recordReadinessFailure({
+				code: "monitor_failed_event_streak_cleared",
+				detail: "failure streak cleared: previous failures now recovered",
+				originKey: sessionOriginKey,
+				at: this.#now(),
+			});
+			// Clear durable escalation flag when streak is cleared
+			const escalationKey = monitorEscalationKey(sessionOriginKey, monitorId);
+			this.#database.core.metaDelete(escalationKey);
 			state.escalatedForCurrentStreak = false;
 		}
 	}
@@ -3228,6 +3266,10 @@ function monitorRollHandoffKey(sessionOriginKey: string): string {
 
 function monitorContextBudgetArmKey(sessionOriginKey: string): string {
 	return `monitor_context_budget_arm:${sessionOriginKey}`;
+}
+
+function monitorEscalationKey(sessionOriginKey: string, monitorId: string): string {
+	return `monitor_escalation:${sessionOriginKey}:${monitorId}`;
 }
 
 interface RetiredSession {
