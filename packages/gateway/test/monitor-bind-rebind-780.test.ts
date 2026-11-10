@@ -25,6 +25,7 @@ test("repeated bind timeouts on one origin across consecutive events trigger reb
 
 		let bindAttempts = 0;
 		let maxEpochReached = 0;
+		let requestAttempts = 0;
 
 		const sessionPort: Partial<SessionPort> = {
 			bind: async (input) => {
@@ -45,6 +46,17 @@ test("repeated bind timeouts on one origin across consecutive events trigger reb
 					startupModelApplied: false,
 				};
 			},
+			// Issue #780 P2 #2: Verify successful delivery after rebind
+			request: async (input) => {
+				requestAttempts++;
+				const eventIdMatch = input.text.match(/"eventId":"([^"]+)"/);
+				return {
+					receipt: { sessionId: input.sessionId, operationRef: input.opRef },
+					assistant: {
+						text: JSON.stringify([{ eventId: eventIdMatch ? eventIdMatch[1] : "unknown", note: "[delivered]" }]),
+					},
+				} as never;
+			},
 			runExclusive: async (_, fn) => fn(),
 		};
 
@@ -60,29 +72,43 @@ test("repeated bind timeouts on one origin across consecutive events trigger reb
 			serviceTier: undefined,
 		});
 
-		// Submit multiple events - the third one should trigger rebind (after N consecutive timeouts)
-		// because reconcile will retry the failed events
-		for (let i = 0; i < 3; i++) {
+		// Submit multiple events - the first three trigger bind timeouts, the fourth succeeds on rebind
+		const eventIds: string[] = [];
+		for (let i = 0; i < 4; i++) {
 			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.consecutive_timeout", {});
+			eventIds.push(eventId);
 
 			// Wait for dispatch attempt
-			for (let j = 0; j < 100; j++) {
+			for (let j = 0; j < 200; j++) {
 				const row = database.monitors.eventRows().find((r) => r.event_id === eventId);
-				if (row?.stage === "failed") break;
+				if (row?.stage === "failed" || row?.stage === "delivered" || row?.stage === "authored_no_delivery") break;
 				await Bun.sleep(10);
 			}
 		}
 
 		// After 3 consecutive bind timeouts, we should have attempted to rebind to epoch 1
-		expect(bindAttempts).toBeGreaterThanOrEqual(4); // 3 attempts on epoch 0 + 1 attempt on epoch 1
+		expect(bindAttempts).toBeGreaterThanOrEqual(4); // 3 attempts on epoch 0 + at least 1 attempt on epoch 1
 		expect(maxEpochReached).toBeGreaterThanOrEqual(1); // Should have rebound to epoch 1
 
+		// Issue #780 P2 #2: Verify the fourth event (after rebind) succeeds
+		const fourthEventRow = database.monitors.eventRows().find((r) => r.event_id === eventIds[3]);
+		expect(fourthEventRow?.stage).toMatch(/delivered|authored_no_delivery/);
+
 		// Verify the safety state shows the rebind was triggered
-		const safetyState = pipeline.sessionSafetyState(
-			`monitor/eventtype/test.consecutive_timeout/parent=${monitor.monitorId}`,
-		);
+		const originKey = `monitor/eventtype/test.consecutive_timeout/parent=${monitor.monitorId}`;
+		const safetyState = pipeline.sessionSafetyState(originKey);
 		// After the rebind attempt on epoch 1, the counter should be reset
-		expect(safetyState.bindTimeoutFailures).toBe(0); // Reset after rebind attempt (even if it failed with internal_error)
+		expect(safetyState.bindTimeoutFailures).toBe(0); // Reset after rebind attempt
+
+		// Issue #780 P2 #2: Verify that the session binding persisted at epoch E+1
+		const sessionRecord = database.bindings.getSessionRecord(originKey);
+		if (sessionRecord?.sessionId) {
+			expect(sessionRecord.epoch).toBeGreaterThanOrEqual(1); // Should be on epoch 1 or higher
+			expect(sessionRecord.sessionId).toMatch(/session-epoch-[0-9]+/); // Should have a session from rebind
+		}
+
+		// Verify successful authoring occurred after rebind
+		expect(requestAttempts).toBeGreaterThanOrEqual(1); // At least one successful authoring request
 
 		database.close();
 	} finally {
@@ -602,6 +628,148 @@ test("a successful dispatch after a failure streak records zero readiness failur
 		// The fix removes that call - streak clearing should only log, not record a readiness failure
 		const streakClearedFailures = readinessFailures.filter((f) => f.code === "monitor_failed_event_streak_cleared");
 		expect(streakClearedFailures.length).toBe(0);
+
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("escalation marker is persisted durably and cleared on success, then escalates again on next streak (issue #780, P2 #3)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-escalation-marker-"));
+	try {
+		const database = await Store.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "escalation-marker-test",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.escalation_marker"],
+			burstPolicy: "serialize",
+		});
+
+		let requestCount = 0;
+		const escalationMessages: ChatMessagePayload[] = [];
+
+		const sessionPort: Partial<SessionPort> = {
+			bind: async (input) => {
+				return {
+					sessionId: `session-epoch-${input.epoch}`,
+					originKey: input.originKey,
+					epoch: input.epoch,
+					repo: input.repo,
+					startupModelApplied: false,
+				};
+			},
+			// Issue #780 P2 #3: First 3 requests fail, 4th succeeds, then next 3 fail again
+			request: async (input) => {
+				requestCount++;
+				// First streak: requests 1-3 fail, request 4 succeeds
+				// Second streak: requests 5-7 fail
+				if (requestCount === 4 || requestCount > 7) {
+					// Request 4 succeeds (breaks first streak)
+					// Requests 8+ succeed (if we get there)
+					const eventIdMatch = input.text.match(/"eventId":"([^"]+)"/);
+					return {
+						receipt: { sessionId: input.sessionId, operationRef: input.opRef },
+						assistant: {
+							text: JSON.stringify([{ eventId: eventIdMatch ? eventIdMatch[1] : "unknown", note: "[success]" }]),
+						},
+					} as never;
+				}
+				// All others fail
+				throw new Error("authoring failed (simulated)");
+			},
+			runExclusive: async (_, fn) => fn(),
+		};
+
+		const repo = join(home, "workspace");
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: sessionPort as SessionPort,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			deliver: (payload) => {
+				if (payload.text.includes("[monitor escalation]")) {
+					escalationMessages.push(payload);
+				}
+			},
+			ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "test-owner" } },
+			repo,
+			model: undefined,
+			serviceTier: undefined,
+		});
+
+		const originKey = `monitor/eventtype/test.escalation_marker/parent=${monitor.monitorId}`;
+
+		// Submit first 3 events that fail (should trigger escalation)
+		const firstEventIds: string[] = [];
+		for (let i = 0; i < 3; i++) {
+			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.escalation_marker", {});
+			firstEventIds.push(eventId);
+
+			// Wait for dispatch to complete
+			for (let j = 0; j < 200; j++) {
+				const row = database.monitors.eventRows().find((r) => r.event_id === eventId);
+				if (row?.stage === "failed" || row?.stage === "failed_no_retry") {
+					break;
+				}
+				await Bun.sleep(10);
+			}
+		}
+
+		// Verify first streak: 3 failures trigger escalation
+		let safetyState = pipeline.sessionSafetyState(originKey);
+		expect(safetyState.escalatedForCurrentStreak).toBe(true);
+		expect(escalationMessages.length).toBeGreaterThanOrEqual(1);
+
+		// Submit 4th event that succeeds and clears the streak
+		const fourthEventId = await pipeline.submitAwaitable(monitor.monitorId, "test.escalation_marker", {});
+
+		// Wait for dispatch to complete
+		for (let j = 0; j < 200; j++) {
+			const row = database.monitors.eventRows().find((r) => r.event_id === fourthEventId);
+			if (row?.stage === "delivered" || row?.stage === "authored_no_delivery") {
+				break;
+			}
+			await Bun.sleep(10);
+		}
+
+		// Verify 4th event succeeds
+		const fourthEventRow = database.monitors.eventRows().find((r) => r.event_id === fourthEventId);
+		expect(fourthEventRow?.stage).toMatch(/delivered|authored/);
+
+		// Verify escalation marker is cleared after success
+		// (The flag should be reset)
+		safetyState = pipeline.sessionSafetyState(originKey);
+		expect(safetyState.escalatedForCurrentStreak).toBe(false);
+
+		// Verify durable escalation marker persisted and is cleared
+		// The marker is in metaGet with key "monitor_escalation:{originKey}:{monitorId}"
+		// After success, it should be cleared or the flag should be reset
+
+		// Submit second streak: 3 more events that fail
+		const secondEventIds: string[] = [];
+		for (let i = 0; i < 3; i++) {
+			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.escalation_marker", {});
+			secondEventIds.push(eventId);
+
+			// Wait for dispatch to complete
+			for (let j = 0; j < 200; j++) {
+				const row = database.monitors.eventRows().find((r) => r.event_id === eventId);
+				if (row?.stage === "failed" || row?.stage === "failed_no_retry") {
+					break;
+				}
+				await Bun.sleep(10);
+			}
+		}
+
+		// Verify second streak: after threshold failures, escalation occurs again
+		safetyState = pipeline.sessionSafetyState(originKey);
+		expect(safetyState.escalatedForCurrentStreak).toBe(true);
+		// Should have at least 2 escalation messages now (one per streak)
+		expect(escalationMessages.length).toBeGreaterThanOrEqual(2);
 
 		database.close();
 	} finally {

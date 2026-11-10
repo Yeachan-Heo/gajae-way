@@ -2343,30 +2343,32 @@ export class MonitorPropagator {
 	 * Issue #5: skip unfinished (batched/queued) events.
 	 * Issue #6: bound the query with database parameters instead of selecting all rows.
 	 * Codex P2 #1: exclude overlap-skipped events from failure-streak boundaries.
-	 * Codex P2 #2: apply streak eligibility filters in SQL before limiting.
+	 * Codex P2 #2: fetch enough rows to find threshold same-origin failures despite interleaved other-origin events.
 	 */
 	#countConsecutiveFailures(monitorId: string, sessionOriginKey: string): number {
 		const monitor = this.#registry.get(monitorId);
 		if (!monitor?.enabled) return 0;
 
 		// Count consecutive recent failures on this monitor, filtered by session origin.
-		// Fetch more rows than we need to account for filtering in code (Codex P2 #2).
-		// Query with larger limit to ensure we get enough terminal events after filtering.
+		// Fetch a large batch to account for filtering: with N event types and balanced distribution,
+		// we may need 100x the threshold to ensure threshold same-origin failures are not hidden.
 		let count = 0;
-		const limit = MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD * 4;
+		const limit = Math.max(MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD * 100, 500);
 		const recent = this.#database.monitors.eventRows(monitorId, "newest", false, limit);
+
 		for (const row of recent) {
 			// Issue #3: only count failures for this specific session origin
 			const eventOrigin = monitorOriginForEvent(monitor, row.event_type);
 			const eventOriginKey = originKey(eventOrigin);
 
 			if (eventOriginKey !== sessionOriginKey) {
-				// Different session origin, skip this row and continue counting other origins
+				// Different session origin, skip this row and continue searching
 				// (a monitor with multiple event types may have A/B/A sequence)
 				continue;
 			}
 
 			// Skip events that are still in-flight (unfinished) - Issue #5
+			// Codex P2 #2: these must not break the streak
 			if (row.stage === "admitted" || row.stage === "batched" || row.stage === "dispatched") {
 				continue;
 			}
@@ -2380,16 +2382,18 @@ export class MonitorPropagator {
 			// Count only terminal failure stages
 			if (row.stage === "failed" || row.stage === "failed_no_retry" || row.stage === "contract_unmet") {
 				count++;
-				// If we've counted enough origin-specific failures, stop early
+				// If we've counted enough origin-specific failures, stop
 				if (count >= MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD) {
 					break;
 				}
 			} else {
 				// Stop counting at the first non-failed terminal event of this origin
 				// (successful dispatch, e.g., "delivered" or "authored_no_delivery")
+				// This breaks the streak and resets the counter
 				break;
 			}
 		}
+
 		return count;
 	}
 
