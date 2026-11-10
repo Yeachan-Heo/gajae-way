@@ -200,7 +200,7 @@ test("Slack retries deduplicate both envelope and event IDs but dispatch unseen 
 	}
 });
 
-test("interactive block_actions are acknowledged before dispatch and duplicate envelopes dispatch once", async () => {
+test("interactive block_actions are acknowledged after handoff and duplicate envelopes dispatch once", async () => {
 	const f = fixture();
 	const origin = { platform: "slack", kind: "thread", conversationId: "C1:123.456", parentId: "C1" } as const;
 	const blocks = askUserPanelBlocks({
@@ -230,9 +230,10 @@ test("interactive block_actions are acknowledged before dispatch and duplicate e
 		socket.message({ envelope_id: "interactive-1", type: "interactive", payload });
 		socket.message({ envelope_id: "interactive-1", type: "interactive", payload, retry_attempt: 1 });
 		socket.message({ envelope_id: "interactive-1", type: "interactive", payload });
+		await flush();
 		socket.message({ envelope_id: "interactive-2", type: "interactive", payload: { type: "view_submission" } });
 		await flush();
-		expect(f.order).toEqual(["ack", "event", "ack", "ack", "ack"]);
+		expect(f.order).toEqual(["event", "ack", "ack", "ack", "ack"]);
 		expect(socket.sent.map((item) => JSON.parse(item))).toEqual([
 			{ envelope_id: "interactive-1" },
 			{ envelope_id: "interactive-1" },
@@ -245,6 +246,71 @@ test("interactive block_actions are acknowledged before dispatch and duplicate e
 			panelId: "question_001",
 			selectedOptionId: "option_a",
 		});
+	} finally {
+		f.mode.stop();
+	}
+});
+
+test("Slack block-action ACK waits for a successful handoff shared by concurrent retries", async () => {
+	let release!: () => void;
+	const accepted = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let calls = 0;
+	const f = fixture({
+		async onEvent() {
+			calls++;
+			await accepted;
+		},
+	});
+	try {
+		await f.boot();
+		const socket = f.sockets[0] as FakeSocket;
+		const frame = { envelope_id: "action", type: "interactive", payload: { type: "block_actions" } };
+		socket.message(frame);
+		socket.message({ ...frame, retry_attempt: 1 });
+		await flush();
+		expect(calls).toBe(1);
+		expect(socket.sent).toEqual([]);
+		release();
+		await flush();
+		expect(socket.sent.map((data) => JSON.parse(data))).toEqual([{ envelope_id: "action" }, { envelope_id: "action" }]);
+		socket.message({ ...frame, retry_attempt: 2 });
+		await flush();
+		expect(calls).toBe(1);
+		expect(socket.sent).toHaveLength(3);
+	} finally {
+		release();
+		f.mode.stop();
+	}
+});
+
+test("Slack retries failed block-action handoffs instead of acknowledging or deduplicating them", async () => {
+	let calls = 0;
+	let available = false;
+	const f = fixture({
+		async onEvent() {
+			calls++;
+			if (!available) throw new Error("gateway reconnecting");
+		},
+	});
+	try {
+		await f.boot();
+		const socket = f.sockets[0] as FakeSocket;
+		const frame = { envelope_id: "action", type: "interactive", payload: { type: "block_actions" } };
+		socket.message(frame);
+		await flush();
+		expect(calls).toBe(1);
+		expect(socket.sent).toEqual([]);
+		available = true;
+		socket.message({ ...frame, retry_attempt: 1 });
+		await flush();
+		expect(calls).toBe(2);
+		expect(socket.sent).toEqual([JSON.stringify({ envelope_id: "action" })]);
+		socket.message({ ...frame, retry_attempt: 2 });
+		await flush();
+		expect(calls).toBe(2);
+		expect(socket.sent).toHaveLength(2);
 	} finally {
 		f.mode.stop();
 	}

@@ -212,7 +212,9 @@ export function extractBotCommand(message: SlackInboundMessage, botUserId: strin
 	if (!/^[ \t]+/.test(rest)) return undefined;
 	const command = rest.trim();
 	if (/[\r\n`]/.test(command) || command.includes("<@")) return undefined;
-	return /^\/(?:new|reset|model|restart)(?:[ \t]+[^\r\n]*)?$/.test(command) ? command : undefined;
+	return /^\/(?:new|reset|model|restart)(?:[ \t]+[^\r\n]*)?$/.test(command)
+		? command.replace(/^(\S+)[ \t]+/, "$1 ")
+		: undefined;
 }
 
 export interface PendingEdit {
@@ -916,10 +918,8 @@ export class ReconnectingGateway implements GatewayClientLike {
 			.catch((error) => console.error(`Slack engagement.reaction failed: ${errorText(error)}`));
 	}
 
-	sendPanelResponse(response: EngagementPanelResponseParams): void {
-		void this.#client
-			?.request("engagement.panel_response", response)
-			.catch((error) => console.error(`Slack engagement.panel_response failed: ${errorText(error)}`));
+	async sendPanelResponse(response: EngagementPanelResponseParams): Promise<void> {
+		await this.request("engagement.panel_response", response);
 	}
 
 	private monitor(client: GatewayClientLike, strikes = 0): void {
@@ -1087,10 +1087,17 @@ export async function startSlackAdapter(
 		if (!isSlackDmChannel(message.channel, message.channel_type)) return Promise.resolve();
 		return mutate((state) => rememberKnownDm(state, message.channel, now()));
 	};
-	/** A thread the persona is answering in stays recoverable after its parent falls behind the watermark. */
-	const rememberThread = (origin: OriginRef): Promise<void> => {
-		if (origin.kind !== "thread") return Promise.resolve();
-		return mutate((state) => rememberParticipatedThread(state, origin.conversationId, now()));
+	/** Physical threads stay recoverable even when a bot-root reply uses the channel session. */
+	const rememberThread = (origin: OriginRef, message: SlackInboundMessage): Promise<void> => {
+		if (origin.kind === "dm") return Promise.resolve();
+		const threadId =
+			message.thread_ts && message.thread_ts !== message.ts
+				? slackMessageId(message.channel, message.thread_ts)
+				: origin.kind === "thread"
+					? origin.conversationId
+					: undefined;
+		if (!threadId) return Promise.resolve();
+		return mutate((state) => rememberParticipatedThread(state, threadId, now()));
 	};
 	const prime = async (message: SlackInboundMessage): Promise<void> => {
 		await Promise.all([
@@ -1156,22 +1163,7 @@ export async function startSlackAdapter(
 				const text = extractBotCommand(message, identity.botUserId) ?? renderInboundText(message, directory);
 				if (text === "") return;
 				const engagement = engagementForMessage(message, admitted.origin, identity, directory, config.channels);
-				// Auto-thread on mention in channel (Hermes-like contract: channel mention → thread + new session).
-				// A reply inside a thread is never a fresh channel mention: decideInbound already chose its
-				// session (a thread under the bot's own message keeps the channel one), and re-rooting it
-				// at the reply would open a new thread and a new session.
-				const inThread = message.thread_ts !== undefined && message.thread_ts !== message.ts;
-				const baseOrigin = inThread ? admitted.origin : admitted.origin;
-				const threadOrigin =
-					!inThread && engagement.mentioned && message.ts
-						? {
-								platform: "slack" as const,
-								kind: "thread" as const,
-								conversationId: slackMessageId(message.channel, message.ts),
-								parentId: message.channel,
-							}
-						: baseOrigin;
-				const origin = rememberOrigin(slackMessageId(message.channel, message.ts), threadOrigin);
+				const origin = routedOrigin;
 				let prepared: Awaited<ReturnType<typeof prepareSlackImages>>;
 				try {
 					prepared = await prepareImages(message.files);
@@ -1190,7 +1182,7 @@ export async function startSlackAdapter(
 					prepared.images,
 				);
 				if (result?.engaged) {
-					await rememberThread(origin);
+					await rememberThread(origin, message);
 					if (typeof result.turnId === "string")
 						await sendSlackImageNotice(api, origin, prepared.notice, log, engagement.replyTo?.messageId);
 				}
@@ -1205,7 +1197,7 @@ export async function startSlackAdapter(
 		} else if (event.type === "block_actions") {
 			const blockAction = event as unknown as SlackBlockAction;
 			const response = describePanelResponse(blockAction);
-			if (response) gateway.sendPanelResponse(response);
+			if (response) await gateway.sendPanelResponse(response);
 		}
 	};
 	const handleSlashCommand = async (command: SlackSlashCommand): Promise<void> => {
@@ -1347,7 +1339,7 @@ export async function startSlackAdapter(
 				// after the grace period expires. Only clear once the grace period has passed.
 				if (!isWithinGrace) await mutate((state) => clearAttempt(state, messageId));
 				if (sent.verdict === "acked" && sent.result?.engaged) {
-					await rememberThread(origin);
+					await rememberThread(origin, message);
 					if (typeof sent.result.turnId === "string")
 						await sendSlackImageNotice(api, origin, prepared.notice, log, engagement.replyTo?.messageId);
 				}

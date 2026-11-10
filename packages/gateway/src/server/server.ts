@@ -640,6 +640,7 @@ function notifyOwnerRestartCancelled(
 	requestId: string,
 	origin: OriginRef,
 	reason = "a persona reply was not confirmed as delivered before the drain deadline",
+	replyToMessageId?: string,
 ): void {
 	const payload = {
 		turnId: crypto.randomUUID(),
@@ -647,12 +648,13 @@ function notifyOwnerRestartCancelled(
 		role: "assistant" as const,
 		text: `Restart cancelled: ${reason}.`,
 		final: true,
+		...(replyToMessageId ? { replyToMessageId } : {}),
 	};
 	if (origin.platform === "loopback") {
 		connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: requestId, payload });
 		return;
 	}
-	const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
+	const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text, replyToMessageId);
 	if (!delivery) return;
 	runtime.delivery.markInflight(delivery.deliveryId as string);
 	broadcastDelivery(runtime, delivery);
@@ -2528,7 +2530,7 @@ async function sendChat(
 				messageId?: unknown;
 				receivedAt?: unknown;
 				voice?: unknown;
-				engagement?: { mentioned?: unknown; group?: unknown; authorId?: unknown };
+				engagement?: { mentioned?: unknown; group?: unknown; authorId?: unknown; replyTo?: { messageId?: unknown } };
 		  }
 		| undefined;
 	if (!params) throw new ProtocolError("invalid_params", "chat.send requires parameters");
@@ -2567,6 +2569,10 @@ async function sendChat(
 	}
 	const key = originKey(origin);
 	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database.inbox);
+	const replyToMessageId =
+		typeof params.engagement?.replyTo?.messageId === "string" && params.engagement.replyTo.messageId
+			? params.engagement.replyTo.messageId
+			: undefined;
 	// `/model` is a privileged control path. Apply the same direct-message and
 	// group authorisation policy as ordinary engagement before inspecting or
 	// mutating the durable override.
@@ -2592,6 +2598,7 @@ async function sendChat(
 			role: "assistant" as const,
 			text: outcome.text,
 			final: true,
+			...(replyToMessageId ? { replyToMessageId } : {}),
 		};
 		connection.write({
 			v: PROFILE_VERSION,
@@ -2602,7 +2609,7 @@ async function sendChat(
 		if (origin.platform === "loopback")
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: request.id, payload });
 		else {
-			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
+			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text, replyToMessageId);
 			if (delivery) {
 				runtime.delivery.markInflight(delivery.deliveryId as string);
 				for (const recipient of runtime.connections)
@@ -2637,6 +2644,7 @@ async function sendChat(
 			role: "assistant" as const,
 			text: "Restarting the gateway; back in a few seconds.",
 			final: true,
+			...(replyToMessageId ? { replyToMessageId } : {}),
 		};
 		connection.write({
 			v: PROFILE_VERSION,
@@ -2647,7 +2655,7 @@ async function sendChat(
 		if (origin.platform === "loopback")
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: request.id, payload });
 		else {
-			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
+			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text, replyToMessageId);
 			if (delivery) {
 				runtime.delivery.markInflight(delivery.deliveryId as string);
 				for (const recipient of runtime.connections)
@@ -2692,6 +2700,7 @@ async function sendChat(
 						request.id,
 						origin,
 						"the stack supervisor did not finish its current service command before the takeover deadline",
+						replyToMessageId,
 					);
 					return;
 				}
@@ -2711,7 +2720,7 @@ async function sendChat(
 			if (outcome === "timed_out") {
 				console.warn("owner restart cancelled; persona reply delivery was not confirmed before the drain deadline");
 				await runtime.personaSessions.cancelRestartDrain(ownerRestartId);
-				notifyOwnerRestartCancelled(connection, runtime, request.id, origin);
+				notifyOwnerRestartCancelled(connection, runtime, request.id, origin, undefined, replyToMessageId);
 				return;
 			}
 			// Exit non-zero on purpose: launchd KeepAlive=true and systemd
@@ -2748,6 +2757,7 @@ async function sendChat(
 			role: "assistant" as const,
 			text: "Started a fresh session.",
 			final: true,
+			...(replyToMessageId ? { replyToMessageId } : {}),
 		};
 		connection.write({
 			v: PROFILE_VERSION,
@@ -2758,7 +2768,7 @@ async function sendChat(
 		if (origin.platform === "loopback")
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: request.id, payload });
 		else {
-			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
+			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text, replyToMessageId);
 			if (delivery) {
 				runtime.delivery.markInflight(delivery.deliveryId as string);
 				for (const recipient of runtime.connections)

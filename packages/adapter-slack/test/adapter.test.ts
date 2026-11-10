@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { ImageFetch } from "@gajae-gateway/images";
 import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajae-gateway/protocol";
 import { SlackApiError, type SlackHistoryPage, SlackWebApi } from "../src/api";
+import { panelAction } from "../src/interactions";
 import {
 	decideInbound,
 	describeMessageEdit,
@@ -103,6 +104,17 @@ test("Slack raw bot commands preserve arguments and author without creating a to
 			origin: { kind: "thread", conversationId: "C1:1699999999.000001" },
 			text: "/model x",
 		});
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("Slack bot-addressed model commands normalize tabs before gateway dispatch", async () => {
+	const f = await fixture(undefined, { autoRecover: false });
+	try {
+		await f.event({ ...inbound({ text: "<@UBOT>\t/model\tprovider/model" }) });
+		expect(chatSends(f.client)).toHaveLength(1);
+		expect(chatSends(f.client)[0]).toMatchObject({ origin, text: "/model provider/model" });
 	} finally {
 		f.socket.stop();
 	}
@@ -430,17 +442,20 @@ class Socket implements WebSocketLike {
 }
 async function fixture(
 	channels?: Record<string, { engagement: "open" | "mention-open" | "closed" }>,
-	options: { readonly autoRecover?: boolean; readonly now?: () => number; readonly imageFetch?: ImageFetch } = {},
+	options: {
+		readonly autoRecover?: boolean;
+		readonly now?: () => number;
+		readonly imageFetch?: ImageFetch;
+		readonly recoveryCursorPath?: string;
+	} = {},
 ) {
 	const api = new Api();
 	const sockets: Socket[] = [];
 	const logs: string[] = [];
 	const gateway = new Gateway();
-	const recoveryCursorPath = join(
-		tmpdir(),
-		`slack-recovery-${crypto.randomUUID()}`,
-		"adapters/slack/recovery-cursor.json",
-	);
+	const recoveryCursorPath =
+		options.recoveryCursorPath ??
+		join(tmpdir(), `slack-recovery-${crypto.randomUUID()}`, "adapters/slack/recovery-cursor.json");
 	const adapter = await startSlackAdapter(
 		{
 			botToken: "xoxb-test",
@@ -494,6 +509,58 @@ async function fixture(
 		},
 	};
 }
+
+test("Slack panel clicks remain unacknowledged until the gateway accepts after reconnect", async () => {
+	const f = await fixture(undefined, { autoRecover: false });
+	const acknowledgements: string[] = [];
+	const socket = f.sockets[0] as WebSocketLike;
+	socket.send = (data) => {
+		acknowledgements.push(data);
+	};
+	const frame = {
+		envelope_id: "panel-click",
+		type: "interactive",
+		payload: {
+			type: "block_actions",
+			user: { id: "U1", name: "Alice" },
+			channel: { id: "C1" },
+			message: { ts: "1700000000.000001" },
+			actions: [{ type: "button", ...panelAction("ask_user", "pending_panel", "choice_1", origin, "option_selected") }],
+		},
+	};
+	const click = async () => {
+		socket.onmessage?.({ data: JSON.stringify(frame) });
+		await flush();
+	};
+	const requests = () => f.client.requests.filter((request) => request.verb === "engagement.panel_response");
+	try {
+		f.client.failure = new Error("gateway connection lost");
+		await click();
+		expect(requests()).toHaveLength(1);
+		expect(f.gateway.connected).toBe(false);
+		expect(acknowledgements).toEqual([]);
+		await click();
+		expect(requests()).toHaveLength(1);
+		expect(acknowledgements).toEqual([]);
+
+		f.client.failure = undefined;
+		f.gateway.adoptClient(f.client);
+		await click();
+		expect(requests()).toHaveLength(2);
+		expect(requests()[1]?.params).toMatchObject({
+			origin,
+			panelId: "pending_panel",
+			selectedOptionId: "choice_1",
+			responderId: "U1",
+		});
+		expect(acknowledgements).toEqual([JSON.stringify({ envelope_id: "panel-click" })]);
+		await click();
+		expect(requests()).toHaveLength(2);
+		expect(acknowledgements).toHaveLength(2);
+	} finally {
+		f.socket.stop();
+	}
+});
 
 test("Slack send and edit arm presence only for engaged responses with a real turn ID", async () => {
 	const f = await fixture(undefined, { autoRecover: false });
@@ -1805,6 +1872,54 @@ test("Slack recovery joins a still-pending live send instead of calling it a dup
 	} finally {
 		f.socket.stop();
 		f.recovery.stop();
+	}
+});
+
+test("Slack bot-root threads remain recoverable after a restart and the root leaves channel history", async () => {
+	for (const initial of ["live", "recovered"]) {
+		const channels = { C1: { engagement: "mention-open" as const } };
+		const f = await fixture(channels, { autoRecover: false });
+		let resumed: Awaited<ReturnType<typeof fixture>> | undefined;
+		const root = "1700000001.000000";
+		const rootMessage = { type: "message", user: "UBOT", ts: root, text: "bot parent", reply_count: 1 };
+		const firstReply = inbound({
+			ts: "1700000030.000001",
+			text: "<@UBOT> first reply",
+			thread_ts: root,
+			parent_user_id: "UBOT",
+		});
+		try {
+			f.api.conversationsReplies = async (_channel, ts) => ({
+				messages: ts === root ? [rootMessage, { ...firstReply }] : [],
+				has_more: false,
+			});
+			if (initial === "live") await f.event({ ...firstReply });
+			f.api.history.C1 = [{ ...inbound({ ts: "1700000050.000001", text: "later channel context" }) }, rootMessage];
+			expect(await f.recoverMissedMessages()).toBe(true);
+			expect(chatSends(f.client).find((send) => send.text === "@UBOT first reply")).toMatchObject({ origin });
+			const saved = await loadRecoveryCursors(f.recoveryCursorPath);
+			expect(saved.recoveredThrough.C1).toBe("1700000050.000001");
+			expect(saved.participatedThreads[`C1:${root}`]).toBeDefined();
+			f.socket.stop();
+
+			resumed = await fixture(channels, { autoRecover: false, recoveryCursorPath: f.recoveryCursorPath });
+			resumed.api.history.C1 = [];
+			resumed.api.conversationsReplies = async (_channel, ts) => ({
+				messages:
+					ts === root
+						? [rootMessage, { ...firstReply }, { ...inbound({ ts: "1700000060.000001", text: "<@UBOT> late reply" }) }]
+						: [],
+				has_more: false,
+			});
+			expect(await resumed.recoverMissedMessages()).toBe(true);
+			expect(chatSends(resumed.client)).toHaveLength(1);
+			expect(chatSends(resumed.client)[0]).toMatchObject({ origin, text: "@UBOT late reply" });
+			const recovered = await loadRecoveryCursors(resumed.recoveryCursorPath);
+			expect(recovered.participatedThreads[`C1:${root}`]?.through).toBe("1700000060.000001");
+		} finally {
+			f.socket.stop();
+			resumed?.socket.stop();
+		}
 	}
 });
 
