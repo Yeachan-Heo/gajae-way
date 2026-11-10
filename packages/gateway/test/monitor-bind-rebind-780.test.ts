@@ -447,8 +447,9 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 			});
 
 			// Submit events until escalation threshold is reached
+			if (!persistedMonitorId) throw new Error("monitor ID not set after first boot");
 			for (let i = 0; i < 3; i++) {
-				const eventId = await pipeline.submitAwaitable(persistedMonitorId!, "test.restart_escalation", {});
+				const eventId = await pipeline.submitAwaitable(persistedMonitorId, "test.restart_escalation", {});
 
 				// Wait for dispatch attempt
 				for (let j = 0; j < 100; j++) {
@@ -469,7 +470,8 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 		{
 			const database = await Store.open(dbPath);
 			const registry = new MonitorRegistry(database);
-			const monitor = registry.get(persistedMonitorId!);
+			if (!persistedMonitorId) throw new Error("monitor ID not set after first boot");
+			const monitor = registry.get(persistedMonitorId);
 			if (!monitor) throw new Error("failed to load persisted monitor on restart (Issue #780 P3)");
 
 			const sessionPort: Partial<SessionPort> = {
@@ -498,7 +500,8 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 			});
 
 			// Submit another event to trigger the already-escalated streak check
-			const eventId = await pipeline.submitAwaitable(persistedMonitorId!, "test.restart_escalation", {});
+			if (!persistedMonitorId) throw new Error("monitor ID not available for second check");
+			const eventId = await pipeline.submitAwaitable(persistedMonitorId, "test.restart_escalation", {});
 
 			// Wait for dispatch attempt
 			for (let j = 0; j < 100; j++) {
