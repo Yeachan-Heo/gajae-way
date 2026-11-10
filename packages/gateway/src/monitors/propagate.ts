@@ -1405,19 +1405,44 @@ export class MonitorPropagator {
 
 								// If threshold reached, rebind to a fresh epoch (issue #780).
 								if (safety.bindTimeoutFailures >= MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD) {
-									console.error(
-										`monitor bind timeout rebind triggered for ${sessionOriginKey}: epoch=${boundEpoch} -> ${boundEpoch + 1}`,
-									);
-									// Rebind to fresh epoch: use rotateEpoch to persist the new epoch AND clear the poisoned session ID.
-									// rotateEpoch increments the persisted epoch and clears gjc_session_id so the next bind gets a fresh session.
-									const newEpoch = this.#database.transaction((tx) => {
-										return this.#database.bindings.rotateEpoch(tx, sessionOriginKey);
-									});
-									boundEpoch = newEpoch;
-									safety.bindTimeoutFailures = 0; // Reset counter for new epoch
-									safety.bindTimeoutEpoch = boundEpoch;
-									this.#safety.set(sessionOriginKey, safety);
-									continue; // Retry bind with new epoch
+									// Before rotating, check if a session was already created.
+									// If session.create succeeded in parallel, preserve and reconcile the created session
+									// instead of rotating (issue #780: ambiguous session.create).
+									const currentSession = this.#database.bindings.getSessionRecord(sessionOriginKey);
+									const sessionExists =
+										currentSession && currentSession.epoch === boundEpoch && currentSession.sessionId;
+
+									if (sessionExists) {
+										console.error(
+											`monitor bind timeout but session was created: preserving ${currentSession.sessionId} at epoch=${boundEpoch}`,
+										);
+										// Session exists at this epoch, use it instead of rotating
+										binding = {
+											sessionId: currentSession.sessionId,
+											originKey: sessionOriginKey,
+											epoch: currentSession.epoch,
+											repo: this.#repo,
+											startupModelApplied: false,
+										};
+										safety.bindTimeoutFailures = 0;
+										safety.bindTimeoutEpoch = undefined;
+										this.#safety.set(sessionOriginKey, safety);
+										break; // Exit the retry loop with the preserved session
+									} else {
+										console.error(
+											`monitor bind timeout rebind triggered for ${sessionOriginKey}: epoch=${boundEpoch} -> ${boundEpoch + 1}`,
+										);
+										// No session exists, safe to rotate the epoch
+										// rotateEpoch persists the new epoch and clears gjc_session_id so the next bind gets a fresh session.
+										const newEpoch = this.#database.transaction((tx) => {
+											return this.#database.bindings.rotateEpoch(tx, sessionOriginKey);
+										});
+										boundEpoch = newEpoch;
+										safety.bindTimeoutFailures = 0; // Reset counter for new epoch
+										safety.bindTimeoutEpoch = boundEpoch;
+										this.#safety.set(sessionOriginKey, safety);
+										continue; // Retry bind with new epoch
+									}
 								}
 							}
 							// Non-timeout or threshold not reached: propagate the error.
@@ -2299,10 +2324,12 @@ export class MonitorPropagator {
 				console.error(
 					`monitor escalation triggered for ${sessionOriginKey} (monitor ${monitorId}): consecutive_failures=${consecutiveCount}`,
 				);
-				// Mark escalation as sent durably
-				this.#database.core.metaSet(escalationKey, JSON.stringify({ escalatedAt: this.#now(), monitorId }));
-				state.escalatedForCurrentStreak = true;
-				this.#emitMonitorEscalation(sessionOriginKey, monitorId, consecutiveCount);
+				// Emit escalation with atomic persistence of dedup marker
+				const escalated = this.#emitMonitorEscalation(sessionOriginKey, monitorId, consecutiveCount, escalationKey);
+				// Set in-memory suppression only after durable marker is persisted
+				if (escalated) {
+					state.escalatedForCurrentStreak = true;
+				}
 			}
 		}
 	}
@@ -2310,13 +2337,19 @@ export class MonitorPropagator {
 	/**
 	 * Emit an operator escalation for consecutive monitor failures.
 	 * Issue #780: wire to the existing operator escalation path.
+	 * Returns true if escalation was durably persisted, false otherwise.
 	 */
-	#emitMonitorEscalation(_sessionOriginKey: string, monitorId: string, failureCount: number): void {
+	#emitMonitorEscalation(
+		_sessionOriginKey: string,
+		monitorId: string,
+		failureCount: number,
+		escalationKey: string,
+	): boolean {
 		const monitor = this.#registry.get(monitorId);
-		if (!monitor) return;
+		if (!monitor) return false;
 
 		const target = monitor.channelTarget ?? this.#ownerTarget;
-		if (!target) return;
+		if (!target) return false;
 
 		const message = `[monitor escalation] The monitor "${monitor.name}" (${monitorId}) has failed ${failureCount} consecutive times. Please investigate and consider rolling the session.`;
 		// Generate deliveryId first so it's included in both live delivery and outbox persistence
@@ -2342,10 +2375,10 @@ export class MonitorPropagator {
 			});
 		}
 
-		// Persist to outbox for durability
+		// Persist to outbox for durability and atomically set escalation dedup marker
 		try {
 			const admitted = this.#database.transaction((tx) => {
-				return this.#database.outbox.enqueue(
+				const enqueued = this.#database.outbox.enqueue(
 					tx,
 					{
 						deliveryId,
@@ -2355,10 +2388,16 @@ export class MonitorPropagator {
 					},
 					this.#now(),
 				);
+				// Mark escalation as sent durably only after outbox enqueue succeeds
+				if (enqueued) {
+					this.#database.core.metaSet(escalationKey, JSON.stringify({ escalatedAt: this.#now(), monitorId }));
+				}
+				return enqueued;
 			});
 			if (admitted) {
 				this.#delivery.markInflight(deliveryId);
 			}
+			return admitted;
 		} catch (error) {
 			this.#recordReadinessFailure({
 				code: "monitor_escalation_persistence_failed",
@@ -2366,6 +2405,7 @@ export class MonitorPropagator {
 				originKey: originKey(target.origin),
 				at: this.#now(),
 			});
+			return false;
 		}
 	}
 
