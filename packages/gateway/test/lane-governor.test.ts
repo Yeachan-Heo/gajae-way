@@ -1219,7 +1219,3 @@ test("#778: forceRetire with close failure checks fresh liveness before rotating
 	if (!binding) throw new Error("binding should still exist");
 	expect(binding.epoch).toBe(1); // Rotated from 0
 });
-
-
-
-
