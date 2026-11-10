@@ -255,7 +255,11 @@ test("a successful dispatch after failures clears the failure streak (issue #780
 				if (requestCount === 3) {
 					return {
 						receipt: { sessionId: input.sessionId, operationRef: input.opRef },
-						assistant: { text: JSON.stringify([{ eventId: input.text.match(/"eventId":"([^"]+)"/)?.[1] ?? "unknown", note: "[author note: success]" }]) },
+						assistant: {
+							text: JSON.stringify([
+								{ eventId: input.text.match(/"eventId":"([^"]+)"/)?.[1] ?? "unknown", note: "[author note: success]" },
+							]),
+						},
 					} as never;
 				}
 				// First two should fail for streak
@@ -288,7 +292,12 @@ test("a successful dispatch after failures clears the failure streak (issue #780
 			// Wait for dispatch to complete
 			for (let j = 0; j < 200; j++) {
 				const row = database.monitors.eventRows().find((r) => r.event_id === eventId);
-				if (row?.stage === "failed" || row?.stage === "failed_no_retry" || row?.stage === "delivered" || row?.stage === "authored_no_delivery") {
+				if (
+					row?.stage === "failed" ||
+					row?.stage === "failed_no_retry" ||
+					row?.stage === "delivered" ||
+					row?.stage === "authored_no_delivery"
+				) {
 					break;
 				}
 				await Bun.sleep(10);
@@ -298,7 +307,11 @@ test("a successful dispatch after failures clears the failure streak (issue #780
 		// After three events (2 failed + 1 successful), check that streak is cleared
 		const rows = database.monitors.eventRows();
 		const successRow = rows.find((r) => r.event_id === eventIds[2]);
-		const failureRows = rows.filter((r) => (r.event_id === eventIds[0] || r.event_id === eventIds[1]) && (r.stage === "failed" || r.stage === "failed_no_retry"));
+		const failureRows = rows.filter(
+			(r) =>
+				(r.event_id === eventIds[0] || r.event_id === eventIds[1]) &&
+				(r.stage === "failed" || r.stage === "failed_no_retry"),
+		);
 
 		// Verify streak was created
 		expect(failureRows.length).toBe(2);
