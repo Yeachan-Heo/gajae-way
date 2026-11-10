@@ -8,6 +8,7 @@ import {
 	decideInbound,
 	describeMessageEdit,
 	engagementForMessage,
+	extractBotCommand,
 	type GatewayClientLike,
 	LruSet,
 	monitorFailureDecision,
@@ -21,6 +22,7 @@ import {
 	slackHeartbeatDetails,
 	startSlackAdapter,
 	subscribeSlackDeliveries,
+	subscribeSlackProgress,
 } from "../src/main";
 import { slackMessageOrigin } from "../src/origin";
 import { loadRecoveryCursors } from "../src/recovery";
@@ -73,12 +75,12 @@ class Gateway implements GatewayClientLike {
 	readonly requests: { verb: string; params: unknown }[] = [];
 	readonly handlers = new Set<(message: ChatMessagePayload) => void>();
 	engaged = true;
-	turnId: string | null = "accepted-turn";
+	turnId: string | null | undefined;
 	failure?: Error;
 	async request<T = unknown>(verb: string, params?: unknown): Promise<T> {
 		this.requests.push({ verb, params });
 		if (this.failure) throw this.failure;
-		return { engaged: this.engaged, turnId: this.engaged ? this.turnId : null } as T;
+		return { engaged: this.engaged, ...(this.turnId === undefined ? {} : { turnId: this.turnId }) } as T;
 	}
 	onChatMessage(handler: (message: ChatMessagePayload) => void) {
 		this.handlers.add(handler);
@@ -87,6 +89,286 @@ class Gateway implements GatewayClientLike {
 		};
 	}
 }
+test("Slack raw bot commands preserve arguments and author without creating a top-level thread", async () => {
+	const f = await fixture();
+	try {
+		for (const [index, command] of ["/new", "/reset", "/model provider/model", "/restart"].entries()) {
+			await f.event({ ...inbound({ ts: `170000000${index}.000001`, text: `<@UBOT> ${command}` }) });
+			expect(chatSends(f.client).at(-1)).toMatchObject({ origin, text: command, engagement: { authorId: "U1" } });
+		}
+		await f.event({
+			...inbound({ ts: "1700000010.000001", thread_ts: "1699999999.000001", text: "<@UBOT> /model x" }),
+		});
+		expect(chatSends(f.client).at(-1)).toMatchObject({
+			origin: { kind: "thread", conversationId: "C1:1699999999.000001" },
+			text: "/model x",
+		});
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("Slack command extraction ignores quoted code, prose, attachments, and foreign mentions", () => {
+	for (const text of [
+		"`<@UBOT> /new`",
+		"> <@UBOT> /new",
+		"please <@UBOT> /new",
+		"<@OTHER> /new",
+		"<@UBOT> /unknown",
+		"<@UBOT> /new\nprose",
+		"<@UBOT> /new <@OTHER>",
+	]) {
+		expect(extractBotCommand(inbound({ text }), "UBOT")).toBeUndefined();
+	}
+	expect(extractBotCommand(inbound({ text: "<@UBOT> /new", files: [{ id: "F1" }] }), "UBOT")).toBeUndefined();
+	expect(extractBotCommand(inbound({ text: "<@UBOT> /model model_with_underscores" }), "UBOT")).toBe(
+		"/model model_with_underscores",
+	);
+});
+
+test("Slack live and recovered top-level mentions and bot commands choose identical origins", async () => {
+	for (const text of ["<@UBOT> hello", "<@UBOT> /new", "<@UBOT> /model provider/model"]) {
+		const live = await fixture({ C1: { engagement: "mention-open" } }, { autoRecover: false });
+		const recovered = await fixture({ C1: { engagement: "mention-open" } }, { autoRecover: false });
+		try {
+			const message = inbound({ text });
+			await live.event({ ...message });
+			recovered.api.history.C1 = [{ ...message }];
+			await recovered.recoverMissedMessages();
+			expect(chatSends(recovered.client)).toHaveLength(1);
+			expect(chatSends(recovered.client)[0]).toEqual(chatSends(live.client)[0]);
+		} finally {
+			live.socket.stop();
+			recovered.socket.stop();
+		}
+	}
+});
+
+test("Slack edits retain previous origin when mentions are added or removed", () => {
+	for (const [before, after, kind] of [
+		["hello", "<@UBOT> hello", "channel"],
+		["<@UBOT> hello", "hello", "thread"],
+	] as const) {
+		const edit = describeMessageEdit(
+			{
+				...inbound(),
+				subtype: "message_changed",
+				message: inbound({ text: after }),
+				previous_message: inbound({ text: before }),
+			},
+			identity,
+			names,
+			undefined,
+		);
+		expect(edit?.origin.kind).toBe(kind);
+		expect(edit?.engagement.explicitMention).toBe(after.includes("<@UBOT>"));
+	}
+});
+
+test("Slack successive mention edits retain the first observed conversation", async () => {
+	const f = await fixture();
+	try {
+		await f.event({ ...inbound({ text: "hello" }) });
+		let previous = inbound({ text: "hello" });
+		for (const text of ["<@UBOT> hello", "hello again", "<@UBOT> final"]) {
+			const message = inbound({ text });
+			await f.event({
+				type: "message",
+				subtype: "message_changed",
+				channel: "C1",
+				ts: "1700000002.000001",
+				message,
+				previous_message: previous,
+			});
+			previous = message;
+		}
+		const edits = f.client.requests.filter((request) => request.verb === "chat.edit");
+		expect(edits).toHaveLength(3);
+		for (const edit of edits) expect(edit.params).toMatchObject({ origin });
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("Slack partial chunk success makes a later definitive failure uncertain", async () => {
+	const client = new Gateway();
+	const api = new Api();
+	let calls = 0;
+	api.postMessage = async (channel) => {
+		if (++calls === 2) throw new SlackApiError(200, "invalid_blocks");
+		return { channel, ts: "2.000" };
+	};
+	await settleSlackDelivery(client, api, delivery({ text: "x".repeat(9000) }));
+	expect(calls).toBe(2);
+	expect(client.requests).toEqual([
+		{ verb: "delivery.fail", params: { deliveryId: "delivery", reason: expect.any(String), ambiguous: true } },
+	]);
+});
+
+test("Slack complete settlements serialize one origin while unrelated origins continue after failure", async () => {
+	const client = new Gateway();
+	const api = new Api();
+	const order: string[] = [];
+	let release!: () => void;
+	const blocked = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let first = true;
+	api.postMessage = async (channel, text) => {
+		order.push(`${channel}:${text[0]}`);
+		if (channel === "C1" && first) {
+			first = false;
+			await blocked;
+		}
+		if (text === "fail") throw new SlackApiError(200, "invalid_auth");
+		return { channel, ts: "2.000" };
+	};
+	const off = subscribeSlackDeliveries(client, api);
+	const emit = (message: ChatMessagePayload) => {
+		for (const handler of client.handlers) handler(message);
+	};
+	emit(delivery({ text: "A".repeat(9000), deliveryId: "A" }));
+	emit(delivery({ text: "fail", deliveryId: "fail" }));
+	emit(delivery({ text: "B", deliveryId: "B" }));
+	emit(delivery({ origin: { ...origin, conversationId: "C2" }, text: "other", deliveryId: "other" }));
+	await flush();
+	expect(order).toEqual(["C1:A", "C2:o"]);
+	release();
+	await flush();
+	expect(order.filter((entry) => entry.startsWith("C1:"))).toEqual(["C1:A", "C1:A", "C1:A", "C1:f", "C1:B"]);
+	expect(
+		client.requests.filter((request) => request.verb === "delivery.confirm").map((request) => request.params),
+	).toContainEqual({ deliveryId: "B" });
+	off();
+});
+
+test("Slack terminal progress waits for complete queued settlements before closing live replies", async () => {
+	let progressHandler!: Parameters<NonNullable<GatewayClientLike["onChatProgress"]>>[0];
+	const client = new Gateway() as Gateway & { onChatProgress: NonNullable<GatewayClientLike["onChatProgress"]> };
+	client.onChatProgress = (handler) => {
+		progressHandler = handler;
+		return () => {};
+	};
+	const api = new Api();
+	let release!: () => void;
+	const pending = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const order: string[] = [];
+	api.postMessage = async (channel) => {
+		order.push("post");
+		await pending;
+		return { channel, ts: "2.000" };
+	};
+	const off = subscribeSlackDeliveries(client, api);
+	const progressOff = subscribeSlackProgress(client, undefined, console, {
+		close: async () => {
+			order.push("close");
+		},
+	});
+	for (const handler of client.handlers) handler(delivery());
+	progressHandler({ turnId: "turn", origin, elapsedMs: 1, toolCalls: 0, outputTokens: 1, final: true });
+	await flush();
+	expect(order).toEqual(["post"]);
+	release();
+	await flush();
+	expect(order).toEqual(["post", "close"]);
+	off();
+	progressOff();
+});
+
+test("Slack settlement ordering survives gateway client replacement", async () => {
+	const f = await fixture(undefined, { autoRecover: false });
+	let release!: () => void;
+	const blocked = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const order: string[] = [];
+	f.api.postMessage = async (channel, text) => {
+		order.push(text);
+		if (text === "first") await blocked;
+		return { channel, ts: "2.000" };
+	};
+	try {
+		for (const handler of f.client.handlers) handler(delivery({ text: "first", deliveryId: "first" }));
+		await flush();
+		const replacement = new Gateway();
+		f.gateway.adoptClient(replacement);
+		for (const handler of replacement.handlers) handler(delivery({ text: "second", deliveryId: "second" }));
+		await flush();
+		expect(order).toEqual(["first"]);
+		release();
+		await flush();
+		expect(order).toEqual(["first", "second"]);
+	} finally {
+		release();
+		f.socket.stop();
+	}
+});
+
+test("Slack file, reaction and panel deliveries share the complete settlement queue", async () => {
+	const { mkdtemp, writeFile, realpath, rm } = await import("node:fs/promises");
+	const home = await mkdtemp(join(tmpdir(), "slack-settlement-"));
+	const path = join(home, "reply.txt");
+	await writeFile(path, "file");
+	const api = new Api();
+	const client = new Gateway();
+	const order: string[] = [];
+	let release!: () => void;
+	const blocked = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	api.uploadFile = async () => {
+		order.push("file");
+		await blocked;
+	};
+	api.addReaction = async () => {
+		order.push("reaction");
+	};
+	api.postMessage = async (channel) => {
+		order.push("panel");
+		return { channel, ts: "2.000" };
+	};
+	const off = subscribeSlackDeliveries(client, api);
+	try {
+		const file = { path: await realpath(path), name: "reply.txt", size: 4 };
+		const messages = [
+			delivery({ deliveryId: "file", file }),
+			delivery({
+				deliveryId: "reaction",
+				reaction: { targetMessageId: "C1:1.000", emoji: "👍", emojiName: "thumbsup" },
+			}),
+			delivery({
+				deliveryId: "panel",
+				duplicateWarning: true,
+				askUserPanel: {
+					panelId: "q_1",
+					question: "Choose",
+					expiresAt: "2099-01-01T00:00:00Z",
+					options: [{ id: "opt_a", label: "A" }],
+				},
+			}),
+		];
+		for (const message of messages) for (const handler of client.handlers) handler(message);
+		// Wait for the asynchronous file read without relying on a fixed microtask count.
+		for (let i = 0; i < 100 && order.length === 0; i++) await Bun.sleep(1);
+		expect(order).toEqual(["file"]);
+		expect(client.requests).toEqual([]);
+		release();
+		await flush();
+		expect(order).toEqual(["file", "reaction", "panel"]);
+		expect(client.requests.map((request) => request.params)).toEqual([
+			{ deliveryId: "file" },
+			{ deliveryId: "reaction" },
+			{ deliveryId: "panel" },
+		]);
+	} finally {
+		release();
+		off();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
 class Api extends SlackWebApi {
 	readonly posts: unknown[][] = [];
 	readonly reactions: unknown[][] = [];
@@ -212,6 +494,27 @@ async function fixture(
 		},
 	};
 }
+
+test("Slack send and edit arm presence only for engaged responses with a real turn ID", async () => {
+	const f = await fixture(undefined, { autoRecover: false });
+	try {
+		f.client.turnId = null;
+		const sent = await f.gateway.requestRecovered("C1:1.000", origin, "hello", engagement);
+		expect(sent.result).toEqual({ engaged: true, turnId: null });
+		f.gateway.sendEdit("C1:1.000", origin, "edited", engagement);
+		await flush();
+		expect(f.api.reactions).toEqual([]);
+		f.client.turnId = "real-turn";
+		await f.gateway.requestRecovered("C1:2.000", origin, "hello", engagement);
+		await flush();
+		expect(f.api.reactions).toEqual([["C1", "2.000", "hourglass_flowing_sand"]]);
+		f.gateway.sendEdit("C1:3.000", origin, "edited", engagement);
+		await flush();
+		expect(f.api.reactions).toContainEqual(["C1", "3.000", "hourglass_flowing_sand"]);
+	} finally {
+		f.socket.stop();
+	}
+});
 
 for (const shape of [
 	{ channel: "D1" },
@@ -654,7 +957,7 @@ test("Slack edits use nested identity, edited timestamp and rendered body equali
 			names,
 			undefined,
 		);
-		expect(fallback?.receivedAt).toBe("2023-11-14T22:13:20.123Z");
+		expect(fallback).toBeUndefined();
 		expect(
 			describeMessageEdit(
 				{ ...inbound(), subtype: "message_changed", message: inbound({ text: "" }) },
@@ -1520,7 +1823,7 @@ test("Slack recovery revisits a thread the persona joined after its parent fell 
 		expect(await f.recoverMissedMessages()).toBe(true);
 		let cursors = await loadRecoveryCursors(f.recoveryCursorPath);
 		expect(cursors.recoveredThrough.C1).toBe("1700000050.000001");
-		expect(Object.keys(cursors.participatedThreads)).toEqual(["C1:1700000001.000000"]);
+		expect(Object.keys(cursors.participatedThreads)).toEqual(["C1:1700000001.000000", "C1:1700000050.000001"]);
 		// A reply lands in that old thread while the adapter is down; history shows no parent.
 		replies["C1:1700000001.000000"] = [
 			{ type: "message", user: "U1", ts: "1700000001.000000", text: "root" },

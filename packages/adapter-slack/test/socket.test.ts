@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { describePanelResponse, type SlackBlockAction } from "../src/interactions";
+import { askUserPanelBlocks } from "../src/panels";
 import { SlackSocketMode, type SocketModeHandlers, type WebSocketLike } from "../src/socket";
 
 class FakeSocket implements WebSocketLike {
@@ -193,6 +195,56 @@ test("Slack retries deduplicate both envelope and event IDs but dispatch unseen 
 		await flush();
 		expect(socket.sent).toHaveLength(4);
 		expect(f.events).toEqual([{ text: "a" }, { text: "new" }]);
+	} finally {
+		f.mode.stop();
+	}
+});
+
+test("interactive block_actions are acknowledged before dispatch and duplicate envelopes dispatch once", async () => {
+	const f = fixture();
+	const origin = { platform: "slack", kind: "thread", conversationId: "C1:123.456", parentId: "C1" } as const;
+	const blocks = askUserPanelBlocks({
+		turnId: "turn",
+		origin,
+		role: "assistant",
+		text: "Choose",
+		final: true,
+		askUserPanel: {
+			panelId: "question_001",
+			question: "Choose",
+			expiresAt: new Date(Date.now() + 60_000).toISOString(),
+			options: [{ id: "option_a", label: "A" }],
+		},
+	});
+	const button = (blocks.find((block) => block.type === "actions")?.elements as unknown[])[0];
+	const payload = {
+		type: "block_actions",
+		user: { id: "U1", name: "User" },
+		channel: { id: "C1" },
+		message: { type: "message", ts: "123.457", thread_ts: "123.456" },
+		actions: [button],
+	};
+	try {
+		await f.boot();
+		const socket = f.sockets[0] as FakeSocket;
+		socket.message({ envelope_id: "interactive-1", type: "interactive", payload });
+		socket.message({ envelope_id: "interactive-1", type: "interactive", payload, retry_attempt: 1 });
+		socket.message({ envelope_id: "interactive-1", type: "interactive", payload });
+		socket.message({ envelope_id: "interactive-2", type: "interactive", payload: { type: "view_submission" } });
+		await flush();
+		expect(f.order).toEqual(["ack", "event", "ack", "ack", "ack"]);
+		expect(socket.sent.map((item) => JSON.parse(item))).toEqual([
+			{ envelope_id: "interactive-1" },
+			{ envelope_id: "interactive-1" },
+			{ envelope_id: "interactive-1" },
+			{ envelope_id: "interactive-2" },
+		]);
+		expect(f.events).toEqual([payload]);
+		expect(describePanelResponse(f.events[0] as SlackBlockAction)).toMatchObject({
+			origin,
+			panelId: "question_001",
+			selectedOptionId: "option_a",
+		});
 	} finally {
 		f.mode.stop();
 	}

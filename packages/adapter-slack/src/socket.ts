@@ -350,11 +350,13 @@ export class SlackSocketMode {
 			this.seen.delete(frame.envelope_id);
 			this.seen.set(frame.envelope_id, eventId);
 			while (this.seen.size > 1024) this.seen.delete(this.seen.keys().next().value as string);
-			if (typeof frame.retry_attempt === "number" && frame.retry_attempt > 0 && duplicate) return;
+			if (duplicate) return;
 			const envelope = frame as unknown as SlackEnvelope;
 			if (frame.type === "events_api" && isObject(payload?.event)) {
 				this.lastEventAt = this.now();
 				await this.handlers.onEvent(payload.event, envelope);
+			} else if (frame.type === "interactive" && payload?.type === "block_actions") {
+				await this.handlers.onEvent(payload, envelope);
 			} else if (frame.type === "slash_commands" && payload) {
 				await this.handlers.onSlashCommand(payload as unknown as SlackSlashCommand, envelope);
 			} else {

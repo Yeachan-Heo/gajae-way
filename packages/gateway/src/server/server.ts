@@ -3390,7 +3390,7 @@ async function createInboundTurnLifecycle(
 			) !== deliveryId
 		)
 			return;
-		const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, text, undefined, deliveryId);
+		const payload = runtime.delivery.prepare(turnId, origin, text, undefined, deliveryId);
 		if (!payload) return;
 		deliveredParts.push(text);
 		assistantDeliveryStarted = true;
@@ -3629,7 +3629,7 @@ async function createInboundTurnLifecycle(
 	 */
 	const deliverFiles = async (paths: readonly string[], replyTo: string | undefined) => {
 		const notify = (deliveryId: string, text: string) => {
-			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, text, replyTo, deliveryId, false);
+			const payload = runtime.delivery.prepare(turnId, origin, text, replyTo, deliveryId, false);
 			if (!payload) return;
 			deliveredIds.push(payload.deliveryId as string);
 			assistantDeliveryStarted = true;
@@ -3658,7 +3658,7 @@ async function createInboundTurnLifecycle(
 				notify(`${deliveryId}-x`, `(file not sent: ${checked.name} - ${checked.reason})`);
 				continue;
 			}
-			const payload = runtime.delivery.prepareFile(crypto.randomUUID(), origin, checked.file, deliveryId, replyTo);
+			const payload = runtime.delivery.prepareFile(turnId, origin, checked.file, deliveryId, replyTo);
 			if (!payload) continue;
 			deliveredIds.push(payload.deliveryId as string);
 			assistantDeliveryStarted = true;
@@ -3715,7 +3715,7 @@ async function createInboundTurnLifecycle(
 						);
 						continue;
 					}
-					const payload = runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+					const payload = runtime.delivery.prepareReaction(turnId, origin, {
 						targetMessageId: wanted.targetMessageId,
 						emoji: wanted.emoji,
 						emojiName: wanted.emojiName,
@@ -3744,7 +3744,7 @@ async function createInboundTurnLifecycle(
 						);
 						continue;
 					}
-					const payload = runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+					const payload = runtime.delivery.prepareReaction(turnId, origin, {
 						targetMessageId,
 						emoji: wanted.emoji,
 						emojiName: wanted.emojiName,
@@ -3915,12 +3915,12 @@ async function createInboundTurnLifecycle(
 			// while the persona keeps streaming. Only the terminal reply - or the
 			// unconditional final progress tick - tears it down.
 			const payload = runtime.delivery.prepare(
-				crypto.randomUUID(),
+				turnId,
 				origin,
 				step.body,
 				step.replyTo,
 				deliveryId,
-				source === "terminal",
+				source === "terminal" && step === local.at(-1),
 			);
 			if (!payload) continue;
 			deliveredParts.push(step.body);
@@ -4520,7 +4520,7 @@ function acknowledgeSteer(runtime: Runtime, steered: InboundMessageRow, turnId: 
 		}
 		broadcastDelivery(
 			runtime,
-			runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+			runtime.delivery.prepareReaction(turnId ?? crypto.randomUUID(), origin, {
 				targetMessageId,
 				emoji: eyes.unicode,
 				emojiName: eyes.name,

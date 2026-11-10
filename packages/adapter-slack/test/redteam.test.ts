@@ -74,7 +74,7 @@ class Client implements GatewayClientLike {
 	async request<T>(verb: string, params?: unknown): Promise<T> {
 		this.calls.push({ verb, params });
 		if (this.failure) throw this.failure;
-		return { engaged: this.engaged } as T;
+		return { engaged: this.engaged, turnId: this.engaged ? "turn" : null } as T;
 	}
 	onChatMessage() {
 		return () => {};
@@ -774,6 +774,7 @@ test("RT-SLACK-37 only terminal refusals consume dead-letter budget", async () =
 	for (const [error, attempts] of [
 		[terminal, 1],
 		[new Error("connection closed"), 1],
+		[new Error("request timed out: chat.send"), 1],
 		[terminal, 2],
 		[terminal, 3],
 	] as const) {
@@ -870,8 +871,8 @@ test("RT-SLACK-40 every engaged turn gets a presence reaction on the triggering 
 	await gateway.requestInbound("C1:3.0", thread, "thread follow-up", { ...engagement, mentioned: false });
 	await flush();
 	expect(api.reactions[1]).toEqual(["C1", "3.0", "hourglass_flowing_sand"]);
-	await status.clear("C1");
-	await status.clear("C1:1.0");
+	await status.clear("C1", "turn");
+	await status.clear("C1:1.0", "turn");
 	expect(api.removed).toEqual([
 		["C1", "2.0", "hourglass_flowing_sand"],
 		["C1", "3.0", "hourglass_flowing_sand"],
@@ -975,7 +976,7 @@ test("RT-SLACK-49 presence coalesces thirty ticks into a bounded number of react
 		() => {},
 		() => now,
 	);
-	status.arm(origin, "C1:1.0");
+	status.arm(origin, "C1:1.0", "turn");
 	await flush();
 	expect(api.reactions).toEqual([["C1", "1.0", "hourglass_flowing_sand"]]);
 	// Thirty ticks in twenty seconds, phase flipping every tick: at most one swap
@@ -996,9 +997,9 @@ test("RT-SLACK-49 presence coalesces thirty ticks into a bounded number of react
 	expect(api.reactions.length).toBeLessThanOrEqual(3);
 	expect(api.posts).toEqual([]);
 	// Clear removes every marker we own, exactly once, and ignores a second clear.
-	await status.clear("C1");
+	await status.clear("C1", "turn");
 	const removedAfterClear = api.removed.length;
-	await status.clear("C1");
+	await status.clear("C1", "turn");
 	expect(api.removed.length).toBe(removedAfterClear);
 	const shown = new Set(api.reactions.map((r) => r[2]));
 	for (const name of shown) expect(api.removed.some((r) => r[2] === name)).toBe(true);
@@ -1078,7 +1079,7 @@ test("RT-SLACK-53 gradient buckets coalescing exact cleanup, stale timeout, and 
 		() => {},
 		() => now,
 	);
-	status.arm(origin, "C1:1.0");
+	status.arm(origin, "C1:1.0", "t");
 	await flush();
 	expect(api.reactions).toEqual([["C1", "1.0", "hourglass_flowing_sand"]]);
 	for (let i = 1; i <= 30; i++) {
@@ -1105,12 +1106,12 @@ test("RT-SLACK-53 gradient buckets coalescing exact cleanup, stale timeout, and 
 		expect(api.reactions.map((r) => r[2])).toContain(clock);
 		expect(api.reactions.map((r) => r[2])).toContain(effort);
 	}
-	await status.clear("C1");
+	await status.clear("C1", "t");
 	expect(api.removed.map((r) => JSON.stringify(r)).sort()).toEqual(api.reactions.map((r) => JSON.stringify(r)).sort());
 	const count = api.removed.length;
-	await status.clear("C1");
+	await status.clear("C1", "t");
 	expect(api.removed).toHaveLength(count);
-	status.arm(origin, "C1:2.0");
+	status.arm(origin, "C1:2.0", "t");
 	await flush();
 	// Refresh does not clear markers (only keeps them alive)
 	const refreshTimer = timers.find((t) => t.ms === 45000);
@@ -1118,7 +1119,7 @@ test("RT-SLACK-53 gradient buckets coalescing exact cleanup, stale timeout, and 
 	await flush();
 	expect(api.removed.length).toBe(count);
 	// Stale timeout clears markers if no signal arrives (simulating gateway crash)
-	status.arm(origin, "C1:3.0");
+	status.arm(origin, "C1:3.0", "t");
 	await flush();
 	timers.length = 0;
 	const status2 = new WorkingStatus(
@@ -1132,7 +1133,7 @@ test("RT-SLACK-53 gradient buckets coalescing exact cleanup, stale timeout, and 
 		() => {},
 		() => now,
 	);
-	status2.arm(origin, "C1:4.0");
+	status2.arm(origin, "C1:4.0", "t");
 	await flush();
 	const beforeStaleRemoves = api.removed.length;
 	// Advance past stale window without any updates
@@ -1143,7 +1144,7 @@ test("RT-SLACK-53 gradient buckets coalescing exact cleanup, stale timeout, and 
 	// Markers should be removed by stale timeout
 	expect(api.removed.length).toBeGreaterThan(beforeStaleRemoves);
 	// Explicit clear removes markers (already cleared, so should be idempotent)
-	await status.clear("C1");
+	await status.clear("C1", "t");
 	await flush();
 	expect(api.posts).toEqual([]);
 });
@@ -1163,18 +1164,18 @@ test("RT-SLACK-54 clear during add removes late marker and replacement cleans ol
 		await original(...args);
 	});
 	const status = new WorkingStatus(api);
-	status.arm(origin, "C1:1.0");
+	status.arm(origin, "C1:1.0", "turn");
 	await flush();
-	await status.clear("C1");
+	await status.clear("C1", "turn");
 	release();
 	await flush();
 	expect(api.removed).toEqual(api.reactions);
-	status.arm(origin, "C1:2.0");
+	status.arm(origin, "C1:2.0", "turn");
 	await flush();
-	status.arm(origin, "C1:3.0");
+	status.arm(origin, "C1:3.0", "turn");
 	await flush();
 	expect(api.removed).toContainEqual(["C1", "2.0", "hourglass_flowing_sand"]);
-	await status.clear("C1");
+	await status.clear("C1", "turn");
 	expect(api.removed).toEqual(api.reactions);
 });
 
@@ -1186,7 +1187,7 @@ test("RT-SLACK-54 cleanup errors are logged without blocking delivery confirmati
 			errors.push(args);
 		},
 	});
-	status.arm(origin, "C1:1.0");
+	status.arm(origin, "C1:1.0", "turn");
 	await flush();
 	spyOn(api, "removeReaction").mockRejectedValue(new Error("remove denied"));
 	const client = new Client();
@@ -1202,7 +1203,7 @@ test("RT-SLACK-57 persona allowlist is disjoint and thumbs up leaves presence al
 	for (const { name } of REACTION_ALLOWLIST) expect(isPresenceReaction(SLACK_REACTION_NAMES[name]!)).toBe(false);
 	const api = new Api();
 	const status = new WorkingStatus(api);
-	status.arm(origin, "C1:1.0");
+	status.arm(origin, "C1:1.0", "turn");
 	await flush();
 	await settleSlackReaction(
 		new Client(),
@@ -1211,7 +1212,7 @@ test("RT-SLACK-57 persona allowlist is disjoint and thumbs up leaves presence al
 	);
 	expect(api.reactions).toContainEqual(["C1", "1.0", "+1"]);
 	expect(api.removed).toEqual([]);
-	await status.clear("C1");
+	await status.clear("C1", "turn");
 });
 
 for (const cosmetics of [1, 20])
@@ -1379,7 +1380,7 @@ test("RT-SLACK-67 failed add retries on later update and each failed remove logs
 	);
 	spyOn(api, "addReaction").mockRejectedValueOnce(new Error("add denied"));
 	const remove = spyOn(api, "removeReaction").mockRejectedValue(new Error("remove denied"));
-	status.arm(origin, "C1:1.0");
+	status.arm(origin, "C1:1.0", "t");
 	await flush();
 	expect(api.reactions).toEqual([]);
 	expect(errors).toHaveLength(1);
@@ -1405,7 +1406,7 @@ test("RT-SLACK-67 failed add retries on later update and each failed remove logs
 		activity: { kind: "tool", label: "tool" },
 	});
 	const client = new Client();
-	await settleSlackDelivery(client, api, delivery(), console, status);
+	await settleSlackDelivery(client, api, delivery({ turnId: "t" }), console, status);
 	expect(client.calls).toContainEqual({ verb: "delivery.confirm", params: { deliveryId: "delivery" } });
 	expect(remove.mock.calls.length).toBeGreaterThan(0);
 	expect(errors.length).toBe(1 + remove.mock.calls.length);
@@ -1443,12 +1444,12 @@ test("RT-SLACK-67 fetcher flipping desired state on every add is bounded to eigh
 		() => {},
 		() => now,
 	);
-	status.arm(origin, "C1:1.0");
+	status.arm(origin, "C1:1.0", "t");
 	for (let i = 0; i < 30; i++) await flush();
 	expect(adds).toBe(8);
 	expect(removes).toBe(7);
 	flipping = false;
-	await status.clear("C1");
+	await status.clear("C1", "t");
 });
 
 test("RT-SLACK-69 retirement frees idle lane and preserves waiter arriving during retirement sleep", async () => {

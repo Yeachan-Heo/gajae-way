@@ -8,7 +8,12 @@ import {
 	presenceMarkersFor,
 	presenceSnapshot,
 } from "@gajae-gateway/protocol";
-import { type GatewayClientLike, settleSlackDelivery, subscribeSlackProgress } from "../src/main";
+import {
+	type GatewayClientLike,
+	settleSlackDelivery,
+	subscribeSlackDeliveries,
+	subscribeSlackProgress,
+} from "../src/main";
 import { isPresenceReaction, presenceStatusText, WORKING_STATUS_STALE_MS, WorkingStatus } from "../src/status";
 import { liveGateway, stopLiveGatewaysAfterEach } from "./live-gateways";
 
@@ -119,7 +124,7 @@ test("presence markers never collide with the persona's reaction allowlist", asy
 
 test("Slack presence is reactions on the triggering message, never a posted or edited message", async () => {
 	const f = fixture();
-	f.status.arm(origin, "C1:1.000");
+	f.status.arm(origin, "C1:1.000", "turn");
 	await flush();
 	expect(f.adds).toEqual(["C1:1.000:hourglass_flowing_sand"]);
 	expect(f.posts).toEqual([]);
@@ -139,7 +144,7 @@ test("Slack presence is reactions on the triggering message, never a posted or e
 	expect(names(f.removes)).toEqual(["hourglass_flowing_sand", "clock1"]);
 	expect(names(f.adds).at(-1)).toBe("clock2");
 	// Delivery: every marker we own comes off, nothing else is touched.
-	await f.status.clear("C1");
+	await f.status.clear("C1", "turn");
 	expect(new Set(names(f.removes))).toEqual(new Set(["hourglass_flowing_sand", "clock1", "wrench", "clock2", "three"]));
 	expect(f.posts).toEqual([]);
 	expect(f.timers.size).toBe(0);
@@ -147,7 +152,7 @@ test("Slack presence is reactions on the triggering message, never a posted or e
 
 test("Slack presence swaps are coalesced to one per window even when the phase flips", async () => {
 	const f = fixture();
-	f.status.arm(origin, "C1:1.000");
+	f.status.arm(origin, "C1:1.000", "turn");
 	await flush();
 	await f.status.update(
 		progress({ elapsedMs: 3_000, toolCalls: 0, outputTokens: 0, activity: { kind: "tool", label: "bash" } }),
@@ -164,14 +169,14 @@ test("Slack presence swaps are coalesced to one per window even when the phase f
 	);
 	expect(names(f.removes)).toEqual(["hourglass_flowing_sand"]);
 	expect(names(f.adds)).toEqual(["hourglass_flowing_sand", "writing_hand", "one"]);
-	await f.status.clear("C1");
+	await f.status.clear("C1", "turn");
 });
 
 test("Slack presence: a newer turn on the same conversation takes over, and the refresh timer keeps the new one alive", async () => {
 	const f = fixture();
-	f.status.arm(origin, "C1:1.000");
+	f.status.arm(origin, "C1:1.000", "turn");
 	await flush();
-	f.status.arm(origin, "C1:2.000");
+	f.status.arm(origin, "C1:2.000", "turn");
 	await flush();
 	expect(f.removes).toEqual(["C1:1.000:hourglass_flowing_sand"]);
 	expect(f.adds).toEqual(["C1:1.000:hourglass_flowing_sand", "C1:2.000:hourglass_flowing_sand"]);
@@ -194,7 +199,7 @@ test("Slack presence failures are logged, never thrown, and a clear during a swa
 	f.api.addReaction = async () => {
 		throw new Error("Slack reaction failed");
 	};
-	f.status.arm(origin, "C1:1.000");
+	f.status.arm(origin, "C1:1.000", "turn");
 	await flush();
 	expect(f.errors).toHaveLength(1);
 	// Slow add: clear runs while it is in flight; the late marker is removed.
@@ -205,32 +210,36 @@ test("Slack presence failures are logged, never thrown, and a clear during a swa
 			finish = resolve;
 		});
 	};
-	f.status.arm(origin, "C1:3.000");
+	f.status.arm(origin, "C1:3.000", "turn");
 	await flush();
-	await f.status.clear("C1");
+	await f.status.clear("C1", "turn");
 	finish();
 	await flush();
 	expect(f.removes.at(-1)).toBe("C1:3.000:hourglass_flowing_sand");
 	// Malformed message id: nothing is attempted.
-	f.status.arm(origin, "not-an-id");
+	f.status.arm(origin, "not-an-id", "turn");
 	await flush();
 	expect(f.adds.filter((entry) => entry.includes("not-an-id"))).toEqual([]);
 	// Foreign platform: ignored.
-	f.status.arm({ ...origin, platform: "discord" }, "C1:4.000");
+	f.status.arm({ ...origin, platform: "discord" }, "C1:4.000", "turn");
 	await flush();
 	expect(f.adds.some((entry) => entry.includes("4.000"))).toBe(false);
 });
 
 class Gateway implements GatewayClientLike {
 	readonly handlers = new Set<(p: ChatProgressPayload) => void>();
+	readonly messageHandlers = new Set<(message: ChatMessagePayload) => void>();
 	readonly requests: string[] = [];
 	engaged = true;
 	async request<T>(verb: string): Promise<T> {
 		this.requests.push(verb);
-		return { engaged: this.engaged } as T;
+		return { engaged: this.engaged, turnId: "turn" } as T;
 	}
-	onChatMessage() {
-		return () => {};
+	onChatMessage(handler: (message: ChatMessagePayload) => void) {
+		this.messageHandlers.add(handler);
+		return () => {
+			this.messageHandlers.delete(handler);
+		};
 	}
 	onChatProgress(handler: (p: ChatProgressPayload) => void) {
 		this.handlers.add(handler);
@@ -247,7 +256,7 @@ test("Slack progress final clears the gradient of silent turns, logs failures, a
 	const f = fixture();
 	const gateway = new Gateway();
 	const off = subscribeSlackProgress(gateway, f.status);
-	f.status.arm(origin, "C1:1.000");
+	f.status.arm(origin, "C1:1.000", "turn");
 	await flush();
 	gateway.emit(progress());
 	await flush();
@@ -276,6 +285,223 @@ test("Slack progress final clears the gradient of silent turns, logs failures, a
 	failingOff();
 });
 
+test("queued old final progress cannot clear a newer turn on the same message", async () => {
+	const f = fixture();
+	const gateway = new Gateway();
+	let release!: () => void;
+	let posting = false;
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	f.api.postMessage = async (channel) => {
+		posting = true;
+		await gate;
+		return { channel, ts: "10.001" };
+	};
+	const offDelivery = subscribeSlackDeliveries(gateway, f.api, console, f.status);
+	const offProgress = subscribeSlackProgress(gateway, f.status);
+	f.status.arm(origin, "C1:1.000", "A");
+	await flush();
+	for (const handler of gateway.messageHandlers)
+		handler({
+			turnId: "A",
+			origin,
+			role: "assistant",
+			text: "reply",
+			deliveryId: "d",
+			final: false,
+		});
+	await flush();
+	expect(posting).toBe(true);
+	gateway.emit(progress({ turnId: "A", final: true }));
+	f.status.arm(origin, "C1:1.000", "B");
+	await flush();
+	release();
+	await flush();
+	expect(f.removes).toEqual([]);
+	await f.status.clear("C1", "B");
+	expect(f.removes).toEqual(["C1:1.000:hourglass_flowing_sand"]);
+	offProgress();
+	offDelivery();
+});
+
+for (const final of [false, true]) {
+	test(`old ${final ? "final" : "mid-turn"} delivery cannot change newer presence`, async () => {
+		const f = fixture();
+		const gateway = new Gateway();
+		const thread: OriginRef = { platform: "slack", kind: "thread", conversationId: "C1:1.000", parentId: "C1" };
+		let release!: () => void;
+		let posting = false;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		f.api.postMessage = async (channel, text, threadTs) => {
+			posting = true;
+			await gate;
+			f.posts.push([channel, text, threadTs]);
+			return { channel, ts: "10.001" };
+		};
+		f.status.arm(thread, "C1:1.002", "A");
+		await flush();
+		const delivery = settleSlackDelivery(
+			gateway,
+			f.api,
+			{
+				turnId: "A",
+				origin: thread,
+				role: "assistant",
+				text: "reply",
+				deliveryId: "d",
+				final,
+			},
+			console,
+			f.status,
+		);
+		await flush();
+		expect(posting).toBe(true);
+		f.status.arm(thread, "C1:1.002", "B");
+		await flush();
+		const statuses = [...f.statuses];
+		release();
+		await delivery;
+		await flush();
+		expect(f.statuses).toEqual(statuses);
+		expect(f.removes).toEqual([]);
+		await f.status.clear(thread.conversationId, "B");
+		expect(f.statuses.at(-1)).toBe("C1:1.000:");
+		expect(f.removes).toEqual(["C1:1.002:hourglass_flowing_sand"]);
+	});
+}
+
+test("old updates and cancelled stale timers cannot change the replacement turn", async () => {
+	const f = fixture();
+	f.status.arm(origin, "C1:1.000", "A");
+	await flush();
+	const oldStale = [...f.timers].find((timer) => timer.ms === WORKING_STATUS_STALE_MS);
+	f.status.arm(origin, "C1:1.000", "B");
+	await flush();
+	const timers = [...f.timers];
+	f.tick(PRESENCE_MIN_SWAP_MS);
+	await f.status.update(progress({ turnId: "A", activity: { kind: "tool", label: "bash" } }));
+	await oldStale?.fn();
+	await flush();
+	expect([...f.timers]).toEqual(timers);
+	expect(f.adds).toEqual(["C1:1.000:hourglass_flowing_sand"]);
+	expect(f.removes).toEqual([]);
+	await f.status.update(progress({ turnId: "B", activity: { kind: "tool", label: "bash" } }));
+	expect(names(f.adds)).toContain("wrench");
+	await f.status.clear("C1", "B");
+});
+
+test("a stale callback captured before a different-message replacement cannot clear it", async () => {
+	const f = fixture();
+	f.status.arm(origin, "C1:1.000", "A");
+	await flush();
+	const stale = [...f.timers].find((timer) => timer.ms === WORKING_STATUS_STALE_MS);
+	f.status.arm(origin, "C1:2.000", "B");
+	await flush();
+	const timers = [...f.timers];
+	stale?.fn();
+	await flush();
+	expect([...f.timers]).toEqual(timers);
+	expect(f.removes).toEqual(["C1:1.000:hourglass_flowing_sand"]);
+	await f.status.clear("C1", "B");
+	expect(f.removes).toEqual(["C1:1.000:hourglass_flowing_sand", "C1:2.000:hourglass_flowing_sand"]);
+});
+
+test("cancelled stale and retry callbacks cannot retire a replacement entry", async () => {
+	const f = fixture();
+	f.status.arm(origin, "C1:1.000", "A");
+	await flush();
+	const oldStale = [...f.timers].find((timer) => timer.ms === WORKING_STATUS_STALE_MS);
+	const remove = f.api.removeReaction;
+	f.api.removeReaction = async () => {
+		throw new Error("remove failed");
+	};
+	await f.status.clear("C1", "A");
+	const retry = [...f.timers].find((timer) => timer.ms === 5_000);
+	expect(retry).toBeDefined();
+	f.api.removeReaction = remove;
+	f.status.arm(origin, "C1:1.000", "B");
+	await flush();
+	oldStale?.fn();
+	retry?.fn();
+	await flush();
+	expect(f.removes).toEqual([]);
+	f.status.arm(origin, "C1:2.000", "C");
+	await flush();
+	oldStale?.fn();
+	retry?.fn();
+	await flush();
+	expect(f.removes).toEqual(["C1:1.000:hourglass_flowing_sand"]);
+	await f.status.clear("C1", "C");
+	expect(f.removes).toEqual(["C1:1.000:hourglass_flowing_sand", "C1:2.000:hourglass_flowing_sand"]);
+});
+
+test("retired retry cannot remove a newer owner of the same message or native line", async () => {
+	const f = fixture();
+	const thread: OriginRef = { platform: "slack", kind: "thread", conversationId: "C1:1.000", parentId: "C1" };
+	f.status.arm(thread, "C1:1.002", "A");
+	await flush();
+	const remove = f.api.removeReaction;
+	f.api.removeReaction = async () => {
+		throw new Error("remove failed");
+	};
+	f.failStatus(new Error("clear failed"));
+	await f.status.clear(thread.conversationId, "A");
+	const retry = [...f.timers].find((timer) => timer.ms === 5_000);
+	expect(retry).toBeDefined();
+	f.failStatus(undefined);
+	f.api.removeReaction = remove;
+	f.status.arm(thread, "C1:1.003", "B");
+	await flush();
+	f.status.arm(thread, "C1:1.002", "C");
+	await flush();
+	const before = [...f.removes];
+	const statuses = [...f.statuses];
+	retry?.fn();
+	await flush();
+	expect(f.removes).toEqual(before);
+	expect(f.statuses).toEqual(statuses);
+	await f.status.clear(thread.conversationId, "C");
+	expect(f.removes).toContain("C1:1.002:hourglass_flowing_sand");
+	expect(f.statuses.at(-1)).toBe("C1:1.000:");
+});
+
+test("an in-flight old native clear completes before the replacement status is set", async () => {
+	const f = fixture();
+	const thread: OriginRef = { platform: "slack", kind: "thread", conversationId: "C1:1.000", parentId: "C1" };
+	f.status.arm(thread, "C1:1.002", "A");
+	await flush();
+	let release!: () => void;
+	let clearing = false;
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const setStatus = f.api.setThreadStatus;
+	f.api.setThreadStatus = async (channel, ts, text) => {
+		if (text === "") {
+			clearing = true;
+			await gate;
+		}
+		await setStatus(channel, ts, text);
+	};
+	const oldClear = f.status.clear(thread.conversationId, "A");
+	await flush();
+	expect(clearing).toBe(true);
+	f.status.arm(thread, "C1:1.003", "B");
+	await flush();
+	release();
+	await oldClear;
+	await flush();
+	expect(f.statuses.slice(-2)).toEqual([
+		"C1:1.000:",
+		`C1:1.000:${presenceStatusText({ phase: "queued", clock: 0, effort: -1 })}`,
+	]);
+	f.api.setThreadStatus = setStatus;
+	await f.status.clear(thread.conversationId, "B");
+});
+
 for (const reaction of [false, true]) {
 	for (const fails of [false, true]) {
 		test(`Slack delivery clears presence for reaction=${reaction} failure=${fails}`, async () => {
@@ -291,6 +517,7 @@ for (const reaction of [false, true]) {
 				};
 			}
 			const message = {
+				turnId: "turn",
 				origin,
 				text: "reply",
 				deliveryId: "delivery",
@@ -298,8 +525,9 @@ for (const reaction of [false, true]) {
 				...(reaction ? { reaction: { targetMessageId: "C1:1.001", emoji: "👍", emojiName: "thumbsup" } } : {}),
 			} as ChatMessagePayload;
 			await settleSlackDelivery(gateway, f.api, message, console, {
-				async clear(id) {
+				async clear(id, turnId) {
 					expect(id).toBe("C1");
+					expect(turnId).toBe("turn");
 					cleared++;
 					throw new Error("Slack cleanup failed");
 				},
@@ -315,7 +543,7 @@ for (const reaction of [false, true]) {
 
 test("Slack status line is never set for a root channel message, so no empty thread opens", async () => {
 	const f = fixture();
-	f.status.arm(origin, "C1:1.000");
+	f.status.arm(origin, "C1:1.000", "turn");
 	await flush();
 	// Presence still shows as reactions on the message itself.
 	expect(f.adds).toEqual(["C1:1.000:hourglass_flowing_sand"]);
@@ -323,8 +551,8 @@ test("Slack status line is never set for a root channel message, so no empty thr
 	await f.status.update(progress({ elapsedMs: 61_000, activity: { kind: "tool", label: "bash" } }));
 	const refresh = [...f.timers].find((timer) => timer.ms === WORKING_STATUS_REFRESH_MS);
 	await refresh?.fn();
-	await f.status.reassert(origin.conversationId);
-	await f.status.clear(origin.conversationId);
+	await f.status.reassert(origin.conversationId, "turn");
+	await f.status.clear(origin.conversationId, "turn");
 	await flush();
 	expect(f.statuses).toEqual([]);
 	expect(f.removes.length).toBeGreaterThan(0);
@@ -333,17 +561,17 @@ test("Slack status line is never set for a root channel message, so no empty thr
 test("a DM turn keeps the native status line on the triggering message", async () => {
 	const dm: OriginRef = { platform: "slack", kind: "dm", conversationId: "D1" };
 	const f = fixture();
-	f.status.arm(dm, "D1:1.000");
+	f.status.arm(dm, "D1:1.000", "turn");
 	await flush();
 	expect(f.statuses).toEqual([`D1:1.000:${presenceStatusText({ phase: "queued", clock: 0, effort: -1 })}`]);
 	f.tick(PRESENCE_MIN_SWAP_MS);
 	await f.status.update(progress({ origin: dm, elapsedMs: 61_000, activity: { kind: "tool", label: "bash" } }));
 	expect(f.statuses.at(-1)).toBe(`D1:1.000:${presenceStatusText({ phase: "tool", clock: 1, effort: 2 })}`);
 	// A mid-turn delivery clears the line; the DM entry re-asserts it.
-	await f.status.reassert(dm.conversationId);
+	await f.status.reassert(dm.conversationId, "turn");
 	await flush();
 	expect(f.statuses.at(-1)).toBe(`D1:1.000:${presenceStatusText({ phase: "tool", clock: 1, effort: 2 })}`);
-	await f.status.clear(dm.conversationId);
+	await f.status.clear(dm.conversationId, "turn");
 	await flush();
 	expect(f.statuses.at(-1)).toBe("D1:1.000:");
 	expect(f.removes.length).toBeGreaterThan(0);
@@ -353,10 +581,16 @@ test("Slack interim delivery keeps presence and re-sets the status line; the fin
 	const f = fixture();
 	const gateway = new Gateway();
 	const origin: OriginRef = { platform: "slack", kind: "thread", conversationId: "C1:1.000", parentId: "C1" };
-	f.status.arm(origin, "C1:1.002");
+	f.status.arm(origin, "C1:1.002", "turn");
 	await flush();
 	expect(f.statuses).toEqual([`C1:1.000:${presenceStatusText({ phase: "queued", clock: 0, effort: -1 })}`]);
-	const interim = { origin, text: "still working", deliveryId: "d1", final: false } as ChatMessagePayload;
+	const interim = {
+		turnId: "turn",
+		origin,
+		text: "still working",
+		deliveryId: "d1",
+		final: false,
+	} as ChatMessagePayload;
 	await settleSlackDelivery(gateway, f.api, interim, console, f.status);
 	await flush();
 	// Slack cleared the line when the interim posted; it is set again, markers stay.
@@ -364,6 +598,7 @@ test("Slack interim delivery keeps presence and re-sets the status line; the fin
 	expect(f.statuses[1]).toBe(f.statuses[0]);
 	expect(f.removes).toEqual([]);
 	const reaction = {
+		turnId: "turn",
 		origin,
 		text: "👍",
 		deliveryId: "d2",
@@ -377,7 +612,7 @@ test("Slack interim delivery keeps presence and re-sets the status line; the fin
 	await settleSlackDelivery(
 		gateway,
 		f.api,
-		{ origin, text: "done", deliveryId: "d3", final: true } as ChatMessagePayload,
+		{ turnId: "turn", origin, text: "done", deliveryId: "d3", final: true } as ChatMessagePayload,
 		console,
 		f.status,
 	);
@@ -405,13 +640,13 @@ test("Slack inbound arms presence for every engaged turn, on the triggering mess
 			const expected = engaged;
 			expect(f.adds).toEqual(expected ? ["C1:1.001:hourglass_flowing_sand"] : []);
 			expect(f.posts).toEqual([]);
-			await f.status.clear("C1");
+			await f.status.clear("C1", "turn");
 			gateway.sendEdit("C1:1.001", origin, "edited", engagement);
 			await flush();
 			expect(f.adds).toHaveLength(expected ? 2 : 0);
 			gateway.adoptClient(new Gateway());
 			expect(client.handlers.size).toBe(0);
-			await f.status.clear("C1");
+			await f.status.clear("C1", "turn");
 		}
 	}
 });
@@ -420,17 +655,17 @@ test("Slack presence: re-arming the same message keeps ownership of markers alre
 	// G5-PRESENCE-SAME-MESSAGE-REARM: an accepted edit re-arms the same id after a
 	// completed multi-marker swap; the old markers must still be ours to remove.
 	const f = fixture();
-	f.status.arm(origin, "C1:1.000");
+	f.status.arm(origin, "C1:1.000", "turn");
 	await flush();
 	f.tick(PRESENCE_MIN_SWAP_MS);
 	await f.status.update(progress({ elapsedMs: 61_000, activity: { kind: "tool", label: "bash" } }));
 	expect(names(f.adds)).toEqual(["hourglass_flowing_sand", "wrench", "clock1", "three"]);
 	// Same message re-armed: gradient restarts from queued; nothing is orphaned.
-	f.status.arm(origin, "C1:1.000");
+	f.status.arm(origin, "C1:1.000", "turn");
 	await flush();
 	expect(new Set(names(f.removes))).toEqual(new Set(["hourglass_flowing_sand", "wrench", "clock1", "three"]));
 	expect(names(f.adds).at(-1)).toBe("hourglass_flowing_sand");
-	await f.status.clear("C1");
+	await f.status.clear("C1", "turn");
 	// Every marker ever added was removed; the message is clean.
 	const balance = new Map<string, number>();
 	for (const name of names(f.adds)) balance.set(name as string, (balance.get(name as string) ?? 0) + 1);
@@ -451,7 +686,7 @@ test("Slack presence: a swap requested while a slow call is in flight is applied
 		await add(channel, ts, name);
 		if (name === "hourglass_flowing_sand") await gate;
 	};
-	f.status.arm(origin, "C1:1.000");
+	f.status.arm(origin, "C1:1.000", "turn");
 	await flush();
 	// The queued add is still pending; a phase change arrives past the window.
 	f.tick(PRESENCE_MIN_SWAP_MS);
@@ -465,13 +700,13 @@ test("Slack presence: a swap requested while a slow call is in flight is applied
 	// After the slow add resolved, the loop re-diffed and applied the tool phase.
 	expect(names(f.removes)).toEqual(["hourglass_flowing_sand"]);
 	expect(names(f.adds)).toEqual(["hourglass_flowing_sand", "wrench", "one"]);
-	await f.status.clear("C1");
+	await f.status.clear("C1", "turn");
 });
 
 test("Slack presence: cleanup failures are logged, never thrown, and never block delivery settlement", async () => {
 	// RT-SLACK-54 / CLEAN-G5-04.
 	const f = fixture();
-	f.status.arm(origin, "C1:1.000");
+	f.status.arm(origin, "C1:1.000", "turn");
 	await flush();
 	f.api.removeReaction = async () => {
 		throw new Error("remove denied");
@@ -480,7 +715,7 @@ test("Slack presence: cleanup failures are logged, never thrown, and never block
 	await settleSlackDelivery(
 		gateway,
 		f.api,
-		{ origin, text: "reply", deliveryId: "d", final: true } as ChatMessagePayload,
+		{ turnId: "turn", origin, text: "reply", deliveryId: "d", final: true } as ChatMessagePayload,
 		console,
 		f.status,
 	);
@@ -488,10 +723,115 @@ test("Slack presence: cleanup failures are logged, never thrown, and never block
 	expect(f.errors.some((line) => line.includes("remove denied"))).toBe(true);
 });
 
+test("Slack presence keeps failed removals owned and retries them after clear", async () => {
+	const f = fixture();
+	f.status.arm(origin, "C1:1.000", "turn");
+	await flush();
+	const remove = f.api.removeReaction;
+	let attempts = 0;
+	f.api.removeReaction = async (channel, ts, name) => {
+		attempts++;
+		if (attempts <= 2) throw new Error("remove unavailable");
+		await remove(channel, ts, name);
+	};
+	f.tick(PRESENCE_MIN_SWAP_MS);
+	await f.status.update(
+		progress({ elapsedMs: 20_000, toolCalls: 0, outputTokens: 0, activity: { kind: "writing", label: "writing" } }),
+	);
+	expect(attempts).toBe(1);
+	const gateway = new Gateway();
+	await settleSlackDelivery(
+		gateway,
+		f.api,
+		{ turnId: "turn", origin, text: "reply", deliveryId: "d", final: true } as ChatMessagePayload,
+		console,
+		f.status,
+	);
+	expect(gateway.requests).toEqual(["delivery.confirm"]);
+	expect(attempts).toBe(3); // The failed old marker and the new marker were both attempted.
+	expect(names(f.removes)).toEqual(["writing_hand"]);
+	const retry = [...f.timers].find((timer) => timer.ms === 5_000);
+	expect(retry).toBeDefined();
+	retry?.fn();
+	await flush();
+	expect(attempts).toBe(4);
+	expect(names(f.removes)).toEqual(["writing_hand", "hourglass_flowing_sand"]);
+	expect(f.timers.size).toBe(0);
+});
+
+test("Slack presence cleanup retries are bounded and survive a new turn", async () => {
+	const f = fixture();
+	f.status.arm(origin, "C1:1.000", "turn");
+	await flush();
+	const remove = f.api.removeReaction;
+	let attempts = 0;
+	f.api.removeReaction = async (channel, ts, name) => {
+		if (ts === "1.000") {
+			attempts++;
+			throw new Error("remove unavailable");
+		}
+		await remove(channel, ts, name);
+	};
+	await f.status.clear("C1", "turn");
+	expect(attempts).toBe(1);
+	f.status.arm(origin, "C1:2.000", "turn");
+	await flush();
+	for (let i = 0; i < 3; i++) {
+		const retry = [...f.timers].find((timer) => timer.ms === 5_000);
+		expect(retry).toBeDefined();
+		retry?.fn();
+		await flush();
+	}
+	expect(attempts).toBe(4);
+	expect([...f.timers].some((timer) => timer.ms === 5_000)).toBe(false);
+	await f.status.clear("C1", "turn");
+	expect(f.removes).toContain("C1:2.000:hourglass_flowing_sand");
+});
+
+test("Slack native status failures remain unconfirmed and are retried without spinning", async () => {
+	const f = fixture();
+	const thread: OriginRef = { platform: "slack", kind: "thread", conversationId: "C1:1.000", parentId: "C1" };
+	f.failStatus(new Error("status unavailable"));
+	f.status.arm(thread, "C1:1.002", "turn");
+	await flush();
+	expect(f.statuses).toEqual([]);
+	expect(f.errors.filter((line) => line.includes("status unavailable"))).toHaveLength(1);
+	f.failStatus(undefined);
+	const refresh = [...f.timers].find((timer) => timer.ms === WORKING_STATUS_REFRESH_MS);
+	await refresh?.fn();
+	await flush();
+	expect(f.statuses).toEqual([`C1:1.000:${presenceStatusText({ phase: "queued", clock: 0, effort: -1 })}`]);
+	f.failStatus(new Error("clear unavailable"));
+	await f.status.clear(thread.conversationId, "turn");
+	expect(f.errors.filter((line) => line.includes("clear unavailable"))).toHaveLength(1);
+	f.failStatus(undefined);
+	const retry = [...f.timers].find((timer) => timer.ms === 5_000);
+	expect(retry).toBeDefined();
+	retry?.fn();
+	await flush();
+	expect(f.statuses.at(-1)).toBe("C1:1.000:");
+	expect(f.timers.size).toBe(0);
+});
+
+test("Slack native status refresh failure keeps the last confirmed line owned for clear", async () => {
+	const f = fixture();
+	const thread: OriginRef = { platform: "slack", kind: "thread", conversationId: "C1:1.000", parentId: "C1" };
+	f.status.arm(thread, "C1:1.002", "turn");
+	await flush();
+	f.failStatus(new Error("refresh unavailable"));
+	const refresh = [...f.timers].find((timer) => timer.ms === WORKING_STATUS_REFRESH_MS);
+	await refresh?.fn();
+	await flush();
+	expect(f.errors.filter((line) => line.includes("refresh unavailable"))).toHaveLength(1);
+	f.failStatus(undefined);
+	await f.status.clear(thread.conversationId, "turn");
+	expect(f.statuses.at(-1)).toBe("C1:1.000:");
+});
+
 test("Slack presence: a retire during a pending add still removes what was shown, even if the add fails", async () => {
 	// G6-PRESENCE-FAILED-ADD-RETIRE.
 	const f = fixture();
-	f.status.arm(origin, "C1:1.000");
+	f.status.arm(origin, "C1:1.000", "turn");
 	await flush();
 	f.tick(PRESENCE_MIN_SWAP_MS);
 	let failSecond!: (error: Error) => void;
@@ -508,7 +848,7 @@ test("Slack presence: a retire during a pending add still removes what was shown
 	);
 	await flush();
 	// Retire while clock1's add is pending.
-	const cleared = f.status.clear("C1");
+	const cleared = f.status.clear("C1", "turn");
 	failSecond(new Error("add denied"));
 	await update;
 	await cleared;
@@ -532,7 +872,7 @@ test("Slack presence: a change arriving during the last pass is still applied", 
 		await add(channel, ts, name);
 		if (name === "hourglass_flowing_sand") await new Promise<void>((resolve) => (release = resolve));
 	};
-	f.status.arm(origin, "C1:1.000");
+	f.status.arm(origin, "C1:1.000", "turn");
 	await flush();
 	f.tick(PRESENCE_MIN_SWAP_MS);
 	const change = f.status.update(
@@ -544,14 +884,14 @@ test("Slack presence: a change arriving during the last pass is still applied", 
 	await flush();
 	expect(names(f.adds)).toEqual(["hourglass_flowing_sand", "writing_hand", "one"]);
 	expect(names(f.removes)).toEqual(["hourglass_flowing_sand"]);
-	await f.status.clear("C1");
+	await f.status.clear("C1", "turn");
 });
 
 test("Slack presence: periodic refresh keeps status alive across multiple turns", async () => {
 	const f = fixture();
 	// A threaded turn anchors the status line to the thread root.
 	const origin: OriginRef = { platform: "slack", kind: "thread", conversationId: "C1:1.000", parentId: "C1" };
-	f.status.arm(origin, "C1:1.002");
+	f.status.arm(origin, "C1:1.002", "turn");
 	await flush();
 	// Initial arm sets the queued marker and status line
 	expect(names(f.adds)).toEqual(["hourglass_flowing_sand"]);
@@ -589,7 +929,7 @@ test("Slack presence: periodic refresh keeps status alive across multiple turns"
 	expect(f.removes).toEqual([]);
 
 	// Explicitly clear the status
-	await f.status.clear("C1:1.000");
+	await f.status.clear("C1:1.000", "turn");
 	await flush();
 	// Now the markers should be removed
 	expect(f.removes.length).toBeGreaterThan(0);
@@ -597,7 +937,7 @@ test("Slack presence: periodic refresh keeps status alive across multiple turns"
 
 test("Slack presence: missing signals clear markers after stale window", async () => {
 	const f = fixture();
-	f.status.arm(origin, "C1:1.000");
+	f.status.arm(origin, "C1:1.000", "turn");
 	await flush();
 	const initialRemoves = f.removes.length;
 
@@ -628,7 +968,7 @@ test("Slack presence: missing signals clear markers after stale window", async (
 
 test("Slack presence: periodic signals reset stale window", async () => {
 	const f = fixture();
-	f.status.arm(origin, "C1:1.000");
+	f.status.arm(origin, "C1:1.000", "turn");
 	await flush();
 	const initialRemoves = f.removes.length;
 
@@ -664,7 +1004,7 @@ test("Slack presence: periodic signals reset stale window", async () => {
 
 test("Slack presence: 150s turn with first frame at 120s keeps status visible throughout", async () => {
 	const f = fixture();
-	f.status.arm(origin, "C1:1.000");
+	f.status.arm(origin, "C1:1.000", "turn");
 	await flush();
 	const initialRemoves = f.removes.length;
 
@@ -701,7 +1041,7 @@ test("Slack presence: 150s turn with first frame at 120s keeps status visible th
 	// Advance to 150s with final signal
 	f.tick(30_000);
 	// Final signal triggers clear, not update
-	await f.status.clear("C1");
+	await f.status.clear("C1", "turn");
 	await flush();
 	// Clear should remove all remaining markers
 	expect(f.removes.length).toBeGreaterThan(removesAfterActivity);
@@ -709,7 +1049,7 @@ test("Slack presence: 150s turn with first frame at 120s keeps status visible th
 
 test("Slack presence: explicit clear removes all markers exactly once", async () => {
 	const f = fixture();
-	f.status.arm(origin, "C1:1.000");
+	f.status.arm(origin, "C1:1.000", "turn");
 	await flush();
 	const initialAdds = f.adds.length;
 	const initialRemoves = f.removes.length;
@@ -723,7 +1063,7 @@ test("Slack presence: explicit clear removes all markers exactly once", async ()
 	expect(f.removes.length).toBe(initialRemoves);
 
 	// Now clear explicitly
-	await f.status.clear("C1");
+	await f.status.clear("C1", "turn");
 	await flush();
 	// All markers should be removed exactly once
 	const finalRemoves = f.removes.length;
