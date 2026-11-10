@@ -834,9 +834,12 @@ export interface WorkRetireParams {
  * so the next `work.run` for that name creates a fresh session. A lane with an
  * open attempt is never retired from under its turn.
  *
- * When `force` is true, skip attempt-state checks and require broker liveness
- * proving the session dead or disowned; if found dead, close as `host_lost` and
- * rebind the epoch. `allDead` retires all dead lanes at once (implies force).
+ * When `force` is true, skip attempt-state checks and apply one of two paths:
+ * 1. Broker liveness proof the session is dead or disowned: close as `host_lost` and rebind the epoch.
+ * 2. Live session with idle foreground activity, unknown broker op status, no running background jobs,
+ *    and an open attempt: settle the attempt as `operator_abandoned` and close the session. This abandonment
+ *    path may fail if close() errors and the session remains live (binding is preserved).
+ * `allDead` retires all dead lanes at once (implies force with path 1).
  */
 export type WorkRetireResult =
 	| {

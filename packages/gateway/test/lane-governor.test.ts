@@ -1303,3 +1303,64 @@ test("#778: forceRetire preserves binding when close fails and liveness is unkno
 	if (!binding) throw new Error("binding should still exist");
 	expect(binding.epoch).toBe(0); // NOT rotated, binding preserved
 });
+
+test("#778: forceRetire refuses abandonment when background jobs are running", async () => {
+	database = await Store.open(":memory:");
+	// Stuck lane: session is live but idle, attempt is open with idle broker activity and unknown status,
+	// BUT background jobs are still running
+	bind("stuck-with-jobs", NOW - 120_000, SESSION_ID);
+
+	const identity = laneJobIdentity("stuck-with-jobs");
+	let record: LaneJobRecord = createLaneJobRecord({
+		jobId: identity.jobId,
+		branch: "work/test",
+		worktreePath: "/tmp/worker-repo",
+		sessionId: SESSION_ID,
+		now: () => new Date(NOW - 120_000),
+	});
+	record = appendAttempt(record, {
+		opRef: "op-stuck-jobs-1",
+		sessionId: SESSION_ID,
+		startedAt: new Date(NOW - 120_000).toISOString(),
+	});
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }),
+	);
+
+	const port = new ScriptedSessionPort();
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		idleRetireMs: 60_000,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	// Setup broker evidence: live with idle activity and unknown status
+	port.setSessionState(SESSION_ID, { live: true, activityState: "idle" });
+
+	// Setup running background jobs
+	port.hostJobs.set(SESSION_ID, [
+		{ id: "job-1", type: "task", label: "async-subtask" },
+		{ id: "job-2", type: "bash", label: "background-script" },
+	]);
+
+	const result = await governor.forceRetire("stuck-with-jobs");
+
+	// Should REFUSE because there are running jobs
+	expect(result.retired).toBe(false);
+	expect(result.retired === false && result.reason).toMatch(/still live/);
+
+	// Should log abandonment refusal due to running jobs
+	expect(logs.some((line) => line.includes("lane_abandonment_refused"))).toBe(true);
+	expect(logs.some((line) => line.includes("running_jobs"))).toBe(true);
+
+	// Epoch should NOT be rotated (binding preserved)
+	const sessionKey = workSessionKey("stuck-with-jobs");
+	const binding = database.bindings.getSessionRecord(sessionKey);
+	if (!binding) throw new Error("binding should still exist");
+	expect(binding.epoch).toBe(0); // Unchanged
+});
+
+

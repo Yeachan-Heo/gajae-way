@@ -446,10 +446,12 @@ export class LaneGovernor {
 			// For abandonment, we need broker evidence:
 			// 1. Session activity state is idle
 			// 2. Op status from broker is unknown with receiptState unknown (not in_flight, not accepted)
+			// 3. No background jobs (async tasks, bash) still running in the session host
 			const lastAttempt = record?.attempts.at(-1);
 			let canRetireAsAbandonment = false;
 			let brokerActivityIdle = false;
 			let opStatusUnknown = false;
+			let runningJobsEmpty = true;
 			if (liveness.live === true && !liveness.disowned && isIdleEnough && isOpenAttempt && lastAttempt) {
 				// Check broker activity state
 				try {
@@ -482,23 +484,56 @@ export class LaneGovernor {
 					opStatusUnknown = false;
 				}
 
-				// Allow abandonment only if both broker conditions are met
-				canRetireAsAbandonment = brokerActivityIdle && opStatusUnknown;
+				// Check for running background jobs (async tasks, bash) that would be terminated by close
+				if (brokerActivityIdle && opStatusUnknown && this.#port.runningJobs) {
+					try {
+						const jobs = await this.#port.runningJobs({ sessionId: lane.sessionId, repo });
+						runningJobsEmpty = jobs.length === 0;
+						if (!runningJobsEmpty) {
+							this.#log(`lane_abandonment_refused name=${name} session=${lane.sessionId} reason=running_jobs count=${jobs.length}`);
+						}
+					} catch (error) {
+						const detail = sanitizeDiagnostic(diagnostic(error));
+						this.#log(`lane_running_jobs_check_failed name=${name} session=${lane.sessionId} reason=${detail}`);
+						// Conservative: cannot confirm jobs are empty, refuse abandonment
+						runningJobsEmpty = false;
+					}
+				}
+
+				// Allow abandonment only if all broker conditions and job status are met
+				canRetireAsAbandonment = brokerActivityIdle && opStatusUnknown && runningJobsEmpty;
 			}
 
 			// Allow retiring if:
 			// 1. Session is dead/disowned (normal case), OR
 			// 2. Session is live but idle with broker confirmation (operator abandonment), OR
 			// 3. Session is live but idle with an attempt already settled as operator_abandoned (may be retrying close after transient failure)
+			//    But only if there are no running jobs to protect independent background work.
 			const sessionIsDeadOrDisowned = liveness.live === false || liveness.disowned;
 			// For retry-after-transient-close-failure, only allow if the attempt was settled as operator_abandoned,
 			// not for other end reasons like session_dead or session_disowned from a reaped wait or other failure.
 			let isAlreadySettledAbandon = false;
+			let retryRunningJobsEmpty = true;
 			if (lastAttempt && lastAttempt.endedAt && liveness.live === true && !liveness.disowned && isIdleEnough) {
 				// Check if the attempt was settled with operator_abandoned reason
 				const runtime = this.#database.work.workAttemptGet(lastAttempt.opRef);
 				if (runtime && runtime.terminal?.reasonCode === "operator_abandoned") {
-					isAlreadySettledAbandon = true;
+					// Before allowing retry, verify no new running jobs have started since settlement
+					if (this.#port.runningJobs) {
+						try {
+							const jobs = await this.#port.runningJobs({ sessionId: lane.sessionId, repo });
+							retryRunningJobsEmpty = jobs.length === 0;
+							if (!retryRunningJobsEmpty) {
+								this.#log(`lane_retry_abandon_refused name=${name} session=${lane.sessionId} reason=running_jobs count=${jobs.length}`);
+							}
+						} catch (error) {
+							const detail = sanitizeDiagnostic(diagnostic(error));
+							this.#log(`lane_retry_running_jobs_check_failed name=${name} session=${lane.sessionId} reason=${detail}`);
+							// Conservative: cannot confirm jobs are empty, refuse retry
+							retryRunningJobsEmpty = false;
+						}
+					}
+					isAlreadySettledAbandon = retryRunningJobsEmpty;
 				}
 			}
 
