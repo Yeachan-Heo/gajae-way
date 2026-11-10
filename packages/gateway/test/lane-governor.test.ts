@@ -10,9 +10,11 @@ import {
 	createLaneJobRecord,
 	type LaneJobRecord,
 	newOpRef,
+	parseLaneJobRecord,
 } from "@gajae-gateway/subsession";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
 import { BrokerAuthorityError, Store } from "../src/store";
+import type { WorkAttemptSettlement, WorkAttemptTerminalEvidence } from "../src/store/groups/work";
 import { ScriptedSessionPort } from "./session-port.fake";
 
 const NOW = Date.parse("2026-09-01T12:00:00.000Z");
@@ -1172,7 +1174,7 @@ test("#778: forceRetire with close failure checks fresh liveness before rotating
 	bind("dead-close-fail", NOW - 120_000, SESSION_ID);
 
 	const identity = laneJobIdentity("dead-close-fail");
-	let record: LaneJobRecord = createLaneJobRecord({
+	const record: LaneJobRecord = createLaneJobRecord({
 		jobId: identity.jobId,
 		branch: "work/test",
 		worktreePath: "/tmp/worker-repo",
@@ -1361,4 +1363,152 @@ test("#778: forceRetire refuses abandonment when background jobs are running", a
 	const binding = database.bindings.getSessionRecord(sessionKey);
 	if (!binding) throw new Error("binding should still exist");
 	expect(binding.epoch).toBe(0); // Unchanged
+});
+
+test("#778: forceRetire retries after close failure without requiring full idle period", async () => {
+	database = await Store.open(":memory:");
+	// Stuck lane: session is live but idle, attempt is open with idle broker activity and unknown status
+	bind("retry-close-fail", NOW - 120_000, SESSION_ID);
+
+	const identity = laneJobIdentity("retry-close-fail");
+	let record: LaneJobRecord = createLaneJobRecord({
+		jobId: identity.jobId,
+		branch: "work/test",
+		worktreePath: "/tmp/worker-repo",
+		sessionId: SESSION_ID,
+		now: () => new Date(NOW - 120_000),
+	});
+	record = appendAttempt(record, {
+		opRef: "op-retry-1",
+		sessionId: SESSION_ID,
+		startedAt: new Date(NOW - 120_000).toISOString(),
+	});
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }),
+	);
+
+	const port = new ScriptedSessionPort();
+	const logs: string[] = [];
+	const settledAttempts: Array<{ name: string; opRef: string; reason: string; endedAt: string }> = [];
+
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		idleRetireMs: 60_000,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	// Mock settlement: mark the attempt as settled with operator_abandoned reason
+	governor.setForceRetireSettlement((name, opRef, reason, endedAt) => {
+		settledAttempts.push({ name, opRef, reason, endedAt });
+		// Simulate the settlement by marking the attempt as ended in the job record
+		const job = database.work.laneJobJsonByLaneKey(identity.laneKey);
+		const runtime = database.work.workAttemptGet(opRef);
+		if (job && runtime) {
+			const parsed = parseLaneJobRecord(job);
+			const updated = closeAttempt({
+				record: parsed,
+				opRef,
+				endState: "attempt_ended",
+				errorCode: reason,
+				endedAt,
+			});
+			// Update both job record and work runtime
+			database.transaction((tx) => {
+				database.work.putLaneJob(tx, {
+					...updated,
+					laneKey: identity.laneKey,
+					json: JSON.stringify(updated),
+				});
+				// Update work runtime with terminal evidence
+				const terminal: WorkAttemptTerminalEvidence = {
+					kind: "local",
+					observedAt: endedAt,
+					reasonCode: reason,
+				};
+				const settlement: WorkAttemptSettlement = {
+					decision: "no_target",
+					settledAt: endedAt,
+					terminal,
+				};
+				const result = database.work.workAttemptSettle(tx, opRef, runtime.version, updated, settlement);
+				if (!result) {
+					throw new Error(`settlement failed for ${opRef}`);
+				}
+			});
+		}
+		return true;
+	});
+
+	// Setup broker evidence: live with idle activity and unknown status
+	port.setSessionState(SESSION_ID, { live: true, activityState: "idle" });
+
+	// FIRST ATTEMPT: forceRetire with transient close failure
+	// Monkey-patch close to fail on first call
+	const originalClose = port.close.bind(port);
+	let closeCount = 0;
+	port.close = async (input: { sessionId: string; repo: string }) => {
+		if (input.sessionId === SESSION_ID && closeCount === 0) {
+			closeCount++;
+			throw new Error("close() simulated transient failure");
+		}
+		closeCount++;
+		return originalClose(input);
+	};
+
+	const result1 = await governor.forceRetire("retry-close-fail");
+	expect(result1.retired).toBe(false);
+	if (!result1.retired) {
+		expect(result1.reason).toContain("session close failed");
+	}
+	expect(settledAttempts).toHaveLength(1);
+	expect(settledAttempts[0].reason).toBe("operator_abandoned");
+
+	// Binding preserved with epoch unchanged
+	const sessionKey = workSessionKey("retry-close-fail");
+	const binding1 = database.bindings.getSessionRecord(sessionKey);
+	if (!binding1) throw new Error("binding should still exist");
+	expect(binding1.epoch).toBe(0);
+
+	// SECOND ATTEMPT: Immediate retry with fresh governor (simulating a retry after transient failure)
+	// The key test: with only 1 second elapsed (not the 60s idle requirement),
+	// the retry should still succeed because the attempt is already settled as operator_abandoned.
+	// Before the fix, this would fail because isIdleEnough would be false.
+
+	const governor2 = new LaneGovernor({
+		database,
+		sessionPort: port,
+		idleRetireMs: 60_000,
+		now: () => NOW + 1000, // Only 1 second has passed, not 60 seconds
+		log: (line) => logs.push(line),
+	});
+
+	governor2.setForceRetireSettlement((_name, _opRef, _reason, _endedAt) => {
+		return true;
+	});
+
+	const result2 = await governor2.forceRetire("retry-close-fail");
+	// This should SUCCEED despite only 1 second elapsed
+	// because the attempt is already settled as operator_abandoned
+	if (!result2.retired) {
+		console.log("\n===== DEBUG: Second forceRetire failed =====");
+		console.log("Reason:", result2.reason);
+		const lane = governor2.activeLanes().find((l) => l.name === "retry-close-fail");
+		console.log("Lane state:", {
+			name: lane?.name,
+			idleMs: lane?.idleMs,
+			attemptOpen: lane?.attemptOpen,
+		});
+		const runtime = database.work.workAttemptGet("op-retry-1");
+		console.log("Runtime terminal:", runtime?.terminal);
+		console.log("Runtime settledAt:", runtime?.settledAt);
+		console.log("Recent logs:", logs.filter((l) => l.includes("retry") || l.includes("retry-close")).join("\n"));
+	}
+	expect(result2.retired).toBe(true);
+
+	// Epoch should be rotated
+	const binding2 = database.bindings.getSessionRecord(sessionKey);
+	if (!binding2) throw new Error("binding should still exist");
+	expect(binding2.epoch).toBe(1);
 });

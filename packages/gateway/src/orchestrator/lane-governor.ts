@@ -514,9 +514,11 @@ export class LaneGovernor {
 			const sessionIsDeadOrDisowned = liveness.live === false || liveness.disowned;
 			// For retry-after-transient-close-failure, only allow if the attempt was settled as operator_abandoned,
 			// not for other end reasons like session_dead or session_disowned from a reaped wait or other failure.
+			// Do not require isIdleEnough for retry: settlement's activity update has made the lane appear newly active.
+			// Instead, revalidate current liveness and running jobs; the abandonment intent is persisted in the terminal reason.
 			let isAlreadySettledAbandon = false;
 			let retryRunningJobsEmpty = true;
-			if (lastAttempt && lastAttempt.endedAt && liveness.live === true && !liveness.disowned && isIdleEnough) {
+			if (lastAttempt && lastAttempt.endedAt && liveness.live === true && !liveness.disowned) {
 				// Check if the attempt was settled with operator_abandoned reason
 				const runtime = this.#database.work.workAttemptGet(lastAttempt.opRef);
 				if (runtime && runtime.terminal?.reasonCode === "operator_abandoned") {
