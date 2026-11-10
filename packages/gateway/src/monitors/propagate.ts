@@ -1867,7 +1867,11 @@ export class MonitorPropagator {
 							this.#emitStage(row, "authored_no_delivery");
 						}
 					}
-					if (noDeliveryRecorded) this.#recordReadinessSuccess(sessionOriginKey);
+					if (noDeliveryRecorded) {
+						this.#recordReadinessSuccess(sessionOriginKey);
+						// Issue #4: clear escalation state on successful targetless dispatch
+						this.#clearConsecutiveFailedEventCount(sessionOriginKey, monitor.monitorId);
+					}
 					return;
 				}
 				// Fenced delivery admission: the ledger insert is conditional on every
