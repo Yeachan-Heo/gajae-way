@@ -9,6 +9,7 @@ import { MonitorRegistry } from "../src/monitors/registry";
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
 import type { SessionPort } from "../src/orchestrator/session-port";
 import { Store } from "../src/store";
+import { sessionPortFromScript } from "./session-port.fake";
 
 test("repeated bind timeouts on one origin across consecutive events trigger rebind (issue #780)", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-bind-rebind-"));
@@ -507,26 +508,36 @@ test("a successful dispatch after a failure streak records zero readiness failur
 			originKey: string;
 		}> = [];
 
-		const sessionPort: Partial<SessionPort> = {
-			bind: async (input) => {
-				return {
-					sessionId: `session-epoch-${input.epoch}`,
-					originKey: input.originKey,
-					epoch: input.epoch,
-					repo: input.repo,
-					startupModelApplied: false,
-				};
+		let sendAttempts = 0;
+		const port = sessionPortFromScript({
+			respond: async (_sessionId: string, text: string) => {
+				sendAttempts++;
+				// First event fails (authoring throws)
+				if (sendAttempts === 1) {
+					throw new Error("simulated authoring failure");
+				}
+				// Second event succeeds with valid monitor authoring response
+				// Extract event IDs from the prompt JSON array (at the end of the text)
+				const jsonMatch = text.match(/\[.*\]$/s);
+				if (!jsonMatch) throw new Error("No event array in prompt");
+				const events = JSON.parse(jsonMatch[0]) as Array<{ eventId: string }>;
+				const authored = events.map(({ eventId }) => ({
+					eventId,
+					note: "dispatched successfully",
+				}));
+				return JSON.stringify(authored);
 			},
-			runExclusive: async (_, fn) => fn(),
-		};
+		});
 
 		const pipeline = new MonitorPropagator({
 			database,
 			registry,
-			sessionPort: sessionPort as SessionPort,
+			sessionPort: port,
 			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
 			delivery: new DeliveryService(database),
 			emit: () => {},
+			deliver: () => {}, // Non-null delivery target needed to trigger #clearConsecutiveFailedEventCount
+			ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "test-owner" } },
 			repo: join(home, "workspace"),
 			model: undefined,
 			serviceTier: undefined,
@@ -535,23 +546,29 @@ test("a successful dispatch after a failure streak records zero readiness failur
 			},
 		});
 
-		// Submit an event - it will fail because authoring is not mocked
-		const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.streak_cleared_readiness", {});
+		// Submit first event - will fail because authoring throws
+		pipeline.submit(monitor.monitorId, "test.streak_cleared_readiness", {});
+		// Submit second event - will succeed because respond completes with valid response
+		pipeline.submit(monitor.monitorId, "test.streak_cleared_readiness", {});
 
-		// Wait for dispatch attempt
-		for (let i = 0; i < 100; i++) {
-			const row = database.monitors.eventRows().find((r) => r.event_id === eventId);
-			if (row?.stage === "failed") break;
-			await Bun.sleep(10);
-		}
+		// Drain to ensure all dispatches complete
+		await pipeline.drain();
 
-		// Clear the failure streak manually by resetting the counter
-		// (since all events fail without mocked authoring, we simulate the clear via direct count reset)
-		const key = `monitor_failed_event_count:${monitor.monitorId}`;
-		database.core.metaDelete(key);
+		// Verify both events are in the database
+		const rows = database.monitors.eventRows();
+		expect(rows.length).toBeGreaterThanOrEqual(2);
+
+		// First event should have failed
+		const failedEvents = rows.filter((r) => r.stage === "failed");
+		expect(failedEvents.length).toBeGreaterThanOrEqual(1);
+
+		// Second event should have reached authored_no_delivery or authored
+		const authoredEvents = rows.filter((r) => ["authored_no_delivery", "authored"].includes(r.stage));
+		expect(authoredEvents.length).toBeGreaterThanOrEqual(1);
 
 		// Verify that streak-cleared does NOT create a readiness failure
-		// (it should only log to console.error as an informational diagnostic)
+		// The buggy version calls onReadinessFailure with code="monitor_failed_event_streak_cleared"
+		// The fix removes that call - streak clearing should only log, not record a readiness failure
 		const streakClearedFailures = readinessFailures.filter((f) => f.code === "monitor_failed_event_streak_cleared");
 		expect(streakClearedFailures.length).toBe(0);
 
