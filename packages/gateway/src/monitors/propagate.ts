@@ -1399,21 +1399,15 @@ export class MonitorPropagator {
 								}
 								safety.bindTimeoutFailures++;
 								this.#safety.set(sessionOriginKey, safety);
-								this.#recordReadinessFailure({
-									code: "monitor_bind_timeout",
-									detail: `bind timeout: count=${safety.bindTimeoutFailures}/${MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD} epoch=${boundEpoch}`,
-									originKey: sessionOriginKey,
-									at: this.#now(),
-								});
+								console.error(
+									`monitor bind timeout for ${sessionOriginKey}: count=${safety.bindTimeoutFailures}/${MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD} epoch=${boundEpoch}`,
+								);
 
 								// If threshold reached, rebind to a fresh epoch (issue #780).
 								if (safety.bindTimeoutFailures >= MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD) {
-									this.#recordReadinessFailure({
-										code: "monitor_bind_timeout_rebind",
-										detail: `bind timeout rebind triggered: epoch=${boundEpoch} -> ${boundEpoch + 1}`,
-										originKey: sessionOriginKey,
-										at: this.#now(),
-									});
+									console.error(
+										`monitor bind timeout rebind triggered for ${sessionOriginKey}: epoch=${boundEpoch} -> ${boundEpoch + 1}`,
+									);
 									// Rebind to fresh epoch: increment it and try again.
 									boundEpoch++;
 									safety.bindTimeoutFailures = 0; // Reset counter for new epoch
@@ -2266,24 +2260,18 @@ export class MonitorPropagator {
 		const state = this.#safetyState(sessionOriginKey);
 		const consecutiveCount = this.#countConsecutiveFailures(monitorId);
 
-		this.#recordReadinessFailure({
-			code: "monitor_failed_event",
-			detail: `consecutive failures: count=${consecutiveCount}/${MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD}`,
-			originKey: sessionOriginKey,
-			at: this.#now(),
-		});
+		console.error(
+			`monitor failed event for ${sessionOriginKey} (monitor ${monitorId}): consecutive_failures=${consecutiveCount}/${MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD}`,
+		);
 
 		// Escalate when threshold reached and not yet escalated for this streak
 		if (consecutiveCount >= MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD && !state.escalatedForCurrentStreak) {
 			const escalationKey = monitorEscalationKey(sessionOriginKey, monitorId);
 			const alreadyEscalated = this.#database.core.metaGet(escalationKey) !== undefined;
 			if (!alreadyEscalated) {
-				this.#recordReadinessFailure({
-					code: "monitor_failed_event_escalation",
-					detail: `escalation triggered: consecutive_failures=${consecutiveCount}`,
-					originKey: sessionOriginKey,
-					at: this.#now(),
-				});
+				console.error(
+					`monitor escalation triggered for ${sessionOriginKey} (monitor ${monitorId}): consecutive_failures=${consecutiveCount}`,
+				);
 				// Mark escalation as sent durably
 				this.#database.core.metaSet(escalationKey, JSON.stringify({ escalatedAt: this.#now(), monitorId }));
 				state.escalatedForCurrentStreak = true;
@@ -2361,12 +2349,9 @@ export class MonitorPropagator {
 		const consecutiveCount = this.#countConsecutiveFailures(monitorId);
 
 		if (consecutiveCount === 0) {
-			this.#recordReadinessFailure({
-				code: "monitor_failed_event_streak_cleared",
-				detail: "failure streak cleared: previous failures now recovered",
-				originKey: sessionOriginKey,
-				at: this.#now(),
-			});
+			console.error(
+				`monitor failure streak cleared for ${sessionOriginKey} (monitor ${monitorId}): previous failures now recovered`,
+			);
 			// Clear durable escalation flag when streak is cleared
 			const escalationKey = monitorEscalationKey(sessionOriginKey, monitorId);
 			this.#database.core.metaDelete(escalationKey);
