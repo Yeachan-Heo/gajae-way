@@ -2,14 +2,14 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { GatewayConfig } from "../../gateway/src/config";
-import { startUnixServer } from "../../gateway/src/server/server";
-import { Store } from "../../gateway/src/store";
-import { attachTestBrokerOwnership, ScriptedSessionPort } from "../../gateway/test/session-port.fake";
+import { SlackWebApi } from "../../adapter-slack/src/api";
+import { type SlackInboundMessage, startSlackAdapter } from "../../adapter-slack/src/main";
+import type { WebSocketLike } from "../../adapter-slack/src/socket";
 import { GajaewayClient } from "../../sdk/src/client";
-import { SlackWebApi } from "../src/api";
-import { type SlackInboundMessage, startSlackAdapter } from "../src/main";
-import type { WebSocketLike } from "../src/socket";
+import type { GatewayConfig } from "../src/config";
+import { startUnixServer } from "../src/server/server";
+import { Store } from "../src/store";
+import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 class CommandApi extends SlackWebApi {
 	readonly posts: { channel: string; text: string; threadTs?: string }[] = [];
