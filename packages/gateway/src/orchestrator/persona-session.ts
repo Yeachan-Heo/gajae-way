@@ -20,6 +20,7 @@ import {
 	DEFAULT_SESSIONS_BUSY_STALL_MS,
 	DEFAULT_SESSIONS_IDLE_RETIRE_MS,
 	DEFAULT_SESSIONS_MAX_LIVE_HOSTS,
+	DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS,
 	DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
 	type GjcModelSelection,
 	type GjcServiceTier,
@@ -151,6 +152,14 @@ function providerTransportRetryAttempt(
 /** An escalated hold (#686) whose late answer is still wanted; restored on adoption after a restart. */
 function escalatedHoldKey(opRef: string): string {
 	return `escalated-hold:${opRef}`;
+}
+
+/**
+ * When an escalated retired hold was first seen with its host provably not live.
+ * Cleared when the host is seen live or the op reports a readable status again.
+ */
+function retiredHoldDeadSinceKey(opRef: string): string {
+	return `retired-hold-dead-since:${opRef}`;
 }
 
 /** Track relay unavailable events for a turn to detect unresponsive relays even on live hosts (#766). */
@@ -291,6 +300,7 @@ function completeInboundTurn(
 	if (changed === 1) store.core.metaDelete(escalatedHoldKey(opRef));
 	// Clean up relay unavailability tracker when turn completes (#766)
 	if (changed === 1) store.core.metaDelete(relayUnavailableTrackerKey(opRef));
+	if (changed === 1) store.core.metaDelete(retiredHoldDeadSinceKey(opRef));
 	return changed;
 }
 
@@ -671,6 +681,8 @@ export interface PersonaSessionManagerOptions {
 	readonly busyStallMs?: number;
 	/** Unknown-state turn on a dead host holds its origin at most this long; default DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS (#686). */
 	readonly unresolvedHoldMs?: number;
+	/** Escalated retired hold on a host not live this long is closed; default DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS. */
+	readonly retiredHoldAbandonMs?: number;
 	/** Called when a reverse request from the SDK host arrives. */
 	readonly onReverseRequest?: (input: {
 		originKey: string;
@@ -734,6 +746,7 @@ export class PersonaSessionManager {
 	#hostIdleRetireMs: number;
 	#busyStallMs: number;
 	#unresolvedHoldMs: number;
+	#retiredHoldAbandonMs: number;
 	#draining = false;
 	#restartDrainId: string | undefined;
 	#stopped = false;
@@ -773,6 +786,11 @@ export class PersonaSessionManager {
 			options.unresolvedHoldMs,
 			DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
 			"unresolvedHoldMs",
+		);
+		this.#retiredHoldAbandonMs = positiveInteger(
+			options.retiredHoldAbandonMs,
+			DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS,
+			"retiredHoldAbandonMs",
 		);
 		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
 		this.#onSloEvent = options.onSloEvent;
@@ -855,6 +873,11 @@ export class PersonaSessionManager {
 			DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
 			"unresolvedHoldMs",
 		);
+		this.#retiredHoldAbandonMs = positiveInteger(
+			config?.retiredHoldAbandonMs,
+			DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS,
+			"retiredHoldAbandonMs",
+		);
 	}
 
 	get busyStallMs(): number {
@@ -863,6 +886,10 @@ export class PersonaSessionManager {
 
 	get unresolvedHoldMs(): number {
 		return this.#unresolvedHoldMs;
+	}
+
+	get retiredHoldAbandonMs(): number {
+		return this.#retiredHoldAbandonMs;
 	}
 
 	get maxLiveHosts(): number {
@@ -4270,6 +4297,7 @@ class OriginActor {
 				await this.#dispatchNext();
 				return;
 			}
+			if (await this.#abandonDeadRetiredHold(bound)) return;
 			this.#logRecoveryHoldOnce(bound.turn, "status_unavailable", `detail=${safeDiagnostic(error)}`);
 			// A turn no relay will announce the end of must not wait for the 60 s
 			// sweep after one unreadable status: keep rechecking at the bounded cadence.
@@ -4301,6 +4329,8 @@ class OriginActor {
 				await this.#dispatchNext();
 				return;
 			}
+			// Only an unknown op is eligible: an in-flight one may still be mutating the workspace (#772).
+			if (report.status.status === "unknown" && (await this.#abandonDeadRetiredHold(bound))) return;
 			const reason =
 				report.status.status === "unknown" ? "operation_state_unknown" : "relay_unavailable_holds_in_flight";
 			this.#logRecoveryHoldOnce(bound.turn, reason, `sweeps=${count}`);
@@ -4308,6 +4338,7 @@ class OriginActor {
 			return;
 		}
 		this.#holdSweeps.delete(bound.turn.opRef);
+		this.#clearRetiredHoldDeadSince(bound.turn.opRef);
 		if (this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state === "bound")
 			this.#manager.database.transaction((tx) => this.#manager.database.inbox.turnAccept(tx, bound.turn.opRef));
 		if (!isTerminalStatus(report.status.status)) {
@@ -4847,6 +4878,71 @@ class OriginActor {
 		}
 		await this.#notifySettled(bound);
 		await this.#settleAfterTerminal(bound);
+	}
+
+	/**
+	 * Closes an escalated retired hold (#686) whose host has stayed provably not
+	 * live for `retiredHoldAbandonMs` while its operation state stayed unknown or
+	 * unreadable. #718 keeps such a hold open so a late answer can still land,
+	 * but a host that is gone cannot produce one: the hold only adds per-minute
+	 * status and liveness CLI spawns, and on a long-lived gateway those piled up
+	 * until the broker stopped answering live turns. The user was already told at
+	 * escalation and the claimed inputs are closed, so no second notice is sent
+	 * and nothing is resent. A host seen live, or a readable status, restarts the
+	 * window. Liveness is read only when the window opens and when it closes.
+	 */
+	async #abandonDeadRetiredHold(bound: BoundTurn): Promise<boolean> {
+		if (!bound.retired || !bound.answerWanted) return false;
+		const database = this.#manager.database;
+		const opRef = bound.turn.opRef;
+		if (database.core.metaGet(escalatedHoldKey(opRef)) === undefined) return false;
+		// An escalation notice not yet handed to delivery keeps its trigger, as retention does.
+		if (database.core.metaGet(escalationNoticeKey(this.originKey, opRef)) !== undefined) return false;
+		const now = this.#manager.now();
+		const deadSinceKey = retiredHoldDeadSinceKey(opRef);
+		const recorded = database.core.metaGet(deadSinceKey);
+		const deadSince = recorded === undefined ? Number.NaN : Number.parseInt(recorded, 10);
+		if (Number.isFinite(deadSince) && now - deadSince < this.#manager.retiredHoldAbandonMs) return false;
+		const host = await this.#bindingState(bound.sessionId);
+		if (host.live === true && host.disowned !== true) {
+			// A live host may still produce the answer: the window starts over.
+			this.#clearRetiredHoldDeadSince(opRef);
+			return false;
+		}
+		// Unanswerable liveness proves nothing either way: keep the window and ask
+		// again next sweep, so a busy broker can neither close it nor reset it.
+		if (host.live !== false && host.disowned !== true) return false;
+		if (!Number.isFinite(deadSince)) {
+			database.core.metaSet(deadSinceKey, String(now));
+			return false;
+		}
+		const open = database.inbox.turnRow(opRef);
+		if (open?.state !== "pending" || (open.turn_state !== "accepted" && open.turn_state !== "bound")) {
+			this.#clearRetiredHoldDeadSince(opRef);
+			await this.#forgetClosed(bound);
+			return true;
+		}
+		bound.tail?.setTurnRunning(false);
+		this.#flushStaleOutput(bound, "session_gone");
+		await bound.tail?.close();
+		const completed = database.transaction((tx) => {
+			const changed = completeInboundTurn(database, tx, opRef, "turn_failed");
+			database.core.metaDelete(deadSinceKey);
+			return changed;
+		});
+		for (const held of database.inbox.steersHeld(opRef)) await this.#abandonHeldSteer(held, opRef, bound);
+		this.#manager.log(
+			`retired_hold_abandoned origin=${this.originKey} epoch=${bound.epoch} opRef=${opRef} session=${bound.sessionId} notLiveMs=${now - deadSince} reason=host_not_live`,
+			"warn",
+		);
+		if (completed === 1) await this.#notifySettled(bound);
+		await this.#forgetClosed(bound);
+		return true;
+	}
+
+	#clearRetiredHoldDeadSince(opRef: string): void {
+		const key = retiredHoldDeadSinceKey(opRef);
+		if (this.#manager.database.core.metaGet(key) !== undefined) this.#manager.database.core.metaDelete(key);
 	}
 
 	/** Drops actor tracking for a turn that is already closed durably, then serves anything queued behind it. */

@@ -1025,6 +1025,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		hostIdleRetireMs: options.config.sessions?.idleRetireMs,
 		busyStallMs: options.config.sessions?.busyStallMs,
 		unresolvedHoldMs: options.config.sessions?.unresolvedHoldMs,
+		retiredHoldAbandonMs: options.config.sessions?.retiredHoldAbandonMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
 		brokerAvailable: () => options.broker?.isAvailable ?? true,
 		// biome-ignore lint/style/noNonNullAssertion: broker is non-null when lambda is called

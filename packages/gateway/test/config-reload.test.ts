@@ -238,6 +238,17 @@ test("sessions host limits parse, omit absent fields, and reload live", async ()
 	expect(
 		parseConfigFile({ schemaVersion: 1, sessions: { busyStallMs: 86_400_000, unresolvedHoldMs: 60_000 } }).sessions,
 	).toEqual({ busyStallMs: 86_400_000, unresolvedHoldMs: 60_000 });
+	// Dead retired hold abandonment window, at both ends of its range.
+	expect(parseConfigFile({ schemaVersion: 1, sessions: { retiredHoldAbandonMs: 3_600_000 } }).sessions).toEqual({
+		retiredHoldAbandonMs: 3_600_000,
+	});
+	expect(parseConfigFile({ schemaVersion: 1, sessions: { retiredHoldAbandonMs: 2_592_000_000 } }).sessions).toEqual({
+		retiredHoldAbandonMs: 2_592_000_000,
+	});
+	for (const retiredHoldAbandonMs of [3_599_999, 2_592_000_001, 1.5])
+		expect(() => parseConfigFile({ schemaVersion: 1, sessions: { retiredHoldAbandonMs } })).toThrow(
+			"sessions.retiredHoldAbandonMs must be an integer",
+		);
 	const path = await home();
 	await Bun.write(
 		join(path, "config.json"),
