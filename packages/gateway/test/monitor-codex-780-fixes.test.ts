@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
+import { crypto } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatMessagePayload } from "@gajae-gateway/protocol";
-import { crypto } from "node:crypto";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
@@ -214,7 +214,7 @@ test("fix #5 & #6: failure counting skips unfinished events and uses bounded que
 		// Query 2x threshold events from the monitor
 		const recentEvents = database.monitors.eventRows(monitor.monitorId, "newest", false, 6);
 		expect(recentEvents.length).toBeLessThanOrEqual(6); // Bounded by limit
-		
+
 		// Verify all returned events are from this monitor
 		for (const event of recentEvents) {
 			expect(event.monitor_id).toBe(monitor.monitorId);
