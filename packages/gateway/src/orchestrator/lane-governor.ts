@@ -489,14 +489,18 @@ export class LaneGovernor {
 			// Allow retiring if:
 			// 1. Session is dead/disowned (normal case), OR
 			// 2. Session is live but idle with broker confirmation (operator abandonment), OR
-			// 3. Session is live but idle with an attempt already settled (may be retrying close after transient failure)
+			// 3. Session is live but idle with an attempt already settled as operator_abandoned (may be retrying close after transient failure)
 			const sessionIsDeadOrDisowned = liveness.live === false || liveness.disowned;
-			const isAlreadySettledAbandon =
-				lastAttempt &&
-				lastAttempt.endedAt &&
-				liveness.live === true &&
-				!liveness.disowned &&
-				isIdleEnough;
+			// For retry-after-transient-close-failure, only allow if the attempt was settled as operator_abandoned,
+			// not for other end reasons like session_dead or session_disowned from a reaped wait or other failure.
+			let isAlreadySettledAbandon = false;
+			if (lastAttempt && lastAttempt.endedAt && liveness.live === true && !liveness.disowned && isIdleEnough) {
+				// Check if the attempt was settled with operator_abandoned reason
+				const runtime = this.#database.work.workAttemptGet(lastAttempt.opRef);
+				if (runtime && runtime.terminal?.reasonCode === "operator_abandoned") {
+					isAlreadySettledAbandon = true;
+				}
+			}
 
 			if (!sessionIsDeadOrDisowned && !canRetireAsAbandonment && !isAlreadySettledAbandon) {
 				this.#log(`lane_force_retire_rejected name=${name} session=${lane.sessionId} reason=session_still_live`);
@@ -538,12 +542,14 @@ export class LaneGovernor {
 			} catch (error) {
 				const detail = sanitizeDiagnostic(diagnostic(error));
 				this.#log(`lane_close_failed name=${name} session=${lane.sessionId} detail=${detail} action=force_close`);
-				// For abandonment of a live host, preserve the binding if close fails:
-				// the old host may still be executing, and we must not rotate the epoch.
-				if (canRetireAsAbandonment) {
+				// On close failure, do a fresh liveness check before proceeding with rotateEpoch.
+				// Only proceed if we can confirm the host is dead/disowned; otherwise preserve the binding.
+				const closeFailureLiveness = await this.#safeLiveness(lane.sessionId, repo);
+				if (closeFailureLiveness.live === true && !closeFailureLiveness.disowned) {
+					// Host is still live; must not rotate epoch while host is executing.
 					return { retired: false, sessionKey, reason: `session close failed: ${detail}` };
 				}
-				// For dead/disowned sessions, proceed even if close fails since we have liveness proof.
+				// For dead/disowned sessions confirmed by fresh liveness check, proceed with rotation.
 			}
 			this.#database.transaction((tx) => this.#database.bindings.rotateEpoch(tx, sessionKey));
 			const logReason = canRetireAsAbandonment ? "operator_abandoned" : "operator_force";

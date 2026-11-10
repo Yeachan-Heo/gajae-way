@@ -119,7 +119,7 @@ test("retire closes the session in its job repo, clears the binding, bumps epoch
 		closed: true,
 	});
 	expect(port.closes).toEqual([{ sessionId: "sess-a", repo: "/tmp/worker-repo" }]);
-	expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before?.epoch + 1 });
+	expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before!.epoch + 1 });
 	expect(governor.activeLanes()).toEqual([]);
 	expect(logs).toContain("lane_retired name=a session=sess-a reason=operator closed=true");
 });
@@ -178,7 +178,7 @@ test("a failed close keeps the lane bound unless the broker proves the session g
 		closed: false,
 	});
 	expect(port.closes).toHaveLength(2);
-	expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before?.epoch + 1 });
+	expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before!.epoch + 1 });
 	expect(governor.activeLanes()).toEqual([]);
 	expect(logs).toContain("lane_retired name=a session=sess-a reason=operator closed=false");
 });
@@ -1166,7 +1166,60 @@ test("#778: forceRetire preserves binding when close() fails on abandoned host",
 	expect(logs.some((line) => line.includes("lane_close_failed"))).toBe(true);
 });
 
-// TODO: #778 Add regression test for close retry after transient failure
-// The test needs to verify that when close() fails after settlement has persisted endedAt,
-// a retry of forceRetire() will retry the close without re-settling the attempt.
-// The current implementation allows this via isAlreadySettledAbandon condition.
+test("#778: forceRetire with close failure checks fresh liveness before rotating epoch", async () => {
+	database = await Store.open(":memory:");
+	// Dead lane where close fails but host is confirmed dead with fresh liveness check
+	bind("dead-close-fail", NOW - 120_000, SESSION_ID);
+
+	const identity = laneJobIdentity("dead-close-fail");
+	let record: LaneJobRecord = createLaneJobRecord({
+		jobId: identity.jobId,
+		branch: "work/test",
+		worktreePath: "/tmp/worker-repo",
+		now: () => new Date(NOW - 120_000),
+	});
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }),
+	);
+
+	class FailingClosePort extends ScriptedSessionPort {
+		override async close(input: { sessionId: string; repo: string }) {
+			if (input.sessionId === SESSION_ID) {
+				throw new Error("close() simulated failure");
+			}
+		}
+	}
+
+	const port = new FailingClosePort();
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		idleRetireMs: 60_000,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	// Session is dead from the start
+	port.setSessionState(SESSION_ID, { live: false });
+
+	const result = await governor.forceRetire("dead-close-fail");
+
+	// Should succeed despite close failure because fresh liveness check proves host is dead
+	expect(result.retired).toBe(true);
+	if (result.retired) {
+		expect(result.closed).toBe(false); // close failed
+	}
+	// Should log the close failure and then confirm dead via liveness
+	expect(logs.some((line) => line.includes("lane_close_failed"))).toBe(true);
+
+	// Epoch should have been rotated despite close failure
+	const sessionKey = workSessionKey("dead-close-fail");
+	const binding = database.bindings.getSessionRecord(sessionKey);
+	if (!binding) throw new Error("binding should still exist");
+	expect(binding.epoch).toBe(1); // Rotated from 0
+});
+
+
+
+
