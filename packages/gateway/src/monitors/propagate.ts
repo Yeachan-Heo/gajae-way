@@ -21,6 +21,7 @@ import { sanitizeDiagnostic, sanitizeDiagnosticDetail } from "../orchestrator/re
 import {
 	isSessionBusy,
 	LastAssistantUnreadableError,
+	type SessionBinding,
 	type SessionPort,
 	SessionRequestTimeoutError,
 	SessionTerminalError,
@@ -165,12 +166,26 @@ const BACKOFF_EXEMPT_FAILURES: ReadonlySet<string> = new Set<DispatchFailureCode
 ]);
 
 /**
- * How long shutdown waits for in-flight authoring turns before marking them
+/** How long shutdown waits for in-flight authoring turns before marking them
  * interrupted. The monitor and persona drains run concurrently; together with
  * the 5s connection settle this keeps an ordered stop inside a 40s
  * `TimeoutStopSec` (#225).
  */
 export const MONITOR_SHUTDOWN_DRAIN_MS = 10_000;
+
+/**
+ * Consecutive bind timeout attempts on the same origin+epoch before triggering
+ * a rebind to a fresh epoch. Issue #780: one poisoned session key caused 6
+ * consecutive events to drop with no escalation until restarted.
+ */
+export const MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD = 3;
+
+/**
+ * Consecutive terminal failed events per origin before emitting an escalation.
+ * Issue #780: when K consecutive events fail, escalate once per streak so the
+ * operator sees the dark monitor within hours.
+ */
+export const MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD = 3;
 
 /** A live dispatch claim, so a bounded shutdown can fail and release exactly what this process holds. */
 interface LiveClaim {
@@ -284,6 +299,14 @@ export interface MonitorSessionSafetyState {
 	pendingRoll: SessionRollReason | undefined;
 	/** Reason of the last roll actually performed. */
 	lastRoll: SessionRollReason | undefined;
+	/** Consecutive bind timeout failures for the current epoch. Issue #780 rebind. */
+	bindTimeoutFailures: number;
+	/** Epoch number when bind timeouts started being tracked. */
+	bindTimeoutEpoch: number | undefined;
+	/** Consecutive terminal failed events for this origin (across epochs). Issue #780 escalation. */
+	conseculiveFailedEventCount: number;
+	/** Whether we've escalated for the current streak of failed events. */
+	escalatedForCurrentStreak: boolean;
 }
 
 export class MonitorPropagator {
@@ -1341,18 +1364,66 @@ export class MonitorPropagator {
 					dispatchOperationArgs = { opRef: resumeTurn.opRef };
 					dispatchPhase = "procedure";
 				} else {
-					const boundEpoch = this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
-					dispatchOperation = "bind";
-					dispatchOperationArgs = {
-						epoch: boundEpoch,
-						hasModel: effectiveModel !== undefined,
-					};
-					const binding = await this.#sessionPort.bind({
-						originKey: sessionOriginKey,
-						epoch: boundEpoch,
-						repo: this.#repo,
-						...(effectiveModel ? { model: effectiveModel } : {}),
-					});
+					let boundEpoch = this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
+					let binding: SessionBinding | undefined;
+					let lastBindError: unknown;
+
+					// Try bind, potentially rebinding on consecutive timeouts (issue #780).
+					for (let rebindAttempts = 0; rebindAttempts < 3 && !binding; rebindAttempts++) {
+						try {
+							dispatchOperation = "bind";
+							dispatchOperationArgs = {
+								epoch: boundEpoch,
+								hasModel: effectiveModel !== undefined,
+							};
+							binding = await this.#sessionPort.bind({
+								originKey: sessionOriginKey,
+								epoch: boundEpoch,
+								repo: this.#repo,
+								...(effectiveModel ? { model: effectiveModel } : {}),
+							});
+							// Bind succeeded: reset timeout counter for this epoch
+							const safety = this.#safety.get(sessionOriginKey);
+							if (safety) {
+								safety.bindTimeoutFailures = 0;
+								safety.bindTimeoutEpoch = undefined;
+							}
+						} catch (bindError) {
+							lastBindError = bindError;
+							const safety = this.#safetyState(sessionOriginKey);
+
+							// Check if this is a bind timeout for the current epoch.
+							if (isBindTimeoutError(bindError)) {
+								// Reset counter if this is a different epoch
+								if (safety.bindTimeoutEpoch !== boundEpoch) {
+									safety.bindTimeoutFailures = 0;
+									safety.bindTimeoutEpoch = boundEpoch;
+								}
+								safety.bindTimeoutFailures++;
+								this.#safety.set(sessionOriginKey, safety);
+								console.error(
+									`monitor bind timeout for ${sessionOriginKey}: count=${safety.bindTimeoutFailures}/${MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD} epoch=${boundEpoch}`,
+								);
+
+								// If threshold reached, rebind to a fresh epoch (issue #780).
+								if (safety.bindTimeoutFailures >= MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD) {
+									console.error(
+										`monitor bind timeout rebind triggered for ${sessionOriginKey}: epoch=${boundEpoch} -> ${boundEpoch + 1}`,
+									);
+									// Rebind to fresh epoch: increment it and try again.
+									boundEpoch++;
+									safety.bindTimeoutFailures = 0; // Reset counter for new epoch
+									safety.bindTimeoutEpoch = boundEpoch;
+									this.#safety.set(sessionOriginKey, safety);
+									continue; // Retry bind with new epoch
+								}
+							}
+							// Non-timeout or threshold not reached: propagate the error.
+							throw bindError;
+						}
+					}
+
+					if (!binding) throw lastBindError ?? new Error("bind failed");
 					sessionId = binding.sessionId;
 					boundSessionId = sessionId;
 					boundSessionEpoch = binding.epoch;
@@ -1895,6 +1966,8 @@ export class MonitorPropagator {
 					// owner-DM canonicalize note stuck inflight for minutes).
 					this.#deliver?.(payload);
 				} else if (noDeliveryRecorded && !readinessFailure) this.#recordReadinessSuccess(sessionOriginKey);
+				// Dispatch succeeded: clear the failed event streak (issue #780)
+				this.#clearConsecutiveFailedEventCount(sessionOriginKey);
 			} catch (error) {
 				// Public-safe structured evidence only: a stable phase code and event ids.
 				// The raw error body can carry secrets and is never persisted or logged.
@@ -1942,6 +2015,8 @@ export class MonitorPropagator {
 				if (transitionedFailure) readinessFailure = { code, detail: `monitor dispatch failed during ${dispatchPhase}` };
 				flushReadinessFailure();
 				console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
+				// Track consecutive failures for potential escalation (issue #780).
+				this.#trackConsecutiveFailedEvent(sessionOriginKey, monitor.monitorId);
 				await this.#recordAuthoringFailure({
 					sessionOriginKey,
 					failureClass,
@@ -2144,10 +2219,54 @@ export class MonitorPropagator {
 			lastContextTokens: undefined,
 			pendingRoll: undefined,
 			lastRoll: undefined,
+			bindTimeoutFailures: 0,
+			bindTimeoutEpoch: undefined,
+			conseculiveFailedEventCount: 0,
+			escalatedForCurrentStreak: false,
 		};
 		this.#safety.set(sessionOriginKey, fresh);
 		return fresh;
 	}
+	/**
+	 * Track a failed monitor event and check if escalation is needed.
+	 * Issue #780: when K consecutive events fail, escalate once per streak.
+	 */
+	#trackConsecutiveFailedEvent(sessionOriginKey: string, monitorId: string): void {
+		const state = this.#safetyState(sessionOriginKey);
+		state.conseculiveFailedEventCount++;
+
+		console.error(
+			`monitor failed event for ${sessionOriginKey} (monitor ${monitorId}): count=${state.conseculiveFailedEventCount}/${MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD}`,
+		);
+
+		// Escalate when threshold reached and not yet escalated for this streak
+		if (
+			state.conseculiveFailedEventCount >= MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD &&
+			!state.escalatedForCurrentStreak
+		) {
+			console.error(
+				`monitor failed event escalation for ${sessionOriginKey} (monitor ${monitorId}): consecutive_failures=${state.conseculiveFailedEventCount}`,
+			);
+			state.escalatedForCurrentStreak = true;
+			// TODO: emit escalation notification to operator
+		}
+	}
+
+	/**
+	 * Reset the failed event counter when a successful dispatch happens.
+	 * Issue #780: a success clears the failure streak and the escalation flag.
+	 */
+	#clearConsecutiveFailedEventCount(sessionOriginKey: string): void {
+		const state = this.#safetyState(sessionOriginKey);
+		if (state.conseculiveFailedEventCount > 0) {
+			console.error(
+				`monitor failed event streak cleared for ${sessionOriginKey}: count=${state.conseculiveFailedEventCount}`,
+			);
+			state.conseculiveFailedEventCount = 0;
+			state.escalatedForCurrentStreak = false;
+		}
+	}
+
 	/**
 	 * THE ONE monitor-session failure classifier and native-compaction request
 	 * point (issue #68).
@@ -2845,6 +2964,19 @@ function isDurableNoSendFailureForOperation(
 	)
 		return false;
 	return failure.session_id === sessionId && failure.op_ref === opRef;
+}
+
+/**
+ * True when the error is a bind-phase timeout or broker unavailability.
+ * Issue #780: detect poisoned session keys where every bind for an epoch
+ * times out and never recovers without a rebind.
+ */
+function isBindTimeoutError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return (
+		(message.includes("timeout") || message.includes("timed out")) &&
+		(message.includes("broker_unavailable") || message.includes("GjcCliUnavailableError"))
+	);
 }
 
 function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase: string): DispatchFailureCode {
