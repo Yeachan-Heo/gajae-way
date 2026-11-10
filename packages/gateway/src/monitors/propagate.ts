@@ -303,8 +303,6 @@ export interface MonitorSessionSafetyState {
 	bindTimeoutFailures: number;
 	/** Epoch number when bind timeouts started being tracked. */
 	bindTimeoutEpoch: number | undefined;
-	/** Consecutive terminal failed events for this origin (across epochs). Issue #780 escalation. */
-	conseculiveFailedEventCount: number;
 	/** Whether we've escalated for the current streak of failed events. */
 	escalatedForCurrentStreak: boolean;
 }
@@ -1967,7 +1965,7 @@ export class MonitorPropagator {
 					this.#deliver?.(payload);
 				} else if (noDeliveryRecorded && !readinessFailure) this.#recordReadinessSuccess(sessionOriginKey);
 				// Dispatch succeeded: clear the failed event streak (issue #780)
-				this.#clearConsecutiveFailedEventCount(sessionOriginKey);
+				this.#clearConsecutiveFailedEventCount(sessionOriginKey, monitor.monitorId);
 			} catch (error) {
 				// Public-safe structured evidence only: a stable phase code and event ids.
 				// The raw error body can carry secrets and is never persisted or logged.
@@ -2221,34 +2219,106 @@ export class MonitorPropagator {
 			lastRoll: undefined,
 			bindTimeoutFailures: 0,
 			bindTimeoutEpoch: undefined,
-			conseculiveFailedEventCount: 0,
 			escalatedForCurrentStreak: false,
 		};
 		this.#safety.set(sessionOriginKey, fresh);
 		return fresh;
 	}
 	/**
+	 * Count consecutive failed monitor events from the database.
+	 * Issue #780: derive from durable failure rows to survive gateway restarts.
+	 */
+	#countConsecutiveFailures(monitorId: string): number {
+		const monitor = this.#registry.get(monitorId);
+		if (!monitor?.enabled) return 0;
+
+		// Count consecutive recent failures on this monitor, counting backward from the latest event.
+		let count = 0;
+		const recent = this.#database.monitors
+			.eventRows()
+			.filter((row) => row.monitor_id === monitorId)
+			.sort((a, b) => Date.parse(b.fired_at) - Date.parse(a.fired_at))
+			.slice(0, MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD * 2); // Look back at ~2x threshold
+		for (const row of recent) {
+			if (row.stage === "failed" || row.stage === "failed_no_retry" || row.stage === "contract_unmet") {
+				count++;
+			} else {
+				// Stop counting at the first non-failed event
+				break;
+			}
+		}
+		return count;
+	}
+
+	/**
 	 * Track a failed monitor event and check if escalation is needed.
 	 * Issue #780: when K consecutive events fail, escalate once per streak.
 	 */
 	#trackConsecutiveFailedEvent(sessionOriginKey: string, monitorId: string): void {
 		const state = this.#safetyState(sessionOriginKey);
-		state.conseculiveFailedEventCount++;
+		const consecutiveCount = this.#countConsecutiveFailures(monitorId);
 
 		console.error(
-			`monitor failed event for ${sessionOriginKey} (monitor ${monitorId}): count=${state.conseculiveFailedEventCount}/${MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD}`,
+			`monitor failed event for ${sessionOriginKey} (monitor ${monitorId}): count=${consecutiveCount}/${MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD}`,
 		);
 
 		// Escalate when threshold reached and not yet escalated for this streak
-		if (
-			state.conseculiveFailedEventCount >= MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD &&
-			!state.escalatedForCurrentStreak
-		) {
+		if (consecutiveCount >= MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD && !state.escalatedForCurrentStreak) {
 			console.error(
-				`monitor failed event escalation for ${sessionOriginKey} (monitor ${monitorId}): consecutive_failures=${state.conseculiveFailedEventCount}`,
+				`monitor failed event escalation for ${sessionOriginKey} (monitor ${monitorId}): consecutive_failures=${consecutiveCount}`,
 			);
 			state.escalatedForCurrentStreak = true;
-			// TODO: emit escalation notification to operator
+			this.#emitMonitorEscalation(sessionOriginKey, monitorId, consecutiveCount);
+		}
+	}
+
+	/**
+	 * Emit an operator escalation for consecutive monitor failures.
+	 * Issue #780: wire to the existing operator escalation path.
+	 */
+	#emitMonitorEscalation(_sessionOriginKey: string, monitorId: string, failureCount: number): void {
+		const monitor = this.#registry.get(monitorId);
+		if (!monitor) return;
+
+		const target = monitor.channelTarget ?? this.#ownerTarget;
+		if (!target) return;
+
+		const message = `[monitor escalation] The monitor "${monitor.name}" (${monitorId}) has failed ${failureCount} consecutive times. Please investigate and consider rolling the session.`;
+		const payload: ChatMessagePayload = {
+			turnId: crypto.randomUUID(),
+			origin: target.origin,
+			role: "assistant",
+			text: message,
+			final: true,
+		};
+
+		// Deliver to live adapters immediately
+		try {
+			this.#deliver?.(payload);
+		} catch (error) {
+			console.error(`monitor escalation delivery failed: ${error}`);
+		}
+
+		// Persist to outbox for durability
+		try {
+			const deliveryId = crypto.randomUUID();
+			const admitted = this.#database.transaction((tx) => {
+				return this.#database.outbox.enqueue(
+					tx,
+					{
+						deliveryId,
+						turnId: payload.turnId,
+						originKey: originKey(target.origin),
+						payloadJson: JSON.stringify(payload),
+					},
+					this.#now(),
+				);
+			});
+			if (admitted) {
+				this.#delivery.markInflight(deliveryId);
+			}
+		} catch (error) {
+			console.error(`monitor escalation persistence failed: ${error}`);
 		}
 	}
 
@@ -2256,13 +2326,12 @@ export class MonitorPropagator {
 	 * Reset the failed event counter when a successful dispatch happens.
 	 * Issue #780: a success clears the failure streak and the escalation flag.
 	 */
-	#clearConsecutiveFailedEventCount(sessionOriginKey: string): void {
+	#clearConsecutiveFailedEventCount(sessionOriginKey: string, monitorId: string): void {
 		const state = this.#safetyState(sessionOriginKey);
-		if (state.conseculiveFailedEventCount > 0) {
-			console.error(
-				`monitor failed event streak cleared for ${sessionOriginKey}: count=${state.conseculiveFailedEventCount}`,
-			);
-			state.conseculiveFailedEventCount = 0;
+		const consecutiveCount = this.#countConsecutiveFailures(monitorId);
+
+		if (consecutiveCount === 0) {
+			console.error(`monitor failed event streak cleared for ${sessionOriginKey}: previous failures now recovered`);
 			state.escalatedForCurrentStreak = false;
 		}
 	}
