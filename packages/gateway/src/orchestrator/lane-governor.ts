@@ -450,7 +450,7 @@ export class LaneGovernor {
 			let canRetireAsAbandonment = false;
 			let brokerActivityIdle = false;
 			let opStatusUnknown = false;
-			if (liveness.live !== false && !liveness.disowned && isIdleEnough && isOpenAttempt && lastAttempt) {
+			if (liveness.live === true && !liveness.disowned && isIdleEnough && isOpenAttempt && lastAttempt) {
 				// Check broker activity state
 				try {
 					const brokerSession = await this.#port.inspect({ sessionId: lane.sessionId, repo });
@@ -531,7 +531,12 @@ export class LaneGovernor {
 			} catch (error) {
 				const detail = sanitizeDiagnostic(diagnostic(error));
 				this.#log(`lane_close_failed name=${name} session=${lane.sessionId} detail=${detail} action=force_close`);
-				// For force retire, we proceed even if close fails since we have liveness proof.
+				// For abandonment of a live host, preserve the binding if close fails:
+				// the old host may still be executing, and we must not rotate the epoch.
+				if (canRetireAsAbandonment) {
+					return { retired: false, sessionKey, reason: `session close failed: ${detail}` };
+				}
+				// For dead/disowned sessions, proceed even if close fails since we have liveness proof.
 			}
 			this.#database.transaction((tx) => this.#database.bindings.rotateEpoch(tx, sessionKey));
 			const logReason = canRetireAsAbandonment ? "operator_abandoned" : "operator_force";

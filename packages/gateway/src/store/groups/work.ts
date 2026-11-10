@@ -317,6 +317,7 @@ const WORK_REASON_CODES = new Set([
 	"host_lost",
 	"recovery_indeterminate",
 	"output_unavailable",
+	"operator_abandoned",
 ]);
 
 export function workAssert(condition: unknown, assertion = "work attempt payload validation"): asserts condition {

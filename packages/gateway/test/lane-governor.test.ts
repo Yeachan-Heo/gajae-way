@@ -11,9 +11,9 @@ import {
 	type LaneJobRecord,
 	newOpRef,
 } from "@gajae-gateway/subsession";
-import { LaneGovernor, laneJobIdentity } from "../src/orchestrator/lane-governor";
+import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
 import { BrokerAuthorityError, Store } from "../src/store";
-import { initializeTestBrokerAuthority, ScriptedSessionPort } from "./session-port.fake";
+import { ScriptedSessionPort } from "./session-port.fake";
 
 const NOW = Date.parse("2026-09-01T12:00:00.000Z");
 const SESSION_ID = "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0";
@@ -1092,4 +1092,76 @@ test("#778: forceRetire refuses abandonment when op status is in_flight", async 
 	}
 	// Should NOT settle the attempt
 	expect(settledAttempts).toHaveLength(0);
+});
+
+test("#778: forceRetire preserves binding when close() fails on abandoned host", async () => {
+	database = await Store.open(":memory:");
+	// Stuck lane: session is live but idle, attempt is open with idle broker activity and unknown status
+	bind("stuck-close-fail", NOW - 120_000, SESSION_ID);
+
+	const identity = laneJobIdentity("stuck-close-fail");
+	let record: LaneJobRecord = createLaneJobRecord({
+		jobId: identity.jobId,
+		branch: "work/test",
+		worktreePath: "/tmp/worker-repo",
+		sessionId: SESSION_ID,
+		now: () => new Date(NOW - 120_000),
+	});
+	record = appendAttempt(record, {
+		opRef: "op-stuck-1",
+		sessionId: SESSION_ID,
+		startedAt: new Date(NOW - 120_000).toISOString(),
+	});
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }),
+	);
+
+	class FailingClosePort extends ScriptedSessionPort {
+		override async close(input: { sessionId: string; repo: string }) {
+			if (input.sessionId === SESSION_ID) {
+				throw new Error("close() simulated failure on live host");
+			}
+		}
+	}
+
+	const port = new FailingClosePort();
+	const logs: string[] = [];
+	const settledAttempts: Array<{ name: string; opRef: string; reason: string; endedAt: string }> = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		idleRetireMs: 60_000,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	governor.setForceRetireSettlement((name, opRef, reason, endedAt) => {
+		settledAttempts.push({ name, opRef, reason, endedAt });
+		return true;
+	});
+
+	// Setup broker evidence: live with idle activity and unknown status
+	port.setSessionState(SESSION_ID, { live: true, activityState: "idle" });
+	// Don't seed operation - status() returns unknown
+
+	const result = await governor.forceRetire("stuck-close-fail");
+
+	// Should FAIL (not retire) because close() failed on live abandoned host
+	expect(result.retired).toBe(false);
+	if (!result.retired) {
+		expect(result.reason).toContain("session close failed");
+	}
+
+	// The attempt SHOULD have been settled (before close)
+	expect(settledAttempts).toHaveLength(1);
+	expect(settledAttempts[0].reason).toBe("operator_abandoned");
+
+	// But epoch should NOT be rotated (binding preserved)
+	const sessionKey = workSessionKey("stuck-close-fail");
+	const currentBinding = database.bindings.getSessionRecord(sessionKey);
+	if (!currentBinding) throw new Error("binding should still exist");
+	expect(currentBinding.epoch).toBe(0); // Unchanged from original binding
+
+	// Should log the close failure
+	expect(logs.some((line) => line.includes("lane_close_failed"))).toBe(true);
 });
