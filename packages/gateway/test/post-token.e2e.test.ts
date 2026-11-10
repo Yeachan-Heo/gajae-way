@@ -106,7 +106,7 @@ function messages(client: { frames: any[] }): any[] {
 }
 
 function rows(originKey: string) {
-	return database!.outbox.rows().filter((row) => row.origin_key === originKey);
+	return database?.outbox.rows().filter((row) => row.origin_key === originKey);
 }
 
 async function eventually(predicate: () => boolean, message: string, attempts = 400): Promise<void> {
@@ -177,7 +177,7 @@ test("[SEND:]/[POST:] blocks anywhere in a reply post once each; the text around
 		"배포 끝났습니다 [SEND:discord:report-room] 완료: 배포 [SENDDONE] 확인 부탁\n[POST:<#report-room>]\n두 번째 보고\n[POSTDONE]",
 	);
 	await eventually(() => rows(REPORT).length === 2, "both posts were not sent");
-	await eventually(() => database!.inbox.nonterminalTurns(HERE).length === 0, "turn never settled");
+	await eventually(() => database?.inbox.nonterminalTurns(HERE).length === 0, "turn never settled");
 	await Bun.sleep(50);
 	expect(rows(REPORT).map((row) => JSON.parse(row.payload_json).text)).toEqual(["완료: 배포", "두 번째 보고"]);
 	expect(rows(HERE).map((row) => JSON.parse(row.payload_json).text)).toEqual(["배포 끝났습니다", "확인 부탁"]);
@@ -217,19 +217,19 @@ test("a [POST:] part goes to the configured target once, recorded there as the p
 	expect(report.payload.deliveryId).toBe(postId);
 	expect(rows(REPORT).map((row) => row.delivery_id)).toEqual([postId]);
 	// The target's next turn reads the post as unread context from "you".
-	const window = database!.transaction((tx) => database!.inbox.contextWindow(tx, REPORT, "next-trigger"));
+	const window = database?.transaction((tx) => database?.inbox.contextWindow(tx, REPORT, "next-trigger"));
 	expect(window.rows.map((row) => [row.message_id, row.body])).toEqual([[`post/${postId}`, "완료: 배포 끝 <#chan-1>"]]);
 	expect(window.rows[0]?.author_name).toStartWith("you (posted here from");
 	// Once confirmed, a fresh target session sees it once in its recent history.
-	expect(database!.transaction((tx) => database!.outbox.confirm(tx, postId))).toBe("transitioned");
+	expect(database?.transaction((tx) => database?.outbox.confirm(tx, postId))).toBe("transitioned");
 	// A fresh target session sees it once, through the context row recentConversation reads.
 	const since = new Date(Date.now() - 60_000).toISOString();
-	const recent = database!.inbox.recentContext(REPORT, 20, since);
+	const recent = database?.inbox.recentContext(REPORT, 20, since);
 	expect(recent.map((entry) => entry.body)).toEqual(["완료: 배포 끝 <#chan-1>"]);
 	expect(recent[0]?.id).toBe(`post/${postId}`);
 	expect(recent[0]?.author).toStartWith("you (posted here from");
 	// ...and not also as a confirmed delivery: the context row is the single carrier.
-	expect(database!.outbox.confirmedConversation("report-room", since, 20)).toHaveLength(0);
+	expect(database?.outbox.confirmedConversation("report-room", since, 20)).toHaveLength(0);
 	// The source room's history keeps the local part only.
 	expect(rows(HERE).map((row) => JSON.parse(row.payload_json).text)).toEqual(["여기 답"]);
 });
@@ -265,7 +265,7 @@ test("a refused target keeps the part here with the token stripped", async () =>
 		["chan-1", "슬랙"],
 		["chan-1", "형식오류"],
 	]);
-	expect(database!.outbox.rows().every((row) => row.origin_key === HERE)).toBe(true);
+	expect(database?.outbox.rows().every((row) => row.origin_key === HERE)).toBe(true);
 	const refusals = logged.filter((line) => line.includes("gateway post target refused"));
 	expect(refusals.map((line) => line.match(/reason=(\w+)/)?.[1])).toEqual([
 		"unconfigured_channel",
@@ -301,7 +301,7 @@ test("mid-work speech holds a [POST:] part; the terminal answer posts it exactly
 	expect(messages(client).map((frame) => frame.payload.text)).toEqual(["작업 중"]);
 	port.complete(send.opRef, `[POST:${REPORT}] 최종 보고`);
 	await eventually(() => rows(REPORT).length === 2, "held and final posts were not sent");
-	await eventually(() => database!.inbox.nonterminalTurns(HERE).length === 0, "turn never settled");
+	await eventually(() => database?.inbox.nonterminalTurns(HERE).length === 0, "turn never settled");
 	await Bun.sleep(50);
 	expect(rows(REPORT).map((row) => JSON.parse(row.payload_json).text)).toEqual(["최종 보고", "중간에만 쓴 보고"]);
 	expect(messages(client).filter((frame) => frame.payload.origin.conversationId === "report-room")).toHaveLength(2);
@@ -317,8 +317,8 @@ test("a second terminal pass or a regenerated answer for the same trigger posts 
 	expect(rows(REPORT)[0]?.delivery_id).toBe(postId);
 	// The slot is owned: a regenerated answer's claim returns the existing post.
 	expect(
-		database!.transaction((tx) =>
-			database!.inbox.claimTerminal(
+		database?.transaction((tx) =>
+			database?.inbox.claimTerminal(
 				tx,
 				send.opRef,
 				0,
@@ -326,7 +326,7 @@ test("a second terminal pass or a regenerated answer for the same trigger posts 
 			),
 		),
 	).toBe(postId);
-	expect(database!.transaction((tx) => database!.inbox.contextWindow(tx, REPORT, "next")).rows).toHaveLength(1);
+	expect(database?.transaction((tx) => database?.inbox.contextWindow(tx, REPORT, "next")).rows).toHaveLength(1);
 	expect(rows(REPORT)).toHaveLength(1);
 });
 
@@ -340,13 +340,13 @@ test("the post survives a gateway restart exactly once: held before the crash, p
 	port.emitAssistant(send.sessionId, `로컬 답\n[BREAK]\n[POST:${REPORT}] 재시작 보고`, "evt-final-s1", send.opRef);
 	await eventually(() => messages(client).length === 1, "local part was not delivered");
 	expect(rows(REPORT)).toHaveLength(0);
-	await server!.stop();
+	await server?.stop();
 	server = undefined;
 	port.seedOperation(send.opRef, send.sessionId, "terminal_ok", `로컬 답\n[BREAK]\n[POST:${REPORT}] 재시작 보고`);
 	port.bind = bind;
 	port.resume = resume;
 	await startGateway(port);
-	await eventually(() => database!.inbox.nonterminalTurns(HERE).length === 0, "recovered turn never completed", 2_000);
+	await eventually(() => database?.inbox.nonterminalTurns(HERE).length === 0, "recovered turn never completed", 2_000);
 	expect(rows(REPORT).map((row) => [row.delivery_id, JSON.parse(row.payload_json).text])).toEqual([
 		[deterministicPostDeliveryId(HERE, REPORT, testIdToSnowflake("s1"), 1), "재시작 보고"],
 	]);

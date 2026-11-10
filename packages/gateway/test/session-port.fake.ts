@@ -542,8 +542,7 @@ export class ScriptedSessionPort implements SessionPort {
 
 	async fetchLastAssistant(input: { sessionId: string; repo: string }) {
 		const operation = [...this.#operations.values()].reverse().find((entry) => entry.sessionId === input.sessionId);
-		if (!operation || operation.state !== "terminal_ok")
-			throw new Error("scripted session has no terminal assistant output");
+		if (operation?.state !== "terminal_ok") throw new Error("scripted session has no terminal assistant output");
 		return { text: operation.text, pages: 1, complete: true };
 	}
 
@@ -816,7 +815,10 @@ export class ScriptedSessionPort implements SessionPort {
 	}
 
 	/** Patches a bound session's state, or seeds one the port never bound (a session left on disk by an earlier runtime). */
-	setSessionState(sessionId: string, patch: Partial<Pick<BrokerSession, "repo" | "live" | "deleted" | "activityState">>): void {
+	setSessionState(
+		sessionId: string,
+		patch: Partial<Pick<BrokerSession, "repo" | "live" | "deleted" | "activityState">>,
+	): void {
 		const current = this.#sessionStates.get(sessionId) ?? { sessionId, repo: "", live: false, deleted: false };
 		this.#sessionStates.set(sessionId, { ...current, ...patch });
 	}

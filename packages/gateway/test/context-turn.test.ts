@@ -206,7 +206,7 @@ test("a chatty turn past the mid-work part budget still delivers its final answe
 	const texts = client.frames.filter((frame) => frame.event === "chat.message").map((frame) => frame.payload.text);
 	expect(texts.filter((text) => text.startsWith("progress note"))).toHaveLength(10);
 	expect(texts.filter((text) => text === "the final answer")).toHaveLength(1);
-	expect(database.inbox.turnRow(sessionPort.sends[0]!.opRef)?.terminal_delivery_id).not.toBeNull();
+	expect(database.inbox.turnRow(sessionPort.sends[0]?.opRef)?.terminal_delivery_id).not.toBeNull();
 	client.close();
 });
 

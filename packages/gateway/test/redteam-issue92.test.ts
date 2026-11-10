@@ -256,7 +256,7 @@ test("red-team: a stale death notice from a finished turn's relay never detaches
 		await eventually(() => port.sends.length === 1, "first send missing");
 		const first = required(port.sends[0], "first send missing");
 		const firstRelay = port.tailsOf(first.sessionId)[0];
-		const lateDeath = firstRelay!.captureDeathNotice();
+		const lateDeath = firstRelay?.captureDeathNotice();
 		port.complete(first.opRef, "first answer");
 		await eventually(() => target.database.inbox.pendingCount(ORIGIN_KEY) === 0, "first turn did not settle");
 
@@ -304,8 +304,8 @@ test("red-team: a relay refused at attach (endpoint_stale) rebinds on a fresh ep
 			true,
 		);
 		// The stale session's binding was rotated: the send rode a NEW session.
-		expect(port.sends[0]!.sessionId).toBe(`${ORIGIN_KEY}-session-1`);
-		port.complete(port.sends[0]!.opRef, "answer on the fresh session");
+		expect(port.sends[0]?.sessionId).toBe(`${ORIGIN_KEY}-session-1`);
+		port.complete(port.sends[0]?.opRef, "answer on the fresh session");
 		await eventually(() => target.database.inbox.pendingCount(ORIGIN_KEY) === 0, "turn did not settle");
 		expect(target.terminal).toEqual(["answer on the fresh session"]);
 		expect(target.logs.some((line) => line.includes("host hello did not arrive"))).toBe(false);

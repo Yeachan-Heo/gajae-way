@@ -110,10 +110,10 @@ test("a fresh epoch after escalation never re-renders the held request or its cl
 	for (let i = 0; i < 400 && !port.sends.some((send) => send.sessionId === "session-1"); i++) await Bun.sleep(5);
 	const fresh = port.sends.find((send) => send.sessionId === "session-1");
 	expect(fresh).toBeDefined();
-	expect(fresh!.text).toContain("NEXT-QUESTION");
+	expect(fresh?.text).toContain("NEXT-QUESTION");
 	// Only what arrived after the held send is actionable; the held request and the
 	// context its prompt carried may appear solely as answered session history.
-	const unread = fresh!.text.slice(fresh!.text.indexOf("[Unread messages"));
+	const unread = fresh?.text.slice(fresh?.text.indexOf("[Unread messages"));
 	expect(unread).toContain("LATER-REMARK");
 	expect(unread).not.toContain("HELD-REQUEST");
 	expect(unread).not.toContain("CLAIMED-CONTEXT");
@@ -123,7 +123,7 @@ test("a fresh epoch after escalation never re-renders the held request or its cl
 	// The escalation notice is in the delivery ledger for the origin.
 	const notices = db.outbox.list({}).filter((row) => row.originKey === originKey && row.deliveryId.startsWith("gw-h-"));
 	expect(notices).toHaveLength(1);
-	expect(JSON.parse(notices[0]!.payloadJson).text).toContain("[turn held]");
+	expect(JSON.parse(notices[0]?.payloadJson).text).toContain("[turn held]");
 }, 30_000);
 
 interface Fixture {
@@ -379,10 +379,10 @@ test("a queued message the held prompt carried as context is closed as its input
 	await until(() => f.port.sends.some((send) => send.sessionId === "session-1"));
 	const fresh = f.port.sends.filter((send) => send.sessionId === "session-1");
 	expect(fresh).toHaveLength(1);
-	expect(fresh[0]!.text).toContain("NEXT-QUESTION");
-	expect(fresh[0]!.text).toContain("msg:m-next)]");
+	expect(fresh[0]?.text).toContain("NEXT-QUESTION");
+	expect(fresh[0]?.text).toContain("msg:m-next)]");
 	// It may appear only as answered history, never as the trigger or unread input.
-	const actionable = fresh[0]!.text.slice(fresh[0]!.text.indexOf("\n\n") + 2);
+	const actionable = fresh[0]?.text.slice(fresh[0]?.text.indexOf("\n\n") + 2);
 	expect(actionable).not.toContain("QUEUED-REQUEST");
 	const queued = db.inbox.turnRows(heldOpRef).find((row) => row.message_id === "m-queued");
 	expect(queued).toMatchObject({ state: "done", turn_role: "steer", turn_state: "done" });

@@ -119,7 +119,7 @@ test("retire closes the session in its job repo, clears the binding, bumps epoch
 		closed: true,
 	});
 	expect(port.closes).toEqual([{ sessionId: "sess-a", repo: "/tmp/worker-repo" }]);
-	expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before!.epoch + 1 });
+	expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before?.epoch + 1 });
 	expect(governor.activeLanes()).toEqual([]);
 	expect(logs).toContain("lane_retired name=a session=sess-a reason=operator closed=true");
 });
@@ -178,7 +178,7 @@ test("a failed close keeps the lane bound unless the broker proves the session g
 		closed: false,
 	});
 	expect(port.closes).toHaveLength(2);
-	expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before!.epoch + 1 });
+	expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before?.epoch + 1 });
 	expect(governor.activeLanes()).toEqual([]);
 	expect(logs).toContain("lane_retired name=a session=sess-a reason=operator closed=false");
 });
@@ -1165,3 +1165,8 @@ test("#778: forceRetire preserves binding when close() fails on abandoned host",
 	// Should log the close failure
 	expect(logs.some((line) => line.includes("lane_close_failed"))).toBe(true);
 });
+
+// TODO: #778 Add regression test for close retry after transient failure
+// The test needs to verify that when close() fails after settlement has persisted endedAt,
+// a retry of forceRetire() will retry the close without re-settling the attempt.
+// The current implementation allows this via isAlreadySettledAbandon condition.

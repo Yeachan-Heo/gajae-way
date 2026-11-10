@@ -5,9 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LOOPBACK_ORIGIN, type OriginRef, originKey } from "@gajae-gateway/protocol";
 import { appendAttempt, closeAttempt, createLaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
-import { bootGateway } from "../src/boot";
 import { buildDeliveryPayload, DeliveryService } from "../src/delivery/delivery";
-import { readPinnedGjcVersion } from "../src/orchestrator/broker";
 import { DatabaseStartupError, LATEST_SCHEMA_VERSION, Store } from "../src/store";
 import {
 	resolveLaneReportOrigin,
@@ -26,7 +24,7 @@ import type { WriteTx } from "../src/store/tx";
 const START = "2026-09-08T00:00:00.000Z";
 const END = "2026-09-08T00:00:10.000Z";
 const SESSION = "ad2f2494-2584-4d13-b7b6-c6ac24a1087f";
-const PARENT_SESSION = "bcb7f8a3-30e5-4d76-9e7e-32d2e2f51f9a";
+const _PARENT_SESSION = "bcb7f8a3-30e5-4d76-9e7e-32d2e2f51f9a";
 const directories: string[] = [];
 const handles: Array<{ close(): void }> = [];
 afterEach(async () => {
@@ -1149,7 +1147,7 @@ DELETE FROM schema_migrations WHERE version >= 21;
 
 		// No-op update should return the current runtime without bumping version
 		expect(patched).toBeTruthy();
-		expect(patched!.version).toBe(0);
+		expect(patched?.version).toBe(0);
 
 		// No journal entry should be created for no-op update
 		const journalEvents = f.raw
@@ -1179,8 +1177,8 @@ DELETE FROM schema_migrations WHERE version >= 21;
 
 		// Update should succeed and bump version
 		expect(patched).toBeTruthy();
-		expect(patched!.version).toBe(1);
-		expect(patched!.sendPhase).toBe("accepted");
+		expect(patched?.version).toBe(1);
+		expect(patched?.sendPhase).toBe("accepted");
 
 		// Journal should have the acceptance event (not update, since this changes acceptance status)
 		const journalEventsReal = f.raw

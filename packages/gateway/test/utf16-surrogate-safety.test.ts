@@ -73,7 +73,7 @@ test("renderPrompt output is always well-formed", () => {
 	}
 
 	// Test with text that would have a lone surrogate before toWellFormed()
-	const malformedText = "Reply PONG " + String.fromCharCode(0xd83d); // Lone high surrogate
+	const malformedText = `Reply PONG ${String.fromCharCode(0xd83d)}`; // Lone high surrogate
 	const preamble = "You are a helpful assistant.";
 	const result = renderPrompt(preamble, malformedText);
 
@@ -88,7 +88,7 @@ test("renderPrompt without preamble is also well-formed", () => {
 		return `${systemPreamble}\n\n${text}`.toWellFormed();
 	}
 
-	const malformedText = "Text with " + String.fromCharCode(0xd83d); // Lone high surrogate
+	const malformedText = `Text with ${String.fromCharCode(0xd83d)}`; // Lone high surrogate
 	const result = renderPrompt(undefined, malformedText);
 
 	expect(result.toWellFormed()).toBe(result);
@@ -112,7 +112,7 @@ test("clipByCodePoints handles emoji sequences and zero-width joiners", () => {
 
 test("clipByCodePoints of 1000 code points from long message", () => {
 	// Create a message with exactly 1000 code points of 'a'
-	const longMessage = "a".repeat(1000) + "🟠" + "b".repeat(100);
+	const longMessage = `${"a".repeat(1000)}🟠${"b".repeat(100)}`;
 
 	const clipped = clipByCodePoints(longMessage, 1000);
 	expect(clipped).toBe("a".repeat(1000));
@@ -121,17 +121,17 @@ test("clipByCodePoints of 1000 code points from long message", () => {
 
 test("clipByCodePoints when clipping includes an emoji at the boundary", () => {
 	// Create a message where the 1000th code point is an emoji
-	const longMessage = "a".repeat(999) + "🟠" + "b".repeat(100);
+	const longMessage = `${"a".repeat(999)}🟠${"b".repeat(100)}`;
 
 	const clipped = clipByCodePoints(longMessage, 1000);
-	expect(clipped).toBe("a".repeat(999) + "🟠");
+	expect(clipped).toBe(`${"a".repeat(999)}🟠`);
 	expect(clipped.toWellFormed()).toBe(clipped);
 });
 
 test("clipped context bodies are never malformed", () => {
 	// Simulate the unread context rendering from server.ts line 2021
 	const unreadEntry = {
-		body: "This is a very long message " + "🟠".repeat(300), // Many emoji copies
+		body: `This is a very long message ${"🟠".repeat(300)}`, // Many emoji copies
 	};
 
 	const clipped = clipByCodePoints(unreadEntry.body, 1000);
@@ -146,7 +146,7 @@ test("clipped context bodies are never malformed", () => {
 
 test("clipped recent history entries are never malformed", () => {
 	// Simulate the recent history rendering from server.ts line 2047
-	const recentEntry = "Some text " + "😀".repeat(200); // Many emoji copies
+	const recentEntry = `Some text ${"😀".repeat(200)}`; // Many emoji copies
 
 	const clipped = clipByCodePoints(recentEntry, 500);
 	expect(clipped.toWellFormed()).toBe(clipped);

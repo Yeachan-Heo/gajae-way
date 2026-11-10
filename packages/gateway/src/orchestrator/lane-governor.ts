@@ -488,10 +488,17 @@ export class LaneGovernor {
 
 			// Allow retiring if:
 			// 1. Session is dead/disowned (normal case), OR
-			// 2. Session is live but idle with broker confirmation (operator abandonment)
+			// 2. Session is live but idle with broker confirmation (operator abandonment), OR
+			// 3. Session is live but idle with an attempt already settled (may be retrying close after transient failure)
 			const sessionIsDeadOrDisowned = liveness.live === false || liveness.disowned;
+			const isAlreadySettledAbandon =
+				lastAttempt &&
+				lastAttempt.endedAt &&
+				liveness.live === true &&
+				!liveness.disowned &&
+				isIdleEnough;
 
-			if (!sessionIsDeadOrDisowned && !canRetireAsAbandonment) {
+			if (!sessionIsDeadOrDisowned && !canRetireAsAbandonment && !isAlreadySettledAbandon) {
 				this.#log(`lane_force_retire_rejected name=${name} session=${lane.sessionId} reason=session_still_live`);
 				return {
 					retired: false,

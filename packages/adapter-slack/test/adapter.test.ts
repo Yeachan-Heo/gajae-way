@@ -1820,10 +1820,10 @@ test("#710: recovery that finds messages the connected socket never delivered fl
 	let clock = 1_700_000_000_000;
 	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false, now: () => clock });
 	try {
-		f.sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "hello" }) });
+		f.sockets[0]?.onmessage?.({ data: JSON.stringify({ type: "hello" }) });
 		expect(f.mode.connected).toBe(true);
 		// One message arrives live; two later ones never reach the socket.
-		f.sockets[0]!.onmessage?.({
+		f.sockets[0]?.onmessage?.({
 			data: JSON.stringify({
 				envelope_id: "env-live",
 				type: "events_api",
@@ -1871,7 +1871,7 @@ test("#710: recovered messages are not blamed on the socket when it was not yet 
 		f.api.history.C1 = [{ type: "message", user: "U1", ts: "1700000100.000001", text: "while not greeted" }];
 		// No hello yet: an ordinary outage backfill.
 		expect(await f.recoverMissedMessages()).toBe(true);
-		f.sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "hello" }) });
+		f.sockets[0]?.onmessage?.({ data: JSON.stringify({ type: "hello" }) });
 		clock = 1_700_000_700_000;
 		// Posted 1 minute ago: may still be on its way.
 		f.api.history.C1 = [{ type: "message", user: "U1", ts: "1700000640.000001", text: "fresh" }];
@@ -1905,11 +1905,11 @@ test("#710: slash-command envelope after missed message still counts as a gap (E
 	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false, now: () => clock });
 	try {
 		// Socket connects and receives hello
-		f.sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "hello" }) });
+		f.sockets[0]?.onmessage?.({ data: JSON.stringify({ type: "hello" }) });
 		expect(f.mode.connected).toBe(true);
 
 		// One message arrives live via events_api
-		f.sockets[0]!.onmessage?.({
+		f.sockets[0]?.onmessage?.({
 			data: JSON.stringify({
 				envelope_id: "env-live",
 				type: "events_api",
@@ -1924,7 +1924,7 @@ test("#710: slash-command envelope after missed message still counts as a gap (E
 
 		// Another message arrives but we never receive its events_api envelope
 		// Instead, we receive a slash_command envelope (which should NOT update lastEnvelopeAt for deaf-socket detection)
-		f.sockets[0]!.onmessage?.({
+		f.sockets[0]?.onmessage?.({
 			data: JSON.stringify({
 				envelope_id: "env-slash",
 				type: "slash_commands",
@@ -1967,7 +1967,7 @@ test("#710: messages within grace period are not blamed on deaf socket", async (
 	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false, now: () => clock });
 	try {
 		// Socket connects but says hello (proves it's connected)
-		f.sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "hello" }) });
+		f.sockets[0]?.onmessage?.({ data: JSON.stringify({ type: "hello" }) });
 		expect(f.mode.connected).toBe(true);
 
 		// Advance time to within grace period
@@ -2004,12 +2004,12 @@ test("#710: Event Subscriptions stay off after forced reconnect; suspect flag cl
 	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false, now: () => clock });
 	try {
 		// Socket connects and receives hello
-		f.sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "hello" }) });
+		f.sockets[0]?.onmessage?.({ data: JSON.stringify({ type: "hello" }) });
 		expect(f.mode.connected).toBe(true);
 
 		// One message arrives live via events_api to set initial lastEnvelopeAt
 		clock = 1_700_000_010_000;
-		f.sockets[0]!.onmessage?.({
+		f.sockets[0]?.onmessage?.({
 			data: JSON.stringify({
 				envelope_id: "env-live-1",
 				type: "events_api",
@@ -2032,7 +2032,7 @@ test("#710: Event Subscriptions stay off after forced reconnect; suspect flag cl
 		expect(f.eventsSuspect()).toBeUndefined();
 		expect(await f.recoverMissedMessages()).toBe(true);
 		expect(f.eventsSuspect()).toBeDefined();
-		const suspectSince = f.eventsSuspect()!.since;
+		const suspectSince = f.eventsSuspect()?.since;
 		// Verify suspect was set due to missed message
 		expect(suspectSince).toBe(1_700_000_600_000);
 
@@ -2045,7 +2045,7 @@ test("#710: Event Subscriptions stay off after forced reconnect; suspect flag cl
 		// An empty recovery pass should NOT clear the suspect flag
 		expect(await f.recoverMissedMessages()).toBe(true);
 		expect(f.eventsSuspect()).toBeDefined();
-		expect(f.eventsSuspect()!.since).toBe(suspectSince);
+		expect(f.eventsSuspect()?.since).toBe(suspectSince);
 	} finally {
 		f.socket.stop();
 		f.recovery.stop();

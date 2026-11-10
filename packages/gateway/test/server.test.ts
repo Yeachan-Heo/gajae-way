@@ -101,11 +101,11 @@ async function connect(socketPath: string): Promise<{
 		});
 	};
 	return {
-		send: (value) => writer!.write(value as Frame),
+		send: (value) => writer?.write(value as Frame),
 		frames,
 		wireLines,
 		waitForFrame,
-		close: () => writer!.close(),
+		close: () => writer?.close(),
 	};
 }
 
@@ -722,7 +722,7 @@ test("post-send disown ambiguity retains the original operation without degradin
 		await waitFrame(client.frames, "send-disowned-session");
 		for (let attempt = 0; attempt < 400 && !port?.statusReads.length; attempt++) await Bun.sleep(5);
 		expect(port?.statusReads.length).toBeGreaterThan(0);
-		const original = port!.sends[0]!;
+		const original = port?.sends[0]!;
 		expect(database.inbox.turnRow(original.opRef)).toMatchObject({
 			turn_state: "bound",
 			turn_op_ref: original.opRef,
@@ -738,9 +738,9 @@ test("post-send disown ambiguity retains the original operation without degradin
 				failure: null,
 			});
 		}
-		expect(port!.sends).toHaveLength(1);
-		expect(port!.sendAttempts).toHaveLength(1);
-		expect(port!.binds).toHaveLength(1);
+		expect(port?.sends).toHaveLength(1);
+		expect(port?.sendAttempts).toHaveLength(1);
+		expect(port?.binds).toHaveLength(1);
 		expect(database.bindings.getSessionRecord(key)).toEqual({ sessionId: original.sessionId, epoch: 0 });
 
 		unknown = false;
@@ -757,9 +757,9 @@ test("post-send disown ambiguity retains the original operation without degradin
 			await Bun.sleep(5);
 		expect(database.inbox.turnRow(original.opRef)?.turn_state).toBe("done");
 		expect(replies()).toHaveLength(1);
-		expect(port!.sends).toHaveLength(1);
-		expect(port!.sendAttempts).toHaveLength(1);
-		expect(port!.binds).toHaveLength(1);
+		expect(port?.sends).toHaveLength(1);
+		expect(port?.sendAttempts).toHaveLength(1);
+		expect(port?.binds).toHaveLength(1);
 		expect(database.bindings.getSessionRecord(key)).toEqual({ sessionId: original.sessionId, epoch: 0 });
 	} finally {
 		// Always provide the real native terminal, including when an assertion fails,
@@ -1042,7 +1042,7 @@ test("inflight rows are not re-broadcast by the timed sweep within ack timeout",
 	const ledger = new DeliveryService(database);
 	ledger.markInflight(deliveryId);
 	const row = ledger.get(deliveryId);
-	const updatedAt = Date.parse(row!.updatedAt);
+	const updatedAt = Date.parse(row?.updatedAt);
 
 	// Count chat.message frames with this deliveryId before the sweep
 	const messagesBeforeSweep = client.frames.filter(
@@ -1662,13 +1662,13 @@ test("model refusals notify once without consuming the pending message's eventua
 				(frame) => frame.event === "chat.message" && frame.payload.text === "the original message is answered",
 			),
 		);
-		await until(() => database.inbox.turnRow(port.sends[0]!.opRef)?.state === "done");
+		await until(() => database.inbox.turnRow(port.sends[0]?.opRef)?.state === "done");
 		expect(attempts).toBe(3);
 		expect(port.sends).toHaveLength(1);
 		expect(port.sends[0]?.sessionId).toBe(sessionId);
 		expect(port.binds).toHaveLength(1);
 		expect(notices()).toHaveLength(1);
-		expect(database.inbox.turnRow(port.sends[0]!.opRef)?.terminal_delivery_id).not.toBeNull();
+		expect(database.inbox.turnRow(port.sends[0]?.opRef)?.terminal_delivery_id).not.toBeNull();
 	} finally {
 		client.close();
 	}
@@ -1802,7 +1802,7 @@ test("large memory.audit and concurrent progress remain independently parseable 
 	const auditResponse = client.frames.find((frame) => frame.type === "response" && frame.id === "audit");
 	expect(auditResponse).toBeDefined();
 	expect(auditResponse?.result?.opRef).toBeDefined();
-	const opRef = (auditResponse!.result as { opRef: string }).opRef;
+	const opRef = (auditResponse?.result as { opRef: string }).opRef;
 
 	// Poll for the audit result via memory.status
 	let auditStatus: any;
@@ -2129,7 +2129,7 @@ test("restart prepare waits for delivered turns and holds new persona dispatches
 	const replyDelivery = client.frames.find(
 		(frame) => frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "reply-1",
 	);
-	if (!replyDelivery || replyDelivery.type !== "event" || !replyDelivery.payload.deliveryId)
+	if (replyDelivery?.type !== "event" || !replyDelivery.payload.deliveryId)
 		throw new Error("terminal reply delivery was not broadcast");
 	client.send({
 		v: "0.1",
@@ -2347,7 +2347,7 @@ test("restart prepare treats an expired terminal delivery as settled", async () 
 			(frame) =>
 				frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "expired terminal reply",
 		);
-		if (!terminalReply || terminalReply.type !== "event" || !terminalReply.payload.deliveryId)
+		if (terminalReply?.type !== "event" || !terminalReply.payload.deliveryId)
 			throw new Error("terminal reply was not broadcast");
 		for (let attempt = 1; attempt <= 5; attempt++) {
 			const id = `expire-terminal-${attempt}`;
@@ -2436,7 +2436,7 @@ test("expired terminal delivery IDs do not poison later restarts after outbox re
 				frame.event === "chat.message" &&
 				frame.payload.text === "terminal reply that expires before a restart",
 		);
-		if (!terminalReply || terminalReply.type !== "event" || !terminalReply.payload.deliveryId)
+		if (terminalReply?.type !== "event" || !terminalReply.payload.deliveryId)
 			throw new Error("terminal reply was not broadcast");
 		const deliveryId = terminalReply.payload.deliveryId;
 		const triggerRowQuery = database.core
@@ -2453,7 +2453,7 @@ test("expired terminal delivery IDs do not poison later restarts after outbox re
 			if (triggerRow?.turn_state === "done" && triggerRow.terminal_delivery_id !== null) break;
 			await Bun.sleep(5);
 		}
-		if (!triggerRow || triggerRow.turn_state !== "done" || triggerRow.terminal_delivery_id === null)
+		if (triggerRow?.turn_state !== "done" || triggerRow.terminal_delivery_id === null)
 			throw new Error("terminal trigger did not finish with a delivery link");
 		expect(Object.values(JSON.parse(triggerRow.terminal_delivery_id) as Record<string, string>)).toContain(deliveryId);
 		client.send({
@@ -2582,7 +2582,7 @@ test("restart prepare waits for a terminal delivery whose actor settled before t
 				frame.event === "chat.message" &&
 				frame.payload.text === "terminal reply before drain",
 		);
-		if (!terminalReply || terminalReply.type !== "event" || !terminalReply.payload.deliveryId)
+		if (terminalReply?.type !== "event" || !terminalReply.payload.deliveryId)
 			throw new Error("pre-drain terminal reply was not broadcast");
 		await Bun.sleep(30);
 		client.send({
@@ -2686,7 +2686,7 @@ test("restart prepare includes unconfirmed terminal deliveries persisted by the 
 			(frame) =>
 				frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "durable terminal reply",
 		);
-		if (!terminalReply || terminalReply.type !== "event" || !terminalReply.payload.deliveryId)
+		if (terminalReply?.type !== "event" || !terminalReply.payload.deliveryId)
 			throw new Error("terminal reply was not persisted by the first gateway");
 		const deliveryId = terminalReply.payload.deliveryId;
 		expect(firstDatabase.outbox.unsettledTerminalDeliveryIds()).toContain(deliveryId);
@@ -3023,7 +3023,7 @@ test("owner /restart resumes after a stack drain is cancelled and waits for acti
 			(frame) =>
 				frame.type === "event" && frame.event === "chat.message" && frame.payload.text === "active reply delivered",
 		);
-		if (!activeReply || activeReply.type !== "event" || !activeReply.payload.deliveryId)
+		if (activeReply?.type !== "event" || !activeReply.payload.deliveryId)
 			throw new Error("owner restart reply was not broadcast");
 		client.send({
 			v: "0.1",
@@ -3527,11 +3527,11 @@ test("an open-channel burst from several authors: the first is the turn, later o
 	expect(turns[0]).toContain("[alice | discord channel c1 (author:u1, msg:m1)]");
 	try {
 		// Each steer names its speaker and message, like a trigger would.
-		expect(sessionPort.steers[0]!.text).toContain("bob");
-		expect(sessionPort.steers[0]!.text).toContain("msg:m2");
-		expect(sessionPort.steers[0]!.text).toContain("second message");
-		expect(sessionPort.steers[1]!.text).toContain("carol");
-		expect(sessionPort.steers[1]!.text).toContain("msg:m3");
+		expect(sessionPort.steers[0]?.text).toContain("bob");
+		expect(sessionPort.steers[0]?.text).toContain("msg:m2");
+		expect(sessionPort.steers[0]?.text).toContain("second message");
+		expect(sessionPort.steers[1]?.text).toContain("carol");
+		expect(sessionPort.steers[1]?.text).toContain("msg:m3");
 	} finally {
 		release();
 	}
@@ -4498,7 +4498,7 @@ test("work capacity rejects new lanes, permits reuse, and work.retire frees the 
 	await waitFor(client.frames, 2);
 	const first = client.frames.find((frame) => frame.id === "first");
 	expect(first).toMatchObject({ type: "response", result: { held: false, sessionKey: "work/task/a" } });
-	const sessionId = database.bindings.getSessionRecord("work/task/a")!.sessionId;
+	const sessionId = database.bindings.getSessionRecord("work/task/a")?.sessionId;
 	client.send({
 		v: "0.1",
 		type: "request",
@@ -4907,7 +4907,7 @@ test("Unix stop detaches a long run before request drain and leaves the attempt 
 	for (let i = 0; i < 600 && f.port.sends.length === 0; i++) await Bun.sleep(5);
 	expect(f.port.sends).toHaveLength(1);
 	let stopped = false;
-	const stop = server!.stop().then(() => {
+	const stop = server?.stop().then(() => {
 		stopped = true;
 	});
 	for (let i = 0; i < 600 && !stopped; i++) await Bun.sleep(5);
@@ -5006,7 +5006,7 @@ test("stdio stop detaches work.run before runtime request drain in an actual chi
 		try {
 			expect(reopened.work.workAttemptOpen()).toHaveLength(1);
 			expect(
-				parseLaneJobRecord(reopened.work.laneJobJson(reopened.work.workAttemptOpen()[0]!.jobId)!).attempts[0]?.endedAt,
+				parseLaneJobRecord(reopened.work.laneJobJson(reopened.work.workAttemptOpen()[0]?.jobId)!).attempts[0]?.endedAt,
 			).toBeUndefined();
 		} finally {
 			reopened.close();
@@ -5025,7 +5025,7 @@ for (const verb of ["work.start", "work.run"] as const) {
 		f.client.send({ v: "0.1", type: "request", id: "worker", verb, params: { name, text: "work", cwd: directory } });
 		for (let i = 0; i < 600 && f.port.sends.length === 0; i++) await Bun.sleep(5);
 		expect(f.port.sends).toHaveLength(1);
-		const opRef = f.port.sends[0]!.opRef;
+		const opRef = f.port.sends[0]?.opRef;
 		const expectedOrigin = { platform: "work", kind: "task", conversationId: name };
 		for (const phase of ["open", "settled"] as const) {
 			if (phase === "settled") {

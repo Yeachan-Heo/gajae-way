@@ -622,7 +622,7 @@ test("failed send after proven startup model remains uncertain without retry or 
 	await expect(
 		f.manager.start({ name: "a", text: "work", cwd: f.directory, model: "startup-model" }),
 	).rejects.toMatchObject({ detail: { reasonCode: "send_acceptance_uncertain" } });
-	const opRef = f.job().attempts[0]!.opRef;
+	const opRef = f.job().attempts[0]?.opRef;
 	expect(f.db.work.workAttemptGet(opRef)?.sendPhase).toBe("uncertain");
 	await f.manager.recover();
 	await f.restart();
@@ -648,12 +648,12 @@ test("start acknowledges before terminal, one observer survives caller-free comp
 	await until(() => attaches === 1);
 	await Promise.all([f.manager.recover(), f.manager.recover()]);
 	expect(attaches).toBe(1);
-	const activity = f.db.bindings.workLaneRows()[0]!.last_activity_at;
+	const activity = f.db.bindings.workLaneRows()[0]?.last_activity_at;
 	await Bun.sleep(10);
 	f.port.complete(result.opRef, "done");
 	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
 	expect(f.job().attempts[0]?.endState).toBe("completed");
-	expect(f.db.bindings.workLaneRows()[0]!.last_activity_at! > activity!).toBe(true);
+	expect(f.db.bindings.workLaneRows()[0]?.last_activity_at! > activity!).toBe(true);
 	expect(f.notices).toHaveLength(1);
 	expect(f.notices[0]).toMatchObject({ turnId: result.opRef, origin, text: "[lane a] completed: done" });
 	expect(f.db.outbox.rows()).toHaveLength(1);
@@ -686,13 +686,13 @@ test("status is pure during a run wait and steer returns the exact supplied clie
 	const owner = {};
 	const run = f.manager.run({ name: "a", text: "work", cwd: f.directory }, owner);
 	await until(() => f.port.sends.length === 1);
-	const op = f.port.sends[0]!.opRef;
+	const op = f.port.sends[0]?.opRef;
 	const before = f.db.work.laneJobJson(laneJobIdentity("a").jobId);
-	const activity = f.db.bindings.workLaneRows()[0]!.last_activity_at;
+	const activity = f.db.bindings.workLaneRows()[0]?.last_activity_at;
 	const snapshot = await f.manager.status({ name: "a" });
 	expect(snapshot).toMatchObject({ attempt: { opRef: op }, op: { status: "in_flight" } });
 	expect(f.db.work.laneJobJson(snapshot.jobId)).toBe(before);
-	expect(f.db.bindings.workLaneRows()[0]!.last_activity_at).toBe(activity);
+	expect(f.db.bindings.workLaneRows()[0]?.last_activity_at).toBe(activity);
 	const steer = await f.manager.steer({ name: "a", text: "correction" });
 	expect(steer.steered).toBe(true);
 	if (steer.steered) expect(f.port.steers[0]?.clientRef).toBe(steer.clientRef);
@@ -763,7 +763,7 @@ test("caller timeout only detaches and a later completion settles the same opera
 	const f = await fixture({ waitTimeoutMs: 25, ownerTarget: () => origin });
 	const run = f.manager.run({ name: "a", text: "work", cwd: f.directory }, {});
 	await expect(run).rejects.toMatchObject({ detail: { reasonCode: "work_wait_timeout" } });
-	const op = f.port.sends[0]!.opRef;
+	const op = f.port.sends[0]?.opRef;
 	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
 	f.port.complete(op, "late answer");
 	await until(() => f.db.work.workAttemptGet(op)?.settledAt !== null);
@@ -808,8 +808,8 @@ test("a disconnect before send receipt cannot leave a newly registered waiter be
 });
 
 for (const [label, text, disposition] of [
-	["full body", "HEAD:" + "가😀".repeat(1000) + ":TAIL", "available"],
-	["silent body", "HEAD:" + "가😀".repeat(1000) + "[SILENT]", "silent"],
+	["full body", `HEAD:${"가😀".repeat(1000)}:TAIL`, "available"],
+	["silent body", `HEAD:${"가😀".repeat(1000)}[SILENT]`, "silent"],
 ] as const) {
 	test(`run retains exact ${label} when output precedes the send receipt without reporting to its parent`, async () => {
 		const f = await fixture({ allowNested: () => true, ownerTarget: () => origin });
@@ -912,7 +912,7 @@ test("proven original silence suppresses before prefix and UTF8 clipping, and su
 	await f.restart();
 	expect(f.notices).toHaveLength(0);
 	expect(f.db.outbox.rows()).toHaveLength(0);
-	expect(utf8Prefix("HEAD" + "가".repeat(1000) + "TAIL")).toBe("HEAD" + "가".repeat(681));
+	expect(utf8Prefix(`HEAD${"가".repeat(1000)}TAIL`)).toBe(`HEAD${"가".repeat(681)}`);
 	expect(utf8Prefix("😀가tail", 6)).toBe("😀");
 	expect(utf8Prefix("😀가tail", 7)).toBe("😀가");
 });
@@ -920,7 +920,7 @@ test("proven original silence suppresses before prefix and UTF8 clipping, and su
 for (const [label, text] of [
 	["preamble", "Nothing to report. [SILENT]"],
 	["lowercase", "Nothing to report. [silent]"],
-	["beyond excerpt", "HEAD:" + "가".repeat(1000) + "[SILENT]"],
+	["beyond excerpt", `HEAD:${"가".repeat(1000)}[SILENT]`],
 ] as const) {
 	test(`proven original ${label} silence persists before clipping and suppresses start delivery`, async () => {
 		const f = await fixture();
@@ -955,7 +955,7 @@ for (const [label, text] of [
 		const f = await fixture({ ownerTarget: () => origin });
 		const run = f.manager.run({ name: "a", text: "work", cwd: f.directory }, {});
 		await until(() => f.port.sends.length === 1);
-		const opRef = f.port.sends[0]!.opRef;
+		const opRef = f.port.sends[0]?.opRef;
 		f.port.complete(opRef, text);
 		expect(await run).toMatchObject({ held: false, text, opRef });
 		const runtime = f.db.work.workAttemptGet(opRef)!;
@@ -981,7 +981,7 @@ test("unavailable output preserves completed outcome without prior assistant fal
 	};
 	const run = f.manager.run({ name: "a", text: "work", cwd: f.directory }, {});
 	await until(() => f.port.sends.length === 1);
-	f.port.complete(f.port.sends[0]!.opRef, "untrusted");
+	f.port.complete(f.port.sends[0]?.opRef, "untrusted");
 	await expect(run).rejects.toMatchObject({ detail: { reasonCode: "output_unavailable" } });
 	expect(f.job().attempts[0]?.endState).toBe("completed");
 	expect(f.notices).toHaveLength(0);
@@ -1032,7 +1032,7 @@ for (const [reason, state] of [
 		});
 		await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
 		expect(f.job().attempts[0]?.endState).toBe(state);
-		const suffix = f.notices[0]!.text.slice("[lane a] attempt_ended: ".length);
+		const suffix = f.notices[0]?.text.slice("[lane a] attempt_ended: ".length);
 		expect(suffix.startsWith(`${reason === "unknown_reason" ? "stopped_incomplete" : reason}: `)).toBe(true);
 		expect(Buffer.byteLength(suffix)).toBeLessThanOrEqual(2048);
 	});
@@ -1835,7 +1835,7 @@ test("an inconsistent runtime is quarantined and not re-logged on subsequent rec
 	// Verify that recovery doesn't re-log the same error on subsequent calls
 	const errorCountBefore = errors.mock.calls.length;
 	await f.manager.recover();
-	const errorCountAfter = errors.mock.calls.length;
+	const _errorCountAfter = errors.mock.calls.length;
 	// Should not have new work_recovery_invalid_attempt logs
 	const newInvalidLogs = [...errors.mock.calls.slice(errorCountBefore)].filter((call) => {
 		const line = String(call[0]);
@@ -2209,14 +2209,14 @@ for (const revoke of ["stop", "generation", "binding"] as const) {
 				// Separately race a durable checkpoint so rejection must CAS latest.
 				// It must change a field: no-op patches no longer bump the version (#648).
 				expect(sessionActivity).toBeDefined();
-				sessionActivity!();
+				sessionActivity?.();
 				const checkpoint = f.db.transaction((tx) =>
 					f.db.work.workAttemptUpdate(tx, before.opRef, before.version, {
 						turnEndObservedAt: new Date(Date.parse(before.startedAt) + 1).toISOString(),
 					}),
 				);
 				expect(checkpoint).toBeDefined();
-				expect(checkpoint!.version).toBeGreaterThan(before.version);
+				expect(checkpoint?.version).toBeGreaterThan(before.version);
 			}
 			let transition: Promise<void> | undefined;
 			if (revoke === "stop") transition = f.manager.stop();
@@ -2426,7 +2426,7 @@ test("stop releases run before draining a blocked finite output read and preserv
 	};
 	const run = f.manager.run({ name: "a", text: "work", cwd: f.directory }, {}).catch((e: unknown) => e);
 	await until(() => f.port.sends.length === 1);
-	const op = f.port.sends[0]!.opRef;
+	const op = f.port.sends[0]?.opRef;
 	f.port.complete(op, "answer");
 	await until(() => reading);
 	const stop = f.manager.stop();
@@ -2829,7 +2829,7 @@ test("run from a lane with nesting allowed remains response-only", async () => {
 		{},
 	);
 	await until(() => f.port.sends.length === 2);
-	const opRef = f.port.sends[1]!.opRef;
+	const opRef = f.port.sends[1]?.opRef;
 	f.port.complete(opRef, "response only");
 	expect(await run).toMatchObject({ held: false, text: "response only", opRef });
 	const runtime = f.db.work.workAttemptGet(opRef)!;
@@ -2978,11 +2978,11 @@ for (const failure of ["provider", "deadline"] as const) {
 			expect(JSON.stringify(saved)).not.toContain("PRIVATE");
 			expect(f.job().attempts[0]?.endState).toBe(failure === "provider" ? "failed" : "attempt_ended");
 			expect(f.notices).toHaveLength(1);
-			expect(f.notices[0]!.text).toContain(reason);
-			if (receiptState) expect(f.notices[0]!.text).toContain(`receiptState=${receiptState}`);
-			expect(f.notices[0]!.text).toContain(`code=${outcome.code}`);
-			expect(f.notices[0]!.text).not.toContain("PRIVATE");
-			if (failure === "provider") expect(f.notices[0]!.text).toContain("providerCode=server_is_overloaded");
+			expect(f.notices[0]?.text).toContain(reason);
+			if (receiptState) expect(f.notices[0]?.text).toContain(`receiptState=${receiptState}`);
+			expect(f.notices[0]?.text).toContain(`code=${outcome.code}`);
+			expect(f.notices[0]?.text).not.toContain("PRIVATE");
+			if (failure === "provider") expect(f.notices[0]?.text).toContain("providerCode=server_is_overloaded");
 			await f.restart();
 			expect(f.notices).toHaveLength(1);
 			expect(f.port.sends).toHaveLength(1);
@@ -3077,8 +3077,8 @@ test("#696 confirmed host death ends execution without replacing an observed pro
 		output: { disposition: "unavailable", reads: 0 },
 	});
 	expect(f.notices).toHaveLength(1);
-	expect(f.notices[0]!.text).toContain("providerCode=server_is_overloaded");
-	expect(f.notices[0]!.text).toContain("receiptState=missing");
+	expect(f.notices[0]?.text).toContain("providerCode=server_is_overloaded");
+	expect(f.notices[0]?.text).toContain("receiptState=missing");
 	await f.restart();
 	expect(f.notices).toHaveLength(1);
 	expect(f.port.sends).toHaveLength(1);
@@ -3831,16 +3831,16 @@ for (const evidence of ["idle", "dead"] as const) {
 			try {
 				const result = await started(f, "a", origin);
 				await until(() => attached !== undefined);
-				relay.streams[0]!.host({ type: "activity", state: "idle" });
+				relay.streams[0]?.host({ type: "activity", state: "idle" });
 				await until(() => backlogEntered);
-				attached!.correlate(result.opRef, { commandId: `command-${result.opRef}`, turnId: `turn-${result.opRef}` });
+				attached?.correlate(result.opRef, { commandId: `command-${result.opRef}`, turnId: `turn-${result.opRef}` });
 				f.port.liveness = async () => ({ live: false, disowned: false });
 				terminalAt = Date.now();
 				terminal = true;
 				await until(() => rechecking);
 				expect(executionProbes).toBe(1);
-				relay.streams[0]!.host({ type: "activity", state: "active" });
-				relay.streams[0]!.host({
+				relay.streams[0]?.host({ type: "activity", state: "active" });
+				relay.streams[0]?.host({
 					type: "event",
 					kind: "tool_execution_start",
 					commandId: "foreign-command",
@@ -3848,7 +3848,7 @@ for (const evidence of ["idle", "dead"] as const) {
 					payload: { toolName: "bash" },
 				});
 				if (ingressKind === "tool") {
-					relay.streams[0]!.host({
+					relay.streams[0]?.host({
 						type: "event",
 						kind: "tool_execution_start",
 						commandId: `command-${result.opRef}`,
@@ -3857,7 +3857,7 @@ for (const evidence of ["idle", "dead"] as const) {
 					});
 				} else {
 					// Native execution can restart without an SDK owner, before content.
-					relay.streams[0]!.host(
+					relay.streams[0]?.host(
 						ingressKind === "agent_start"
 							? { type: "agent_start" }
 							: { type: "event", kind: "agent_start", payload: {} },
@@ -3936,7 +3936,7 @@ test("recovery cannot use CLI idle snapshots before a real correlated observer i
 	try {
 		await f.restart();
 		await until(() => attached !== undefined && probes > 0);
-		relay.streams[0]!.host({
+		relay.streams[0]?.host({
 			type: "event",
 			kind: "tool_execution_start",
 			commandId: `command-${result.opRef}`,
@@ -3945,7 +3945,7 @@ test("recovery cannot use CLI idle snapshots before a real correlated observer i
 		});
 		// This response proves the preceding frame reached the real reader. The
 		// frame has no selected operation yet, so it cannot advance the epoch.
-		await attached!.query("context.get", {});
+		await attached?.query("context.get", {});
 		expect(ingress).toBe(0);
 		releaseContext.resolve();
 		await until(() => contextResolved);
@@ -3997,7 +3997,7 @@ test("a real relay transport gap invalidates a pending idle snapshot", async () 
 	});
 	try {
 		await until(() => probes > 0 && relay.streams.length > 0);
-		relay.streams[0]!.close();
+		relay.streams[0]?.close();
 		await until(() => relay.streams.length > 1);
 		releaseContext.resolve();
 		await until(() => probes > 1);
@@ -4458,11 +4458,11 @@ test("CAS loss does not fan out or perform a separate history/activity update", 
 	await until(() => calls > 0);
 	// Streamed frames may refresh activity before settlement; a lost settlement
 	// CAS must not write it (or history) again on any later retry.
-	const activity = f.db.bindings.workLaneRows()[0]!.last_activity_at;
+	const activity = f.db.bindings.workLaneRows()[0]?.last_activity_at;
 	const seen = calls;
 	await until(() => calls > seen);
 	expect(f.db.work.laneJobJson(result.jobId)).toBe(history);
-	expect(f.db.bindings.workLaneRows()[0]!.last_activity_at).toBe(activity);
+	expect(f.db.bindings.workLaneRows()[0]?.last_activity_at).toBe(activity);
 	expect(f.notices).toHaveLength(0);
 	expect(f.db.outbox.rows()).toHaveLength(0);
 	f.db.work.workAttemptSettle = settle;
@@ -4581,9 +4581,9 @@ for (const status of ["terminal_ok", "failed"] as const) {
 				if (observedAtSend && receiptState === "present") expect(response).toMatchObject({ started: true });
 				else
 					expect(response).toMatchObject({ code: "verb_failed", detail: { reasonCode: "send_acceptance_uncertain" } });
-				const opRef = f.job().attempts[0]!.opRef;
+				const opRef = f.job().attempts[0]?.opRef;
 				if (receiptState === "missing" || (status === "failed" && receiptState !== "present"))
-					f.port.emitTurnEnd(f.job().attempts[0]!.sessionId, opRef, status === "failed" ? "agent_failed" : "agent_end");
+					f.port.emitTurnEnd(f.job().attempts[0]?.sessionId, opRef, status === "failed" ? "agent_failed" : "agent_end");
 				await until(() => f.db.work.workAttemptGet(opRef)?.settledAt != null);
 				const runtime = f.db.work.workAttemptGet(opRef)!;
 				expect(runtime.sendPhase).toBe(receiptState === "present" ? "accepted" : "uncertain");
@@ -4604,7 +4604,7 @@ for (const status of ["terminal_ok", "failed"] as const) {
 test("completion excerpt retains the leading marker and scalar-safe prefix, not the tail", async () => {
 	const f = await fixture();
 	const result = await started(f, "a", origin);
-	const source = "HEAD:" + "😀".repeat(1000) + ":TAIL";
+	const source = `HEAD:${"😀".repeat(1000)}:TAIL`;
 	f.port.complete(result.opRef, source);
 	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
 	const head = "[lane a] completed: ";
@@ -4636,7 +4636,7 @@ test("report and fallback text stay within 2048 UTF-8 bytes including the lane h
 	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
 	const runtime = f.db.work.workAttemptGet(result.opRef)!;
 	expect(f.notices[0]?.text).toBe(reportText(name, "completed", "end_turn", result.opRef, runtime.output));
-	expect(Buffer.byteLength(f.notices[0]!.text, "utf8")).toBeLessThanOrEqual(2048);
+	expect(Buffer.byteLength(f.notices[0]?.text, "utf8")).toBeLessThanOrEqual(2048);
 });
 
 test("repository and PR head facts survive a large completion excerpt", () => {
@@ -4749,7 +4749,7 @@ test("AC-K parent change in the same epoch re-prepends the notice", async () => 
 	await until(() => f.db.work.workAttemptGet(first.opRef)?.settledAt !== null);
 	const changedOrigin = { ...origin, conversationId: "different-parent" };
 	f.setOwnerTarget(changedOrigin);
-	const second = await started(f);
+	const _second = await started(f);
 	expect(f.port.sends[1]?.systemPreamble).toContain(`persona conversation ${originKey(changedOrigin)}`);
 });
 
@@ -4763,7 +4763,7 @@ test("AC-K nested-refused notice is prepended to start sends and run sends carry
 	const run = f.manager.run({ name: "a", text: "run text", cwd: f.directory }, {});
 	await until(() => f.port.sends.length === 2);
 	expect(f.port.sends[1]?.systemPreamble).toBeUndefined();
-	f.port.complete(f.port.sends[1]!.opRef, "run result");
+	f.port.complete(f.port.sends[1]?.opRef, "run result");
 	expect(await run).toMatchObject({ held: false, text: "run result" });
 });
 
@@ -5397,7 +5397,7 @@ test("#308 a native start between probes resets accumulated host-loss grace", as
 	let prior = inspections;
 	await until(() => inspections > prior);
 	// Invoke receipt-time ingress synchronously between completed probe ticks.
-	nativeStart!();
+	nativeStart?.();
 	now += 1;
 	prior = inspections;
 	await until(() => inspections > prior || f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
@@ -5476,7 +5476,7 @@ for (const stage of ["status", "inspect"] as const) {
 				block = true;
 				now += 100;
 				await until(() => entered);
-				relay.streams[0]!.host(
+				relay.streams[0]?.host(
 					lifecycle === "raw" ? { type: "agent_start" } : { type: "event", kind: "agent_start", payload: {} },
 				);
 				holdNextStatus = true;
@@ -5535,12 +5535,12 @@ test("#308 streamed turn frames advance lane activity past the attempt start", a
 	let now = Date.now();
 	const f = await fixture({ now: () => now });
 	const result = await started(f);
-	const startedAt = f.db.bindings.workLaneRows()[0]!.last_activity_at!;
-	expect(startedAt).toBe(f.db.work.workAttemptGet(result.opRef)!.startedAt);
+	const startedAt = f.db.bindings.workLaneRows()[0]?.last_activity_at!;
+	expect(startedAt).toBe(f.db.work.workAttemptGet(result.opRef)?.startedAt);
 	now += 5_000;
 	f.port.emitTool(result.sessionId, { toolName: "bash" });
-	await until(() => f.db.bindings.workLaneRows()[0]!.last_activity_at !== startedAt);
-	expect(f.db.bindings.workLaneRows()[0]!.last_activity_at).toBe(new Date(now).toISOString());
+	await until(() => f.db.bindings.workLaneRows()[0]?.last_activity_at !== startedAt);
+	expect(f.db.bindings.workLaneRows()[0]?.last_activity_at).toBe(new Date(now).toISOString());
 	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
 });
 
@@ -5592,7 +5592,7 @@ test("transport failure never leaks errorMessage secrets in lane notice", async 
 	f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
 	f.port.fail(result.opRef, "private failure", { code: "sdk_failed" });
 	await until(() => f.db.work.workAttemptOpen().length === 0);
-	const attempt = f.db.work.workAttemptGet(result.opRef);
+	const _attempt = f.db.work.workAttemptGet(result.opRef);
 	const notice = f.notices[0]?.text ?? "";
 	// Private error messages must never appear in lane notice
 	expect(notice).not.toContain("secret");
@@ -6688,7 +6688,7 @@ for (const retirement of ["automatic", "force"] as const) {
 		const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
 		const { head, sessionId } = await awaitingLane(f, `fix/${retirement}-retire-checks-report`);
 		await until(() => f.notices.length === 1);
-		const opRef = f.job().attempts.at(-1)!.opRef;
+		const opRef = f.job().attempts.at(-1)?.opRef;
 		const savedRuntime = f.db.work.workAttemptGet(opRef)!;
 		expect(savedRuntime).toMatchObject({ terminal: { reasonCode: "end_turn" } });
 		expect(savedRuntime.settledAt).not.toBeNull();
@@ -6738,7 +6738,7 @@ test("ended checks retirement admits a distinct report to the bound persona inbo
 	f.db.transaction((tx) => f.db.bindings.bind(tx, originKey(origin), crypto.randomUUID()));
 	const { sessionId } = await awaitingLane(f, "fix/retire-checks-persona");
 	await until(() => nudges.length === 1);
-	const runtime = f.db.work.workAttemptGet(f.job().attempts.at(-1)!.opRef)!;
+	const runtime = f.db.work.workAttemptGet(f.job().attempts.at(-1)?.opRef)!;
 	expect(f.db.inbox.pendingOldest(originKey(origin))?.message_id).toBe(runtime.reportId);
 	f.port.setSessionState(sessionId, { live: false });
 	expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: true });
@@ -6856,7 +6856,7 @@ test("ended checks retirement requires dead or disowned proof, not unknown liven
 	await until(() => f.notices.length === 1);
 	const job = f.job();
 	const binding = f.db.bindings.getSessionRecord(workSessionKey("a"));
-	const runtime = f.db.work.workAttemptGet(job.attempts.at(-1)!.opRef);
+	const runtime = f.db.work.workAttemptGet(job.attempts.at(-1)?.opRef);
 	const rows = f.db.outbox.rows();
 	for (const live of [true, undefined]) {
 		f.port.liveness = async () => ({ live, disowned: false });
@@ -6865,7 +6865,7 @@ test("ended checks retirement requires dead or disowned proof, not unknown liven
 	}
 	expect(f.job()).toEqual(job);
 	expect(f.db.bindings.getSessionRecord(workSessionKey("a"))).toEqual(binding);
-	expect(f.db.work.workAttemptGet(runtime!.opRef)).toEqual(runtime);
+	expect(f.db.work.workAttemptGet(runtime?.opRef)).toEqual(runtime);
 	expect(f.db.outbox.rows()).toEqual(rows);
 	expect(f.notices).toHaveLength(1);
 	expect(f.port.closes).toHaveLength(0);
@@ -8538,24 +8538,24 @@ test("#604: an operator directive reaches a running lane before its next step an
 	expect(added.directives).toHaveLength(1);
 	const [directive] = added.directives;
 	expect(directive).toMatchObject({ scope: "owner", text: "Do not render video or run TTS on this host." });
-	expect(directive!.id).toMatch(/^wd-[0-9a-f]{8}$/);
+	expect(directive?.id).toMatch(/^wd-[0-9a-f]{8}$/);
 	expect(f.port.steers).toHaveLength(1);
-	expect(f.port.steers[0]!.text).toContain("New standing directive from your operator");
-	expect(f.port.steers[0]!.text).toContain(`- (${directive!.id}) Do not render video or run TTS on this host.`);
+	expect(f.port.steers[0]?.text).toContain("New standing directive from your operator");
+	expect(f.port.steers[0]?.text).toContain(`- (${directive?.id}) Do not render video or run TTS on this host.`);
 	// A lane started afterwards carries it ahead of its task.
 	await started(f, "later");
 	const laterSend = f.port.sends.at(-1)!;
 	expect(laterSend.text.startsWith("[Standing directives from your operator.")).toBe(true);
-	expect(laterSend.text).toContain(`- (${directive!.id}) Do not render video or run TTS on this host.`);
+	expect(laterSend.text).toContain(`- (${directive?.id}) Do not render video or run TTS on this host.`);
 	expect(laterSend.text.endsWith("\n\nwork")).toBe(true);
 	// Removed directives stop applying.
-	expect((await f.manager.directive({ action: "remove", id: directive!.id })).directives).toEqual([]);
+	expect((await f.manager.directive({ action: "remove", id: directive?.id })).directives).toEqual([]);
 	const g = await fixture();
 	const removed = await g.manager.directive({ action: "add", text: "temporary" });
 	expect(removed.propagated).toEqual([]);
-	await g.manager.directive({ action: "remove", id: removed.directives[0]!.id });
+	await g.manager.directive({ action: "remove", id: removed.directives[0]?.id });
 	await started(g, "after-removal");
-	expect(g.port.sends.at(-1)!.text).toBe("work");
+	expect(g.port.sends.at(-1)?.text).toBe("work");
 });
 
 test("#604: a conversation's directive binds only the lanes that conversation started, and lanes cannot set one", async () => {
@@ -8580,7 +8580,7 @@ test("#604: a conversation's directive binds only the lanes that conversation st
 	expect(f.port.steers.map((steer) => steer.sessionId)).toEqual([own.sessionId]);
 	// The host operator sees every directive; the other conversation's lane got none.
 	expect((await f.manager.directive({ action: "list" })).directives).toHaveLength(1);
-	const laneSession = f.db.bindings.getSessionRecord(workSessionKey("other"))!.sessionId;
+	const laneSession = f.db.bindings.getSessionRecord(workSessionKey("other"))?.sessionId;
 	await expect(
 		f.manager.directive({ action: "add", text: "lanes cannot widen or narrow this", callerSessionId: laneSession }),
 	).rejects.toMatchObject({ detail: { reasonCode: "directive_from_lane" } });

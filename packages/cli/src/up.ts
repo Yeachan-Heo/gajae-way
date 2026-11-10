@@ -98,7 +98,7 @@ export async function runUp(options: UpOptions): Promise<void> {
 			const gatewayCmd = isSourceCheckout ? "bun" : "gajaeway-gateway";
 			const gatewayArgs = isSourceCheckout ? ["packages/gateway/src/main.ts", "daemon"] : ["daemon"];
 
-			const gatewayProcess = spawn(gatewayCmd, gatewayArgs, { cwd: process.cwd() });
+			const _gatewayProcess = spawn(gatewayCmd, gatewayArgs, { cwd: process.cwd() });
 
 			// Give gateway a moment to start
 			await new Promise((resolve) => setTimeout(resolve, 2000));
@@ -106,8 +106,8 @@ export async function runUp(options: UpOptions): Promise<void> {
 			// Start enabled adapters
 			const adapters = await enabledAdapters(options.home);
 			for (const adapter of adapters) {
-				const adapterCmd = isSourceCheckout ? "dist/gajaeway-" + adapter : "gajaeway-" + adapter;
-				const adapterProcess = spawn(adapterCmd, [], { cwd: process.cwd() });
+				const adapterCmd = isSourceCheckout ? `dist/gajaeway-${adapter}` : `gajaeway-${adapter}`;
+				const _adapterProcess = spawn(adapterCmd, [], { cwd: process.cwd() });
 				// Don't wait for adapter; let it run in background
 			}
 

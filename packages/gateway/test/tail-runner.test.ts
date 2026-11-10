@@ -13,7 +13,7 @@ test("request frames enforce the UTF-8 byte limit before writing and keep the re
 	const relay = scriptedRelay(async (request) => ({ ok: true, result: { operation: request.operation } }));
 	const runner = new TailRunner({ stream: relay.spawn, repo: "/tmp" });
 	const handle = await runner.attach({ sessionId: "sdk-frame-limit", brokerGeneration: 0, repo: "/tmp" });
-	const connectionId = relay.streams[0]!.connectionId;
+	const connectionId = relay.streams[0]?.connectionId;
 	const images = [{ data: "aW1hZ2U=", mimeType: "image/jpeg" }];
 	const emptyTextFrame = {
 		type: "control_request",
@@ -38,7 +38,7 @@ test("request frames enforce the UTF-8 byte limit before writing and keep the re
 	expect(overflow).not.toBeInstanceOf(RelayClosedError);
 	expect(isUnwrittenRelayRequest(overflow)).toBe(true);
 	expect((overflow as Error).message).not.toContain(overflowText);
-	expect(relay.streams[0]!.written.filter((frame) => frame.type === "control_request")).toHaveLength(1);
+	expect(relay.streams[0]?.written.filter((frame) => frame.type === "control_request")).toHaveLength(1);
 
 	await expect(handle.control("small", { text: "still usable" })).resolves.toEqual({
 		ok: true,

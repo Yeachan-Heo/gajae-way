@@ -608,7 +608,7 @@ async function validateRollbackJournal(agentDir: string, journal: ProvisionJourn
 	for (const name of journal.selected) {
 		const entry = entryByName(name);
 		const record = journal.entries[name];
-		if (!entry || !record || !record.original || typeof record.original !== "object")
+		if (!entry || !record?.original || typeof record.original !== "object")
 			throw new BrokerAgentError("broker_agent_unrecoverable", `unknown journal entry=${name}`);
 		for (const component of targetComponents(entry)) {
 			if (!Object.hasOwn(record.original, component))

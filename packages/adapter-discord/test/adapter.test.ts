@@ -1210,7 +1210,7 @@ test("working status is a reaction gradient on the triggering message and clears
 	// Inside the window: coalesced.
 	await status.update({ turnId: "t", origin, elapsedMs: 125_000, toolCalls: 3, outputTokens: 1250 });
 	expect(reacted).toHaveLength(4);
-	const requests: Array<{ verb: string; params: unknown }> = [];
+	const _requests: Array<{ verb: string; params: unknown }> = [];
 	let emit: ((progress: ChatProgressPayload) => void) | undefined;
 	const gateway: GatewayClientLike = {
 		request: async <T>() => ({}) as T,
@@ -1875,11 +1875,11 @@ test("rapid consecutive messages in one thread: only latest carries status react
 });
 
 test("typing indicator is idempotent: multiple begin calls on same conversation update deadline without error", async () => {
-	let channelFetched = 0;
+	let _channelFetched = 0;
 	const typing = new TypingIndicator({
 		channels: {
 			fetch: async () => {
-				channelFetched++;
+				_channelFetched++;
 				return {
 					sendTyping: async () => {
 						// Mock successful typing send
@@ -1891,7 +1891,7 @@ test("typing indicator is idempotent: multiple begin calls on same conversation 
 	} as any);
 	// Multiple begin calls on same conversation should be idempotent
 	typing.begin("conv-1");
-	const firstCallTime = Date.now();
+	const _firstCallTime = Date.now();
 	await Bun.sleep(10);
 	typing.begin("conv-1");
 	await Bun.sleep(10);
@@ -1942,7 +1942,7 @@ test("channel mention should set mentioned flag for thread creation logic", () =
 });
 
 test("thread reply message stays in thread", () => {
-	const botUser = { id: "bot-1" };
+	const _botUser = { id: "bot-1" };
 	const threadMessage = {
 		id: "msg-2",
 		author: { id: "user-1" },

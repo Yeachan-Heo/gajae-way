@@ -24,7 +24,7 @@ test("clipContextBody: preserves text content before clip marker", () => {
 	const result = clipContextBody(text, 100);
 	const content = result.slice(0, 100);
 	// First 100 chars of "abcabc..." is 33 repetitions of "abc" (99 chars) + "a" (1 char)
-	expect(content).toBe("abc".repeat(33) + "a"); // First 100 chars
+	expect(content).toBe(`${"abc".repeat(33)}a`); // First 100 chars
 });
 
 test("clipContextBody: shows correct character count in marker", () => {

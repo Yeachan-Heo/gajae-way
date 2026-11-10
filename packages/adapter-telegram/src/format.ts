@@ -621,7 +621,7 @@ export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT)
 
 	for (let i = 0; i < tokens.length; i++) {
 		const token = tokens[i];
-		if (!token || !token.value) continue;
+		if (!token?.value) continue;
 		if (token.open) {
 			const nextStack = [...stack, { name: token.open, tag: token.openTag ?? token.value }];
 			let depth = 1;

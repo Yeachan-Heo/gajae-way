@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eventTypeOrigin, monitorSessionOrigin, type OriginRef, originKey } from "@gajae-gateway/protocol";
@@ -9,7 +9,7 @@ import { discordMessageOrigin } from "../../adapter-discord/src/origin";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
-import { resolveLaneReportOrigin, workAttemptDeliveryId } from "../src/store/groups/work";
+import { resolveLaneReportOrigin } from "../src/store/groups/work";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 const rootOrigin: OriginRef = { platform: "discord", kind: "channel", conversationId: "parent-channel" };
@@ -222,7 +222,7 @@ for (const [label, origin] of [
 				),
 			"persona lane-report row",
 		);
-		const reportId = f.database.work.workAttemptGet(work.opRef)!.reportId;
+		const reportId = f.database.work.workAttemptGet(work.opRef)?.reportId;
 		expect(reportRow.filter((row) => row.message_id === reportId)).toMatchObject([
 			expect.objectContaining({
 				source: "lane_report",
@@ -281,7 +281,7 @@ test("AC-C idle persona is woken with one send carrying the internal lane report
 	await bindPersonaSession(f, rootKey, personaSessionId);
 	const lane = await startLane(f, "idle-worker", personaSessionId);
 	await settleLane(f, lane.result.opRef, "idle report");
-	const reportId = f.database.work.workAttemptGet(lane.result.opRef)!.reportId;
+	const reportId = f.database.work.workAttemptGet(lane.result.opRef)?.reportId;
 	const sends = await eventually(
 		() => f.port.sends,
 		(items) => items.some((send) => send.text.includes("[Internal report from another Gajae session")),
@@ -466,7 +466,7 @@ for (const [label, channelTarget, reason] of [
 			`work_parent_resolved verb=start name=monitor-owner source=owner kind=persona fallback=monitor_${reason} monitor=${monitor.monitorId}`,
 		]);
 		await settleLane(f, lane.result.opRef, "owner fallback");
-		expect(f.database.work.workAttemptGet(lane.result.opRef)!.parent).toMatchObject({
+		expect(f.database.work.workAttemptGet(lane.result.opRef)?.parent).toMatchObject({
 			kind: "persona",
 			originKey: rootKey,
 		});
@@ -477,7 +477,7 @@ for (const [label, channelTarget, reason] of [
 		);
 		await silencePersona(
 			f,
-			sends.find((send) => send.text.includes("[Internal report from another Gajae session"))!.opRef,
+			sends.find((send) => send.text.includes("[Internal report from another Gajae session"))?.opRef,
 		);
 	});
 }
@@ -530,11 +530,11 @@ test("conversation-turn and terminal starts keep their parents next to a monitor
 	]);
 	await settleLane(f, conversation.value.result.opRef, "chat result");
 	await settleLane(f, terminal.value.result.opRef, "terminal result");
-	expect(f.database.work.workAttemptGet(conversation.value.result.opRef)!.parent).toMatchObject({
+	expect(f.database.work.workAttemptGet(conversation.value.result.opRef)?.parent).toMatchObject({
 		kind: "persona",
 		originKey: originKey(personaOrigin),
 	});
-	expect(f.database.work.workAttemptGet(terminal.value.result.opRef)!.parent).toMatchObject({
+	expect(f.database.work.workAttemptGet(terminal.value.result.opRef)?.parent).toMatchObject({
 		kind: "persona",
 		originKey: rootKey,
 	});
@@ -558,7 +558,7 @@ test("AC-E work.start from a lane is refused by default before bind, send, or jo
 	});
 	expect(f.port.binds).toHaveLength(binds);
 	expect(f.port.sendAttempts).toHaveLength(sends);
-	expect(f.database.work.laneJobJson("lanejob-" + Buffer.from("refused-child").toString("hex"))).toBeUndefined();
+	expect(f.database.work.laneJobJson(`lanejob-${Buffer.from("refused-child").toString("hex")}`)).toBeUndefined();
 });
 
 test("AC-E work.run from a lane is refused before bind or waiter creation", async () => {
@@ -718,7 +718,7 @@ for (const reset of ["/new", "rebindEpoch"] as const) {
 		const afterReset = f.database.bindings.getSessionRecord(rootKey)!;
 		expect(afterReset.sessionId).toBe("");
 		await settleLane(f, lane.result.opRef, "follows origin");
-		const reportId = f.database.work.workAttemptGet(lane.result.opRef)!.reportId;
+		const reportId = f.database.work.workAttemptGet(lane.result.opRef)?.reportId;
 		const internalSend = await eventually(
 			() => f.port.sends,
 			(sends) => Boolean(sends.find((send) => send.text.includes("[Internal report from another Gajae session"))),
@@ -745,7 +745,7 @@ test("AC-J closed channel admits an internal report without engagement", async (
 	await bindPersonaSession(f, key);
 	const lane = await startLane(f, "closed-worker");
 	await settleLane(f, lane.result.opRef, "closed report");
-	const reportId = f.database.work.workAttemptGet(lane.result.opRef)!.reportId;
+	const reportId = f.database.work.workAttemptGet(lane.result.opRef)?.reportId;
 	const sends = await eventually(
 		() => f.port.sends,
 		(items) => items.some((send) => send.text.includes("[Internal report from another Gajae session")),
@@ -850,7 +850,7 @@ test("AC-435 Slack channel root trigger routes lane report to thread", async () 
 	const lane = await startLane(f, "ac435-slack-worker", persona.sessionId);
 	expect(lane.error).toBeUndefined();
 	await settleLane(f, lane.result.opRef, "slack thread result");
-	const reportId = f.database.work.workAttemptGet(lane.result.opRef)!.reportId;
+	const reportId = f.database.work.workAttemptGet(lane.result.opRef)?.reportId;
 	const reportRows = await eventually(
 		() => f.database.inbox.turnRows(persona.opRef),
 		(rows) => rows.some((row) => row.source === "lane_report" && row.message_id === reportId),
@@ -877,7 +877,7 @@ test("AC-435 Discord channel root trigger keeps the lane report at the channel r
 	const lane = await startLane(f, "ac435-discord-worker", persona.sessionId);
 	expect(lane.error).toBeUndefined();
 	await settleLane(f, lane.result.opRef, "discord thread result");
-	const reportId = f.database.work.workAttemptGet(lane.result.opRef)!.reportId;
+	const reportId = f.database.work.workAttemptGet(lane.result.opRef)?.reportId;
 	const reportRows = await eventually(
 		() => f.database.inbox.turnRows(persona.opRef),
 		(rows) => rows.some((row) => row.source === "lane_report" && row.message_id === reportId),
@@ -910,7 +910,7 @@ test("Discord channel report wakes an idle persona and posts its reply at the ch
 	const lane = await startLane(f, "idle-channel-worker", persona.sessionId);
 	await silencePersona(f, persona.opRef);
 	await settleLane(f, lane.result.opRef, "channel result");
-	const reportId = f.database.work.workAttemptGet(lane.result.opRef)!.reportId;
+	const reportId = f.database.work.workAttemptGet(lane.result.opRef)?.reportId;
 	const sends = await eventually(
 		() => f.port.sends,
 		(items) => items.some((send) => send.text.includes("[Internal report from another Gajae session")),
@@ -1038,7 +1038,7 @@ for (const source of ["public", "private", "unknown", "auto-created"] as const) 
 				(items) => items.length === 1,
 				"thread reply delivery",
 			);
-			const payload = chatMessages(f)[0]!.payload;
+			const payload = chatMessages(f)[0]?.payload;
 			expect(payload.origin).toEqual(origin);
 			const fetched: string[] = [];
 			const sent: Array<[string, unknown]> = [];
@@ -1137,7 +1137,7 @@ for (const type of [12, undefined] as const) {
 			(items) => items.length === 1,
 			"thread fallback delivery",
 		);
-		const payload = chatMessages(f)[0]!.payload;
+		const payload = chatMessages(f)[0]?.payload;
 		expect(payload.origin).toEqual(origin);
 		const fetched: string[] = [];
 		const sent: unknown[] = [];

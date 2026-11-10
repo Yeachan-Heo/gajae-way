@@ -296,7 +296,7 @@ test("default memory monitors seed per-name and respect operator removals", asyn
 			.map((monitor) => monitor.name)
 			.sort(),
 	).toEqual(["memory-canonicalize", "memory-debloat"]);
-	registry2.remove(registry2.list().find((monitor) => monitor.name === "memory-debloat")!.monitorId);
+	registry2.remove(registry2.list().find((monitor) => monitor.name === "memory-debloat")?.monitorId);
 	expect(seedDefaultMonitors(registry2, database2)).toBe(0);
 	database2.close();
 
@@ -306,7 +306,7 @@ test("default memory monitors seed per-name and respect operator removals", asyn
 	const registry3 = new Registry(database3);
 	registry3.add(DEFAULT_MEMORY_MONITORS[2]!);
 	expect(seedDefaultMonitors(registry3, database3)).toBe(2);
-	registry3.remove(registry3.list().find((monitor) => monitor.name === "memory-debloat")!.monitorId);
+	registry3.remove(registry3.list().find((monitor) => monitor.name === "memory-debloat")?.monitorId);
 	expect(seedDefaultMonitors(registry3, database3)).toBe(0);
 	expect(registry3.list().map((monitor) => monitor.name)).not.toContain("memory-debloat");
 	database3.close();

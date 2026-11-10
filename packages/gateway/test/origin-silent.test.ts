@@ -182,12 +182,12 @@ test("today's incident queues one owner DM per origin per incident, and one more
 	const first = alerter.sweep(NOW);
 	expect(first).toHaveLength(1);
 	expect(first[0]).toMatchObject({ kind: "silent", originKey: CHANNEL });
-	expect(first[0]!.deliveryId).toMatch(/^gw-s-[0-9a-f]{32}$/);
+	expect(first[0]?.deliveryId).toMatch(/^gw-s-[0-9a-f]{32}$/);
 	// The DM is in the delivery ledger, committed with the incident.
-	const queued = db.outbox.get(first[0]!.deliveryId);
+	const queued = db.outbox.get(first[0]?.deliveryId);
 	expect(queued?.state).toBe("pending");
 	expect(queued?.originKey).toBe("discord/dm/owner-dm/peer=owner");
-	const text = first[0]!.payload!.text;
+	const text = first[0]?.payload?.text;
 	expect(text).toContain(CHANNEL);
 	expect(text).toContain("reason=operation_state_unknown");
 	expect(text).toContain(`op=${opRef}`);
@@ -196,7 +196,7 @@ test("today's incident queues one owner DM per origin per incident, and one more
 	expect(alerter.sweep(NOW + MINUTE)).toEqual([]);
 	expect(new OriginSilentAlerter(db, () => OWNER).sweep(NOW + 2 * MINUTE)).toEqual([]);
 	// The owner DM itself is not an answer on the silent origin.
-	db.transaction((tx) => db.outbox.confirm(tx, first[0]!.deliveryId));
+	db.transaction((tx) => db.outbox.confirm(tx, first[0]?.deliveryId));
 	expect(findSilentOrigins(db, NOW + 2 * MINUTE)).toHaveLength(1);
 
 	// The hold clears and the origin answers.
@@ -205,8 +205,8 @@ test("today's incident queues one owner DM per origin per incident, and one more
 	const cleared = alerter.sweep(NOW + 3 * MINUTE);
 	expect(cleared).toHaveLength(1);
 	expect(cleared[0]).toMatchObject({ kind: "cleared", originKey: CHANNEL });
-	expect(cleared[0]!.deliveryId).not.toBe(first[0]!.deliveryId);
-	expect(db.outbox.get(cleared[0]!.deliveryId)?.state).toBe("pending");
+	expect(cleared[0]?.deliveryId).not.toBe(first[0]?.deliveryId);
+	expect(db.outbox.get(cleared[0]?.deliveryId)?.state).toBe("pending");
 	expect(alerter.sweep(NOW + 4 * MINUTE)).toEqual([]);
 	expect(new RuntimeCycleProjector(db, { queueDepth: 0 }).project(new Date(NOW + 4 * MINUTE)).gates).not.toContain(
 		"origin_silent",
@@ -228,7 +228,7 @@ test("an incident transition never commits without its owner DM: a failed ledger
 	// Rolled back with the failed DM: the next sweep (or a restarted gateway) alerts again.
 	const retried = new OriginSilentAlerter(db, () => OWNER, { log: () => {} }).sweep(NOW + MINUTE);
 	expect(retried.map((transition) => transition.kind)).toEqual(["silent"]);
-	expect(db.outbox.get(retried[0]!.deliveryId)?.state).toBe("pending");
+	expect(db.outbox.get(retried[0]?.deliveryId)?.state).toBe("pending");
 
 	// Same for the clear: the incident stays until the cleared DM is queued.
 	deliver(db, "gw-d-reply", 0);
@@ -252,7 +252,7 @@ for (const raw of [
 		db.core.metaSet(`origin_silent:${CHANNEL}`, raw);
 		const cleared = new OriginSilentAlerter(db, () => OWNER, { log: (line) => logs.push(line) }).sweep(NOW);
 		expect(cleared.map((transition) => transition.kind)).toEqual(["cleared"]);
-		expect(db.outbox.get(cleared[0]!.deliveryId)?.state).toBe("pending");
+		expect(db.outbox.get(cleared[0]?.deliveryId)?.state).toBe("pending");
 		expect(db.core.metaGet(`origin_silent:${CHANNEL}`)).toBeUndefined();
 		expect(db.core.metaGet(`origin_silent_corrupt:${CHANNEL}`)).toBe(raw);
 		expect(logs.some((line) => line.startsWith("origin_silent_incident_corrupt"))).toBe(true);
@@ -264,7 +264,7 @@ test("without an owner target the incident is recorded for ops cycle and no DM i
 	enqueue(db, { messageId: "m-1", ageMs: 16 * MINUTE });
 	const [transition] = new OriginSilentAlerter(db, () => undefined, { log: () => {} }).sweep(NOW);
 	expect(transition).toMatchObject({ kind: "silent", payload: undefined });
-	expect(db.outbox.get(transition!.deliveryId)).toBeUndefined();
+	expect(db.outbox.get(transition?.deliveryId)).toBeUndefined();
 });
 
 test("lane_report messages with no platform messages should trigger origin_silent (issue #766)", async () => {
