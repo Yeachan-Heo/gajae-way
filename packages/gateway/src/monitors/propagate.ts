@@ -1408,15 +1408,10 @@ export class MonitorPropagator {
 									console.error(
 										`monitor bind timeout rebind triggered for ${sessionOriginKey}: epoch=${boundEpoch} -> ${boundEpoch + 1}`,
 									);
-									// Rebind to fresh epoch: persist the new epoch to database before attempting bind.
-									// This ensures recordOwnedBinding will accept the new epoch.
-									const newEpoch = boundEpoch + 1;
-									this.#database.transaction((tx) => {
-										const current = this.#database.bindings.getSessionRecord(sessionOriginKey);
-										if (current) {
-											// Update existing session record to new epoch
-											this.#database.bindings.updateSessionEpoch(tx, sessionOriginKey, newEpoch);
-										}
+									// Rebind to fresh epoch: use rotateEpoch to persist the new epoch AND clear the poisoned session ID.
+									// rotateEpoch increments the persisted epoch and clears gjc_session_id so the next bind gets a fresh session.
+									const newEpoch = this.#database.transaction((tx) => {
+										return this.#database.bindings.rotateEpoch(tx, sessionOriginKey);
 									});
 									boundEpoch = newEpoch;
 									safety.bindTimeoutFailures = 0; // Reset counter for new epoch

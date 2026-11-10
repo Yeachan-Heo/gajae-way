@@ -1,5 +1,4 @@
 import { expect, test } from "bun:test";
-import { crypto } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -110,7 +109,6 @@ test("fix #2: escalation payload includes deliveryId (issue #780, codex finding 
 			deliver: (payload) => {
 				deliveredMessages.push(payload);
 			},
-			owner: undefined,
 		});
 
 		// Simulate 3 failed events to trigger escalation
@@ -125,7 +123,7 @@ test("fix #2: escalation payload includes deliveryId (issue #780, codex finding 
 					"test-batch",
 					"internal_error",
 					"test failure",
-					new Date().toISOString(),
+					Date.now(),
 					false,
 					{},
 				);
@@ -203,7 +201,7 @@ test("fix #5 & #6: failure counting skips unfinished events and uses bounded que
 					"test-batch",
 					"internal_error",
 					"test failure",
-					new Date().toISOString(),
+					Date.now(),
 					false,
 					{},
 				);
