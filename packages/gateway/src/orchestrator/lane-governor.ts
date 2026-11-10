@@ -455,7 +455,7 @@ export class LaneGovernor {
 				try {
 					const brokerSession = await this.#port.inspect({ sessionId: lane.sessionId, repo });
 					if (brokerSession) {
-						brokerActivityIdle = !brokerSession.activityState || brokerSession.activityState === "idle";
+						brokerActivityIdle = brokerSession.activityState === "idle";
 					}
 				} catch (error) {
 					const detail = sanitizeDiagnostic(diagnostic(error));

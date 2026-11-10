@@ -915,7 +915,7 @@ test("#778: forceRetire settles an open idle attempt on a live session as operat
 	database = await Store.open(":memory:");
 	// Stuck lane: session is live but idle, attempt is open with idle broker activity and unknown status
 	bind("stuck", NOW - 120_000, SESSION_ID); // idle for 120s, use proper session ID format
-	
+
 	// Create a job record with an open attempt (no endedAt)
 	const identity = laneJobIdentity("stuck");
 	let record: LaneJobRecord = createLaneJobRecord({
@@ -937,7 +937,7 @@ test("#778: forceRetire settles an open idle attempt on a live session as operat
 	);
 
 	const port = new ScriptedSessionPort();
-	const logs: string[] = [];  
+	const logs: string[] = [];
 	const settledAttempts: Array<{ name: string; opRef: string; reason: string; endedAt: string }> = [];
 	const governor = new LaneGovernor({
 		database,
@@ -980,14 +980,19 @@ test("#778: forceRetire settles an open idle attempt on a live session as operat
 	expect(port.closes).toContainEqual({ sessionId: SESSION_ID, repo: "/tmp/worker-repo" });
 
 	// Verify retirement was logged
-	expect(logs.some((line) => line.includes("lane_retired name=stuck") && line.includes("reason=operator_abandoned"))).toBe(true);
+	expect(
+		logs.some((line) => line.includes("lane_retired name=stuck") && line.includes("reason=operator_abandoned")),
+	).toBe(true);
 });
 
-test("#778: forceRetire refuses abandonment when broker activity is not idle", async () => {
+test.each([
+	["running", "running" as string | undefined],
+	["unreported", undefined],
+])("#778: forceRetire refuses abandonment when broker activity is %s", async (_label, activityState) => {
 	database = await Store.open(":memory:");
 	// Stuck lane but broker is still busy
 	bind("stuck-busy", NOW - 120_000, SESSION_ID);
-	
+
 	const identity = laneJobIdentity("stuck-busy");
 	let record: LaneJobRecord = createLaneJobRecord({
 		jobId: identity.jobId,
@@ -1022,7 +1027,7 @@ test("#778: forceRetire refuses abandonment when broker activity is not idle", a
 	});
 
 	// Setup broker evidence with BUSY activity (not idle)
-	port.setSessionState(SESSION_ID, { live: true, activityState: "running" }); // Activity is running, not idle
+	port.setSessionState(SESSION_ID, { live: true, activityState });
 	// Don't seed the operation - status would be unknown but activity check fails first
 
 	const result = await governor.forceRetire("stuck-busy");
@@ -1040,7 +1045,7 @@ test("#778: forceRetire refuses abandonment when op status is in_flight", async 
 	database = await Store.open(":memory:");
 	// Stuck lane but op is still in flight on broker
 	bind("stuck-inflight", NOW - 120_000, SESSION_ID);
-	
+
 	const identity = laneJobIdentity("stuck-inflight");
 	let record: LaneJobRecord = createLaneJobRecord({
 		jobId: identity.jobId,
