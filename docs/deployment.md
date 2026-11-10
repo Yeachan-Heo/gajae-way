@@ -424,9 +424,11 @@ The gateway accepts standalone `MEDIA:<absolute-path>` lines for Telegram replie
 
 Discord, Slack, and Telegram accept up to four native image attachments per message, with a 20 MiB source limit per image, a 16-megapixel limit, and a 96 KiB combined prepared-image limit. Static PNG/JPEG images are normalized for native model input. Other formats such as GIF and WebP remain represented as attachment descriptions; captions and sibling files are preserved. A supported PNG/JPEG preparation failure never becomes a successful text-only turn: it is logged in sanitized adapter diagnostics without posting into a conversation whose authorization is unknown. A prompt already admitted by the gateway that exceeds the SDK frame limit instead receives a visible failure notice.
 
+Slack and Discord additionally bound pre-admission image work across all conversations in each running adapter: at most two preparations may be active, and at most eight may start in a rolling 60-second window. The budget is acquired before downloading and covers all downloads and decoding; exhausted work is rejected immediately, not queued or converted to a text-only turn. Slack recovery shares the live-event budget and retries budget exhaustion. Text-only messages and non-native attachment descriptions do not consume the budget. Caption edits on GIF/WebP attachments remain ordinary text edits; native PNG/JPEG attachment edits are unsupported.
+
 Slack image downloads manually follow only a bounded redirect from `files.slack.com` to `files-edge.slack.com`. The bearer token is sent only to `files.slack.com`, never to the redirected host. HTML responses and every other redirect host are rejected.
 
-When a Telegram file download fails transiently, the adapter retries the same update before advancing the polling offset, so the update is not lost while the file is unavailable.
+When a Telegram file download or gateway request fails transiently, the adapter retries the same update before advancing the polling offset. A terminal gateway `invalid_params` rejection instead persists sanitized rejection evidence together with the update cursor and advances past that update, so one invalid message cannot block other chats or reactions.
 
 ### 5. Start the gateway
 

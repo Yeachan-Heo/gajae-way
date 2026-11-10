@@ -2,7 +2,12 @@ import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
-import { type ImageFetch, PromptImageDownloadError } from "@gajae-gateway/images";
+import {
+	type ImageFetch,
+	ImagePreparationBudget,
+	ImagePreparationBudgetError,
+	PromptImageDownloadError,
+} from "@gajae-gateway/images";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import {
 	type ChannelEngagementPolicy,
@@ -18,7 +23,7 @@ import {
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 import { deliveryFailureIsAmbiguous, OutboundLimiter, SlackApiError, SlackWebApi } from "./api";
-import { describeInboundBody, isSlackImage, prepareSlackImages, type SlackFileCarrier } from "./attachments";
+import { describeInboundBody, isSlackNativeImage, prepareSlackImages, type SlackFileCarrier } from "./attachments";
 import { SlackDirectory } from "./author";
 import { adapterHome, type LoadedSlackAdapterConfig, loadSlackAdapterConfig } from "./config";
 import { describePanelResponse, type SlackBlockAction } from "./interactions";
@@ -237,7 +242,10 @@ export function describeMessageEdit(
 }
 
 function hasNativeImageEdit(event: SlackInboundMessage): boolean {
-	return (event.message?.files ?? []).some(isSlackImage) || (event.previous_message?.files ?? []).some(isSlackImage);
+	return (
+		(event.message?.files ?? []).some(isSlackNativeImage) ||
+		(event.previous_message?.files ?? []).some(isSlackNativeImage)
+	);
 }
 
 /** Bounded inbound identity memory prevents replay/reconnect duplicate turns. */
@@ -960,6 +968,11 @@ export async function startSlackAdapter(
 		live,
 	);
 	const ingress = new OrderedIngress();
+	const imageBudget = new ImagePreparationBudget();
+	const prepareImages = (files: SlackFileCarrier["files"]) =>
+		(files ?? []).some(isSlackNativeImage)
+			? imageBudget.run(() => prepareSlackImages(files, config.botToken, ports.imageFetch))
+			: prepareSlackImages(files, config.botToken, ports.imageFetch);
 	const now = ports.now ?? Date.now;
 	const cursorPath = ports.recoveryCursorPath ?? recoveryCursorPath();
 	let cursors: RecoveryCursorState | undefined;
@@ -1063,7 +1076,7 @@ export async function startSlackAdapter(
 					: maybeThreadOnMention(admitted.origin, engagement.mentioned, message.ts);
 				let prepared: Awaited<ReturnType<typeof prepareSlackImages>>;
 				try {
-					prepared = await prepareSlackImages(message.files, config.botToken, ports.imageFetch);
+					prepared = await prepareImages(message.files);
 				} catch {
 					// Gateway authorization is authoritative and cannot be established locally. Do not
 					// post into a channel whose authorization is unknown, or send text without the image.
@@ -1173,12 +1186,41 @@ export async function startSlackAdapter(
 			if (text === "") return "skip";
 			const messageId = slackMessageId(message.channel, message.ts);
 			const engagement = engagementForMessage(message, admitted.origin, identity, directory, config.channels);
+			const recordFailure = async (
+				classification: ReturnType<typeof classifyRecoveryFailure>,
+				reason: string,
+			): Promise<RecoveryDelivery> => {
+				let exhausted = false;
+				await mutate((state) => {
+					const recorded = recordAttempt(state, messageId, message.channel, classification, reason, nowMs);
+					exhausted = recorded.exhausted;
+					return recorded.state;
+				});
+				if (!exhausted) return "unavailable";
+				log.error(`Slack recovery discarded ${messageId} after repeated ${classification} failures: ${reason}`);
+				await mutate((state) =>
+					recordDeadLetter(state, {
+						messageId,
+						conversationId: message.channel,
+						classification,
+						attempts: RECOVERY_MAX_ATTEMPTS,
+						reason,
+						at: new Date(nowMs).toISOString(),
+					}),
+				);
+				return "discard";
+			};
 			let prepared: Awaited<ReturnType<typeof prepareSlackImages>>;
 			try {
-				prepared = await prepareSlackImages(message.files, config.botToken, ports.imageFetch);
+				prepared = await prepareImages(message.files);
 			} catch (error) {
 				log.error("Slack recovery image input preparation failed; chat.send was not dispatched.");
-				return error instanceof PromptImageDownloadError && error.retryable ? "unavailable" : "discard";
+				if (
+					error instanceof ImagePreparationBudgetError ||
+					(error instanceof PromptImageDownloadError && error.retryable)
+				)
+					return "unavailable";
+				return recordFailure("terminal-message", "Slack image input preparation failed.");
 			}
 			// A stale backfill (old, and the bot already posted after it in that
 			// conversation) is recorded so the persona's context is complete, but it
@@ -1217,25 +1259,7 @@ export async function startSlackAdapter(
 			// says nothing about the message and leaves the cursor exactly where it is.
 			const classification = classifyRecoveryFailure(sent.failure);
 			const reason = errorText(sent.failure);
-			let exhausted = false;
-			await mutate((state) => {
-				const recorded = recordAttempt(state, messageId, message.channel, classification, reason, nowMs);
-				exhausted = recorded.exhausted;
-				return recorded.state;
-			});
-			if (!exhausted) return "unavailable";
-			log.error(`Slack recovery discarded ${messageId} after repeated ${classification} failures: ${reason}`);
-			await mutate((state) =>
-				recordDeadLetter(state, {
-					messageId,
-					conversationId: message.channel,
-					classification,
-					attempts: RECOVERY_MAX_ATTEMPTS,
-					reason,
-					at: new Date(nowMs).toISOString(),
-				}),
-			);
-			return "discard";
+			return recordFailure(classification, reason);
 		};
 		for (const channel of channels) {
 			if ((current().quarantined[channel]?.failures ?? 0) >= RECOVERY_UNREADABLE_QUARANTINE_ATTEMPTS) continue;

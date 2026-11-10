@@ -3,6 +3,8 @@ import { Buffer } from "node:buffer";
 import { Jimp } from "jimp";
 import {
 	downloadPromptImage,
+	ImagePreparationBudget,
+	ImagePreparationBudgetError,
 	MAX_IMAGE_TOTAL_BYTES,
 	MAX_PROMPT_IMAGES,
 	PromptImageDownloadError,
@@ -90,6 +92,81 @@ function insertPngChunk(source: Uint8Array, type: string, data: Uint8Array): Uin
 function promptImage(bytes: Uint8Array): { data: string; mimeType: "image/jpeg" } {
 	return { data: Buffer.from(bytes).toString("base64"), mimeType: "image/jpeg" };
 }
+
+describe("adapter-wide image preparation budget", () => {
+	test("rejects cross-origin work before fetching while two jobs are active, without queuing", async () => {
+		const budget = new ImagePreparationBudget();
+		const releases: Array<() => void> = [];
+		const inFlight = ["channel-a", "channel-b"].map((origin) =>
+			budget.run(async () => {
+				await new Promise<void>((resolve) => releases.push(resolve));
+				return origin;
+			}),
+		);
+		let fetched = false;
+		await expect(
+			budget.run(async () => {
+				fetched = true;
+			}),
+		).rejects.toBeInstanceOf(ImagePreparationBudgetError);
+		expect(fetched).toBe(false);
+		for (const release of releases) release();
+		expect(await Promise.all(inFlight)).toEqual(["channel-a", "channel-b"]);
+		expect(fetched).toBe(false);
+		expect(await budget.run(async () => "channel-c")).toBe("channel-c");
+	});
+
+	test("bounds sequential starts with a rolling window and reopens at the exact boundary", async () => {
+		let now = 0;
+		const budget = new ImagePreparationBudget(() => now);
+		let starts = 0;
+		const work = async () => ++starts;
+		for (let index = 0; index < 8; index += 1) {
+			now = index * 1_000;
+			await budget.run(work);
+		}
+		now = 59_999;
+		await expect(budget.run(work)).rejects.toBeInstanceOf(ImagePreparationBudgetError);
+		expect(starts).toBe(8);
+		now = 60_000;
+		expect(await budget.run(work)).toBe(9);
+		await expect(budget.run(work)).rejects.toBeInstanceOf(ImagePreparationBudgetError);
+		now = 61_000;
+		expect(await budget.run(work)).toBe(10);
+	});
+
+	test("failed processing releases concurrency but still spends its rate allowance", async () => {
+		const budget = new ImagePreparationBudget();
+		for (let index = 0; index < 8; index += 1) {
+			await expect(
+				budget.run(() => {
+					throw new Error("decode failed");
+				}),
+			).rejects.toThrow("decode failed");
+		}
+		let fetched = false;
+		await expect(
+			budget.run(async () => {
+				fetched = true;
+			}),
+		).rejects.toBeInstanceOf(ImagePreparationBudgetError);
+		expect(fetched).toBe(false);
+	});
+
+	test("a rejected concurrent attempt does not consume rate allowance", async () => {
+		const budget = new ImagePreparationBudget();
+		const releases: Array<() => void> = [];
+		const inFlight = Array.from({ length: 2 }, () =>
+			budget.run(() => new Promise<void>((resolve) => releases.push(resolve))),
+		);
+		for (let index = 0; index < 8; index += 1)
+			await expect(budget.run(async () => undefined)).rejects.toBeInstanceOf(ImagePreparationBudgetError);
+		for (const release of releases) release();
+		await Promise.all(inFlight);
+		for (let index = 0; index < 6; index += 1) await budget.run(async () => undefined);
+		await expect(budget.run(async () => undefined)).rejects.toBeInstanceOf(ImagePreparationBudgetError);
+	});
+});
 
 describe("prompt image preparation", () => {
 	test("returns canonical budgeted JPEGs and an explicit notice", async () => {

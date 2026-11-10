@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test";
 import type { ImageFetch } from "@gajae-gateway/images";
-import { downloadPromptImage } from "@gajae-gateway/images";
+import { downloadPromptImage, ImagePreparationBudget } from "@gajae-gateway/images";
 import {
 	collectAttachments,
+	createDiscordImagePreparer,
 	DISCORD_IMAGE_ALLOWED_HOSTS,
 	describeAttachment,
 	describeInboundBody,
@@ -224,6 +225,92 @@ test("more than four images are rejected before any download", async () => {
 		),
 	).rejects.toThrow("at most 4 images");
 	expect(downloadCount).toBe(0);
+});
+
+test("the shared budget bounds native preparations and holds a failed job until sibling downloads settle", async () => {
+	const prepareImages = createDiscordImagePreparer(new ImagePreparationBudget());
+	let releaseSibling!: (bytes: Uint8Array) => void;
+	let releaseOther!: (bytes: Uint8Array) => void;
+	const sibling = new Promise<Uint8Array>((resolve) => {
+		releaseSibling = resolve;
+	});
+	const other = new Promise<Uint8Array>((resolve) => {
+		releaseOther = resolve;
+	});
+	const downloads: string[] = [];
+	let prepared = 0;
+	const ports = {
+		download: async (url: string) => {
+			downloads.push(url);
+			if (url.endsWith("/failed")) throw new Error("download failure");
+			if (url.endsWith("/sibling")) return sibling;
+			if (url.endsWith("/other")) return other;
+			return Uint8Array.of(1);
+		},
+		prepare: async () => {
+			prepared++;
+			return { images: [], notice: "" };
+		},
+	};
+	const message = (...paths: string[]) => ({
+		attachments: paths.map((path) => ({ contentType: "image/png", url: `https://cdn.discordapp.com/${path}` })),
+	});
+	const failed = prepareImages(message("failed", "sibling"), ports).then(
+		() => undefined,
+		(error: unknown) => error,
+	);
+	const pending = prepareImages(message("other"), ports);
+	await expect(prepareImages(message("blocked"), ports)).rejects.toThrow();
+	expect(downloads).toEqual([
+		"https://cdn.discordapp.com/failed",
+		"https://cdn.discordapp.com/sibling",
+		"https://cdn.discordapp.com/other",
+	]);
+	await expect(prepareImages({}, ports)).resolves.toEqual({ images: [], notice: "" });
+	await expect(
+		prepareImages({ attachments: [{ contentType: "image/gif", url: "https://cdn.discordapp.com/gif" }] }, ports),
+	).resolves.toEqual({ images: [], notice: "" });
+	await Promise.resolve();
+	await expect(prepareImages(message("still-blocked"), ports)).rejects.toThrow();
+	expect(downloads).toHaveLength(3);
+	releaseSibling(Uint8Array.of(2));
+	expect(await failed).toMatchObject({ disposition: "retryable" });
+	await expect(prepareImages(message("accepted"), ports)).resolves.toEqual({ images: [], notice: "" });
+	releaseOther(Uint8Array.of(3));
+	await pending;
+	expect(prepared).toBe(2);
+});
+
+test("native decoding retains its budget slot until preparation finishes", async () => {
+	const prepareImages = createDiscordImagePreparer(new ImagePreparationBudget());
+	let release!: () => void;
+	let decoding!: () => void;
+	const pendingDecode = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const decodeStarted = new Promise<void>((resolve) => {
+		decoding = resolve;
+	});
+	let downloads = 0;
+	const ports = {
+		download: async () => {
+			downloads++;
+			return Uint8Array.of(1);
+		},
+		prepare: async () => {
+			decoding();
+			await pendingDecode;
+			return { images: [], notice: "" };
+		},
+	};
+	const message = { attachments: [{ contentType: "image/jpeg", url: "https://cdn.discordapp.com/photo" }] };
+	const first = prepareImages(message, ports);
+	const second = prepareImages(message, ports);
+	await decodeStarted;
+	await expect(prepareImages(message, ports)).rejects.toThrow();
+	expect(downloads).toBe(2);
+	release();
+	await Promise.all([first, second]);
 });
 
 test("an attachment-only message produces a body instead of the empty string that was dropped", () => {

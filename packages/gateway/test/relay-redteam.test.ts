@@ -258,6 +258,7 @@ for (const state of ["unknown", "accepted", "in_flight"] as const) {
 		const sequence: string[] = [];
 		port.send = async (input) => {
 			port.sendAttempts.push(input);
+			input.beforeWrite?.();
 			sequence.push("send");
 			throw new RelayClosedError(input.sessionId, "before receipt", true);
 		};
@@ -416,6 +417,7 @@ test("RT04 unknown bound operation survives repeated live-idle sweeps until its 
 		if (firstOp) return send(input);
 		firstOp = input.opRef;
 		port.sendAttempts.push(input);
+		input.beforeWrite?.();
 		throw new RelayClosedError(input.sessionId, "before receipt", true);
 	};
 	const status = port.status.bind(port);
@@ -517,6 +519,7 @@ test("RT08 client_ref_conflict is typed and actor queries status without resendi
 	let statuses = 0;
 	port.send = async (input) => {
 		port.sendAttempts.push(input);
+		input.beforeWrite?.();
 		throw new OpRefRejectedError(input.opRef, "client_ref_conflict", {});
 	};
 	port.status = async (input) => {

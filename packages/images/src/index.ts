@@ -28,6 +28,35 @@ export class PromptImageDownloadError extends Error {
 	}
 }
 
+export class ImagePreparationBudgetError extends Error {
+	constructor() {
+		super("Image preparation budget exhausted.");
+		this.name = "ImagePreparationBudgetError";
+	}
+}
+
+/** Share one instance across an adapter's live and recovery ingress, never one per origin. */
+export class ImagePreparationBudget {
+	#active = 0;
+	#starts: number[] = [];
+
+	constructor(private readonly now: () => number = () => performance.now()) {}
+
+	/** No queue: admission precedes retrieval, and the slot covers all downloads and decoding. */
+	async run<T>(work: () => Promise<T>): Promise<T> {
+		const now = this.now();
+		this.#starts = this.#starts.filter((start) => now - start < 60_000);
+		if (this.#active >= 2 || this.#starts.length >= 8) throw new ImagePreparationBudgetError();
+		this.#starts.push(now);
+		this.#active += 1;
+		try {
+			return await work();
+		} finally {
+			this.#active -= 1;
+		}
+	}
+}
+
 interface ImageDimensions {
 	readonly width: number;
 	readonly height: number;

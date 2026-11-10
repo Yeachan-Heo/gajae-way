@@ -11,8 +11,8 @@
 - **adapter-telegram**: Send persona Markdown as Telegram HTML, split without breaking tags or entities; syntax the renderer cannot place exactly (images, link titles, unbalanced link parentheses, `_underscore_` emphasis) stays literal text. A retried multi-chunk reply resumes after the chunks Telegram already accepted, waits out short flood-control `retry_after` pauses, and expires once Telegram keeps refusing the same chunk (#654)
 
 ### Fixes
-- **gateway**: Keep pending image-bearing messages out of text steering, include image payloads in prompt fingerprints, and settle an oversized local prompt as `prompt_too_large` with a visible failure notice instead of leaving it uncertain.
-- **adapters**: Preserve non-native image attachments, captions, and sibling files; restrict Slack image redirects and retry transient Telegram downloads without advancing the update offset.
+- **gateway**: Keep pending image-bearing messages out of text steering, include image payloads in prompt fingerprints, and validate exact relay frames before the durable send fence so oversized local prompts settle crash-safely as `prompt_too_large` with a visible failure notice instead of remaining uncertain.
+- **adapters**: Preserve non-native image attachments, captions, sibling files, and GIF/WebP caption edits; restrict Slack image redirects, globally bound Slack/Discord image retrieval and decoding, and advance Telegram past durably recorded terminal protocol rejections while retaining transient retries.
 
 ## [0.4.2] - 2026-10-29
 

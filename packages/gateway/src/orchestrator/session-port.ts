@@ -50,7 +50,6 @@ import {
 	isRelayTransportFailure,
 	isUnwrittenRelayRequest,
 	type RelayResponse,
-	serializeRelayRequestFrame,
 	type TailAttachInput,
 	type TailHandle,
 	type TailRunner,
@@ -288,6 +287,10 @@ export interface SessionSendInput {
 	 * throwaway relay for the send (the turn then has no live observer).
 	 */
 	readonly relay?: TailHandle;
+	/** Durable caller fence, committed after exact frame validation and before each prompt write. */
+	readonly beforeWrite?: () => void;
+	/** Durable local rejection, recorded synchronously before a too-large error escapes. */
+	readonly onPayloadTooLarge?: () => void;
 }
 
 export interface SessionSteerInput {
@@ -1343,23 +1346,6 @@ export class BrokerSessionPort implements SessionPort {
 		assertValidOpRef(input.opRef);
 		if (input.text.trim().length === 0) throw new OpRefError("prompt text must not be empty");
 		const text = renderPrompt(input.systemPreamble, input.text);
-		const promptInput = {
-			text,
-			clientRef: input.opRef,
-			...(input.images?.length ? { images: input.images } : {}),
-		};
-		// Reject prompts that cannot fit even with an empty request id and
-		// connection id before writing a durable broker intent. This throws the
-		// typed local payload rejection; TailRunner checks the exact frame again
-		// once the live relay envelope is known and preserves the same classification.
-		serializeRelayRequestFrame(input.sessionId, {
-			type: "control_request",
-			id: "",
-			connectionId: "",
-			operation: "turn.prompt",
-			input: promptInput,
-			confirm: false,
-		});
 		// `turn.prompt` is not idempotent at the broker (a reused clientRef is
 		// refused), so the gateway journals it: intent before the relay call,
 		// receipt after. Completed acceptance returns the stored receipt; only
@@ -1479,11 +1465,15 @@ export class BrokerSessionPort implements SessionPort {
 			}
 			let response: RelayResponse;
 			try {
-				response = await relay.control("turn.prompt", {
-					text,
-					clientRef: input.opRef,
-					...(input.images?.length ? { images: input.images } : {}),
-				});
+				response = await relay.control(
+					"turn.prompt",
+					{
+						text,
+						clientRef: input.opRef,
+						...(input.images?.length ? { images: input.images } : {}),
+					},
+					{ beforeWrite: input.beforeWrite, onPayloadTooLarge: input.onPayloadTooLarge },
+				);
 			} catch (error) {
 				// The retry never reached the host (relay gone before the frame was
 				// written, e.g. the host exited while we waited): the authenticated

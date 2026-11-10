@@ -140,6 +140,10 @@ export interface RelayRequestOptions {
 	readonly timeoutMs?: number;
 	/** Continuation cursor of a paged query, sent as the top-level `cursor` of `query_request` (as gjc's CLI does). */
 	readonly cursor?: string;
+	/** Called synchronously after exact-envelope validation and before the stream write. */
+	readonly beforeWrite?: () => void;
+	/** Called synchronously when exact-envelope validation proves the request was not written. */
+	readonly onPayloadTooLarge?: (error: RelayPayloadTooLargeError) => void;
 }
 
 export type RelayResponse = {
@@ -685,7 +689,14 @@ class ManagedTailHandle implements TailHandle {
 		const connectionId = this.#connectionId;
 		if (!stream || !connectionId) throw new RelayClosedError(this.sessionId, "relay not open", false);
 		const id = `gw-${this.brokerGeneration}-${++this.#requestSeq}`;
-		const serialized = serializeRelayRequestFrame(this.sessionId, { type, id, connectionId, ...body });
+		let serialized: string;
+		try {
+			serialized = serializeRelayRequestFrame(this.sessionId, { type, id, connectionId, ...body });
+		} catch (error) {
+			if (error instanceof RelayPayloadTooLargeError) options?.onPayloadTooLarge?.(error);
+			throw error;
+		}
+		options?.beforeWrite?.();
 		const timeoutMs = options?.timeoutMs ?? this.#runner.requestTimeoutMs;
 		return await new Promise<RelayResponse>((resolve, reject) => {
 			const timer = setTimeout(() => {

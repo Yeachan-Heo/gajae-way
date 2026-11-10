@@ -173,6 +173,13 @@ test("Slack image preparation rejects absent private URLs and off-host URLs with
 	).rejects.toThrow("missing its private URL");
 	await expect(
 		prepareSlackImages(
+			[{ mimetype: "image/png", url_private: "https://files.slack.com/first.png" }, { mimetype: "image/png" }],
+			"xoxb-slack-test",
+			fetchImpl,
+		),
+	).rejects.toThrow("missing its private URL");
+	await expect(
+		prepareSlackImages(
 			[
 				{
 					mimetype: "image/jpeg",
@@ -185,6 +192,41 @@ test("Slack image preparation rejects absent private URLs and off-host URLs with
 		),
 	).rejects.toThrow();
 	expect(requests).toEqual([]);
+});
+
+test("Slack waits for sibling downloads after a preparation failure", async () => {
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let started!: () => void;
+	const siblingStarted = new Promise<void>((resolve) => {
+		started = resolve;
+	});
+	let settled = false;
+	const preparation = prepareSlackImages(
+		[
+			{ mimetype: "image/png", url_private: "https://files.slack.com/fail.png" },
+			{ mimetype: "image/png", url_private: "https://files.slack.com/held.png" },
+		],
+		"xoxb-slack-test",
+		async (input) => {
+			if (String(input).endsWith("/fail.png")) return new Response("unavailable", { status: 503 });
+			started();
+			await held;
+			return new Response(ONE_PIXEL_PNG);
+		},
+	).finally(() => {
+		settled = true;
+	});
+	try {
+		await siblingStarted;
+		for (let i = 0; i < 10; ++i) await Promise.resolve();
+		expect(settled).toBe(false);
+	} finally {
+		release();
+	}
+	await expect(preparation).rejects.toThrow();
 });
 
 test("Slack image preparation enforces the four-image limit before downloading", async () => {

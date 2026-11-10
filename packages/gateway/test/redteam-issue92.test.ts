@@ -167,6 +167,7 @@ class ConflictUnknownPort extends ScriptedSessionPort {
 		this.attempts++;
 		if (this.attempts === 1) {
 			this.sendAttempts.push(input);
+			input.beforeWrite?.();
 			throw new OpRefRejectedError(input.opRef, "client_ref_conflict", { code: "client_ref_conflict" });
 		}
 		return await super.send(input);

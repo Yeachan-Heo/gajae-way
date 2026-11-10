@@ -391,28 +391,61 @@ test("Slack image preparation failures skip chat.send and log no private URL", a
 test("Slack message edits that add or remove native images are rejected without chat.edit", async () => {
 	const f = await fixture();
 	try {
-		const imageFile = {
-			id: "F123456",
-			name: "photo.png",
-			mimetype: "image/png",
-			url_private: "https://files.slack.com/files-pri/T1-F123456/photo.png",
-		};
-		for (const [files, previousFiles] of [
-			[[], [imageFile]],
-			[[imageFile], []],
-		] as const) {
-			await f.event({
-				type: "message",
-				subtype: "message_changed",
-				channel: "C1",
-				ts: "1700000000.123456",
-				message: inbound({ text: "updated caption", files }),
-				previous_message: inbound({ text: "old caption", files: previousFiles }),
-			});
+		for (const mimetype of ["image/png", "image/jpeg"]) {
+			const imageFile = { id: "F123456", mimetype, url_private: "https://files.slack.com/private" };
+			for (const [files, previousFiles] of [
+				[[], [imageFile]],
+				[[imageFile], []],
+			] as const) {
+				await f.event({
+					type: "message",
+					subtype: "message_changed",
+					channel: "C1",
+					ts: "1700000000.123456",
+					message: inbound({ text: "updated caption", files }),
+					previous_message: inbound({ text: "old caption", files: previousFiles }),
+				});
+			}
 		}
 		expect(f.client.requests.filter(({ verb }) => verb === "chat.edit" || verb === "chat.send")).toEqual([]);
-		expect(f.logs.filter((line) => line.includes("Slack image edit rejected"))).toHaveLength(2);
+		expect(f.logs.filter((line) => line.includes("Slack image edit rejected"))).toHaveLength(4);
 		expect(f.logs.join("\n")).not.toContain("files.slack.com");
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("Slack text edits retain unsupported GIF and WebP attachments", async () => {
+	const f = await fixture();
+	try {
+		for (const format of ["gif", "webp"]) {
+			const file = {
+				name: `image.${format}`,
+				mimetype: `image/${format}`,
+				url_private: `https://files.slack.com/image.${format}`,
+			};
+			for (const [files, previousFiles] of [
+				[[], [file]],
+				[[file], []],
+			] as const) {
+				await f.event({
+					type: "message",
+					subtype: "message_changed",
+					channel: "C1",
+					ts: "1700000000.123456",
+					message: inbound({ text: "updated caption", files }),
+					previous_message: inbound({ text: "old caption", files: previousFiles }),
+				});
+			}
+		}
+		const edits = f.client.requests.filter(({ verb }) => verb === "chat.edit");
+		expect(edits).toHaveLength(4);
+		expect(edits.map(({ params }) => (params as { text: string }).text)).toEqual([
+			"updated caption",
+			"updated caption\n[image · image.gif · https://files.slack.com/image.gif]",
+			"updated caption",
+			"updated caption\n[image · image.webp · https://files.slack.com/image.webp]",
+		]);
 	} finally {
 		f.socket.stop();
 	}
@@ -1229,6 +1262,133 @@ test("Slack recovery keeps the watermark when the gateway is unavailable and qua
 	} finally {
 		f.socket.stop();
 		f.recovery.stop();
+	}
+});
+
+test("Slack shares image admission between live conversations and recovery without blocking text", async () => {
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let started!: () => void;
+	const bothStarted = new Promise<void>((resolve) => {
+		started = resolve;
+	});
+	let downloads = 0;
+	const f = await fixture(
+		{ C1: { engagement: "open" } },
+		{
+			autoRecover: false,
+			imageFetch: async () => {
+				downloads++;
+				if (downloads === 2) started();
+				if (downloads <= 2) await held;
+				return new Response(ONE_PIXEL_PNG, { headers: { "content-type": "image/png" } });
+			},
+		},
+	);
+	const file = { name: "photo.png", mimetype: "image/png", url_private: "https://files.slack.com/photo.png" };
+	try {
+		await f.handleEvent({ ...inbound({ channel: "C2", files: [file] }) });
+		await f.handleEvent({ ...inbound({ channel: "C3", files: [file] }) });
+		await bothStarted;
+		f.api.history.C1 = [{ type: "message", user: "U1", ts: "1700000040.000001", text: "recovered", files: [file] }];
+		for (let i = 0; i < 4; ++i) expect(await f.recoverMissedMessages()).toBe(false);
+		expect(downloads).toBe(2);
+		expect((await loadRecoveryCursors(f.recoveryCursorPath)).recoveredThrough.C1).toBeUndefined();
+		expect(chatSends(f.client)).toEqual([]);
+
+		await f.handleEvent({ ...inbound({ channel: "C4", text: "plain text" }) });
+		await f.handleEvent({
+			...inbound({ channel: "C5", text: "unsupported", files: [{ name: "image.gif", mimetype: "image/gif" }] }),
+		});
+		await f.handleEvent({ ...inbound({ channel: "C6", text: "rejected image", files: [file] }) });
+		await flush();
+		expect(
+			chatSends(f.client)
+				.map((send) => send.text)
+				.sort(),
+		).toEqual(["plain text", "unsupported\n[image · image.gif]"]);
+		expect(downloads).toBe(2);
+		expect(f.logs).toContain("Slack image input preparation failed; chat.send was not dispatched.");
+
+		release();
+		await f.ingress.drain();
+		expect(await f.recoverMissedMessages()).toBe(true);
+		expect(downloads).toBe(3);
+		expect((await loadRecoveryCursors(f.recoveryCursorPath)).recoveredThrough.C1).toBe("1700000040.000001");
+		expect(chatSends(f.client).filter((send) => send.text === "recovered\n[image · photo.png]")).toHaveLength(1);
+	} finally {
+		release();
+		f.socket.stop();
+	}
+});
+
+test("Slack retains a failed image job's slot until its sibling download settles", async () => {
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let started!: () => void;
+	const bothStarted = new Promise<void>((resolve) => {
+		started = resolve;
+	});
+	let downloads = 0;
+	const f = await fixture(undefined, {
+		autoRecover: false,
+		imageFetch: async (input) => {
+			if (String(input).endsWith("/fail.png")) return new Response("unavailable", { status: 503 });
+			if (++downloads === 2) started();
+			await held;
+			return new Response(ONE_PIXEL_PNG);
+		},
+	});
+	const file = { name: "photo.png", mimetype: "image/png", url_private: "https://files.slack.com/photo.png" };
+	try {
+		await f.handleEvent({
+			...inbound({
+				channel: "C2",
+				files: [{ mimetype: "image/png", url_private: "https://files.slack.com/fail.png" }, file],
+			}),
+		});
+		await f.handleEvent({ ...inbound({ channel: "C3", files: [file] }) });
+		await bothStarted;
+		await flush();
+		await f.handleEvent({ ...inbound({ channel: "C4", files: [file] }) });
+		await flush();
+		expect(downloads).toBe(2);
+		expect(chatSends(f.client)).toEqual([]);
+		expect(f.logs).toContain("Slack image input preparation failed; chat.send was not dispatched.");
+	} finally {
+		release();
+		await f.ingress.drain();
+		f.socket.stop();
+	}
+});
+
+test("Slack recovery bounds terminal image failures before discarding", async () => {
+	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false });
+	try {
+		f.api.history.C1 = [
+			{
+				type: "message",
+				user: "U1",
+				ts: "1700000040.000001",
+				text: "bad image",
+				files: [{ name: "photo.png", mimetype: "image/png" }],
+			},
+		];
+		for (let i = 0; i < 2; ++i) {
+			expect(await f.recoverMissedMessages()).toBe(false);
+			expect((await loadRecoveryCursors(f.recoveryCursorPath)).recoveredThrough.C1).toBeUndefined();
+		}
+		expect(await f.recoverMissedMessages()).toBe(true);
+		const cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.recoveredThrough.C1).toBe("1700000040.000001");
+		expect(cursors.deadLetters).toHaveLength(1);
+		expect(chatSends(f.client)).toEqual([]);
+	} finally {
+		f.socket.stop();
 	}
 });
 

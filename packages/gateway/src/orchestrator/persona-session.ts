@@ -27,6 +27,7 @@ import {
 } from "../config";
 import { BrokerAuthorityError, type Store } from "../store";
 import {
+	editedOriginalId,
 	type InboundMessageRow,
 	type InboundTurn,
 	type TerminalUnlinkedReason,
@@ -49,7 +50,6 @@ import {
 	deterministicInterimDeliveryId,
 	isRelayTransportFailure,
 	MAX_RELAY_REQUEST_FRAME_BYTES,
-	RelayPayloadTooLargeError,
 	TailCapacityError,
 	type TailFrame,
 	type TailHandle,
@@ -100,6 +100,8 @@ const STEER_REPLAY_ATTEMPTS = 2;
 const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
 const LOCAL_PREFLIGHT_REJECTION_PREFIX = "persona-local-preflight-rejection:";
 const PROMPT_TOO_LARGE_CODE = "prompt_too_large";
+
+class SendTurnNoLongerBoundError extends Error {}
 
 function localPreflightRejectionKey(opRef: string): string {
 	return `${LOCAL_PREFLIGHT_REJECTION_PREFIX}${opRef}`;
@@ -503,8 +505,8 @@ export interface PersonaTurnStartInput extends PersonaTurnIdentity {
 	/** The trigger row; the one prompt body of this turn. */
 	readonly trigger: InboundMessageRow;
 	/**
-	 * Present only for a settlement lifecycle of an already sent turn (adopted
-	 * after a restart or escalation): the context its prompt durably claimed.
+	 * Present only for a settlement lifecycle: the context an already sent prompt
+	 * durably claimed, or only the failed trigger for a local preflight rejection.
 	 * No new context window is prepared or committed for it (#686).
 	 */
 	readonly sentContextIds?: readonly string[];
@@ -1726,7 +1728,17 @@ class OriginActor {
 		}
 		const unlinkedReason: TerminalUnlinkedReason = bound.retired && !bound.answerWanted ? "retired" : "turn_failed";
 		const completed = this.#manager.database.transaction((tx) => {
+			const prompt = ownedTurnPrompt(this.#manager.database, opRef);
+			const authority = this.#manager.database.bindings.authority;
 			const changed = completeInboundTurn(this.#manager.database, tx, opRef, unlinkedReason);
+			if (changed === 1 && prompt && authority)
+				this.#manager.database.bindings.releaseBrokerOperation(
+					tx,
+					authority,
+					"turn.prompt",
+					JSON.stringify([prompt.sessionId, opRef]),
+					opRef,
+				);
 			if (changed === 1 || this.#manager.database.inbox.turnRow(opRef)?.turn_state === "done")
 				this.#manager.database.core.metaDelete(key);
 			return changed;
@@ -1738,7 +1750,7 @@ class OriginActor {
 
 	/**
 	 * Why a bound trigger provably never reached the host (#685): no durable send
-	 * intent was stamped before `port.send`, or the port holds an authenticated
+	 * intent was stamped before the relay stream write, or the port holds an authenticated
 	 * `busy` refusal for its op-ref. Undefined means the prompt may have landed.
 	 */
 	#unadmittedReason(opRef: string, sessionId: string | null): "send_not_attempted" | "prompt_busy_refused" | undefined {
@@ -1766,6 +1778,7 @@ class OriginActor {
 	 * A turn whose prompt may have landed is left for reconcile; it is never resent.
 	 */
 	#releaseUnadmittedTurn(turn: InboundTurn, retired: boolean, source: "recovery" | "dispatch"): boolean {
+		if (localPreflightRejection(this.#manager.database, turn.opRef)) return false;
 		const reason = this.#unadmittedReason(turn.opRef, turn.sessionId);
 		if (!reason) return false;
 		const attempt = this.#manager.database.transaction((tx) => {
@@ -2174,7 +2187,13 @@ class OriginActor {
 			sessionId,
 			turn,
 			trigger,
-			sentContextIds: this.#manager.database.inbox.sentContextIds(turn.opRef),
+			// A locally rejected, unfenced prompt never acquired a send-context claim.
+			// Settle its trigger without selecting or consuming other unread context.
+			sentContextIds:
+				localPreflightRejection(this.#manager.database, turn.opRef) &&
+				!this.#manager.database.inbox.sendAttempted(turn.opRef)
+					? [editedOriginalId(trigger.message_id) ?? trigger.message_id]
+					: this.#manager.database.inbox.sentContextIds(turn.opRef),
 		});
 		let tail: TailHandle | undefined;
 		let detached = false;
@@ -2515,6 +2534,10 @@ class OriginActor {
 		const unresolved = this.#manager.database.inbox
 			.nonterminalTurns(this.originKey)
 			.find((turn) => turn.epoch === epoch);
+		if (unresolved && localPreflightRejection(this.#manager.database, unresolved.opRef)) {
+			await this.#recoverTurn(unresolved);
+			return;
+		}
 		if (
 			unresolved &&
 			!(
@@ -2743,22 +2766,6 @@ class OriginActor {
 			return;
 		}
 		const preamble = this.#preambleForSend(binding.sessionId, epoch, lifecycle, context);
-		// Durable send intent (#685) and the context rows this prompt rendered
-		// (#686): from here on the prompt may land, so recovery must reconcile
-		// this turn instead of requeueing it, and its inputs belong to it.
-		if (
-			!this.#manager.database.transaction((tx) =>
-				this.#manager.database.inbox.markSendAttempted(tx, opRef, [...(lifecycle.contextMessageIds ?? [])]),
-			)
-		) {
-			// The row left `bound` underneath this actor; nothing was sent for it.
-			this.#current = undefined;
-			this.#state = "idle";
-			await tail.close();
-			await this.#notifyReleased(current);
-			this.#manager.log(`persona_send_skipped origin=${this.originKey} opRef=${opRef} reason=turn_not_bound`, "warn");
-			return;
-		}
 		try {
 			const receipt = await this.#manager.port.send({
 				sessionId: binding.sessionId,
@@ -2770,6 +2777,18 @@ class OriginActor {
 				busyStallMs: this.#manager.busyStallMs,
 				...(preamble.text ? { systemPreamble: preamble.text } : {}),
 				...(lifecycle.sendModelFallback ? { model: lifecycle.sendModelFallback } : {}),
+				beforeWrite: () => {
+					// The exact frame is already validated; persist intent and context before it can land.
+					if (
+						!this.#manager.database.transaction((tx) =>
+							this.#manager.database.inbox.markSendAttempted(tx, opRef, [...(lifecycle.contextMessageIds ?? [])]),
+						)
+					)
+						throw new SendTurnNoLongerBoundError();
+				},
+				onPayloadTooLarge: () => {
+					this.#manager.database.core.metaSet(localPreflightRejectionKey(opRef), PROMPT_TOO_LARGE_CODE);
+				},
 			});
 			tail.correlate(opRef, receipt);
 			this.#manager.database.transaction((tx) => this.#manager.database.inbox.turnAccept(tx, opRef));
@@ -2779,12 +2798,15 @@ class OriginActor {
 			this.#bindEpochPoisoned = false;
 			this.#clearBindWedgeProbe();
 		} catch (error) {
-			if (error instanceof RelayPayloadTooLargeError) {
-				// The serializer's typed rejection proves this prompt was not written.
-				// Persist the local decision under the original op-ref so a restart can
-				// deliver its failure instead of interpreting unknown broker status as
-				// an ambiguous accepted prompt.
-				this.#manager.database.core.metaSet(localPreflightRejectionKey(opRef), PROMPT_TOO_LARGE_CODE);
+			if (error instanceof SendTurnNoLongerBoundError) {
+				this.#current = undefined;
+				this.#state = "idle";
+				await tail.close();
+				await this.#notifyReleased(current);
+				this.#manager.log(`persona_send_skipped origin=${this.originKey} opRef=${opRef} reason=turn_not_bound`, "warn");
+				return;
+			}
+			if (localPreflightRejection(this.#manager.database, opRef)) {
 				await this.#settleLocalPreflightRejection(current, PROMPT_TOO_LARGE_CODE);
 				return;
 			}

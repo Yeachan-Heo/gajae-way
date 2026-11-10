@@ -1,4 +1,4 @@
-import type { ImageFetch } from "@gajae-gateway/images";
+import type { ImageFetch, ImagePreparationBudget } from "@gajae-gateway/images";
 import { downloadPromptImage, PromptImageDownloadError, preparePromptImages } from "@gajae-gateway/images";
 import type { PromptImage } from "@gajae-gateway/protocol";
 
@@ -88,6 +88,14 @@ export function selectNativeImageAttachments(message: AttachmentCarrier): Attach
 	return collectAttachments(message).filter(isNativeImageAttachment);
 }
 
+/** Share one preparation budget between all live and recovered messages. */
+export function createDiscordImagePreparer(budget: ImagePreparationBudget): typeof prepareDiscordImages {
+	return (message, ports) =>
+		selectNativeImageAttachments(message).length === 0
+			? prepareDiscordImages(message, ports)
+			: budget.run(() => prepareDiscordImages(message, ports));
+}
+
 /** Prepare supported Discord image attachments for a native prompt. */
 export async function prepareDiscordImages(
 	message: AttachmentCarrier,
@@ -103,7 +111,11 @@ export async function prepareDiscordImages(
 			throw new DiscordImagePreparationError("terminal");
 		return url;
 	});
-	const sources = await Promise.all(urls.map((url) => downloadDiscordImage(url, ports)));
+	const downloads = await Promise.allSettled(urls.map((url) => downloadDiscordImage(url, ports)));
+	const sources = downloads.map((download) => {
+		if (download.status === "rejected") throw download.reason;
+		return download.value;
+	});
 	try {
 		return await ports.prepare(sources);
 	} catch {

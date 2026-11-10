@@ -2,7 +2,9 @@ import { expect, test } from "bun:test";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { preparePromptImages } from "@gajae-gateway/images";
 import type { ChatMessagePayload, ChatSendParams } from "@gajae-gateway/protocol";
+import { ProtocolError } from "@gajae-gateway/protocol";
 import {
 	TelegramAttachmentRetryableError,
 	type TelegramAttachmentSaver,
@@ -133,6 +135,160 @@ test("deduplicates update ids durably after successfully sending an inbound turn
 			engagement: { mentioned: true, group: true, authorId: "42" },
 			messageId: "-100123:7",
 		});
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test.each([
+	"image/png",
+	"image/jpeg",
+] as const)("persists a rejected %s control-command image and continues with a later message", async (mimeType) => {
+	const home = await temporaryHome();
+	try {
+		const bytes =
+			mimeType === "image/png"
+				? testImage
+				: Buffer.from((await preparePromptImages([testImage])).images[0]!.data, "base64");
+		const path = join(home, "input-image");
+		await writeFile(path, bytes);
+		const state = await TelegramAdapterState.load(home);
+		const adapter = new TelegramAdapter(
+			state,
+			"agent",
+			"900",
+			{ chats: {} },
+			{ save: async () => ({ path }) },
+			noImageNotice,
+		);
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const gateway = mockGateway(requests);
+		gateway.request = async <T>(verb: string, params?: unknown) => {
+			requests.push({ verb, params });
+			const sent = params as ChatSendParams;
+			if (sent.images?.length && sent.text?.startsWith("/model "))
+				throw new ProtocolError("invalid_params", "chat.send cannot combine prompt images with control commands", {
+					data: "private-image-data secret-token",
+				});
+			return { engaged: false, turnId: null } as T;
+		};
+		const update: TelegramUpdate = {
+			update_id: 81,
+			message: {
+				message_id: 1,
+				chat: { id: 22, type: "private" },
+				from: { id: 44 },
+				caption: "/model private-caption",
+				document: { file_id: "secret-token", file_unique_id: "u", mime_type: mimeType },
+			},
+		};
+		expect(await adapter.handleUpdate(gateway, update)).toBe(true);
+		expect((requests[0]?.params as ChatSendParams).images).toHaveLength(1);
+		const disk = await readFile(state.path, "utf8");
+		expect(disk).not.toContain("private");
+		expect(disk).not.toContain("secret-token");
+		expect(disk).not.toContain((requests[0]?.params as ChatSendParams).images![0]!.data);
+		const reloaded = await TelegramAdapterState.load(home);
+		expect(reloaded.updateId).toBe(81);
+		expect(reloaded.lastRejection).toEqual({ updateId: 81, verb: "chat.send", code: "invalid_params" });
+		const restarted = new TelegramAdapter(reloaded, "agent", "900", { chats: {} }, noAttachments, noImageNotice);
+		expect(await restarted.handleUpdate(gateway, update)).toBe(false);
+		expect(
+			await restarted.handleUpdate(gateway, {
+				update_id: 82,
+				message: { message_id: 2, chat: { id: 22, type: "private" }, from: { id: 44 }, text: "later" },
+			}),
+		).toBe(true);
+		expect(requests.map(({ verb }) => verb)).toEqual(["chat.send", "chat.send"]);
+		const finalState = await TelegramAdapterState.load(home);
+		expect(finalState.updateId).toBe(82);
+		expect(finalState.lastRejection).toEqual({ updateId: 81, verb: "chat.send", code: "invalid_params" });
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("transient and unknown gateway errors do not advance the persisted cursor", async () => {
+	const home = await temporaryHome();
+	try {
+		const state = await TelegramAdapterState.load(home);
+		await state.acceptUpdate(80);
+		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} }, noAttachments, noImageNotice);
+		const update: TelegramUpdate = {
+			update_id: 81,
+			message: { message_id: 1, chat: { id: 22, type: "private" }, from: { id: 44 }, text: "hello" },
+		};
+		for (const error of [
+			new ProtocolError("verb_failed", "request timed out"),
+			new ProtocolError("gateway_shutting_down", "gateway stopping"),
+			new ProtocolError("lane_capacity", "busy"),
+			Object.assign(new Error("unrecognized error"), { code: "invalid_params" }),
+		]) {
+			await expect(
+				adapter.handleUpdate(
+					{
+						request: async () => {
+							throw error;
+						},
+					},
+					update,
+				),
+			).rejects.toBe(error);
+			expect(state.updateId).toBe(80);
+			const reloaded = await TelegramAdapterState.load(home);
+			expect(reloaded.updateId).toBe(80);
+			expect(reloaded.lastRejection).toBeUndefined();
+		}
+		expect(await adapter.handleUpdate(mockGateway([]), update)).toBe(true);
+		expect((await TelegramAdapterState.load(home)).updateId).toBe(81);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("a rejection is not accepted in memory when its durable state write fails", async () => {
+	const home = await temporaryHome();
+	try {
+		const state = await TelegramAdapterState.load(home);
+		await state.acceptUpdate(80);
+		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} }, noAttachments, noImageNotice);
+		const save = state.save.bind(state);
+		let saves = 0;
+		state.save = async () => {
+			if (++saves === 2) throw new Error("disk unavailable");
+			await save();
+		};
+		const update: TelegramUpdate = {
+			update_id: 81,
+			message: { message_id: 1, chat: { id: 22, type: "private" }, from: { id: 44 }, text: "hello" },
+		};
+		const error = new ProtocolError("invalid_params", "invalid request");
+		await expect(
+			adapter.handleUpdate(
+				{
+					request: async () => {
+						throw error;
+					},
+				},
+				update,
+			),
+		).rejects.toThrow("disk unavailable");
+		expect(state.updateId).toBe(80);
+		expect(state.lastRejection).toBeUndefined();
+		expect((await TelegramAdapterState.load(home)).updateId).toBe(80);
+		expect(
+			await adapter.handleUpdate(
+				{
+					request: async () => {
+						throw error;
+					},
+				},
+				update,
+			),
+		).toBe(true);
+		const reloaded = await TelegramAdapterState.load(home);
+		expect(reloaded.updateId).toBe(81);
+		expect(reloaded.lastRejection).toEqual({ updateId: 81, verb: "chat.send", code: "invalid_params" });
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}

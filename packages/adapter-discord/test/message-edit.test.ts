@@ -48,6 +48,39 @@ test("a messageUpdate that is not a user edit is not forwarded: no edit timestam
 	expect(describeMessageEdit(edited(), SELF, OPEN, { content: "hello", partial: false })?.text).toBe("hello, edited");
 });
 
+test("GIF and WebP caption edits retain attachment descriptions and compare the original attachment state", () => {
+	for (const extension of ["gif", "webp"]) {
+		const attachment = {
+			name: `image.${extension}`,
+			contentType: `image/${extension}`,
+			url: `https://cdn.discordapp.com/image.${extension}?sig=secret`,
+		};
+		const before = { content: "old caption", attachments: [attachment], partial: false };
+		const after = edited({ content: "new caption", attachments: [attachment] });
+		expect(describeMessageEdit(after, SELF, OPEN, before)?.text).toBe(
+			`new caption\n[image · image.${extension} · ${attachment.url}]`,
+		);
+		expect(
+			describeMessageEdit(edited({ content: "old caption", attachments: [attachment] }), SELF, OPEN, before),
+		).toBeUndefined();
+		expect(describeMessageEdit(edited({ content: "old caption", attachments: [] }), SELF, OPEN, before)?.text).toBe(
+			"old caption",
+		);
+	}
+});
+
+test("native image edits are rejected when an image is present before or after the edit", () => {
+	for (const contentType of ["image/png", "image/jpeg"]) {
+		const attachment = { name: "photo", contentType, url: "https://cdn.discordapp.com/photo" };
+		expect(
+			describeMessageEdit(edited({ attachments: [attachment] }), SELF, OPEN, { content: "before" }),
+		).toBeUndefined();
+		expect(
+			describeMessageEdit(edited(), SELF, OPEN, { content: "before", attachments: [attachment], partial: false }),
+		).toBeUndefined();
+	}
+});
+
 function gateway(client: { request: (verb: string, params?: unknown) => Promise<unknown> }) {
 	return new ReconnectingGateway(
 		"socket",

@@ -1,5 +1,6 @@
 import { basename, join } from "node:path";
 import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
+import { ImagePreparationBudget } from "@gajae-gateway/images";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import {
 	type ChannelEngagementPolicy,
@@ -21,11 +22,12 @@ import { AttachmentBuilder, Client, GatewayIntentBits, MessageFlags, Partials } 
 import pkg from "../package.json";
 import {
 	type AttachmentCarrier,
+	createDiscordImagePreparer,
 	DiscordImagePreparationError,
 	describeInboundBody,
 	firstVoiceMessage,
 	prepareDiscordImages,
-	selectImageAttachments,
+	selectNativeImageAttachments,
 } from "./attachments";
 import { type AuthorLike, resolveDisplayName, resolveServerTag } from "./author";
 import {
@@ -349,7 +351,7 @@ export function describeMessageEdit(
 	if (!engagement) return undefined;
 	// chat.edit has no image field. Never turn a replacement image into a
 	// text-only edit that could leave the gateway's previous image in effect.
-	if (selectImageAttachments(message).length > 0 || (before && selectImageAttachments(before).length > 0))
+	if (selectNativeImageAttachments(message).length > 0 || (before && selectNativeImageAttachments(before).length > 0))
 		return undefined;
 	const text = describeInboundBody(message);
 	if (text === "") return undefined;
@@ -1264,6 +1266,7 @@ async function decodePcmWithFfmpeg(ogg: Uint8Array): Promise<Int16Array | undefi
 }
 
 export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): Promise<void> {
+	const prepareImages = createDiscordImagePreparer(new ImagePreparationBudget());
 	const discord = new Client({
 		intents: [...new Set([...REQUIRED_INTENTS, ...(config.intents ?? [])])],
 		// DM channels are not cached on a cold start; without the Channel partial
@@ -1293,6 +1296,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		undefined,
 		discordSpeechPorts(config.voice),
 		config.gatewayDownAlert ? gatewayDownAlarm(discord, config.gatewayDownAlert) : undefined,
+		prepareImages,
 	);
 	// Transcription makes ingress asynchronous, and two messages in one
 	// conversation must not overtake each other while one waits on the network.
@@ -1315,7 +1319,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		ingress.run(origin.conversationId, async () => {
 			let preparedImages: { readonly images: PromptImage[]; readonly notice: string };
 			try {
-				preparedImages = await prepareDiscordImages(message);
+				preparedImages = await prepareImages(message);
 			} catch {
 				// The shared helper sanitizes its failure; omit its details here as a
 				// final guard against a signed CDN URL reaching logs. No text fallback.
@@ -1367,7 +1371,8 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		void (async () => {
 			const message = after.partial ? await after.fetch().catch(() => undefined) : after;
 			if (!message) return;
-			const imageEdit = selectImageAttachments(message).length > 0 || selectImageAttachments(before).length > 0;
+			const imageEdit =
+				selectNativeImageAttachments(message).length > 0 || selectNativeImageAttachments(before).length > 0;
 			if (imageEdit) {
 				if (typeof message.editedTimestamp === "number" && decideInbound(message, discord.user, config.channels))
 					console.error(`Discord image edit rejected message=${message.id}; native image edits are unsupported.`);

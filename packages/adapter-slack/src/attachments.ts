@@ -43,18 +43,25 @@ export async function prepareSlackImages(
 	const images = (files ?? []).filter(isSlackNativeImage);
 	if (images.length === 0) return { images: [], notice: "" };
 	if (images.length > SLACK_IMAGE_LIMIT) throw new Error("Slack messages can include at most four images");
-	const sources = await Promise.all(
-		images.map((file) => {
-			const url = nonBlank(file.url_private);
-			if (!url) throw new Error("Slack image attachment is missing its private URL");
-			return downloadPromptImage(url, {
+	const urls = images.map((file) => {
+		const url = nonBlank(file.url_private);
+		if (!url) throw new Error("Slack image attachment is missing its private URL");
+		return url;
+	});
+	const downloads = await Promise.allSettled(
+		urls.map((url) =>
+			downloadPromptImage(url, {
 				allowedHosts: SLACK_IMAGE_HOSTS,
 				headers: { Authorization: `Bearer ${botToken}` },
 				redirectPolicy: { allowedHosts: SLACK_IMAGE_REDIRECT_HOSTS },
 				...(fetchImpl ? { fetch: fetchImpl } : {}),
-			});
-		}),
+			}),
+		),
 	);
+	const sources = downloads.map((download) => {
+		if (download.status === "rejected") throw download.reason;
+		return download.value;
+	});
 	return preparePromptImages(sources);
 }
 

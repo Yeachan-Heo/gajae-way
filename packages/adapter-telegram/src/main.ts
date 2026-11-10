@@ -11,6 +11,7 @@ import {
 	OUTBOUND_FILE_MAX_BYTES,
 	originKey,
 	type PromptImage,
+	ProtocolError,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import {
@@ -802,7 +803,12 @@ export class TelegramAdapter {
 		// engagement.reaction and must never reach chat.send.
 		const reaction = describeTelegramReaction(update.message_reaction, this.botUserId);
 		if (reaction) {
-			await gateway.request("engagement.reaction", reaction);
+			try {
+				await gateway.request("engagement.reaction", reaction);
+			} catch (error) {
+				if (!(error instanceof ProtocolError) || error.code !== "invalid_params") throw error;
+				return this.state.rejectUpdate(update.update_id, "engagement.reaction");
+			}
 			return this.state.acceptUpdate(update.update_id);
 		}
 		const message = update.message;
@@ -844,13 +850,19 @@ export class TelegramAdapter {
 			if (!("path" in stored) && stored.retryable) throw new TelegramAttachmentRetryableError();
 		}
 		const body = describeInboundBody(content, attachment, stored, images !== undefined);
-		const accepted = await gateway.request<ChatSendResult>("chat.send", {
-			origin,
-			text: body,
-			engagement,
-			messageId: telegramInboundMessageId(message.chat.id, message.message_id),
-			...(images ? { images } : {}),
-		});
+		let accepted: ChatSendResult;
+		try {
+			accepted = await gateway.request<ChatSendResult>("chat.send", {
+				origin,
+				text: body,
+				engagement,
+				messageId: telegramInboundMessageId(message.chat.id, message.message_id),
+				...(images ? { images } : {}),
+			});
+		} catch (error) {
+			if (!(error instanceof ProtocolError) || error.code !== "invalid_params") throw error;
+			return this.state.rejectUpdate(update.update_id, "chat.send");
+		}
 		if (accepted.engaged && accepted.turnId !== null && imageNotice) {
 			try {
 				for (const chunk of renderTelegramDelivery(`Image processing: ${imageNotice}`))
@@ -1072,7 +1084,7 @@ class ReconnectingGateway implements GatewayClientLike {
 		try {
 			return await this.#client.request<T>(verb, params);
 		} catch (error) {
-			this.scheduleReconnect();
+			if (!(error instanceof ProtocolError) || error.code !== "invalid_params") this.scheduleReconnect();
 			throw error;
 		}
 	}
