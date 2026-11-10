@@ -265,6 +265,10 @@ export class BindingsGroup {
 			.run(tx, at, originRefJson, originKey);
 	}
 
+	updateSessionEpoch(tx: WriteTx, originKey: string, newEpoch: number): void {
+		this.#db.prepare("UPDATE sessions SET epoch = ? WHERE origin_key = ?").run(tx, newEpoch, originKey);
+	}
+
 	touchBoundSession(tx: WriteTx, originKey: string, sessionId: string, epoch: number, at: string): boolean {
 		return (
 			this.#db

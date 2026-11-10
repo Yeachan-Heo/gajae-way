@@ -1408,8 +1408,17 @@ export class MonitorPropagator {
 									console.error(
 										`monitor bind timeout rebind triggered for ${sessionOriginKey}: epoch=${boundEpoch} -> ${boundEpoch + 1}`,
 									);
-									// Rebind to fresh epoch: increment it and try again.
-									boundEpoch++;
+									// Rebind to fresh epoch: persist the new epoch to database before attempting bind.
+									// This ensures recordOwnedBinding will accept the new epoch.
+									const newEpoch = boundEpoch + 1;
+									this.#database.transaction((tx) => {
+										const current = this.#database.bindings.getSessionRecord(sessionOriginKey);
+										if (current) {
+											// Update existing session record to new epoch
+											this.#database.bindings.updateSessionEpoch(tx, sessionOriginKey, newEpoch);
+										}
+									});
+									boundEpoch = newEpoch;
 									safety.bindTimeoutFailures = 0; // Reset counter for new epoch
 									safety.bindTimeoutEpoch = boundEpoch;
 									this.#safety.set(sessionOriginKey, safety);
@@ -1898,6 +1907,7 @@ export class MonitorPropagator {
 					if (updated) noDeliveryRecorded = true;
 				}
 				const validDeliveryEntries: typeof nonSilentEntries = [];
+				let hasContractUnmetFailure = false;
 				for (const entry of nonSilentEntries) {
 					const eventRow = fenced.find((row) => row.event_id === entry.eventId);
 					const isEcho = eventRow ? this.#isContractEcho(monitor, eventRow, entry.note) : false;
@@ -1922,6 +1932,7 @@ export class MonitorPropagator {
 							detail: "monitor authoring result echoed its contract",
 						};
 						if (eventRow) this.#emitStage(eventRow, "contract_unmet");
+						hasContractUnmetFailure = true; // Track that this batch had contract_unmet outcomes
 					}
 				}
 				// Deliver only non-silent notes that contain information beyond the contract.
@@ -1964,8 +1975,13 @@ export class MonitorPropagator {
 					// owner-DM canonicalize note stuck inflight for minutes).
 					this.#deliver?.(payload);
 				} else if (noDeliveryRecorded && !readinessFailure) this.#recordReadinessSuccess(sessionOriginKey);
-				// Dispatch succeeded: clear the failed event streak (issue #780)
-				this.#clearConsecutiveFailedEventCount(sessionOriginKey, monitor.monitorId);
+				// Issue #4: contract_unmet outcomes on success path must also feed failure-streak check
+				if (hasContractUnmetFailure) {
+					this.#trackConsecutiveFailedEvent(sessionOriginKey, monitor.monitorId);
+				} else {
+					// Dispatch succeeded with no failures: clear the failed event streak (issue #780)
+					this.#clearConsecutiveFailedEventCount(sessionOriginKey, monitor.monitorId);
+				}
 			} catch (error) {
 				// Public-safe structured evidence only: a stable phase code and event ids.
 				// The raw error body can carry secrets and is never persisted or logged.
@@ -2227,25 +2243,37 @@ export class MonitorPropagator {
 		return fresh;
 	}
 	/**
-	 * Count consecutive failed monitor events from the database.
+	 * Count consecutive failed monitor events from the database per session origin.
 	 * Issue #780: derive from durable failure rows to survive gateway restarts.
+	 * Issue #3: count per session origin, not per monitor across all event types.
+	 * Issue #5: skip unfinished (batched/queued) events.
+	 * Issue #6: bound the query with database parameters instead of selecting all rows.
 	 */
-	#countConsecutiveFailures(monitorId: string): number {
+	#countConsecutiveFailures(monitorId: string, sessionOriginKey: string): number {
 		const monitor = this.#registry.get(monitorId);
 		if (!monitor?.enabled) return 0;
 
-		// Count consecutive recent failures on this monitor, counting backward from the latest event.
+		// Count consecutive recent failures on this monitor, filtered by session origin.
+		// Query is bounded to 2x threshold events to minimize database load.
 		let count = 0;
-		const recent = this.#database.monitors
-			.eventRows()
-			.filter((row) => row.monitor_id === monitorId)
-			.sort((a, b) => Date.parse(b.fired_at) - Date.parse(a.fired_at))
-			.slice(0, MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD * 2); // Look back at ~2x threshold
+		const limit = MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD * 2;
+		const recent = this.#database.monitors.eventRows(monitorId, "newest", false, limit);
 		for (const row of recent) {
+			// Issue #3: only count failures for this specific session origin
+			const eventOrigin = monitorOriginForEvent(monitor, row.event_type);
+			if (originKey(eventOrigin) !== sessionOriginKey) {
+				// Different session origin, stop counting (consecutive means same origin)
+				break;
+			}
+			// Skip events that are still in-flight (unfinished) - Issue #5
+			if (row.stage === "admitted" || row.stage === "batched" || row.stage === "dispatched") {
+				continue;
+			}
+			// Count only terminal failure stages
 			if (row.stage === "failed" || row.stage === "failed_no_retry" || row.stage === "contract_unmet") {
 				count++;
 			} else {
-				// Stop counting at the first non-failed event
+				// Stop counting at the first non-failed terminal event
 				break;
 			}
 		}
@@ -2258,7 +2286,7 @@ export class MonitorPropagator {
 	 */
 	#trackConsecutiveFailedEvent(sessionOriginKey: string, monitorId: string): void {
 		const state = this.#safetyState(sessionOriginKey);
-		const consecutiveCount = this.#countConsecutiveFailures(monitorId);
+		const consecutiveCount = this.#countConsecutiveFailures(monitorId, sessionOriginKey);
 
 		console.error(
 			`monitor failed event for ${sessionOriginKey} (monitor ${monitorId}): consecutive_failures=${consecutiveCount}/${MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD}`,
@@ -2292,12 +2320,15 @@ export class MonitorPropagator {
 		if (!target) return;
 
 		const message = `[monitor escalation] The monitor "${monitor.name}" (${monitorId}) has failed ${failureCount} consecutive times. Please investigate and consider rolling the session.`;
+		// Generate deliveryId first so it's included in both live delivery and outbox persistence
+		const deliveryId = crypto.randomUUID();
 		const payload: ChatMessagePayload = {
 			turnId: crypto.randomUUID(),
 			origin: target.origin,
 			role: "assistant",
 			text: message,
 			final: true,
+			deliveryId,
 		};
 
 		// Deliver to live adapters immediately
@@ -2314,7 +2345,6 @@ export class MonitorPropagator {
 
 		// Persist to outbox for durability
 		try {
-			const deliveryId = crypto.randomUUID();
 			const admitted = this.#database.transaction((tx) => {
 				return this.#database.outbox.enqueue(
 					tx,
@@ -2346,7 +2376,7 @@ export class MonitorPropagator {
 	 */
 	#clearConsecutiveFailedEventCount(sessionOriginKey: string, monitorId: string): void {
 		const state = this.#safetyState(sessionOriginKey);
-		const consecutiveCount = this.#countConsecutiveFailures(monitorId);
+		const consecutiveCount = this.#countConsecutiveFailures(monitorId, sessionOriginKey);
 
 		if (consecutiveCount === 0) {
 			console.error(
