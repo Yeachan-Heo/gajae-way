@@ -490,7 +490,9 @@ export class LaneGovernor {
 						const jobs = await this.#port.runningJobs({ sessionId: lane.sessionId, repo });
 						runningJobsEmpty = jobs.length === 0;
 						if (!runningJobsEmpty) {
-							this.#log(`lane_abandonment_refused name=${name} session=${lane.sessionId} reason=running_jobs count=${jobs.length}`);
+							this.#log(
+								`lane_abandonment_refused name=${name} session=${lane.sessionId} reason=running_jobs count=${jobs.length}`,
+							);
 						}
 					} catch (error) {
 						const detail = sanitizeDiagnostic(diagnostic(error));
@@ -524,7 +526,9 @@ export class LaneGovernor {
 							const jobs = await this.#port.runningJobs({ sessionId: lane.sessionId, repo });
 							retryRunningJobsEmpty = jobs.length === 0;
 							if (!retryRunningJobsEmpty) {
-								this.#log(`lane_retry_abandon_refused name=${name} session=${lane.sessionId} reason=running_jobs count=${jobs.length}`);
+								this.#log(
+									`lane_retry_abandon_refused name=${name} session=${lane.sessionId} reason=running_jobs count=${jobs.length}`,
+								);
 							}
 						} catch (error) {
 							const detail = sanitizeDiagnostic(diagnostic(error));

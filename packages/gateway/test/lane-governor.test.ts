@@ -1362,5 +1362,3 @@ test("#778: forceRetire refuses abandonment when background jobs are running", a
 	if (!binding) throw new Error("binding should still exist");
 	expect(binding.epoch).toBe(0); // Unchanged
 });
-
-
