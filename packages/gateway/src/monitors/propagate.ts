@@ -1380,11 +1380,12 @@ export class MonitorPropagator {
 								repo: this.#repo,
 								...(effectiveModel ? { model: effectiveModel } : {}),
 							});
-							// Bind succeeded: reset timeout counter for this epoch
+							// Bind succeeded: reset timeout counter for this epoch and persist (issue #780, P2 #2)
 							const safety = this.#safety.get(sessionOriginKey);
 							if (safety) {
 								safety.bindTimeoutFailures = 0;
 								safety.bindTimeoutEpoch = undefined;
+								this.#persistBindTimeoutCounter(sessionOriginKey, 0, boundEpoch);
 							}
 						} catch (bindError) {
 							lastBindError = bindError;
@@ -1399,18 +1400,37 @@ export class MonitorPropagator {
 								}
 								safety.bindTimeoutFailures++;
 								this.#safety.set(sessionOriginKey, safety);
+								// Persist the incremented counter to survive restarts (issue #780, P2 #2)
+								this.#persistBindTimeoutCounter(sessionOriginKey, safety.bindTimeoutFailures, boundEpoch);
 								console.error(
 									`monitor bind timeout for ${sessionOriginKey}: count=${safety.bindTimeoutFailures}/${MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD} epoch=${boundEpoch}`,
 								);
 
-								// If threshold reached, rebind to a fresh epoch (issue #780).
-								if (safety.bindTimeoutFailures >= MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD) {
-									// Before rotating, check if a session was already created.
-									// If session.create succeeded in parallel, preserve and reconcile the created session
-									// instead of rotating (issue #780: ambiguous session.create).
-									const currentSession = this.#database.bindings.getSessionRecord(sessionOriginKey);
-									const sessionExists =
-										currentSession && currentSession.epoch === boundEpoch && currentSession.sessionId;
+							// If threshold reached, rebind to a fresh epoch (issue #780).
+							if (safety.bindTimeoutFailures >= MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD) {
+								// Before rotating, check for any pending session.create intent.
+								// If session.create succeeded in the broker but SessionPort hasn't recorded it yet,
+								// the create intent will still be pending. Rotate only if there's no pending create
+								// for the current origin+epoch (issue #780: ambiguous session.create).
+								const pendingCreate = this.#hasPendingCreateIntent(sessionOriginKey, boundEpoch);
+								if (pendingCreate) {
+									console.error(
+										`monitor bind timeout but pending session.create exists for ${sessionOriginKey} epoch=${boundEpoch}, waiting for create to resolve`,
+									);
+									// A pending create may eventually succeed; don't rotate the epoch yet.
+									// Reset the timeout counter and persist it (issue #780, P2 #2)
+									safety.bindTimeoutFailures = 0;
+									this.#safety.set(sessionOriginKey, safety);
+									this.#persistBindTimeoutCounter(sessionOriginKey, 0, boundEpoch);
+									throw bindError; // Propagate the error to retry at this epoch
+								}
+
+								// Check if a session was already created.
+								// If session.create succeeded in parallel, preserve and reconcile the created session
+								// instead of rotating (issue #780: ambiguous session.create).
+								const currentSession = this.#database.bindings.getSessionRecord(sessionOriginKey);
+								const sessionExists =
+									currentSession && currentSession.epoch === boundEpoch && currentSession.sessionId;
 
 									if (sessionExists) {
 										console.error(
@@ -1432,12 +1452,14 @@ export class MonitorPropagator {
 										console.error(
 											`monitor bind timeout rebind triggered for ${sessionOriginKey}: epoch=${boundEpoch} -> ${boundEpoch + 1}`,
 										);
-										// No session exists, safe to rotate the epoch
+										// No session exists and no pending create, safe to rotate the epoch
 										// rotateEpoch persists the new epoch and clears gjc_session_id so the next bind gets a fresh session.
 										const newEpoch = this.#database.transaction((tx) => {
 											return this.#database.bindings.rotateEpoch(tx, sessionOriginKey);
 										});
 										boundEpoch = newEpoch;
+										// Persist the bind timeout counter reset and new epoch to survive restarts (issue #780, P2 #2)
+										this.#persistBindTimeoutCounter(sessionOriginKey, 0, newEpoch);
 										safety.bindTimeoutFailures = 0; // Reset counter for new epoch
 										safety.bindTimeoutEpoch = boundEpoch;
 										this.#safety.set(sessionOriginKey, safety);
@@ -2241,6 +2263,10 @@ export class MonitorPropagator {
 	#safetyState(sessionOriginKey: string): MonitorSessionSafetyState {
 		const existing = this.#safety.get(sessionOriginKey);
 		if (existing) return existing;
+		// Load persisted bind timeout counter for this origin (issue #780, P2 #2)
+		const currentBinding = this.#database.bindings.getSessionRecord(sessionOriginKey);
+		const currentEpoch = currentBinding?.epoch ?? 0;
+		const persistedCount = this.#loadBindTimeoutCounter(sessionOriginKey, currentEpoch);
 		const fresh: MonitorSessionSafetyState = {
 			turns: 0,
 			contextFailures: 0,
@@ -2257,8 +2283,8 @@ export class MonitorPropagator {
 			lastContextTokens: undefined,
 			pendingRoll: undefined,
 			lastRoll: undefined,
-			bindTimeoutFailures: 0,
-			bindTimeoutEpoch: undefined,
+			bindTimeoutFailures: persistedCount, // Restore from durable storage
+			bindTimeoutEpoch: currentEpoch,
 			escalatedForCurrentStreak: false,
 		};
 		this.#safety.set(sessionOriginKey, fresh);
@@ -2266,6 +2292,64 @@ export class MonitorPropagator {
 		// so in-memory state is just for tracking within a single boot cycle.
 		return fresh;
 	}
+
+	/**
+	 * Check if there is a pending session.create intent for the given origin+epoch.
+	 * Issue #780, P2 #1: Before rotating the epoch, ensure no unresolved create intent exists
+	 * that would be orphaned by the epoch change.
+	 */
+	#hasPendingCreateIntent(sessionOriginKey: string, epoch: number): boolean {
+		const createScope = JSON.stringify([sessionOriginKey, epoch]);
+		const intents = this.#database.memory.openRows();
+		for (const intent of intents) {
+			if (intent.kind === "session.create") {
+				try {
+					const payload = JSON.parse(intent.payload_json);
+					// Check if this intent's scope matches the current origin+epoch
+					if (payload.scope === createScope) {
+						return true; // Found a pending create for this origin+epoch
+					}
+				} catch {
+					// Ignore parse errors; continue checking other intents
+				}
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Persist the bind timeout counter for this origin to survive gateway restarts.
+	 * Issue #780, P2 #2: The counter must be persisted in durable storage, not just in memory.
+	 */
+	#persistBindTimeoutCounter(sessionOriginKey: string, count: number, epoch: number): void {
+		const key = `monitor_bind_timeout:${sessionOriginKey}`;
+		try {
+			this.#database.core.metaSet(key, JSON.stringify({ count, epoch, timestamp: this.#now() }));
+		} catch (error) {
+			console.error(`failed to persist bind timeout counter for ${sessionOriginKey}:`, error);
+		}
+	}
+
+	/**
+	 * Load the persisted bind timeout counter from durable storage.
+	 * Returns the count if it's still valid for the current epoch, 0 otherwise.
+	 */
+	#loadBindTimeoutCounter(sessionOriginKey: string, currentEpoch: number): number {
+		const key = `monitor_bind_timeout:${sessionOriginKey}`;
+		try {
+			const raw = this.#database.core.metaGet(key);
+			if (!raw) return 0;
+			const data = JSON.parse(raw);
+			// Only return the count if we're still on the same epoch
+			if (data.epoch === currentEpoch) {
+				return data.count ?? 0;
+			}
+			return 0; // Epoch changed, reset the counter
+		} catch {
+			return 0; // Ignore parse errors
+		}
+	}
+
 	/**
 	 * Count consecutive failed monitor events from the database per session origin.
 	 * Issue #780: derive from durable failure rows to survive gateway restarts.
@@ -2285,10 +2369,14 @@ export class MonitorPropagator {
 		for (const row of recent) {
 			// Issue #3: only count failures for this specific session origin
 			const eventOrigin = monitorOriginForEvent(monitor, row.event_type);
-			if (originKey(eventOrigin) !== sessionOriginKey) {
-				// Different session origin, stop counting (consecutive means same origin)
-				break;
+			const eventOriginKey = originKey(eventOrigin);
+			
+			if (eventOriginKey !== sessionOriginKey) {
+				// Different session origin, skip this row and continue counting other origins
+				// (a monitor with multiple event types may have A/B/A sequence)
+				continue;
 			}
+			
 			// Skip events that are still in-flight (unfinished) - Issue #5
 			if (row.stage === "admitted" || row.stage === "batched" || row.stage === "dispatched") {
 				continue;
@@ -2296,8 +2384,12 @@ export class MonitorPropagator {
 			// Count only terminal failure stages
 			if (row.stage === "failed" || row.stage === "failed_no_retry" || row.stage === "contract_unmet") {
 				count++;
+				// If we've counted enough origin-specific failures, stop early
+				if (count >= MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD) {
+					break;
+				}
 			} else {
-				// Stop counting at the first non-failed terminal event
+				// Stop counting at the first non-failed terminal event of this origin
 				break;
 			}
 		}
@@ -2363,19 +2455,9 @@ export class MonitorPropagator {
 			deliveryId,
 		};
 
-		// Deliver to live adapters immediately
-		try {
-			this.#deliver?.(payload);
-		} catch (error) {
-			this.#recordReadinessFailure({
-				code: "monitor_escalation_delivery_failed",
-				detail: `escalation delivery failed: ${failureDetail(error)}`,
-				originKey: originKey(target.origin),
-				at: this.#now(),
-			});
-		}
-
-		// Persist to outbox for durability and atomically set escalation dedup marker
+		// Issue #780, P2 #4: Persist escalation BEFORE calling live delivery callback.
+		// This ensures that if a crash/failure occurs between persistence and delivery,
+		// the durable outbox will still have the message for retry, guaranteeing one-per-streak delivery.
 		try {
 			const admitted = this.#database.transaction((tx) => {
 				const enqueued = this.#database.outbox.enqueue(
@@ -2394,10 +2476,26 @@ export class MonitorPropagator {
 				}
 				return enqueued;
 			});
-			if (admitted) {
-				this.#delivery.markInflight(deliveryId);
+			
+			// Only deliver to live adapters if persistence succeeded
+			if (!admitted) {
+				return false;
 			}
-			return admitted;
+			
+			// Persistence succeeded; now deliver to live adapters
+			this.#delivery.markInflight(deliveryId);
+			try {
+				this.#deliver?.(payload);
+			} catch (error) {
+				this.#recordReadinessFailure({
+					code: "monitor_escalation_delivery_failed",
+					detail: `escalation delivery failed: ${failureDetail(error)}`,
+					originKey: originKey(target.origin),
+					at: this.#now(),
+				});
+				// Delivery to live clients failed, but it's persisted in the outbox for retry
+			}
+			return true; // Persistence succeeded, even if live delivery had issues
 		} catch (error) {
 			this.#recordReadinessFailure({
 				code: "monitor_escalation_persistence_failed",
