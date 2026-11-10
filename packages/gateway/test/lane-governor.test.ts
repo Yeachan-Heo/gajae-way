@@ -1219,3 +1219,87 @@ test("#778: forceRetire with close failure checks fresh liveness before rotating
 	if (!binding) throw new Error("binding should still exist");
 	expect(binding.epoch).toBe(1); // Rotated from 0
 });
+
+test("#778: forceRetire preserves binding when close fails and liveness is unknown", async () => {
+	database = await Store.open(":memory:");
+	// Stuck lane where close fails and liveness probe also fails, leaving live: undefined
+	bind("unknown-liveness", NOW - 120_000, SESSION_ID);
+
+	const identity = laneJobIdentity("unknown-liveness");
+	let record: LaneJobRecord = createLaneJobRecord({
+		jobId: identity.jobId,
+		branch: "work/test",
+		worktreePath: "/tmp/worker-repo",
+		sessionId: SESSION_ID,
+		now: () => new Date(NOW - 120_000),
+	});
+	// Append an open attempt (no endedAt means broker status is uncertain)
+	record = appendAttempt(record, {
+		opRef: "op-unknown-liveness-1",
+		sessionId: SESSION_ID,
+		startedAt: new Date(NOW - 120_000).toISOString(),
+	});
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }),
+	);
+
+	class FailingClosePort extends ScriptedSessionPort {
+		private livenessCallCount = 0;
+
+		override async close(input: { sessionId: string; repo: string }): Promise<void> {
+			if (input.sessionId === SESSION_ID) {
+				throw new Error("close() simulated failure");
+			}
+			await super.close(input);
+		}
+
+		override async liveness(input: { sessionId: string; repo: string }) {
+			// First call (line 443): return live=true to enable abandonment checks
+			// Second call (after close failure): throw to simulate liveness probe failure
+			if (input.sessionId === SESSION_ID) {
+				this.livenessCallCount++;
+				if (this.livenessCallCount > 1) {
+					throw new Error("liveness probe failed");
+				}
+			}
+			return super.liveness(input);
+		}
+	}
+
+	const port = new FailingClosePort();
+	const logs: string[] = [];
+	const settledAttempts: Array<{ name: string; opRef: string; reason: string; endedAt: string }> = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		idleRetireMs: 60_000,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+
+	// Set up settlement callback to track settled attempts
+	governor.setForceRetireSettlement((name, opRef, reason, endedAt) => {
+		settledAttempts.push({ name, opRef, reason, endedAt });
+		return true;
+	});
+
+	// Session is live but liveness probe will fail
+	// Set up broker session with idle activity state to enable abandonment check
+	port.setSessionState(SESSION_ID, { live: true, activityState: "idle" });
+
+	const result = await governor.forceRetire("unknown-liveness");
+
+	// Should FAIL (not retire) because liveness is unknown after close failure
+	expect(result.retired).toBe(false);
+	expect(result.retired === false && result.reason).toMatch(/session close failed/);
+
+	// Should log the close failure and liveness probe failure
+	expect(logs.some((line) => line.includes("lane_close_failed"))).toBe(true);
+	expect(logs.some((line) => line.includes("liveness_probe_failed"))).toBe(true);
+
+	// Epoch should NOT have been rotated (binding preserved)
+	const sessionKey = workSessionKey("unknown-liveness");
+	const binding = database.bindings.getSessionRecord(sessionKey);
+	if (!binding) throw new Error("binding should still exist");
+	expect(binding.epoch).toBe(0); // NOT rotated, binding preserved
+});

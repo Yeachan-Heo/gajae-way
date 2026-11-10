@@ -545,8 +545,8 @@ export class LaneGovernor {
 				// On close failure, do a fresh liveness check before proceeding with rotateEpoch.
 				// Only proceed if we can confirm the host is dead/disowned; otherwise preserve the binding.
 				const closeFailureLiveness = await this.#safeLiveness(lane.sessionId, repo);
-				if (closeFailureLiveness.live === true && !closeFailureLiveness.disowned) {
-					// Host is still live; must not rotate epoch while host is executing.
+				if (closeFailureLiveness.live !== false && !closeFailureLiveness.disowned) {
+					// Host may still be live or liveness is unknown; must not rotate epoch without confirmation it is dead/disowned.
 					return { retired: false, sessionKey, reason: `session close failed: ${detail}` };
 				}
 				// For dead/disowned sessions confirmed by fresh liveness check, proceed with rotation.
