@@ -1168,8 +1168,33 @@ export class WorkLaneManager {
 			throw workError("work send acceptance uncertain", "send_acceptance_uncertain", runtime);
 		}
 		// Detect provably undelivered sends: transport_unavailable AND session has no record of the operation
-		const sendUndelivered =
-			transportUnavailableError && statusFromQuery && statusFromQuery.status === "unknown" && !accepted && !rejected;
+		// AND broker-reported activity is idle AND session has no accepted command/user turn for this clientRef.
+		// Missing/unreported activity counts as NOT idle (per #779 rule).
+		let sendUndelivered = false;
+		if (
+			transportUnavailableError &&
+			statusFromQuery &&
+			statusFromQuery.status === "unknown" &&
+			!accepted &&
+			!rejected
+		) {
+			// Require positive broker evidence: activity must be idle AND no accepted turn/command
+			try {
+				if (this.#port.liveness) {
+					const liveness = await this.#port.liveness({ sessionId: runtime.sessionId, repo: runtime.cwd });
+					// Missing activity counts as NOT idle per #779; only settle on positive idle evidence
+					const activityIsIdle = liveness.activity?.state === "idle";
+					// Check if there's no accepted command/user turn for this clientRef
+					const noAcceptedTurn = !statusFromQuery.commandId && !statusFromQuery.turnId;
+					// Only settle if we have positive evidence of both idle + no accepted turn
+					if (activityIsIdle && noAcceptedTurn) {
+						sendUndelivered = true;
+					}
+				}
+			} catch {
+				// If liveness check fails, don't settle (uncertain)
+			}
+		}
 		latest =
 			this.#updateAttempt(
 				opRef,
@@ -1181,9 +1206,9 @@ export class WorkLaneManager {
 							...(rejected
 								? { terminal: { kind: "local", observedAt: this.#at(), reasonCode: "send_rejected" } as const }
 								: sendUndelivered
-								? { terminal: { kind: "local", observedAt: this.#at(), reasonCode: "send_undelivered" } as const }
-								: {}),
-					},
+									? { terminal: { kind: "local", observedAt: this.#at(), reasonCode: "send_undelivered" } as const }
+									: {}),
+						},
 			) ?? latest;
 		this.#schedule(observer, 0);
 		if (rejected) throw workError("work send rejected", "send_rejected", latest);
