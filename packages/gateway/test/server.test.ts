@@ -1401,6 +1401,98 @@ test("unauthorized direct messages cannot invoke /new or /model", async () => {
 	client.close();
 });
 
+test("in a public channel with audience=all, non-owner cannot /model set|clear but can /model show", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-channel-command-auth-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		model: { preset: "default" },
+		channels: { "discord:public": { engagement: "open", audience: "all" } },
+		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "owner-dm", peerId: "owner-id" } },
+	};
+	const database = await Store.open(config.dbPath);
+	const sessionPort = new ScriptedSessionPort({ onBind: (input) => bindWorkFixture(input.originKey, input.epoch) });
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	const channelOrigin = { platform: "discord", kind: "channel", conversationId: "public" };
+	const nonOwnerEngagement = { mentioned: false, group: true, authorId: "member" };
+	const ownerEngagement = { mentioned: false, group: true, authorId: "owner-id" };
+
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+
+	// Non-owner cannot set model
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "non-owner-set",
+		verb: "chat.send",
+		params: { origin: channelOrigin, text: "/model set gpt-4", engagement: nonOwnerEngagement },
+	});
+	await waitFrame(client.frames, "non-owner-set");
+	expect(client.frames.find((frame) => frame.id === "non-owner-set")).toMatchObject({
+		type: "response",
+		result: { turnId: null, engaged: false },
+	});
+
+	// Non-owner cannot clear model
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "non-owner-clear",
+		verb: "chat.send",
+		params: { origin: channelOrigin, text: "/model clear", engagement: nonOwnerEngagement },
+	});
+	await waitFrame(client.frames, "non-owner-clear");
+	expect(client.frames.find((frame) => frame.id === "non-owner-clear")).toMatchObject({
+		type: "response",
+		result: { turnId: null, engaged: false },
+	});
+
+	// Non-owner CAN show model (read-only, only needs engagement gate)
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "non-owner-show",
+		verb: "chat.send",
+		params: { origin: channelOrigin, text: "/model show", engagement: nonOwnerEngagement },
+	});
+	await waitFrame(client.frames, "non-owner-show");
+	const showResponse = client.frames.find((frame) => frame.id === "non-owner-show");
+	expect(showResponse).toMatchObject({
+		type: "response",
+		result: { engaged: true },
+	});
+	const showEvent = client.frames.find(
+		(frame) => frame.type === "event" && frame.event === "chat.message" && frame.payload?.text?.includes("model:"),
+	);
+	expect(showEvent).toMatchObject({
+		type: "event",
+		event: "chat.message",
+	});
+
+	// Owner CAN set model
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "owner-set",
+		verb: "chat.send",
+		params: { origin: channelOrigin, text: "/model set gpt-4", engagement: ownerEngagement },
+	});
+	await waitFrame(client.frames, "owner-set");
+	const ownerSetResponse = client.frames.find((frame) => frame.id === "owner-set");
+	expect(ownerSetResponse?.result?.engaged).toBe(true);
+	expect(database.bindings.modelGet("discord/channel/public")?.selection).toEqual({ preset: "gpt-4" });
+
+	client.close();
+});
+
 test("a mention-less /new inside an engaged thread is authorised", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-command-thread-follow-up-"));
 	const config: GatewayConfig = {

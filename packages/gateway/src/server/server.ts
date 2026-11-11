@@ -2581,18 +2581,36 @@ async function sendChat(
 		typeof params.engagement?.replyTo?.messageId === "string" && params.engagement.replyTo.messageId
 			? params.engagement.replyTo.messageId
 			: undefined;
-	// `/model` is a privileged control path. Apply the same direct-message and
-	// group authorisation policy as ordinary engagement before inspecting or
-	// mutating the durable override.
+	// `/model` is a privileged control path. Read-only `/model show` applies
+	// engagement gates. Mutations (`/model set` and `/model clear`) require the
+	// configured owner.
 	if (userText === "/model" || userText.startsWith("/model ")) {
-		if (!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp)) {
-			connection.write({
-				v: PROFILE_VERSION,
-				type: "response",
-				id: request.id,
-				result: { turnId: null, engaged: false },
-			});
-			return;
+		const rest = userText.slice("/model".length).trim();
+		const [head = ""] = rest.split(/\s+/).filter((part) => part !== "");
+		const isReadOnly = rest === "" || head === "show";
+
+		if (isReadOnly) {
+			// Read-only: check engagement only
+			if (!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp)) {
+				connection.write({
+					v: PROFILE_VERSION,
+					type: "response",
+					id: request.id,
+					result: { turnId: null, engaged: false },
+				});
+				return;
+			}
+		} else {
+			// Mutation: require owner
+			if (!isOwner(runtime.config, params.engagement)) {
+				connection.write({
+					v: PROFILE_VERSION,
+					type: "response",
+					id: request.id,
+					result: { turnId: null, engaged: false },
+				});
+				return;
+			}
 		}
 		const outcome = applyModelCommand(userText, key, origin, options.database, runtime.config.model);
 		if (outcome.rebind) {
@@ -2749,6 +2767,8 @@ async function sendChat(
 	if (params.text === "/new" || params.text === "/reset") {
 		// Session resets are privileged control paths: an unauthorized DM must not
 		// erase the caller's session merely because commands bypass normal dispatch.
+		// Engagement gating prevents abuse in public channels; owner gating is not
+		// required because a reset affects only the current conversation origin.
 		if (!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp)) {
 			connection.write({
 				v: PROFILE_VERSION,
@@ -4901,4 +4921,17 @@ function commandAuthorised(
 	threadFollowUp: boolean,
 ): boolean {
 	return decideEngagement(origin, engagement as Parameters<typeof decideEngagement>[1], config, threadFollowUp).engaged;
+}
+
+/**
+ * Check if an actor is allowed to perform owner-level operations.
+ * Returns true if no owner is configured (anyone is allowed), or if the
+ * command issuer matches the configured owner.
+ */
+function isOwner(config: GatewayConfig, engagement: unknown): boolean {
+	const owner = ownerPeerIdOf(config);
+	// If no owner is configured, anyone can perform owner-level operations
+	if (owner === undefined) return true;
+	const authorId = (engagement as { authorId?: string } | undefined)?.authorId;
+	return authorId === owner;
 }
