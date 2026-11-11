@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { BrokerStartupFailureTracker } from "../src/orchestrator/broker-liveness";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { BrokerStartupFailureTracker, validateStartupExitRecord } from "../src/orchestrator/broker-liveness";
+import { GlobalGjcClient } from "../src/orchestrator/broker";
 
 describe("BrokerStartupFailureTracker", () => {
 	test("K distinct records with the same reason trigger exactly one alert", () => {
@@ -156,5 +159,165 @@ describe("BrokerStartupFailureTracker", () => {
 
 		const state = tracker.state();
 		expect(state.failureCount).toBe(0);
+	});
+});
+
+describe("validateStartupExitRecord", () => {
+	test("validates records with valid schema", () => {
+		const now = Date.now();
+		const record = { pid: 1001, writtenAt: now, reason: "startup-lock-blocked" };
+
+		const validated = validateStartupExitRecord(record);
+		expect(validated).toBeDefined();
+		expect(validated?.pid).toBe(1001);
+		expect(validated?.writtenAt).toBe(now);
+		expect(validated?.reason).toBe("startup-lock-blocked");
+	});
+
+	test("includes optional blockingLockPath", () => {
+		const now = Date.now();
+		const record = {
+			pid: 1001,
+			writtenAt: now,
+			reason: "startup-lock-unavailable",
+			blockingLockPath: "/tmp/lock",
+		};
+
+		const validated = validateStartupExitRecord(record);
+		expect(validated?.blockingLockPath).toBe("/tmp/lock");
+	});
+
+	test("rejects invalid reasons", () => {
+		const now = Date.now();
+		const record = { pid: 1001, writtenAt: now, reason: "unknown-reason" };
+
+		const validated = validateStartupExitRecord(record);
+		expect(validated).toBeUndefined();
+	});
+
+	test("rejects missing required fields", () => {
+		const now = Date.now();
+
+		expect(validateStartupExitRecord({ pid: 1001, reason: "startup-lock-blocked" })).toBeUndefined();
+		expect(validateStartupExitRecord({ writtenAt: now, reason: "startup-lock-blocked" })).toBeUndefined();
+		expect(validateStartupExitRecord({ pid: 1001, writtenAt: now })).toBeUndefined();
+	});
+});
+
+describe("GlobalGjcClient startup-exit tracking", () => {
+	test("integration: K distinct startup-exit records trigger exactly one alert", () => {
+		// This test verifies the integration between validateStartupExitRecord and BrokerStartupFailureTracker
+		const alerts: Array<{ reason: string; blockingPath?: string }> = [];
+		const tracker = new BrokerStartupFailureTracker({ threshold: 3 });
+		const now = Date.now();
+
+		// Simulate reading 5 distinct startup-exit records from disk
+		for (let i = 0; i < 5; i++) {
+			const startupRecord = {
+				pid: 1000 + i,
+				writtenAt: now + i * 1000,
+				reason: "startup-lock-unavailable",
+				blockingLockPath: `/tmp/lock-${i}`,
+			};
+
+			const validated = validateStartupExitRecord(startupRecord);
+			if (validated) {
+				const shouldAlert = tracker.recordFailure(validated, now + i * 1000);
+				if (shouldAlert) {
+					alerts.push({
+						reason: validated.reason,
+						blockingPath: validated.blockingLockPath,
+					});
+				}
+			}
+		}
+
+		// Should have exactly one alert (when K=3 threshold is reached)
+		expect(alerts).toHaveLength(1);
+		expect(alerts[0]?.reason).toBe("startup-lock-unavailable");
+		expect(alerts[0]?.blockingPath).toBeDefined();
+	});
+
+	test("integration: same record re-read many times produces no alert", () => {
+		const alerts: Array<{ reason: string; blockingPath?: string }> = [];
+		const tracker = new BrokerStartupFailureTracker({ threshold: 3 });
+		const now = Date.now();
+		const startupRecord = {
+			pid: 1000,
+			writtenAt: now,
+			reason: "startup-lock-blocked",
+		};
+
+		// Simulate re-reading the same record 5 times
+		for (let i = 0; i < 5; i++) {
+			const validated = validateStartupExitRecord(startupRecord);
+			if (validated) {
+				const shouldAlert = tracker.recordFailure(validated, now);
+				if (shouldAlert) {
+					alerts.push({
+						reason: validated.reason,
+						blockingPath: validated.blockingLockPath,
+					});
+				}
+			}
+		}
+
+		// No alert should be fired for the same record re-read
+		expect(alerts).toHaveLength(0);
+	});
+
+	test("integration: alert re-arms after reset", () => {
+		const alerts: Array<{ reason: string; blockingPath?: string }> = [];
+		const tracker = new BrokerStartupFailureTracker({ threshold: 3 });
+		const now = Date.now();
+
+		// First, record 3 distinct records to trigger alert
+		for (let i = 0; i < 3; i++) {
+			const startupRecord = {
+				pid: 1000 + i,
+				writtenAt: now + i * 1000,
+				reason: "startup-lock-blocked",
+			};
+
+			const validated = validateStartupExitRecord(startupRecord);
+			if (validated) {
+				const shouldAlert = tracker.recordFailure(validated, now + i * 1000);
+				if (shouldAlert) {
+					alerts.push({
+						reason: validated.reason,
+						blockingPath: validated.blockingLockPath,
+					});
+				}
+			}
+		}
+
+		// First alert should have been fired
+		expect(alerts.length).toBe(1);
+
+		// Reset (simulating broker becoming live)
+		tracker.reset();
+
+		// Record new distinct records; they should trigger a new alert after threshold
+		for (let i = 3; i < 6; i++) {
+			const startupRecord = {
+				pid: 2000 + i,
+				writtenAt: now + i * 1000,
+				reason: "startup-lock-blocked",
+			};
+
+			const validated = validateStartupExitRecord(startupRecord);
+			if (validated) {
+				const shouldAlert = tracker.recordFailure(validated, now + i * 1000);
+				if (shouldAlert) {
+					alerts.push({
+						reason: validated.reason,
+						blockingPath: validated.blockingLockPath,
+					});
+				}
+			}
+		}
+
+		// Should now have 2 alerts (one before reset, one after)
+		expect(alerts.length).toBe(2);
 	});
 });

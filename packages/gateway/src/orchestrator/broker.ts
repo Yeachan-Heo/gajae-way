@@ -9,6 +9,7 @@ import {
 	type PidAliveProbe,
 	readBrokerDiscovery,
 	readBrokerStartupExitRecordSync,
+	validateStartupExitRecord,
 } from "./broker-liveness";
 import { isVerifiedGjcVersion, MIN_GJC_VERSION, VERIFIED_GJC_THROUGH } from "./gjc-contract";
 import { extractRuntimeError, sanitizeDiagnostic } from "./rebind";
@@ -23,6 +24,7 @@ export {
 	type PidAliveProbe,
 	readBrokerDiscovery,
 	readBrokerStartupExitRecordSync,
+	validateStartupExitRecord,
 } from "./broker-liveness";
 export const GJC_ATTACH_ONLY_ENV = "GJC_SDK_BROKER_AUTOSTART";
 
@@ -467,8 +469,6 @@ export class GlobalGjcClient {
 	#churnAlerted = false;
 	/** Tracks consecutive broker startup failures with the same reason. */
 	#startupFailureTracker = new BrokerStartupFailureTracker();
-	/** Pending startup wedge alerts waiting for server delivery. */
-	#pendingStartupAlerts: Array<{ reason: string; blockingPath?: string }> = [];
 
 	constructor(options: GlobalGjcClientOptions) {
 		this.#options = options;
@@ -535,25 +535,18 @@ export class GlobalGjcClient {
 	judgeLiveness(): Promise<BrokerLivenessVerdict> {
 		return judgeBrokerLiveness(this.discoveryPath, this.#options.isPidAlive ?? defaultPidAlive);
 	}
-	/**
-	 * Resets startup failure tracking when the broker is confirmed as live.
-	 * Called when a successful broker generation is established.
-	 */
-	confirmBrokerLive(): void {
-		this.#startupFailureTracker.reset();
-	}
 
-	/**
-	 * Retrieves and clears pending startup wedge alerts queued for server delivery.
-	 */
-	dequeuePendingStartupAlerts(): Array<{ reason: string; blockingPath?: string }> {
-		const alerts = this.#pendingStartupAlerts.slice();
-		this.#pendingStartupAlerts = [];
-		return alerts;
-	}
 	onGeneration(listener: BrokerGenerationListener): () => void {
 		this.#listeners.add(listener);
 		return () => this.#listeners.delete(listener);
+	}
+
+	/**
+	 * Sets or updates the onStartupWedgeAlert callback.
+	 * Used to wire the callback after the runtime is created.
+	 */
+	setOnStartupWedgeAlert(callback: (detail: { reason: string; blockingPath?: string }) => void): void {
+		(this.#options as Partial<GlobalGjcClientOptions>).onStartupWedgeAlert = callback;
 	}
 	async preflight(): Promise<void> {
 		const result = await preflightGjcRuntime(
@@ -777,6 +770,8 @@ export class GlobalGjcClient {
 					}
 				}
 			}
+			// Reset startup failure tracker when broker is confirmed live
+			this.#startupFailureTracker.reset();
 			return true;
 		} catch (error) {
 			if (epoch === this.#epoch && !this.#stopped) {
@@ -834,30 +829,6 @@ export class GlobalGjcClient {
 		this.#log(
 			`broker_respawn_churn respawns=${this.recentRespawns(now)} windowMs=${BROKER_RESPAWN_WINDOW_MS} pid=${pid} generation=${this.#generation + 1}`,
 		);
-
-		// Check for startup-exit record and queue alert if threshold is reached
-		const startupRecord = readBrokerStartupExitRecordSync(this.agentDir);
-		if (startupRecord) {
-			const shouldAlert = this.#startupFailureTracker.recordFailure(startupRecord, now);
-			if (shouldAlert) {
-				const blockingPath =
-					typeof startupRecord === "object" && startupRecord !== null
-						? (startupRecord as Record<string, unknown>).blockingLockPath
-						: undefined;
-				const reason =
-					typeof startupRecord === "object" && startupRecord !== null
-						? (startupRecord as Record<string, unknown>).reason
-						: "unknown";
-				const alert = {
-					reason: String(reason),
-					blockingPath: typeof blockingPath === "string" ? blockingPath : undefined,
-				};
-				// Queue alert for server delivery
-				this.#pendingStartupAlerts.push(alert);
-				// Also call callback if provided
-				this.#options.onStartupWedgeAlert?.(alert);
-			}
-		}
 	}
 	#schedule(epoch: number): void {
 		// Continue observation after involuntary stops so the #246 guard can trigger.
@@ -876,6 +847,21 @@ export class GlobalGjcClient {
 					this.#outageSince = undefined;
 					this.#liveOutageSince = undefined;
 				} else if (epoch === this.#epoch && !this.#stopped) {
+					// Check for startup-exit record and track failures
+					const startupRecord = readBrokerStartupExitRecordSync(this.agentDir);
+					const validatedRecord = startupRecord ? validateStartupExitRecord(startupRecord) : undefined;
+					if (validatedRecord) {
+						const shouldAlert = this.#startupFailureTracker.recordFailure(validatedRecord, now);
+						if (shouldAlert) {
+							const recordCount = this.#startupFailureTracker.recentRecordCount();
+							const logLine = `broker_startup_wedge reason=${validatedRecord.reason}${validatedRecord.blockingLockPath ? ` blockingLockPath=${validatedRecord.blockingLockPath}` : ""} records=${recordCount}`;
+							this.#log(logLine);
+							this.#options.onStartupWedgeAlert?.({
+								reason: validatedRecord.reason,
+								blockingPath: validatedRecord.blockingLockPath,
+							});
+						}
+					}
 					this.#log(
 						new GjcCliUnavailableError(
 							`global broker unavailable; observing without repair: ${this.#unavailableReason}`,

@@ -1202,27 +1202,6 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	});
 	const originSilent = new OriginSilentAlerter(options.database, () => runtime.config.ownerTarget?.origin);
 	const reconcileTimer = setInterval(() => {
-		// Check for pending broker startup wedge alerts
-		if (broker) {
-			const alerts = broker.dequeuePendingStartupAlerts();
-			for (const alert of alerts) {
-				const ownerOrigin = runtime.config.ownerTarget?.origin;
-				if (ownerOrigin) {
-					const ownerDeliveryId = `broker-startup-wedge:${crypto.randomUUID()}`;
-					const alertText = `[operator alert] broker startup wedged: reason=${alert.reason}${
-						alert.blockingPath ? ` blockingPath=${alert.blockingPath}` : ""
-					}`;
-					const ownerPayload = runtime.delivery.prepare(
-						crypto.randomUUID(),
-						ownerOrigin,
-						alertText,
-						undefined,
-						ownerDeliveryId,
-					);
-					if (ownerPayload) broadcastDelivery(runtime, ownerPayload);
-				}
-			}
-		}
 		alertSilentOrigins(runtime, originSilent);
 		void monitors.reconcile();
 		void personaSessions
@@ -1323,7 +1302,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		clearTimeout(retentionBootTimer);
 	};
 	const brokerWithGeneration = options.broker as
-		| (GlobalGjcClient & { onGeneration?: GlobalGjcClient["onGeneration"] })
+		| (GlobalGjcClient & {
+				onGeneration?: GlobalGjcClient["onGeneration"];
+				setOnStartupWedgeAlert?: (callback: (detail: { reason: string; blockingPath?: string }) => void) => void;
+		  })
 		| undefined;
 	const stopBrokerGenerationListener =
 		typeof brokerWithGeneration?.onGeneration === "function"
@@ -1343,6 +1325,26 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 							.catch((error: unknown) => console.error(`gjc version refresh failed: ${diagnostic(error)}`));
 				})
 			: undefined;
+	// Wire startup wedge alerts to owner delivery
+	if (typeof brokerWithGeneration?.setOnStartupWedgeAlert === "function") {
+		brokerWithGeneration.setOnStartupWedgeAlert((detail) => {
+			const ownerOrigin = runtime.config.ownerTarget?.origin;
+			if (ownerOrigin) {
+				const ownerDeliveryId = `broker-startup-wedge:${crypto.randomUUID()}`;
+				const alertText = `[operator alert] broker startup wedged: reason=${detail.reason}${
+					detail.blockingPath ? ` blockingPath=${detail.blockingPath}` : ""
+				}`;
+				const ownerPayload = runtime.delivery.prepare(
+					crypto.randomUUID(),
+					ownerOrigin,
+					alertText,
+					undefined,
+					ownerDeliveryId,
+				);
+				if (ownerPayload) broadcastDelivery(runtime, ownerPayload);
+			}
+		});
+	}
 	runtime = {
 		config: options.config,
 		stopping: false,

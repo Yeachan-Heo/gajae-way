@@ -10,8 +10,21 @@ interface BrokerExitRecord {
 	readonly path?: unknown;
 	readonly detail?: unknown;
 	readonly blockingLockPath?: unknown;
+	readonly pid?: unknown;
+	readonly writtenAt?: unknown;
 	[key: string]: unknown;
 }
+
+/**
+ * Valid startup failure reasons per gjc schema:
+ * startup-deadline, startup-signal, startup-lock-blocked, startup-lock-unavailable
+ */
+const STARTUP_FAILURE_REASONS = new Set([
+	"startup-deadline",
+	"startup-signal",
+	"startup-lock-blocked",
+	"startup-lock-unavailable",
+]);
 
 /** gjc's own discovery heartbeat TTL. */
 export const BROKER_HEARTBEAT_TTL_MS = 15_000;
@@ -224,6 +237,36 @@ export function brokerStartupFailureReason(record: unknown): string | undefined 
 }
 
 /**
+ * Extracts a validated startup-exit record from raw data, or undefined if invalid.
+ * Required fields: pid (number), writtenAt (number), reason (valid startup reason).
+ * Optional: blockingLockPath (string).
+ */
+export function validateStartupExitRecord(
+	record: unknown,
+):
+	| { readonly pid: number; readonly writtenAt: number; readonly reason: string; readonly blockingLockPath?: string }
+	| undefined {
+	if (typeof record !== "object" || record === null || Array.isArray(record)) return undefined;
+	const candidate = record as BrokerExitRecord;
+
+	const pid = typeof candidate.pid === "number" && Number.isSafeInteger(candidate.pid) ? candidate.pid : undefined;
+	const writtenAt =
+		typeof candidate.writtenAt === "number" && Number.isSafeInteger(candidate.writtenAt)
+			? candidate.writtenAt
+			: undefined;
+	const reason = typeof candidate.reason === "string" ? candidate.reason : undefined;
+
+	if (!pid || !writtenAt || !reason || !STARTUP_FAILURE_REASONS.has(reason)) return undefined;
+
+	return {
+		pid,
+		writtenAt,
+		reason,
+		blockingLockPath: typeof candidate.blockingLockPath === "string" ? candidate.blockingLockPath : undefined,
+	};
+}
+
+/**
  * Tracks distinct broker startup-exit records over a bounded window.
  * Identifies uniqueness by pid/writtenAt pair, so re-reading the same record doesn't count as a new failure.
  */
@@ -296,6 +339,11 @@ export class BrokerStartupFailureTracker {
 			latestReason: this.#records[this.#records.length - 1]?.reason,
 			lastAlertedReason: this.#lastAlertReason,
 		};
+	}
+
+	/** Returns count of recent records for alert logging. */
+	recentRecordCount(): number {
+		return this.#records.length;
 	}
 }
 
