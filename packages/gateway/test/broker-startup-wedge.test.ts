@@ -1,4 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { GlobalGjcClient } from "../src/orchestrator/broker";
 import { BrokerStartupFailureTracker, validateStartupExitRecord } from "../src/orchestrator/broker-liveness";
 
 describe("BrokerStartupFailureTracker", () => {
@@ -201,120 +205,106 @@ describe("validateStartupExitRecord", () => {
 	});
 });
 
-describe("GlobalGjcClient startup-exit tracking", () => {
-	test("integration: K distinct startup-exit records trigger exactly one alert", () => {
-		// This test verifies the integration between validateStartupExitRecord and BrokerStartupFailureTracker
-		const alerts: Array<{ reason: string; blockingPath?: string }> = [];
-		const tracker = new BrokerStartupFailureTracker({ threshold: 3 });
-		const now = Date.now();
-
-		// Simulate reading 5 distinct startup-exit records from disk
-		for (let i = 0; i < 5; i++) {
-			const startupRecord = {
-				pid: 1000 + i,
-				writtenAt: now + i * 1000,
-				reason: "startup-lock-unavailable",
-				blockingLockPath: `/tmp/lock-${i}`,
-			};
-
-			const validated = validateStartupExitRecord(startupRecord);
-			if (validated) {
-				const shouldAlert = tracker.recordFailure(validated, now + i * 1000);
-				if (shouldAlert) {
-					alerts.push({
-						reason: validated.reason,
-						blockingPath: validated.blockingLockPath,
-					});
-				}
-			}
-		}
-
-		// Should have exactly one alert (when K=3 threshold is reached)
-		expect(alerts).toHaveLength(1);
-		expect(alerts[0]?.reason).toBe("startup-lock-unavailable");
-		expect(alerts[0]?.blockingPath).toBeDefined();
+describe("GlobalGjcClient startup-exit tracking (#800)", () => {
+	const cleanups: Array<() => Promise<void>> = [];
+	afterEach(async () => {
+		for (const cleanup of cleanups.splice(0)) await cleanup();
 	});
 
-	test("integration: same record re-read many times produces no alert", () => {
+	async function wedgedClient() {
+		const agentDir = await realpath(await mkdtemp(join(tmpdir(), "gw-800-")));
+		await mkdir(join(agentDir, "sdk"), { recursive: true });
+		let available = true;
 		const alerts: Array<{ reason: string; blockingPath?: string }> = [];
-		const tracker = new BrokerStartupFailureTracker({ threshold: 3 });
-		const now = Date.now();
-		const startupRecord = {
-			pid: 1000,
-			writtenAt: now,
-			reason: "startup-lock-blocked",
+		const logs: string[] = [];
+		const client = new GlobalGjcClient({
+			executable: "/fake/nondefault/bin/gjc",
+			agentDir,
+			command: async () => ({
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: { sessions: [] } }),
+				stderr: "",
+			}),
+			discovery: async () => ({ pid: 12345, url: "ws://127.0.0.1:12345", token: "t", heartbeatAt: Date.now() }),
+			healthProbe: async () => available,
+			healthIntervalMs: 5,
+			reconnectBackoff: { initialMs: 2, maxMs: 5 },
+			log: (line) => logs.push(String(line)),
+		});
+		client.setOnStartupWedgeAlert((wedge) => alerts.push(wedge));
+		cleanups.push(async () => {
+			await client.stop();
+			await rm(agentDir, { recursive: true, force: true });
+		});
+		let writtenAt = Date.now();
+		const writeStartupExit = (pid: number) =>
+			writeFile(
+				join(agentDir, "sdk", "broker.startup-exit.json"),
+				JSON.stringify({
+					reason: "startup-lock-unavailable",
+					pid,
+					writtenAt: ++writtenAt,
+					blockingLockPath: join(agentDir, "sdk", "sessions", "index.jsonl.lock"),
+				}),
+			);
+		return {
+			client,
+			alerts,
+			logs,
+			writeStartupExit,
+			setAvailable: (value: boolean) => {
+				available = value;
+			},
 		};
+	}
 
-		// Simulate re-reading the same record 5 times
-		for (let i = 0; i < 5; i++) {
-			const validated = validateStartupExitRecord(startupRecord);
-			if (validated) {
-				const shouldAlert = tracker.recordFailure(validated, now);
-				if (shouldAlert) {
-					alerts.push({
-						reason: validated.reason,
-						blockingPath: validated.blockingLockPath,
-					});
-				}
-			}
+	async function ticks(logs: string[], count: number): Promise<void> {
+		const observed = () => logs.filter((line) => line.includes("observing without repair")).length;
+		const target = observed() + count;
+		for (let i = 0; i < 400 && observed() < target; i++) await Bun.sleep(5);
+		expect(observed()).toBeGreaterThanOrEqual(target);
+	}
+
+	test("K distinct startup-exit records while the broker is down raise exactly one owner alert", async () => {
+		const wedge = await wedgedClient();
+		await wedge.client.start();
+		wedge.setAvailable(false);
+		for (let pid = 1; pid <= 5; pid++) {
+			await wedge.writeStartupExit(pid);
+			await ticks(wedge.logs, 2);
 		}
-
-		// No alert should be fired for the same record re-read
-		expect(alerts).toHaveLength(0);
+		expect(wedge.alerts).toHaveLength(1);
+		expect(wedge.alerts[0]?.reason).toBe("startup-lock-unavailable");
+		expect(wedge.alerts[0]?.blockingPath).toEndWith("index.jsonl.lock");
+		expect(wedge.logs.filter((line) => line.startsWith("broker_startup_wedge "))).toHaveLength(1);
 	});
 
-	test("integration: alert re-arms after reset", () => {
-		const alerts: Array<{ reason: string; blockingPath?: string }> = [];
-		const tracker = new BrokerStartupFailureTracker({ threshold: 3 });
-		const now = Date.now();
+	test("one startup-exit record observed on many ticks raises no alert", async () => {
+		const wedge = await wedgedClient();
+		await wedge.client.start();
+		wedge.setAvailable(false);
+		await wedge.writeStartupExit(1);
+		await ticks(wedge.logs, 10);
+		expect(wedge.alerts).toEqual([]);
+	});
 
-		// First, record 3 distinct records to trigger alert
-		for (let i = 0; i < 3; i++) {
-			const startupRecord = {
-				pid: 1000 + i,
-				writtenAt: now + i * 1000,
-				reason: "startup-lock-blocked",
-			};
-
-			const validated = validateStartupExitRecord(startupRecord);
-			if (validated) {
-				const shouldAlert = tracker.recordFailure(validated, now + i * 1000);
-				if (shouldAlert) {
-					alerts.push({
-						reason: validated.reason,
-						blockingPath: validated.blockingLockPath,
-					});
-				}
-			}
+	test("a live broker re-arms the alert for the next wedge", async () => {
+		const wedge = await wedgedClient();
+		await wedge.client.start();
+		wedge.setAvailable(false);
+		for (let pid = 1; pid <= 3; pid++) {
+			await wedge.writeStartupExit(pid);
+			await ticks(wedge.logs, 2);
 		}
-
-		// First alert should have been fired
-		expect(alerts.length).toBe(1);
-
-		// Reset (simulating broker becoming live)
-		tracker.reset();
-
-		// Record new distinct records; they should trigger a new alert after threshold
-		for (let i = 3; i < 6; i++) {
-			const startupRecord = {
-				pid: 2000 + i,
-				writtenAt: now + i * 1000,
-				reason: "startup-lock-blocked",
-			};
-
-			const validated = validateStartupExitRecord(startupRecord);
-			if (validated) {
-				const shouldAlert = tracker.recordFailure(validated, now + i * 1000);
-				if (shouldAlert) {
-					alerts.push({
-						reason: validated.reason,
-						blockingPath: validated.blockingLockPath,
-					});
-				}
-			}
+		expect(wedge.alerts).toHaveLength(1);
+		wedge.setAvailable(true);
+		for (let i = 0; i < 400 && !wedge.client.isAvailable; i++) await Bun.sleep(5);
+		expect(wedge.client.isAvailable).toBe(true);
+		wedge.setAvailable(false);
+		for (let pid = 11; pid <= 13; pid++) {
+			await wedge.writeStartupExit(pid);
+			await ticks(wedge.logs, 2);
 		}
-
-		// Should now have 2 alerts (one before reset, one after)
-		expect(alerts.length).toBe(2);
+		expect(wedge.alerts).toHaveLength(2);
 	});
 });

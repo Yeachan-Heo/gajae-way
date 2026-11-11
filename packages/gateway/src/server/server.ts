@@ -1304,7 +1304,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const brokerWithGeneration = options.broker as
 		| (GlobalGjcClient & {
 				onGeneration?: GlobalGjcClient["onGeneration"];
-				setOnStartupWedgeAlert?: (callback: (detail: { reason: string; blockingPath?: string }) => void) => void;
+				setOnStartupWedgeAlert?: GlobalGjcClient["setOnStartupWedgeAlert"];
 		  })
 		| undefined;
 	const stopBrokerGenerationListener =
@@ -1325,7 +1325,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 							.catch((error: unknown) => console.error(`gjc version refresh failed: ${diagnostic(error)}`));
 				})
 			: undefined;
-	// Wire startup wedge alerts to owner delivery
+	// A broker that keeps failing startup parks every origin silently (#800): tell the owner once.
 	if (typeof brokerWithGeneration?.setOnStartupWedgeAlert === "function") {
 		brokerWithGeneration.setOnStartupWedgeAlert((detail) => {
 			const ownerOrigin = runtime.config.ownerTarget?.origin;

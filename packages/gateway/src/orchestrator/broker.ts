@@ -126,11 +126,11 @@ export interface GlobalGjcClientOptions {
 	readonly onLiveOutageExceeded?: (detail: string) => void;
 	/** Broker-unavailable refusals are counted by the gateway SLO journal. */
 	readonly onUnavailable?: (at: number) => void;
-	/**
-	 * Emitted when broker startup keeps failing with the same reason across K consecutive
-	 * observations over a bounded window. Carries the reason and blocking path.
-	 */
-	readonly onStartupWedgeAlert?: (detail: { reason: string; blockingPath?: string }) => void;
+}
+/** One broker startup wedge: K distinct startup-exit records sharing a reason (#800). */
+export interface BrokerStartupWedge {
+	readonly reason: string;
+	readonly blockingPath?: string;
 }
 export type GlobalGjcClientDependencies = Omit<GlobalGjcClientOptions, "cwd">;
 
@@ -469,6 +469,7 @@ export class GlobalGjcClient {
 	#churnAlerted = false;
 	/** Tracks consecutive broker startup failures with the same reason. */
 	#startupFailureTracker = new BrokerStartupFailureTracker();
+	#onStartupWedge: ((wedge: BrokerStartupWedge) => void) | undefined;
 
 	constructor(options: GlobalGjcClientOptions) {
 		this.#options = options;
@@ -541,12 +542,9 @@ export class GlobalGjcClient {
 		return () => this.#listeners.delete(listener);
 	}
 
-	/**
-	 * Sets or updates the onStartupWedgeAlert callback.
-	 * Used to wire the callback after the runtime is created.
-	 */
-	setOnStartupWedgeAlert(callback: (detail: { reason: string; blockingPath?: string }) => void): void {
-		(this.#options as Partial<GlobalGjcClientOptions>).onStartupWedgeAlert = callback;
+	/** The runtime installs the owner alert after the client exists, like onGeneration. */
+	setOnStartupWedgeAlert(listener: (wedge: BrokerStartupWedge) => void): void {
+		this.#onStartupWedge = listener;
 	}
 	async preflight(): Promise<void> {
 		const result = await preflightGjcRuntime(
@@ -856,7 +854,7 @@ export class GlobalGjcClient {
 							const recordCount = this.#startupFailureTracker.recentRecordCount();
 							const logLine = `broker_startup_wedge reason=${validatedRecord.reason}${validatedRecord.blockingLockPath ? ` blockingLockPath=${validatedRecord.blockingLockPath}` : ""} records=${recordCount}`;
 							this.#log(logLine);
-							this.#options.onStartupWedgeAlert?.({
+							this.#onStartupWedge?.({
 								reason: validatedRecord.reason,
 								blockingPath: validatedRecord.blockingLockPath,
 							});
