@@ -813,14 +813,17 @@ export class MonitorPropagator {
 									return undefined;
 								return current;
 							});
-							if (failedRow) {
-								this.#emitStage(failedRow, "failed_no_retry");
+						if (failedRow) {
+							this.#emitStage(failedRow, "failed_no_retry");
+							// Skip escalation tracking when monitor is missing (issue #780, Codex P2 #1)
+							if (this.#registry.get(failedRow.monitor_id)) {
 								this.#trackTerminalFailure(failedRow);
 							}
-							continue;
-						}
-						const expectedRaw = disposition.kind === "terminal" ? disposition.raw : undefined;
-						const failedRow = this.#database.transaction((tx) => {
+					}
+					continue;
+				}
+				const expectedRaw = disposition.kind === "terminal" ? disposition.raw : undefined;
+				const failedRow = this.#database.transaction((tx) => {
 							const current = this.#database.monitors.eventGet(row.event_id);
 							if (
 								!current ||
@@ -2037,10 +2040,17 @@ export class MonitorPropagator {
 					this.#deliver?.(payload);
 				} else if (noDeliveryRecorded && !readinessFailure) this.#recordReadinessSuccess(sessionOriginKey);
 				// Issue #4: contract_unmet outcomes on success path must also feed failure-streak check
+				// After a successful dispatch (even mixed with contract_unmet), clear escalation marker
+				// as the successful outcome creates a recovery boundary (issue #780, Codex P2 #3)
+				if (validDeliveryEntries.length > 0) {
+					// Success creates a recovery boundary, so clear the escalation marker
+					this.#clearConsecutiveFailedEventCount(sessionOriginKey, monitor.monitorId);
+				}
 				if (hasContractUnmetFailure) {
+					// Track contract failures for potential escalation
 					this.#trackConsecutiveFailedEvent(sessionOriginKey, monitor.monitorId);
-				} else {
-					// Dispatch succeeded with no failures: clear the failed event streak (issue #780)
+				} else if (validDeliveryEntries.length === 0) {
+					// Dispatch succeeded with no failures and no contract_unmet: clear the failed event streak (issue #780)
 					this.#clearConsecutiveFailedEventCount(sessionOriginKey, monitor.monitorId);
 				}
 			} catch (error) {
