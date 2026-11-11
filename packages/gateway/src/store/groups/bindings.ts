@@ -404,6 +404,13 @@ export class BindingsGroup {
 			.all() as Array<{ origin_key: string; gjc_session_id: string; last_activity_at: string | null }>;
 	}
 
+	/** Get all active session origin keys. */
+	listOriginKeys(): readonly string[] {
+		return (this.#db.prepare("SELECT origin_key FROM sessions ORDER BY origin_key").all() as Array<{ origin_key: string }> || []).map(
+			(row) => row.origin_key,
+		);
+	}
+
 	workLaneRepoBySessionId(sessionId: string): string | undefined {
 		const authority = this.brokerAuthority();
 		if (!authority) return undefined;

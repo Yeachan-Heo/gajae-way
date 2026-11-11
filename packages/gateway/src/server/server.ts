@@ -368,6 +368,22 @@ async function applyConfigReload(
 	runtime.personaSessions.setStallTimeoutMs(result.config.stallTimeoutMs);
 	runtime.personaSessions.setHostLimits(result.config.sessions);
 	options.broker?.setMaxPoolSize(result.config.sessions?.maxLiveHosts ?? DEFAULT_SESSIONS_MAX_LIVE_HOSTS);
+
+	// If the default model changed, rebind sessions without per-conversation overrides
+	if (result.changed.includes("model") && result.config.model) {
+		const originKeys = options.database.bindings.listOriginKeys();
+		for (const originKey of originKeys) {
+			// Only rebind if this origin doesn't have a per-conversation override
+			if (!options.database.bindings.modelGet(originKey)) {
+				runtime.personaSessions.rebindModel(originKey, result.config.model).catch((error) => {
+					console.error(
+						`failed to rebind model for origin ${originKey} during config reload: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				});
+			}
+		}
+	}
+
 	console.info(
 		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
 	);
