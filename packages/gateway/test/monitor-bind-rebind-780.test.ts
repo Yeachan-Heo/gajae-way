@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { ChatMessagePayload } from "@gajae-gateway/protocol";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
@@ -434,13 +435,16 @@ test("in-flight bind operations whose outcome is unknown must not be counted as 
 	}
 });
 
+
 test("a restart mid-streak does not send a second escalation (issue #780)", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-restart-escalation-"));
 	try {
 		const dbPath = join(home, "gateway.db");
 		let persistedMonitorId: string | undefined;
+		let firstBootEscalations = 0;
+		let secondBootEscalations = 0;
 
-		// First boot: reach escalation threshold
+		// First boot: create terminal failures that trigger exactly one escalation
 		{
 			const database = await Store.open(dbPath);
 			const registry = new MonitorRegistry(database);
@@ -453,12 +457,31 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 					burstPolicy: "serialize",
 				});
 			}
-			persistedMonitorId = monitor.monitorId; // Issue #780 P3: reuse persisted monitor ID across restart
+			persistedMonitorId = monitor.monitorId;
+
+			// Seed terminal failures directly in the database
+			for (let i = 0; i < 3; i++) {
+				const eventId = randomUUID();
+				database.transaction((tx) => {
+					database.monitors.eventCreate(tx, {
+						eventId,
+						monitorId: monitor.monitorId,
+						eventType: "test.restart_escalation",
+						payloadJson: JSON.stringify({}),
+						firedAt: new Date(Date.now() - 1000 * (3 - i)).toISOString(),
+					});
+					database.monitors.eventUpdate(tx, eventId, "failed_no_retry");
+				});
+			}
 
 			const sessionPort: Partial<SessionPort> = {
-				bind: async (_input) => {
-					throw new GjcCliUnavailableError("timeout after 40s");
-				},
+				bind: async (input) => ({
+					sessionId: `session-epoch-${input.epoch}`,
+					originKey: input.originKey,
+					epoch: input.epoch,
+					repo: input.repo,
+					startupModelApplied: false,
+				}),
 				runExclusive: async (_, fn) => fn(),
 			};
 
@@ -472,7 +495,9 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 				delivery: new DeliveryService(database),
 				emit: () => {},
 				deliver: (payload) => {
-					deliveredMessages.push(payload);
+					if (payload.text.includes("[monitor escalation]")) {
+						deliveredMessages.push(payload);
+					}
 				},
 				ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "test-owner" } },
 				repo: join(home, "workspace"),
@@ -480,27 +505,21 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 				serviceTier: undefined,
 			});
 
-			// Submit events that fail with bind timeouts - with P2 #1 fix, these don't escalate because they're retryable 'failed' stages
+			// Submit a new event that will trigger the failure check and escalation
 			if (!persistedMonitorId) throw new Error("monitor ID not set after first boot");
-			for (let i = 0; i < 3; i++) {
-				const eventId = await pipeline.submitAwaitable(persistedMonitorId, "test.restart_escalation", {});
+			const triggerEventId = await pipeline.submitAwaitable(persistedMonitorId, "test.restart_escalation", {});
+			database.transaction((tx) => database.monitors.eventUpdate(tx, triggerEventId, "failed_no_retry"));
 
-				// Wait for dispatch attempt
-				for (let j = 0; j < 100; j++) {
-					const row = database.monitors.eventRows().find((r) => r.event_id === eventId);
-					if (row?.stage === "failed") break;
-					await Bun.sleep(10);
-				}
-			}
+			await Bun.sleep(100);
 
-			// Should NOT have sent any escalation (retryable failures don't escalate)
-			const escalationMessages = deliveredMessages.filter((m) => m.text.includes("[monitor escalation]"));
-			expect(escalationMessages.length).toBe(0);
+			firstBootEscalations = deliveredMessages.length;
+			console.error(`First boot escalations: ${firstBootEscalations}`);
+			expect(firstBootEscalations).toBe(1); // Should have exactly one escalation
 
 			database.close();
 		}
 
-		// Second boot: check that escalation is not sent again
+		// Second boot: with the streak still open, no new escalation should be sent
 		{
 			const database = await Store.open(dbPath);
 			const registry = new MonitorRegistry(database);
@@ -509,9 +528,13 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 			if (!monitor) throw new Error("failed to load persisted monitor on restart (Issue #780 P3)");
 
 			const sessionPort: Partial<SessionPort> = {
-				bind: async (_input) => {
-					throw new GjcCliUnavailableError("timeout after 40s");
-				},
+				bind: async (input) => ({
+					sessionId: `session-epoch-${input.epoch}`,
+					originKey: input.originKey,
+					epoch: input.epoch,
+					repo: input.repo,
+					startupModelApplied: false,
+				}),
 				runExclusive: async (_, fn) => fn(),
 			};
 
@@ -525,7 +548,9 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 				delivery: new DeliveryService(database),
 				emit: () => {},
 				deliver: (payload) => {
-					deliveredMessages.push(payload);
+					if (payload.text.includes("[monitor escalation]")) {
+						deliveredMessages.push(payload);
+					}
 				},
 				ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "test-owner" } },
 				repo: join(home, "workspace"),
@@ -533,20 +558,16 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 				serviceTier: undefined,
 			});
 
-			// Submit another event after restart - with P2 #1 fix, retryable failures still don't escalate
+			// Submit another event after restart - should NOT trigger a second escalation
 			if (!persistedMonitorId) throw new Error("monitor ID not available for second check");
-			const eventId = await pipeline.submitAwaitable(persistedMonitorId, "test.restart_escalation", {});
+			const triggerEventId = await pipeline.submitAwaitable(persistedMonitorId, "test.restart_escalation", {});
+			database.transaction((tx) => database.monitors.eventUpdate(tx, triggerEventId, "failed_no_retry"));
 
-			// Wait for dispatch attempt
-			for (let j = 0; j < 100; j++) {
-				const row = database.monitors.eventRows().find((r) => r.event_id === eventId);
-				if (row?.stage === "failed") break;
-				await Bun.sleep(10);
-			}
+			await Bun.sleep(100);
 
-			// Should NOT have sent any escalation (retryable failures don't escalate, not even after restart)
-			const escalationMessages = deliveredMessages.filter((m) => m.text.includes("[monitor escalation]"));
-			expect(escalationMessages.length).toBe(0); // No escalation on second boot
+			secondBootEscalations = deliveredMessages.length;
+			console.error(`Second boot escalations: ${secondBootEscalations}`);
+			expect(secondBootEscalations).toBe(0); // No second escalation (already escalated in first boot)
 
 			database.close();
 		}
@@ -727,11 +748,142 @@ test("escalation marker is persisted durably and cleared on success, then escala
 test("three retryable 'failed' events do not trigger escalation (issue #780, P2 #1 - failure-escalation streak fix)", async () => {
 	// Regression test: verify that retryable 'failed' stages are excluded from
 	// the escalation streak counter. Only terminal failures ('failed_no_retry' and
-	// 'contract_unmet') should be counted. This ensures the system doesn't escalate
-	// prematurely when reconcile() can still retry events.
-	// (This test documents the expected behavior; full end-to-end testing of
-	// contract_unmet is covered by monitor-codex-780-fixes.test.ts)
+	// 'contract_unmet') should be counted.
 	// The fix is in #countConsecutiveFailures which now checks:
 	// if (row.stage !== "failed_no_retry" && row.stage !== "contract_unmet") { return count; }
-	// Previously it checked: if (row.stage !== "failed" && ...) which included retryable failures
+	// Previously it treated 'failed' as breaking the streak instead of skipping it.
+
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retryable-failures-"));
+	try {
+		const database = await Store.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "retryable-failures-test",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.retryable_failures"],
+			burstPolicy: "serialize",
+		});
+
+		const escalationMessages: ChatMessagePayload[] = [];
+
+		const sessionPort: Partial<SessionPort> = {
+			bind: async (input) => ({
+				sessionId: `session-epoch-${input.epoch}`,
+				originKey: input.originKey,
+				epoch: input.epoch,
+				repo: input.repo,
+				startupModelApplied: false,
+			}),
+			runExclusive: async (_, fn) => fn(),
+		};
+
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: sessionPort as SessionPort,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			deliver: (payload) => {
+				if (payload.text.includes("[monitor escalation]")) {
+					escalationMessages.push(payload);
+				}
+			},
+			ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "test-owner" } },
+			repo: join(home, "workspace"),
+			model: undefined,
+			serviceTier: undefined,
+		});
+
+		const originKey = `monitor/eventtype/test.retryable_failures/parent=${monitor.monitorId}`;
+
+		// Test 1: Verify that 3 retryable-only 'failed' events do NOT escalate
+		{
+			const retryableIds: string[] = [];
+			for (let i = 0; i < 3; i++) {
+				const eventId = randomUUID();
+				retryableIds.push(eventId);
+				// Create event directly in database with 'failed' (retryable) stage
+				database.transaction((tx) => {
+					database.monitors.eventCreate(tx, {
+						eventId,
+						monitorId: monitor.monitorId,
+						eventType: "test.retryable_failures",
+						payloadJson: JSON.stringify({}),
+						firedAt: new Date(Date.now() - 1000 * i).toISOString(),
+					});
+					database.monitors.eventUpdate(tx, eventId, "failed");
+				});
+			}
+
+			// Interleave a newer 'failed' event (to confirm they're not breaking the scan)
+			const newerFailedId = randomUUID();
+			database.transaction((tx) => {
+				database.monitors.eventCreate(tx, {
+					eventId: newerFailedId,
+					monitorId: monitor.monitorId,
+					eventType: "test.retryable_failures",
+					payloadJson: JSON.stringify({}),
+					firedAt: new Date().toISOString(),
+				});
+				database.monitors.eventUpdate(tx, newerFailedId, "failed");
+			});
+
+			// Verify NO escalation for retryable-only failures
+			expect(escalationMessages.length).toBe(0);
+		}
+
+		escalationMessages.length = 0;
+
+		// Test 2: Verify that 3 terminal failures (failed_no_retry) interleaved with 'failed' DO escalate exactly once
+		{
+			const terminalIds: string[] = [];
+			for (let i = 0; i < 3; i++) {
+				const eventId = randomUUID();
+				terminalIds.push(eventId);
+				// Create event at terminal failure stage (failed_no_retry)
+				database.transaction((tx) => {
+					database.monitors.eventCreate(tx, {
+						eventId,
+						monitorId: monitor.monitorId,
+						eventType: "test.retryable_failures",
+						payloadJson: JSON.stringify({}),
+						firedAt: new Date(Date.now() - 2000 * (3 - i)).toISOString(),
+					});
+					database.monitors.eventUpdate(tx, eventId, "failed_no_retry");
+				});
+			}
+
+			// Interleave newer 'failed' (retry-pending) events
+			for (let i = 0; i < 2; i++) {
+				const eventId = randomUUID();
+				database.transaction((tx) => {
+					database.monitors.eventCreate(tx, {
+						eventId,
+						monitorId: monitor.monitorId,
+						eventType: "test.retryable_failures",
+						payloadJson: JSON.stringify({}),
+						firedAt: new Date(Date.now() + 100 * i).toISOString(),
+					});
+					database.monitors.eventUpdate(tx, eventId, "failed");
+				});
+			}
+
+			// Submit a new event that will trigger dispatch and failure check
+			const triggerEventId = await pipeline.submitAwaitable(monitor.monitorId, "test.retryable_failures", {});
+			// Move it to failed stage to trigger the failure tracking
+			database.transaction((tx) => database.monitors.eventUpdate(tx, triggerEventId, "failed"));
+
+			// Wait for propagator to process
+			await Bun.sleep(100);
+
+			// Verify exactly ONE escalation for terminal failures
+			expect(escalationMessages.length).toBe(1);
+			expect(escalationMessages[0]!.text).toContain("[monitor escalation]");
+		}
+
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
 });

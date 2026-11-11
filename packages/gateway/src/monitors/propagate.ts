@@ -2374,14 +2374,21 @@ export class MonitorPropagator {
 			for (const row of page) {
 				// Issue #3: only count failures for this specific session origin
 				if (originKey(monitorOriginForEvent(monitor, row.event_type)) !== sessionOriginKey) continue;
-				// Issue #5: in-flight events do not break the streak
-				if (row.stage === "admitted" || row.stage === "batched" || row.stage === "dispatched") continue;
+				// Issue #5: in-flight and retry-pending events are undecided: they neither count nor break
+				// the streak. An origin failing every hour always has its newest event still awaiting a
+				// retry backoff, so treating `failed` as a streak break would mean it never escalates (#780).
+				if (
+					row.stage === "admitted" ||
+					row.stage === "batched" ||
+					row.stage === "dispatched" ||
+					row.stage === "failed"
+				)
+					continue;
 				// Codex P2 #1: overlap-skipped events are scheduling outcomes, not failures
 				if (row.stage === "skipped") continue;
 				// Codex P2 #1: only count terminal failures (failed_no_retry and contract_unmet)
-				// Retryable 'failed' stages do not escalate; reconcile() will redispatch them (packages/gateway/src/store/groups/monitors.ts:75-105)
 				if (row.stage !== "failed_no_retry" && row.stage !== "contract_unmet") {
-					// Any non-terminal event ends the streak
+					// A successful terminal event ends the streak
 					return count;
 				}
 				count++;
