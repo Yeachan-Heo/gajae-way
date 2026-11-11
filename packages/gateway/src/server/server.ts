@@ -1051,41 +1051,6 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				deliveryId,
 			);
 			if (payload) broadcastDelivery(runtime, payload);
-
-			// Check for broker startup wedge and emit operator alert if threshold reached
-			if (options.broker && reason === "broker_wedged") {
-				const alerted = options.broker.checkStartupWedgeAlert(false);
-				if (alerted) {
-					const record = options.broker.readBrokerExitRecordSync();
-					const blockingPath = typeof record === "object" && record !== null
-						? (record as Record<string, unknown>).blockingLockPath
-						: undefined;
-					const exitReason = typeof record === "object" && record !== null
-						? (record as Record<string, unknown>).reason
-						: "unknown";
-					console.error(`broker_startup_wedge_detected reason=${exitReason} blockingPath=${blockingPath ?? "unknown"}`);
-
-					const ownerOrigin = runtime.config.ownerTarget?.origin;
-					if (ownerOrigin) {
-						const ownerContext = runtime.inbound.get(trigger.message_id) || { turnId: crypto.randomUUID() };
-						const ownerDeliveryId = `broker-startup-wedge:${crypto.randomUUID()}`;
-						const alertText = `[operator alert] broker startup wedged: reason=${exitReason}${
-							blockingPath ? ` blockingPath=${blockingPath}` : ""
-						}`;
-						const ownerPayload = runtime.delivery.prepare(
-							ownerContext.turnId,
-							ownerOrigin,
-							alertText,
-							undefined,
-							ownerDeliveryId,
-						);
-						if (ownerPayload) broadcastDelivery(runtime, ownerPayload);
-					}
-				}
-			} else if (options.broker && reason === "broker_discovery_absent") {
-				// Reset startup failure tracking when broker is discovered again
-				options.broker.checkStartupWedgeAlert(true);
-			}
 		},
 		onTurnStart: async (input) => await createInboundTurnLifecycle(input, options, runtime),
 		// A steer whose acceptance was learnt after its turn's lifecycle is gone
@@ -1237,6 +1202,27 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	});
 	const originSilent = new OriginSilentAlerter(options.database, () => runtime.config.ownerTarget?.origin);
 	const reconcileTimer = setInterval(() => {
+		// Check for pending broker startup wedge alerts
+		if (broker) {
+			const alerts = broker.dequeuePendingStartupAlerts();
+			for (const alert of alerts) {
+				const ownerOrigin = runtime.config.ownerTarget?.origin;
+				if (ownerOrigin) {
+					const ownerDeliveryId = `broker-startup-wedge:${crypto.randomUUID()}`;
+					const alertText = `[operator alert] broker startup wedged: reason=${alert.reason}${
+						alert.blockingPath ? ` blockingPath=${alert.blockingPath}` : ""
+					}`;
+					const ownerPayload = runtime.delivery.prepare(
+						crypto.randomUUID(),
+						ownerOrigin,
+						alertText,
+						undefined,
+						ownerDeliveryId,
+					);
+					if (ownerPayload) broadcastDelivery(runtime, ownerPayload);
+				}
+			}
+		}
 		alertSilentOrigins(runtime, originSilent);
 		void monitors.reconcile();
 		void personaSessions

@@ -1,91 +1,160 @@
 import { describe, expect, test } from "bun:test";
-import { BrokerStartupFailureTracker, brokerStartupFailureReason } from "../src/orchestrator/broker-liveness";
+import { BrokerStartupFailureTracker } from "../src/orchestrator/broker-liveness";
 
 describe("BrokerStartupFailureTracker", () => {
-	test("startup-lock-unavailable reason is detected", () => {
-		const record = { reason: "startup-lock-unavailable", path: "/some/path" };
-		expect(brokerStartupFailureReason(record)).toBe("startup-lock-unavailable");
-	});
-
-	test("other reasons are not detected as startup failures", () => {
-		expect(brokerStartupFailureReason({ reason: "ordinary-shutdown" })).toBeUndefined();
-		expect(brokerStartupFailureReason({ reason: "heartbeat-renewal-blocked" })).toBeUndefined();
-		expect(brokerStartupFailureReason({})).toBeUndefined();
-		expect(brokerStartupFailureReason(null)).toBeUndefined();
-	});
-
-	test("transient single failure does not trigger alert", () => {
+	test("K distinct records with the same reason trigger exactly one alert", () => {
 		const tracker = new BrokerStartupFailureTracker({ threshold: 3 });
-		expect(tracker.recordFailure("startup-lock-unavailable")).toBe(false);
-		expect(tracker.recordFailure("startup-lock-unavailable")).toBe(false);
-		const state = tracker.state();
-		expect(state.failureCount).toBe(2);
-		expect(state.latestReason).toBe("startup-lock-unavailable");
-	});
+		const now = Date.now();
 
-	test("K consecutive startup-lock-unavailable records trigger exactly one alert", () => {
-		const tracker = new BrokerStartupFailureTracker({ threshold: 3 });
-		// First two failures: no alert
-		expect(tracker.recordFailure("startup-lock-unavailable")).toBe(false);
-		expect(tracker.recordFailure("startup-lock-unavailable")).toBe(false);
-		// Third failure: alert
-		expect(tracker.recordFailure("startup-lock-unavailable")).toBe(true);
-		// Fourth failure: no alert (rate-limited)
-		expect(tracker.recordFailure("startup-lock-unavailable")).toBe(false);
+		// Create 3 distinct records with the same reason
+		const record1 = { pid: 1001, writtenAt: now, reason: "startup-lock-blocked", version: 1, mode: "startup" };
+		const record2 = { pid: 1002, writtenAt: now + 100, reason: "startup-lock-blocked", version: 1, mode: "startup" };
+		const record3 = { pid: 1003, writtenAt: now + 200, reason: "startup-lock-blocked", version: 1, mode: "startup" };
+
+		// First two: no alert
+		expect(tracker.recordFailure(record1, now)).toBe(false);
+		expect(tracker.recordFailure(record2, now)).toBe(false);
+
+		// Third distinct record: alert
+		expect(tracker.recordFailure(record3, now)).toBe(true);
+
+		// Fourth distinct record: no alert (rate-limited to same reason)
+		const record4 = { pid: 1004, writtenAt: now + 300, reason: "startup-lock-blocked", version: 1, mode: "startup" };
+		expect(tracker.recordFailure(record4, now)).toBe(false);
 
 		const state = tracker.state();
 		expect(state.failureCount).toBe(4);
-		expect(state.lastAlertedReason).toBe("startup-lock-unavailable");
-	});
-
-	test("different reason resets alert rate-limiting", () => {
-		const tracker = new BrokerStartupFailureTracker({ threshold: 3 });
-		// Three startup-lock-unavailable failures -> alert
-		expect(tracker.recordFailure("startup-lock-unavailable")).toBe(false);
-		expect(tracker.recordFailure("startup-lock-unavailable")).toBe(false);
-		expect(tracker.recordFailure("startup-lock-unavailable")).toBe(true);
-		// Switch to different reason and record three of them -> alert
-		expect(tracker.recordFailure("startup-lock-blocked")).toBe(false);
-		expect(tracker.recordFailure("startup-lock-blocked")).toBe(false);
-		expect(tracker.recordFailure("startup-lock-blocked")).toBe(true);
-
-		const state = tracker.state();
 		expect(state.lastAlertedReason).toBe("startup-lock-blocked");
 	});
 
-	test("reset clears failure tracking and re-arms alert", () => {
+	test("the same record re-read many times gives no alert", () => {
 		const tracker = new BrokerStartupFailureTracker({ threshold: 3 });
-		// Three failures -> alert
-		expect(tracker.recordFailure("startup-lock-unavailable")).toBe(false);
-		expect(tracker.recordFailure("startup-lock-unavailable")).toBe(false);
-		expect(tracker.recordFailure("startup-lock-unavailable")).toBe(true);
+		const now = Date.now();
 
-		// Reset on successful broker start
+		// Create one record
+		const record = { pid: 1001, writtenAt: now, reason: "startup-lock-blocked", version: 1, mode: "startup" };
+
+		// Try to record the same record many times
+		expect(tracker.recordFailure(record, now)).toBe(false);
+		expect(tracker.recordFailure(record, now)).toBe(false);
+		expect(tracker.recordFailure(record, now)).toBe(false);
+		expect(tracker.recordFailure(record, now)).toBe(false);
+		expect(tracker.recordFailure(record, now)).toBe(false);
+
+		// Should still be 1 distinct record, no alert
+		const state = tracker.state();
+		expect(state.failureCount).toBe(1);
+		expect(state.lastAlertedReason).toBeUndefined();
+	});
+
+	test("a confirmed live broker re-arms the alert", () => {
+		const tracker = new BrokerStartupFailureTracker({ threshold: 3 });
+		const now = Date.now();
+
+		// Record 3 distinct records to trigger alert
+		const record1 = { pid: 1001, writtenAt: now, reason: "startup-lock-blocked", version: 1, mode: "startup" };
+		const record2 = { pid: 1002, writtenAt: now + 100, reason: "startup-lock-blocked", version: 1, mode: "startup" };
+		const record3 = { pid: 1003, writtenAt: now + 200, reason: "startup-lock-blocked", version: 1, mode: "startup" };
+
+		expect(tracker.recordFailure(record1, now)).toBe(false);
+		expect(tracker.recordFailure(record2, now)).toBe(false);
+		expect(tracker.recordFailure(record3, now)).toBe(true); // Alert
+
+		let state = tracker.state();
+		expect(state.failureCount).toBe(3);
+		expect(state.lastAlertedReason).toBe("startup-lock-blocked");
+
+		// Reset on broker liveness confirmation
 		tracker.reset();
 
-		const state = tracker.state();
+		state = tracker.state();
 		expect(state.failureCount).toBe(0);
 		expect(state.lastAlertedReason).toBeUndefined();
 
-		// New failures should alert again after threshold
-		expect(tracker.recordFailure("startup-lock-unavailable")).toBe(false);
-		expect(tracker.recordFailure("startup-lock-unavailable")).toBe(false);
-		expect(tracker.recordFailure("startup-lock-unavailable")).toBe(true);
+		// New distinct records should alert again after threshold
+		const record4 = { pid: 2001, writtenAt: now + 1000, reason: "startup-lock-blocked", version: 1, mode: "startup" };
+		const record5 = { pid: 2002, writtenAt: now + 1100, reason: "startup-lock-blocked", version: 1, mode: "startup" };
+		const record6 = { pid: 2003, writtenAt: now + 1200, reason: "startup-lock-blocked", version: 1, mode: "startup" };
+
+		expect(tracker.recordFailure(record4, now + 1000)).toBe(false);
+		expect(tracker.recordFailure(record5, now + 1000)).toBe(false);
+		expect(tracker.recordFailure(record6, now + 1000)).toBe(true); // Alert again
 	});
 
-	test("bounded window removes old failures", () => {
+	test("distinct records identified by pid/writtenAt pair", () => {
+		const tracker = new BrokerStartupFailureTracker({ threshold: 2 });
+		const now = Date.now();
+
+		// Create records with same pid but different writtenAt
+		const record1 = { pid: 1001, writtenAt: now, reason: "startup-lock-blocked", version: 1, mode: "startup" };
+		const record2 = { pid: 1001, writtenAt: now + 100, reason: "startup-lock-blocked", version: 1, mode: "startup" };
+
+		// Both are distinct (different writtenAt), so second one should trigger alert
+		expect(tracker.recordFailure(record1, now)).toBe(false);
+		expect(tracker.recordFailure(record2, now)).toBe(true);
+
+		const state = tracker.state();
+		expect(state.failureCount).toBe(2);
+	});
+
+	test("different reasons don't interfere with alert rate-limiting", () => {
+		const tracker = new BrokerStartupFailureTracker({ threshold: 2 });
+		const now = Date.now();
+
+		// Record 2 of reason A to trigger alert
+		const recordA1 = { pid: 1001, writtenAt: now, reason: "startup-lock-blocked", version: 1, mode: "startup" };
+		const recordA2 = { pid: 1002, writtenAt: now + 100, reason: "startup-lock-blocked", version: 1, mode: "startup" };
+
+		expect(tracker.recordFailure(recordA1, now)).toBe(false);
+		expect(tracker.recordFailure(recordA2, now)).toBe(true); // Alert for reason A
+
+		// Record 2 of reason B
+		const recordB1 = { pid: 2001, writtenAt: now + 200, reason: "startup-deadline", version: 1, mode: "startup" };
+		const recordB2 = { pid: 2002, writtenAt: now + 300, reason: "startup-deadline", version: 1, mode: "startup" };
+
+		expect(tracker.recordFailure(recordB1, now)).toBe(false);
+		// Should trigger alert for reason B (different from A)
+		expect(tracker.recordFailure(recordB2, now)).toBe(true);
+
+		const state = tracker.state();
+		expect(state.failureCount).toBe(4);
+		expect(state.lastAlertedReason).toBe("startup-deadline");
+	});
+
+	test("bounded window removes old records", () => {
 		const tracker = new BrokerStartupFailureTracker({ windowMs: 1000, threshold: 3 });
 		const now = Date.now();
 
-		// Add first failure
-		expect(tracker.recordFailure("startup-lock-unavailable", now)).toBe(false);
+		// Add first record
+		const record1 = { pid: 1001, writtenAt: now, reason: "startup-lock-blocked", version: 1, mode: "startup" };
+		expect(tracker.recordFailure(record1, now)).toBe(false);
 
 		// Simulate time passing beyond window
 		const laterNow = now + 2000;
-		expect(tracker.recordFailure("startup-lock-unavailable", laterNow)).toBe(false);
+
+		// Add second record well after the window
+		const record2 = { pid: 1002, writtenAt: laterNow, reason: "startup-lock-blocked", version: 1, mode: "startup" };
+		expect(tracker.recordFailure(record2, laterNow)).toBe(false);
+
+		// State should show only 1 record (old one was cleaned up)
+		const state = tracker.state();
+		expect(state.failureCount).toBe(1);
+		expect(state.latestReason).toBe("startup-lock-blocked");
+	});
+
+	test("invalid records are ignored", () => {
+		const tracker = new BrokerStartupFailureTracker({ threshold: 3 });
+		const now = Date.now();
+
+		// Try to record various invalid records
+		expect(tracker.recordFailure(null, now)).toBe(false);
+		expect(tracker.recordFailure(undefined, now)).toBe(false);
+		expect(tracker.recordFailure({}, now)).toBe(false);
+		expect(tracker.recordFailure({ pid: 1001 }, now)).toBe(false); // Missing writtenAt and reason
+		expect(tracker.recordFailure({ writtenAt: now }, now)).toBe(false); // Missing pid and reason
+		expect(tracker.recordFailure({ pid: 1001, writtenAt: now }, now)).toBe(false); // Missing reason
 
 		const state = tracker.state();
-		// Old failure should be outside the window, so only 1 failure counted
-		expect(state.failureCount).toBe(1);
+		expect(state.failureCount).toBe(0);
 	});
 });

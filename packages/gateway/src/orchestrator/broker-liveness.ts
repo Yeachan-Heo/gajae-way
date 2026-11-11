@@ -172,6 +172,16 @@ export function readBrokerExitRecordSync(agentDir: string): unknown {
 	return undefined;
 }
 
+/** Synchronous reader for startup-exit records only. */
+export function readBrokerStartupExitRecordSync(agentDir: string): unknown {
+	const path = join(agentDir, "sdk", "broker.startup-exit.json");
+	try {
+		return parseBrokerExitRecord(readFileSync(path, "utf8"));
+	} catch {
+		return undefined;
+	}
+}
+
 /** Formats broker exit information for display in hold notices. */
 function describeBrokerExit(record: BrokerExitRecord | undefined): string | undefined {
 	if (!record) return undefined;
@@ -207,64 +217,71 @@ export function brokerStartupFailureReason(record: unknown): string | undefined 
 	if (!reason) return undefined;
 	const reasonLower = reason.toLowerCase();
 	// Detect startup failure reasons (not normal shutdown, etc.)
-	if (
-		reasonLower.includes("startup") &&
-		(reasonLower.includes("lock") || reasonLower.includes("unavailable"))
-	) {
+	if (reasonLower.includes("startup") && (reasonLower.includes("lock") || reasonLower.includes("unavailable"))) {
 		return reason;
 	}
 	return undefined;
 }
 
-/** Tracks consecutive broker startup failures with the same reason over a bounded window. */
+/**
+ * Tracks distinct broker startup-exit records over a bounded window.
+ * Identifies uniqueness by pid/writtenAt pair, so re-reading the same record doesn't count as a new failure.
+ */
 export class BrokerStartupFailureTracker {
 	readonly #windowMs: number;
 	readonly #threshold: number;
-	#failures: Array<{ readonly at: number; readonly reason: string }> = [];
+	#records: Array<{ readonly pid: number; readonly writtenAt: number; readonly reason: string; readonly at: number }> =
+		[];
 	#lastAlertReason: string | undefined;
-	#lastAlertedAt: number = 0;
 
 	constructor(options: { windowMs?: number; threshold?: number } = {}) {
 		this.#windowMs = options.windowMs ?? 30 * 60_000; // 30 minutes
 		this.#threshold = options.threshold ?? 3;
 	}
 
-	/** Records a broker startup failure and returns true if threshold is reached. */
-	recordFailure(reason: string, now = Date.now()): boolean {
+	/**
+	 * Records a distinct broker startup-exit record and returns true if threshold is reached.
+	 * Identity is by pid/writtenAt pair; duplicate records are ignored.
+	 */
+	recordFailure(record: unknown, now = Date.now()): boolean {
+		if (typeof record !== "object" || record === null || Array.isArray(record)) return false;
+		const candidate = record as Record<string, unknown>;
+
+		// Extract record identity
+		const pid = typeof candidate.pid === "number" ? candidate.pid : undefined;
+		const writtenAt = typeof candidate.writtenAt === "number" ? candidate.writtenAt : undefined;
+		const reason = typeof candidate.reason === "string" ? candidate.reason : undefined;
+
+		if (!pid || !writtenAt || !reason) return false;
+
+		// Check if this record already exists (same pid/writtenAt)
+		const recordId = `${pid}:${writtenAt}`;
+		const exists = this.#records.some((r) => `${r.pid}:${r.writtenAt}` === recordId);
+		if (exists) return false;
+
+		// Clean up records outside window
 		const floor = now - this.#windowMs;
-		const live = this.#failures.findIndex((f) => f.at > floor);
-		this.#failures.splice(0, live < 0 ? this.#failures.length : live);
+		const live = this.#records.findIndex((r) => r.at > floor);
+		this.#records.splice(0, live < 0 ? this.#records.length : live);
 
-		this.#failures.push({ at: now, reason });
+		// Add new distinct record
+		this.#records.push({ pid, writtenAt, reason, at: now });
 
-		// Count consecutive failures with the same reason
-		let sameReasonCount = 0;
-		let lastReason = "";
-		for (let i = this.#failures.length - 1; i >= 0; i--) {
-			const failure = this.#failures[i];
-			if (i === this.#failures.length - 1) {
-				lastReason = failure.reason;
-			}
-			if (failure.reason === lastReason) {
-				sameReasonCount++;
-			} else {
-				break;
-			}
-		}
+		// Count records with the same reason
+		const sameReasonCount = this.#records.filter((r) => r.reason === reason).length;
 
 		// Check if threshold is reached and alert is not rate-limited
 		const thresholdReached = sameReasonCount >= this.#threshold;
 		const shouldAlert = thresholdReached && reason !== this.#lastAlertReason;
 		if (shouldAlert) {
 			this.#lastAlertReason = reason;
-			this.#lastAlertedAt = now;
 		}
-		return thresholdReached && shouldAlert;
+		return shouldAlert;
 	}
 
 	/** Resets the alert when broker startup succeeds. */
 	reset(): void {
-		this.#failures = [];
+		this.#records = [];
 		this.#lastAlertReason = undefined;
 	}
 
@@ -275,8 +292,8 @@ export class BrokerStartupFailureTracker {
 		lastAlertedReason: string | undefined;
 	} {
 		return {
-			failureCount: this.#failures.length,
-			latestReason: this.#failures[this.#failures.length - 1]?.reason,
+			failureCount: this.#records.length,
+			latestReason: this.#records[this.#records.length - 1]?.reason,
 			lastAlertedReason: this.#lastAlertReason,
 		};
 	}
