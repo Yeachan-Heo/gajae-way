@@ -2377,12 +2377,7 @@ export class MonitorPropagator {
 				// Issue #5: in-flight and retry-pending events are undecided: they neither count nor break
 				// the streak. An origin failing every hour always has its newest event still awaiting a
 				// retry backoff, so treating `failed` as a streak break would mean it never escalates (#780).
-				if (
-					row.stage === "admitted" ||
-					row.stage === "batched" ||
-					row.stage === "dispatched" ||
-					row.stage === "failed"
-				)
+				if (row.stage === "admitted" || row.stage === "batched" || row.stage === "dispatched" || row.stage === "failed")
 					continue;
 				// Codex P2 #1: overlap-skipped events are scheduling outcomes, not failures
 				if (row.stage === "skipped") continue;
