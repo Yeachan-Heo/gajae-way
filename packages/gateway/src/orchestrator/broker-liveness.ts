@@ -199,6 +199,89 @@ export function isBrokerIndexLockBlocked(record: unknown): boolean {
 	);
 }
 
+/** Extracts the startup failure reason from an exit record, or undefined if not a startup failure. */
+export function brokerStartupFailureReason(record: unknown): string | undefined {
+	if (typeof record !== "object" || record === null || Array.isArray(record)) return undefined;
+	const candidate = record as BrokerExitRecord;
+	const reason = typeof candidate.reason === "string" ? candidate.reason : undefined;
+	if (!reason) return undefined;
+	const reasonLower = reason.toLowerCase();
+	// Detect startup failure reasons (not normal shutdown, etc.)
+	if (
+		reasonLower.includes("startup") &&
+		(reasonLower.includes("lock") || reasonLower.includes("unavailable"))
+	) {
+		return reason;
+	}
+	return undefined;
+}
+
+/** Tracks consecutive broker startup failures with the same reason over a bounded window. */
+export class BrokerStartupFailureTracker {
+	readonly #windowMs: number;
+	readonly #threshold: number;
+	#failures: Array<{ readonly at: number; readonly reason: string }> = [];
+	#lastAlertReason: string | undefined;
+	#lastAlertedAt: number = 0;
+
+	constructor(options: { windowMs?: number; threshold?: number } = {}) {
+		this.#windowMs = options.windowMs ?? 30 * 60_000; // 30 minutes
+		this.#threshold = options.threshold ?? 3;
+	}
+
+	/** Records a broker startup failure and returns true if threshold is reached. */
+	recordFailure(reason: string, now = Date.now()): boolean {
+		const floor = now - this.#windowMs;
+		const live = this.#failures.findIndex((f) => f.at > floor);
+		this.#failures.splice(0, live < 0 ? this.#failures.length : live);
+
+		this.#failures.push({ at: now, reason });
+
+		// Count consecutive failures with the same reason
+		let sameReasonCount = 0;
+		let lastReason = "";
+		for (let i = this.#failures.length - 1; i >= 0; i--) {
+			const failure = this.#failures[i];
+			if (i === this.#failures.length - 1) {
+				lastReason = failure.reason;
+			}
+			if (failure.reason === lastReason) {
+				sameReasonCount++;
+			} else {
+				break;
+			}
+		}
+
+		// Check if threshold is reached and alert is not rate-limited
+		const thresholdReached = sameReasonCount >= this.#threshold;
+		const shouldAlert = thresholdReached && reason !== this.#lastAlertReason;
+		if (shouldAlert) {
+			this.#lastAlertReason = reason;
+			this.#lastAlertedAt = now;
+		}
+		return thresholdReached && shouldAlert;
+	}
+
+	/** Resets the alert when broker startup succeeds. */
+	reset(): void {
+		this.#failures = [];
+		this.#lastAlertReason = undefined;
+	}
+
+	/** Returns the current tracking state for diagnostics. */
+	state(): {
+		failureCount: number;
+		latestReason: string | undefined;
+		lastAlertedReason: string | undefined;
+	} {
+		return {
+			failureCount: this.#failures.length,
+			latestReason: this.#failures[this.#failures.length - 1]?.reason,
+			lastAlertedReason: this.#lastAlertReason,
+		};
+	}
+}
+
 /** Builds the single-line operator/user-facing notice for a pending bind hold. */
 export async function describeBindHold(
 	verdict: BrokerLivenessVerdict | undefined,

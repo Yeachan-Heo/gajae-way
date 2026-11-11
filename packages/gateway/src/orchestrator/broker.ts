@@ -4,9 +4,12 @@ import type { CliResult, CliRunner } from "@gajae-gateway/subsession";
 import {
 	type BrokerDiscovery,
 	type BrokerLivenessVerdict,
+	BrokerStartupFailureTracker,
+	brokerStartupFailureReason,
 	judgeBrokerLiveness,
 	type PidAliveProbe,
 	readBrokerDiscovery,
+	readBrokerExitRecordSync,
 } from "./broker-liveness";
 import { isVerifiedGjcVersion, MIN_GJC_VERSION, VERIFIED_GJC_THROUGH } from "./gjc-contract";
 import { extractRuntimeError, sanitizeDiagnostic } from "./rebind";
@@ -15,10 +18,13 @@ export {
 	BROKER_HEARTBEAT_TTL_MS,
 	type BrokerDiscovery,
 	type BrokerLivenessVerdict,
+	BrokerStartupFailureTracker,
+	brokerStartupFailureReason,
 	describeBindHold,
 	judgeBrokerLiveness,
 	type PidAliveProbe,
 	readBrokerDiscovery,
+	readBrokerExitRecordSync,
 } from "./broker-liveness";
 export const GJC_ATTACH_ONLY_ENV = "GJC_SDK_BROKER_AUTOSTART";
 
@@ -120,6 +126,11 @@ export interface GlobalGjcClientOptions {
 	readonly onLiveOutageExceeded?: (detail: string) => void;
 	/** Broker-unavailable refusals are counted by the gateway SLO journal. */
 	readonly onUnavailable?: (at: number) => void;
+	/**
+	 * Emitted when broker startup keeps failing with the same reason across K consecutive
+	 * observations over a bounded window. Carries the reason and blocking path.
+	 */
+	readonly onStartupWedgeAlert?: (detail: { reason: string; blockingPath?: string }) => void;
 }
 export type GlobalGjcClientDependencies = Omit<GlobalGjcClientOptions, "cwd">;
 
@@ -456,6 +467,8 @@ export class GlobalGjcClient {
 	/** Observation times of incarnation changes after the first; bounded by the churn window. */
 	#respawns: number[] = [];
 	#churnAlerted = false;
+	/** Tracks consecutive broker startup failures with the same reason. */
+	#startupFailureTracker = new BrokerStartupFailureTracker();
 
 	constructor(options: GlobalGjcClientOptions) {
 		this.#options = options;
@@ -521,6 +534,38 @@ export class GlobalGjcClient {
 	/** Judges the daemon from its own discovery file, bypassing SDK transport. */
 	judgeLiveness(): Promise<BrokerLivenessVerdict> {
 		return judgeBrokerLiveness(this.discoveryPath, this.#options.isPidAlive ?? defaultPidAlive);
+	}
+	/**
+	 * Checks broker startup failure record and emits alert if threshold is reached.
+	 * Returns true if alert was emitted (and is rate-limited), false if no alert needed.
+	 * Call with isSuccessful=true when broker starts successfully to reset alert state.
+	 */
+	checkStartupWedgeAlert(isSuccessful: boolean): boolean {
+		if (isSuccessful) {
+			this.#startupFailureTracker.reset();
+			return false;
+		}
+
+		const record = readBrokerExitRecordSync(this.agentDir);
+		const reason = brokerStartupFailureReason(record);
+		if (!reason) return false;
+
+		const shouldAlert = this.#startupFailureTracker.recordFailure(reason);
+		if (shouldAlert) {
+			const blockingPath = typeof record === "object" && record !== null
+				? (record as Record<string, unknown>).blockingLockPath
+				: undefined;
+			this.#options.onStartupWedgeAlert?.({
+				reason,
+				blockingPath: typeof blockingPath === "string" ? blockingPath : undefined,
+			});
+		}
+		return shouldAlert;
+	}
+
+	/** Synchronously reads the broker exit record (for alert generation). */
+	readBrokerExitRecordSync(): unknown {
+		return readBrokerExitRecordSync(this.agentDir);
 	}
 	onGeneration(listener: BrokerGenerationListener): () => void {
 		this.#listeners.add(listener);
