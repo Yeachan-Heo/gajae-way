@@ -634,6 +634,44 @@ test("failed send after proven startup model remains uncertain without retry or 
 	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
 });
 
+test("#790 transport_unavailable during send with unknown status marks attempt as send_undelivered (terminal)", async () => {
+	const f = await fixture();
+	f.port.send = async (input) => {
+		f.port.sendAttempts.push(input);
+		const error = new Error("Connection timeout") as Error & { details?: { code?: string } };
+		error.details = { code: "transport_unavailable" };
+		throw error;
+	};
+	// Override status to return "unknown" for the operation
+	f.port.status = async (input) => {
+		return {
+			operationRef: input.opRef,
+			status: {
+				status: "unknown" as const,
+			},
+			summaryCompleted: false,
+		};
+	};
+	await expect(
+		f.manager.start({ name: "a", text: "work", cwd: f.directory }),
+	).rejects.toMatchObject({ detail: { reasonCode: "send_undelivered" } });
+	const sessionId = f.job().attempts[0]?.sessionId;
+	const opRef = f.job().attempts[0]!.opRef;
+	const runtime = f.db.work.workAttemptGet(opRef)!;
+	expect(runtime.sendPhase).toBe("uncertain");
+	expect(runtime.terminal).toMatchObject({ reasonCode: "send_undelivered" });
+	// Wait for observer to close the attempt in the job record
+	await until(() => f.job().attempts[0]?.endedAt !== undefined);
+	const attempt = f.job().attempts[0]!;
+	expect(attempt.endedAt).toBeDefined();
+	expect(attempt.endState).toBe("attempt_ended");
+	// Mark the session as dead to prove the operation was never delivered
+	f.port.setSessionState(sessionId, { live: false });
+	// Lane should now be retirable (session is dead and operation is unknown)
+	const retireResult = await f.lanes.retire("a", "operator");
+	expect(retireResult.retired).toBe(true);
+});
+
 test("start acknowledges before terminal, one observer survives caller-free completion and refreshes activity", async () => {
 	const f = await fixture();
 	let attaches = 0;
