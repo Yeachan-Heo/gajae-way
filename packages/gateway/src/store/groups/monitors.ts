@@ -37,6 +37,8 @@ export interface MonitorFailureRow {
 	readonly protocol_reason: ProtocolFailureReason | null;
 	readonly response_byte_length: number | null;
 	readonly response_entry_count: number | null;
+	readonly session_id: string | null;
+	readonly op_ref: string | null;
 }
 
 export interface RecentMonitorFailureRow {
@@ -220,11 +222,12 @@ export class MonitorsGroup {
 			modelJson: string | null;
 			serviceTier: string | null;
 			procedureFilesJson?: string | null;
+			contextRollTokens?: number | null;
 		},
 	): void {
 		this.#db
 			.prepare(
-				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json, context_roll_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 			)
 			.run(
 				tx,
@@ -241,6 +244,7 @@ export class MonitorsGroup {
 				row.modelJson,
 				row.serviceTier,
 				row.procedureFilesJson ?? null,
+				row.contextRollTokens ?? null,
 			);
 	}
 
@@ -258,10 +262,11 @@ export class MonitorsGroup {
 		model_json: string | null;
 		service_tier: string | null;
 		procedure_files_json: string | null;
+		context_roll_tokens: number | null;
 	}> {
 		return this.#db
 			.prepare(
-				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json FROM monitors ORDER BY created_at",
+				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json, context_roll_tokens FROM monitors ORDER BY created_at",
 			)
 			.all() as Array<{
 			monitor_id: string;
@@ -277,6 +282,7 @@ export class MonitorsGroup {
 			model_json: string | null;
 			service_tier: string | null;
 			procedure_files_json: string | null;
+			context_roll_tokens: number | null;
 		}>;
 	}
 
@@ -302,12 +308,13 @@ export class MonitorsGroup {
 			modelJson: string | null;
 			serviceTier: string | null;
 			procedureFilesJson: string | null;
+			contextRollTokens: number | null;
 		},
 	): boolean {
 		return (
 			this.#db
 				.prepare(
-					"UPDATE monitors SET name = ?, trigger_json = ?, event_types_json = ?, burst_policy = ?, channel_target_json = ?, enabled = ?, instruction = ?, model_json = ?, service_tier = ?, procedure_files_json = ? WHERE monitor_id = ?",
+					"UPDATE monitors SET name = ?, trigger_json = ?, event_types_json = ?, burst_policy = ?, channel_target_json = ?, enabled = ?, instruction = ?, model_json = ?, service_tier = ?, procedure_files_json = ?, context_roll_tokens = ? WHERE monitor_id = ?",
 				)
 				.run(
 					tx,
@@ -321,6 +328,7 @@ export class MonitorsGroup {
 					row.modelJson,
 					row.serviceTier,
 					row.procedureFilesJson,
+					row.contextRollTokens,
 					row.id,
 				).changes > 0
 		);
@@ -517,7 +525,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		detail: string,
 		now = Date.now(),
 		terminal = false,
-		options?: MonitorFailureOptions,
+		options?: MonitorFailureOptions & { sessionId?: string; opRef?: string },
 	): boolean {
 		this.#core.assertNotQuarantined("monitor", eventId);
 		const changes = this.#db
@@ -919,7 +927,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		return (
 			(this.#db
 				.prepare(
-					"SELECT event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 1",
+					"SELECT event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count, session_id, op_ref FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 1",
 				)
 				.get(eventId) as MonitorFailureRow | null) ?? undefined
 		);
@@ -938,7 +946,13 @@ ORDER BY monitor_failures.rowid DESC LIMIT ?`,
 			.all(limit) as RecentMonitorFailureRow[];
 	}
 
-	failureRecord(tx: WriteTx, eventId: string, code: string, detail: string, options?: MonitorFailureOptions): void {
+	failureRecord(
+		tx: WriteTx,
+		eventId: string,
+		code: string,
+		detail: string,
+		options?: MonitorFailureOptions & { sessionId?: string; opRef?: string },
+	): void {
 		const protocolFailure = options?.protocolFailure;
 		if (protocolFailure) {
 			if (!(PROTOCOL_FAILURE_REASONS as readonly string[]).includes(protocolFailure.reason))
@@ -956,7 +970,7 @@ ORDER BY monitor_failures.rowid DESC LIMIT ?`,
 		const failedAt = new Date().toISOString();
 		this.#db
 			.prepare(
-				"INSERT INTO monitor_failures (event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+				"INSERT INTO monitor_failures (event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count, session_id, op_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 			)
 			.run(
 				tx,
@@ -967,6 +981,8 @@ ORDER BY monitor_failures.rowid DESC LIMIT ?`,
 				protocolFailure?.reason ?? null,
 				protocolFailure?.responseByteLength ?? null,
 				protocolFailure?.responseEntryCount ?? null,
+				options?.sessionId ?? null,
+				options?.opRef ?? null,
 			);
 		this.#db
 			.prepare(

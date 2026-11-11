@@ -187,9 +187,16 @@ export interface EngagementContext {
 	readonly replyTo?: ReplyContext;
 }
 
+export interface PromptImage {
+	readonly data: string;
+	readonly mimeType: "image/jpeg";
+}
+
 export interface ChatSendParams {
 	readonly origin: OriginRef;
 	readonly text: string;
+	/** Prepared, bounded JPEG images attached to the prompt. */
+	readonly images?: readonly PromptImage[];
 	/** Stable platform message id for idempotent live/backfill ingestion. */
 	readonly messageId?: string;
 	/** Platform event time, when available; ordering and age policy use this value. */
@@ -566,6 +573,12 @@ export interface MonitorSpec {
 	readonly model?: MonitorModelSelection;
 	/** Absent means inherit the gateway default; present overrides this monitor's request tier. */
 	readonly serviceTier?: MonitorServiceTier;
+	/**
+	 * After an answered authoring turn at or above this session context size in
+	 * tokens, arm a roll. The next fresh dispatch starts a new session epoch
+	 * seeded with the monitor digest. Unset means never roll on context size.
+	 */
+	readonly contextRollTokens?: number;
 	/** Inject each reportable authored result as an internal report into this conversation session. */
 	readonly reportTo?: OriginRef | null;
 	readonly enabled?: boolean;
@@ -579,8 +592,10 @@ export interface MonitorRecord extends MonitorSpec {
 	readonly enabled: boolean;
 }
 
-export interface MonitorUpdateParams extends Partial<Omit<MonitorSpec, "trigger">> {
+export interface MonitorUpdateParams extends Partial<Omit<MonitorSpec, "trigger" | "contextRollTokens">> {
 	readonly monitorId: string;
+	/** Null clears the observed-usage roll threshold on update. */
+	readonly contextRollTokens?: number | null;
 	/** Replace the trigger spec; use schedule to change only a cron schedule. */
 	readonly trigger?: TriggerSpec;
 	/** Change the schedule while retaining the monitor's existing cron trigger. */
@@ -819,9 +834,12 @@ export interface WorkRetireParams {
  * so the next `work.run` for that name creates a fresh session. A lane with an
  * open attempt is never retired from under its turn.
  *
- * When `force` is true, skip attempt-state checks and require broker liveness
- * proving the session dead or disowned; if found dead, close as `host_lost` and
- * rebind the epoch. `allDead` retires all dead lanes at once (implies force).
+ * When `force` is true, skip attempt-state checks and apply one of two paths:
+ * 1. Broker liveness proof the session is dead or disowned: close as `host_lost` and rebind the epoch.
+ * 2. Live session with idle foreground activity, unknown broker op status, no running background jobs,
+ *    and an open attempt: settle the attempt as `operator_abandoned` and close the session. This abandonment
+ *    path may fail if close() errors and the session remains live (binding is preserved).
+ * `allDead` retires all dead lanes at once (implies force with path 1).
  */
 export type WorkRetireResult =
 	| {
@@ -1051,8 +1069,12 @@ export interface SilentOriginView {
 	/** Oldest unanswered platform message on the origin. */
 	readonly oldestMessageId: string;
 	readonly oldestPendingAgeMs: number;
-	/** Unanswered messages older than the threshold. */
+	/** Unanswered platform messages older than the threshold. */
 	readonly unanswered: number;
+	/** Pending lane report backlog (internal diagnostic messages, not user messages). */
+	readonly pendingLaneReports?: number;
+	/** Oldest pending lane report when the backlog exceeds the threshold (#766). */
+	readonly oldestLaneReportAgeMs?: number;
 	/** The nonterminal trigger that owns the origin's current epoch; null when none is bound. */
 	readonly blockingOpRef: string | null;
 	readonly holdReason: OriginHoldReason;

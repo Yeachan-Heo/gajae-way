@@ -1,7 +1,9 @@
+import { Database as SqliteDatabase } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { PromptImage } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import { PersonaSessionManager, renderSteer, steerDirectedAtPersona } from "../src/orchestrator/persona-session";
 import { Store } from "../src/store";
@@ -10,6 +12,7 @@ import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "steering" } as const;
 const ORIGIN_KEY = "loopback/loopback/steering";
+const PROMPT_IMAGES = [{ data: "aGVsbG8=", mimeType: "image/jpeg" }] as const satisfies readonly PromptImage[];
 
 let home = "";
 let database: Store | undefined;
@@ -30,7 +33,12 @@ class SteeringTranscriptPort extends ScriptedSessionPort {
 	}
 }
 
-function enqueue(messageId: string, body: string, engagement?: Record<string, unknown>): void {
+function enqueue(
+	messageId: string,
+	body: string,
+	engagement?: Record<string, unknown>,
+	imagesJson?: string | null,
+): void {
 	expect(
 		database?.transaction((tx) =>
 			database?.inbox.enqueue(tx, {
@@ -40,6 +48,7 @@ function enqueue(messageId: string, body: string, engagement?: Record<string, un
 				body,
 				receivedAt: new Date().toISOString(),
 				...(engagement ? { engagementJson: JSON.stringify(engagement) } : {}),
+				...(imagesJson === undefined ? {} : { imagesJson }),
 			}),
 		),
 	).toBe(true);
@@ -96,6 +105,7 @@ test("a mid-turn message issues one steer, keeps one send, and is attributed in 
 	);
 
 	expect(port.sends).toHaveLength(1);
+	expect(port.sends[0]).not.toHaveProperty("images");
 	expect(port.steers).toEqual([
 		expect.objectContaining({
 			sessionId: running.sessionId,
@@ -127,6 +137,148 @@ test("a mid-turn message issues one steer, keeps one send, and is attributed in 
 			database?.inbox.turnRows(batch.opRef).every((row) => row.state === "done" && row.turn_state === "done") === true,
 		"running batch did not complete after its tail terminal event",
 	);
+});
+
+test("an image-bearing message stays pending while busy and is sent with its images as the next turn", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-steer-image-pending-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const port = attachTestBrokerOwnership(
+		database,
+		new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` }),
+		join(home, "agent"),
+	);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "steering-image-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			...(trigger.images_json === null ? {} : { images: JSON.parse(trigger.images_json) as readonly PromptImage[] }),
+		}),
+	});
+
+	enqueue("trigger", "first request");
+	await manager.notifyInbound(ORIGIN_KEY);
+	await eventually(() => port.sends.length === 1, "initial turn did not start");
+	const running = port.sends[0]!;
+
+	enqueue("photo-request", "describe this image", undefined, JSON.stringify(PROMPT_IMAGES));
+	await manager.notifyInbound(ORIGIN_KEY);
+
+	expect(port.steers).toHaveLength(0);
+	expect(database.inbox.pendingOldest(ORIGIN_KEY)).toMatchObject({
+		message_id: "photo-request",
+		state: "pending",
+		turn_role: null,
+		turn_state: null,
+		turn_op_ref: null,
+		images_json: JSON.stringify(PROMPT_IMAGES),
+	});
+
+	port.complete(running.opRef, "first answer");
+	await eventually(() => port.sends.length === 2, "pending image message did not start as the next turn");
+	const next = port.sends[1]!;
+	expect(next).toMatchObject({
+		sessionId: running.sessionId,
+		text: "describe this image",
+		images: PROMPT_IMAGES,
+	});
+	expect(port.steers).toHaveLength(0);
+	port.complete(next.opRef, "image description");
+	await eventually(
+		() => database?.inbox.turnRow(next.opRef)?.turn_state === "done",
+		"image-bearing next turn did not settle",
+	);
+});
+
+test("an image-bearing row already in context is not closed as consumed input", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-steer-image-context-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const port = attachTestBrokerOwnership(
+		database,
+		new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` }),
+		join(home, "agent"),
+	);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "steering-image-context-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			...(trigger.images_json === null ? {} : { images: JSON.parse(trigger.images_json) as readonly PromptImage[] }),
+			contextMessageIds: new Set(["photo-in-context"]),
+		}),
+	});
+
+	enqueue("trigger", "first request");
+	await manager.notifyInbound(ORIGIN_KEY);
+	await eventually(() => port.sends.length === 1, "initial turn did not start");
+	const running = port.sends[0]!;
+
+	enqueue("photo-in-context", "describe this image", undefined, JSON.stringify(PROMPT_IMAGES));
+	await manager.notifyInbound(ORIGIN_KEY);
+
+	expect(port.steers).toHaveLength(0);
+	expect(database.inbox.pendingOldest(ORIGIN_KEY)).toMatchObject({
+		message_id: "photo-in-context",
+		state: "pending",
+		turn_role: null,
+		turn_state: null,
+		turn_op_ref: null,
+	});
+	expect(database.inbox.turnRows(running.opRef).map((row) => row.message_id)).toEqual(["trigger"]);
+
+	port.complete(running.opRef, "first answer");
+	await eventually(() => port.sends.length === 2, "image in context was not dispatched as the next turn");
+	const next = port.sends[1]!;
+	expect(next).toMatchObject({ text: "describe this image", images: PROMPT_IMAGES });
+	port.complete(next.opRef, "image description");
+	await eventually(
+		() => database?.inbox.turnRow(next.opRef)?.turn_state === "done",
+		"image-bearing next turn did not settle",
+	);
+});
+
+test("malformed persisted image data stays pending instead of being steered as text", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-steer-image-malformed-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const port = attachTestBrokerOwnership(
+		database,
+		new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` }),
+		join(home, "agent"),
+	);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "steering-image-malformed-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+	});
+
+	enqueue("trigger", "first request");
+	await manager.notifyInbound(ORIGIN_KEY);
+	await eventually(() => port.sends.length === 1, "initial turn did not start");
+
+	enqueue("malformed-photo", "describe this image");
+	const raw = new SqliteDatabase(join(home, "gateway.db"));
+	try {
+		raw.query("UPDATE inbound_messages SET images_json = ? WHERE message_id = ?").run("not-json", "malformed-photo");
+	} finally {
+		raw.close();
+	}
+	await manager.notifyInbound(ORIGIN_KEY);
+
+	expect(port.steers).toHaveLength(0);
+	expect(database.inbox.pendingOldest(ORIGIN_KEY)).toMatchObject({
+		message_id: "malformed-photo",
+		state: "pending",
+		turn_role: null,
+		turn_state: null,
+		turn_op_ref: null,
+		images_json: "not-json",
+	});
 });
 
 test("the steer header asks for the steered message's own reply instead of folding it into the final answer", () => {

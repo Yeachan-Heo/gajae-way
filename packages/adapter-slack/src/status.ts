@@ -17,12 +17,15 @@ const WORKING_STATUS_REFRESH_MS = 45_000;
 
 type Timer = { unref?(): void };
 type Entry = {
+	turnId: string;
 	readonly channel: string;
 	readonly ts: string;
 	/**
-	 * Thread the native status line hangs under. Only set when the turn lives in a
-	 * thread; a root channel/DM message has no thread for the reply to land in, and
-	 * setting a status on it would open an empty thread under the user's message.
+	 * Thread the native status line hangs under. Threaded turns use the thread
+	 * root; a DM uses the triggering message because the DM itself is the only
+	 * thread Slack renders the line in. A root channel message has no thread for
+	 * the reply to land in, and setting a status on it would open an empty thread
+	 * under the user's message.
 	 */
 	readonly threadTs: string | undefined;
 	/** Coalescing state: what the gradient should show, decided by presenceTransition. */
@@ -31,15 +34,20 @@ type Entry = {
 	readonly shown: Set<string>;
 	/** Native status text Slack confirmed; "" means none. Same desired/applied split as `shown`. */
 	shownStatus: string;
+	refreshStatus: boolean;
 	/** True while the gradient is wanted at all; false once cleared (desired = nothing). */
 	wanted: boolean;
 	reconciling: boolean;
 	/** A change arrived while a pass was running; the loop re-diffs before it exits. */
 	pending: boolean;
+	cleanupRetries: number;
+	cleanupTimer?: Timer;
 };
 
 /** Bound on re-diff passes in one reconcile run; retirement cleanup runs regardless. */
 const RECONCILE_MAX_PASSES = 8;
+const CLEANUP_MAX_RETRIES = 3;
+const CLEANUP_RETRY_MS = 5_000;
 const PHASE_TEXT: Record<PresenceSnapshot["phase"], string> = {
 	queued: "\uc694\uccad\uc744 \ubc1b\uc558\uc5b4\uc694\u2026",
 	tool: "\uc791\uc5c5 \uc911\u2026",
@@ -81,19 +89,22 @@ export function presenceStatusText(snapshot: PresenceSnapshot): string {
  * call leaves the marker un-shown so it is retried rather than believed.
  *
  * The same snapshot also drives Slack's native "<app> <status>" line
- * (assistant.threads.setStatus) under the thread the reply will land in - the
- * affordance users know from Slack's AI apps. Only threaded turns get it: a
- * root channel/DM message is answered at the root, and a status keyed to its
- * ts would open an empty thread under it. It works on channel and DM threads
- * with an ordinary bot token (verified live 2026-09-17), needs no Agent
- * registration, and is reconciled exactly like a marker: desired text vs
- * confirmed text. Slack clears it when the reply posts and expires it after
- * two minutes; retiring the entry clears it explicitly for silent turns.
+ * (assistant.threads.setStatus) on the thread the reply will land in - the
+ * affordance users know from Slack's AI apps. Threaded turns anchor it to the
+ * thread root; a DM anchors it to the triggering message, since Slack renders
+ * assistant status on that message. A root channel message gets none: its
+ * reply posts at the root, and a status keyed to its ts would open an empty
+ * thread under it. It works with an ordinary bot token (verified live
+ * 2026-09-17), needs no Agent registration, and is reconciled exactly like a
+ * marker: desired text vs confirmed text. Slack clears it when the reply posts
+ * and expires it after two minutes; retiring the entry clears it explicitly
+ * for silent turns.
  */
 export class WorkingStatus {
 	readonly #entries = new Map<string, Entry>();
 	readonly #refreshTimers = new Map<string, Timer>();
 	readonly #staleTimers = new Map<string, Timer>();
+	readonly #statusCalls = new Map<string, Promise<void>>();
 
 	constructor(
 		readonly api: Pick<SlackWebApi, "addReaction" | "removeReaction" | "setThreadStatus">,
@@ -108,7 +119,7 @@ export class WorkingStatus {
 	 * marker goes on immediately: it is the room's only sign the message was
 	 * seen until the first progress tick. Best-effort, never awaited by callers.
 	 */
-	arm(origin: OriginRef, messageId: string): void {
+	arm(origin: OriginRef, messageId: string, turnId: string): void {
 		if (origin.platform !== "slack") return;
 		const target = parseSlackMessageId(messageId);
 		if (!target) return;
@@ -118,33 +129,47 @@ export class WorkingStatus {
 			// Same message re-armed (an accepted edit): keep the ownership record
 			// - the markers already on the message are still ours - and just
 			// restart the gradient from queued.
+			if (prior.cleanupTimer) this.clearTimer(prior.cleanupTimer);
+			prior.cleanupTimer = undefined;
+			prior.cleanupRetries = 0;
+			prior.turnId = turnId;
 			prior.wanted = true;
 			prior.state = presenceInitial(this.now());
-			this.#armStale(key);
+			this.#armStale(key, prior);
 			this.#armRefresh(key, prior);
 			void this.#reconcile(key, prior);
 			return;
 		}
 		// A different message in the same conversation takes over; the old
 		// gradient is retired through its own reconcile (desired = nothing).
-		if (prior) this.#retire(key, prior);
-		// Inside a thread the status hangs under that thread. A root channel/DM
-		// message gets no status line: its reply posts at the root, so a status
-		// keyed to the message's ts would open a thread nothing ever lands in.
-		const threadTs = origin.kind === "thread" ? parseSlackMessageId(origin.conversationId)?.ts : undefined;
+		// A thread turn hangs its status under that thread's root. A DM has no
+		// thread of its own, and its reply lands at the DM root, so the triggering
+		// message is the only anchor Slack can show the line on. A root channel
+		// message gets none: its reply posts at the root, and a status keyed to the
+		// message's ts would open a thread nothing ever lands in.
+		const threadTs =
+			origin.kind === "thread"
+				? parseSlackMessageId(origin.conversationId)?.ts
+				: origin.kind === "dm"
+					? target.ts
+					: undefined;
 		const entry: Entry = {
+			turnId,
 			channel: target.channel,
 			ts: target.ts,
 			threadTs,
 			state: presenceInitial(this.now()),
 			shown: new Set(),
 			shownStatus: "",
+			refreshStatus: false,
 			wanted: true,
 			reconciling: false,
 			pending: false,
+			cleanupRetries: 0,
 		};
 		this.#entries.set(key, entry);
-		this.#armStale(key);
+		if (prior?.wanted) void this.#retire(key, prior);
+		this.#armStale(key, entry);
 		this.#armRefresh(key, entry);
 		void this.#reconcile(key, entry);
 	}
@@ -153,9 +178,9 @@ export class WorkingStatus {
 		if (progress.origin.platform !== "slack") return;
 		const key = progress.origin.conversationId;
 		const entry = this.#entries.get(key);
-		if (!entry?.wanted) return;
+		if (!entry?.wanted || entry.turnId !== progress.turnId) return;
 		// Reset both stale and refresh timers on each signal: the turn is still alive.
-		this.#armStale(key);
+		this.#armStale(key, entry);
 		this.#armRefresh(key, entry);
 		const swap = presenceTransition(entry.state, progress, this.now());
 		if (!swap) return;
@@ -163,16 +188,15 @@ export class WorkingStatus {
 		await this.#reconcile(key, entry);
 	}
 
-	async clear(conversationId: string): Promise<void> {
+	async clear(conversationId: string, turnId: string): Promise<void> {
+		const entry = this.#entries.get(conversationId);
+		if (!entry || entry.turnId !== turnId) return;
 		const refreshTimer = this.#refreshTimers.get(conversationId);
 		if (refreshTimer) this.clearTimer(refreshTimer);
 		this.#refreshTimers.delete(conversationId);
 		const staleTimer = this.#staleTimers.get(conversationId);
 		if (staleTimer) this.clearTimer(staleTimer);
 		this.#staleTimers.delete(conversationId);
-		const entry = this.#entries.get(conversationId);
-		if (!entry) return;
-		this.#entries.delete(conversationId);
 		await this.#retire(conversationId, entry);
 	}
 
@@ -181,9 +205,9 @@ export class WorkingStatus {
 	 * line on every reply, but the turn is still running. Forget the confirmed
 	 * line and reconcile so it is set again; reactions are untouched.
 	 */
-	async reassert(conversationId: string): Promise<void> {
+	async reassert(conversationId: string, turnId: string): Promise<void> {
 		const entry = this.#entries.get(conversationId);
-		if (!entry?.wanted) return;
+		if (!entry?.wanted || entry.turnId !== turnId) return;
 		entry.shownStatus = "";
 		await this.#reconcile(conversationId, entry);
 	}
@@ -194,13 +218,13 @@ export class WorkingStatus {
 		await this.#reconcile(key, entry);
 	}
 
-	#armStale(key: string): void {
+	#armStale(key: string, entry: Entry): void {
 		const prior = this.#staleTimers.get(key);
 		if (prior) this.clearTimer(prior);
 		const timer = this.setTimer(async () => {
 			// No gateway signal arrived within the stale window: turn likely crashed or missed
 			// its terminal signal. Clear to prevent the status from staying alive forever.
-			if (this.#entries.has(key)) void this.clear(key);
+			if (this.#entries.get(key) === entry && this.#staleTimers.get(key) === timer) void this.clear(key, entry.turnId);
 		}, WORKING_STATUS_STALE_MS);
 		timer.unref?.();
 		this.#staleTimers.set(key, timer);
@@ -212,27 +236,57 @@ export class WorkingStatus {
 		const timer = this.setTimer(async () => {
 			// Periodically refresh the status line to keep it alive (Slack expires after ~2min).
 			// The entry may have been cleared by an explicit clear() call in the meantime.
-			if (!this.#entries.has(key)) return;
+			if (this.#entries.get(key) !== entry || this.#refreshTimers.get(key) !== timer) return;
 			if (!entry.wanted) return;
-			// Force refresh of the status line by clearing the confirmed state, even if
-			// the desired text hasn't changed. Slack's expiry timer resets on every setStatus call.
-			if (entry.shownStatus) entry.shownStatus = "";
+			// Preserve the last confirmed text if a refresh fails; it still needs cleanup.
+			entry.refreshStatus = true;
 			// Re-reconcile to refresh the status line without changing the desired state.
 			await this.#reconcile(key, entry);
 			// Re-arm the refresh timer for the next cycle.
-			if (this.#entries.has(key)) this.#armRefresh(key, entry);
+			if (this.#entries.get(key) === entry && this.#refreshTimers.get(key) === timer && entry.wanted)
+				this.#armRefresh(key, entry);
 		}, WORKING_STATUS_REFRESH_MS);
 		timer.unref?.();
 		this.#refreshTimers.set(key, timer);
+	}
+
+	/** Serialize writes to the shared native line, including retired entries. */
+	async #setStatus(key: string, entry: Entry, desiredStatus: string): Promise<boolean> {
+		let applied = false;
+		const turnId = entry.turnId;
+		const wanted = entry.wanted;
+		const call = (this.#statusCalls.get(key) ?? Promise.resolve())
+			.catch(() => {})
+			.then(async () => {
+				const current = this.#entries.get(key);
+				if (entry.turnId !== turnId || entry.wanted !== wanted) return;
+				if (entry.wanted ? current !== entry : current && current !== entry && current.threadTs === entry.threadTs)
+					return;
+				await this.api.setThreadStatus(entry.channel, entry.threadTs as string, desiredStatus);
+				applied = true;
+			});
+		this.#statusCalls.set(key, call);
+		try {
+			await call;
+			return applied;
+		} finally {
+			if (this.#statusCalls.get(key) === call) this.#statusCalls.delete(key);
+		}
+	}
+
+	#sameMessageOwner(key: string, entry: Entry): Entry | undefined {
+		const current = this.#entries.get(key);
+		return current && current !== entry && current.channel === entry.channel && current.ts === entry.ts
+			? current
+			: undefined;
 	}
 
 	/**
 	 * Drives `shown` towards the desired set. One loop per entry; a call that
 	 * finds the loop running marks a continuation and returns, and the running
 	 * loop re-diffs after each pass (and once more for any continuation) until
-	 * nothing is left to do. Retirement (`wanted=false`) is always driven to
-	 * completion: removals are attempted even after an add failed, and an entry
-	 * retired while a pass was in flight is cleaned by that same loop.
+	 * nothing is left to do. Retirement (`wanted=false`) attempts removals even
+	 * after an add failed; failed cleanup is retried separately on a bounded timer.
 	 */
 	async #reconcile(key: string, entry: Entry): Promise<void> {
 		if (entry.reconciling) {
@@ -240,9 +294,16 @@ export class WorkingStatus {
 			return;
 		}
 		entry.reconciling = true;
+		let failedStatus: string | undefined;
 		try {
 			for (let pass = 0; pass < RECONCILE_MAX_PASSES; pass++) {
 				entry.pending = false;
+				const owner = this.#sameMessageOwner(key, entry);
+				if (owner && entry.shown.size > 0) {
+					for (const name of entry.shown) owner.shown.add(name);
+					entry.shown.clear();
+					void this.#reconcile(key, owner);
+				}
 				const desired = new Set(entry.wanted ? presenceMarkersFor(entry.state.snapshot).map((m) => m.slackName) : []);
 				const remove = [...entry.shown].filter((name) => !desired.has(name));
 				const add = [...desired].filter((name) => !entry.shown.has(name));
@@ -251,30 +312,50 @@ export class WorkingStatus {
 				// The line goes first: it is the one signal a reader actually sees as
 				// "the app is working", and it costs one request per change. A refusal
 				// leaves it un-shown for the next pass; the reactions still carry presence.
-				if (entry.threadTs !== undefined && entry.shownStatus !== desiredStatus) {
+				const current = this.#entries.get(key);
+				if (
+					entry.threadTs !== undefined &&
+					(entry.shownStatus !== desiredStatus || (entry.wanted && entry.refreshStatus)) &&
+					failedStatus !== desiredStatus &&
+					(entry.wanted || !current || current === entry || current.threadTs !== entry.threadTs)
+				) {
 					try {
-						await this.api.setThreadStatus(entry.channel, entry.threadTs, desiredStatus);
-						entry.shownStatus = desiredStatus;
+						if (await this.#setStatus(key, entry, desiredStatus)) {
+							entry.shownStatus = desiredStatus;
+							entry.refreshStatus = false;
+						}
 					} catch (error) {
 						this.log.error(`Slack status line failed for ${key}: ${errorText(error)}`);
-						// Do not retry the line inside this reconcile; treat it as applied so
-						// a hard refusal (e.g. unsupported channel type) cannot spin the loop.
-						entry.shownStatus = desiredStatus;
+						failedStatus = desiredStatus;
 					}
 				}
 				if (remove.length === 0 && add.length === 0) {
 					if (!entry.pending) return;
 					continue;
 				}
+				let removeFailed = false;
 				for (const name of remove) {
+					const owner = this.#sameMessageOwner(key, entry);
+					if (owner) {
+						owner.shown.add(name);
+						entry.shown.delete(name);
+						void this.#reconcile(key, owner);
+						continue;
+					}
 					try {
 						await this.api.removeReaction(entry.channel, entry.ts, name);
+						entry.shown.delete(name);
+						const owner = this.#sameMessageOwner(key, entry);
+						if (owner) {
+							owner.shown.delete(name);
+							void this.#reconcile(key, owner);
+						}
 					} catch (error) {
 						// Not fatal to anything - but a marker we could not remove is still
 						// on the message, and that is worth knowing about.
 						this.log.error(`Slack presence could not remove :${name}: on ${key}: ${errorText(error)}`);
+						removeFailed = true;
 					}
-					entry.shown.delete(name);
 				}
 				let addFailed = false;
 				for (const name of add) {
@@ -282,6 +363,12 @@ export class WorkingStatus {
 					try {
 						await this.api.addReaction(entry.channel, entry.ts, name, "cosmetic");
 						entry.shown.add(name);
+						const owner = this.#sameMessageOwner(key, entry);
+						if (owner) {
+							owner.shown.add(name);
+							entry.shown.delete(name);
+							void this.#reconcile(key, owner);
+						}
 					} catch (error) {
 						this.log.error(`Slack presence could not add :${name}: on ${key}: ${errorText(error)}`);
 						// Leave it un-shown; the next desired-state change retries. Stop
@@ -292,23 +379,34 @@ export class WorkingStatus {
 				}
 				// A failed add ends the pass unless the entry was retired meanwhile, in
 				// which case the loop continues so the removals happen.
-				if (addFailed && entry.wanted && !entry.pending) return;
-			}
-			// Pass budget exhausted with work still pending: never leave a retired
-			// entry's markers behind, whatever else is outstanding.
-			if (!entry.wanted && entry.shown.size > 0) {
-				for (const name of [...entry.shown]) {
-					await this.api
-						.removeReaction(entry.channel, entry.ts, name)
-						.catch((error) =>
-							this.log.error(`Slack presence could not remove :${name}: on ${key}: ${errorText(error)}`),
-						);
-					entry.shown.delete(name);
-				}
+				if ((removeFailed || (addFailed && entry.wanted)) && !entry.pending) return;
 			}
 		} finally {
 			entry.reconciling = false;
+			if (!entry.wanted) this.#scheduleCleanup(key, entry);
 		}
+	}
+
+	#scheduleCleanup(key: string, entry: Entry): void {
+		const current = this.#entries.get(key);
+		const statusOwned = !current || current === entry || current.threadTs !== entry.threadTs;
+		const needsCleanup = entry.shown.size > 0 || (statusOwned && entry.shownStatus !== "");
+		if (!needsCleanup || entry.cleanupRetries >= CLEANUP_MAX_RETRIES) {
+			if (entry.cleanupTimer) this.clearTimer(entry.cleanupTimer);
+			entry.cleanupTimer = undefined;
+			if (current === entry) this.#entries.delete(key);
+			return;
+		}
+		if (entry.cleanupTimer) return;
+		entry.cleanupRetries++;
+		const timer = this.setTimer(() => {
+			if (entry.cleanupTimer !== timer || entry.wanted) return;
+			this.clearTimer(timer);
+			entry.cleanupTimer = undefined;
+			void this.#reconcile(key, entry);
+		}, CLEANUP_RETRY_MS);
+		timer.unref?.();
+		entry.cleanupTimer = timer;
 	}
 }
 

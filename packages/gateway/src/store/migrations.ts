@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 39;
+export const LATEST_SCHEMA_VERSION = 42;
 
 export interface MigrationHost {
 	readonly database: {
@@ -884,6 +884,55 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(39, new Date().toISOString());
+		});
+	}
+	if (current < 40) {
+		host.withTransaction(() => {
+			const columns = new Set(
+				host.database
+					.statement<{ name: string }>("PRAGMA table_info(monitors)")
+					.all()
+					.map((row) => row.name),
+			);
+			if (!columns.has("context_roll_tokens"))
+				host.database.execute("ALTER TABLE monitors ADD COLUMN context_roll_tokens INTEGER");
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(40, new Date().toISOString());
+		});
+	}
+	if (current < 41) {
+		host.withTransaction(() => {
+			const columns = new Set(
+				host.database
+					.statement<{ name: string }>("PRAGMA table_info(monitor_failures)")
+					.all()
+					.map((row) => row.name),
+			);
+			const additions: Array<[string, string]> = [
+				["session_id", "TEXT"],
+				["op_ref", "TEXT"],
+			];
+			for (const [name, declaration] of additions)
+				if (!columns.has(name)) host.database.execute(`ALTER TABLE monitor_failures ADD COLUMN ${name} ${declaration}`);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(41, new Date().toISOString());
+		});
+	}
+	if (current < 42) {
+		host.withTransaction(() => {
+			const columns = new Set(
+				host.database
+					.statement<{ name: string }>("PRAGMA table_info(inbound_messages)")
+					.all()
+					.map((row) => row.name),
+			);
+			if (!columns.has("images_json"))
+				host.database.execute("ALTER TABLE inbound_messages ADD COLUMN images_json TEXT");
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(42, new Date().toISOString());
 		});
 	}
 }

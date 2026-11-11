@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.5.0] - 2026-11-11
+
+### Deps
+- **gateway**: Pin GJC 0.20.0 (#786)
+
+### Fixes
+- **gateway**: Allow forced retire of idle open attempts as operator abandonment (#779)
+- **gateway**: Don't post failure notice when stall cutoff finds properly concluded reply (#769)
+- **gateway**: Keep an accepted authoring turn whose status is unknown (#746)
+- **gateway**: Escalate holds on live-but-unresponsive hosts and surface lane-report backlogs (#767)
+- **gateway**: Escalate terminal_uncertain/ambiguous holds and dedupe alternating reasons (#773)
+- **delivery**: Drop a malformed Discord reply target instead of losing the reply; validate reply targets and handle Discord 50035 errors (#763, #764)
+- **adapter-slack**: Keep the native working status on DM turns (#754)
+
+### Features
+- **gateway**: Opt-in per-monitor session roll on observed context size; retire size-rolled sessions through the broker's journaled `session.close`, preserving transcripts but aborting active work; retirement records survive monitor removal and restart, and are swept on later fresh dispatches and the gateway's 60-second monitor reconcile (#738)
+- **adapters**: Forward static PNG/JPEG attachments from Discord, Slack, and Telegram as durable native model inputs through the `chat.images` capability; persist inbound image rows in schema 42 and keep non-native formats as attachment descriptions (#775)
+- **adapter-slack**: Complete command routing, interactions, and delivery lifecycle; route explicitly bot-addressed session commands through gateway authorization without creating a top-level mention thread; dispatch Socket Mode interactive envelopes, preserve panel origin and underscore-containing option ids (#777)
+- **adapter-telegram**: Send persona Markdown as Telegram HTML, split without breaking tags or entities; syntax the renderer cannot place exactly stays literal text; a retried multi-chunk reply resumes after chunks already accepted and respects Telegram flood-control (#774)
+
 ## [0.4.4] - 2026-11-04
 
 ### Fixes
@@ -28,25 +48,22 @@
 - **gateway**: A held restart drain reports not-ready with its restart id; an inherited drain is held and reported at boot instead of silently fencing dispatch (#713)
 - **gateway**: Escalate an unresolved hold on a retired epoch too, and bound status polling on escalated retired holds (#705, #715)
 - **gateway**: Make `work.start` admission visible and idempotent across a caller timeout (#707)
-- **gateway**: Settle `awaiting_checks` on `work.retire` so retired lanes cannot respawn (#716)
-- **work**: Preserve SDK failure causes independently of receipts (#696)
-- **monitors**: A failed event can no longer wedge an `overlap=skip` monitor; a running authoring turn is never aged out (#702)
-- **adapter-slack**: Recover a closed socket and detect deaf event delivery (#710)
 
 ## [0.4.1] - 2026-10-27
 
 ### Fixes
-- **gateway**: Requeue bound turns that never reached `turn.prompt` under a fresh op-ref; a CLI queue timeout is no longer treated as a broker outage (#675, #685)
-- **gateway**: Bound unresolved recovery holds, fence escalated holds' inputs, and keep their late answers and escalation notices durable (#686)
-- **gateway**: Detect busy-wait stalls and preserve a busy refusal only when the retry provably never reached the host (#687, #689)
-- **gateway**: Alert the owner when an origin goes silent (#688)
-- **gateway**: Keep an AGENTS.md update pending until a turn carrying it succeeds, and size the CLI pool from the effective host cap (#676)
-- **gateway**: The schema 39 migration skips turns quarantined by a broker-authority cutover instead of failing boot
+- **gateway**: Gate `ops cycle` and repair-step `monitor_failed` event isolation and require a submitted-turn repair base (#712)
+- **gateway**: Suppress `broker_unavailable` when the broker is visible but unreachable and surface what caused the failed endpoint fetch (#714)
 
 ## [0.4.0] - 2026-10-26
 
 ### Features
-- **gateway**: Support the GJC 0.19.0 runtime contracts and lifecycle fences; the pinned GJC is now 0.19.0 (#663)
+- **gateway**: Ledger operator directives (`/directive`) with outcomes and durable routing; directives reach monitors (#694, #695)
+- **gateway**: `gajaeway stop` waits for stalled-turn repair and drains turns (#710)
+- **gateway**: Deliver a monitor's *inferred* outcome from a still-valid cached result when GJC cannot be reached (#706)
+
+### Fixes
+- **gateway**: Pin GJC 0.19.0 (#663)
 - **gateway**: Announce stack restarts to active conversations ("restarting", then "back online" or "restart cancelled"), configurable via `restartNotice` (#662)
 - **gateway**: Default daily memory de-bloat cron for Markdown memory files over 100KB (#651)
 - **gateway**: Suggest gjc-listed models in `/model set` autocomplete (#647)

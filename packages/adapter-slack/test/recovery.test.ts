@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SlackApiError, type SlackHistoryPage } from "../src/api";
 import type { SlackInboundMessage } from "../src/main";
-import { slackMessageOrigin } from "../src/origin";
+import { resolveSlackMessageOrigin, slackMessageOrigin } from "../src/origin";
 import {
 	EMPTY_RECOVERY_STATE,
 	loadRecoveryCursors,
@@ -15,6 +15,7 @@ import {
 	type RecoveryHistoryPort,
 	RecoveryScheduler,
 	recoverConversation,
+	recoverThread,
 	recoveryCursorPath,
 	rememberKnownDm,
 	STALE_BACKFILL_MS,
@@ -253,6 +254,87 @@ describe("Slack conversation replay", () => {
 			kind: "thread",
 			conversationId: "C1:1.0",
 		});
+	});
+
+	test("channel recovery carries the root author into every paged reply", async () => {
+		for (const parent of ["BOT", "U2"]) {
+			const port = portFor([message("1.0", { user: parent, reply_count: 2 })]);
+			port.replies = async (_channel, _ts, options) =>
+				options.cursor ? page([message("3.0")]) : page([message("2.0")], "next");
+			const seen: SlackInboundMessage[] = [];
+			await recoverConversation(port, "C1", {
+				...base,
+				deliver: async (msg) => {
+					if (msg.thread_ts) seen.push(msg);
+					return "acked";
+				},
+			});
+			expect(seen.map((msg) => msg.parent_user_id)).toEqual([parent, parent]);
+			expect(seen.map((msg) => resolveSlackMessageOrigin(msg, "BOT", true).kind)).toEqual(
+				parent === "BOT" ? ["channel", "channel"] : ["thread", "thread"],
+			);
+		}
+	});
+
+	test("independent thread recovery fetches an older root author separately from the reply cursor", async () => {
+		for (const parent of ["BOT", "U2"]) {
+			const requests: { oldest: string; cursor?: string; limit: number }[] = [];
+			const port = {
+				replies: async (_channel: string, _ts: string, options: { oldest: string; cursor?: string; limit: number }) => {
+					requests.push(options);
+					if (options.oldest === "0.0") return page([message("1.0", { user: parent })]);
+					return options.cursor ? page([message("4.0")]) : page([message("3.0")], "next");
+				},
+			};
+			const seen: SlackInboundMessage[] = [];
+			const result = await recoverThread(port, "C1", "1.0", {
+				...base,
+				cursor: "2.0",
+				deliver: async (msg) => {
+					seen.push(msg);
+					return "acked";
+				},
+			});
+			expect(requests.map((request) => request.oldest)).toEqual(["0.0", "2.0", "2.0"]);
+			expect(result.advancedTo).toBe("4.0");
+			expect(seen.map((msg) => msg.parent_user_id)).toEqual([parent, parent]);
+			expect(seen.map((msg) => resolveSlackMessageOrigin(msg, "BOT", true).kind)).toEqual(
+				parent === "BOT" ? ["channel", "channel"] : ["thread", "thread"],
+			);
+		}
+	});
+
+	test("channel reply pages supply the author when the history root lacks it", async () => {
+		const port = portFor([{ ts: "1.0", reply_count: 1 }]);
+		port.replies = async (_channel, _ts, options) =>
+			options.cursor ? page([message("1.0", { user: "BOT" })]) : page([message("2.0")], "next");
+		const seen: SlackInboundMessage[] = [];
+		await recoverConversation(port, "C1", {
+			...base,
+			deliver: async (msg) => {
+				seen.push(msg);
+				return "acked";
+			},
+		});
+		expect(seen.find((msg) => msg.ts === "2.0")?.parent_user_id).toBe("BOT");
+	});
+
+	test("independent thread delivery failure holds its cursor before the failed reply", async () => {
+		const port = {
+			replies: async (_channel: string, _ts: string, options: { oldest: string }) =>
+				options.oldest === "0.0" ? page([message("1.0", { user: "BOT" })]) : page([message("3.0"), message("4.0")]),
+		};
+		const seen: string[] = [];
+		const result = await recoverThread(port, "C1", "1.0", {
+			...base,
+			cursor: "2.0",
+			deliver: async (msg) => {
+				seen.push(msg.ts);
+				return msg.ts === "3.0" ? "acked" : "unavailable";
+			},
+		});
+		expect(seen).toEqual(["3.0", "4.0"]);
+		expect(result).toMatchObject({ failed: true, advancedTo: "3.0", discarded: 0 });
 	});
 
 	test("own bot skips, duplicate and skip advance, unavailable stops without crossing", async () => {

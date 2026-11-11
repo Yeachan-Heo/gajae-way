@@ -2,7 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PROFILE_VERSION } from "@gajae-gateway/protocol";
+import { type HelloPayload, negotiate, PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "../src/client";
 
 type Peer = { end(): void; write(data: string): unknown };
@@ -51,6 +51,35 @@ function negotiated(): string {
 		payload: { profileVersion: PROFILE_VERSION, capabilities: [] },
 	})}\n`;
 }
+
+test("required image capability refuses a text-only gateway before any request", async () => {
+	let requests = 0;
+	let requirements: readonly string[] | undefined;
+	await withSocket(
+		(socket, frame) => {
+			if (frame.type === "request") requests++;
+			if (frame.type !== "hello") return;
+			const hello = (frame as unknown as { payload: HelloPayload }).payload;
+			requirements = hello.requiredCapabilities;
+			const result = negotiate(hello, [PROFILE_VERSION], ["chat.loopback"]);
+			if (result.ok) throw new Error("image client must reject text-only gateway");
+			socket.write(
+				`${JSON.stringify({
+					v: PROFILE_VERSION,
+					type: "error",
+					error: { code: result.code, message: result.detail },
+				})}\n`,
+			);
+		},
+		async (path) => {
+			await expect(
+				GajaewayClient.connectSocket(path, { requiredCapabilities: ["chat.images"], requestTimeoutMs: 500 }),
+			).rejects.toThrow("chat.images");
+			expect(requirements).toEqual(["chat.images"]);
+			expect(requests).toBe(0);
+		},
+	);
+});
 
 test("invalid request params do not leak pending work or disconnect the client", async () => {
 	let held: { socket: Peer; id: string } | undefined;

@@ -3,10 +3,14 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { preparePromptImages } from "@gajae-gateway/images";
 import {
+	type Frame,
 	type GatewayReadinessResult,
 	type MemoryOperationStatusResult,
+	OrderedFrameWriter,
 	originKey,
+	type PromptImage,
 	WORK_JOBS_DEFAULT_LIMIT,
 	WORK_JOBS_MAX_LIMIT,
 } from "@gajae-gateway/protocol";
@@ -18,7 +22,7 @@ import { MonitorRegistry } from "../src/monitors/registry";
 import { ModelNotSelectedError } from "../src/orchestrator/session-port";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { Store } from "../src/store";
+import { LATEST_SCHEMA_VERSION, Store } from "../src/store";
 import {
 	attachTestBrokerOwnership,
 	ScriptedSessionPort,
@@ -29,6 +33,15 @@ import {
 let directory = "";
 let server: GatewayServer | undefined;
 const workSessionIds = new Map<string, string>();
+const VALID_PROMPT_PNG = Uint8Array.from(
+	Buffer.from(
+		"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGP4z8DAAMIM/4EAAB/uBfsL2WiLAAAAAElFTkSuQmCC",
+		"base64",
+	),
+);
+const OTHER_PROMPT_PNG = Uint8Array.from(
+	Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR4nGNgQAYAAA4AAamRc7EAAAAASUVORK5CYII=", "base64"),
+);
 afterEach(async () => {
 	await server?.stop();
 	server = undefined;
@@ -48,9 +61,13 @@ async function connect(socketPath: string): Promise<{
 	const wireLines: string[] = [];
 	const frameWaiters = new Map<string, Array<() => void>>();
 	let buffered = Buffer.alloc(0);
+	let writer: OrderedFrameWriter | undefined;
 	const socket = await Bun.connect({
 		unix: socketPath,
 		socket: {
+			drain() {
+				writer?.drain();
+			},
 			data(_socket, data) {
 				buffered = Buffer.concat([buffered, Buffer.from(data)]);
 				let newline = buffered.indexOf(10);
@@ -74,6 +91,7 @@ async function connect(socketPath: string): Promise<{
 			},
 		},
 	});
+	writer = new OrderedFrameWriter({ write: (bytes) => socket.write(bytes), close: () => socket.end() });
 	const waitForFrame = (id: string): Promise<void> => {
 		if (frames.some((frame) => frame.id === id)) return Promise.resolve();
 		return new Promise<void>((resolve) => {
@@ -83,11 +101,11 @@ async function connect(socketPath: string): Promise<{
 		});
 	};
 	return {
-		send: (value) => socket.write(`${JSON.stringify(value)}\n`),
+		send: (value) => writer!.write(value as Frame),
 		frames,
 		wireLines,
 		waitForFrame,
-		close: () => socket.end(),
+		close: () => writer!.close(),
 	};
 }
 
@@ -112,6 +130,36 @@ async function waitFrame(frames: any[], id: string, timeoutMs: number = 15000): 
 		await Bun.sleep(5);
 	}
 	expect(frames.some((frame) => frame.id === id)).toBe(true);
+}
+
+async function makePromptImage(source: Uint8Array = VALID_PROMPT_PNG): Promise<PromptImage> {
+	const { images } = await preparePromptImages([source]);
+	const image = images[0];
+	if (!image) throw new Error("test image preparation returned no prompt image");
+	return image;
+}
+
+function withJpegComment(image: PromptImage, payloadBytes: number): PromptImage {
+	const bytes = Buffer.from(image.data, "base64");
+	const scanOffset = bytes.indexOf(Buffer.from([0xff, 0xda]));
+	if (scanOffset < 0) throw new Error("prepared test JPEG has no scan marker");
+	const comment = Buffer.alloc(payloadBytes + 4, 0x41);
+	comment[0] = 0xff;
+	comment[1] = 0xfe;
+	comment.writeUInt16BE(payloadBytes + 2, 2);
+	return {
+		data: Buffer.concat([bytes.subarray(0, scanOffset), comment, bytes.subarray(scanOffset)]).toString("base64"),
+		mimeType: "image/jpeg",
+	};
+}
+
+async function waitForCompletedSend(database: Store, port: ScriptedSessionPort, index: number): Promise<void> {
+	const state = () => {
+		const send = port.sends[index];
+		return send ? database.inbox.turnRow(send.opRef)?.turn_state : undefined;
+	};
+	for (let attempt = 0; attempt < 400 && state() !== "done"; attempt++) await Bun.sleep(5);
+	expect(state()).toBe("done");
 }
 
 async function startDeliveryServer(
@@ -160,7 +208,7 @@ async function startDeliveryServer(
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
-	return { client, config, database };
+	return { client, config, database, sessionPort };
 }
 
 test("requires negotiation then serves status, shutdown, and validates chat params", async () => {
@@ -198,7 +246,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	expect(client.frames[1].type).toBe("negotiated");
 	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(client.frames, 3);
-	expect(client.frames[2].result.schemaVersion).toBe(39);
+	expect(client.frames[2].result.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
 	expect(client.frames[2].result.readiness).toMatchObject({ ready: true, state: "ready", reason: null, failure: null });
 	expect(client.frames[2].result.contextDiff).toEqual({
@@ -238,6 +286,207 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 		result: { stopping: true },
 	});
 	expect(client.frames.some((frame) => frame.event === "gateway.stopping")).toBe(true);
+	client.close();
+});
+
+test("chat.send validates image inputs before acceptance and rejects images attached to control commands", async () => {
+	const { client, database, sessionPort } = await startDeliveryServer();
+	const image = await makePromptImage();
+	const origin = { platform: "discord", kind: "dm", conversationId: "invalid-images", peerId: "owner" } as const;
+	const engagement = { mentioned: false, group: false, authorId: "owner" };
+	const invalidImages: unknown[] = [
+		null,
+		[{ data: "AB==", mimeType: "image/jpeg" }],
+		[{ data: image.data, mimeType: "image/png" }],
+		[{ data: Buffer.from("not a JPEG").toString("base64"), mimeType: "image/jpeg" }],
+		Array.from({ length: 5 }, () => image),
+		Array.from({ length: 4 }, () => withJpegComment(image, 25_000)),
+		[{ data: "A".repeat(140_000), mimeType: "image/jpeg" }],
+	];
+	for (const [index, images] of invalidImages.entries()) {
+		const id = `invalid-image-${index}`;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "chat.send",
+			params: { origin, text: "inspect this", messageId: id, engagement, images },
+		});
+		await waitFrame(client.frames, id);
+		expect(client.frames.find((frame) => frame.id === id)).toMatchObject({
+			type: "error",
+			error: { code: "invalid_params" },
+		});
+	}
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "image-command",
+		verb: "chat.send",
+		params: { origin, text: "/new", messageId: "image-command", engagement, images: [image] },
+	});
+	await waitFrame(client.frames, "image-command");
+	expect(client.frames.find((frame) => frame.id === "image-command")).toMatchObject({
+		type: "error",
+		error: { code: "invalid_params" },
+	});
+	expect(sessionPort.sends).toHaveLength(0);
+	expect(database.inbox.messageImagesJson("invalid-image-0", originKey(origin))).toBeUndefined();
+	expect(database.bindings.getSessionRecord(originKey(origin))).toBeUndefined();
+	client.close();
+});
+
+test("chat.send persists and rehydrates only trigger images, supports image-only turns, and guards duplicates and edits", async () => {
+	const { client, database, sessionPort } = await startDeliveryServer();
+	const image = await makePromptImage();
+	const otherImage = await makePromptImage(OTHER_PROMPT_PNG);
+	expect(otherImage.data).not.toBe(image.data);
+	const origin = { platform: "discord", kind: "dm", conversationId: "image-origin-a", peerId: "owner" } as const;
+	const otherOrigin = { platform: "discord", kind: "dm", conversationId: "image-origin-b", peerId: "owner" } as const;
+	const key = originKey(origin);
+	const engagement = { mentioned: false, group: false, authorId: "owner" };
+	const send = (
+		id: string,
+		target: typeof origin | typeof otherOrigin,
+		text: string,
+		images?: readonly PromptImage[],
+		messageId = id,
+	) =>
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "chat.send",
+			params: {
+				origin: target,
+				text,
+				messageId,
+				engagement,
+				...(images ? { images } : {}),
+			},
+		});
+	const turnIdFor = (id: string): string => {
+		const frame = client.frames.find((candidate) => candidate.id === id);
+		if (typeof frame?.result?.turnId !== "string") throw new Error(`request ${id} had no turn id`);
+		return frame.result.turnId;
+	};
+
+	send("image-only-trigger", origin, "", [image]);
+	await waitFrame(client.frames, "image-only-trigger");
+	expect(turnIdFor("image-only-trigger")).toBeString();
+	await waitForCompletedSend(database, sessionPort, 0);
+	expect(sessionPort.sends[0]?.images).toEqual([image]);
+	expect(sessionPort.sends[0]?.text).toContain("The user sent 1 image without accompanying text.");
+	expect(database.inbox.messageImagesJson("image-only-trigger", key)).toBe(JSON.stringify([image]));
+	expect(sessionPort.sends[0]?.text).toContain("Current message: 1 native image(s) attached");
+
+	send("image-duplicate", origin, "", [image], "image-only-trigger");
+	await waitFrame(client.frames, "image-duplicate");
+	expect(client.frames.find((frame) => frame.id === "image-duplicate")).toMatchObject({
+		type: "response",
+		result: { turnId: null, engaged: true },
+	});
+	expect(sessionPort.sends).toHaveLength(1);
+
+	send("image-conflict", origin, "", [otherImage], "image-only-trigger");
+	await waitFrame(client.frames, "image-conflict");
+	expect(client.frames.find((frame) => frame.id === "image-conflict")).toMatchObject({
+		type: "error",
+		error: { code: "invalid_params" },
+	});
+	expect(sessionPort.sends).toHaveLength(1);
+	expect(database.inbox.messageImagesJson("image-only-trigger", key)).toBe(JSON.stringify([image]));
+
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "image-edit",
+		verb: "chat.edit",
+		params: { origin, messageId: "image-only-trigger", text: "edited caption", engagement },
+	});
+	await waitFrame(client.frames, "image-edit");
+	expect(client.frames.find((frame) => frame.id === "image-edit")).toMatchObject({
+		type: "error",
+		error: { code: "invalid_params" },
+	});
+
+	send("text-after-image", origin, "ordinary text");
+	await waitFrame(client.frames, "text-after-image");
+	expect(turnIdFor("text-after-image")).toBeString();
+	await waitForCompletedSend(database, sessionPort, 1);
+	expect(sessionPort.sends[1]?.images).toBeUndefined();
+	expect(sessionPort.sends[1]?.text).not.toContain("Current message: 1 native image(s) attached");
+	expect(sessionPort.sends[1]?.text).not.toContain(image.data);
+	expect(database.inbox.messageImagesJson("text-after-image", key)).toBeNull();
+	send("text-duplicate", origin, "ordinary text", undefined, "text-after-image");
+	await waitFrame(client.frames, "text-duplicate");
+	expect(client.frames.find((frame) => frame.id === "text-duplicate")).toMatchObject({
+		type: "response",
+		result: { turnId: null, engaged: true },
+	});
+	expect(sessionPort.sends).toHaveLength(2);
+
+	send("other-origin-text", otherOrigin, "another conversation");
+	await waitFrame(client.frames, "other-origin-text");
+	expect(turnIdFor("other-origin-text")).toBeString();
+	await waitForCompletedSend(database, sessionPort, 2);
+	expect(sessionPort.sends[2]?.images).toBeUndefined();
+	expect(sessionPort.sends[2]?.text).not.toContain(image.data);
+	expect(database.inbox.messageImagesJson("other-origin-text", originKey(otherOrigin))).toBeNull();
+	client.close();
+});
+
+test("declined image messages remain text context without durable image payloads", async () => {
+	const { client, database, sessionPort } = await startDeliveryServer({
+		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "owner", peerId: "owner" } },
+	});
+	const image = await makePromptImage();
+	const origin = { platform: "discord", kind: "channel", conversationId: "declined-image" } as const;
+	const key = originKey(origin);
+	const body = "not addressed to the persona\n[image · picture.png · 12 KB]";
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "declined-image",
+		verb: "chat.send",
+		params: {
+			origin,
+			text: body,
+			messageId: "declined-image",
+			engagement: { mentioned: false, group: true, authorId: "stranger" },
+			images: [image],
+		},
+	});
+	await waitFrame(client.frames, "declined-image");
+	expect(client.frames.find((frame) => frame.id === "declined-image")).toMatchObject({
+		type: "response",
+		result: { turnId: null, engaged: false },
+	});
+	expect(database.inbox.messageImagesJson("declined-image", key)).toBeUndefined();
+	expect(database.inbox.recentInbound(key, 10, new Date(0).toISOString())).toContainEqual(
+		expect.objectContaining({ id: "declined-image", body }),
+	);
+	expect(sessionPort.sends).toHaveLength(0);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "after-declined-image",
+		verb: "chat.send",
+		params: {
+			origin,
+			text: "hello @agent",
+			messageId: "after-declined-image",
+			engagement: { mentioned: true, group: true, authorId: "owner" },
+		},
+	});
+	await waitFrame(client.frames, "after-declined-image");
+	expect(client.frames.find((frame) => frame.id === "after-declined-image")?.result.engaged).toBe(true);
+	await waitForCompletedSend(database, sessionPort, 0);
+	expect(sessionPort.sends[0]?.images).toBeUndefined();
+	expect(sessionPort.sends[0]?.text).toContain(
+		"[image · picture.png · 12 KB · past attachment; not part of this message, do not fetch]",
+	);
+	expect(sessionPort.sends[0]?.text).not.toContain("native image(s) attached");
 	client.close();
 });
 
@@ -1553,7 +1802,7 @@ test("large memory.audit and concurrent progress remain independently parseable 
 	const auditResponse = client.frames.find((frame) => frame.type === "response" && frame.id === "audit");
 	expect(auditResponse).toBeDefined();
 	expect(auditResponse?.result?.opRef).toBeDefined();
-	const opRef = (auditResponse?.result as { opRef: string }).opRef;
+	const opRef = (auditResponse!.result as { opRef: string }).opRef;
 
 	// Poll for the audit result via memory.status
 	let auditStatus: any;
@@ -3565,7 +3814,7 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 	const database = await Store.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
-		respond: async () => "[REPLY:msg-42] threaded answer\n[BREAK]\nplain follow-up",
+		respond: async () => "[REPLY:1544704223634260038] threaded answer\n[BREAK]\nplain follow-up",
 	});
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
@@ -3590,9 +3839,56 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 	}
 	const messages = client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
 	expect(messages).toHaveLength(2);
-	expect(messages[0].payload).toMatchObject({ text: "threaded answer", replyToMessageId: "msg-42" });
+	expect(messages[0].payload).toMatchObject({ text: "threaded answer", replyToMessageId: "1544704223634260038" });
 	expect(messages[1].payload.text).toBe("plain follow-up");
 	expect(messages[1].payload.replyToMessageId).toBeUndefined();
+	client.close();
+});
+
+test("a non-snowflake Discord [REPLY:] target is dropped and the text still delivers (#763)", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => "[REPLY:silent-none] hello",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "dm",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "discord", kind: "dm", conversationId: "c1", peerId: "p1" },
+			text: "hello",
+			messageId: "m-1",
+			engagement: { mentioned: false, group: false, authorId: "p1" },
+		},
+	});
+	for (let attempt = 0; attempt < 400; attempt++) {
+		if (client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message").length >= 1) break;
+		await Bun.sleep(5);
+	}
+	const messages = client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
+	// The message is delivered, but without the invalid reply reference
+	expect(messages).toHaveLength(1);
+	expect(messages[0].payload.text).toBe("hello");
+	// Crucially, replyToMessageId must NOT be set to the invalid ID
+	expect(messages[0].payload.replyToMessageId).toBeUndefined();
 	client.close();
 });
 
@@ -4342,7 +4638,9 @@ test("every turn preamble carries the attachment-scope rule", async () => {
 		},
 	});
 	for (let attempt = 0; attempt < 400 && preambles.length === 0; attempt++) await Bun.sleep(10);
-	expect(preambles[0]).toContain("If the current message lists none, it has none");
+	expect(preambles[0]).toContain("use native images attached to this turn as the current image input");
+	expect(preambles[0]).toContain("does not make it this message's attachment unless its id matches");
+	expect(preambles[0]).toContain("never treat an older file as part of the current message");
 	client.close();
 });
 

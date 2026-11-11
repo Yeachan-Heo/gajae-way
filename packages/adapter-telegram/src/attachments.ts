@@ -6,22 +6,24 @@
  * so every such message was dropped before it reached the gateway — the persona
  * never saw the image and the conversation-context ledger never recorded it.
  *
- * The fix follows the Discord adapter: attachments are rendered into the message
- * body as one bracketed text line, so no protocol field or schema migration is
- * needed and every downstream consumer (context ledger, memory capture, turn
- * header) sees the attachment because it is simply part of the text.
+ * Non-image attachments are rendered into the message body as one bracketed text
+ * line. Images are also described there, but their freshly downloaded bytes are
+ * separately prepared as native prompt input so the model can actually see them.
  *
  * Unlike Discord, a Telegram file url embeds the bot token
  * (`https://api.telegram.org/file/bot<token>/<path>`), so it must never be put
  * in the body: the body is persisted in the ledger and shown to the persona. The
- * adapter therefore downloads the file itself and renders the local path, which
- * the persona (running on the same host) can read directly. Files land under the
- * adapter home with owner-only permissions and are pruned after a retention
- * window, because the Bot API cannot re-serve a file path forever either.
+ * adapter therefore downloads files itself. Non-image files render their local
+ * path, while images are read from that freshly returned path and sent natively.
+ * Files land under the adapter home with owner-only permissions and are pruned
+ * after a retention window, because the Bot API cannot re-serve them forever.
  */
 
-import { mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdir, open, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { extname, join } from "node:path";
+import { preparePromptImages } from "@gajae-gateway/images";
+import type { PromptImage } from "@gajae-gateway/protocol";
 
 /** The Bot API refuses `getFile` for anything larger than this. */
 export const TELEGRAM_BOT_DOWNLOAD_LIMIT = 20 * 1024 * 1024;
@@ -36,6 +38,8 @@ class TelegramAttachmentHttpError extends Error {
 		super(`file download returned HTTP ${status}`);
 	}
 }
+
+class TelegramAttachmentSizeError extends Error {}
 
 export interface TelegramFileShape {
 	readonly file_id: string;
@@ -81,7 +85,17 @@ export interface TelegramAttachment {
 }
 
 /** Where a downloaded attachment ended up, or why it is not on disk. */
-export type StoredAttachment = { readonly path: string } | { readonly unavailable: string };
+export type StoredAttachment =
+	| { readonly path: string }
+	| { readonly unavailable: string; readonly retryable?: boolean };
+
+/** A temporary download failure must leave its Telegram update unaccepted. */
+export class TelegramAttachmentRetryableError extends Error {
+	constructor() {
+		super("Telegram attachment download temporarily unavailable");
+		this.name = "TelegramAttachmentRetryableError";
+	}
+}
 
 export interface TelegramFileApi {
 	getFile(fileId: string, signal: AbortSignal): Promise<{ readonly file_path?: string; readonly file_size?: number }>;
@@ -90,6 +104,26 @@ export interface TelegramFileApi {
 
 export interface TelegramAttachmentSaver {
 	save(attachment: TelegramAttachment, chatId: string, messageId: number): Promise<StoredAttachment>;
+}
+
+export type TelegramImagePreparation = {
+	readonly images: PromptImage[];
+	readonly notice: string;
+};
+
+/**
+ * Reads the image from the freshly saved local attachment and prepares it for
+ * native prompt input. Paths are accepted only from the saver result, never
+ * from Telegram message fields or gateway payloads.
+ */
+export async function prepareTelegramImage(
+	stored: StoredAttachment,
+	prepare: typeof preparePromptImages = preparePromptImages,
+): Promise<TelegramImagePreparation> {
+	if (!("path" in stored)) throw new Error("image attachment is unavailable");
+	const bytes = await readStoredImage(stored.path);
+	if (!isPng(bytes) && !isJpeg(bytes)) throw new Error("image attachment must be PNG or JPEG");
+	return prepare([bytes]);
 }
 
 /**
@@ -140,16 +174,76 @@ export function describeInboundBody(
 	content: string,
 	attachment: TelegramAttachment | undefined,
 	stored: StoredAttachment | undefined,
+	/** Marks an image as native input instead of implying the model should read its local path. */
+	imageIncluded = false,
 ): string {
 	if (!attachment || !stored) return content;
-	const line = describeTelegramAttachment(attachment, stored);
+	const line =
+		imageIncluded && attachment.kind === "image"
+			? describeTelegramImage(attachment)
+			: describeTelegramAttachment(attachment, stored);
 	return content.trim() === "" ? line : `${content}\n${line}`;
+}
+
+function describeTelegramImage(attachment: TelegramAttachment): string {
+	const parts: string[] = [attachment.kind];
+	if (attachment.name) parts.push(attachment.name);
+	const size = formatSize(attachment.size);
+	if (size) parts.push(size);
+	return `[${parts.join(" · ")}]`;
+}
+
+function isPng(bytes: Uint8Array): boolean {
+	return (
+		bytes.length >= 8 &&
+		bytes[0] === 0x89 &&
+		bytes[1] === 0x50 &&
+		bytes[2] === 0x4e &&
+		bytes[3] === 0x47 &&
+		bytes[4] === 0x0d &&
+		bytes[5] === 0x0a &&
+		bytes[6] === 0x1a &&
+		bytes[7] === 0x0a
+	);
+}
+
+function isJpeg(bytes: Uint8Array): boolean {
+	return bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+}
+
+async function readStoredImage(path: string): Promise<Uint8Array> {
+	let handle: Awaited<ReturnType<typeof open>>;
+	try {
+		handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK | constants.O_NOCTTY);
+	} catch {
+		throw new Error("image attachment is unavailable");
+	}
+	try {
+		const info = await handle.stat();
+		if (!info.isFile() || info.size > TELEGRAM_BOT_DOWNLOAD_LIMIT)
+			throw new Error("image attachment exceeds the 20 MB limit or is not a regular file");
+		const bytes = Buffer.allocUnsafe(info.size + 1);
+		let length = 0;
+		while (length < bytes.length) {
+			const read = await handle.read(bytes, length, bytes.length - length, null);
+			if (read.bytesRead === 0) break;
+			length += read.bytesRead;
+		}
+		if (length > TELEGRAM_BOT_DOWNLOAD_LIMIT || length !== info.size)
+			throw new Error("image attachment changed or exceeds the 20 MB limit");
+		return bytes.subarray(0, length);
+	} catch (error) {
+		if (error instanceof Error && error.message.startsWith("image attachment ")) throw error;
+		throw new Error("image attachment could not be read");
+	} finally {
+		await handle.close().catch(() => {});
+	}
 }
 
 /**
  * Downloads inbound attachments into `directory/<chatId>/` with owner-only
- * permissions. Never throws: a failed download still produces a body line, so
- * the message reaches the persona even when the bytes do not.
+ * permissions. Never throws: deterministic failures retain a sanitized body
+ * diagnostic, while temporary failures are marked retryable for the adapter.
  */
 export class TelegramAttachmentStore implements TelegramAttachmentSaver {
 	constructor(
@@ -162,6 +256,7 @@ export class TelegramAttachmentStore implements TelegramAttachmentSaver {
 	async save(attachment: TelegramAttachment, chatId: string, messageId: number): Promise<StoredAttachment> {
 		if (attachment.size !== undefined && attachment.size > TELEGRAM_BOT_DOWNLOAD_LIMIT)
 			return { unavailable: "exceeds the 20 MB bot download limit" };
+		let stage: "getFile" | "download" | "store" = "getFile";
 		try {
 			const controller = new AbortController();
 			const timer = setTimeout(() => controller.abort(), this.timeoutMs);
@@ -170,7 +265,9 @@ export class TelegramAttachmentStore implements TelegramAttachmentSaver {
 				if (!file.file_path) return { unavailable: "Telegram returned no file path" };
 				if (validNumber(file.file_size) && file.file_size > TELEGRAM_BOT_DOWNLOAD_LIMIT)
 					return { unavailable: "exceeds the 20 MB bot download limit" };
+				stage = "download";
 				const bytes = await this.download(file.file_path, controller.signal);
+				stage = "store";
 				const directory = join(this.directory, safeSegment(chatId));
 				await mkdir(directory, { recursive: true, mode: 0o700 });
 				const extension = safeExtension(file.file_path) ?? safeExtension(attachment.name ?? "") ?? "";
@@ -188,7 +285,10 @@ export class TelegramAttachmentStore implements TelegramAttachmentSaver {
 			const detail =
 				error instanceof TelegramAttachmentHttpError ? `file download returned HTTP ${error.status}` : "request failed";
 			this.log.error(`Telegram attachment download failed: ${detail}`);
-			return { unavailable: "download failed" };
+			return {
+				unavailable: "download failed",
+				...(isRetryableAttachmentFailure(error, stage) ? { retryable: true } : {}),
+			};
 		}
 	}
 
@@ -206,7 +306,7 @@ export class TelegramAttachmentStore implements TelegramAttachmentSaver {
 				size += value.byteLength;
 				if (size > TELEGRAM_BOT_DOWNLOAD_LIMIT) {
 					await reader.cancel().catch(() => undefined);
-					throw new Error("file exceeds the bot download limit");
+					throw new TelegramAttachmentSizeError("file exceeds the bot download limit");
 				}
 				chunks.push(value);
 			}
@@ -221,6 +321,18 @@ export class TelegramAttachmentStore implements TelegramAttachmentSaver {
 		}
 		return bytes;
 	}
+}
+
+function isRetryableAttachmentFailure(error: unknown, stage: "getFile" | "download" | "store"): boolean {
+	if (stage === "store" || error instanceof TelegramAttachmentSizeError) return false;
+	const status =
+		error instanceof TelegramAttachmentHttpError
+			? error.status
+			: error instanceof Error && "status" in error && typeof error.status === "number"
+				? error.status
+				: undefined;
+	if (status !== undefined) return status === 408 || status === 429 || (status >= 500 && status <= 599);
+	return true;
 }
 
 /** Removes downloaded attachments older than `maxAgeMs`; missing directories are fine. */
@@ -281,7 +393,7 @@ function fromFile(kind: TelegramAttachmentKind, file: TelegramTimedFileShape | T
 
 function kindForMime(mimeType: string | undefined): TelegramAttachmentKind {
 	const mime = nonBlank(mimeType)?.toLowerCase() ?? "";
-	if (mime.startsWith("image/")) return "image";
+	if (mime === "image/png" || mime === "image/jpeg") return "image";
 	if (mime.startsWith("video/")) return "video";
 	if (mime.startsWith("audio/")) return "audio";
 	return "file";

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { LogLevel } from "@gajae-gateway/log";
+import type { PromptImage } from "@gajae-gateway/protocol";
 import {
 	assertControlAllowed,
 	assertValidOpRef,
@@ -7,9 +8,11 @@ import {
 	CLIENT_REF_CONFLICT_CODE,
 	decideRecovery,
 	GjcCliError,
+	type HoldKind,
 	isOpRefRejection,
 	isTerminalStatus,
 	OpRefRejectedError,
+	type PromptStatus,
 	projectOpState,
 	type StatusReport,
 } from "@gajae-gateway/subsession";
@@ -24,6 +27,7 @@ import {
 } from "../config";
 import { BrokerAuthorityError, type Store } from "../store";
 import {
+	editedOriginalId,
 	type InboundMessageRow,
 	type InboundTurn,
 	type TerminalUnlinkedReason,
@@ -45,6 +49,7 @@ import {
 import {
 	deterministicInterimDeliveryId,
 	isRelayTransportFailure,
+	MAX_RELAY_REQUEST_FRAME_BYTES,
 	TailCapacityError,
 	type TailFrame,
 	type TailHandle,
@@ -93,7 +98,19 @@ const SUBMISSION_RETRY_DELAY_MS = 3_000;
 const STEER_REPLAY_ATTEMPTS = 2;
 /** Bind failures back off exponentially from DISPATCH_FAILURE_RETRY_MS up to this ceiling. */
 const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
-/** Identical bind failures before the broker's own discovery file is judged. */
+const LOCAL_PREFLIGHT_REJECTION_PREFIX = "persona-local-preflight-rejection:";
+const PROMPT_TOO_LARGE_CODE = "prompt_too_large";
+
+class SendTurnNoLongerBoundError extends Error {}
+
+function localPreflightRejectionKey(opRef: string): string {
+	return `${LOCAL_PREFLIGHT_REJECTION_PREFIX}${opRef}`;
+}
+
+function localPreflightRejection(store: Store, opRef: string): string | undefined {
+	const code = store.core.metaGet(localPreflightRejectionKey(opRef));
+	return code === PROMPT_TOO_LARGE_CODE ? code : undefined;
+}
 
 function freshTurnMetaKey(originKey: string, epoch: number, triggerMessageId: string): string {
 	return `fresh_turn_attempt:${originKey}:${epoch}:${triggerMessageId}`;
@@ -134,6 +151,11 @@ function providerTransportRetryAttempt(
 /** An escalated hold (#686) whose late answer is still wanted; restored on adoption after a restart. */
 function escalatedHoldKey(opRef: string): string {
 	return `escalated-hold:${opRef}`;
+}
+
+/** Track relay unavailable events for a turn to detect unresponsive relays even on live hosts (#766). */
+function relayUnavailableTrackerKey(opRef: string): string {
+	return `relay_unavailable:${opRef}`;
 }
 
 const ESCALATION_NOTICE_PREFIX = "escalation-notice:";
@@ -267,6 +289,8 @@ function completeInboundTurn(
 	if (changed === 1 && prompt) store.bindings.abandonBrokerPromptBusyRefusal(tx, prompt);
 	if (changed === 1 && consumeExit) store.core.metaDelete(stalledExitProofKey(opRef));
 	if (changed === 1) store.core.metaDelete(escalatedHoldKey(opRef));
+	// Clean up relay unavailability tracker when turn completes (#766)
+	if (changed === 1) store.core.metaDelete(relayUnavailableTrackerKey(opRef));
 	return changed;
 }
 
@@ -417,6 +441,8 @@ export const PERSONA_RESTART_DRAIN_MAX_WAIT_MS = 300_000;
  */
 export interface PersonaTurnLifecycle {
 	readonly text: string;
+	/** Image inputs associated with the trigger; image rows cannot be consumed as text-only steers. */
+	readonly images?: readonly PromptImage[];
 	/**
 	 * Stable persona preamble. The actor puts it into a session's context on the
 	 * first send, after it changes, after the context shrank (compaction) or a
@@ -479,8 +505,8 @@ export interface PersonaTurnStartInput extends PersonaTurnIdentity {
 	/** The trigger row; the one prompt body of this turn. */
 	readonly trigger: InboundMessageRow;
 	/**
-	 * Present only for a settlement lifecycle of an already sent turn (adopted
-	 * after a restart or escalation): the context its prompt durably claimed.
+	 * Present only for a settlement lifecycle: the context an already sent prompt
+	 * durably claimed, or only the failed trigger for a local preflight rejection.
 	 * No new context window is prepared or committed for it (#686).
 	 */
 	readonly sentContextIds?: readonly string[];
@@ -1635,7 +1661,10 @@ class OriginActor {
 		await this.#emitEscalationNotices();
 		const turns = this.#manager.database.inbox.nonterminalTurns(this.originKey);
 		const open = new Set(turns.map((turn) => turn.opRef));
-		for (const opRef of this.#recoveryHoldReasons.keys()) if (!open.has(opRef)) this.#recoveryHoldReasons.delete(opRef);
+		for (const key of this.#loggedRecoveryHolds) {
+			const opRef = key.split(":")[0];
+			if (opRef && !open.has(opRef)) this.#loggedRecoveryHolds.delete(key);
+		}
 		for (const turn of turns) {
 			if (this.#current?.turn.opRef === turn.opRef || this.#retired.has(retiredKey({ epoch: turn.epoch, turn })))
 				continue;
@@ -1664,9 +1693,64 @@ class OriginActor {
 		return true;
 	}
 
+	async #settleLocalPreflightRejection(bound: BoundTurn, code: string): Promise<void> {
+		if (code !== PROMPT_TOO_LARGE_CODE) return;
+		const opRef = bound.turn.opRef;
+		const key = localPreflightRejectionKey(opRef);
+		if (localPreflightRejection(this.#manager.database, opRef) !== code) return;
+		const message = `the prompt exceeded the ${MAX_RELAY_REQUEST_FRAME_BYTES}-byte request limit before it was sent; reduce the text or number of images and send again`;
+		const error = new GjcRuntimeError(`${code}: ${message}`, { code, message });
+		this.#manager.log(
+			`persona_send_preflight_rejected origin=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} opRef=${opRef} reason=${code}`,
+			"warn",
+		);
+		bound.tail?.setTurnRunning(false);
+		try {
+			await bound.tail?.close();
+		} catch (closeError) {
+			this.#manager.log(
+				`send_preflight_tail_close_failed origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(closeError)}`,
+				"warn",
+			);
+		}
+		bound.tail = undefined;
+		if (!bound.retired || bound.answerWanted) {
+			try {
+				await bound.lifecycle.onFailure?.({ ...bound, error, forceFailureNotice: true });
+			} catch (noticeError) {
+				this.#manager.log(
+					`send_preflight_failure_notice_failed origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(noticeError)}`,
+					"error",
+				);
+				this.#scheduleStatusRecheck(bound);
+				throw noticeError;
+			}
+		}
+		const unlinkedReason: TerminalUnlinkedReason = bound.retired && !bound.answerWanted ? "retired" : "turn_failed";
+		const completed = this.#manager.database.transaction((tx) => {
+			const prompt = ownedTurnPrompt(this.#manager.database, opRef);
+			const authority = this.#manager.database.bindings.authority;
+			const changed = completeInboundTurn(this.#manager.database, tx, opRef, unlinkedReason);
+			if (changed === 1 && prompt && authority)
+				this.#manager.database.bindings.releaseBrokerOperation(
+					tx,
+					authority,
+					"turn.prompt",
+					JSON.stringify([prompt.sessionId, opRef]),
+					opRef,
+				);
+			if (changed === 1 || this.#manager.database.inbox.turnRow(opRef)?.turn_state === "done")
+				this.#manager.database.core.metaDelete(key);
+			return changed;
+		});
+		await this.#notifySettled(bound);
+		if (completed > 0 || this.#manager.database.inbox.turnRow(opRef)?.turn_state === "done")
+			await this.#settleAfterTerminal(bound);
+	}
+
 	/**
 	 * Why a bound trigger provably never reached the host (#685): no durable send
-	 * intent was stamped before `port.send`, or the port holds an authenticated
+	 * intent was stamped before the relay stream write, or the port holds an authenticated
 	 * `busy` refusal for its op-ref. Undefined means the prompt may have landed.
 	 */
 	#unadmittedReason(opRef: string, sessionId: string | null): "send_not_attempted" | "prompt_busy_refused" | undefined {
@@ -1694,6 +1778,7 @@ class OriginActor {
 	 * A turn whose prompt may have landed is left for reconcile; it is never resent.
 	 */
 	#releaseUnadmittedTurn(turn: InboundTurn, retired: boolean, source: "recovery" | "dispatch"): boolean {
+		if (localPreflightRejection(this.#manager.database, turn.opRef)) return false;
 		const reason = this.#unadmittedReason(turn.opRef, turn.sessionId);
 		if (!reason) return false;
 		const attempt = this.#manager.database.transaction((tx) => {
@@ -1722,14 +1807,31 @@ class OriginActor {
 	 * input fence, retired hold and one notice, without rotating an epoch the
 	 * origin has already left. The escalation marker makes it exactly once.
 	 */
-	async #escalateUnresolvedHold(turn: InboundTurn, bound: BoundTurn | undefined): Promise<boolean> {
+	async #escalateUnresolvedHold(
+		turn: InboundTurn,
+		bound: BoundTurn | undefined,
+		evidence: { readonly status?: PromptStatus | "unavailable"; readonly holdKind?: HoldKind } = {},
+	): Promise<boolean> {
 		if (this.#stopped || this.#manager.stopped || bound?.retired) return false;
 		if (bound && this.#current !== bound) return false;
 		const retiredEpoch = turn.epoch !== this.#epoch();
 		// A live BoundTurn is always on the current epoch; only a recovered row can be retired.
 		if (retiredEpoch && bound) return false;
 		const database = this.#manager.database;
-		if (database.core.metaGet(escalatedHoldKey(turn.opRef)) !== undefined) return false;
+		if (database.core.metaGet(escalatedHoldKey(turn.opRef)) !== undefined) {
+			// Already escalated: a crash between the durable escalation and its adoption
+			// leaves the held op unobserved, so a recovered row is adopted again here.
+			const heldSession = turn.sessionId;
+			if (bound || !heldSession) return false;
+			if (this.#current?.turn.opRef === turn.opRef || this.#retired.has(retiredKey({ epoch: turn.epoch, turn })))
+				return false;
+			if (!(await this.#adoptEscalatedHold(turn, heldSession))) return false;
+			this.#manager.log(
+				`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=unresolved_hold_readopted`,
+				"warn",
+			);
+			return true;
+		}
 		// The hold starts at the send. A row stamped by the schema 39 backfill
 		// ('pre-migration-39') or bound before dispatch was recorded falls back to
 		// its bind and then its arrival, so an old stranded row is still bounded (#705).
@@ -1746,12 +1848,32 @@ class OriginActor {
 		if (heldMs < this.#manager.unresolvedHoldMs) return false;
 		const sessionId = bound?.sessionId ?? turn.sessionId;
 		if (!sessionId) return false;
-		// Only a dead host is evidence the op will not settle by itself; an
-		// unanswerable probe is not.
+		// Check for relay unavailable evidence even if the host is live (#766).
+		// A live host whose relay is unresponsive should escalate if the evidence spans long enough.
+		const relayTrackerTs = database.core.metaGet(relayUnavailableTrackerKey(turn.opRef));
+		const hasRelayUnavailableEvidence =
+			relayTrackerTs !== undefined &&
+			this.#manager.now() - Number.parseInt(relayTrackerTs, 10) >= this.#manager.unresolvedHoldMs;
+		// A dead host is always evidence; a live unresponsive relay is if evidence spans long enough.
 		const host = await this.#bindingState(sessionId);
-		if (host.live !== false && host.disowned !== true) return false;
-		// A turn recovery never adopted carries no status verdict yet.
-		if (!bound && (await this.#statusForRecovery(sessionId, turn.opRef)).status.status !== "unknown") return false;
+		if (!hasRelayUnavailableEvidence && host.live !== false && host.disowned !== true) return false;
+		let status = evidence.status;
+		if (!bound) {
+			// A turn recovery never adopted carries no status verdict yet: read it fresh.
+			const report = await this.#statusForRecovery(sessionId, turn.opRef);
+			status = report.status.status;
+			// An accepted or in-flight op may still be mutating the workspace; no hold
+			// kind lifts that fence, whatever the broker liveness says (#772).
+			if (status === "accepted" || status === "in_flight") return false;
+			// Terminal-uncertain and ambiguous-authority holds escalate on a settled
+			// (terminal) status too; every other hold needs an unknown one (#772).
+			const settledEscalates =
+				evidence.holdKind === "operation_uncertain" || evidence.holdKind === "ambiguous_authority";
+			if (status !== "unknown" && !settledEscalates) return false;
+			// A settled status only speaks for the held op when the report names it:
+			// a mismatched or missing identity is an authority shift, never evidence (#772).
+			if (status !== "unknown" && report.operationRef !== turn.opRef) return false;
+		}
 		const trigger = database.inbox.turnRow(turn.opRef);
 		if (!trigger) return false;
 		// One transaction: the fresh epoch, the held op's answer-wanted
@@ -1776,7 +1898,10 @@ class OriginActor {
 			return { nextEpoch: epoch, closedInputs: closed };
 		});
 		this.#holdSweeps.delete(turn.opRef);
-		this.#recoveryHoldReasons.delete(turn.opRef);
+		// Clean up logged holds for this opRef when it's escalated
+		for (const key of this.#loggedRecoveryHolds) {
+			if (key.startsWith(`${turn.opRef}:`)) this.#loggedRecoveryHolds.delete(key);
+		}
 		for (const row of closedInputs) {
 			// Whether the model read it is unknown: release its ownership without a 👀.
 			await this.#manager.emitHeldSteerAccepted({ originKey: this.originKey, row, opRef: turn.opRef, abandoned: true });
@@ -1786,7 +1911,7 @@ class OriginActor {
 			);
 		}
 		this.#manager.log(
-			`recovery_hold_escalated origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} heldMs=${heldMs} evidence="status=unknown live=${host.live ?? "unknown"} disowned=${host.disowned ?? false}"`,
+			`recovery_hold_escalated origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} heldMs=${heldMs} evidence="status=${status ?? "unknown"} holdKind=${evidence.holdKind ?? "none"} live=${host.live ?? "unknown"} disowned=${host.disowned ?? false}"`,
 			"warn",
 		);
 		if (bound) {
@@ -1806,22 +1931,8 @@ class OriginActor {
 			await bound.lifecycle.onRetired?.(bound);
 			this.#scheduleRetiredReattach(bound);
 		} else {
-			try {
-				// Adopted without a relay: the host is gone. Periodic reconcile reads
-				// its status; a reattach is tried on the bounded retired schedule.
-				const adopted = await this.#adoptRecoveredTurn(turn, sessionId, true, true);
-				// No bounded-cadence rechecks for an escalated hold: the sweep reads it (#715).
-				adopted.tailEvidenceUnavailable = false;
-				this.#clearStallReconciliation(adopted);
-				adopted.detached = true;
-				this.#scheduleRetiredReattach(adopted);
-			} catch (error) {
-				// Still durable: the next recovery scan treats it as a retired-epoch turn.
-				this.#manager.log(
-					`retired_hold_adopt_failed origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
-					"warn",
-				);
-			}
+			// On failure the escalation marker stays durable: the next recovery scan re-adopts it.
+			await this.#adoptEscalatedHold(turn, sessionId);
 		}
 		this.#manager.log(
 			`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=unresolved_hold_escalated`,
@@ -1829,6 +1940,31 @@ class OriginActor {
 		);
 		await this.#emitEscalationNotices();
 		return true;
+	}
+
+	/**
+	 * Adopts an escalated hold's recovered row as a detached retired turn so the
+	 * periodic sweep reads its status and a late answer is still delivered. Used
+	 * by the escalation itself and by recovery after a restart that lost it.
+	 */
+	async #adoptEscalatedHold(turn: InboundTurn, sessionId: string): Promise<boolean> {
+		try {
+			// Adopted without a relay: the host is gone. Periodic reconcile reads
+			// its status; a reattach is tried on the bounded retired schedule.
+			const adopted = await this.#adoptRecoveredTurn(turn, sessionId, true, true);
+			// No bounded-cadence rechecks for an escalated hold: the sweep reads it (#715).
+			adopted.tailEvidenceUnavailable = false;
+			this.#clearStallReconciliation(adopted);
+			adopted.detached = true;
+			this.#scheduleRetiredReattach(adopted);
+			return true;
+		} catch (error) {
+			this.#manager.log(
+				`retired_hold_adopt_failed origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
+				"warn",
+			);
+			return false;
+		}
 	}
 
 	/**
@@ -1862,6 +1998,22 @@ class OriginActor {
 		if (this.#quarantinedTurn(turn.opRef)) return;
 		const currentEpoch = this.#epoch();
 		const retired = turn.epoch < currentEpoch;
+		const localRejection = localPreflightRejection(this.#manager.database, turn.opRef);
+		if (localRejection) {
+			const sessionId = turn.sessionId;
+			if (!sessionId) {
+				this.#manager.log(
+					`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=local_preflight_session_unavailable`,
+					"warn",
+				);
+				return;
+			}
+			// The durable gateway-side rejection is authoritative for this op-ref;
+			// recovery must not ask the broker about a prompt that was never issued.
+			const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, true);
+			await this.#settleLocalPreflightRejection(bound, localRejection);
+			return;
+		}
 		if (turn.state === "bound" && this.#releaseUnadmittedTurn(turn, retired, "recovery")) return;
 		const sessionId = turn.sessionId;
 		if (!sessionId) {
@@ -1997,7 +2149,8 @@ class OriginActor {
 				return;
 			case "operator_hold": {
 				// Unknown status and an empty queue do not authenticate non-admission.
-				if (status.status.status === "unknown" && (await this.#escalateUnresolvedHold(turn, undefined))) return;
+				// Also escalate terminal_uncertain and ambiguous authority holds after unresolvedHoldMs (#772).
+				if (await this.#escalateUnresolvedHold(turn, undefined, { holdKind: decision.holdKind })) return;
 				this.#logRecoveryHoldOnce(turn, decision.reason);
 				return;
 			}
@@ -2008,10 +2161,11 @@ class OriginActor {
 	 * Recovery scans run every minute; an unchanged hold is logged once per
 	 * (op-ref, reason) and again only when its reason changes (#705).
 	 */
-	/** Logs a hold once per reason change; `extra` (e.g. `detail=…`) describes the first occurrence. */
+	/** Logs a hold once per reason; alternating reasons log once each per op-ref (#772, #705). */
 	#logRecoveryHoldOnce(turn: InboundTurn, reason: string, extra?: string): void {
-		if (this.#recoveryHoldReasons.get(turn.opRef) === reason) return;
-		this.#recoveryHoldReasons.set(turn.opRef, reason);
+		const key = `${turn.opRef}:${reason}`;
+		if (this.#loggedRecoveryHolds.has(key)) return;
+		this.#loggedRecoveryHolds.add(key);
 		this.#manager.log(
 			`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${reason}${extra ? ` ${extra}` : ""}`,
 			"warn",
@@ -2033,7 +2187,13 @@ class OriginActor {
 			sessionId,
 			turn,
 			trigger,
-			sentContextIds: this.#manager.database.inbox.sentContextIds(turn.opRef),
+			// A locally rejected, unfenced prompt never acquired a send-context claim.
+			// Settle its trigger without selecting or consuming other unread context.
+			sentContextIds:
+				localPreflightRejection(this.#manager.database, turn.opRef) &&
+				!this.#manager.database.inbox.sendAttempted(turn.opRef)
+					? [editedOriginalId(trigger.message_id) ?? trigger.message_id]
+					: this.#manager.database.inbox.sentContextIds(turn.opRef),
 		});
 		let tail: TailHandle | undefined;
 		let detached = false;
@@ -2114,8 +2274,8 @@ class OriginActor {
 	}
 
 	readonly #holdSweeps = new Map<string, number>();
-	/** Last logged recovery-scan hold reason per op-ref (#705). */
-	readonly #recoveryHoldReasons = new Map<string, string>();
+	/** Logged recovery hold reasons to dedupe alternating reasons; keyed by "opRef:reason" (#772). */
+	readonly #loggedRecoveryHolds = new Set<string>();
 
 	/** Liveness of a binding from the raw broker envelope; the normalized inspect where the port has no raw read. */
 	async #bindingState(sessionId: string): Promise<{
@@ -2374,6 +2534,10 @@ class OriginActor {
 		const unresolved = this.#manager.database.inbox
 			.nonterminalTurns(this.originKey)
 			.find((turn) => turn.epoch === epoch);
+		if (unresolved && localPreflightRejection(this.#manager.database, unresolved.opRef)) {
+			await this.#recoverTurn(unresolved);
+			return;
+		}
 		if (
 			unresolved &&
 			!(
@@ -2602,32 +2766,29 @@ class OriginActor {
 			return;
 		}
 		const preamble = this.#preambleForSend(binding.sessionId, epoch, lifecycle, context);
-		// Durable send intent (#685) and the context rows this prompt rendered
-		// (#686): from here on the prompt may land, so recovery must reconcile
-		// this turn instead of requeueing it, and its inputs belong to it.
-		if (
-			!this.#manager.database.transaction((tx) =>
-				this.#manager.database.inbox.markSendAttempted(tx, opRef, [...(lifecycle.contextMessageIds ?? [])]),
-			)
-		) {
-			// The row left `bound` underneath this actor; nothing was sent for it.
-			this.#current = undefined;
-			this.#state = "idle";
-			await tail.close();
-			await this.#notifyReleased(current);
-			this.#manager.log(`persona_send_skipped origin=${this.originKey} opRef=${opRef} reason=turn_not_bound`, "warn");
-			return;
-		}
 		try {
 			const receipt = await this.#manager.port.send({
 				sessionId: binding.sessionId,
 				repo: this.#manager.repo,
 				text: lifecycle.text,
+				...(lifecycle.images ? { images: lifecycle.images } : {}),
 				opRef,
 				relay: tail,
 				busyStallMs: this.#manager.busyStallMs,
 				...(preamble.text ? { systemPreamble: preamble.text } : {}),
 				...(lifecycle.sendModelFallback ? { model: lifecycle.sendModelFallback } : {}),
+				beforeWrite: () => {
+					// The exact frame is already validated; persist intent and context before it can land.
+					if (
+						!this.#manager.database.transaction((tx) =>
+							this.#manager.database.inbox.markSendAttempted(tx, opRef, [...(lifecycle.contextMessageIds ?? [])]),
+						)
+					)
+						throw new SendTurnNoLongerBoundError();
+				},
+				onPayloadTooLarge: () => {
+					this.#manager.database.core.metaSet(localPreflightRejectionKey(opRef), PROMPT_TOO_LARGE_CODE);
+				},
 			});
 			tail.correlate(opRef, receipt);
 			this.#manager.database.transaction((tx) => this.#manager.database.inbox.turnAccept(tx, opRef));
@@ -2637,6 +2798,18 @@ class OriginActor {
 			this.#bindEpochPoisoned = false;
 			this.#clearBindWedgeProbe();
 		} catch (error) {
+			if (error instanceof SendTurnNoLongerBoundError) {
+				this.#current = undefined;
+				this.#state = "idle";
+				await tail.close();
+				await this.#notifyReleased(current);
+				this.#manager.log(`persona_send_skipped origin=${this.originKey} opRef=${opRef} reason=turn_not_bound`, "warn");
+				return;
+			}
+			if (localPreflightRejection(this.#manager.database, opRef)) {
+				await this.#settleLocalPreflightRejection(current, PROMPT_TOO_LARGE_CODE);
+				return;
+			}
 			if (error instanceof ModelNotSelectedError && error.opRef === opRef) {
 				const refusal = new GjcRuntimeError(
 					"model_not_selected: request was not admitted because no model is selected",
@@ -2811,6 +2984,7 @@ class OriginActor {
 	#preSendFailures = 0;
 	/** A terminal_uncertain bind poisons this epoch's idempotency key; retries cannot make that key decidable. */
 	#bindEpochPoisoned = false;
+	/** Identical bind failures before the broker's own discovery file is judged. */
 	#sameDetailBindFailures = 0;
 	#lastBindDetail: string | undefined;
 	#bindHoldProbed = false;
@@ -3043,6 +3217,8 @@ class OriginActor {
 	 * turn) or the session refused and is being recovered.
 	 */
 	async #steerRow(current: BoundTurn, row: InboundMessageRow): Promise<boolean> {
+		// turn.steer is text-only; uncertain persisted image data stays queued as well.
+		if (hasPersistedImages(row.images_json)) return false;
 		if (
 			this.#manager.database.bindings.isQuarantined("inbound", row.message_id) ||
 			this.#quarantinedTurn(current.turn.opRef)
@@ -3586,6 +3762,33 @@ class OriginActor {
 		}
 	}
 
+	/**
+	 * Check if the turn's last assistant message has stopReason "stop",
+	 * indicating the agent properly concluded and did not have an error.
+	 * Returns true if the last message is confirmed to end with stopReason "stop",
+	 * false if it has a different stopReason, and undefined if unreadable.
+	 */
+	async #lastAssistantIsAnswering(bound: BoundTurn): Promise<boolean | undefined> {
+		const port = this.#manager.port;
+		if (!port.fetchAssistantSince || bound.dispatchedAtMs === undefined) return undefined;
+		try {
+			const found = await port.fetchAssistantSince({
+				sessionId: bound.sessionId,
+				repo: this.#manager.repo,
+				notBeforeMs: bound.dispatchedAtMs,
+				...this.#liveRelay(bound),
+			});
+			// Correlate with the text from the tail to ensure we're looking at the same message
+			if (!found || found.text !== bound.lastAssistantText) return undefined;
+			return found.stopReason === "stop";
+		} catch (error) {
+			this.#manager.log(
+				`stall_last_assistant_probe_failed origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+			);
+			return undefined;
+		}
+	}
+
 	/** True while `bound` is still this actor's current or retired turn and the actor runs. */
 	#stillTracked(bound: BoundTurn): boolean {
 		return (
@@ -3784,6 +3987,12 @@ class OriginActor {
 			// for commands. Keeping a closed handle here made status throw forever.
 			bound.tail = undefined;
 			bound.detached = true;
+			// Record first-outage time on relay death to detect unresponsive relays (#766).
+			// This ensures statusOf records evidence even on the CLI-only path after detach.
+			const trackerKey = relayUnavailableTrackerKey(bound.turn.opRef);
+			if (this.#manager.database.core.metaGet(trackerKey) === undefined) {
+				this.#manager.database.core.metaSet(trackerKey, this.#manager.now().toString());
+			}
 		}
 		if (!bound.tailEvidenceUnavailable) {
 			bound.tailEvidenceUnavailable = true;
@@ -4009,13 +4218,23 @@ class OriginActor {
 		const base = { sessionId: bound.sessionId, repo: this.#manager.repo, opRef: bound.turn.opRef };
 		if (!bound.tail || bound.detached) return await this.#manager.port.status(base);
 		try {
-			return await this.#manager.port.status({ ...base, relay: bound.tail });
+			const report = await this.#manager.port.status({ ...base, relay: bound.tail });
+			// Clear relay unavailable tracker on successful relay/status answer (#766)
+			this.#manager.database.core.metaDelete(relayUnavailableTrackerKey(bound.turn.opRef));
+			return report;
 		} catch (error) {
 			if (!isRelayTransportFailure(error)) throw error;
 			this.#manager.log(
 				`status_relay_unavailable origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
 				"error",
 			);
+			// Track relay unavailable evidence to detect unresponsive relays on live hosts (#766).
+			// Record only the first unavailable timestamp for the current unavailability streak;
+			// it is cleared on successful relay/status answer and scoped per op so it cannot leak.
+			const trackerKey = relayUnavailableTrackerKey(bound.turn.opRef);
+			if (this.#manager.database.core.metaGet(trackerKey) === undefined) {
+				this.#manager.database.core.metaSet(trackerKey, this.#manager.now().toString());
+			}
 			return await this.#manager.port.status(base);
 		}
 	}
@@ -4023,6 +4242,11 @@ class OriginActor {
 	async #reconcileBound(bound: BoundTurn, knownReport?: StatusReport): Promise<void> {
 		if (this.#stopped || this.#manager.stopped) return;
 		if (this.#quarantinedTurn(bound.turn.opRef)) return;
+		const localRejection = localPreflightRejection(this.#manager.database, bound.turn.opRef);
+		if (localRejection) {
+			await this.#settleLocalPreflightRejection(bound, localRejection);
+			return;
+		}
 		bound.stallHostTerminated = confirmedStalledExit(this.#manager.database, {
 			opRef: bound.turn.opRef,
 			originKey: this.originKey,
@@ -4042,7 +4266,7 @@ class OriginActor {
 				await this.#closeTerminatedStalledTurn(bound);
 				return;
 			}
-			if (await this.#escalateUnresolvedHold(bound.turn, bound)) {
+			if (await this.#escalateUnresolvedHold(bound.turn, bound, { status: "unavailable" })) {
 				await this.#dispatchNext();
 				return;
 			}
@@ -4058,7 +4282,12 @@ class OriginActor {
 			this.#scheduleStatusRecheck(bound);
 			return;
 		}
-		if (report.status.status === "unknown") {
+		// Check for relay unavailable evidence even with "in_flight" status (#766).
+		const relayTrackerTs = this.#manager.database.core.metaGet(relayUnavailableTrackerKey(bound.turn.opRef));
+		const hasRelayUnavailableEvidence =
+			relayTrackerTs !== undefined &&
+			this.#manager.now() - Number.parseInt(relayTrackerTs, 10) >= this.#manager.unresolvedHoldMs;
+		if (report.status.status === "unknown" || (report.status.status === "in_flight" && hasRelayUnavailableEvidence)) {
 			const count = (this.#holdSweeps.get(bound.turn.opRef) ?? 0) + 1;
 			this.#holdSweeps.set(bound.turn.opRef, count);
 			const state = this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state;
@@ -4068,11 +4297,13 @@ class OriginActor {
 			}
 			// Neither a missing acknowledgement nor queue/session observations
 			// establish non-admission or authorize a new operation identity.
-			if (await this.#escalateUnresolvedHold(bound.turn, bound)) {
+			if (await this.#escalateUnresolvedHold(bound.turn, bound, { status: report.status.status })) {
 				await this.#dispatchNext();
 				return;
 			}
-			this.#logRecoveryHoldOnce(bound.turn, "operation_state_unknown", `sweeps=${count}`);
+			const reason =
+				report.status.status === "unknown" ? "operation_state_unknown" : "relay_unavailable_holds_in_flight";
+			this.#logRecoveryHoldOnce(bound.turn, reason, `sweeps=${count}`);
 			if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
 			return;
 		}
@@ -4558,10 +4789,25 @@ class OriginActor {
 			const message =
 				"the session running this turn produced no terminal event before the stall deadline; the request was not resent";
 			try {
+				// Check if the turn delivered a reply that properly concluded (stopReason "stop").
+				// If it did, don't post the failure notice, as the user has their answer.
+				let forceFailureNotice = true;
+				if (bound.lastAssistantText !== undefined) {
+					const isAnswering = await this.#lastAssistantIsAnswering(bound);
+					// isAnswering === true: last message has stopReason "stop" → no notice needed
+					// isAnswering === false: last message has different stopReason → keep notice
+					// isAnswering === undefined: read failed → keep notice (fail safe)
+					if (isAnswering === true) {
+						forceFailureNotice = false;
+						this.#manager.log(
+							`stall_turn_answered_properly origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} last_stop_reason=stop`,
+						);
+					}
+				}
 				await bound.lifecycle.onFailure?.({
 					...bound,
 					error: new GjcRuntimeError(`session_unavailable: ${message}`, { code: "session_unavailable", message }),
-					forceFailureNotice: true,
+					forceFailureNotice,
 				});
 			} catch (error) {
 				this.#scheduleStatusRecheck(bound);
@@ -5193,6 +5439,16 @@ export function steerDirectedAtPersona(row: InboundMessageRow): boolean {
 		readonly replyTo?: { readonly fromSelf?: boolean };
 	};
 	return engagement.group !== true || engagement.mentioned === true || engagement.replyTo?.fromSelf === true;
+}
+
+function hasPersistedImages(imagesJson: string | null): boolean {
+	if (imagesJson === null) return false;
+	try {
+		const parsed: unknown = JSON.parse(imagesJson);
+		return !Array.isArray(parsed) || parsed.length > 0;
+	} catch {
+		return true;
+	}
 }
 
 function laneSteerText(row: InboundMessageRow, lifecycle?: PersonaTurnLifecycle): string {

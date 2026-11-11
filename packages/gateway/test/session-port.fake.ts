@@ -145,6 +145,8 @@ export class ScriptedSessionPort implements SessionPort {
 	readonly models: Array<{ sessionId: string; repo: string; selection: GjcModelSelection }> = [];
 	readonly serviceTiers: Array<{ sessionId: string; repo: string; tier: GjcServiceTier }> = [];
 	readonly closes: Array<{ sessionId: string; repo: string }> = [];
+	/** Per-session close attempts: errors preserve the live host; undefined succeeds. */
+	readonly closeOutcomes = new Map<string, Array<Error | undefined>>();
 	readonly statusReads: Array<{ sessionId: string; repo: string; opRef: string; relayUsed: boolean }> = [];
 	readonly #sessions = new Map<string, string>();
 	readonly #sessionStates = new Map<string, BrokerSession>();
@@ -214,12 +216,17 @@ export class ScriptedSessionPort implements SessionPort {
 
 	async close(input: { sessionId: string; repo: string }): Promise<void> {
 		this.closes.push(input);
+		const outcome = this.closeOutcomes.get(input.sessionId)?.shift();
+		if (outcome) throw outcome;
 		const state = this.#sessionStates.get(input.sessionId);
 		if (state) this.#sessionStates.set(input.sessionId, { ...state, live: false });
 	}
 
 	/** Background jobs each scripted host reports as running; an Error makes the read fail. */
 	readonly hostJobs = new Map<string, readonly RunningHostJob[] | Error>();
+	/** Explicit undefined models incomplete context evidence, rather than the default idle state. */
+	readonly hostTurnRunning = new Map<string, boolean | undefined | Error>();
+	readonly hostQueueEmpty = new Map<string, boolean | Error>();
 	/** Injects tail activity while a caller is awaiting the running-job probe. */
 	beforeRunningJobs?: (input: { sessionId: string; repo: string }) => void | Promise<void>;
 	/** Injects operation changes while a caller is awaiting host inspection. */
@@ -227,9 +234,27 @@ export class ScriptedSessionPort implements SessionPort {
 
 	async runningJobs(input: { sessionId: string; repo: string }): Promise<readonly RunningHostJob[]> {
 		await this.beforeRunningJobs?.(input);
+		if (this.#sessionStates.get(input.sessionId)?.live !== true) throw new Error("scripted host unavailable");
 		const jobs = this.hostJobs.get(input.sessionId) ?? [];
 		if (jobs instanceof Error) throw jobs;
 		return jobs;
+	}
+
+	async turnRunning(input: { sessionId: string; repo: string; relay?: TailHandle }): Promise<boolean | undefined> {
+		if (this.#sessionStates.get(input.sessionId)?.live !== true) throw new Error("scripted host unavailable");
+		if (this.hostTurnRunning.has(input.sessionId)) {
+			const running = this.hostTurnRunning.get(input.sessionId);
+			if (running instanceof Error) throw running;
+			return running;
+		}
+		return [...this.#operations.values()].some((op) => op.sessionId === input.sessionId && op.state === "in_flight");
+	}
+
+	async queueEmpty(input: { sessionId: string; repo: string; relay?: TailHandle }): Promise<boolean> {
+		if (this.#sessionStates.get(input.sessionId)?.live !== true) throw new Error("scripted host unavailable");
+		const empty = this.hostQueueEmpty.get(input.sessionId) ?? true;
+		if (empty instanceof Error) throw empty;
+		return empty;
 	}
 
 	/** Ends the host of a retired session; a live seeded session is "terminated", anything else "already_gone". */
@@ -280,6 +305,7 @@ export class ScriptedSessionPort implements SessionPort {
 
 	async send(input: SessionSendInput): Promise<SendReceipt> {
 		this.sendAttempts.push(input);
+		input.beforeWrite?.();
 		if (this.#operations.has(input.opRef))
 			throw new OpRefRejectedError(input.opRef, "client_ref_conflict", { code: "client_ref_conflict" });
 		this.sends.push(input);
@@ -488,12 +514,12 @@ export class ScriptedSessionPort implements SessionPort {
 		);
 	}
 
-	readonly #assistantRows = new Map<string, Array<{ text: string; at: number }>>();
+	readonly #assistantRows = new Map<string, Array<{ text: string; at: number; stopReason?: string }>>();
 
 	/** Scripts a transcript assistant row; a session with scripted rows answers fetchAssistantSince from them only. */
-	appendAssistant(sessionId: string, text: string, at: number = Date.now()): void {
+	appendAssistant(sessionId: string, text: string, at: number = Date.now(), stopReason?: string): void {
 		const rows = this.#assistantRows.get(sessionId) ?? [];
-		rows.push({ text, at });
+		rows.push({ text, at, stopReason });
 		this.#assistantRows.set(sessionId, rows);
 	}
 
@@ -504,7 +530,7 @@ export class ScriptedSessionPort implements SessionPort {
 			const eligible = rows.filter((row) => row.at + 2_000 >= input.notBeforeMs);
 			const chosen =
 				(input.preferSpoken ? eligible.filter((row) => !isSilentReply(row.text)).at(-1) : undefined) ?? eligible.at(-1);
-			return chosen ? { text: chosen.text, pages: 1, complete: true } : undefined;
+			return chosen ? { text: chosen.text, pages: 1, complete: true, stopReason: chosen.stopReason } : undefined;
 		}
 		const operation = [...this.#operations.values()]
 			.reverse()
@@ -528,6 +554,11 @@ export class ScriptedSessionPort implements SessionPort {
 		handles.add(handle);
 		this.#tails.set(input.sessionId, handles);
 		return handle;
+	}
+
+	/** Test-only accessor to get tail handles for a session. */
+	getTailHandles(sessionId: string): ReadonlySet<ScriptedTailHandle> {
+		return this.#tails.get(sessionId) ?? new Set();
 	}
 
 	async runCompaction(_input: {
@@ -785,7 +816,10 @@ export class ScriptedSessionPort implements SessionPort {
 	}
 
 	/** Patches a bound session's state, or seeds one the port never bound (a session left on disk by an earlier runtime). */
-	setSessionState(sessionId: string, patch: Partial<Pick<BrokerSession, "repo" | "live" | "deleted">>): void {
+	setSessionState(
+		sessionId: string,
+		patch: Partial<Pick<BrokerSession, "repo" | "live" | "deleted" | "activityState">>,
+	): void {
 		const current = this.#sessionStates.get(sessionId) ?? { sessionId, repo: "", live: false, deleted: false };
 		this.#sessionStates.set(sessionId, { ...current, ...patch });
 	}
@@ -813,6 +847,7 @@ export class ScriptedSessionPort implements SessionPort {
 
 	seedAcceptedSend(input: SessionSendInput, state: Operation["state"] = "in_flight", text = ""): void {
 		this.sendAttempts.push(input);
+		input.beforeWrite?.();
 		this.sends.push(input);
 		const now = Date.now();
 		this.#operations.set(input.opRef, {

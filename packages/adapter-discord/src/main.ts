@@ -1,5 +1,6 @@
 import { basename, join } from "node:path";
 import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
+import { ImagePreparationBudget } from "@gajae-gateway/images";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import {
 	type ChannelEngagementPolicy,
@@ -9,6 +10,7 @@ import {
 	type OriginRef,
 	PRESENCE_ALL_MARKERS,
 	type PresenceState,
+	type PromptImage,
 	presenceInitial,
 	presenceMarkersFor,
 	presenceTransition,
@@ -18,7 +20,15 @@ import {
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import { AttachmentBuilder, Client, GatewayIntentBits, MessageFlags, Partials } from "discord.js";
 import pkg from "../package.json";
-import { type AttachmentCarrier, describeInboundBody, firstVoiceMessage } from "./attachments";
+import {
+	type AttachmentCarrier,
+	createDiscordImagePreparer,
+	DiscordImagePreparationError,
+	describeInboundBody,
+	firstVoiceMessage,
+	prepareDiscordImages,
+	selectNativeImageAttachments,
+} from "./attachments";
 import { type AuthorLike, resolveDisplayName, resolveServerTag } from "./author";
 import {
 	adapterHome,
@@ -197,6 +207,7 @@ export interface DiscordInboundMessage extends DiscordMessageOriginShape, ReplyM
 	readonly id: string;
 	readonly content: string;
 	readonly createdTimestamp?: number;
+	readonly editedTimestamp?: number | null;
 	readonly author: {
 		readonly id: string;
 		readonly bot?: boolean;
@@ -338,6 +349,10 @@ export function describeMessageEdit(
 	if (typeof editedAt !== "number") return undefined;
 	const engagement = decideInbound(message, botUser, channels);
 	if (!engagement) return undefined;
+	// chat.edit has no image field. Never turn a replacement image into a
+	// text-only edit that could leave the gateway's previous image in effect.
+	if (selectNativeImageAttachments(message).length > 0 || (before && selectNativeImageAttachments(before).length > 0))
+		return undefined;
 	const text = describeInboundBody(message);
 	if (text === "") return undefined;
 	if (before && !before.partial && describeInboundBody({ ...before, content: before.content ?? "" }) === text)
@@ -907,6 +922,44 @@ function endDiscordWorkingState(
 		);
 }
 
+/**
+ * Sends a delivery's first part, threaded to `reference` when given. failIfNotExists keeps a
+ * deleted target from failing the delivery; a malformed reference (Discord 50035 Invalid Form
+ * Body, e.g. a non-snowflake id) fails before anything posts, so the part is resent once without
+ * the reference instead of losing the text (#763).
+ */
+async function sendFirstDiscordPart(
+	channel: DiscordTextChannelLike,
+	part: { content: string; files?: readonly unknown[] },
+	reference: string | undefined,
+): Promise<void> {
+	const plain = part.files ? { files: part.files, content: part.content } : part.content;
+	if (!reference) {
+		await channel.send(plain);
+		return;
+	}
+	try {
+		await channel.send({ ...part, reply: { messageReference: reference, failIfNotExists: false } });
+	} catch (error) {
+		const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
+		if (code !== "50035") throw error;
+		console.log(
+			`discord reply_reference_rejected reference=${JSON.stringify(reference.slice(0, 80))}; resending without it`,
+		);
+		await channel.send(plain);
+	}
+}
+
+async function sendDiscordInboundNotice(message: DiscordInboundMessage, content: string): Promise<void> {
+	const channel = message.channel as typeof message.channel & { send?: DiscordTextChannelLike["send"] };
+	if (typeof channel.send !== "function") return;
+	try {
+		await sendFirstDiscordPart({ send: channel.send.bind(channel) }, { content }, message.id);
+	} catch {
+		console.error(`Discord inbound image notice failed message=${message.id}.`);
+	}
+}
+
 export async function settleDiscordDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	discord: DiscordClientLike,
@@ -939,36 +992,21 @@ export async function settleDiscordDelivery(
 		}
 		const chunks = text === "" ? [] : chunkDiscordMessage(text);
 		const files = mediaResult.attachments;
+		// Reply-threading applies to the first send only. A reply reference points into the thread, so
+		// it is dropped on parent fallback (notice).
+		const reference = message.replyToMessageId && !notice ? message.replyToMessageId : undefined;
 		try {
 			if (files.length > 0 && chunks.length === 0) {
-				const reply =
-					message.replyToMessageId && !notice
-						? { messageReference: message.replyToMessageId, failIfNotExists: false }
-						: undefined;
-				await channel.send({
-					files,
-					content: chunks[0] ?? "",
-					...(reply ? { reply } : {}),
-				});
+				await sendFirstDiscordPart(channel, { files, content: "" }, reference);
 			} else {
 				for (let index = 0; index < chunks.length; index++) {
-					// Reply-threading applies to the first chunk only; failIfNotExists keeps a
-					// deleted target from failing the whole delivery.
 					const chunk = chunks[index] as string;
-					// A reply reference points into the thread, so it is dropped on parent fallback.
-					if (index === 0 && files.length > 0)
-						await channel.send({
-							content: chunk,
-							files,
-							...(message.replyToMessageId && !notice
-								? { reply: { messageReference: message.replyToMessageId, failIfNotExists: false } }
-								: {}),
-						});
-					else if (index === 0 && message.replyToMessageId && !notice)
-						await channel.send({
-							content: chunk,
-							reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
-						});
+					if (index === 0)
+						await sendFirstDiscordPart(
+							channel,
+							files.length > 0 ? { content: chunk, files } : { content: chunk },
+							reference,
+						);
 					else await channel.send(chunk);
 				}
 			}
@@ -1228,6 +1266,7 @@ async function decodePcmWithFfmpeg(ogg: Uint8Array): Promise<Int16Array | undefi
 }
 
 export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): Promise<void> {
+	const prepareImages = createDiscordImagePreparer(new ImagePreparationBudget());
 	const discord = new Client({
 		intents: [...new Set([...REQUIRED_INTENTS, ...(config.intents ?? [])])],
 		// DM channels are not cached on a cold start; without the Channel partial
@@ -1257,6 +1296,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		undefined,
 		discordSpeechPorts(config.voice),
 		config.gatewayDownAlert ? gatewayDownAlarm(discord, config.gatewayDownAlert) : undefined,
+		prepareImages,
 	);
 	// Transcription makes ingress asynchronous, and two messages in one
 	// conversation must not overtake each other while one waits on the network.
@@ -1277,6 +1317,16 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		const receivedAt =
 			typeof message.createdTimestamp === "number" ? new Date(message.createdTimestamp).toISOString() : undefined;
 		ingress.run(origin.conversationId, async () => {
+			let preparedImages: { readonly images: PromptImage[]; readonly notice: string };
+			try {
+				preparedImages = await prepareImages(message);
+			} catch {
+				// The shared helper sanitizes its failure; omit its details here as a
+				// final guard against a signed CDN URL reaching logs. No text fallback.
+				console.error(`Discord image preparation failed message=${message.id}; no chat.send was issued.`);
+				return;
+			}
+			// Do not create a thread or emit notices for an image that cannot be sent.
 			// Auto-create thread on mention in channel (Hermes-like contract).
 			void nameThreadFromMessage(message, origin, unnamedThreads);
 			origin = await maybeCreateThreadOnMention(
@@ -1295,7 +1345,22 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			// spoken message is answered in voice and text both, without the
 			// persona having to ask for it.
 			const spoken = firstVoiceMessage(message) !== undefined;
-			gateway.sendInbound(message.id as string, origin, body, engagement, receivedAt, spoken, messageChannelId);
+			if (preparedImages.images.length === 0) {
+				gateway.sendInbound(message.id as string, origin, body, engagement, receivedAt, spoken, messageChannelId);
+				return;
+			}
+			const accepted = await gateway.requestInbound(
+				message.id as string,
+				origin,
+				body,
+				engagement,
+				receivedAt,
+				spoken,
+				messageChannelId,
+				preparedImages.images,
+			);
+			if (accepted?.engaged && accepted.turnId != null && preparedImages.notice)
+				await sendDiscordInboundNotice(message, `Image processing: ${preparedImages.notice}`);
 		});
 	});
 	// An edit is an update of a message the persona may already have read, not a
@@ -1306,6 +1371,13 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		void (async () => {
 			const message = after.partial ? await after.fetch().catch(() => undefined) : after;
 			if (!message) return;
+			const imageEdit =
+				selectNativeImageAttachments(message).length > 0 || selectNativeImageAttachments(before).length > 0;
+			if (imageEdit) {
+				if (typeof message.editedTimestamp === "number" && decideInbound(message, discord.user, config.channels))
+					console.error(`Discord image edit rejected message=${message.id}; native image edits are unsupported.`);
+				return;
+			}
 			const edit = describeMessageEdit(message, discord.user, config.channels, before);
 			if (!edit) return;
 			ingress.run(edit.origin.conversationId, async () => {
@@ -1535,7 +1607,8 @@ export async function handleSlashCommand(
 
 /** Outcome of one recovery send; every failure carries its classification. */
 export type RecoveredSendResult =
-	| { readonly verdict: "acked" | "duplicate" }
+	| { readonly verdict: "acked"; readonly engaged?: boolean; readonly turnId?: string | null }
+	| { readonly verdict: "duplicate" }
 	| { readonly verdict: "unavailable"; readonly failure: RecoveryFailureClass; readonly summary: string };
 
 export class ReconnectingGateway {
@@ -1568,6 +1641,7 @@ export class ReconnectingGateway {
 		readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 		readonly speech?: DiscordSpeechPorts,
 		readonly downAlarm?: GatewayDownAlarm,
+		readonly prepareImages: typeof prepareDiscordImages = prepareDiscordImages,
 	) {
 		this.#client = initialClient;
 		void this.ensureCursors();
@@ -1593,6 +1667,7 @@ export class ReconnectingGateway {
 		try {
 			const options = {
 				clientName: "adapter-discord",
+				requiredCapabilities: ["chat.images"],
 				onRetry: (attempt: number, delayMs: number, error: unknown) =>
 					console.warn(
 						`gateway_socket_waiting client=adapter-discord path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${error instanceof Error ? error.message : String(error)}`,
@@ -1771,18 +1846,48 @@ export class ReconnectingGateway {
 		const outcome = await recoverConversation(fetched, {
 			cursor: before,
 			nowMs: Date.now(),
+			// Attachment-only image messages have empty content but still need to
+			// reach deliver so their native bytes are recovered with the turn.
+			skipEmptyContent: false,
 			deliver: async (message) => {
 				// Same normalization as live messageCreate: one decision, one origin shape,
 				// one gateway verb — recovery never forks engagement semantics.
 				const engagement = decideInbound(message, botUser, this.config.channels);
 				if (!engagement) return "skip";
+				const text = describeInboundBody(message);
+				if (text === "") return "skip";
+				let preparedImages: { readonly images: PromptImage[]; readonly notice: string } | undefined;
+				let imageFailure: DiscordImagePreparationError | undefined;
+				let preparationDone = false;
 				const origin = discordMessageOrigin(message);
 				let failure: RecoveryFailureClass = "write-path-unknown";
 				let summary = "unclassified chat.send failure";
 				for (let attempt = 1; attempt <= RECOVERY_MAX_ATTEMPTS; attempt++) {
-					const result = await this.requestRecovered(message.id, origin, message.content, engagement);
+					if (!preparationDone && imageFailure?.disposition !== "terminal") {
+						try {
+							preparedImages = await this.prepareImages(message);
+							imageFailure = undefined;
+							preparationDone = true;
+						} catch (error) {
+							imageFailure =
+								error instanceof DiscordImagePreparationError ? error : new DiscordImagePreparationError("retryable");
+							console.error(
+								`Discord recovery image preparation ${imageFailure.disposition} failure message=${message.id}; no text-only send will be attempted.`,
+							);
+						}
+					}
+					const result = imageFailure
+						? {
+								verdict: "unavailable" as const,
+								failure:
+									imageFailure.disposition === "terminal" ? ("terminal-message" as const) : ("retryable" as const),
+								summary: imageFailure.disposition === "terminal" ? "image input rejected" : "image download failed",
+							}
+						: await this.requestRecovered(message.id, origin, text, engagement, preparedImages?.images);
 					if (result.verdict !== "unavailable") {
 						this.forgetAttempts(message.id);
+						if (result.verdict === "acked" && result.engaged && result.turnId != null && preparedImages?.notice)
+							await sendDiscordInboundNotice(message, `Image processing: ${preparedImages.notice}`);
 						return result.verdict;
 					}
 					failure = result.failure;
@@ -1792,6 +1897,28 @@ export class ReconnectingGateway {
 					this.noteAttempt(message.id, channelId, failure, summary);
 					if (attempt < RECOVERY_MAX_ATTEMPTS) await this.sleep(RECOVERY_ATTEMPT_BACKOFF_MS * 2 ** (attempt - 1));
 				}
+				if (
+					imageFailure?.disposition === "terminal" &&
+					(this.#cursors?.attempts[message.id]?.terminalAttempts ?? 0) >= RECOVERY_MAX_ATTEMPTS
+				) {
+					this.flushCursors();
+					const attempts = this.#cursors?.attempts[message.id]?.terminalAttempts ?? RECOVERY_MAX_ATTEMPTS;
+					this.deadLetter({
+						messageId: message.id,
+						conversationId: channelId,
+						classification: "terminal-message",
+						attempts,
+						at: new Date().toISOString(),
+						summary: "image input rejected",
+					});
+					this.forgetAttempts(message.id);
+					console.error(
+						`Discord recovery rejected image message ${message.id} in channel ${channelId} after ${attempts} terminal preparation failures; dead-lettered without chat.send.`,
+					);
+					// Unlike a gateway terminal rejection, no later successful send is
+					// needed to prove the write path: local image validation is decisive.
+					return "skip";
+				}
 				this.flushCursors();
 				const terminalAttempts = this.#cursors?.attempts[message.id]?.terminalAttempts ?? 0;
 				// Out of per-pass budget. A discard is only *proposed* here, and only with
@@ -1800,7 +1927,7 @@ export class ReconnectingGateway {
 				// so a contract regression that fails every message discards nothing.
 				if (failure === "terminal-message" && terminalAttempts >= RECOVERY_MAX_ATTEMPTS) {
 					console.error(
-						`Discord recovery proposes discarding message ${message.id} in channel ${channelId} after ${terminalAttempts} terminal chat.send rejections (${summary}); held until a later message proves the write path works.`,
+						`Discord recovery proposes discarding message ${message.id} in channel ${channelId} after ${terminalAttempts} terminal message failures (${summary}); held until a later message proves the write path works.`,
 					);
 					return "discard-candidate";
 				}
@@ -1812,7 +1939,7 @@ export class ReconnectingGateway {
 			onDiscard: (message) => {
 				const ledger = this.#cursors?.attempts[message.id];
 				console.error(
-					`Discord recovery is DISCARDING message ${message.id} in channel ${channelId} after ${ledger?.terminalAttempts ?? RECOVERY_MAX_ATTEMPTS} terminal chat.send rejections (${ledger?.summary ?? "terminal rejection"}). Dead-lettered; the rest of the backfill continues.`,
+					`Discord recovery is DISCARDING message ${message.id} in channel ${channelId} after ${ledger?.terminalAttempts ?? RECOVERY_MAX_ATTEMPTS} terminal message failures (${ledger?.summary ?? "terminal rejection"}). Dead-lettered; the rest of the backfill continues.`,
 				);
 				this.deadLetter({
 					messageId: message.id,
@@ -2013,8 +2140,9 @@ export class ReconnectingGateway {
 		receivedAt?: string,
 		voice?: boolean,
 		messageChannelId?: string,
+		images?: readonly PromptImage[],
 	): void {
-		void this.requestInbound(messageId, origin, text, engagement, receivedAt, voice, messageChannelId);
+		void this.requestInbound(messageId, origin, text, engagement, receivedAt, voice, messageChannelId, images);
 	}
 
 	/**
@@ -2153,12 +2281,13 @@ export class ReconnectingGateway {
 		 * thread, but its presence markers belong on the message in the parent.
 		 */
 		messageChannelId?: string,
-	): Promise<{ engaged?: boolean } | undefined> {
+		images?: readonly PromptImage[],
+	): Promise<{ engaged?: boolean; turnId?: string | null } | undefined> {
 		if (origin.platform === "discord" && origin.kind === "dm") {
 			await this.ensureCursors();
 			if (this.#cursors) this.persist(rememberKnownDm(this.#cursors, origin.conversationId, Date.now()));
 		}
-		let result: { engaged?: boolean } | undefined;
+		let result: { engaged?: boolean; turnId?: string | null } | undefined;
 		const verdict = await this.#inbound.join(messageId, async () => {
 			const client = this.#client;
 			if (!client) {
@@ -2168,13 +2297,14 @@ export class ReconnectingGateway {
 			try {
 				// The gateway acknowledges engagement before running the turn, so typing starts only for
 				// turns that will actually produce a reply and never outlives the delivery that clears it.
-				result = await client.request<{ engaged?: boolean }>("chat.send", {
+				result = await client.request<{ engaged?: boolean; turnId?: string | null }>("chat.send", {
 					origin,
 					text,
 					engagement,
 					messageId,
 					...(receivedAt ? { receivedAt } : {}),
 					...(voice ? { voice: true } : {}),
+					...(images?.length ? { images } : {}),
 				});
 				// No recovery-watermark write here on purpose: a live message is no evidence that
 				// the older messages behind it were ever backfilled (issue #33).
@@ -2215,9 +2345,11 @@ export class ReconnectingGateway {
 		origin: OriginRef,
 		text: string,
 		engagement: EngagementContext,
+		images?: readonly PromptImage[],
 	): Promise<RecoveredSendResult> {
 		let failure: RecoveryFailureClass | undefined;
 		let summary: string | undefined;
+		let response: { engaged?: boolean; turnId?: string | null } | undefined;
 		const verdict = await this.#inbound.join(messageId, async () => {
 			const client = this.#client;
 			if (!client) {
@@ -2226,7 +2358,13 @@ export class ReconnectingGateway {
 				return "unavailable";
 			}
 			try {
-				await client.request("chat.send", { origin, text, engagement, messageId });
+				response = await client.request<{ engaged?: boolean; turnId?: string | null }>("chat.send", {
+					origin,
+					text,
+					engagement,
+					messageId,
+					...(images?.length ? { images } : {}),
+				});
 				return "acked";
 			} catch (error) {
 				failure = classifyRecoveryFailure(error);
@@ -2234,7 +2372,13 @@ export class ReconnectingGateway {
 				return "unavailable";
 			}
 		});
-		if (verdict !== "unavailable") return { verdict };
+		if (verdict === "acked")
+			return {
+				verdict,
+				...(response?.engaged ? { engaged: true } : {}),
+				...(response?.turnId !== undefined ? { turnId: response.turnId } : {}),
+			};
+		if (verdict === "duplicate") return { verdict };
 		return {
 			verdict,
 			failure: failure ?? "write-path-unknown",

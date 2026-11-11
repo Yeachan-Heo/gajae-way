@@ -10,6 +10,7 @@ import {
 	type OriginRef,
 	originKey,
 	type ProtocolFailureReason,
+	parseOriginKey,
 } from "@gajae-gateway/protocol";
 import { envelopeErrorCode, GjcCliError, type StatusReport } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
@@ -28,6 +29,7 @@ import {
 } from "../orchestrator/session-port";
 import { RelayClosedError, RelayHelloError, RelayRefusedError } from "../orchestrator/tail-runner";
 import { BrokerAuthorityError, type Store } from "../store";
+import { isBrokerPromptBusyRefusal } from "../store/groups/bindings";
 import {
 	MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS,
 	MONITOR_EVENT_MAX_OPEN_AGE_MS,
@@ -184,6 +186,7 @@ interface AuthoringTurnPointer {
 	readonly sessionId: string;
 	readonly opRef: string;
 	readonly eventIds: readonly string[];
+	readonly sizeRolled?: boolean;
 }
 
 type ExhaustedTurnDisposition =
@@ -275,6 +278,8 @@ export interface MonitorSessionSafetyState {
 	priorRunBusyFailures: number;
 	/** Result of the last native-compaction attempt, or undefined if never attempted. */
 	nativeCompaction: NativeCompactionStatus | undefined;
+	/** Last observed context token count in the current session epoch. */
+	lastContextTokens: number | undefined;
 	/** Armed roll: consumed at the next dispatch boundary. */
 	pendingRoll: SessionRollReason | undefined;
 	/** Reason of the last roll actually performed. */
@@ -308,6 +313,9 @@ export class MonitorPropagator {
 	#inFlight = new Set<string>();
 	/** Re-entrancy guard: only one reconcile sweep may run at a time in this process. */
 	#reconciling = false;
+	#retiredSweep: Promise<void> | undefined;
+	/** Shared by inline and background retirement attempts in this process. */
+	#retiringKeys = new Set<string>();
 	/** In-flight dispatch promises per event, for awaitable submission. */
 	#inFlightPromises = new Map<string, Promise<void>>();
 	/** Lease/batch identity per event this process is authoring right now. */
@@ -450,13 +458,14 @@ export class MonitorPropagator {
 	async drain(timeoutMs = MONITOR_SHUTDOWN_DRAIN_MS): Promise<void> {
 		this.dispose();
 		const deadline = this.#now() + Math.max(0, timeoutMs);
-		while (this.#reconciling || this.#inFlightPromises.size > 0) {
+		while (this.#reconciling || this.#inFlightPromises.size > 0 || this.#retiredSweep) {
 			const remaining = deadline - this.#now();
 			if (remaining <= 0) {
 				this.#interruptClaims();
 				return;
 			}
 			const active = [...new Set(this.#inFlightPromises.values())];
+			if (this.#retiredSweep) active.push(this.#retiredSweep);
 			await Promise.race([Promise.all(active), Bun.sleep(Math.min(remaining, 50))]);
 		}
 	}
@@ -642,6 +651,7 @@ export class MonitorPropagator {
 	 */
 	async reconcile(): Promise<void> {
 		this.reapStale();
+		this.#startRetiredSessionSweep();
 		if (this.#reconciling) {
 			// Yield once so a caller racing the first sweep observes its claimed work
 			// rather than an artificial pre-bind microtask gap in the shared port.
@@ -870,15 +880,16 @@ export class MonitorPropagator {
 	}
 
 	/**
-	 * Only an explicitly failed operation, or one whose own result is definitively
-	 * unreadable, can be discarded; a completed operation whose result is readable
-	 * is resumed under its original op-ref.
+	 * Untagged failed operations retain their existing terminal disposition. A
+	 * size-retired pointer needs definitive output loss or its exact durable busy
+	 * refusal before retirement; its tag applies even after retry exhaustion.
 	 */
-	async #exhaustedTurnDisposition(row: MonitorEventDbRow): Promise<ExhaustedTurnDisposition> {
+	async #exhaustedTurnDisposition(row: MonitorEventDbRow, ownedLeaseId?: string): Promise<ExhaustedTurnDisposition> {
 		const raw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
 		if (raw === undefined) return { kind: "terminal", raw };
 		const turn = parseAuthoringTurnPointer(raw);
 		if (!turn?.eventIds.includes(row.event_id)) return { kind: "hold", reason: "unresolved" };
+		if (turn.sizeRolled && this.#promptBusyRefused(turn)) return { kind: "terminal", raw };
 		const monitor = this.#registry.get(row.monitor_id);
 		// The per-event pointer owns the original session/op-ref. Do not infer the
 		// session from row.event_type (including catch-all) or the current binding.
@@ -890,21 +901,31 @@ export class MonitorPropagator {
 			return { kind: "hold", reason: "unresolved" };
 		}
 		const state = report.status?.status;
-		if (state === "failed") return { kind: "terminal", raw };
+		if (state === "failed" && !turn.sizeRolled) return { kind: "terminal", raw };
 		if (state === "accepted" || state === "in_flight") return { kind: "hold", reason: "running" };
-		if (state !== "terminal_ok") return { kind: "hold", reason: "unresolved" };
+		if (state !== "terminal_ok" && !(state === "failed" && turn.sizeRolled)) {
+			// Durable no-send failures (busy-refused, submission-wedged, host-unavailable)
+			// are explicit evidence the operation was never sent. Forget the pointer and recover.
+			// HOWEVER: verify the failure belongs to this pointer's operation (#742).
+			const failure = this.#database.monitors.failure(row.event_id);
+			if (isDurableNoSendFailureForOperation(failure, turn.sessionId, turn.opRef)) {
+				return { kind: "terminal", raw };
+			}
+			return { kind: "hold", reason: "unresolved" };
+		}
 		// The turn has ended. If the monitor is gone, the events are now unrecoverable.
 		if (!monitor) return { kind: "monitor_invalid", raw };
 		const related: MonitorEventDbRow[] = [];
 		for (const eventId of turn.eventIds) {
 			const current = this.#database.monitors.eventGet(eventId);
+			const liveLeaseId = this.#database.monitors.eventLiveLeaseOwner(eventId, this.#now());
 			if (
 				!current ||
 				current.monitor_id !== row.monitor_id ||
 				current.event_type !== row.event_type ||
 				(TERMINAL_STAGES as readonly string[]).includes(current.stage) ||
 				this.#database.core.metaGet(authoringTurnKey(eventId)) !== raw ||
-				this.#database.monitors.eventLiveLeaseOwner(eventId, this.#now())
+				(liveLeaseId !== undefined && liveLeaseId !== ownedLeaseId)
 			)
 				return { kind: "hold", reason: "unresolved" };
 			related.push(current);
@@ -913,8 +934,9 @@ export class MonitorPropagator {
 		// read is an unresolved hold (age-bounded); a definitively unreadable one is
 		// terminal: retrying could only resend the prompt.
 		const output = await this.#readAuthoringResult(turn, related, report);
-		if (output.status === "unavailable") return { kind: "terminal", raw };
-		if (output.status === "absent") return { kind: "hold", reason: "unresolved" };
+		if (output.status === "unavailable" && (!turn.sizeRolled || output.definitiveLoss))
+			return { kind: "terminal", raw };
+		if (output.status !== "proven") return { kind: "hold", reason: "unresolved" };
 		return { kind: "resume", turn };
 	}
 
@@ -979,6 +1001,10 @@ export class MonitorPropagator {
 						!this.#database.monitors.eventLiveLeaseOwner(row.event_id, this.#now()),
 				);
 			if (!reopenable(members)) continue;
+			if (turn.sizeRolled && this.#promptBusyRefused(turn)) {
+				this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, turn.eventIds, raw));
+				continue;
+			}
 			let report: StatusReport;
 			try {
 				report = await this.#sessionPort.status({ sessionId: turn.sessionId, repo: this.#repo, opRef: turn.opRef });
@@ -987,12 +1013,12 @@ export class MonitorPropagator {
 			}
 			const state = report.status?.status;
 			if (state === "failed") {
-				this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, turn.eventIds, raw));
+				if (!turn.sizeRolled) this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, turn.eventIds, raw));
 				continue;
 			}
 			if (state !== "terminal_ok") continue;
 			const output = await this.#readAuthoringResult(turn, members, report);
-			if (output.status === "unavailable") {
+			if (output.status === "unavailable" && (!turn.sizeRolled || output.definitiveLoss)) {
 				this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, turn.eventIds, raw));
 				continue;
 			}
@@ -1076,13 +1102,15 @@ export class MonitorPropagator {
 			(resumeTurn.eventIds.length !== eventIds.length || !resumeTurn.eventIds.every((id) => eventIds.includes(id)))
 		)
 			return;
-		const savedTurnMatches = () =>
-			!resumeTurn ||
-			resumeTurn.eventIds.every((eventId) => {
+		const savedTurnMatches = () => {
+			const turn = resumeTurn;
+			if (!turn) return true;
+			return turn.eventIds.every((eventId) => {
 				const raw = this.#database.core.metaGet(authoringTurnKey(eventId));
 				const saved = raw === undefined ? undefined : parseAuthoringTurnPointer(raw);
-				return saved !== undefined && sameAuthoringTurn(saved, resumeTurn);
+				return saved !== undefined && sameAuthoringTurn(saved, turn);
 			});
+		};
 		const resumeRowsSafe = (candidateRows: readonly MonitorEventDbRow[]) => {
 			if (!resumeTurn) return true;
 			const first = candidateRows[0];
@@ -1259,6 +1287,7 @@ export class MonitorPropagator {
 			let protocolResponseEntryCount: number | null = null;
 			let protocolValidationActive = false;
 			let readinessFailure: { readonly code: string; readonly detail: string } | undefined;
+			let opRef: string | undefined;
 			const flushReadinessFailure = () => {
 				if (!readinessFailure) return;
 				this.#recordReadinessFailure({
@@ -1269,8 +1298,35 @@ export class MonitorPropagator {
 				readinessFailure = undefined;
 			};
 			try {
+				if (!resumeTurn) {
+					const liveSessionId = this.#database.bindings.getSessionRecord(sessionOriginKey)?.sessionId;
+					for (const row of claimed) {
+						const raw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
+						const saved = raw === undefined ? undefined : parseAuthoringTurnPointer(raw);
+						// Only size-retired pointers need strict original-session evidence.
+						// Failure rotations retain the ordinary reuse path (#187).
+						if (!saved?.sizeRolled || saved.sessionId === liveSessionId) continue;
+						dispatchPhase = "request";
+						if (
+							saved.eventIds.length !== claimed.length ||
+							!claimed.every((member) => saved.eventIds.includes(member.event_id))
+						)
+							throw new AuthoringResultUnavailableError("output_pending");
+						if (this.#promptBusyRefused(saved)) {
+							this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, saved.eventIds, raw));
+							break;
+						}
+						const disposition = await this.#exhaustedTurnDisposition(row, leaseId);
+						if (disposition.kind === "resume") resumeTurn = disposition.turn;
+						else if (disposition.kind === "terminal")
+							this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, saved.eventIds, disposition.raw));
+						else throw new AuthoringResultUnavailableError("output_pending");
+						break;
+					}
+				}
 				// A completed saved turn must be harvested before a pending roll changes
 				// its session ID. Fresh dispatches still roll at this boundary (#68).
+				if (!resumeTurn) await this.#retireRolledSessions(sessionOriginKey);
 				const digest = resumeTurn
 					? undefined
 					: this.#rollSessionIfArmed(sessionOriginKey, JSON.stringify(sessionOrigin), monitor);
@@ -1362,14 +1418,169 @@ export class MonitorPropagator {
 				// the turn it started may still be running. Reuse its op-ref on retry.
 				const authoringEventIds = resumeTurn?.eventIds ?? claimed.map((row) => row.event_id);
 				const reusedOpRef = resumeTurn?.opRef ?? (await this.#reusableAuthoringTurn(authoringEventIds, sessionId));
-				const opRef = reusedOpRef ?? `gw-m-${batchId.replaceAll("-", "")}`;
-				const pendingTurn = JSON.stringify({ sessionId, opRef, eventIds: authoringEventIds });
+				opRef = reusedOpRef ?? `gw-m-${batchId.replaceAll("-", "")}`;
+				// #742: Check if we should hold the pointer instead of overwriting it with a fresh opRef
+				let shouldThrowOutputPending = false;
+				const authority = this.#database.bindings.brokerAuthority();
+				if (reusedOpRef === undefined && !resumeTurn && authority) {
+					for (const row of claimed) {
+						const priorRaw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
+						const prior = priorRaw === undefined ? undefined : parseAuthoringTurnPointer(priorRaw);
+						if (prior && prior.sessionId === sessionId && prior.opRef !== opRef) {
+							// Check if we have positive evidence the prior opRef was never admitted
+							const brokerOp = this.#database.bindings.brokerOperation(
+								authority,
+								"turn.prompt",
+								JSON.stringify([sessionId, prior.opRef]),
+							);
+							if (!isBrokerPromptBusyRefusal(brokerOp)) {
+								// No positive never-admitted evidence: check actual status.
+								// Explicit failure permits fresh authoring; unknown status holds the pointer.
+								try {
+									const report = await this.#sessionPort.status({
+										sessionId,
+										repo: this.#repo,
+										opRef: prior.opRef,
+									});
+									const state = report.status?.status;
+									if (state === "failed") {
+										// Explicit failure permits fresh authoring
+									} else {
+										// Durable no-send failures (busy-refused, submission-wedged, host-unavailable)
+										// are explicit evidence the operation was never sent. Permit fresh authoring.
+										// HOWEVER: verify the failure belongs to this pointer's operation (#742).
+										const failure = this.#database.monitors.failure(row.event_id);
+										if (isDurableNoSendFailureForOperation(failure, prior.sessionId, prior.opRef)) {
+											// Durable failure: permit fresh authoring
+										} else {
+											// Unknown status, throwing, or other states: hold the pointer (#742)
+											shouldThrowOutputPending = true;
+											break;
+										}
+									}
+								} catch {
+									// Unable to check status: hold the pointer instead
+									shouldThrowOutputPending = true;
+									break;
+								}
+							}
+						}
+					}
+				}
+				if (shouldThrowOutputPending) {
+					throw new AuthoringResultUnavailableError("output_pending");
+				}
+				// #742: Check pointers with different sessionId before transaction.
+				// Resolve them against their own sessionId to decide whether to hold, forget, or harvest.
+				const eventIdsToForget: string[] = [];
+				if (reusedOpRef === undefined && !resumeTurn) {
+					for (const row of claimed) {
+						const priorRaw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
+						const prior = priorRaw === undefined ? undefined : parseAuthoringTurnPointer(priorRaw);
+						if (prior && prior.sessionId !== sessionId) {
+							// Binding moved after this pointer was created. A durable busy refusal for
+							// the exact old op proves it was never admitted, so it needs no status read
+							// from the old session, which may be unreachable after a roll.
+							if (
+								authority !== null &&
+								isBrokerPromptBusyRefusal(
+									this.#database.bindings.brokerOperation(
+										authority,
+										"turn.prompt",
+										JSON.stringify([prior.sessionId, prior.opRef]),
+									),
+								)
+							) {
+								eventIdsToForget.push(row.event_id);
+								continue;
+							}
+							// Otherwise resolve the old op against its own session.
+							try {
+								const report = await this.#sessionPort.status({
+									sessionId: prior.sessionId,
+									repo: this.#repo,
+									opRef: prior.opRef,
+								});
+								const state = report.status?.status;
+								if (state === "accepted" || state === "in_flight") {
+									// Old turn still running: hold this dispatch, keep the pointer.
+									throw new AuthoringResultUnavailableError("output_pending");
+								}
+								if (state === "terminal_ok") {
+									// Old turn finished: would harvest, but session context differs.
+									// For safety, hold instead of attempting cross-session harvest.
+									throw new AuthoringResultUnavailableError("output_pending");
+								}
+								if (state === "failed") {
+									// A terminally failed turn permits a fresh prompt.
+									eventIdsToForget.push(row.event_id);
+								} else if (state === "unknown" || typeof state === "undefined") {
+									// Unknown status: hold pointer for operator judgement (#742).
+									// Exception: explicit failure rolls invalidate old session context and allow fresh authoring.
+									const lastRoll = this.#safetyState(sessionOriginKey).lastRoll;
+									if (
+										lastRoll === "session_submission_wedged" ||
+										lastRoll === "session_busy_stalled" ||
+										lastRoll === "session_prior_run_busy_stalled" ||
+										lastRoll === "session_host_unavailable"
+									) {
+										// Explicit failure roll: old context is invalid, forget the pointer
+										eventIdsToForget.push(row.event_id);
+									} else {
+										// Size roll or other reasons: hold pointer
+										throw new AuthoringResultUnavailableError("output_pending");
+									}
+								} else {
+									// Other inconclusive status: hold pointer
+									throw new AuthoringResultUnavailableError("output_pending");
+								}
+							} catch (error) {
+								// Unreadable status in old session after explicit failure roll: forget the pointer (#742/#738).
+								// Failure codes (session_*_stalled, session_submission_wedged, session_host_unavailable)
+								// are definitive reasons to roll. The old session context is invalid.
+								const lastRoll = this.#safetyState(sessionOriginKey).lastRoll;
+								if (
+									lastRoll === "session_submission_wedged" ||
+									lastRoll === "session_busy_stalled" ||
+									lastRoll === "session_prior_run_busy_stalled" ||
+									lastRoll === "session_host_unavailable"
+								) {
+									// Explicit failure roll: forget the old pointer
+									eventIdsToForget.push(row.event_id);
+								} else {
+									// Other errors (size roll, unknown reason): hold the pointer
+									if (!(error instanceof AuthoringResultUnavailableError)) {
+										throw new AuthoringResultUnavailableError("output_pending");
+									}
+									throw error;
+								}
+							}
+						}
+					}
+				}
+				// Build turn with sizeRolled tracking from #738
+				const savedRaw = this.#database.core.metaGet(authoringTurnKey(authoringEventIds[0] ?? ""));
+				const savedTurn = savedRaw === undefined ? undefined : parseAuthoringTurnPointer(savedRaw);
+				const turn: AuthoringTurnPointer = {
+					sessionId,
+					opRef,
+					eventIds: authoringEventIds,
+					...(resumeTurn?.sizeRolled || (reusedOpRef !== undefined && savedTurn?.sizeRolled)
+						? { sizeRolled: true }
+						: {}),
+				};
+				const pendingTurn = JSON.stringify(turn);
 				this.#database.transaction((tx) => {
 					for (const row of claimed) {
 						const priorRaw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
 						const prior = priorRaw === undefined ? undefined : parseAuthoringTurnPointer(priorRaw);
-						if (prior && (prior.sessionId !== sessionId || prior.opRef !== opRef))
+						// Forget the prior pointer when same-session busy-refused OR in eventIdsToForget.
+						if (
+							eventIdsToForget.includes(row.event_id) ||
+							(prior && prior.sessionId === sessionId && prior.opRef !== opRef)
+						) {
 							this.#forgetAuthoringTurn(tx, [row.event_id], priorRaw);
+						}
 						this.#database.core.metaSet(authoringTurnKey(row.event_id), pendingTurn);
 					}
 				});
@@ -1378,27 +1589,47 @@ export class MonitorPropagator {
 				dispatchOperationArgs = {
 					opRef,
 				};
-				const requestInput = { sessionId, repo: this.#repo, originKey: sessionOriginKey, text: prompt, opRef };
+				const requestInput = {
+					sessionId,
+					repo: this.#repo,
+					originKey: sessionOriginKey,
+					text: prompt,
+					opRef,
+					...(reusedOpRef === undefined && this.#registry.get(monitor.monitorId)?.contextRollTokens !== undefined
+						? { sampleContext: true }
+						: {}),
+				};
+				const requestResult = reusedOpRef === undefined ? await this.#sessionPort.request(requestInput) : undefined;
 				const response =
-					reusedOpRef === undefined
-						? (await this.#sessionPort.request(requestInput)).assistant.text
-						: await this.#harvestAuthoringTurn(
-								requestInput,
-								{ sessionId, opRef, eventIds: authoringEventIds },
-								claimed,
-								pendingTurn,
-							);
+					requestResult !== undefined
+						? requestResult.assistant.text
+						: await this.#harvestAuthoringTurn(requestInput, turn, claimed, pendingTurn);
 				protocolResponseByteLength = Buffer.byteLength(response, "utf8");
 				dispatchPhase = "validate";
 				// The authoring turn is now part of the session transcript whatever its
 				// content, so it is counted here rather than after the response is
 				// validated. The count is OBSERVATIONAL: it is reported, and it never
-				// rolls a session on its own — native gjc compaction owns keeping the
-				// context bounded while the session is answering.
+				// rolls a session on its own. Native compaction owns context bounds;
+				// an owner may separately opt in to a context-size roll.
 				if (boundSessionEpoch !== undefined) {
-					const turns = this.#database.transaction((tx) =>
-						this.#database.bindings.incrementTurnCount(tx, sessionOriginKey, JSON.stringify(sessionOrigin)),
-					);
+					const answeredEpoch = boundSessionEpoch;
+					const turns = this.#database.transaction((tx) => {
+						const turns = this.#database.bindings.incrementTurnCount(
+							tx,
+							sessionOriginKey,
+							JSON.stringify(sessionOrigin),
+						);
+						const handoffKey = monitorRollHandoffKey(sessionOriginKey);
+						const handoffEpoch = parseRollHandoffEpoch(this.#database.core.metaGet(handoffKey));
+						if (
+							response.trim() &&
+							this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch === answeredEpoch &&
+							handoffEpoch !== undefined &&
+							handoffEpoch <= answeredEpoch
+						)
+							this.#database.core.metaDelete(handoffKey);
+						return turns;
+					});
 					const safety = this.#safetyState(sessionOriginKey);
 					safety.turns = turns;
 					if (this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch === boundSessionEpoch)
@@ -1406,13 +1637,41 @@ export class MonitorPropagator {
 				}
 				// A non-empty answer is proof the session still has usable context, so
 				// it clears the context-failure streak. A malformed answer is still an
-				// answer: it must not arm the safety net.
-				if (boundSessionEpoch !== undefined) {
+				// answer: it is not evidence of context exhaustion. An empty answer
+				// does not clear the context-failure streak here and never samples
+				// context or arms a size roll; it fails after the lease fence below.
+				if (boundSessionEpoch !== undefined && response.trim()) {
 					const safety = this.#safetyState(sessionOriginKey);
-					if (response.trim()) {
-						safety.contextFailures = 0;
-						// The runtime accepted and finished a turn, so it is not stalled.
-						safety.busyFailures = 0;
+					safety.contextFailures = 0;
+					// The runtime accepted and finished a turn, so it is not stalled.
+					safety.busyFailures = 0;
+					const contextUsage = requestResult?.contextUsage;
+					if (
+						contextUsage !== undefined &&
+						this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch === boundSessionEpoch
+					) {
+						safety.lastContextTokens = contextUsage.tokens;
+						const currentMonitor = this.#registry.get(monitor.monitorId);
+						const contextRollTokens = currentMonitor?.contextRollTokens;
+						if (contextRollTokens !== undefined && !safety.pendingRoll && contextUsage.tokens >= contextRollTokens) {
+							this.#database.transaction(() =>
+								this.#database.core.metaSet(
+									monitorContextBudgetArmKey(sessionOriginKey),
+									JSON.stringify({ epoch: boundSessionEpoch, tokens: contextUsage.tokens }),
+								),
+							);
+							safety.pendingRoll = "context_budget";
+							console.error(
+								`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=context_budget context_tokens=${contextUsage.tokens}/${contextRollTokens} turns=${safety.turns}`,
+							);
+						} else if (currentMonitor && safety.pendingRoll === "context_budget") {
+							this.#database.transaction(() =>
+								this.#database.core.metaSet(
+									monitorContextBudgetArmKey(sessionOriginKey),
+									JSON.stringify({ epoch: boundSessionEpoch, tokens: contextUsage.tokens }),
+								),
+							);
+						}
 					}
 				}
 				// Lease fencing: after an await, this attempt may no longer own the
@@ -1663,7 +1922,11 @@ export class MonitorPropagator {
 							`dispatch phase failed (${code}): ${failureDetail(error)} ${JSON.stringify({ phase: dispatchPhase, operation: dispatchOperation, operation_args: dispatchOperationArgs, sessionId: boundSessionId ?? null, origin: sessionOriginKey, attempt: row.dispatch_attempts + 1 })}`,
 							now(),
 							false,
-							protocolFailure,
+							{
+								...(protocolFailure ?? {}),
+								sessionId: boundSessionId,
+								opRef,
+							},
 						);
 						if (failed) {
 							transitionedFailure = true;
@@ -1705,6 +1968,7 @@ export class MonitorPropagator {
 	 * that operation's own `turn.result`, never from the session's latest assistant
 	 * message, which a later turn may have replaced. A pending or unreachable result
 	 * keeps the pointer for a later attempt; a definitively unreadable one drops it.
+	 * Tagged turns are observed without a duplicate request, including failed ops.
 	 */
 	async #harvestAuthoringTurn(
 		requestInput: Parameters<SessionPort["request"]>[0],
@@ -1712,6 +1976,10 @@ export class MonitorPropagator {
 		rows: readonly MonitorEventDbRow[],
 		pendingTurn: string,
 	): Promise<string> {
+		if (turn.sizeRolled && this.#promptBusyRefused(turn)) {
+			this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, turn.eventIds, pendingTurn));
+			throw new AuthoringResultUnavailableError("output_unavailable");
+		}
 		const readStatus = async () => {
 			try {
 				return await this.#sessionPort.status({ sessionId: turn.sessionId, repo: this.#repo, opRef: turn.opRef });
@@ -1721,6 +1989,8 @@ export class MonitorPropagator {
 			}
 		};
 		let report = await readStatus();
+		if (turn.sizeRolled && report.status.status !== "terminal_ok")
+			throw new AuthoringResultUnavailableError("output_pending");
 		if (report.status.status === "accepted" || report.status.status === "in_flight") {
 			await this.#sessionPort.request(requestInput);
 			report = await readStatus();
@@ -1728,7 +1998,7 @@ export class MonitorPropagator {
 		if (report.status.status !== "terminal_ok") throw new SessionTerminalError(report);
 		const output = await this.#readAuthoringResult(turn, rows, report);
 		if (output.status === "proven") return output.text;
-		if (output.status === "unavailable")
+		if (output.status === "unavailable" && (!turn.sizeRolled || output.definitiveLoss))
 			this.#database.transaction((tx) =>
 				this.#forgetAuthoringTurn(
 					tx,
@@ -1742,7 +2012,7 @@ export class MonitorPropagator {
 	 * The op-ref of a previous attempt's authoring turn for exactly these events
 	 * on this session, when that turn is still running or finished successfully.
 	 * A failed, unknown or unreadable prior turn is forgotten so the retry sends
-	 * a fresh prompt.
+	 * a fresh prompt unless its persisted size-roll tag requires strict evidence.
 	 */
 	async #reusableAuthoringTurn(eventIds: readonly string[], sessionId: string): Promise<string | undefined> {
 		const raw = this.#database.core.metaGet(authoringTurnKey(eventIds[0] ?? ""));
@@ -1752,11 +2022,39 @@ export class MonitorPropagator {
 		const forget = () => {
 			this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, eventIds, raw));
 		};
-		if (
-			prior.sessionId !== sessionId ||
-			prior.eventIds.length !== eventIds.length ||
-			!eventIds.every((id) => prior.eventIds.includes(id))
-		) {
+		if (prior.sizeRolled) {
+			if (this.#promptBusyRefused(prior)) {
+				forget();
+				return undefined;
+			}
+			if (prior.eventIds.length !== eventIds.length || !eventIds.every((id) => prior.eventIds.includes(id)))
+				throw new AuthoringResultUnavailableError("output_pending");
+			let report: StatusReport;
+			try {
+				report = await this.#sessionPort.status({ sessionId: prior.sessionId, repo: this.#repo, opRef: prior.opRef });
+			} catch {
+				throw new AuthoringResultUnavailableError("transport_error");
+			}
+			if (report.status.status !== "terminal_ok") throw new AuthoringResultUnavailableError("output_pending");
+			const output = await this.#readAuthoringResult(
+				prior,
+				this.#database.monitors.eventsByIds([...prior.eventIds]),
+				report,
+			);
+			if (output.status === "unavailable" && output.definitiveLoss) {
+				forget();
+				return undefined;
+			}
+			if (output.status !== "proven") throw new AuthoringResultUnavailableError(output.code);
+			if (prior.sessionId !== sessionId) throw new AuthoringResultUnavailableError("output_pending");
+			return prior.opRef;
+		}
+		if (prior.sessionId !== sessionId) {
+			// A rebinding does not prove that the turn in the old session was never
+			// admitted. Leave it for the dispatch path to resolve against that session.
+			return undefined;
+		}
+		if (prior.eventIds.length !== eventIds.length || !eventIds.every((id) => prior.eventIds.includes(id))) {
 			forget();
 			return undefined;
 		}
@@ -1764,12 +2062,30 @@ export class MonitorPropagator {
 			const report = await this.#sessionPort.status({ sessionId, repo: this.#repo, opRef: prior.opRef });
 			const state = report.status.status;
 			if (state === "accepted" || state === "in_flight" || state === "terminal_ok") return prior.opRef;
+			// Failed status: forget and let dispatch author fresh (#742).
+			if (state === "failed") {
+				forget();
+				return undefined;
+			}
+			// Unknown status: hold for operator judgement, do not forget or reuse (#742).
+			return undefined;
 		} catch {
-			// Unreadable status is not evidence of a live turn.
+			// Unreadable status is not evidence of a live turn. Hold on throwing status.
 		}
-		forget();
 		return undefined;
 	}
+	/** Exact authority-scoped no-send evidence for this session and prompt. */
+	#promptBusyRefused(turn: AuthoringTurnPointer): boolean {
+		const authority = this.#database.bindings.brokerAuthority();
+		if (authority === null) return false;
+		const record = this.#database.bindings.brokerOperation(
+			authority,
+			"turn.prompt",
+			JSON.stringify([turn.sessionId, turn.opRef]),
+		);
+		return record?.operationRef === turn.opRef && isBrokerPromptBusyRefusal(record);
+	}
+
 	/** Abandon only captured pointers; sibling owners and replacement pointers remain authoritative. */
 	#forgetAuthoringTurn(tx: WriteTx, eventIds: readonly string[], raw: string | undefined): void {
 		if (raw === undefined) return;
@@ -1820,6 +2136,7 @@ export class MonitorPropagator {
 			stalledSessionId: undefined,
 			priorRunBusyFailures: 0,
 			nativeCompaction: undefined,
+			lastContextTokens: undefined,
 			pendingRoll: undefined,
 			lastRoll: undefined,
 		};
@@ -1861,6 +2178,7 @@ export class MonitorPropagator {
 		monitor: MonitorRecord;
 	}): Promise<void> {
 		const { sessionOriginKey, failureClass, error, sessionId, boundEpoch, replayed, monitor } = input;
+		if (!this.#registry.get(monitor.monitorId)) return;
 		const state = this.#safetyState(sessionOriginKey);
 		const currentEpoch =
 			boundEpoch !== undefined &&
@@ -1883,7 +2201,11 @@ export class MonitorPropagator {
 			// Replayed events still count: a busy refusal says nothing about the
 			// payload, only about the session that refused it. The epoch check
 			// still applies so a dead session's refusals never roll its successor.
-			if (currentEpoch && !state.pendingRoll && state.busyFailures >= MONITOR_BUSY_FAILURE_ROLL_THRESHOLD) {
+			if (
+				currentEpoch &&
+				(!state.pendingRoll || state.pendingRoll === "context_budget") &&
+				state.busyFailures >= MONITOR_BUSY_FAILURE_ROLL_THRESHOLD
+			) {
 				state.pendingRoll = "session_busy_stalled";
 				state.stalledSessionId = sessionId;
 				console.error(
@@ -1904,7 +2226,10 @@ export class MonitorPropagator {
 			console.error(
 				`monitor prior run still busy for ${sessionOriginKey} (monitor ${monitor.monitorId}): prior_run_busy_failures=${state.priorRunBusyFailures}/${MONITOR_PRIOR_RUN_BUSY_FAILURE_ROLL_THRESHOLD} replayed=${replayed} context_failures=${state.contextFailures} (unchanged)`,
 			);
-			if (!state.pendingRoll && state.priorRunBusyFailures >= MONITOR_PRIOR_RUN_BUSY_FAILURE_ROLL_THRESHOLD) {
+			if (
+				(!state.pendingRoll || state.pendingRoll === "context_budget") &&
+				state.priorRunBusyFailures >= MONITOR_PRIOR_RUN_BUSY_FAILURE_ROLL_THRESHOLD
+			) {
 				state.pendingRoll = "session_prior_run_busy_stalled";
 				state.stalledSessionId = sessionId;
 				console.error(
@@ -1915,7 +2240,7 @@ export class MonitorPropagator {
 		}
 		if (isSessionHostUnavailable(error)) {
 			state.busyFailures = 0;
-			if (currentEpoch && !state.pendingRoll) {
+			if (currentEpoch && (!state.pendingRoll || state.pendingRoll === "context_budget")) {
 				state.pendingRoll = "session_host_unavailable";
 				console.error(
 					`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=session_host_unavailable session=${sessionId ?? "none"} turns=${state.turns}`,
@@ -1934,7 +2259,7 @@ export class MonitorPropagator {
 			// before prompting.` (the persona path already resets this shape: see
 			// `isWedgedSubmission` in orchestrator/persona-session.ts).
 			state.busyFailures = 0;
-			if (currentEpoch && !state.pendingRoll) {
+			if (currentEpoch && (!state.pendingRoll || state.pendingRoll === "context_budget")) {
 				state.pendingRoll = "session_submission_wedged";
 				state.stalledSessionId = sessionId;
 				console.error(
@@ -1998,7 +2323,7 @@ export class MonitorPropagator {
 			threshold: this.#contextFailureRollThreshold,
 			nativeCompaction: status,
 		});
-		if (!reason) return;
+		if (!reason || !this.#registry.get(monitor.monitorId)) return;
 		// Arm, do not roll here: the roll must happen at the dispatch boundary
 		// where no batch is in flight.
 		state.pendingRoll = reason;
@@ -2018,18 +2343,267 @@ export class MonitorPropagator {
 			return "failed";
 		}
 	}
+	/** Resolves when the current background retired-session sweep finishes (for tests and diagnostics). */
+	retiredSessionSweepSettled(): Promise<void> {
+		return this.#retiredSweep ?? Promise.resolve();
+	}
+	#startRetiredSessionSweep(): void {
+		if (this.#closing || this.#retiredSweep) return;
+		this.#retiredSweep = this.#sweepRetiredSessions()
+			.catch(() => console.error("monitor retired session sweep failed"))
+			.finally(() => {
+				this.#retiredSweep = undefined;
+			});
+	}
+	/** Removed monitors have no future dispatch, but their retired hosts still need cleanup. */
+	async #sweepRetiredSessions(): Promise<void> {
+		await this.#retireRolledSessions();
+	}
+	/** Bound both sweep paths to two attempts, with shared fair ordering and counter repair. */
+	async #retireRolledSessions(sessionOriginKey?: string): Promise<void> {
+		try {
+			const prefix = sessionOriginKey ? `monitor_retired_session:${sessionOriginKey}:` : "monitor_retired_session:";
+			const records = this.#database.core.metaKeysInRange(prefix, `${prefix}\uffff`).flatMap((key) => {
+				const raw = this.#database.core.metaGet(key);
+				let record = raw === undefined ? undefined : parseRetiredSession(raw);
+				// Repair an invalid logical counter without granting authority to any other invalid fields.
+				if (!record && raw !== undefined) {
+					try {
+						const value = JSON.parse(raw);
+						if (value && typeof value === "object" && "lastAttemptAt" in value) {
+							delete value.lastAttemptAt;
+							record = parseRetiredSession(JSON.stringify(value));
+						}
+					} catch {}
+				}
+				if (!record) return [];
+				const suffix = `:${record.sessionId}`;
+				if (!key.endsWith(suffix)) return [];
+				const recordOriginKey = key.slice("monitor_retired_session:".length, -suffix.length);
+				if (!recordOriginKey || (sessionOriginKey && recordOriginKey !== sessionOriginKey)) return [];
+				try {
+					if (parseOriginKey(recordOriginKey).platform !== "monitor") return [];
+				} catch {
+					return [];
+				}
+				return [{ key, raw: raw!, record, sessionOriginKey: recordOriginKey }];
+			});
+			records.sort(
+				(a, b) =>
+					(a.record.lastAttemptAt ?? 0) - (b.record.lastAttemptAt ?? 0) || a.record.retiredAt - b.record.retiredAt,
+			);
+			// A logical millisecond keeps retries fair even if the clock stalls or moves backwards.
+			let lastAttemptAt = records.reduce((latest, { record }) => Math.max(latest, record.lastAttemptAt ?? 0), 0);
+			// Rebase at saturation so safe but extreme counters cannot starve newer records.
+			if (lastAttemptAt >= Number.MAX_SAFE_INTEGER - 2) {
+				this.#database.transaction(() => {
+					for (const [index, pending] of records.entries()) {
+						if (this.#database.core.metaGet(pending.key) !== pending.raw) continue;
+						pending.record = { ...pending.record, lastAttemptAt: index + 1 };
+						pending.raw = JSON.stringify(pending.record);
+						this.#database.core.metaSet(pending.key, pending.raw);
+					}
+				});
+				lastAttemptAt = records.length;
+			}
+			for (const pending of records.filter(({ key }) => !this.#retiringKeys.has(key)).slice(0, 2)) {
+				if (this.#closing) break;
+				lastAttemptAt = Math.min(Number.MAX_SAFE_INTEGER, Math.max(this.#now(), lastAttemptAt + 1));
+				await this.#attemptRetiredSession(pending, lastAttemptAt);
+			}
+		} catch {
+			// Retirement availability must never prevent authoring or monitor recovery.
+			console.error(`monitor retired session sweep for ${sessionOriginKey ?? "all origins"}: outcome=error`);
+		}
+	}
+	/** Final synchronous authorization protects close without taking a dispatch lock. */
+	async #attemptRetiredSession(pending: PendingRetiredSession, lastAttemptAt: number): Promise<void> {
+		const { key, sessionOriginKey } = pending;
+		if (this.#retiringKeys.has(key)) return;
+		this.#retiringKeys.add(key);
+		let { record, raw } = pending;
+		const { sessionId } = record;
+		let outcome = "held:authorization";
+		try {
+			if (this.#closing || this.#database.core.metaGet(key) !== raw) return;
+			record = { ...record, lastAttemptAt };
+			raw = JSON.stringify(record);
+			this.#database.transaction(() => this.#database.core.metaSet(key, raw));
+			const mayClose = () => {
+				if (
+					this.#closing ||
+					this.#database.core.metaGet(key) !== raw ||
+					this.#database.bindings.getSessionRecord(sessionOriginKey)?.sessionId === sessionId
+				)
+					return false;
+				for (const pointerKey of this.#database.core.metaKeysInRange(
+					"monitor_authoring_turn:",
+					"monitor_authoring_turn;",
+				)) {
+					const pointer = this.#database.core.metaGet(pointerKey);
+					if (pointer !== undefined && parseAuthoringTurnPointer(pointer)?.sessionId === sessionId) return false;
+				}
+				return true;
+			};
+			if (!mayClose()) return;
+			if (!this.#sessionPort.close) {
+				this.#database.transaction(() => this.#database.core.metaDelete(key));
+				outcome = "unsupported";
+				return;
+			}
+			let held: string | undefined;
+			// Independent observations in turn, queue, jobs order do not reserve an idle host.
+			for (const probe of ["turnRunning", "queueEmpty", "runningJobs"] as const) {
+				if (probe === "queueEmpty" && !this.#sessionPort.queueEmpty) continue;
+				try {
+					const result = await this.#sessionPort[probe]?.({ sessionId, repo: this.#repo });
+					const busy =
+						probe === "turnRunning"
+							? result === true
+							: probe === "queueEmpty"
+								? result === false
+								: Array.isArray(result) && result.length > 0;
+					const idle =
+						probe === "turnRunning"
+							? result === false
+							: probe === "queueEmpty"
+								? result === true
+								: Array.isArray(result) && result.length === 0;
+					if (!idle) held ??= `${probe}_${busy ? "busy" : "unknown"}`;
+				} catch {
+					held ??= `${probe}_unavailable`;
+				}
+			}
+			if (held) {
+				outcome = `held:${held}`;
+				return;
+			}
+			// No await between final local authorization, durable intent, and issuing close.
+			const authorized = this.#database.transaction(() => {
+				if (!mayClose()) return false;
+				// Diagnostic only: prior close attempts never authorize another close.
+				record = { ...record, phase: "closing", closeStartedAt: this.#now() };
+				raw = JSON.stringify(record);
+				this.#database.core.metaSet(key, raw);
+				return true;
+			});
+			if (!authorized) return;
+			try {
+				await this.#sessionPort.close({ sessionId, repo: this.#repo });
+				outcome = "closed";
+			} catch (error) {
+				const brokerCode =
+					error instanceof GjcCliError && error.exitCode === 0 ? envelopeErrorCode(error.details) : undefined;
+				const code =
+					typeof brokerCode === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(brokerCode) ? brokerCode : undefined;
+				outcome = `error:${code ?? "unknown"}`;
+				return;
+			}
+			this.#database.transaction(() => {
+				if (this.#database.core.metaGet(key) === raw) this.#database.core.metaDelete(key);
+			});
+		} catch {
+			outcome = "error:unknown";
+		} finally {
+			this.#retiringKeys.delete(key);
+			console.info(`monitor retired session close for ${sessionOriginKey}: session=${sessionId} outcome=${outcome}`);
+		}
+	}
 	/**
-	 * THE ONE monitor-session roll choke point (issue #68). LAST RESORT: it fires
-	 * only for a roll armed by `#recordAuthoringFailure`, never on turn count.
+	 * THE ONE monitor-session roll choke point (issue #68). It consumes an armed
+	 * failure-recovery or owner-opted-in context-size roll, never a turn count.
 	 *
-	 * Returns the digest to inject into this turn's prompt, or undefined when no
-	 * roll was armed. The digest is pure text assembly — a roll costs no model
-	 * turn.
+	 * Returns the digest for a new roll or an unanswered durable handoff on the
+	 * live epoch. The handoff survives failures until a non-empty answer. Digest
+	 * assembly costs no model turn.
 	 */
 	#rollSessionIfArmed(sessionOriginKey: string, originRefJson: string, monitor: MonitorRecord): string | undefined {
 		const state = this.#safetyState(sessionOriginKey);
+		const armKey = monitorContextBudgetArmKey(sessionOriginKey);
+		const handoffKey = monitorRollHandoffKey(sessionOriginKey);
+		if (!this.#registry.get(monitor.monitorId)) {
+			state.pendingRoll = undefined;
+			state.stalledSessionId = undefined;
+			state.lastContextTokens = undefined;
+			this.#database.transaction(() => {
+				this.#database.core.metaDelete(armKey);
+				this.#database.core.metaDelete(handoffKey);
+			});
+			return undefined;
+		}
+		if (!state.pendingRoll || state.pendingRoll === "context_budget") {
+			const rawArm = this.#database.core.metaGet(armKey);
+			if (rawArm !== undefined || state.pendingRoll === "context_budget") {
+				const arm = rawArm === undefined ? undefined : parseContextBudgetArm(rawArm);
+				const liveEpoch = this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
+				if (arm && arm.epoch === liveEpoch) {
+					state.pendingRoll = "context_budget";
+					state.lastContextTokens = arm.tokens;
+				} else {
+					this.#database.transaction(() => this.#database.core.metaDelete(armKey));
+					if (state.pendingRoll === "context_budget") {
+						state.pendingRoll = undefined;
+						state.lastContextTokens = undefined;
+						const threshold = this.#registry.get(monitor.monitorId)?.contextRollTokens;
+						console.info(
+							`monitor session size roll disarmed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=context_budget context_tokens=${arm?.tokens ?? "unknown"}/${threshold ?? "unset"}`,
+						);
+					}
+				}
+			}
+		}
 		const reason = state.pendingRoll;
-		if (!reason) return undefined;
+		if (!reason) {
+			const handoff = this.#database.core.metaGet(handoffKey);
+			if (handoff === undefined) return undefined;
+			const epoch = parseRollHandoffEpoch(handoff);
+			const liveEpoch = this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
+			if (epoch === undefined || epoch > liveEpoch) {
+				this.#database.transaction(() => this.#database.core.metaDelete(handoffKey));
+				return undefined;
+			}
+			const current = this.#registry.get(monitor.monitorId);
+			if (!current) return undefined;
+			return buildMonitorCompactionDigest({
+				monitorName: current.name,
+				instruction: current.instruction,
+				notes: this.#recentAuthoredNotes(current),
+			});
+		}
+		if (reason === "context_budget") {
+			const contextRollTokens = this.#registry.get(monitor.monitorId)?.contextRollTokens;
+			if (
+				contextRollTokens === undefined ||
+				state.lastContextTokens === undefined ||
+				state.lastContextTokens < contextRollTokens
+			) {
+				this.#database.transaction(() => this.#database.core.metaDelete(armKey));
+				state.pendingRoll = undefined;
+				console.info(
+					`monitor session size roll disarmed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=context_budget context_tokens=${state.lastContextTokens ?? "unknown"}/${contextRollTokens ?? "unset"}`,
+				);
+				return undefined;
+			}
+			// Only open work can be redispatched through the live binding. Retained
+			// terminal pointers recover by their own session and must not block a roll.
+			const sessionId = this.#database.bindings.getSessionRecord(sessionOriginKey)?.sessionId;
+			const savedTurns = new Set<string>();
+			if (sessionId) {
+				const openEventIds = new Set(this.#database.monitors.eventsOpen().map((row) => row.event_id));
+				for (const key of this.#database.core.metaKeysInRange("monitor_authoring_turn:", "monitor_authoring_turn;")) {
+					const raw = this.#database.core.metaGet(key);
+					const turn = raw === undefined ? undefined : parseAuthoringTurnPointer(raw);
+					if (turn?.sessionId === sessionId && turn.eventIds.some((eventId) => openEventIds.has(eventId)))
+						savedTurns.add(turn.opRef);
+				}
+			}
+			if (savedTurns.size) {
+				console.info(
+					`monitor session size roll deferred for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=context_budget saved_turns=${savedTurns.size}`,
+				);
+				return undefined;
+			}
+		}
 		// Build the digest BEFORE the roll: it reads durable authored notes, which
 		// the roll does not touch, but reading first keeps the ordering obvious.
 		const digest = buildMonitorCompactionDigest({
@@ -2047,7 +2621,27 @@ export class MonitorPropagator {
 				? state.stalledSessionId
 				: undefined;
 		state.stalledSessionId = undefined;
-		this.#database.transaction((tx) => this.#database.bindings.rotateEpoch(tx, sessionOriginKey, originRefJson));
+		this.#database.transaction((tx) => {
+			if (reason === "context_budget") {
+				const retired = this.#database.bindings.getSessionRecord(sessionOriginKey);
+				if (retired?.sessionId) {
+					const retiredSessionId = retired.sessionId;
+					this.#database.core.metaSet(
+						`monitor_retired_session:${sessionOriginKey}:${retiredSessionId}`,
+						JSON.stringify({ sessionId: retiredSessionId, epoch: retired.epoch, retiredAt: this.#now() }),
+					);
+					for (const key of this.#database.core.metaKeysInRange("monitor_authoring_turn:", "monitor_authoring_turn;")) {
+						const raw = this.#database.core.metaGet(key);
+						const turn = raw === undefined ? undefined : parseAuthoringTurnPointer(raw);
+						if (turn?.sessionId === retiredSessionId)
+							this.#database.core.metaSet(key, JSON.stringify({ ...turn, sizeRolled: true }));
+					}
+				}
+			}
+			const epoch = this.#database.bindings.rotateEpoch(tx, sessionOriginKey, originRefJson);
+			this.#database.core.metaSet(handoffKey, JSON.stringify({ epoch, reason }));
+			this.#database.core.metaDelete(armKey);
+		});
 		// A stalled session is still holding its wedged turn; nothing will prompt
 		// it again now that the origin is bound to a new epoch, so end its host
 		// rather than leave it occupying the runtime forever. Best-effort: the
@@ -2075,6 +2669,7 @@ export class MonitorPropagator {
 		state.busyFailures = 0;
 		state.priorRunBusyFailures = 0;
 		state.turns = 0;
+		state.lastContextTokens = undefined;
 		console.info(
 			`monitor session rolled for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} native_compaction=${state.nativeCompaction ?? "not_attempted"} digest=${digest.length}B.`,
 		);
@@ -2226,6 +2821,25 @@ export class MonitorPropagator {
 			stage,
 		});
 	}
+}
+
+/**
+ * Verify that a failure is a durable no-send failure belonging to the specified operation (#742).
+ * Checks both the code AND that the operation reference matches (sessionId + opRef).
+ */
+function isDurableNoSendFailureForOperation(
+	failure: { readonly code: string; readonly session_id?: string | null; readonly op_ref?: string | null } | undefined,
+	sessionId: string,
+	opRef: string,
+): boolean {
+	if (!failure) return false;
+	if (
+		failure.code !== "session_busy" &&
+		failure.code !== "session_submission_wedged" &&
+		failure.code !== "session_host_unavailable"
+	)
+		return false;
+	return failure.session_id === sessionId && failure.op_ref === opRef;
 }
 
 function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase: string): DispatchFailureCode {
@@ -2402,6 +3016,87 @@ function authoringTurnKey(eventId: string): string {
 	return `monitor_authoring_turn:${eventId}`;
 }
 
+function monitorRollHandoffKey(sessionOriginKey: string): string {
+	return `monitor_roll_handoff:${sessionOriginKey}`;
+}
+
+function monitorContextBudgetArmKey(sessionOriginKey: string): string {
+	return `monitor_context_budget_arm:${sessionOriginKey}`;
+}
+
+interface RetiredSession {
+	sessionId: string;
+	epoch: number;
+	retiredAt: number;
+	lastAttemptAt?: number;
+	phase?: "closing";
+	closeStartedAt?: number;
+}
+
+interface PendingRetiredSession {
+	key: string;
+	raw: string;
+	record: RetiredSession;
+	sessionOriginKey: string;
+}
+
+function parseRetiredSession(raw: string): RetiredSession | undefined {
+	try {
+		const value: unknown = JSON.parse(raw);
+		if (!value || typeof value !== "object") return undefined;
+		const { sessionId, epoch, retiredAt, lastAttemptAt, phase, closeStartedAt } = value as Record<string, unknown>;
+		if (typeof sessionId !== "string" || !sessionId) return undefined;
+		if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 0) return undefined;
+		if (typeof retiredAt !== "number" || !Number.isFinite(retiredAt) || retiredAt < 0) return undefined;
+		if (
+			lastAttemptAt !== undefined &&
+			(typeof lastAttemptAt !== "number" || !Number.isSafeInteger(lastAttemptAt) || lastAttemptAt < 0)
+		)
+			return undefined;
+		if (phase !== undefined && phase !== "closing") return undefined;
+		if (
+			phase === "closing" &&
+			(typeof closeStartedAt !== "number" || !Number.isFinite(closeStartedAt) || closeStartedAt < 0)
+		)
+			return undefined;
+		return {
+			sessionId,
+			epoch,
+			retiredAt,
+			lastAttemptAt,
+			phase,
+			...(phase === "closing" ? { closeStartedAt: closeStartedAt as number } : {}),
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+function parseContextBudgetArm(raw: string): { epoch: number; tokens: number } | undefined {
+	try {
+		const value: unknown = JSON.parse(raw);
+		if (!value || typeof value !== "object") return undefined;
+		const { epoch, tokens } = value as Record<string, unknown>;
+		if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 0) return undefined;
+		if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens < 0) return undefined;
+		return { epoch, tokens };
+	} catch {
+		return undefined;
+	}
+}
+
+function parseRollHandoffEpoch(raw: string | undefined): number | undefined {
+	if (raw === undefined) return undefined;
+	try {
+		const value: unknown = JSON.parse(raw);
+		if (!value || typeof value !== "object") return undefined;
+		const epoch = (value as Record<string, unknown>).epoch;
+		return typeof epoch === "number" && Number.isInteger(epoch) && epoch >= 0 ? epoch : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 function parseAuthoringTurnPointer(raw: string): AuthoringTurnPointer | undefined {
 	let value: unknown;
 	try {
@@ -2423,7 +3118,12 @@ function parseAuthoringTurnPointer(raw: string): AuthoringTurnPointer | undefine
 		new Set(eventIds).size !== eventIds.length
 	)
 		return undefined;
-	return { sessionId: record.sessionId, opRef: record.opRef, eventIds };
+	return {
+		sessionId: record.sessionId,
+		opRef: record.opRef,
+		eventIds,
+		...(record.sizeRolled === true ? { sizeRolled: true } : {}),
+	};
 }
 
 function sameAuthoringTurn(left: AuthoringTurnPointer, right: AuthoringTurnPointer): boolean {

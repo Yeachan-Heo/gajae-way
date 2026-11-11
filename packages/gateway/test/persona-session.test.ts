@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { PromptImage } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import {
 	AGENT_RUN_GRACE_MS,
@@ -19,14 +20,23 @@ import {
 } from "../src/orchestrator/persona-session";
 import { formatFailureNotice } from "../src/orchestrator/rebind";
 import {
+	BrokerSessionPort,
 	ModelNotSelectedError,
 	type SessionCompactionStatus,
 	type SessionContextUsage,
 } from "../src/orchestrator/session-port";
-import type { TailAttachInput, TailFrame } from "../src/orchestrator/tail-runner";
+import {
+	MAX_RELAY_REQUEST_FRAME_BYTES,
+	RelayPayloadTooLargeError,
+	serializeRelayRequestFrame,
+	type TailAttachInput,
+	type TailFrame,
+	type TailHandle,
+	TailRunner,
+} from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, Store } from "../src/store";
 import { BROKER_PROMPT_BUSY_REFUSAL } from "../src/store/groups/bindings";
-import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort, scriptedRelay, steerRefused } from "./session-port.fake";
 
 let home = "";
 let database: Store | undefined;
@@ -112,6 +122,7 @@ async function harness(
 		failure?: (message: string, forceFailureNotice?: boolean) => void;
 		failureError?: (error: Error) => void;
 		modelRefusal?: (input: PersonaFailureInput) => void;
+		imagesFor?: (triggerMessageId: string) => readonly PromptImage[] | undefined;
 		onFrame?: (frame: TailFrame) => boolean | void;
 		contextMessageIds?: readonly string[];
 	} = {},
@@ -142,8 +153,10 @@ async function harness(
 		...extra,
 		onTurnStart: ({ trigger, turn }) => {
 			latestOpRef = turn.opRef;
+			const images = hooks.imagesFor?.(trigger.message_id);
 			return {
 				text: trigger.body,
+				...(images ? { images } : {}),
 				...(hooks.contextMessageIds ? { contextMessageIds: new Set(hooks.contextMessageIds) } : {}),
 				...(hooks.onFrame ? { onFrame: (input) => hooks.onFrame?.(input.frame) } : {}),
 				onTerminal: ({ text, alreadyPosted }) => hooks.terminal?.(text, alreadyPosted),
@@ -323,6 +336,7 @@ test("ambiguous busy send retains its identity and proof despite an unobserved t
 
 		override async send(input: Parameters<ScriptedSessionPort["send"]>[0]): ReturnType<ScriptedSessionPort["send"]> {
 			this.sendAttempts.push(input);
+			input.beforeWrite?.();
 			seedPersonaPrompt(input);
 			throw new GjcCliError("busy", 0, "", { code: "busy", message: "busy" });
 		}
@@ -453,6 +467,308 @@ test("actor immediately dispatches durable inbound with one deterministic caller
 	await eventually(() => terminal.length === 2, "reused session turn did not complete");
 	expect(port.sends).toHaveLength(2);
 	expect(sessionCreateSuccesses).toHaveLength(2);
+});
+
+test("oversized text plus images is a local terminal failure and does not hold an unknown-status live host", async () => {
+	class PayloadLimitSessionPort extends ScriptedSessionPort {
+		readonly oversizedAttempts: Array<Parameters<ScriptedSessionPort["send"]>[0]> = [];
+
+		override async send(input: Parameters<ScriptedSessionPort["send"]>[0]) {
+			try {
+				serializeRelayRequestFrame(input.sessionId, {
+					type: "control_request",
+					id: "",
+					connectionId: "",
+					operation: "turn.prompt",
+					input: {
+						text: input.text,
+						clientRef: input.opRef,
+						...(input.images?.length ? { images: input.images } : {}),
+					},
+					confirm: false,
+				});
+			} catch (error) {
+				if (error instanceof RelayPayloadTooLargeError) {
+					this.oversizedAttempts.push(input);
+					input.onPayloadTooLarge?.();
+				}
+				throw error;
+			}
+			return await super.send(input);
+		}
+	}
+	const port = new PayloadLimitSessionPort();
+	const notices: string[] = [];
+	const logs: string[] = [];
+	await harness(
+		port,
+		{
+			failureError: (error) => notices.push(formatFailureNotice(error)),
+			imagesFor: (messageId) =>
+				messageId === "oversized" ? [{ data: "AQ==".repeat(20_000), mimeType: "image/jpeg" }] : undefined,
+		},
+		(line) => logs.push(line),
+	);
+	enqueue("oversized", "x".repeat(220_000));
+	enqueue("after-oversized", "next pending message");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "the pending message after the local rejection did not dispatch");
+	const rejected = port.oversizedAttempts[0]!;
+	const rejectedOpRef = rejected.opRef;
+	expect(rejected.text).toBe("x".repeat(220_000));
+	expect(rejected.images?.length).toBe(1);
+	expect((await port.liveness({ sessionId: rejected.sessionId, repo: rejected.repo })).live).toBe(true);
+	expect(port.statusReads).toEqual([]);
+	expect(port.sends.map((send) => send.text)).toEqual(["next pending message"]);
+	expect(port.sends.map((send) => send.opRef)).not.toContain(rejectedOpRef);
+	expect(database!.inbox.turnRow(rejectedOpRef)).toMatchObject({
+		state: "done",
+		turn_state: "done",
+		terminal_delivery_id: JSON.stringify({ none: "turn_failed" }),
+	});
+	expect(database!.core.metaGet(`persona-local-preflight-rejection:${rejectedOpRef}`)).toBeUndefined();
+	expect(notices).toHaveLength(1);
+	expect(notices[0]).toContain("prompt_too_large");
+	expect(notices[0]).toContain("before it was sent");
+	expect(notices[0]).toContain("reduce the text or number of images");
+	expect(logs.some((line) => line.includes(`persona_send_preflight_rejected`) && line.includes(rejectedOpRef))).toBe(
+		true,
+	);
+	port.complete(port.sends[0]!.opRef, "next reply");
+	await manager!.tick(KEY);
+});
+
+test("actual relay envelope rejection is durable before actor error handling and survives restart", async () => {
+	const relay = scriptedRelay(() => ({ ok: true, result: {} }));
+	let broker: BrokerSessionPort;
+	let runner: TailRunner;
+	let originalTail: TailHandle | undefined;
+	let realTransport = true;
+	let rejected = false;
+	let markerAtDecision: string | undefined;
+	let fencedAtDecision: boolean | undefined;
+	let pendingRequestAtDecision: string | undefined;
+	class CrashBeforeActorCatchPort extends ScriptedSessionPort {
+		override async attachTail(input: TailAttachInput) {
+			if (!realTransport) return await super.attachTail(input);
+			originalTail = await runner.attach(input);
+			return originalTail;
+		}
+
+		override async send(input: Parameters<ScriptedSessionPort["send"]>[0]) {
+			if (!realTransport) return await super.send(input);
+			try {
+				return await broker.send({
+					...input,
+					onPayloadTooLarge: () => {
+						input.onPayloadTooLarge?.();
+						markerAtDecision = database!.core.metaGet(`persona-local-preflight-rejection:${input.opRef}`);
+						fencedAtDecision = database!.inbox.sendAttempted(input.opRef);
+						pendingRequestAtDecision = database!.bindings.brokerOperation(
+							database!.bindings.authority!,
+							"turn.prompt",
+							JSON.stringify([input.sessionId, input.opRef]),
+						)?.requestJson;
+					},
+				});
+			} catch (error) {
+				if (!(error instanceof RelayPayloadTooLargeError)) throw error;
+				rejected = true;
+				// The process disappears before its actor sees the rejected promise.
+				return await new Promise<never>(() => {});
+			}
+		}
+	}
+	const port = new CrashBeforeActorCatchPort();
+	await harness(port);
+	runner = new TailRunner({ stream: relay.spawn, repo: join(home, "workspace") });
+	broker = new BrokerSessionPort({
+		authority: database!.bindings.authority!,
+		database: database!,
+		cli: async () => {
+			throw new Error("unexpected CLI call");
+		},
+		tailRunner: runner,
+	});
+	const opRef = personaTurnOpRef("instance-test", KEY, 0, "near-limit");
+	const emptyFrame = {
+		type: "control_request",
+		id: "",
+		connectionId: "",
+		operation: "turn.prompt",
+		input: { text: "", clientRef: opRef },
+		confirm: false,
+	};
+	const text = "x".repeat(MAX_RELAY_REQUEST_FRAME_BYTES - Buffer.byteLength(JSON.stringify(emptyFrame)) - 5);
+	expect(
+		Buffer.byteLength(serializeRelayRequestFrame("session-1", { ...emptyFrame, input: { text, clientRef: opRef } })),
+	).toBe(MAX_RELAY_REQUEST_FRAME_BYTES - 5);
+	enqueue("near-limit", text);
+	enqueue("after-crash", "continue after rejection");
+	void manager!.notifyInbound(KEY);
+	await eventually(() => rejected, "actual relay envelope did not reject the near-limit prompt");
+	expect(latestOpRef).toBe(opRef);
+	expect(markerAtDecision).toBe("prompt_too_large");
+	expect(fencedAtDecision).toBe(false);
+	expect(pendingRequestAtDecision).toBeDefined();
+	expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toEqual([]);
+	expect(database!.core.metaGet(`persona-local-preflight-rejection:${opRef}`)).toBe("prompt_too_large");
+
+	// Restore the journal state captured inside the callback, before the port's
+	// unwritten-request cleanup, to model a crash at that exact boundary.
+	const scope = JSON.stringify(["session-1", opRef]);
+	database!.transaction((tx) =>
+		database!.bindings.beginBrokerOperation(tx, database!.bindings.authority!, {
+			operation: "turn.prompt",
+			scope,
+			operationRef: opRef,
+			requestJson: pendingRequestAtDecision!,
+		}),
+	);
+	await originalTail!.close();
+	database!.close();
+	database = await Store.open(join(home, "gateway.db"));
+	realTransport = false;
+	registerFixtureBindings(port);
+	const notices: string[] = [];
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onFailure: ({ error }) => {
+				notices.push(formatFailureNotice(error));
+			},
+		}),
+	});
+	await manager.recover();
+	await eventually(
+		() => port.sends.some((send) => send.text === "continue after rejection"),
+		"later message did not dispatch",
+	);
+	expect(notices).toHaveLength(1);
+	expect(notices[0]).toContain("prompt_too_large");
+	expect(port.statusReads.filter((read) => read.opRef === opRef)).toEqual([]);
+	expect(port.sends.some((send) => send.opRef === opRef)).toBe(false);
+	expect(database.inbox.turnRow(opRef)).toMatchObject({ state: "done", turn_state: "done" });
+	expect(database.core.metaGet(`persona-local-preflight-rejection:${opRef}`)).toBeUndefined();
+	expect(database.bindings.brokerOperation(database.bindings.authority!, "turn.prompt", scope)).toBeUndefined();
+});
+
+test("a fitting real relay request commits its send fence before the write", async () => {
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	await establishStoredSession(port, "fence-fixture");
+	const binding = database!.bindings.getSessionRecord(KEY)!;
+	enqueue("fence-write", "fits");
+	database!.transaction((tx) =>
+		database!.inbox.bindTurn(tx, {
+			messageId: "fence-write",
+			originKey: KEY,
+			epoch: binding.epoch,
+			opRef: "gw-real-fence",
+			sessionId: binding.sessionId,
+		}),
+	);
+	let fenceAtWrite = false;
+	const relay = scriptedRelay(() => {
+		fenceAtWrite = database!.inbox.sendAttempted("gw-real-fence");
+		return { ok: true, result: {} };
+	});
+	const runner = new TailRunner({ stream: relay.spawn, repo: join(home, "workspace") });
+	const broker = new BrokerSessionPort({
+		authority: database!.bindings.authority!,
+		database: database!,
+		cli: async () => {
+			throw new Error("unexpected CLI call");
+		},
+		tailRunner: runner,
+	});
+	const tail = await runner.attach({
+		sessionId: binding.sessionId,
+		repo: join(home, "workspace"),
+		brokerGeneration: 1,
+	});
+	let fenced = false;
+	try {
+		await broker.send({
+			sessionId: binding.sessionId,
+			repo: join(home, "workspace"),
+			text: "fits",
+			opRef: "gw-real-fence",
+			relay: tail,
+			beforeWrite: () => {
+				expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toEqual([]);
+				expect(database!.transaction((tx) => database!.inbox.markSendAttempted(tx, "gw-real-fence"))).toBe(true);
+				fenced = true;
+			},
+		});
+		expect(fenced).toBe(true);
+		expect(fenceAtWrite).toBe(true);
+		expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+	} finally {
+		await tail.close();
+	}
+});
+
+test("dispatch settles a locally rejected unfenced turn even after recovery was already scanned", async () => {
+	const port = new ScriptedSessionPort();
+	const notices: string[] = [];
+	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) });
+	const stored = await establishStoredSession(port, "dispatch-rejection-fixture");
+	const opRef = personaTurnOpRef("instance-test", KEY, 0, "dispatch-rejection");
+	enqueue("dispatch-rejection", "rejected before write");
+	database!.transaction((tx) => {
+		database!.inbox.bindTurn(tx, {
+			messageId: "dispatch-rejection",
+			originKey: KEY,
+			epoch: 0,
+			opRef,
+			sessionId: stored.sessionId,
+		});
+		database!.core.metaSet(`persona-local-preflight-rejection:${opRef}`, "prompt_too_large");
+	});
+	enqueue("dispatch-after-rejection", "later message");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.some((send) => send.text === "later message"), "later message did not dispatch");
+	expect(notices).toHaveLength(1);
+	expect(notices[0]).toContain("prompt_too_large");
+	expect(port.sends.some((send) => send.opRef === opRef)).toBe(false);
+	expect(port.statusReads.filter((read) => read.opRef === opRef)).toEqual([]);
+	expect(database!.inbox.turnRow(opRef)).toMatchObject({ state: "done", turn_state: "done" });
+	expect(database!.core.metaGet(`persona-local-preflight-rejection:${opRef}`)).toBeUndefined();
+});
+
+test("a size-shaped error after acceptance remains ambiguous without local rejection evidence", async () => {
+	class PostWriteSizeErrorPort extends ScriptedSessionPort {
+		override async send(input: Parameters<ScriptedSessionPort["send"]>[0]): Promise<never> {
+			await super.send(input);
+			throw new RelayPayloadTooLargeError(input.sessionId, MAX_RELAY_REQUEST_FRAME_BYTES + 1);
+		}
+	}
+	const port = new PostWriteSizeErrorPort();
+	const notices: string[] = [];
+	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) });
+	enqueue("post-write-size-error", "accepted before error");
+	await manager!.notifyInbound(KEY);
+	const sent = port.sends[0]!;
+	expect(database!.inbox.sendAttempted(sent.opRef)).toBe(true);
+	expect(database!.core.metaGet(`persona-local-preflight-rejection:${sent.opRef}`)).toBeUndefined();
+	expect(notices).toEqual([]);
+	await manager!.stop();
+	manager = new PersonaSessionManager({
+		database: database!,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+	});
+	await manager.recover();
+	expect(port.sends).toHaveLength(1);
+	expect(port.statusReads.some((read) => read.opRef === sent.opRef)).toBe(true);
+	expect(database!.inbox.turnRow(sent.opRef)?.turn_state).not.toBe("done");
 });
 
 for (const outcome of ["complete", "incomplete", "in_flight"] as const)
@@ -1681,7 +1997,10 @@ for (const acceptedBeforeError of [false, true] as const)
 			override async send(input: Parameters<ScriptedSessionPort["send"]>[0]) {
 				if (this.rejectStructuredNotFound && input.text === "possibly accepted") {
 					if (acceptedBeforeError) await super.send(input);
-					else this.sendAttempts.push(input);
+					else {
+						this.sendAttempts.push(input);
+						input.beforeWrite?.();
+					}
 					throw sessionNotFound();
 				}
 				return await super.send(input);
@@ -1819,6 +2138,7 @@ test("session_not_found text without the broker error code remains ambiguous and
 		override async send(input: Parameters<ScriptedSessionPort["send"]>[0]) {
 			if (!this.rejectAmbiguous) return await super.send(input);
 			this.sendAttempts.push(input);
+			input.beforeWrite?.();
 			throw new GjcCliError("turn.prompt failed: session_not_found", 0, "", { code: "timeout" });
 		}
 	}
@@ -3527,6 +3847,119 @@ test("resumed activity clears an unknown-status recovery hold before a later sta
 	expect(database!.inbox.pendingCount(KEY)).toBe(2);
 });
 
+test("a stalled turn with a reply ending in stopReason stop does not post a failure notice (#768)", async () => {
+	const port = new ScriptedSessionPort();
+	const clock = { now: Date.now() };
+	let failureNoticePosted = false;
+	await harness(
+		port,
+		{
+			failure: (_message, forceFailureNotice) => {
+				failureNoticePosted = forceFailureNotice ?? false;
+			},
+		},
+		undefined,
+		{ now: () => clock.now },
+	);
+	enqueue("stall-stop-reply", "answer with a proper conclusion");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const send = port.sends[0]!;
+	// Set up the transcript with a reply that ended with stopReason "stop"
+	port.appendAssistant(send.sessionId, "Here is my answer", clock.now, "stop");
+	port.emitAssistant(send.sessionId, "Here is my answer", "answer-frame", send.opRef);
+	await manager!.tick(KEY);
+
+	// Trigger stall without emitting agent_end
+	port.setActivity(send.sessionId, "tool", clock.now);
+	const statusReads = port.statusReads.length;
+	port.emitStall(send.sessionId);
+	await eventually(() => port.statusReads.length > statusReads, "stall did not check operation status");
+
+	// Advance time to trigger stall cutoff
+	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+	await manager!.tick(KEY);
+
+	// Verify no failure notice was posted
+	expect(failureNoticePosted).toBe(false);
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
+});
+
+test("a stalled turn with interim speech still posts a failure notice", async () => {
+	const port = new ScriptedSessionPort();
+	const clock = { now: Date.now() };
+	let failureNoticePosted = false;
+	await harness(
+		port,
+		{
+			failure: (_message, forceFailureNotice) => {
+				failureNoticePosted = forceFailureNotice ?? false;
+			},
+		},
+		undefined,
+		{ now: () => clock.now },
+	);
+	enqueue("stall-interim-speech", "start working with interim updates");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const send = port.sends[0]!;
+	// Emit interim speech without final answer (no stopReason)
+	port.emitAssistant(send.sessionId, "Still thinking...", "interim-1", send.opRef);
+	await manager!.tick(KEY);
+
+	// Trigger stall without emitting agent_end
+	port.setActivity(send.sessionId, "tool", clock.now);
+	const statusReads = port.statusReads.length;
+	port.emitStall(send.sessionId);
+	await eventually(() => port.statusReads.length > statusReads, "stall did not check operation status");
+
+	// Advance time to trigger stall cutoff
+	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+	await manager!.tick(KEY);
+
+	// Verify failure notice was posted (interim speech did not answer the question)
+	expect(failureNoticePosted).toBe(true);
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
+});
+
+test("a stalled turn with a reply ending in stopReason error still posts a failure notice", async () => {
+	const port = new ScriptedSessionPort();
+	const clock = { now: Date.now() };
+	let failureNoticePosted = false;
+	await harness(
+		port,
+		{
+			failure: (_message, forceFailureNotice) => {
+				failureNoticePosted = forceFailureNotice ?? false;
+			},
+		},
+		undefined,
+		{ now: () => clock.now },
+	);
+	enqueue("stall-error-reply", "fail with an error");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const send = port.sends[0]!;
+	// Set up the transcript with a reply that ended with stopReason "error"
+	port.appendAssistant(send.sessionId, "An error occurred", clock.now, "error");
+	port.emitAssistant(send.sessionId, "An error occurred", "error-frame", send.opRef);
+	await manager!.tick(KEY);
+
+	// Trigger stall without emitting agent_end
+	port.setActivity(send.sessionId, "tool", clock.now);
+	const statusReads = port.statusReads.length;
+	port.emitStall(send.sessionId);
+	await eventually(() => port.statusReads.length > statusReads, "stall did not check operation status");
+
+	// Advance time to trigger stall cutoff
+	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+	await manager!.tick(KEY);
+
+	// Verify failure notice was posted (error stopReason is not "stop")
+	expect(failureNoticePosted).toBe(true);
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
+});
+
 test("an uncorrelated idle broadcast does not retire a turn with stalled-status polling", async () => {
 	class UnknownStatusPort extends ScriptedSessionPort {
 		unknown = false;
@@ -3810,6 +4243,7 @@ class GhostSendPort extends ScriptedSessionPort {
 			this.ghostOpRef = input.opRef;
 			this.ghostSessionId = input.sessionId;
 			this.sendAttempts.push(input);
+			input.beforeWrite?.();
 			throw new GjcCliError("gjc sdk session send reported failure", 0, "", {
 				code: "timeout",
 				message: "SDK session Router startup timed out.",
@@ -3872,6 +4306,7 @@ class UnprovenModelNotSelectedPort extends ScriptedSessionPort {
 
 	override async send(input: Parameters<ScriptedSessionPort["send"]>[0]): Promise<never> {
 		this.sendAttempts.push(input);
+		input.beforeWrite?.();
 		throw this.error;
 	}
 }

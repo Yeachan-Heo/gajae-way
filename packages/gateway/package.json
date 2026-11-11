@@ -8,10 +8,11 @@
 		"gajaeway-gateway": "./src/main.ts"
 	},
 	"gjc": {
-		"version": "0.19.3"
+		"version": "0.20.0"
 	},
 	"dependencies": {
 		"@gajae-gateway/home": "workspace:*",
+		"@gajae-gateway/images": "workspace:*",
 		"@gajae-gateway/log": "workspace:*",
 		"@gajae-gateway/protocol": "workspace:*",
 		"@gajae-gateway/subsession": "workspace:*",

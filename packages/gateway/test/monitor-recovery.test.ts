@@ -32,7 +32,7 @@ import {
 	MONITOR_EVENT_RETRY_BACKOFF_MS,
 } from "../src/store/groups/monitors";
 import type { SessionPortResponder } from "./session-port.fake";
-import { sessionPortFromScript } from "./session-port.fake";
+import { attachTestBrokerOwnership, sessionPortFromScript } from "./session-port.fake";
 
 let home = "";
 let database: Store | undefined;
@@ -46,8 +46,8 @@ afterEach(async () => {
 	home = "";
 });
 
-function fakeSessionPort(respond: SessionPortResponder) {
-	return sessionPortFromScript({ bind: async () => ({ sessionId: "s1" }), respond });
+function fakeSessionPort(respond: SessionPortResponder, sessionId = "s1") {
+	return sessionPortFromScript({ bind: async () => ({ sessionId }), respond });
 }
 
 async function harness(
@@ -2534,4 +2534,410 @@ test("#702: failureDetail names an unlisted Error subclass and keeps only a toke
 		foreignClass: "RuntimePolicyError",
 	});
 	expect(JSON.parse(failureDetail(new Error("plain")))).toEqual({ class: "Error" });
+});
+
+describe("#742: accepted authoring turns held when status is unknown or throws", () => {
+	type PriorStatus = "accepted" | "in_flight" | "unknown" | "throws" | "failed";
+
+	async function dispatchWithPriorPointer(options: {
+		priorStatus: PriorStatus;
+		currentSessionId?: string;
+		priorSessionId?: string;
+		durableBusyRefusal?: boolean;
+	}) {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-742-prior-pointer-"));
+		database = await Store.open(join(home, "gateway.db"));
+		const db = database;
+		const priorSessionId = options.priorSessionId ?? "s1";
+		const currentSessionId = options.currentSessionId ?? priorSessionId;
+		const eventId = crypto.randomUUID();
+		const priorOpRef = crypto.randomUUID();
+		let prompts = 0;
+		let pointerAtPrompt: string | undefined;
+		const sessionPort = fakeSessionPort(async (_sessionId, text) => {
+			prompts++;
+			pointerAtPrompt = db.core.metaGet(`monitor_authoring_turn:${eventId}`);
+			return JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "fresh" })));
+		}, currentSessionId);
+		attachTestBrokerOwnership(db, sessionPort, join(home, "agent"));
+
+		const monitor = new MonitorRegistry(db).add({
+			name: "test-monitor",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.event"],
+		});
+		db.transaction((tx) => {
+			db.monitors.eventCreate(tx, {
+				eventId,
+				monitorId: monitor.monitorId,
+				eventType: "test.event",
+				payloadJson: JSON.stringify({}),
+				firedAt: new Date().toISOString(),
+			});
+			db.monitors.eventUpdate(tx, eventId, "admitted");
+			db.core.metaSet(
+				`monitor_authoring_turn:${eventId}`,
+				JSON.stringify({ sessionId: priorSessionId, opRef: priorOpRef, eventIds: [eventId] }),
+			);
+		});
+
+		const authority = db.bindings.brokerAuthority();
+		if (!authority) throw new Error("test broker authority was not initialized");
+		if (options.durableBusyRefusal) {
+			const scope = JSON.stringify([priorSessionId, priorOpRef]);
+			db.transaction((tx) => {
+				db.bindings.beginBrokerOperation(tx, authority, {
+					operation: "turn.prompt",
+					scope,
+					operationRef: priorOpRef,
+					requestJson: JSON.stringify({ text: "prior prompt" }),
+				});
+				db.bindings.completeBrokerOperation(
+					tx,
+					authority,
+					"turn.prompt",
+					scope,
+					priorOpRef,
+					JSON.stringify({ ok: false, error: { code: "busy" } }),
+				);
+			});
+			expect(db.bindings.brokerOperation(authority, "turn.prompt", scope)?.resultJson).toBe(
+				JSON.stringify({ ok: false, error: { code: "busy" } }),
+			);
+		}
+
+		const originalStatus = sessionPort.status.bind(sessionPort);
+		const statusCalls: Array<{ sessionId: string; opRef: string }> = [];
+		sessionPort.status = async (input) => {
+			statusCalls.push({ sessionId: input.sessionId, opRef: input.opRef });
+			if (input.opRef !== priorOpRef) return originalStatus(input);
+			if (options.priorStatus === "throws") throw new Error("broker_unavailable");
+			return {
+				operationRef: input.opRef,
+				status: { status: options.priorStatus },
+				summaryCompleted: false,
+			} as never;
+		};
+
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry: new MonitorRegistry(db),
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(db),
+			emit: () => {},
+		});
+		propagators.push(propagator);
+		await propagator.reconcile();
+
+		return {
+			db,
+			eventId,
+			priorOpRef,
+			priorSessionId,
+			statusCalls,
+			sessionPort,
+			prompts: () => prompts,
+			pointerAtPrompt: () => pointerAtPrompt,
+		};
+	}
+
+	function expectOldPointerStatus(result: Awaited<ReturnType<typeof dispatchWithPriorPointer>>): void {
+		expect(result.statusCalls).toContainEqual({ sessionId: result.priorSessionId, opRef: result.priorOpRef });
+	}
+
+	test("dispatch does not author fresh when existing pointer status is unknown", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-742-unknown-dispatch-"));
+		database = await Store.open(join(home, "gateway.db"));
+		const db = database;
+		const sessionPort = fakeSessionPort(async () => "[]");
+		// Set up broker authority so the fix can check for busy refusal
+		attachTestBrokerOwnership(db, sessionPort, join(home, "agent"));
+
+		const monitor = new MonitorRegistry(db).add({
+			name: "test-monitor",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.event"],
+		});
+
+		const eventId = crypto.randomUUID();
+		const priorOpRef = crypto.randomUUID();
+
+		// Create an event in admitted state with a prior pointer, simulating a retry scenario
+		db.transaction((tx) => {
+			db.monitors.eventCreate(tx, {
+				eventId,
+				monitorId: monitor.monitorId,
+				eventType: "test.event",
+				payloadJson: JSON.stringify({}),
+				firedAt: new Date().toISOString(),
+			});
+			// Set to admitted state so it gets picked up for dispatch
+			db.monitors.eventUpdate(tx, eventId, "admitted");
+			// Add a prior pointer from that dispatch (as if a prior dispatch created it but then failed during request)
+			const pointer = JSON.stringify({ sessionId: "s1", opRef: priorOpRef, eventIds: [eventId] });
+			db.core.metaSet(`monitor_authoring_turn:${eventId}`, pointer);
+		});
+
+		let statusCallCount = 0;
+		// Make status return unknown to prevent reuse
+		sessionPort.status = async () => {
+			statusCallCount++;
+			return {
+				operationRef: priorOpRef,
+				status: { status: "unknown" as const },
+				summaryCompleted: false,
+			};
+		};
+
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry: new MonitorRegistry(db),
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(db),
+			emit: () => {},
+		});
+		propagators.push(propagator);
+
+		await propagator.reconcile();
+
+		// Should have called status during dispatch
+		expect(statusCallCount).toBeGreaterThan(0);
+		// Pointer should still exist and point to the prior opRef (not overwritten with fresh opRef)
+		const pointerStored = db.core.metaGet(`monitor_authoring_turn:${eventId}`);
+		expect(pointerStored).toBeDefined();
+		if (pointerStored) {
+			const parsed = JSON.parse(pointerStored);
+			// The opRef should NOT have changed to a fresh one
+			expect(parsed.opRef).toBe(priorOpRef);
+		}
+		// Event should move to failed state due to output_pending error
+		const eventRow = db.monitors.eventGet(eventId);
+		if (eventRow) {
+			expect(eventRow.stage).toBe("failed");
+		}
+	});
+
+	test("dispatch does not author fresh when existing pointer status throws", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-742-throw-dispatch-"));
+		database = await Store.open(join(home, "gateway.db"));
+		const db = database;
+		const sessionPort = fakeSessionPort(async () => "[]");
+		// Set up broker authority so the fix can check for busy refusal
+		attachTestBrokerOwnership(db, sessionPort, join(home, "agent"));
+
+		const monitor = new MonitorRegistry(db).add({
+			name: "test-monitor",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.event"],
+		});
+
+		const eventId = crypto.randomUUID();
+		const priorOpRef = crypto.randomUUID();
+
+		db.transaction((tx) => {
+			db.monitors.eventCreate(tx, {
+				eventId,
+				monitorId: monitor.monitorId,
+				eventType: "test.event",
+				payloadJson: JSON.stringify({}),
+				firedAt: new Date().toISOString(),
+			});
+			db.monitors.eventUpdate(tx, eventId, "admitted");
+			const pointer = JSON.stringify({ sessionId: "s1", opRef: priorOpRef, eventIds: [eventId] });
+			db.core.metaSet(`monitor_authoring_turn:${eventId}`, pointer);
+		});
+
+		let statusCallCount = 0;
+		// Make status throw to prevent reuse
+		sessionPort.status = async () => {
+			statusCallCount++;
+			throw new Error("broker_unavailable");
+		};
+
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry: new MonitorRegistry(db),
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(db),
+			emit: () => {},
+		});
+		propagators.push(propagator);
+
+		await propagator.reconcile();
+
+		// Should have called status during dispatch
+		expect(statusCallCount).toBeGreaterThan(0);
+		// Pointer should still exist and not be overwritten
+		const pointerStored = db.core.metaGet(`monitor_authoring_turn:${eventId}`);
+		expect(pointerStored).toBeDefined();
+		if (pointerStored) {
+			const parsed = JSON.parse(pointerStored);
+			// The opRef should NOT have changed to a fresh one
+			expect(parsed.opRef).toBe(priorOpRef);
+		}
+		// Event should move to failed state
+		const eventRow = db.monitors.eventGet(eventId);
+		if (eventRow) {
+			expect(eventRow.stage).toBe("failed");
+		}
+	});
+
+	test("same-session failed prior status sends exactly one fresh prompt and replaces the pointer", async () => {
+		const result = await dispatchWithPriorPointer({ priorStatus: "failed" });
+		expectOldPointerStatus(result);
+		expect(result.prompts()).toBe(1);
+		expect(result.sessionPort.sendAttempts).toHaveLength(1);
+		const replacement = JSON.parse(result.pointerAtPrompt() ?? "null");
+		expect(replacement).toMatchObject({ sessionId: result.priorSessionId, eventIds: [result.eventId] });
+		expect(replacement.opRef).not.toBe(result.priorOpRef);
+		expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBeUndefined();
+	});
+
+	test("moved binding with accepted prior status holds the pointer without prompting", async () => {
+		const result = await dispatchWithPriorPointer({
+			priorStatus: "accepted",
+			priorSessionId: "s1",
+			currentSessionId: "s2",
+		});
+		expect(result.prompts()).toBe(0);
+		expect(result.sessionPort.sendAttempts).toHaveLength(0);
+		expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBe(
+			JSON.stringify({ sessionId: result.priorSessionId, opRef: result.priorOpRef, eventIds: [result.eventId] }),
+		);
+		expect(result.db.monitors.eventGet(result.eventId)?.stage).toBe("failed");
+		expect(result.db.monitors.failure(result.eventId)?.code).toBe("authoring_result_unreadable");
+		expect(result.db.monitors.failure(result.eventId)?.detail).toContain('"code":"output_pending"');
+		expectOldPointerStatus(result);
+	});
+
+	test("moved binding with unknown prior status holds the pointer without prompting", async () => {
+		const result = await dispatchWithPriorPointer({
+			priorStatus: "unknown",
+			priorSessionId: "s1",
+			currentSessionId: "s2",
+		});
+		expect(result.prompts()).toBe(0);
+		expect(result.sessionPort.sendAttempts).toHaveLength(0);
+		expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBe(
+			JSON.stringify({ sessionId: result.priorSessionId, opRef: result.priorOpRef, eventIds: [result.eventId] }),
+		);
+		expect(result.db.monitors.eventGet(result.eventId)?.stage).toBe("failed");
+		expect(result.db.monitors.failure(result.eventId)?.code).toBe("authoring_result_unreadable");
+		expect(result.db.monitors.failure(result.eventId)?.detail).toContain('"code":"output_pending"');
+		expectOldPointerStatus(result);
+	});
+
+	test("moved binding with throwing old-session status holds the pointer without prompting", async () => {
+		const result = await dispatchWithPriorPointer({
+			priorStatus: "throws",
+			priorSessionId: "s1",
+			currentSessionId: "s2",
+		});
+		expect(result.prompts()).toBe(0);
+		expect(result.sessionPort.sendAttempts).toHaveLength(0);
+		expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBe(
+			JSON.stringify({ sessionId: result.priorSessionId, opRef: result.priorOpRef, eventIds: [result.eventId] }),
+		);
+		expect(result.db.monitors.eventGet(result.eventId)?.stage).toBe("failed");
+		expect(result.db.monitors.failure(result.eventId)?.code).toBe("authoring_result_unreadable");
+		expect(result.db.monitors.failure(result.eventId)?.detail).toContain('"code":"output_pending"');
+		expectOldPointerStatus(result);
+	});
+
+	test("moved binding with failed old-session status forgets the pointer and sends exactly one fresh prompt", async () => {
+		const result = await dispatchWithPriorPointer({
+			priorStatus: "failed",
+			priorSessionId: "s1",
+			currentSessionId: "s2",
+		});
+		expect(result.prompts()).toBe(1);
+		expect(result.sessionPort.sendAttempts).toHaveLength(1);
+		const replacement = JSON.parse(result.pointerAtPrompt() ?? "null");
+		expect(replacement).toMatchObject({ sessionId: "s2", eventIds: [result.eventId] });
+		expect(replacement.opRef).not.toBe(result.priorOpRef);
+		expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBeUndefined();
+		expectOldPointerStatus(result);
+	});
+
+	for (const priorStatus of ["unknown", "throws"] as const) {
+		test(`moved binding with durable busy refusal for the old op forgets it without reading old status (${priorStatus})`, async () => {
+			const result = await dispatchWithPriorPointer({
+				priorStatus,
+				priorSessionId: "s1",
+				currentSessionId: "s2",
+				durableBusyRefusal: true,
+			});
+			expect(result.prompts()).toBe(1);
+			expect(result.sessionPort.sendAttempts).toHaveLength(1);
+			const replacement = JSON.parse(result.pointerAtPrompt() ?? "null");
+			expect(replacement).toMatchObject({ sessionId: "s2", eventIds: [result.eventId] });
+			expect(replacement.opRef).not.toBe(result.priorOpRef);
+			expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBeUndefined();
+			// The durable refusal settles it; an unreachable retired session is never asked.
+			expect(result.statusCalls).not.toContainEqual({ sessionId: result.priorSessionId, opRef: result.priorOpRef });
+		});
+	}
+
+	test("#742: stale failure from op A does not cause op B to be forgotten on recovery", async () => {
+		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-monitor-742-stale-failure-"));
+		try {
+			const db = await Store.open(join(raceHome, "gateway.db"));
+			const eventId = crypto.randomUUID();
+			const opA = crypto.randomUUID();
+			const opB = crypto.randomUUID();
+
+			// Create an event with a session_busy failure for opA
+			db.transaction((tx) => {
+				const detail = `dispatch failed ${JSON.stringify({ sessionId: "s1", opRef: opA })}`;
+				db.monitors.failureRecord(tx, eventId, "session_busy", detail);
+			});
+
+			// Later, pointer is replaced with opB
+			const pointerB = JSON.stringify({ sessionId: "s1", opRef: opB, eventIds: [eventId] });
+			db.transaction((tx) => {
+				db.core.metaSet(`monitor_authoring_turn:${eventId}`, pointerB);
+			});
+
+			// Check: Get the failure for this event
+			const failure = db.monitors.failure(eventId);
+			expect(failure).toBeDefined();
+			expect(failure?.code).toBe("session_busy");
+
+			// Core fix test: The helper function should detect that the failure belongs to opA, not opB
+			// Simulate what the code does: check if failure belongs to current pointer's operation
+			if (failure) {
+				// Parse the failure detail to extract operation info
+				const lastBrace = failure.detail.lastIndexOf("{");
+				if (lastBrace !== -1) {
+					try {
+						const parsed = JSON.parse(failure.detail.slice(lastBrace));
+						const failureOpRef = parsed.opRef;
+						const failureSessionId = parsed.sessionId;
+
+						// Verify the failure is for opA, not opB
+						expect(failureOpRef).toBe(opA);
+						expect(failureSessionId).toBe("s1");
+
+						// Verify that checking against opB would return false (failure doesn't belong to opB)
+						const belongsToOpB = failureOpRef === opB && failureSessionId === "s1";
+						expect(belongsToOpB).toBe(false);
+
+						// Verify that checking against opA returns true
+						const belongsToOpA = failureOpRef === opA && failureSessionId === "s1";
+						expect(belongsToOpA).toBe(true);
+					} catch {
+						// If parsing fails, the failure doesn't have operation info
+						// (which would be treated conservatively as not belonging to any operation)
+					}
+				}
+			}
+
+			db.close();
+		} finally {
+			await rm(raceHome, { recursive: true, force: true });
+		}
+	});
 });

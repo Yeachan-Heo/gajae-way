@@ -7,7 +7,7 @@ import type {
 	MonitorEventRecord,
 	MonitorRecord,
 	MonitorScheduleProjection,
-	MonitorSpec,
+	MonitorUpdateParams,
 	OpsCycleParams,
 	OpsCycleResult,
 	OpsDeliveriesParams,
@@ -189,7 +189,7 @@ function parseMonitorUpdateArgs(args: readonly string[]): ParsedMonitorUpdateArg
 	const [monitorId, ...options] = args;
 	if (!monitorId || monitorId.startsWith("--") || options.length === 0) throw new Error(MONITOR_UPDATE_USAGE);
 
-	let jsonPatch: Partial<MonitorSpec> | undefined;
+	let jsonPatch: Omit<MonitorUpdateParams, "monitorId"> | undefined;
 	let schedule: string | undefined;
 	let enabled: boolean | undefined;
 	for (let i = 0; i < options.length; i++) {
@@ -205,7 +205,7 @@ function parseMonitorUpdateArgs(args: readonly string[]): ParsedMonitorUpdateArg
 				throw new Error(MONITOR_UPDATE_USAGE);
 			}
 			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error(MONITOR_UPDATE_USAGE);
-			jsonPatch = parsed as Partial<MonitorSpec>;
+			jsonPatch = parsed as Omit<MonitorUpdateParams, "monitorId">;
 		} else if (option === "--schedule") {
 			const value = options[++i];
 			if (schedule !== undefined || !value || value.startsWith("--")) throw new Error(MONITOR_UPDATE_USAGE);
@@ -405,10 +405,13 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 	if ((cycle as Partial<OpsCycleResult>).silentOrigins === undefined)
 		lines.push("origin silence: not reported by the running gateway");
 	else if (cycle.silentOrigins.length === 0) lines.push("origin silence: none");
-	for (const silent of cycle.silentOrigins ?? [])
-		lines.push(
-			`origin silent: ${silent.originKey} unanswered=${silent.unanswered} oldest=${Math.floor(silent.oldestPendingAgeMs / 60_000)}m reason=${silent.holdReason}${silent.blockingOpRef ? ` op=${silent.blockingOpRef}` : ""}`,
-		);
+	for (const silent of cycle.silentOrigins ?? []) {
+		let silentLine = `origin silent: ${silent.originKey} unanswered=${silent.unanswered} oldest=${Math.floor(silent.oldestPendingAgeMs / 60_000)}m reason=${silent.holdReason}${silent.blockingOpRef ? ` op=${silent.blockingOpRef}` : ""}`;
+		if (silent.pendingLaneReports && silent.pendingLaneReports > 0 && silent.oldestLaneReportAgeMs !== undefined) {
+			silentLine += ` laneReports=${silent.pendingLaneReports} oldestLaneReport=${Math.floor(silent.oldestLaneReportAgeMs / 60_000)}m`;
+		}
+		lines.push(silentLine);
+	}
 	if (cycle.monitorAuthoringLost.length > 0)
 		lines.push(
 			`monitor authoring lost: ${cycle.monitorAuthoringLost.map((m) => `${m.eventType}=${m.consecutive} (last ${m.lastFiredAt})`).join(" ")}`,

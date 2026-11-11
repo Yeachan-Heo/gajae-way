@@ -2,8 +2,10 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ImagePreparationBudget } from "@gajae-gateway/images";
 import type { ChatMessagePayload, ChatProgressPayload } from "@gajae-gateway/protocol";
 import { PRESENCE_MIN_SWAP_MS } from "@gajae-gateway/protocol";
+import { createDiscordImagePreparer } from "../src/attachments";
 import { DiscordAdapterStartupError, loadDiscordAdapterConfig } from "../src/config";
 import {
 	chunkDiscordMessage,
@@ -18,6 +20,7 @@ import {
 	LruSet,
 	maybeCreateThreadOnMention,
 	nameThreadFromMessage,
+	ReconnectingGateway,
 	settleDiscordDelivery,
 	subscribeDiscordDeliveries,
 	subscribeDiscordProgress,
@@ -27,8 +30,85 @@ import {
 	WorkingStatus,
 } from "../src/main";
 import { discordMessageOrigin } from "../src/origin";
+import { snowflakeFromTimestamp } from "../src/recovery";
 
 const author = { id: "author-1" };
+
+test("recovery does not send a text fallback when the shared image budget rejects admission", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-image-budget-"));
+	const budget = new ImagePreparationBudget();
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const first = budget.run(() => held);
+	const second = budget.run(() => held);
+	let downloads = 0;
+	const prepareImages = createDiscordImagePreparer(budget);
+	const ports = {
+		download: async () => {
+			downloads++;
+			return Uint8Array.of(1);
+		},
+		prepare: async () => ({ images: [{ data: "AQ==", mimeType: "image/jpeg" as const }], notice: "" }),
+	};
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = {
+		id,
+		content: "look",
+		author: { id: "human" },
+		channel: { id: "channel-1", name: "general" },
+		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo" }],
+	};
+	const channel = {
+		messages: {
+			fetch: async ({ after }: { after?: string }) => (!after || BigInt(after) < BigInt(id) ? [message] : []),
+		},
+	};
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const gateway = new ReconnectingGateway(
+		"socket",
+		{ channels: { fetch: async () => channel } } as never,
+		{
+			tokenFile: "token",
+			token: "redacted",
+			configPath: "config",
+			channels: { "channel-1": { engagement: "open" } },
+		} as never,
+		undefined,
+		undefined,
+		join(home, "recovery-cursor.json"),
+		() => ({ id: "bot" }),
+		{
+			request: async (verb: string, params: unknown) => {
+				requests.push({ verb, params });
+				return { engaged: false };
+			},
+			onChatMessage: () => () => {},
+		} as never,
+		async () => {},
+		undefined,
+		undefined,
+		(inbound) => prepareImages(inbound, ports),
+	);
+	try {
+		await gateway.recoverMissedMessages();
+		expect(downloads).toBe(0);
+		expect(requests).toEqual([]);
+		expect(gateway.recoveryRetryPending).toBe(true);
+		release();
+		await Promise.all([first, second]);
+		await gateway.recoverMissedMessages();
+		expect(downloads).toBe(1);
+		expect(requests).toHaveLength(1);
+		expect(requests[0]).toMatchObject({ verb: "chat.send", params: { images: [{ data: "AQ==" }] } });
+		expect(gateway.recoveryRetryPending).toBe(false);
+	} finally {
+		release();
+		await Promise.all([first, second]);
+		await rm(home, { recursive: true, force: true });
+	}
+});
 
 test("loads and trims the token credential file without exposing its value", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-adapter-"));
@@ -786,6 +866,52 @@ test("a reply-threaded delivery threads its first chunk and only its first chunk
 	// The continuation is a plain string: threading every chunk would spam the reference.
 	expect(payloads[1]).toBe("x");
 	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("a reply reference Discord rejects as Invalid Form Body resends the text once without it (#763)", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const attempts: unknown[] = [];
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async () => ({
+				send: async (payload: unknown) => {
+					attempts.push(payload);
+					if (typeof payload === "object" && payload !== null && "reply" in payload)
+						throw Object.assign(new Error("Invalid Form Body"), { code: 50035 });
+				},
+			}),
+		},
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, {
+		...delivery(`${"x".repeat(2_000)}y`),
+		replyToMessageId: "silent-none",
+	});
+	expect(attempts).toEqual([
+		{ content: "x".repeat(2_000), reply: { messageReference: "silent-none", failIfNotExists: false } },
+		"x".repeat(2_000),
+		"y",
+	]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("a reply-threaded send failing for any other reason is not resent", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const attempts: unknown[] = [];
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async () => ({
+				send: async (payload: unknown) => {
+					attempts.push(payload);
+					throw Object.assign(new Error("Missing Permissions"), { code: 50013 });
+				},
+			}),
+		},
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, { ...delivery("hello"), replyToMessageId: "msg-42" });
+	expect(attempts).toHaveLength(1);
+	expect(requests).toEqual([
+		{ verb: "delivery.fail", params: { deliveryId: "delivery-1", reason: "Missing Permissions", ambiguous: false } },
+	]);
 });
 
 test("delivery subscription filters non-Discord and missing delivery ids", async () => {
