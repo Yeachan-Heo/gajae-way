@@ -4315,6 +4315,9 @@ class OriginActor {
 		const hasRelayUnavailableEvidence =
 			relayTrackerTs !== undefined &&
 			this.#manager.now() - Number.parseInt(relayTrackerTs, 10) >= this.#manager.unresolvedHoldMs;
+		// Any readable status other than unknown, including an in-flight one held below
+		// on relay evidence, breaks the run of unknown reads an abandonment requires.
+		if (report.status.status !== "unknown") this.#clearRetiredHoldDeadSince(bound.turn.opRef);
 		if (report.status.status === "unknown" || (report.status.status === "in_flight" && hasRelayUnavailableEvidence)) {
 			const count = (this.#holdSweeps.get(bound.turn.opRef) ?? 0) + 1;
 			this.#holdSweeps.set(bound.turn.opRef, count);
@@ -4338,7 +4341,6 @@ class OriginActor {
 			return;
 		}
 		this.#holdSweeps.delete(bound.turn.opRef);
-		this.#clearRetiredHoldDeadSince(bound.turn.opRef);
 		if (this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state === "bound")
 			this.#manager.database.transaction((tx) => this.#manager.database.inbox.turnAccept(tx, bound.turn.opRef));
 		if (!isTerminalStatus(report.status.status)) {
@@ -4888,8 +4890,9 @@ class OriginActor {
 	 * status and liveness CLI spawns, and on a long-lived gateway those piled up
 	 * until the broker stopped answering live turns. The user was already told at
 	 * escalation and the claimed inputs are closed, so no second notice is sent
-	 * and nothing is resent. A host seen live, or a readable status, restarts the
-	 * window. Liveness is read only when the window opens and when it closes.
+	 * and nothing is resent. A host seen live, or any status other than unknown,
+	 * restarts the window; a disowned id is not proof of exit. Liveness is read
+	 * only when the window opens and when it closes.
 	 */
 	async #abandonDeadRetiredHold(bound: BoundTurn): Promise<boolean> {
 		if (!bound.retired || !bound.answerWanted) return false;
@@ -4904,14 +4907,15 @@ class OriginActor {
 		const deadSince = recorded === undefined ? Number.NaN : Number.parseInt(recorded, 10);
 		if (Number.isFinite(deadSince) && now - deadSince < this.#manager.retiredHoldAbandonMs) return false;
 		const host = await this.#bindingState(bound.sessionId);
-		if (host.live === true && host.disowned !== true) {
+		if (host.live === true) {
 			// A live host may still produce the answer: the window starts over.
 			this.#clearRetiredHoldDeadSince(opRef);
 			return false;
 		}
-		// Unanswerable liveness proves nothing either way: keep the window and ask
-		// again next sweep, so a busy broker can neither close it nor reset it.
-		if (host.live !== false && host.disowned !== true) return false;
+		// Only a positive not-live read is evidence. Unanswerable liveness, or a
+		// disowned id (the broker lost the route; a detached host may still run),
+		// proves nothing: keep the window and ask again next sweep.
+		if (host.live !== false) return false;
 		if (!Number.isFinite(deadSince)) {
 			database.core.metaSet(deadSinceKey, String(now));
 			return false;
