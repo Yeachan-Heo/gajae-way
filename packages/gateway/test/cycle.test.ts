@@ -86,7 +86,7 @@ describe("runtime cycle projection", () => {
 		expect(projectRuntimeCycle(sources({ gjcVersion: "0.20.0" }), generatedAt).gates).not.toContain(
 			"gjc_unverified_version",
 		);
-		expect(projectRuntimeCycle(sources({ gjcVersion: "0.19.0" }), generatedAt).gates).not.toContain(
+		expect(projectRuntimeCycle(sources({ gjcVersion: "0.19.3" }), generatedAt).gates).not.toContain(
 			"gjc_unverified_version",
 		);
 		expect(projectRuntimeCycle(sources({ gjcVersion: undefined }), generatedAt).gates).not.toContain(
