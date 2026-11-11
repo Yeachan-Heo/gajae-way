@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
 import type { ChatMessagePayload } from "@gajae-gateway/protocol";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
@@ -435,7 +435,6 @@ test("in-flight bind operations whose outcome is unknown must not be counted as 
 	}
 });
 
-
 test("a restart mid-streak does not send a second escalation (issue #780)", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-restart-escalation-"));
 	try {
@@ -795,8 +794,6 @@ test("three retryable 'failed' events do not trigger escalation (issue #780, P2 
 			serviceTier: undefined,
 		});
 
-		const originKey = `monitor/eventtype/test.retryable_failures/parent=${monitor.monitorId}`;
-
 		// Test 1: Verify that 3 retryable-only 'failed' events do NOT escalate
 		{
 			const retryableIds: string[] = [];
@@ -879,7 +876,7 @@ test("three retryable 'failed' events do not trigger escalation (issue #780, P2 
 
 			// Verify exactly ONE escalation for terminal failures
 			expect(escalationMessages.length).toBe(1);
-			expect(escalationMessages[0]!.text).toContain("[monitor escalation]");
+			expect(escalationMessages[0]?.text).toContain("[monitor escalation]");
 		}
 
 		database.close();
