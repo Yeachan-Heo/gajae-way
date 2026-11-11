@@ -777,7 +777,13 @@ export class MonitorPropagator {
 										return undefined;
 									return current;
 								});
-								if (settled) this.#emitStage(settled, "failed_no_retry");
+								if (settled) {
+									this.#emitStage(settled, "failed_no_retry");
+									const key = originKey(
+										monitorOriginForEvent(this.#registry.get(settled.monitor_id)!, settled.event_type),
+									);
+									this.#trackConsecutiveFailedEvent(key, settled.monitor_id);
+								}
 							}
 							continue;
 						}
@@ -810,7 +816,13 @@ export class MonitorPropagator {
 									return undefined;
 								return current;
 							});
-							if (failedRow) this.#emitStage(failedRow, "failed_no_retry");
+							if (failedRow) {
+								this.#emitStage(failedRow, "failed_no_retry");
+								const key = originKey(
+									monitorOriginForEvent(this.#registry.get(failedRow.monitor_id)!, failedRow.event_type),
+								);
+								this.#trackConsecutiveFailedEvent(key, failedRow.monitor_id);
+							}
 							continue;
 						}
 						const expectedRaw = disposition.kind === "terminal" ? disposition.raw : undefined;
@@ -830,7 +842,13 @@ export class MonitorPropagator {
 							this.#forgetAuthoringTurn(tx, [row.event_id], expectedRaw);
 							return current;
 						});
-						if (failedRow) this.#emitStage(failedRow, "failed_no_retry");
+						if (failedRow) {
+							this.#emitStage(failedRow, "failed_no_retry");
+							const key = originKey(
+								monitorOriginForEvent(this.#registry.get(failedRow.monitor_id)!, failedRow.event_type),
+							);
+							this.#trackConsecutiveFailedEvent(key, failedRow.monitor_id);
+						}
 						continue;
 					}
 					if (
@@ -859,7 +877,11 @@ export class MonitorPropagator {
 		);
 		if (!result.settled) return { eventId, done: false, reason: result.reason };
 		const row = this.#database.monitors.eventGet(eventId);
-		if (row) this.#emitStage(row, "failed_no_retry");
+		if (row) {
+			this.#emitStage(row, "failed_no_retry");
+			const key = originKey(monitorOriginForEvent(this.#registry.get(row.monitor_id)!, row.event_type));
+			this.#trackConsecutiveFailedEvent(key, row.monitor_id);
+		}
 		return { eventId, done: true, previousStage: result.previousStage };
 	}
 
@@ -896,7 +918,11 @@ export class MonitorPropagator {
 		const now = this.#now();
 		const cutoff = new Date(now - MONITOR_EVENT_MAX_OPEN_AGE_MS).toISOString();
 		const rows = this.#database.transaction((tx) => this.#database.monitors.eventReapStale(tx, cutoff, now));
-		for (const row of rows) this.#emitStage(row, "failed_no_retry");
+		for (const row of rows) {
+			this.#emitStage(row, "failed_no_retry");
+			const key = originKey(monitorOriginForEvent(this.#registry.get(row.monitor_id)!, row.event_type));
+			this.#trackConsecutiveFailedEvent(key, row.monitor_id);
+		}
 		return rows.length;
 	}
 
@@ -2363,8 +2389,10 @@ export class MonitorPropagator {
 				if (row.stage === "admitted" || row.stage === "batched" || row.stage === "dispatched") continue;
 				// Codex P2 #1: overlap-skipped events are scheduling outcomes, not failures
 				if (row.stage === "skipped") continue;
-				if (row.stage !== "failed" && row.stage !== "failed_no_retry" && row.stage !== "contract_unmet") {
-					// The first non-failed terminal event of this origin ends the streak
+				// Codex P2 #1: only count terminal failures (failed_no_retry and contract_unmet)
+				// Retryable 'failed' stages do not escalate; reconcile() will redispatch them (packages/gateway/src/store/groups/monitors.ts:75-105)
+				if (row.stage !== "failed_no_retry" && row.stage !== "contract_unmet") {
+					// Any non-terminal event ends the streak
 					return count;
 				}
 				count++;
