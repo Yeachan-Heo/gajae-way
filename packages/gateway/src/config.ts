@@ -33,11 +33,28 @@ export const DEFAULT_WORK_MAX_LANES = 4;
 export const DEFAULT_WORK_IDLE_RETIRE_MS = 6 * 60 * 60_000;
 const WORK_IDLE_RETIRE_MIN_MS = 60_000;
 const WORK_IDLE_RETIRE_MAX_MS = 7 * 24 * 60 * 60_000;
+/** Wall-clock bound for one completion-check command. */
+export const DEFAULT_COMPLETION_CHECK_TIMEOUT_MS = 30_000;
+const COMPLETION_CHECK_TIMEOUT_MIN_MS = 1_000;
+const COMPLETION_CHECK_TIMEOUT_MAX_MS = 120_000;
+/** Re-steers a lane may spend on failed completion checks before it settles anyway. */
+export const DEFAULT_COMPLETION_CHECK_MAX_RESTEERS = 2;
+const COMPLETION_CHECK_MAX_RESTEERS_MAX = 10;
+const COMPLETION_CHECK_ARGV_MAX = 32;
+
+/** Operator-owned command the gateway runs before it settles a completed `work.start` attempt. */
+export interface WorkCompletionCheckConfig {
+	/** argv; the first entry is an absolute executable path. Never run through a shell. */
+	readonly command: readonly string[];
+	readonly timeoutMs?: number;
+	readonly maxResteers?: number;
+}
 
 export interface WorkLaneConfig {
 	readonly maxLanes?: number;
 	readonly idleRetireMs?: number;
 	readonly allowNested?: boolean;
+	readonly completionCheck?: WorkCompletionCheckConfig;
 }
 
 /**
@@ -589,10 +606,63 @@ function parseMonitorCatchUp(value: unknown): MonitorCatchUpConfig {
 	};
 }
 
+function parseCompletionCheck(value: unknown): WorkCompletionCheckConfig {
+	// Composed so the last segment is checked against the config type, and so the
+	// SDK coverage inventory does not read a quoted dotted name as a gateway verb.
+	const field = `work.${"completionCheck" satisfies keyof WorkLaneConfig}`;
+	const input = requireObject(value, field);
+	if (Object.keys(input).some((key) => key !== "command" && key !== "timeoutMs" && key !== "maxResteers"))
+		throw new ConfigError("config_invalid", `${field} may only contain command, timeoutMs, and maxResteers`);
+	const command = parseStringArray(input.command, `${field}.command`);
+	if (command.length === 0)
+		throw new ConfigError("config_invalid", `${field}.command must be a non-empty string array`);
+	if (command.length > COMPLETION_CHECK_ARGV_MAX)
+		throw new ConfigError(
+			"config_invalid",
+			`${field}.command must contain at most ${COMPLETION_CHECK_ARGV_MAX} entries`,
+		);
+	if (command.some((entry) => entry.includes("\0")))
+		throw new ConfigError("config_invalid", `${field}.command entries must not contain NUL`);
+	if (!isAbsolute(command[0] as string))
+		throw new ConfigError("config_invalid", `${field}.command[0] must be an absolute path`);
+	if (
+		input.timeoutMs !== undefined &&
+		(!Number.isInteger(input.timeoutMs) ||
+			(input.timeoutMs as number) < COMPLETION_CHECK_TIMEOUT_MIN_MS ||
+			(input.timeoutMs as number) > COMPLETION_CHECK_TIMEOUT_MAX_MS)
+	)
+		throw new ConfigError(
+			"config_invalid",
+			`${field}.timeoutMs must be an integer between ${COMPLETION_CHECK_TIMEOUT_MIN_MS} and ${COMPLETION_CHECK_TIMEOUT_MAX_MS}`,
+		);
+	if (
+		input.maxResteers !== undefined &&
+		(!Number.isInteger(input.maxResteers) ||
+			(input.maxResteers as number) < 1 ||
+			(input.maxResteers as number) > COMPLETION_CHECK_MAX_RESTEERS_MAX)
+	)
+		throw new ConfigError(
+			"config_invalid",
+			`${field}.maxResteers must be an integer between 1 and ${COMPLETION_CHECK_MAX_RESTEERS_MAX}`,
+		);
+	return {
+		command,
+		...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs as number }),
+		...(input.maxResteers === undefined ? {} : { maxResteers: input.maxResteers as number }),
+	};
+}
+
 function parseWork(value: unknown): WorkLaneConfig {
 	const input = requireObject(value, "work");
-	if (Object.keys(input).some((key) => key !== "maxLanes" && key !== "idleRetireMs" && key !== "allowNested"))
-		throw new ConfigError("config_invalid", "work may only contain maxLanes, idleRetireMs, and allowNested");
+	if (
+		Object.keys(input).some(
+			(key) => key !== "maxLanes" && key !== "idleRetireMs" && key !== "allowNested" && key !== "completionCheck",
+		)
+	)
+		throw new ConfigError(
+			"config_invalid",
+			"work may only contain maxLanes, idleRetireMs, allowNested, and completionCheck",
+		);
 	if (
 		input.maxLanes !== undefined &&
 		(!Number.isInteger(input.maxLanes) || (input.maxLanes as number) < 1 || (input.maxLanes as number) > 256)
@@ -614,6 +684,7 @@ function parseWork(value: unknown): WorkLaneConfig {
 		...(input.maxLanes === undefined ? {} : { maxLanes: input.maxLanes as number }),
 		...(input.idleRetireMs === undefined ? {} : { idleRetireMs: input.idleRetireMs as number }),
 		...(input.allowNested === undefined ? {} : { allowNested: input.allowNested as boolean }),
+		...(input.completionCheck === undefined ? {} : { completionCheck: parseCompletionCheck(input.completionCheck) }),
 	};
 }
 

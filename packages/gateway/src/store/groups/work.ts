@@ -29,8 +29,10 @@ export type WorkAttemptDecision =
 	| "suppressed"
 	| "no_target"
 	| "wake_unaccepted"
-	| "recovery_indeterminate";
-export type WorkAttemptRequestedDecision = "report" | "suppressed" | "no_target" | "wake_unaccepted";
+	| "recovery_indeterminate"
+	/** A failed completion check re-steered the lane; this attempt owes its parent no report. */
+	| "resteered";
+export type WorkAttemptRequestedDecision = "report" | "suppressed" | "no_target" | "wake_unaccepted" | "resteered";
 
 export function workAttemptEndState(
 	reason: string,
@@ -448,6 +450,7 @@ export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: strin
 			"no_target",
 			"wake_unaccepted",
 			"recovery_indeterminate",
+			"resteered",
 		].includes(value.decision),
 	);
 	workAssert(value.decision === "undecided" ? value.settledAt === null : workTime(value.settledAt));
@@ -467,6 +470,10 @@ export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: strin
 				(value.parent.kind === "lane" && value.parent.root === null),
 		);
 		workAssert(value.decision !== "suppressed" || output.knownSilence !== null);
+		workAssert(
+			value.decision !== "resteered" ||
+				(value.mode === "start" && value.wakeReportId === null && value.terminal.reasonCode === "end_turn"),
+		);
 		workAssert(
 			value.decision !== "wake_unaccepted" ||
 				(value.wakeReportId !== null && value.mode === "start" && value.terminal !== null && !workAccepted(value)),
@@ -847,6 +854,8 @@ export class WorkGroup {
 				}
 			} else {
 				workAssert(admission === undefined);
+				// A re-steer owes its lane a durable marker; without it no recovery would ever report.
+				workAssert(requested !== "resteered" || record.completionCheck?.pendingResteer?.opRef === opRef);
 				decision = requested;
 			}
 		}

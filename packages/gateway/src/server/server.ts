@@ -51,6 +51,8 @@ import {
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import {
 	type ConfigOverrides,
+	DEFAULT_COMPLETION_CHECK_MAX_RESTEERS,
+	DEFAULT_COMPLETION_CHECK_TIMEOUT_MS,
 	DEFAULT_SESSIONS_MAX_LIVE_HOSTS,
 	type GatewayConfig,
 	type ReloadResult,
@@ -91,6 +93,7 @@ import { RuntimeCycleProjector } from "../ops/cycle";
 import { OriginSilentAlerter } from "../ops/origin-silent";
 import { DEFAULT_SLO_DAYS, evaluateSlo, type SloRecorder } from "../ops/slo";
 import type { GlobalGjcClient } from "../orchestrator/broker";
+import { commandCompletionCheck } from "../orchestrator/completion-check";
 import { ghCheckStatusClient } from "../orchestrator/gh-checks";
 import { LaneGovernor } from "../orchestrator/lane-governor";
 import {
@@ -1184,6 +1187,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		maxLanes: options.config.work?.maxLanes,
 		idleRetireMs: options.config.work?.idleRetireMs,
 	});
+	const completionCheck = options.config.work?.completionCheck;
 	const work = new WorkLaneManager({
 		database: options.database,
 		port: sessionPort,
@@ -1199,6 +1203,17 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		},
 		deliverFallback: (payload) => broadcastDelivery(runtime, payload),
 		checkStatusClient: ghCheckStatusClient(),
+		...(completionCheck
+			? {
+					completionCheck: {
+						client: commandCompletionCheck(
+							completionCheck.command,
+							completionCheck.timeoutMs ?? DEFAULT_COMPLETION_CHECK_TIMEOUT_MS,
+						),
+						maxResteers: completionCheck.maxResteers ?? DEFAULT_COMPLETION_CHECK_MAX_RESTEERS,
+					},
+				}
+			: {}),
 	});
 	const originSilent = new OriginSilentAlerter(options.database, () => runtime.config.ownerTarget?.origin);
 	const reconcileTimer = setInterval(() => {
