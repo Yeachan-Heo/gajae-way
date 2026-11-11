@@ -1,8 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import { BrokerStartupFailureTracker, validateStartupExitRecord } from "../src/orchestrator/broker-liveness";
-import { GlobalGjcClient } from "../src/orchestrator/broker";
 
 describe("BrokerStartupFailureTracker", () => {
 	test("K distinct records with the same reason trigger exactly one alert", () => {
