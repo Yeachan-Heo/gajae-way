@@ -2070,7 +2070,9 @@ export class WorkLaneManager {
 		}
 		let retries: number;
 		try {
-			retries = this.#job(name)?.completionCheck?.retries ?? 0;
+			// Read only this attempt's lane record instead of a third validated #job() pass on the settle path.
+			const json = this.#db.work.laneJobJson(runtime.jobId);
+			retries = json === undefined ? 0 : (parseLaneJobRecord(json).completionCheck?.retries ?? 0);
 		} catch {
 			return undefined; // An unreadable lane cannot be settled either.
 		}
@@ -2119,6 +2121,9 @@ export class WorkLaneManager {
 	async #settle(observer: Observer, runtime: WorkAttemptRuntime): Promise<void> {
 		const check = await this.#completionCheck(observer, runtime);
 		const resteer = check?.kind === "resteer" ? check : undefined;
+		// A status the check produced must reach the parent even when the worker stayed silent.
+		const status = check?.kind === "settle" ? check.token : undefined;
+		let statusEffects: ChecksReportEffects | undefined;
 		// A re-steered attempt reports nothing, and the next attempt is about to move HEAD.
 		const facts = resteer
 			? undefined
@@ -2298,6 +2303,10 @@ export class WorkLaneManager {
 				// The settled attempt needs no relay; release it before the next attempt attaches its own.
 				await this.#releaseSettledObserver(observer);
 				await this.#startCompletionResteer(name, job, runtime, resteer.text);
+			} else if (status && settled.runtime.decision === "suppressed" && runtime.parent !== null) {
+				// Silence suppresses the worker's own message, not a gate status it never authored:
+				// the attempt keeps its `suppressed` decision and the status becomes a durable report.
+				statusEffects = this.#admitCompletionStatus(name, job, runtime.parent, text, at, runtime.opRef);
 			}
 			return settled;
 		});
@@ -2354,6 +2363,7 @@ export class WorkLaneManager {
 			if (settled.parent?.kind === "lane") await drain(settled.parent.name);
 			await drain(settled.sessionKey.slice("work/task/".length));
 			if (result.requeuedParent) await drain(result.requeuedParent);
+			if (statusEffects) await this.#dispatchChecksEffects(statusEffects);
 		}
 		await this.#releaseSettledObserver(observer);
 	}
@@ -2512,12 +2522,32 @@ export class WorkLaneManager {
 		return effects;
 	}
 	/**
+	 * Reports a completion-check status for a silent attempt. The attempt's own
+	 * decision stays `suppressed` (its message was silent), so this admits a
+	 * lane-level report instead of an attempt admission and survives a restart.
+	 */
+	#admitCompletionStatus(
+		name: string,
+		job: LaneJobRecord,
+		parent: WorkParent,
+		text: string,
+		at: string,
+		opRef: string,
+	): ChecksReportEffects {
+		const reportRef = newOpRef(`completion-status-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
+		const effects = this.#admitJobReport(name, job, parent, text, reportRef, at);
+		console.error(`completion_check_status_reported name=${name} opRef=${opRef} parent=${parent.kind}`);
+		return effects;
+	}
+	/**
 	 * Reports a completion re-steer that never opened an attempt, so the lane is
 	 * not left silent. Nothing is retried: the job stays continuable for an operator.
 	 */
 	#abandonCompletionResteer(name: string, job: LaneJobRecord): ChecksReportEffects {
 		const at = this.#at();
 		const last = job.attempts.at(-1);
+		// The parent comes from the settled attempt's durable runtime row; a missing row
+		// leaves the escalation trail as the only record, which is why it is written there too.
 		const parent = last ? (this.#attemptByOpRef(last.opRef)?.parent ?? null) : null;
 		const head = job.awaitingChecks ? ` head=${job.awaitingChecks.headSha.slice(0, 12)}` : "";
 		const text = `[lane ${name}] attempt_ended: completion_check resteer_failed retries=${job.completionCheck?.retries ?? 0}${head}`;

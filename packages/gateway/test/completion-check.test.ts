@@ -135,6 +135,36 @@ test("completion check never starts the command for an already aborted signal", 
 	expect(existsSync(ran)).toBe(false);
 });
 
+test("completion check inherits only its allowlisted environment, never gateway secrets", async () => {
+	const directory = await scratch();
+	const body = [
+		'if [ -n "$GAJAEWAY_TEST_SECRET" ]; then echo leaked; fi',
+		"printf 'path=%s\\n' \"${PATH:+set}\"",
+		"exit 1",
+	].join("\n");
+	process.env.GAJAEWAY_TEST_SECRET = "must-not-reach-the-check";
+	try {
+		const outcome = await commandCompletionCheck([await script(directory, body)], 5_000).check(lane(directory));
+		if (outcome.kind !== "failed") throw new Error(`unexpected outcome ${outcome.kind}`);
+		expect(outcome.output).not.toContain("leaked");
+		expect(outcome.output).toContain("path=set");
+	} finally {
+		delete process.env.GAJAEWAY_TEST_SECRET;
+	}
+});
+
+test("completion check kills a descendant that left the command's process group", async () => {
+	const setsid = Bun.which("setsid");
+	if (!setsid) return; // macOS has no setsid; the Linux CI matrix covers this case.
+	const directory = await scratch();
+	const pidFile = join(directory, "escaped.pid");
+	const body = `${setsid} sleep 30 &\n${recordPid("$!", pidFile)}\nwait`;
+	const pending = commandCompletionCheck([await script(directory, body)], 3_000).check(lane(directory));
+	const escaped = await hookPid(pidFile);
+	expect(await pending).toEqual({ kind: "unavailable", cause: "timeout" });
+	expect(await untilGone(escaped)).toBe(true);
+});
+
 test("completion check kills a running command when its signal aborts", async () => {
 	const directory = await scratch();
 	const pidFile = join(directory, "check.pid");

@@ -8950,6 +8950,31 @@ test("completion check: a silent attempt is still gated and a silent pass stays 
 	expect(f.job().completionCheck).toBeUndefined();
 });
 
+test("completion check: a silent attempt still reports a gate status to its parent", async () => {
+	// A waiting verdict is a state the parent must see even when the worker said nothing.
+	const waiting = scriptedCompletionCheck([{ kind: "waiting" }]);
+	const first = await fixture(waiting.options);
+	const attempt = await started(first, "a", origin);
+	first.port.complete(attempt.opRef, "[SILENT]");
+	expect((await settled(first, attempt.opRef)).decision).toBe("suppressed");
+	expect(laneReports(first)).toHaveLength(1);
+	expect(laneReports(first)[0]).toContain("completion_check_waiting");
+	expect(first.notices[0]).toMatchObject({ origin });
+
+	// A spent re-steer budget is the same kind of state.
+	const exhausted = scriptedCompletionCheck([unmet("C2 unmet")], 1);
+	const second = await fixture(exhausted.options);
+	const original = await started(second, "a", origin);
+	second.port.complete(original.opRef, "[SILENT]");
+	const resteer = await sent(second, 1);
+	expect((await settled(second, original.opRef)).decision).toBe("resteered");
+	expect(laneReports(second)).toEqual([]);
+	second.port.complete(resteer.opRef, "[SILENT]");
+	expect((await settled(second, resteer.opRef)).decision).toBe("suppressed");
+	expect(laneReports(second)).toHaveLength(1);
+	expect(laneReports(second)[0]).toContain("completion_check_exhausted retries=1");
+});
+
 test("completion check: a lane in a PR-checks cycle keeps its retries, deadline and head across a re-steer", async () => {
 	const checks = scriptedChecks({ prNumber: 700, status: "pending", failingChecks: [] });
 	const check = scriptedCompletionCheck([{ kind: "passed" }, unmet("C2 unmet"), { kind: "passed" }]);

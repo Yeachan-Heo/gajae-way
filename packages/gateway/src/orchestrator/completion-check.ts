@@ -89,14 +89,14 @@ export function commandCompletionCheck(argv: readonly string[], timeoutMs: numbe
 			try {
 				result = await Promise.race([completed, interrupted]);
 			} catch (error) {
-				killGroup(child.pid);
+				terminate(child);
 				await child.exited;
 				return { kind: "unavailable", cause: "abnormal_exit", detail: errorMessage(error) };
 			} finally {
 				clear();
 			}
 			if (result === "timeout" || result === "aborted") {
-				killGroup(child.pid);
+				terminate(child);
 				// SIGKILL cannot be ignored: reap the command so nothing outlives the call.
 				await child.exited;
 				completed.catch(() => undefined);
@@ -117,21 +117,80 @@ export function commandCompletionCheck(argv: readonly string[], timeoutMs: numbe
 }
 
 function spawnCheck(argv: readonly string[], input: CompletionCheckInput) {
-	const env: Record<string, string> = {};
-	for (const [key, value] of Object.entries(process.env)) if (value !== undefined) env[key] = value;
-	env.GAJAEWAY_LANE_KEY = input.laneKey;
-	env.GAJAEWAY_LANE_NAME = input.name;
-	env.GAJAEWAY_SESSION_ID = input.sessionId;
-	env.GAJAEWAY_WORKTREE = input.worktree;
-	env.GAJAEWAY_OP_REF = input.opRef;
 	return Bun.spawn([...argv], {
 		cwd: input.worktree,
-		env,
+		env: checkEnvironment(input),
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
 		detached: true,
 	});
+}
+
+/**
+ * Variables a check may inherit. The gateway environment is deliberately not
+ * forwarded (#803 review): a check often loads repository content, and the
+ * gateway holds credentials there. Operators that need more pass it through an
+ * explicit wrapper argv, e.g. `/usr/bin/env HOME=/home/check <cmd>`.
+ */
+const CHECK_ENV_ALLOWLIST = ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "TERM", "SHELL"] as const;
+
+function checkEnvironment(input: CompletionCheckInput): Record<string, string> {
+	const env: Record<string, string> = {};
+	for (const key of CHECK_ENV_ALLOWLIST) {
+		const value = process.env[key];
+		if (value !== undefined) env[key] = value;
+	}
+	env.GAJAEWAY_LANE_KEY = input.laneKey;
+	env.GAJAEWAY_LANE_NAME = input.name;
+	env.GAJAEWAY_SESSION_ID = input.sessionId;
+	env.GAJAEWAY_WORKTREE = input.worktree;
+	env.GAJAEWAY_OP_REF = input.opRef;
+	return env;
+}
+
+/**
+ * SIGKILLs the command's process group and every process descending from it.
+ * The descendant list is taken first: a child that called `setsid` leaves the
+ * group but is still parented to the command until the group kill lands.
+ * A descendant that both detaches and is reparented before this snapshot
+ * escapes; closing that needs the containment scope in the PR discussion.
+ */
+function terminate(child: { readonly pid: number }): void {
+	const descendants = descendantsOf(child.pid);
+	killGroup(child.pid);
+	for (const pid of descendants) {
+		try {
+			process.kill(pid, "SIGKILL");
+		} catch {
+			/* Already gone. */
+		}
+	}
+}
+
+function descendantsOf(root: number): number[] {
+	const listing = Bun.spawnSync(["ps", "-A", "-o", "pid=,ppid="], { stdout: "pipe", stderr: "ignore" });
+	if (listing.exitCode !== 0) return [];
+	const children = new Map<number, number[]>();
+	for (const line of listing.stdout.toString().split("\n")) {
+		const [pidText, ppidText] = line.trim().split(/\s+/);
+		const pid = Number(pidText);
+		const ppid = Number(ppidText);
+		if (!Number.isInteger(pid) || !Number.isInteger(ppid)) continue;
+		const siblings = children.get(ppid);
+		if (siblings) siblings.push(pid);
+		else children.set(ppid, [pid]);
+	}
+	const found: number[] = [];
+	const queue = [root];
+	for (let next = queue.shift(); next !== undefined; next = queue.shift()) {
+		for (const pid of children.get(next) ?? []) {
+			if (found.includes(pid)) continue;
+			found.push(pid);
+			queue.push(pid);
+		}
+	}
+	return found;
 }
 
 function errorMessage(error: unknown): string {
