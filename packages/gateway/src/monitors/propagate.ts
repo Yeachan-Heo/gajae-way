@@ -779,10 +779,7 @@ export class MonitorPropagator {
 								});
 								if (settled) {
 									this.#emitStage(settled, "failed_no_retry");
-									const key = originKey(
-										monitorOriginForEvent(this.#registry.get(settled.monitor_id)!, settled.event_type),
-									);
-									this.#trackConsecutiveFailedEvent(key, settled.monitor_id);
+									this.#trackTerminalFailure(settled);
 								}
 							}
 							continue;
@@ -818,10 +815,7 @@ export class MonitorPropagator {
 							});
 							if (failedRow) {
 								this.#emitStage(failedRow, "failed_no_retry");
-								const key = originKey(
-									monitorOriginForEvent(this.#registry.get(failedRow.monitor_id)!, failedRow.event_type),
-								);
-								this.#trackConsecutiveFailedEvent(key, failedRow.monitor_id);
+								this.#trackTerminalFailure(failedRow);
 							}
 							continue;
 						}
@@ -844,10 +838,7 @@ export class MonitorPropagator {
 						});
 						if (failedRow) {
 							this.#emitStage(failedRow, "failed_no_retry");
-							const key = originKey(
-								monitorOriginForEvent(this.#registry.get(failedRow.monitor_id)!, failedRow.event_type),
-							);
-							this.#trackConsecutiveFailedEvent(key, failedRow.monitor_id);
+							this.#trackTerminalFailure(failedRow);
 						}
 						continue;
 					}
@@ -879,8 +870,7 @@ export class MonitorPropagator {
 		const row = this.#database.monitors.eventGet(eventId);
 		if (row) {
 			this.#emitStage(row, "failed_no_retry");
-			const key = originKey(monitorOriginForEvent(this.#registry.get(row.monitor_id)!, row.event_type));
-			this.#trackConsecutiveFailedEvent(key, row.monitor_id);
+			this.#trackTerminalFailure(row);
 		}
 		return { eventId, done: true, previousStage: result.previousStage };
 	}
@@ -920,8 +910,7 @@ export class MonitorPropagator {
 		const rows = this.#database.transaction((tx) => this.#database.monitors.eventReapStale(tx, cutoff, now));
 		for (const row of rows) {
 			this.#emitStage(row, "failed_no_retry");
-			const key = originKey(monitorOriginForEvent(this.#registry.get(row.monitor_id)!, row.event_type));
-			this.#trackConsecutiveFailedEvent(key, row.monitor_id);
+			this.#trackTerminalFailure(row);
 		}
 		return rows.length;
 	}
@@ -2406,6 +2395,13 @@ export class MonitorPropagator {
 	 * Track a failed monitor event and check if escalation is needed.
 	 * Issue #780: when K consecutive events fail, escalate once per streak.
 	 */
+	/** Feed a terminal failure into the escalation streak; a removed monitor has no origin left to escalate. */
+	#trackTerminalFailure(row: { monitor_id: string; event_type: string }): void {
+		const monitor = this.#registry.get(row.monitor_id);
+		if (!monitor) return;
+		this.#trackConsecutiveFailedEvent(originKey(monitorOriginForEvent(monitor, row.event_type)), row.monitor_id);
+	}
+
 	#trackConsecutiveFailedEvent(sessionOriginKey: string, monitorId: string): void {
 		const state = this.#safetyState(sessionOriginKey);
 		const consecutiveCount = this.#countConsecutiveFailures(monitorId, sessionOriginKey);
