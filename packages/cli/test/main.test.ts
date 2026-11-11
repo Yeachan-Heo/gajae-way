@@ -1078,10 +1078,43 @@ describe("work operator commands", () => {
 		expect(output.exitCode).toBe(1);
 	});
 
-	for (const command of ["run", "start", "status", "steer"]) {
+	test("work stop prints the settled attempt end state", async () => {
+		const output = await run(["stop", "fix"], {
+			stopped: true,
+			opRef: "work-op",
+			settled: true,
+			endState: "attempt_ended",
+		});
+		expect(output.requests).toEqual([{ verb: "work.stop", params: { name: "fix" } }]);
+		expect(output.lines).toEqual(["stopped: work-op end=attempt_ended"]);
+		expect(output.closed).toBe(true);
+	});
+
+	test("work stop reports an accepted abort that is still settling", async () => {
+		const output = await run(["stop", "fix"], {
+			stopped: true,
+			opRef: "work-op",
+			settled: false,
+			reason: "abort accepted; attempt still settling",
+		});
+		expect(output.lines).toEqual(["stop accepted: work-op (abort accepted; attempt still settling)"]);
+		expect(output.exitCode).not.toBe(1);
+	});
+
+	test("work stop refusal is not a stop", async () => {
+		const output = await run(["stop", "fix"], {
+			stopped: false,
+			reason: "abort_refused:resource_gone",
+			opRef: "work-op",
+		});
+		expect(output.lines).toEqual(["not stopped: abort_refused:resource_gone"]);
+		expect(output.exitCode).toBe(1);
+	});
+
+	for (const command of ["run", "start", "status", "steer", "stop"]) {
 		test(`work ${command} reports gateway errors and closes without retry`, async () => {
 			const output = await run(
-				[command, "fix", ...(command === "status" ? [] : ["task"])],
+				[command, "fix", ...(command === "status" || command === "stop" ? [] : ["task"])],
 				new Error("work status unavailable"),
 			);
 			expect(output.lines).toEqual([]);

@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import type { BrokerSession } from "@gajae-gateway/subsession";
 import { OpRefRejectedError } from "@gajae-gateway/subsession";
 import { parseConfigFile } from "../src/config";
@@ -862,10 +862,18 @@ test("red-team coverage fuzz: exact-boundary fragments plus steer-failure and br
 	}
 });
 
-test("red-team non-goal probes: no running-turn abort or coexistence control remains, and inbound persistence has only ratified turn metadata", async () => {
-	const source = (await Promise.all((await sourceFiles(SOURCE_ROOT)).map((path) => readFile(path, "utf8")))).join("\n");
-	for (const forbidden of ["turn.abort", "turn.replace", "--resume", "keyed-queue"])
-		expect(source).not.toContain(forbidden);
+test("red-team non-goal probes: no implicit running-turn abort or coexistence control remains, and inbound persistence has only ratified turn metadata", async () => {
+	const files = await sourceFiles(SOURCE_ROOT);
+	const sources = await Promise.all(
+		files.map(async (path) => ({ path: relative(SOURCE_ROOT, path), text: await readFile(path, "utf8") })),
+	);
+	const source = sources.map((file) => file.text).join("\n");
+	for (const forbidden of ["turn.replace", "--resume", "keyed-queue"]) expect(source).not.toContain(forbidden);
+	// The operator's explicit work.stop is the only sanctioned abort path.
+	expect(sources.flatMap((file) => (file.text.includes("turn.abort") ? [file.path] : []))).toEqual([
+		"orchestrator/session-port.ts",
+		"orchestrator/work-lane.ts",
+	]);
 	for (const field of ["legacyTurn", "persistentTurn", "turnPath", "turnMode", "turnTransport"] as const) {
 		const parsed = parseConfigFile({ schemaVersion: 1, [field]: true });
 		expect(parsed).not.toHaveProperty(field);

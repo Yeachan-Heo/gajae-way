@@ -55,13 +55,14 @@ describe("describePanelResponse", () => {
 		expect(response?.engagement.group).toBe(true);
 	});
 
-	it("parses approval panel approve response", () => {
+	it("parses an exact approval option click with its binding digest", () => {
 		const blockAction: SlackBlockAction = {
 			type: "block_actions",
 			actions: [
 				{
 					type: "button",
-					action_id: "approval_approval456_allow",
+					action_id: "approval_approval456_0123456789abcdef0123456789abcdef_allow_once",
+					value: "allow_once",
 				},
 			],
 			trigger_id: "trigger123",
@@ -97,38 +98,27 @@ describe("describePanelResponse", () => {
 
 		expect(response).not.toBeNull();
 		expect(response?.panelId).toBe("approval456");
-		expect(response?.responseKind).toBe("approved");
+		expect(response?.digest).toBe("0123456789abcdef0123456789abcdef");
+		expect(response?.responseKind).toBe("option_selected");
+		expect(response?.selectedOptionId).toBe("allow_once");
 		expect(response?.responderId).toBe("U456");
 	});
 
-	it("parses approval panel deny response", () => {
+	it("parses an option id that contains underscores", () => {
 		const blockAction: SlackBlockAction = {
 			type: "block_actions",
 			actions: [
 				{
 					type: "button",
-					action_id: "approval_approval789_deny",
+					action_id: "approval_approval789_fedcba9876543210fedcba9876543210_reject_always",
+					value: "reject_always",
 				},
 			],
 			trigger_id: "trigger123",
-			user: {
-				id: "U789",
-				username: "reviewer",
-				name: "Reviewer User",
-				team_id: "T123",
-			},
-			team: {
-				id: "T123",
-				domain: "test",
-			},
-			channel: {
-				id: "C123",
-				name: "general",
-			},
-			message: {
-				type: "message",
-				ts: "1234567890.123456",
-			},
+			user: { id: "U789", username: "reviewer", name: "Reviewer User", team_id: "T123" },
+			team: { id: "T123", domain: "test" },
+			channel: { id: "C123", name: "general" },
+			message: { type: "message", ts: "1234567890.123456" },
 			token: "token123",
 			api_app_id: "app123",
 			event_ts: "1234567890.123456",
@@ -141,10 +131,33 @@ describe("describePanelResponse", () => {
 			conversationId: "C123",
 		});
 
-		expect(response).not.toBeNull();
-		expect(response?.panelId).toBe("approval789");
-		expect(response?.responseKind).toBe("denied");
-		expect(response?.responderId).toBe("U789");
+		expect(response).toMatchObject({
+			panelId: "approval789",
+			digest: "fedcba9876543210fedcba9876543210",
+			responseKind: "option_selected",
+			selectedOptionId: "reject_always",
+			responderId: "U789",
+		});
+	});
+
+	it("ignores legacy allow/deny buttons that carry no digest", () => {
+		const blockAction: SlackBlockAction = {
+			type: "block_actions",
+			actions: [{ type: "button", action_id: "approval_approval456_allow" }],
+			trigger_id: "trigger123",
+			user: { id: "U456", username: "approver", name: "Approver User", team_id: "T123" },
+			team: { id: "T123", domain: "test" },
+			channel: { id: "C123", name: "general" },
+			message: { type: "message", ts: "1234567890.123456" },
+			token: "token123",
+			api_app_id: "app123",
+			event_ts: "1234567890.123456",
+			event_id: "event123",
+		};
+
+		expect(
+			describePanelResponse(blockAction, { platform: "slack", kind: "channel", conversationId: "C123" }),
+		).toBeNull();
 	});
 
 	it("returns null for non-panel block actions", () => {
@@ -285,6 +298,7 @@ describe("describePanelResponse", () => {
 				panelId,
 				message: "Run tests",
 				expiresAt: new Date(Date.now() + 60_000).toISOString(),
+				digest: "0123456789abcdef0123456789abcdef",
 				options: [
 					{ optionId: "allow_once", name: "Allow once", kind: "allow_once" },
 					{ optionId: "allow_always", name: "Always allow", kind: "allow_always" },
@@ -311,5 +325,6 @@ describe("describePanelResponse", () => {
 			[panelId, "option_selected", "allow_always"],
 			[panelId, "option_selected", "reject_once"],
 		]);
+		expect(new Set(clicked.map((response) => response?.digest))).toEqual(new Set(["0123456789abcdef0123456789abcdef"]));
 	});
 });

@@ -22,15 +22,23 @@ async function sourceSnapshot(): Promise<{ readonly files: readonly string[]; re
 	return { files, text: (await Promise.all(files.map((path) => readFile(path, "utf8")))).join("\n") };
 }
 
-test("hard cutover leaves no resume argv, KeyedQueue subject, or turn-abort path", async () => {
+test("hard cutover leaves no resume argv, KeyedQueue subject, or implicit turn replacement", async () => {
 	const { files, text } = await sourceSnapshot();
 	const relativeFiles = files.map((path) => relative(SOURCE_ROOT, path));
 
 	expect(relativeFiles).not.toContain("server/keyed-queue.ts");
 	expect(text).not.toContain("keyed-queue");
 	expect(text).not.toContain("--resume");
-	expect(text).not.toContain("turn.abort");
 	expect(text).not.toContain("turn.replace");
+	// `turn.abort` is not an implicit recovery path: the ONLY sanctioned use is
+	// the operator's explicit work.stop, which reaches the host through
+	// SessionPort.abort on the relay that owns the turn.
+	const abortSites = (
+		await Promise.all(
+			files.map(async (path) => ({ path: relative(SOURCE_ROOT, path), text: await readFile(path, "utf8") })),
+		)
+	).flatMap((file) => (file.text.includes("turn.abort") ? [file.path] : []));
+	expect(abortSites).toEqual(["orchestrator/session-port.ts", "orchestrator/work-lane.ts"]);
 });
 
 test("configuration has no turn-path coexistence switch and rejects the removed timeout", async () => {

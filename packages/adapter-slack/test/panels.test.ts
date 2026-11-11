@@ -72,7 +72,7 @@ describe("askUserPanelBlocks", () => {
 });
 
 describe("approvalPanelBlocks", () => {
-	it("renders approval panel with allow/deny buttons", () => {
+	it("renders no buttons when the panel offers no options", () => {
 		const futureTime = new Date(Date.now() + 60 * 1000).toISOString();
 		const message: ChatMessagePayload = {
 			turnId: "turn123",
@@ -84,19 +84,15 @@ describe("approvalPanelBlocks", () => {
 				panelId: "approval123",
 				message: "This action requires approval",
 				expiresAt: futureTime,
+				digest: "0123456789abcdef0123456789abcdef",
 			},
 		};
 
 		const blocks = approvalPanelBlocks(message);
 		expect(blocks.length).toBeGreaterThan(0);
 		expect(blocks[0].type).toBe("section");
-		// Should have allow/deny buttons
-		const actionBlocks = blocks.filter((b: any) => b.type === "actions");
-		expect(actionBlocks.length).toBe(1);
-		const buttons = actionBlocks[0].elements as any[];
-		expect(buttons.length).toBe(2);
-		expect(buttons[0].text.text).toBe("Allow");
-		expect(buttons[1].text.text).toBe("Deny");
+		// Exact approval needs an offered option; no generic allow/deny fallback.
+		expect(blocks.filter((b: any) => b.type === "actions")).toHaveLength(0);
 	});
 
 	it("renders approval panel with offered permission options", () => {
@@ -111,6 +107,7 @@ describe("approvalPanelBlocks", () => {
 				panelId: "perm-panel-456",
 				message: "Grant permission?",
 				expiresAt: futureTime,
+				digest: "fedcba9876543210fedcba9876543210",
 				options: [
 					{ optionId: "allow_once", name: "Allow once", kind: "allow_once" },
 					{ optionId: "reject_once", name: "Reject once", kind: "reject_once" },
@@ -126,6 +123,10 @@ describe("approvalPanelBlocks", () => {
 		expect(buttons.length).toBe(2);
 		expect(buttons.map((b: any) => b.text.text)).toContain("Allow once");
 		expect(buttons.map((b: any) => b.text.text)).toContain("Reject once");
+		expect(buttons.map((b: any) => b.action_id)).toEqual([
+			"approval_perm-panel-456_fedcba9876543210fedcba9876543210_allow_once",
+			"approval_perm-panel-456_fedcba9876543210fedcba9876543210_reject_once",
+		]);
 	});
 
 	it("renders expired approval panel without buttons", () => {
@@ -140,6 +141,7 @@ describe("approvalPanelBlocks", () => {
 				panelId: "approval123",
 				message: "This action requires approval",
 				expiresAt: pastTime,
+				digest: "0123456789abcdef0123456789abcdef",
 			},
 		};
 
@@ -236,13 +238,14 @@ describe("approvalPanelFallback", () => {
 				panelId: "approval123",
 				message: "Do you agree?",
 				expiresAt: futureTime,
+				digest: "0123456789abcdef0123456789abcdef",
 			},
 		};
 
 		const fallback = approvalPanelFallback(message);
 		expect(fallback).toBeTruthy();
 		expect(fallback).toContain("Do you agree?");
-		expect(fallback).toContain("check_mark");
+		expect(fallback).toContain("No options were offered");
 	});
 
 	it("returns fallback with offered permission options", () => {
@@ -257,6 +260,7 @@ describe("approvalPanelFallback", () => {
 				panelId: "perm-fallback",
 				message: "Grant this permission?",
 				expiresAt: futureTime,
+				digest: "fedcba9876543210fedcba9876543210",
 				options: [
 					{ optionId: "allow_once", name: "Allow once", kind: "allow_once" },
 					{ optionId: "reject_once", name: "Reject once", kind: "reject_once" },
@@ -283,6 +287,7 @@ describe("approvalPanelFallback", () => {
 				panelId: "approval123",
 				message: "Do you agree?",
 				expiresAt: pastTime,
+				digest: "0123456789abcdef0123456789abcdef",
 			},
 		};
 

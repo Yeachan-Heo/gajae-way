@@ -6,6 +6,7 @@ import type { ChatMessagePayload, ChatProgressPayload } from "@gajae-gateway/pro
 import { PRESENCE_MIN_SWAP_MS } from "@gajae-gateway/protocol";
 import { DiscordAdapterStartupError, loadDiscordAdapterConfig } from "../src/config";
 import {
+	approvalPanelCustomId,
 	chunkDiscordMessage,
 	DISCORD_SLASH_COMMANDS,
 	type DiscordClientLike,
@@ -13,11 +14,14 @@ import {
 	engagementForMessage,
 	type GatewayClientLike,
 	handleModelAutocomplete,
+	handlePanelButton,
 	handleSlashCommand,
 	isPresenceReaction,
 	LruSet,
 	maybeCreateThreadOnMention,
 	nameThreadFromMessage,
+	type PanelButtonInteractionLike,
+	parseApprovalPanelCustomId,
 	settleDiscordDelivery,
 	subscribeDiscordDeliveries,
 	subscribeDiscordProgress,
@@ -1495,4 +1499,191 @@ test("UnnamedThreads forgets the oldest thread past its bound", () => {
 	expect(unnamed.take("a")).toBe(false);
 	expect(unnamed.take("b")).toBe(true);
 	expect(unnamed.take("c")).toBe(true);
+});
+
+const PANEL_DIGEST = "0123456789abcdef0123456789abcdef";
+
+function approvalDelivery(
+	overrides: Partial<NonNullable<ChatMessagePayload["approvalPanel"]>> = {},
+): ChatMessagePayload {
+	return {
+		turnId: "turn-panel",
+		origin: { platform: "discord", kind: "channel", conversationId: "channel-1" },
+		role: "assistant",
+		text: "Run rm -rf build",
+		final: true,
+		deliveryId: "delivery-panel",
+		approvalPanel: {
+			panelId: "panel-1",
+			message: "Run rm -rf build",
+			expiresAt: new Date(Date.now() + 60_000).toISOString(),
+			digest: PANEL_DIGEST,
+			options: [
+				{ optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+				{ optionId: "reject_once", name: "Reject", kind: "reject_once" },
+			],
+			...overrides,
+		},
+	};
+}
+
+function panelChannel(sent: Array<Record<string, unknown>>): DiscordClientLike {
+	return {
+		channels: {
+			fetch: async () => ({
+				send: async (payload: Record<string, unknown>) => {
+					sent.push(payload);
+				},
+			}),
+		},
+	};
+}
+
+function panelButtons(payload: Record<string, unknown>): Array<{ custom_id?: string; label?: string }> {
+	const rows = (payload.components ?? []) as Array<{
+		toJSON(): { components: Array<{ custom_id?: string; label?: string }> };
+	}>;
+	return rows.flatMap((row) => row.toJSON().components);
+}
+
+test("a Discord approval panel renders digest-bound option buttons and confirms the delivery", async () => {
+	const sent: Array<Record<string, unknown>> = [];
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	await settleDiscordDelivery(mockGateway(requests), panelChannel(sent), approvalDelivery());
+	expect(sent).toHaveLength(1);
+	expect(sent[0]?.content).toBe("Run rm -rf build");
+	expect(panelButtons(sent[0]!).map((button) => ({ custom_id: button.custom_id, label: button.label }))).toEqual([
+		{ custom_id: `ap|panel-1|${PANEL_DIGEST}|allow_once`, label: "Allow once" },
+		{ custom_id: `ap|panel-1|${PANEL_DIGEST}|reject_once`, label: "Reject" },
+	]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-panel" } }]);
+});
+
+test("an expired Discord approval panel is read-only and lists the options", async () => {
+	const sent: Array<Record<string, unknown>> = [];
+	await settleDiscordDelivery(
+		mockGateway([]),
+		panelChannel(sent),
+		approvalDelivery({ expiresAt: new Date(Date.now() - 60_000).toISOString() }),
+	);
+	expect(sent).toHaveLength(1);
+	expect(sent[0]?.components).toBeUndefined();
+	expect(String(sent[0]?.content)).toContain("expired");
+	expect(String(sent[0]?.content)).toContain("Allow once");
+});
+
+test("an approval option whose binding cannot fit Discord's custom_id budget renders no buttons", async () => {
+	const sent: Array<Record<string, unknown>> = [];
+	await settleDiscordDelivery(
+		mockGateway([]),
+		panelChannel(sent),
+		approvalDelivery({
+			options: [{ optionId: "x".repeat(80), name: "Too long", kind: "allow_once" }],
+		}),
+	);
+	expect(sent).toHaveLength(1);
+	expect(sent[0]?.components).toBeUndefined();
+});
+
+test("approval custom ids round-trip the panel, digest, and exact option", () => {
+	const customId = approvalPanelCustomId("panel-1", PANEL_DIGEST, "reject_always");
+	expect(customId).toBe(`ap|panel-1|${PANEL_DIGEST}|reject_always`);
+	expect(parseApprovalPanelCustomId(customId!)).toEqual({
+		panelId: "panel-1",
+		digest: PANEL_DIGEST,
+		optionId: "reject_always",
+	});
+	expect(parseApprovalPanelCustomId("ask_user_panel_option")).toBeUndefined();
+	expect(parseApprovalPanelCustomId("ap|panel-1||allow_once")).toBeUndefined();
+	expect(approvalPanelCustomId("panel-1", PANEL_DIGEST, "x".repeat(80))).toBeUndefined();
+});
+
+test("a panel button sends the exact actor, digest, and option to the gateway", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const edited: Array<{ components: readonly unknown[] }> = [];
+	const replies: string[] = [];
+	const interaction: PanelButtonInteractionLike = {
+		customId: `ap|panel-1|${PANEL_DIGEST}|allow_once`,
+		user: { id: "U-author", username: "author", globalName: "Author" },
+		member: { nick: "Nick" },
+		channel: { id: "C1", isDMBased: () => false, isThread: () => false, type: 0 },
+		message: { edit: async (payload) => void edited.push(payload) },
+		deferReply: async () => {},
+		editReply: async (payload) => void replies.push(payload.content),
+	};
+	await handlePanelButton(interaction, {
+		respondPanel: async (params) => {
+			requests.push({ verb: "engagement.panel_response", params });
+		},
+	});
+	expect(requests).toEqual([
+		{
+			verb: "engagement.panel_response",
+			params: {
+				origin: { platform: "discord", kind: "channel", conversationId: "C1" },
+				panelId: "panel-1",
+				responseKind: "option_selected",
+				selectedOptionId: "allow_once",
+				digest: PANEL_DIGEST,
+				responderId: "U-author",
+				engagement: { mentioned: true, group: true, authorId: "U-author", authorName: "Nick" },
+			},
+		},
+	]);
+	expect(edited).toEqual([{ components: [] }]);
+	expect(replies).toEqual(["Approval recorded."]);
+});
+
+test("a thread panel click keeps the thread origin", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	await handlePanelButton(
+		{
+			customId: `ap|panel-1|${PANEL_DIGEST}|allow_once`,
+			user: { id: "U-author" },
+			channel: { id: "T1", parentId: "C1", isDMBased: () => false, isThread: () => true, type: 11 },
+			editReply: async () => {},
+		},
+		{
+			respondPanel: async (params) => {
+				requests.push({ verb: "engagement.panel_response", params });
+			},
+		},
+	);
+	expect(requests[0]?.params).toMatchObject({
+		origin: { platform: "discord", kind: "thread", conversationId: "T1", parentId: "C1" },
+	});
+});
+
+test("a refused panel click reports the refusal and leaves the buttons in place", async () => {
+	const edited: Array<{ components: readonly unknown[] }> = [];
+	const replies: string[] = [];
+	await handlePanelButton(
+		{
+			customId: `ap|panel-1|${PANEL_DIGEST}|allow_once`,
+			user: { id: "U-other" },
+			channel: { id: "C1", isDMBased: () => false, isThread: () => false, type: 0 },
+			message: { edit: async (payload) => void edited.push(payload) },
+			editReply: async (payload) => void replies.push(payload.content),
+		},
+		{
+			respondPanel: async () => {
+				throw new Error("Failed to submit panel response: unauthorized_responder");
+			},
+		},
+	);
+	expect(edited).toEqual([]);
+	expect(replies).toEqual(["Only the person who started this request can approve it."]);
+});
+
+test("non-panel buttons are ignored", async () => {
+	let called = 0;
+	await handlePanelButton(
+		{ customId: "some-other-button", user: { id: "U1" }, channel: { id: "C1" } },
+		{
+			respondPanel: async () => {
+				called++;
+			},
+		},
+	);
+	expect(called).toBe(0);
 });

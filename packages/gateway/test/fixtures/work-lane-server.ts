@@ -25,6 +25,8 @@ export type Control = {
 	unknown?: boolean;
 	refuseSteer?: boolean;
 	unavailable?: boolean;
+	/** `turn.abort` landed: the fixture reports the terminal cancelled outcome. */
+	aborted?: boolean;
 };
 export type Call = { method: string; input: Record<string, unknown> };
 export type Barrier =
@@ -108,12 +110,39 @@ class PersistentPort extends ScriptedSessionPort {
 		const saved = json<{ startedAt: number } | null>(join(this.home, `${input.opRef}.send.json`), null);
 		if (!saved) return report;
 		const status = { ...report.status, startedAt: saved.startedAt };
+		if (control.aborted)
+			// A real host settles an aborted turn as failed with the classified
+			// cancelled outcome; the gateway must derive attempt_ended from it.
+			return {
+				...report,
+				status: {
+					...status,
+					status: "failed",
+					receiptState: "present",
+					terminalAt: control.terminalAt ?? Date.now(),
+					outcome: { reason: "cancelled", kind: "cancelled", provenance: "client_cancel" },
+					error: { code: "cancelled" },
+				},
+			};
 		return control.terminal
 			? {
 					...report,
 					status: { ...status, status: "terminal_ok", receiptState: "present", outcome: { reason: "end_turn" } },
 				}
 			: { ...report, status };
+	}
+	override async abort(input: { sessionId: string; repo: string; opRef: string }) {
+		this.record("abort", input);
+		const controls = this.controls();
+		controls[input.opRef] = {
+			...(controls[input.opRef] ?? {}),
+			aborted: true,
+			terminalAt: controls[input.opRef]?.terminalAt ?? Date.now(),
+		};
+		await Bun.write(join(this.home, "control.json"), JSON.stringify(controls));
+		// The scripted port marks the operation failed; status above carries the
+		// classified cancelled outcome a real turn.abort produces.
+		return super.abort(input);
 	}
 	override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
 		this.record("liveness", input);

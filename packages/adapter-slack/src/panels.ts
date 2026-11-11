@@ -103,7 +103,16 @@ export function approvalPanelBlocks(message: ChatMessagePayload): Block[] {
 			},
 		});
 	} else {
-		// Not expired: show interactive buttons for offered options
+		// Not expired: show interactive buttons for offered options.
+		if (!panel.digest) {
+			// A legacy or malformed panel has no request binding; buttons would only
+			// produce an answer the gateway must refuse.
+			blocks.push({
+				type: "section",
+				text: { type: "mrkdwn", text: "_(This approval request cannot be answered.)_" },
+			});
+			return blocks;
+		}
 		const buttonElements: Array<{
 			type: "button";
 			text: { type: "plain_text"; text: string; emoji: boolean };
@@ -125,36 +134,29 @@ export function approvalPanelBlocks(message: ChatMessagePayload): Block[] {
 						emoji: true,
 					},
 					style,
-					action_id: `approval_${panel.panelId}_${option.optionId}`,
+					// The digest binds the click to this exact request; panelId alone is
+					// not an approval. Slack caps action_id at 255 chars.
+					action_id: `approval_${panel.panelId}_${panel.digest}_${option.optionId}`,
 					value: option.optionId,
 				});
 			}
 		} else {
-			// Fallback to allow/deny buttons if no options provided
-			buttonElements.push(
-				{
-					type: "button",
-					text: {
-						type: "plain_text",
-						text: "Allow",
-						emoji: true,
-					},
-					style: "primary",
-					action_id: `approval_${panel.panelId}_allow`,
-					value: "allow",
+			// No offered options: render no buttons. An optionless allow/deny
+			// fallback would approve a request without binding an exact option.
+		}
+
+		// Slack rejects an overlong action_id. Never truncate the binding: a
+		// read-only panel is the safe fallback when an offered option id does not
+		// fit alongside the panel id and digest.
+		if (buttonElements.some((button) => button.action_id.length > 255)) {
+			blocks.push({
+				type: "section",
+				text: {
+					type: "mrkdwn",
+					text: "_(This approval request cannot be answered with buttons; wait for it to expire.)_",
 				},
-				{
-					type: "button",
-					text: {
-						type: "plain_text",
-						text: "Deny",
-						emoji: true,
-					},
-					style: "danger",
-					action_id: `approval_${panel.panelId}_deny`,
-					value: "deny",
-				},
-			);
+			});
+			return blocks;
 		}
 
 		// Slack button layouts have a max of 5 buttons per row
@@ -205,13 +207,17 @@ export function approvalPanelFallback(message: ChatMessagePayload): string | nul
 	let text = `${panel.message}\n`;
 	if (isExpired) {
 		text += "_(This approval request has expired.)_";
+		if (panel.options?.length) {
+			text += "\nOptions were:\n";
+			for (const option of panel.options) text += `• ${option.name}\n`;
+		}
 	} else if (panel.options && panel.options.length > 0) {
 		text += "Options:\n";
 		for (const option of panel.options) {
 			text += `• ${option.name}\n`;
 		}
 	} else {
-		text += "React with :white_check_mark: to allow or :x: to deny.";
+		text += "_No options were offered for this request._";
 	}
 
 	return text;

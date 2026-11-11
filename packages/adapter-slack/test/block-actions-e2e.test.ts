@@ -181,6 +181,11 @@ describe("Slack Interactive Panels - End-to-End Flow", () => {
 					panelId: "deploy_approval_001",
 					message: "Deploy to production?",
 					expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+					digest: "0123456789abcdef0123456789abcdef",
+					options: [
+						{ optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+						{ optionId: "reject_once", name: "Reject once", kind: "reject_once" },
+					],
 				},
 			};
 
@@ -190,7 +195,8 @@ describe("Slack Interactive Panels - End-to-End Flow", () => {
 				actions: [
 					{
 						type: "button",
-						action_id: "approval_deploy_approval01_allow",
+						action_id: "approval_deploy_approval01_0123456789abcdef0123456789abcdef_allow_once",
+						value: "allow_once",
 					},
 				],
 				trigger_id: "trigger_approve",
@@ -216,9 +222,10 @@ describe("Slack Interactive Panels - End-to-End Flow", () => {
 			});
 
 			expect(response?.panelId).toBe("deploy_approval01");
-			expect(response?.responseKind).toBe("approved");
+			expect(response?.digest).toBe("0123456789abcdef0123456789abcdef");
+			expect(response?.responseKind).toBe("option_selected");
 			expect(response?.responderId).toBe("U_approver");
-			expect(response?.selectedOptionId).toBeUndefined();
+			expect(response?.selectedOptionId).toBe("allow_once");
 		});
 
 		it("completes full approval panel deny flow", () => {
@@ -227,7 +234,8 @@ describe("Slack Interactive Panels - End-to-End Flow", () => {
 				actions: [
 					{
 						type: "button",
-						action_id: "approval_deploy_approval02_deny",
+						action_id: "approval_deploy_approval02_fedcba9876543210fedcba9876543210_reject_once",
+						value: "reject_once",
 					},
 				],
 				trigger_id: "trigger_deny",
@@ -253,7 +261,9 @@ describe("Slack Interactive Panels - End-to-End Flow", () => {
 			});
 
 			expect(response?.panelId).toBe("deploy_approval02");
-			expect(response?.responseKind).toBe("denied");
+			expect(response?.digest).toBe("fedcba9876543210fedcba9876543210");
+			expect(response?.responseKind).toBe("option_selected");
+			expect(response?.selectedOptionId).toBe("reject_once");
 			expect(response?.responderId).toBe("U_reviewer");
 		});
 	});
@@ -334,7 +344,8 @@ describe("Slack Interactive Panels - End-to-End Flow", () => {
 				actions: [
 					{
 						type: "button",
-						action_id: "approval_channel_approval01_allow",
+						action_id: "approval_channel_approval01_0123456789abcdef0123456789abcdef_allow_once",
+						value: "allow_once",
 					},
 				],
 				trigger_id: "trigger_channel",

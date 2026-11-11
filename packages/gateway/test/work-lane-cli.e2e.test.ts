@@ -110,6 +110,35 @@ test("live CLI start/status/steer/jobs/retire: early receipt, open refusal, exac
 	expect(f.calls("resume")).toHaveLength(0);
 }, 40_000);
 
+test("work stop ends the running attempt through turn.abort and reports durable settlement", async () => {
+	const f = await fixture();
+	const started = await cli(f, ["start", "stopme", "--cwd", f.home, "fixture work"]);
+	expect(started.code).toBe(0);
+	expect(started.stderr).toBe("");
+	const pending = await status(f, "stopme");
+	expect(pending.attempt.endedAt).toBeUndefined();
+	expect(pending.op.status).toBe("in_flight");
+
+	const stopped = await cli(f, ["stop", "stopme"]);
+	expect(stopped.code).toBe(0);
+	expect(stopped.stderr).toBe("");
+	expect(stopped.stdout).toBe(`stopped: ${pending.attempt.opRef} end=attempt_ended\n`);
+	expect(f.calls("abort")).toHaveLength(1);
+	expect(f.calls("abort")[0]?.input).toMatchObject({
+		sessionId: pending.sessionId,
+		opRef: pending.attempt.opRef,
+	});
+
+	const final = await status(f, "stopme");
+	expect(final.attempt.endedAt).toEqual(expect.any(String));
+	expect(final.attempt.endState).toBe("attempt_ended");
+	expect(f.snapshot().runtimes[0]?.terminal).toMatchObject({ reasonCode: "cancelled" });
+
+	const again = await cli(f, ["stop", "stopme"]);
+	expect(again.code).toBe(1);
+	expect(again.stdout).toContain("not stopped: no open attempt to stop");
+}, 40_000);
+
 test("run --notify is a usage error", async () => {
 	const f = await fixture();
 	const invalid = await cli(f, ["run", "invalid", "--notify", "discord/channel/fixture", "forbidden"]);

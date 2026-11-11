@@ -1086,7 +1086,8 @@ async function handleRequest(
 		case "work.start":
 		case "work.run":
 		case "work.status":
-		case "work.steer": {
+		case "work.steer":
+		case "work.stop": {
 			const result =
 				request.verb === "work.start"
 					? await runtime.work.start(request.params)
@@ -1094,7 +1095,9 @@ async function handleRequest(
 						? await runtime.work.run(request.params, connection)
 						: request.verb === "work.status"
 							? await runtime.work.status(request.params)
-							: await runtime.work.steer(request.params);
+							: request.verb === "work.stop"
+								? await runtime.work.stopAttempt(request.params)
+								: await runtime.work.steer(request.params);
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 			return;
 		}
@@ -1526,6 +1529,7 @@ async function handleRequest(
 						responseKind?: unknown;
 						responderId?: unknown;
 						selectedOptionId?: unknown;
+						digest?: unknown;
 						engagement?: unknown;
 				  }
 				| undefined;
@@ -1573,11 +1577,19 @@ async function handleRequest(
 				(params?.responseKind as string) === "option_selected"
 					? ((params?.selectedOptionId as string) || "").trim().slice(0, 256)
 					: undefined;
+			const digest = typeof params?.digest === "string" ? params.digest.trim().slice(0, 64) : undefined;
 			const authorId = (engagement?.authorId as string) || "";
 			const actor = typeof engagement?.authorName === "string" ? (engagement.authorName as string) : undefined;
 
 			const coordinatorError = await runtime.permissionPanels
-				.respond({ panelId, responderId, responseKind: responseKind as PanelResponseKind, selectedOptionId })
+				.respond({
+					panelId,
+					responderId,
+					responseKind: responseKind as PanelResponseKind,
+					selectedOptionId,
+					digest,
+					originKey: originKey(origin),
+				})
 				.catch((error: unknown) => `response_error: ${diagnostic(error)}`);
 
 			// Record the panel response in the context ledger (audit trail)

@@ -15,6 +15,7 @@ import type {
 	WorkStartResult,
 	WorkStatusResult,
 	WorkSteerResult,
+	WorkStopResult,
 } from "@gajae-gateway/protocol";
 import { LOOPBACK_ORIGIN, originKey } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
@@ -70,7 +71,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work stop <name>|work retire [--force] <name>|work retire --all-dead|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -770,20 +771,32 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			case "work": {
 				const [command, ...args] = parsed.rest;
 				const usage =
-					'usage: gajaeway work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] "<task text>"|status <name>|steer <name> <text>|retire <name>|jobs';
-				if (command === "status" || command === "steer") {
+					'usage: gajaeway work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] "<task text>"|status <name>|steer <name> <text>|stop <name>|retire <name>|jobs';
+				if (command === "status" || command === "steer" || command === "stop") {
 					const name = args[0];
 					const text = args.slice(1).join(" ").trim();
 					if (
 						!name ||
 						!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) ||
-						(command === "status" ? args.length !== 1 : !text || args.slice(1).some((arg) => arg.startsWith("--")))
+						(command === "status" || command === "stop"
+							? args.length !== 1
+							: !text || args.slice(1).some((arg) => arg.startsWith("--")))
 					)
 						throw new Error(usage);
 					const client = await GajaewayClient.connectSocket(parsed.socket);
 					try {
 						if (command === "status") {
 							console.log(JSON.stringify(await client.request<WorkStatusResult>("work.status", { name })));
+						} else if (command === "stop") {
+							const result = await client.request<WorkStopResult>("work.stop", { name });
+							console.log(
+								result.stopped
+									? result.settled
+										? `stopped: ${result.opRef} end=${result.endState ?? "-"}`
+										: `stop accepted: ${result.opRef} (${result.reason})`
+									: `not stopped: ${result.reason}`,
+							);
+							if (!result.stopped) process.exitCode = 1;
 						} else {
 							const result = await client.request<WorkSteerResult>("work.steer", { name, text });
 							console.log(result.steered ? `steered: ${result.clientRef}` : `not steered: ${result.reason}`);

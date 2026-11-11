@@ -100,34 +100,35 @@ export function describePanelResponse(
 		};
 	}
 
-	// Option buttons are `approval_<panelId>_<optionId>` with the optionId as value;
-	// optionIds such as allow_once contain underscores, so split on the value.
+	// Option buttons are `approval_<panelId>_<digest>_<optionId>` with the optionId as value;
+	// optionIds such as allow_once contain underscores, so split on the value. The digest
+	// segment is what binds the click to the exact reverse request.
 	const optionId = action.value;
-	const optionSuffix = optionId && optionId !== "allow" && optionId !== "deny" ? `_${optionId}` : undefined;
-	const approvalMatch = optionSuffix
-		? action.action_id.startsWith("approval_") && action.action_id.endsWith(optionSuffix)
-			? [action.action_id, action.action_id.slice("approval_".length, -optionSuffix.length), optionId]
-			: null
-		: action.action_id.match(/^approval_(.+)_(allow|deny)$/);
-	if (approvalMatch?.[1]) {
-		const [, panelId, decision] = approvalMatch;
-		const choice =
-			decision === "allow" || decision === "deny"
-				? { responseKind: decision === "allow" ? ("approved" as const) : ("denied" as const) }
-				: { responseKind: "option_selected" as const, selectedOptionId: decision };
-		return {
-			origin,
-			panelId,
-			...choice,
-			responderId: event.user.id,
-			engagement: {
-				mentioned: true,
-				group: origin.kind !== "dm",
-				authorId: event.user.id,
-				authorName: event.user.name,
-			},
-		};
+	if (optionId && optionId !== "allow" && optionId !== "deny") {
+		const suffix = `_${optionId}`;
+		if (action.action_id.startsWith("approval_") && action.action_id.endsWith(suffix)) {
+			const rest = action.action_id.slice("approval_".length, -suffix.length);
+			const digestAt = rest.lastIndexOf("_");
+			if (digestAt > 0) {
+				return {
+					origin,
+					panelId: rest.slice(0, digestAt),
+					digest: rest.slice(digestAt + 1),
+					responseKind: "option_selected",
+					selectedOptionId: optionId,
+					responderId: event.user.id,
+					engagement: {
+						mentioned: true,
+						group: origin.kind !== "dm",
+						authorId: event.user.id,
+						authorName: event.user.name,
+					},
+				};
+			}
+		}
 	}
 
+	// Legacy allow/deny buttons predate digest binding and are no longer rendered;
+	// ignoring them is the safe outcome (the request expires and gjc is cancelled).
 	return null;
 }

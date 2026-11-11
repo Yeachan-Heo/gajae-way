@@ -11,6 +11,7 @@ import {
 	type WorkStartResult,
 	type WorkStatusResult,
 	type WorkSteerResult,
+	type WorkStopResult,
 } from "@gajae-gateway/protocol";
 import {
 	acknowledgeHold,
@@ -51,6 +52,10 @@ const owners = new WeakSet<GatewayDatabase>();
 const FAILURES_PER_READOPTION = 8;
 /** Ceiling for the failure backoff between reconciliation polls. */
 const MAX_FAILURE_BACKOFF_MS = 30_000;
+/** How long `work.stop` waits for the observer to settle the aborted attempt. */
+const DEFAULT_STOP_TIMEOUT_MS = 15_000;
+/** Attempt-settlement poll cadence while `work.stop` waits after an accepted abort. */
+const STOP_SETTLE_POLL_MS = 50;
 const reasons = new Set([
 	"end_turn",
 	"prompt_deadline_exceeded",
@@ -136,6 +141,8 @@ export interface WorkLaneManagerOptions {
 	readonly brokerGeneration?: () => number;
 	readonly pollMs?: number;
 	readonly waitTimeoutMs?: number;
+	/** How long `work.stop` waits for the aborted attempt's durable settlement. */
+	readonly stopTimeoutMs?: number;
 	/** How long consecutive host-gone verdicts must persist before a live observer settles `host_lost`. */
 	readonly hostLostGraceMs?: number;
 	readonly now?: () => number;
@@ -752,6 +759,79 @@ export class WorkLaneManager {
 			return { steered: true, clientRef };
 		});
 	}
+
+	/**
+	 * Ends the open attempt's running turn through `turn.abort` on the relay that
+	 * owns it. The abort is only the request: the attempt is reported stopped
+	 * once its durable row settles from broker evidence, so a host that refuses
+	 * the abort or never reaches a terminal state is never reported as stopped.
+	 */
+	async stopAttempt(params: unknown): Promise<WorkStopResult> {
+		const name = parseName(params);
+		this.#live();
+		const job = this.#job(name, true)!;
+		const captured = job.attempts.find((attempt) => attempt.endedAt === undefined);
+		if (!captured)
+			return {
+				stopped: false,
+				reason: "no open attempt to stop",
+				...(job.attempts.at(-1) ? { opRef: job.attempts.at(-1)!.opRef } : {}),
+			};
+		await this.recover();
+		this.#live();
+		const currentJob = this.#job(name, true)!;
+		const open = currentJob.attempts.find(
+			(attempt) => attempt.opRef === captured.opRef && attempt.endedAt === undefined,
+		);
+		if (!open) {
+			const last = currentJob.attempts.at(-1);
+			return {
+				stopped: false,
+				reason: "no open attempt to stop",
+				...(last ? { opRef: last.opRef } : {}),
+			};
+		}
+		const runtime = this.#db.workAttemptGet(captured.opRef);
+		if (!runtime || !this.#binding(runtime))
+			return { stopped: false, reason: "attempt binding is not current", opRef: captured.opRef };
+		const observer = this.#observers.get(captured.opRef);
+		try {
+			await this.#port.abort({
+				sessionId: captured.sessionId,
+				repo: currentJob.lane.worktreePath,
+				opRef: captured.opRef,
+				...(observer?.tail ? { relay: observer.tail } : {}),
+			});
+		} catch (error) {
+			const refusal = abortRefusalReason(error);
+			if (refusal) {
+				console.error(`work_stop_refused opRef=${captured.opRef} reason=${refusal}`);
+				return { stopped: false, reason: `abort_refused:${refusal}`, opRef: captured.opRef };
+			}
+			throw workError("work stop acceptance uncertain", "stop_acceptance_uncertain", runtime);
+		}
+		const deadline = this.#now() + (this.#options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS);
+		for (;;) {
+			if (this.#db.workAttemptGet(captured.opRef)?.settledAt) {
+				const attempt = this.#job(name)?.attempts.find((candidate) => candidate.opRef === captured.opRef);
+				return {
+					stopped: true,
+					opRef: captured.opRef,
+					settled: true,
+					...(attempt?.endState ? { endState: attempt.endState } : {}),
+				};
+			}
+			if (this.#now() >= deadline)
+				return {
+					stopped: true,
+					opRef: captured.opRef,
+					settled: false,
+					reason: "abort accepted; attempt still settling",
+				};
+			await Bun.sleep(STOP_SETTLE_POLL_MS);
+		}
+	}
+
 	async #query(runtime: { jobId: string; sessionId: string; cwd: string; opRef: string }): Promise<PromptStatusBody> {
 		this.#assertNotQuarantined(runtime.jobId);
 		const report = await this.#port.status({
@@ -995,7 +1075,13 @@ export class WorkLaneManager {
 		}
 		if (runtime.output.disposition === "pending") {
 			if (runtime.output.nextReadAt && this.#now() < Date.parse(runtime.output.nextReadAt)) return;
-			if (runtime.output.reads >= 3 || runtime.terminal?.kind === "local") {
+			if (
+				runtime.output.reads >= 3 ||
+				runtime.terminal?.kind === "local" ||
+				runtime.terminal?.reasonCode === "cancelled"
+			) {
+				// An operator abort ends the turn without a final assistant body: there
+				// is no late receipt to wait for.
 				runtime =
 					this.#db.workAttemptUpdate(runtime.opRef, runtime.version, {
 						output: { ...runtime.output, disposition: "unavailable", nextReadAt: null },
@@ -1122,10 +1208,17 @@ export class WorkLaneManager {
 					knownCheckpoints: job.checkpoints,
 					baselineSha: job.baselineSha,
 				});
+				// A deliberate operator stop is not a stalled continuation: it must
+				// not accumulate toward the automatic continuation hold.
+				const classification: "progressed" | "held" | "stalled" = progressed
+					? "progressed"
+					: endState === "completed" || reason === "cancelled"
+						? "held"
+						: "stalled";
 				job = applyReconciliation({
 					record: job,
 					repository: { ...facts, observedAt: at },
-					classification: progressed ? "progressed" : endState === "completed" ? "held" : "stalled",
+					classification,
 				});
 			}
 
@@ -1891,6 +1984,27 @@ function definitiveSteerRefusal(error: unknown): boolean {
 		return true;
 	return definitiveRefusal(error);
 }
+const abortRefusalCodes = new Set([
+	"resource_gone",
+	"not_running",
+	"no_active_turn",
+	"invalid_params",
+	"session_not_found",
+	"operation_prohibited",
+	"abort_refused",
+	"queue_terminal_unconfirmed",
+]);
+/** A recognized `turn.abort` refusal is a decision; anything else is an uncertain transport. */
+function abortRefusalReason(error: unknown): string | undefined {
+	if (!(error instanceof GjcCliError)) return undefined;
+	const details = error.details as { code?: unknown; refused?: unknown } | undefined;
+	if (details?.refused === true) {
+		const code = typeof details.code === "string" ? details.code : "abort_refused";
+		return /^[a-z_]{1,64}$/.test(code) ? code : "abort_refused";
+	}
+	const code = envelopeErrorCode(error.details);
+	return code && abortRefusalCodes.has(code) ? code : undefined;
+}
 function safeStatus(status: PromptStatusBody): PromptStatusBody {
 	const result: { -readonly [K in keyof PromptStatusBody]: PromptStatusBody[K] } = { status: status.status };
 	for (const key of ["commandId", "turnId", "clientRef"] as const) {
@@ -1939,6 +2053,11 @@ function provesAcceptance(status: PromptStatusBody): boolean {
 
 function terminalEvidence(status: PromptStatusBody, observedAt: string): WorkAttemptTerminalEvidence | undefined {
 	if (status.status !== "terminal_ok" && status.status !== "failed") return undefined;
+	// A failed status can still carry a CLASSIFIED cancellation: an operator
+	// abort is `failed` with outcome.reason=cancelled, not an SDK failure.
+	// Prefer that evidence over the generic sdk_failed fallback.
+	const cancelled =
+		status.outcome?.reason === "cancelled" || status.error?.code === "cancelled" ? "cancelled" : undefined;
 	const reasonCode =
 		status.receiptState === "missing"
 			? "terminal_missing_receipt"
@@ -1947,7 +2066,7 @@ function terminalEvidence(status: PromptStatusBody, observedAt: string): WorkAtt
 				: status.status === "failed"
 					? status.error?.code === "prompt_deadline_exceeded"
 						? "prompt_deadline_exceeded"
-						: "sdk_failed"
+						: (cancelled ?? "sdk_failed")
 					: status.receiptState === "present" && status.outcome?.reason === "end_turn"
 						? "end_turn"
 						: ["cancelled", "max_tokens", "max_turn_requests", "refusal"].includes(status.outcome?.reason ?? "")

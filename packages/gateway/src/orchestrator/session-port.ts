@@ -27,7 +27,6 @@ import {
 	type FailedTransportCause,
 	type FailedTurnEvidence,
 	type FailedTurnEvidenceInput,
-	readFailedTransportCause,
 	readFailedTurnEvidence,
 } from "./failed-turn-evidence";
 import { isSessionGoneCode } from "./gjc-contract";
@@ -81,6 +80,13 @@ export interface SessionPort {
 	resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding>;
 	send(input: SessionSendInput): Promise<SendReceipt>;
 	steer(input: SessionSteerInput): Promise<void>;
+	/**
+	 * Ends the session's running turn through the host's `turn.abort` control.
+	 * Only the relay that submitted the prompt owns the turn; a caller without
+	 * that ownership gets the host's `resource_gone` refusal, never an invented
+	 * cancellation of somebody else's prompt.
+	 */
+	abort(input: { sessionId: string; repo: string; opRef: string; relay?: TailHandle }): Promise<void>;
 	setModel(input: {
 		sessionId: string;
 		repo: string;
@@ -782,6 +788,49 @@ export class BrokerSessionPort implements SessionPort {
 		}
 		if (!isSteerAccepted(body))
 			throw new GjcCliError("gjc sdk turn.steer acceptance unavailable", 0, "", { code: "receipt_identity_mismatch" });
+	}
+
+	async abort(input: { sessionId: string; repo: string; opRef: string; relay?: TailHandle }): Promise<void> {
+		this.#assertOwned(input);
+		assertControlAllowed("turn.abort", { operatorApproval: true });
+		const relay =
+			input.relay ?? (await this.attachTail({ sessionId: input.sessionId, brokerGeneration: 0, repo: input.repo }));
+		let response: RelayResponse;
+		try {
+			this.#database.assertBrokerAuthority(this.#authority);
+			// Empty input selects gjc's default `mode: "turn"`. The terminal-process
+			// scope is a different, explicitly unsupported authority.
+			response = await relay.control("turn.abort", {});
+			this.#database.assertBrokerAuthority(this.#authority);
+		} finally {
+			if (!input.relay) await relay.close();
+		}
+		if (!response.ok) {
+			// `resource_gone` is the host's definitive statement that this caller does
+			// not own the target turn. It is a rejection, not an uncertain transport.
+			const code = response.error?.code;
+			if (
+				code &&
+				[
+					"resource_gone",
+					"not_running",
+					"no_active_turn",
+					"invalid_params",
+					"session_not_found",
+					"operation_prohibited",
+				].includes(code)
+			)
+				throw new GjcCliError("gjc sdk turn.abort refused", 0, "", { code, refused: true });
+			throw relayFailure("turn.abort", response);
+		}
+		// The host's typed disposition can still decline the abort (for example a
+		// queue terminal it could not confirm). Never report that as a stop.
+		const disposition = recordOf(response.result);
+		if (disposition?.aborted === false)
+			throw new GjcCliError("gjc sdk turn.abort refused", 0, "", {
+				code: typeof disposition.reason === "string" ? disposition.reason : "abort_refused",
+				refused: true,
+			});
 	}
 
 	async setModel(input: {

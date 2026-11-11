@@ -191,6 +191,46 @@ for (const entry of cases) {
 	});
 }
 
+test("abort sends turn.abort mode:turn on the owned relay and never falls back to the CLI", async () => {
+	const f = await fixture({
+		mode: "answer",
+		relayReply: () => ({ ok: true, result: { aborted: true } }),
+		cliReply: () => ok({}),
+	});
+	await f.port.abort({ sessionId: "sdk-1", repo: f.repo, opRef: "gw-op", relay: f.handle });
+	expect(f.relay.requests).toHaveLength(1);
+	expect(f.relay.requests[0]).toMatchObject({
+		type: "control_request",
+		operation: "turn.abort",
+		input: {},
+	});
+	expect(f.cli).toEqual([]);
+	await f.handle.close();
+});
+
+test("abort surfaces a host refusal and a declined disposition as refusals, not cancellations", async () => {
+	const refused = await fixture({
+		mode: "refuse",
+		relayReply: () => ({ ok: true, result: { aborted: true } }),
+		cliReply: () => ok({}),
+	});
+	await expect(
+		refused.port.abort({ sessionId: "sdk-1", repo: refused.repo, opRef: "gw-op", relay: refused.handle }),
+	).rejects.toMatchObject({ details: { code: "invalid_params", refused: true } });
+	expect(refused.cli).toEqual([]);
+	await refused.handle.close();
+
+	const declined = await fixture({
+		mode: "answer",
+		relayReply: () => ({ ok: true, result: { aborted: false, reason: "queue_terminal_unconfirmed" } }),
+		cliReply: () => ok({}),
+	});
+	await expect(
+		declined.port.abort({ sessionId: "sdk-1", repo: declined.repo, opRef: "gw-op", relay: declined.handle }),
+	).rejects.toMatchObject({ details: { code: "queue_terminal_unconfirmed", refused: true } });
+	await declined.handle.close();
+});
+
 test("without a relay handle the CLI stays the transport and no relay is opened", async () => {
 	const f = await fixture({
 		mode: "answer",

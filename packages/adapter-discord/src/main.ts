@@ -5,6 +5,7 @@ import {
 	type ChatMessagePayload,
 	type ChatProgressPayload,
 	type EngagementContext,
+	type EngagementPanelResponseParams,
 	type OriginRef,
 	PRESENCE_ALL_MARKERS,
 	type PresenceState,
@@ -15,7 +16,16 @@ import {
 	type SessionModelChoicesResult,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
-import { AttachmentBuilder, Client, GatewayIntentBits, MessageFlags, Partials } from "discord.js";
+import {
+	ActionRowBuilder,
+	AttachmentBuilder,
+	ButtonBuilder,
+	ButtonStyle,
+	Client,
+	GatewayIntentBits,
+	MessageFlags,
+	Partials,
+} from "discord.js";
 import pkg from "../package.json";
 import { type AttachmentCarrier, describeInboundBody, firstVoiceMessage } from "./attachments";
 import { type AuthorLike, resolveDisplayName, resolveServerTag } from "./author";
@@ -152,7 +162,9 @@ export interface DiscordTextChannelLike {
 			| string
 			| { content: string; reply?: { messageReference: string; failIfNotExists?: boolean } }
 			// A voice message carries no content: only the attachment and the flag.
-			| { files: readonly unknown[]; flags: number },
+			| { files: readonly unknown[]; flags: number }
+			// An approval panel carries buttons bound to the request digest.
+			| { content: string; components: readonly unknown[] },
 	): Promise<unknown>;
 }
 
@@ -879,6 +891,85 @@ export function isPresenceReaction(unicode: string): boolean {
 	return PRESENCE_ALL_MARKERS.some((marker) => marker.unicode.replace(/\uFE0F/g, "") === bare);
 }
 
+/** Discord rejects a component custom_id longer than this. */
+const DISCORD_CUSTOM_ID_LIMIT = 100;
+/** Discord caps a message at five action rows of five buttons. */
+const DISCORD_PANEL_BUTTON_LIMIT = 25;
+const DISCORD_BUTTON_LABEL_LIMIT = 80;
+const APPROVAL_CUSTOM_ID_PREFIX = "ap|";
+
+/**
+ * `ap|<panelId>|<digest>|<optionId>`: the digest travels with the click, so a
+ * stale or forged component cannot approve a different request. Undefined when
+ * the binding does not fit Discord's custom_id budget; the caller then renders
+ * a read-only panel instead of truncating the binding.
+ */
+export function approvalPanelCustomId(panelId: string, digest: string, optionId: string): string | undefined {
+	if (!panelId || !digest || !optionId) return undefined;
+	const customId = `${APPROVAL_CUSTOM_ID_PREFIX}${panelId}|${digest}|${optionId}`;
+	return customId.length <= DISCORD_CUSTOM_ID_LIMIT ? customId : undefined;
+}
+
+export function parseApprovalPanelCustomId(
+	customId: string,
+): { readonly panelId: string; readonly digest: string; readonly optionId: string } | undefined {
+	if (!customId.startsWith(APPROVAL_CUSTOM_ID_PREFIX)) return undefined;
+	const [panelId, digest, ...rest] = customId.slice(APPROVAL_CUSTOM_ID_PREFIX.length).split("|");
+	const optionId = rest.join("|");
+	if (!panelId || !optionId || !/^[0-9a-f]{32}$/.test(digest ?? "")) return undefined;
+	return { panelId, digest, optionId };
+}
+
+/** Buttons for an unexpired approval panel; empty when any binding cannot fit. */
+function approvalPanelComponents(message: ChatMessagePayload): readonly unknown[] {
+	const panel = message.approvalPanel;
+	if (!panel?.options?.length) return [];
+	if (Date.parse(panel.expiresAt) <= Date.now()) return [];
+	if (panel.options.length > DISCORD_PANEL_BUTTON_LIMIT) return [];
+	const buttons: ButtonBuilder[] = [];
+	for (const option of panel.options) {
+		const customId = approvalPanelCustomId(panel.panelId, panel.digest, option.optionId);
+		if (!customId) return [];
+		const label = option.name.trim() || option.optionId;
+		buttons.push(
+			new ButtonBuilder()
+				.setCustomId(customId)
+				.setLabel(label.slice(0, DISCORD_BUTTON_LABEL_LIMIT))
+				.setStyle(option.kind.toLowerCase().includes("reject") ? ButtonStyle.Danger : ButtonStyle.Primary),
+		);
+	}
+	const rows: ActionRowBuilder<ButtonBuilder>[] = [];
+	for (let index = 0; index < buttons.length; index += 5)
+		rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons.slice(index, index + 5)));
+	return rows;
+}
+
+/** The panel's visible text; expired panels keep the options as plain history. */
+function approvalPanelContent(message: ChatMessagePayload, notice?: string, readOnly = false): string {
+	const panel = message.approvalPanel!;
+	const base = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text;
+	const lines = [...(notice ? [notice] : []), base];
+	const expired = Date.parse(panel.expiresAt) <= Date.now();
+	if (expired) {
+		lines.push("", "_This approval request has expired._");
+		for (const option of panel.options ?? []) lines.push(`• ${option.name}`);
+	} else if (readOnly) {
+		lines.push("", "_This request cannot be answered in Discord; it will expire unanswered._");
+	}
+	return lines.join("\n").slice(0, DISCORD_MESSAGE_LIMIT);
+}
+
+/** Answer text for a clicked approval panel; never surfaces raw transport detail. */
+function describePanelOutcome(error: unknown): string {
+	const text = error instanceof Error ? error.message : String(error);
+	if (text.includes("unauthorized_responder")) return "Only the person who started this request can approve it.";
+	if (text.includes("digest_mismatch")) return "This approval no longer matches the request. Nothing was approved.";
+	if (text.includes("origin_mismatch")) return "This approval belongs to another conversation. Nothing was approved.";
+	if (text.includes("panel_not_found")) return "This request has expired or was already answered.";
+	if (text.includes("option_not_offered")) return "That option is no longer available for this request.";
+	return "The approval could not be applied. Nothing was approved.";
+}
+
 export async function settleDiscordDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	discord: DiscordClientLike,
@@ -901,26 +992,34 @@ export async function settleDiscordDelivery(
 	}
 	try {
 		const { channel, notice } = await resolveDeliveryChannel(discord, message.origin, deliveryId);
-		const body = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text;
-		const text = notice ? `${notice}\n${body}` : body;
-		const chunks = chunkDiscordMessage(text);
-		for (let index = 0; index < chunks.length; index++) {
-			// Reply-threading applies to the first chunk only; failIfNotExists keeps a
-			// deleted target from failing the whole delivery.
-			const chunk = chunks[index] as string;
-			// A reply reference points into the thread, so it is dropped on parent fallback.
-			if (index === 0 && message.replyToMessageId && !notice)
-				await channel.send({
-					content: chunk,
-					reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
-				});
-			else await channel.send(chunk);
+		if (message.approvalPanel) {
+			const components = approvalPanelComponents(message);
+			const content = approvalPanelContent(message, notice, components.length === 0);
+			// No components is a read-only panel (expired, or a binding that cannot
+			// fit Discord's custom_id budget): it never approves anything by itself.
+			await channel.send(components.length > 0 ? { content, components } : { content });
+		} else {
+			const body = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text;
+			const text = notice ? `${notice}\n${body}` : body;
+			const chunks = chunkDiscordMessage(text);
+			for (let index = 0; index < chunks.length; index++) {
+				// Reply-threading applies to the first chunk only; failIfNotExists keeps a
+				// deleted target from failing the whole delivery.
+				const chunk = chunks[index] as string;
+				// A reply reference points into the thread, so it is dropped on parent fallback.
+				if (index === 0 && message.replyToMessageId && !notice)
+					await channel.send({
+						content: chunk,
+						reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
+					});
+				else await channel.send(chunk);
+			}
+			// Voice rides AFTER the text, and only after the text actually landed:
+			// pairing them is for a readable history, so the readable half must be
+			// the one that is guaranteed. A synthesis failure is logged and the
+			// delivery still confirms — the words arrived, which is the deliverable.
+			if (message.voiceText && speech) await sendVoiceMessage(channel, message.voiceText, speech);
 		}
-		// Voice rides AFTER the text, and only after the text actually landed:
-		// pairing them is for a readable history, so the readable half must be
-		// the one that is guaranteed. A synthesis failure is logged and the
-		// delivery still confirms — the words arrived, which is the deliverable.
-		if (message.voiceText && speech) await sendVoiceMessage(channel, message.voiceText, speech);
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
 		await gateway.request("delivery.fail", {
@@ -1228,6 +1327,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 	discord.on("interactionCreate", (interaction) => {
 		if (interaction.isAutocomplete()) void handleModelAutocomplete(interaction, gateway);
 		else if (interaction.isChatInputCommand()) void handleSlashCommand(interaction, gateway);
+		else if (interaction.isButton()) void handlePanelButton(interaction, gateway);
 	});
 	discord.once("ready", () => {
 		console.log("Discord adapter connected.");
@@ -1375,6 +1475,98 @@ export function resolveInteractionDisplayName(
 	interaction: Pick<SlashInteractionLike, "user" | "member">,
 ): string | undefined {
 	return resolveDisplayName(interaction.user, interaction.member);
+}
+
+/** Duck-typed slice of a Discord button interaction on an approval panel. */
+export interface PanelButtonInteractionLike {
+	isButton?(): boolean;
+	readonly customId?: string;
+	readonly user?: {
+		readonly id: string;
+		readonly username?: string;
+		readonly globalName?: string | null;
+	};
+	readonly member?: {
+		readonly nick?: string | null;
+		readonly displayName?: string | null;
+		readonly nickname?: string | null;
+	} | null;
+	readonly channel?: DiscordMessageOriginShape["channel"] | null;
+	readonly message?: { edit?(payload: { components: readonly never[] }): Promise<unknown> } | null;
+	deferReply?(payload?: { flags?: number }): Promise<unknown>;
+	editReply?(payload: { content: string }): Promise<unknown>;
+	reply?(payload: { content: string; flags?: number }): Promise<unknown>;
+}
+
+/**
+ * Answers a permission panel's button. The digest and actor travel to the
+ * gateway, which is the authority: this handler only reports the click, and a
+ * refusal is shown ephemerally instead of being retried or auto-approved.
+ */
+export async function handlePanelButton(
+	interaction: PanelButtonInteractionLike,
+	gateway: Pick<ReconnectingGateway, "respondPanel">,
+	log: Pick<Console, "error"> = console,
+): Promise<void> {
+	if (!interaction.customId || !interaction.user) return;
+	const parsed = parseApprovalPanelCustomId(interaction.customId);
+	if (!parsed) return;
+	const user = interaction.user;
+	const channel = interaction.channel;
+	if (!channel) {
+		await replyPanel(interaction, "This approval is not attached to a conversation.");
+		return;
+	}
+	let origin: OriginRef;
+	try {
+		origin = discordMessageOrigin({ author: user, channel });
+	} catch (error) {
+		log.error(`Discord approval origin unavailable: ${errorMessage(error)}`);
+		await replyPanel(interaction, "This approval is not attached to a conversation.");
+		return;
+	}
+	// Acknowledge inside Discord's three-second window; the gateway call is local
+	// but must not race the interaction timeout.
+	try {
+		await interaction.deferReply?.({ flags: MessageFlags.Ephemeral });
+	} catch {
+		/* Already acknowledged; the edit path below still reports the outcome. */
+	}
+	const authorName = resolveInteractionDisplayName(interaction);
+	try {
+		await gateway.respondPanel({
+			origin,
+			panelId: parsed.panelId,
+			responseKind: "option_selected",
+			selectedOptionId: parsed.optionId,
+			digest: parsed.digest,
+			responderId: user.id,
+			engagement: {
+				mentioned: true,
+				group: origin.kind !== "dm",
+				authorId: user.id,
+				...(authorName ? { authorName } : {}),
+			},
+		});
+		// Accepted: retire the buttons so the same panel cannot be clicked twice.
+		await interaction.message?.edit?.({ components: [] }).catch(() => {});
+		await replyPanel(interaction, "Approval recorded.");
+	} catch (error) {
+		await replyPanel(interaction, describePanelOutcome(error));
+	}
+}
+
+/** Ephemeral answer that works whether or not the interaction was deferred. */
+async function replyPanel(interaction: PanelButtonInteractionLike, content: string): Promise<void> {
+	if (interaction.editReply) {
+		try {
+			await interaction.editReply({ content });
+			return;
+		} catch {
+			/* Fall through to a direct reply. */
+		}
+	}
+	await interaction.reply?.({ content, flags: MessageFlags.Ephemeral }).catch(() => {});
 }
 
 export async function handleSlashCommand(
@@ -1992,6 +2184,13 @@ export class ReconnectingGateway {
 		void client.request("engagement.reaction", described).catch((error) => {
 			console.error(`Discord engagement.reaction failed: ${error instanceof Error ? error.message : String(error)}`);
 		});
+	}
+
+	/** Reports a clicked approval panel; the gateway validates actor, expiry, and digest. */
+	async respondPanel(params: EngagementPanelResponseParams): Promise<void> {
+		const client = this.#client;
+		if (!client) throw new Error("gateway link not connected");
+		await client.request("engagement.panel_response", params);
 	}
 
 	/** `/model set` autocomplete source; throws when the gateway link is down. */

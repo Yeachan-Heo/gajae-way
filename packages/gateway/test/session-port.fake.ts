@@ -131,6 +131,7 @@ export class ScriptedSessionPort implements SessionPort {
 	readonly sends: SessionSendInput[] = [];
 	readonly sendAttempts: SessionSendInput[] = [];
 	readonly steers: SessionSteerInput[] = [];
+	readonly aborts: Array<{ sessionId: string; repo: string; opRef: string }> = [];
 	readonly workerOutputReads: WorkerOutputInput[] = [];
 	readonly #workerOutputFixtures = new Map<string, CliResult>();
 	readonly binds: SessionBindInput[] = [];
@@ -280,6 +281,24 @@ export class ScriptedSessionPort implements SessionPort {
 	async steer(input: SessionSteerInput): Promise<void> {
 		this.steers.push(input);
 		await this.onSteer?.(input, this);
+	}
+
+	async abort(input: { sessionId: string; repo: string; opRef: string }): Promise<void> {
+		this.aborts.push(input);
+		const operation = this.#operations.get(input.opRef);
+		if (!operation || operation.sessionId !== input.sessionId)
+			throw new GjcCliError("gjc sdk turn.abort refused", 0, "", { code: "resource_gone", refused: true });
+		operation.state = "failed";
+		operation.errorCode = "cancelled";
+		operation.failureOutcome = { reason: "cancelled", kind: "cancelled", provenance: "client_cancel" };
+		operation.terminalAt = Date.now();
+		this.#emit(operation.sessionId, input.opRef, {
+			kind: "agent_failed",
+			rawKind: "agent_failed",
+			payload: { error: { code: "cancelled" } },
+			steerEcho: false,
+			idle: true,
+		});
 	}
 
 	/** Session controls/queries the caller routed over a live relay handle instead of the CLI (issue #316). */

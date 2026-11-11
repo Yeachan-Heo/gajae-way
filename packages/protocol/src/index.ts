@@ -72,6 +72,8 @@ export {
 	type WorkStatusResult,
 	type WorkSteerParams,
 	type WorkSteerResult,
+	type WorkStopParams,
+	type WorkStopResult,
 } from "./catalog";
 export {
 	type ChannelEngagementDecision,

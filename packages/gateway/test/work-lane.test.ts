@@ -295,6 +295,81 @@ test("steer distinguishes structured refusal from transport uncertainty without 
 	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
 });
 
+test("stop aborts the running turn and settles the attempt as attempt_ended", async () => {
+	const f = await fixture();
+	const result = await started(f);
+	const stop = await f.manager.stopAttempt({ name: "a" });
+	expect(stop).toEqual({
+		stopped: true,
+		opRef: result.opRef,
+		settled: true,
+		endState: "attempt_ended",
+	});
+	expect(f.port.aborts).toHaveLength(1);
+	expect(f.port.aborts[0]).toMatchObject({ sessionId: result.sessionId, opRef: result.opRef });
+	const runtime = f.db.workAttemptGet(result.opRef)!;
+	expect(runtime.terminal).toMatchObject({ reasonCode: "cancelled" });
+	expect(runtime.settledAt).not.toBeNull();
+	expect(f.job().attempts[0]).toMatchObject({ endState: "attempt_ended", errorCode: "cancelled" });
+	expect(f.job().state).toBe("attempt_ended");
+	expect(f.job().stalledContinuations).toBe(0);
+	expect(f.notices).toHaveLength(0);
+
+	// A deliberate stop must not accumulate toward the automatic continuation
+	// hold: a second stopped attempt still leaves the counter at zero.
+	const second = await started(f);
+	expect((await f.manager.stopAttempt({ name: "a" })).stopped).toBe(true);
+	expect(second.opRef).not.toBe(result.opRef);
+	expect(f.job().state).toBe("attempt_ended");
+	expect(f.job().stalledContinuations).toBe(0);
+});
+
+test("stop refuses a host abort that does not own the turn and leaves the attempt open", async () => {
+	const f = await fixture();
+	const result = await started(f);
+	f.port.abort = async () => {
+		throw new GjcCliError("secret token", 0, "", { code: "resource_gone", refused: true });
+	};
+	expect(await f.manager.stopAttempt({ name: "a" })).toEqual({
+		stopped: false,
+		reason: "abort_refused:resource_gone",
+		opRef: result.opRef,
+	});
+	expect(f.db.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+	f.port.complete(result.opRef, "finished after refusal");
+	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt !== null);
+	expect(f.job().attempts[0]?.endState).toBe("completed");
+});
+
+test("stop never reports a transport-uncertain abort as stopped", async () => {
+	const f = await fixture();
+	const result = await started(f);
+	f.port.abort = async () => {
+		throw new Error("secret token");
+	};
+	await expect(f.manager.stopAttempt({ name: "a" })).rejects.toMatchObject({
+		message: "work stop acceptance uncertain",
+		detail: { reasonCode: "stop_acceptance_uncertain", opRef: result.opRef },
+	});
+	expect(f.db.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	f.port.complete(result.opRef, "finished after uncertainty");
+	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt !== null);
+});
+
+test("stop finds no open attempt after the attempt completes", async () => {
+	const f = await fixture();
+	const result = await started(f);
+	f.port.complete(result.opRef, "already done");
+	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt !== null);
+	expect(await f.manager.stopAttempt({ name: "a" })).toMatchObject({
+		stopped: false,
+		reason: "no open attempt to stop",
+		opRef: result.opRef,
+	});
+	expect(f.port.aborts).toEqual([]);
+});
+
 test("caller timeout only detaches and a later completion settles the same operation response-only", async () => {
 	const f = await fixture({ waitTimeoutMs: 25, ownerTarget: () => origin });
 	const run = f.manager.run({ name: "a", text: "work", cwd: f.directory }, {});

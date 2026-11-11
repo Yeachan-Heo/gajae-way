@@ -329,6 +329,13 @@ export interface ChatMessagePayload {
 		message: string;
 		/** ISO-8601 timestamp when this panel expires and becomes non-interactive. */
 		expiresAt: string;
+		/**
+		 * Binding digest of the exact reverse request this panel answers.
+		 * A response must echo it verbatim; a panel id alone never authorizes an
+		 * approval. Hex, 32 chars: Discord caps custom_id at 100 chars, so the
+		 * SHA-256 digest is truncated to 128 bits, which still binds the request.
+		 */
+		digest: string;
 		/** Offered permission options; empty if not a permission request. */
 		options?: readonly {
 			/** Unique identifier for this option. */
@@ -688,6 +695,26 @@ export type WorkSteerResult =
 	| { readonly steered: true; readonly clientRef: string }
 	| { readonly steered: false; readonly reason: string };
 
+export interface WorkStopParams {
+	readonly name: string;
+}
+
+/**
+ * `work.stop` ends the open attempt's running turn through the host's
+ * `turn.abort` control on the relay that owns it. `settled` is true only once
+ * the durable attempt actually reached its terminal state; an accepted abort
+ * that is still winding down reports false instead of inventing a stop.
+ */
+export type WorkStopResult =
+	| {
+			readonly stopped: true;
+			readonly opRef: string;
+			readonly settled: true;
+			readonly endState?: string;
+	  }
+	| { readonly stopped: true; readonly opRef: string; readonly settled: false; readonly reason: string }
+	| { readonly stopped: false; readonly reason: string; readonly opRef?: string };
+
 export interface WorkRetireParams {
 	readonly name?: string;
 	readonly force?: boolean;
@@ -837,7 +864,7 @@ export interface EngagementReactionResult {
 
 /**
  * Inbound panel response (engagement.panel_response): user answered an interactive
- * ask-user or approval panel question via Slack block actions.
+ * ask-user or approval panel question via Slack block actions or a Discord button.
  */
 export interface EngagementPanelResponseParams {
 	readonly origin: OriginRef;
@@ -847,7 +874,12 @@ export interface EngagementPanelResponseParams {
 	readonly responseKind: "option_selected" | "approved" | "denied";
 	/** Selected option id (for ask-user panels). */
 	readonly selectedOptionId?: string;
-	/** Slack user id who responded. */
+	/**
+	 * Approval-panel binding digest copied from the delivered panel. It must
+	 * match the pending request exactly; omit it and the approval is refused.
+	 */
+	readonly digest?: string;
+	/** Chat user id who responded. */
 	readonly responderId: string;
 	/** Engagement metadata. */
 	readonly engagement: EngagementContext;
@@ -1026,6 +1058,7 @@ export interface VerbCatalogV01 {
 	"work.start": { params: WorkStartParams; result: WorkStartResult };
 	"work.status": { params: WorkStatusParams; result: WorkStatusResult };
 	"work.steer": { params: WorkSteerParams; result: WorkSteerResult };
+	"work.stop": { params: WorkStopParams; result: WorkStopResult };
 	"work.jobs": { result: WorkJobsResult };
 	"work.retire": { params: WorkRetireParams; result: WorkRetireResult };
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
@@ -1068,6 +1101,7 @@ export const VERBS_V01 = [
 	"work.start",
 	"work.status",
 	"work.steer",
+	"work.stop",
 	"work.jobs",
 	"work.retire",
 	"chat.react",
