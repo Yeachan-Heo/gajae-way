@@ -1440,6 +1440,7 @@ test("in a public channel with audience=all, non-owner cannot /model set|clear b
 		type: "response",
 		result: { turnId: null, engaged: false },
 	});
+	expect(database.bindings.modelGet("discord/channel/public")).toBeUndefined();
 
 	// Non-owner cannot clear model
 	client.send({
@@ -1490,6 +1491,46 @@ test("in a public channel with audience=all, non-owner cannot /model set|clear b
 	expect(ownerSetResponse?.result?.engaged).toBe(true);
 	expect(database.bindings.modelGet("discord/channel/public")?.selection).toEqual({ preset: "gpt-4" });
 
+	client.close();
+});
+
+test("without a configured owner, a shared channel cannot /model set (fail closed)", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-channel-model-no-owner-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		model: { preset: "default" },
+		channels: { "discord:public": { engagement: "open", audience: "all" } },
+	};
+	const database = await Store.open(config.dbPath);
+	const sessionPort = new ScriptedSessionPort({ onBind: (input) => bindWorkFixture(input.originKey, input.epoch) });
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "no-owner-set",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "discord", kind: "channel", conversationId: "public" },
+			text: "/model set gpt-4",
+			engagement: { mentioned: false, group: true, authorId: "member" },
+		},
+	});
+	await waitFrame(client.frames, "no-owner-set");
+	expect(client.frames.find((frame) => frame.id === "no-owner-set")).toMatchObject({
+		type: "response",
+		result: { turnId: null, engaged: false },
+	});
+	expect(database.bindings.modelGet("discord/channel/public")).toBeUndefined();
 	client.close();
 });
 

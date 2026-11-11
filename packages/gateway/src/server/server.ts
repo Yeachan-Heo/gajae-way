@@ -2601,8 +2601,14 @@ async function sendChat(
 				return;
 			}
 		} else {
-			// Mutation: require owner
-			if (!isOwner(runtime.config, params.engagement)) {
+			// Mutation: require the configured owner. Without one, only an authorised
+			// direct message may mutate; shared channels fail closed.
+			const owner = ownerPeerIdOf(runtime.config);
+			const allowed =
+				owner === undefined
+					? origin.kind === "dm" && commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp)
+					: (params.engagement as { authorId?: string } | undefined)?.authorId === owner;
+			if (!allowed) {
 				connection.write({
 					v: PROFILE_VERSION,
 					type: "response",
@@ -4921,17 +4927,4 @@ function commandAuthorised(
 	threadFollowUp: boolean,
 ): boolean {
 	return decideEngagement(origin, engagement as Parameters<typeof decideEngagement>[1], config, threadFollowUp).engaged;
-}
-
-/**
- * Check if an actor is allowed to perform owner-level operations.
- * Returns true if no owner is configured (anyone is allowed), or if the
- * command issuer matches the configured owner.
- */
-function isOwner(config: GatewayConfig, engagement: unknown): boolean {
-	const owner = ownerPeerIdOf(config);
-	// If no owner is configured, anyone can perform owner-level operations
-	if (owner === undefined) return true;
-	const authorId = (engagement as { authorId?: string } | undefined)?.authorId;
-	return authorId === owner;
 }
