@@ -3620,7 +3620,13 @@ async function collectRepoFacts(
 				.map((url) => url.trim())
 				.filter(Boolean);
 			if (pushUrlsResult.exitCode !== 0) {
-				result.pushed = null;
+				// Exit code 2 means "No such remote", which means not pushed
+				if (pushUrlsResult.exitCode === 2) {
+					result.pushed = false;
+				} else {
+					// Other failures (timeouts, permission issues) remain unknown
+					result.pushed = null;
+				}
 			} else if (pushUrls.length === 0) {
 				result.pushed = false;
 			} else {

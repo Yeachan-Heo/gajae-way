@@ -5623,6 +5623,25 @@ async function laneRepo(directory: string, branch: string, push: boolean) {
 	return git(directory, "rev-parse", "HEAD");
 }
 
+/** Creates a repository with no origin remote. */
+async function laneRepoNoOrigin(directory: string, branch: string) {
+	const env = {
+		...process.env,
+		GIT_AUTHOR_NAME: "t",
+		GIT_AUTHOR_EMAIL: "t@t",
+		GIT_COMMITTER_NAME: "t",
+		GIT_COMMITTER_EMAIL: "t@t",
+	};
+	const git = (cwd: string, ...args: string[]) => {
+		const run = Bun.spawnSync(["git", "-C", cwd, ...args], { env, stdout: "pipe", stderr: "pipe" });
+		if (run.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${run.stderr.toString()}`);
+		return run.stdout.toString().trim();
+	};
+	git(directory, "init", "-q", "-b", branch);
+	git(directory, "commit", "-q", "--allow-empty", "-m", "lane head");
+	return git(directory, "rev-parse", "HEAD");
+}
+
 type CheckStatusAnswer = Omit<CheckStatusSnapshot, "headSha"> & { readonly headSha?: string };
 
 function withHeadSha(
@@ -6515,6 +6534,22 @@ test("#481 a detached checkout is not parked when no PR lookup can be attempted"
 	expect(f.job().state).toBe("attempt_ended");
 	expect(f.job().awaitingChecks).toBeUndefined();
 	expect(checks.calls).toEqual([]);
+});
+
+test("#794 completed lane with no origin does not enter awaiting_checks", async () => {
+	const checks = scriptedChecks(undefined);
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const head = await laneRepoNoOrigin(f.directory, "fix/no-origin");
+	const result = await started(f, "a", origin);
+	f.port.complete(result.opRef, "done");
+	await until(() => checksNotice(f, "[lane a] attempt_ended") !== undefined);
+	expect(f.job().state).toBe("attempt_ended");
+	expect(f.job().awaitingChecks).toBeUndefined();
+	const notice = checksNotice(f, "[lane a] attempt_ended");
+	expect(notice).toBeDefined();
+	expect(notice).toContain("pushed=false");
+	// With no origin, pushed=false prevents awaiting_checks entry
+	expect(checks.calls).toEqual([{ headSha: head, cwd: f.directory }]);
 });
 
 test("#595 completed lane with already-green remote-head checks settles without parking", async () => {
