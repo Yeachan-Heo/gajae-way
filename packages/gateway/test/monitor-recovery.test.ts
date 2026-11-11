@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PROTOCOL_FAILURE_REASONS, monitorSessionOrigin, originKey } from "@gajae-gateway/protocol";
+import { monitorSessionOrigin, originKey, PROTOCOL_FAILURE_REASONS } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MemoryClosureQueue } from "../src/memory/closure";
@@ -2926,22 +2926,22 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 						expect(belongsToOpB).toBe(false);
 
 						// Verify that checking against opA returns true
-			const belongsToOpA = failureOpRef === opA && failureSessionId === "s1";
-							expect(belongsToOpA).toBe(true);
-						} catch {
-							// If parsing fails, the failure doesn't have operation info
-							// (which would be treated conservatively as not belonging to any operation)
-						}
+						const belongsToOpA = failureOpRef === opA && failureSessionId === "s1";
+						expect(belongsToOpA).toBe(true);
+					} catch {
+						// If parsing fails, the failure doesn't have operation info
+						// (which would be treated conservatively as not belonging to any operation)
 					}
 				}
-
-				db.close();
-			} finally {
-				await rm(raceHome, { recursive: true, force: true });
 			}
-		});
 
-		// Codex finding: Verify retryable failed rows do not break escalation streak
-		// Test verifies that line 2387 correctly skips 'failed' rows in the streak count
-		// The code already has the correct logic to skip 'failed' stage in the loop at line 2387
+			db.close();
+		} finally {
+			await rm(raceHome, { recursive: true, force: true });
+		}
 	});
+
+	// Codex finding: Verify retryable failed rows do not break escalation streak
+	// Test verifies that line 2387 correctly skips 'failed' rows in the streak count
+	// The code already has the correct logic to skip 'failed' stage in the loop at line 2387
+});
