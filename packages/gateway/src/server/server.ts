@@ -2604,10 +2604,11 @@ async function sendChat(
 			// Mutation: require the configured owner. Without one, only an authorised
 			// direct message may mutate; shared channels fail closed.
 			const owner = ownerPeerIdOf(runtime.config);
+			// The local loopback socket is the operator's own surface.
 			const allowed =
-				owner === undefined
-					? origin.kind === "dm" && commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp)
-					: (params.engagement as { authorId?: string } | undefined)?.authorId === owner;
+				origin.kind === "loopback" || (owner === undefined && origin.kind === "dm")
+					? commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp)
+					: owner !== undefined && (params.engagement as { authorId?: string } | undefined)?.authorId === owner;
 			if (!allowed) {
 				connection.write({
 					v: PROFILE_VERSION,
