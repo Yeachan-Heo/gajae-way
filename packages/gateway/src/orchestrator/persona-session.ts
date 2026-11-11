@@ -2706,6 +2706,52 @@ class OriginActor {
 		// prompt can have landed, so holding the BOUND row as an ambiguous send
 		// would brick the origin. Release it to plain pending and retry with
 		// backoff instead.
+		// Check if we need to rebind the session to the default model
+		// (when there's no per-origin override and the applied model differs from the default).
+		if (this.#manager.sessionModel && !this.#manager.database.bindings.modelGet(this.originKey)) {
+			const currentModel = this.#appliedModel.get(binding.sessionId);
+			const defaultModel = describeModel(this.#manager.sessionModel);
+			if (currentModel !== defaultModel) {
+				// Rebind to the default model using the same mechanism as /model live-rebind.
+				try {
+					await this.#manager.port.setModel({
+						sessionId: binding.sessionId,
+						repo: this.#manager.repo,
+						selection: this.#manager.sessionModel,
+						relay: tail,
+					});
+					this.#appliedModel.set(binding.sessionId, defaultModel);
+					this.#manager.log(
+						`persona_model origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} effective=${defaultModel} changed=true source=default-rebind`,
+					);
+				} catch (error) {
+					await tail.close();
+					const sessionGone = sdkStatusErrorCode(error) === "session_unavailable";
+					const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
+						const attempt = retryInboundTurn(this.#manager.database, tx, opRef);
+						const nextEpoch = sessionGone ? this.#manager.database.bindings.rotateEpoch(tx, this.originKey) : undefined;
+						return { attempt, nextEpoch };
+					});
+					this.#current = undefined;
+					this.#state = "idle";
+					await this.#notifyReleased(current);
+					this.#preSendFailures += 1;
+					const failures = this.#preSendFailures;
+					this.#manager.recordPreSendFailure(this.originKey, safeDiagnostic(error));
+					this.#manager.log(
+						`persona_model_failed origin=${this.originKey} epoch=${epoch}${nextEpoch === undefined ? "" : ` nextEpoch=${nextEpoch}`} session=${binding.sessionId} message=${trigger.message_id} attempt=${attempt} failures=${failures} selection=${defaultModel} detail=${safeDiagnostic(error)}`,
+						"error",
+					);
+					if (sessionGone) this.#preSendFailures = 0;
+					this.#scheduleDispatchRetry(
+						sessionGone
+							? DISPATCH_FAILURE_RETRY_MS
+							: Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, (this.#preSendFailures + 1) * DISPATCH_FAILURE_RETRY_MS),
+					);
+					return;
+				}
+			}
+		}
 		const modelKey = describeModel(lifecycle.effectiveModel);
 		let modelReceipt: { readonly changed: boolean } | undefined;
 		try {
