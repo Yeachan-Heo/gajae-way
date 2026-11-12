@@ -1057,8 +1057,9 @@ export class BindingsGroup {
 
 	/**
 	 * Check if there is any pending session.create operation for the given scope.
-	 * Issue #780, P2 #1: used to guard epoch rotation, ensuring we don't abandon
-	 * an unresolved create whose broker application succeeded but reply was lost.
+	 * Issue #780, P2 #1: used to distinguish a pending create from a missing
+	 * binding so recovery can retain its journal scope until the retired create
+	 * is replayed and any unbound session is closed.
 	 */
 	hasPendingSessionCreate(scope: string): boolean {
 		return (

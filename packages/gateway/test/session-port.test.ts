@@ -72,18 +72,19 @@ afterEach(async () => {
 
 async function brokerPortFixture(cli: CliRunner, instanceId = "session-port-rebind") {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-rebind-"));
-	database = await Store.open(join(home, "gateway.db"));
+	const store = await Store.open(join(home, "gateway.db"));
+	database = store;
 	const agentDir = join(home, "agent");
-	const authority = initializeTestBrokerAuthority(database, agentDir);
+	const authority = initializeTestBrokerAuthority(store, agentDir);
 	const repo = join(home, "workspace");
 	const port = new BrokerSessionPort({
 		authority,
-		database,
+		database: store,
 		cli,
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 		sleep: async () => {},
 	});
-	return { port, repo, database, agentDir };
+	return { port, repo, database: store, agentDir, authority };
 }
 
 test("pending session.create observation is scoped to its origin and epoch", async () => {
@@ -115,6 +116,66 @@ test("pending session.create observation is scoped to its origin and epoch", asy
 	expect(port.hasPendingSessionCreate({ originKey, epoch: 7 })).toBe(true);
 	expect(port.hasPendingSessionCreate({ originKey, epoch: 8 })).toBe(false);
 	expect(port.hasPendingSessionCreate({ originKey: `${originKey}-other`, epoch: 7 })).toBe(false);
+});
+
+test("binding a fresh epoch replays and retires an orphaned pending create", async () => {
+	const originKey = "discord/dm/retired-pending-create";
+	const oldScope = JSON.stringify([originKey, 0]);
+	const oldOperationRef = "gw-retired-pending-create";
+	const oldSessionId = "orphaned-old-session";
+	const freshSessionId = "fresh-epoch-session";
+	const createKeys: string[] = [];
+	const closedSessionIds: string[] = [];
+	const run: CliRunner = async (args) => {
+		if (args.includes("session.create")) {
+			const key = args[args.indexOf("--idempotency-key") + 1] ?? "";
+			createKeys.push(key);
+			return createSuccess(key === oldOperationRef ? oldSessionId : freshSessionId);
+		}
+		if (args.includes("session.close")) {
+			const request = JSON.parse(args[args.indexOf("--json-input") + 1] ?? "{}") as { sessionId?: string };
+			if (request.sessionId) closedSessionIds.push(request.sessionId);
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: {} }), stderr: "" };
+		}
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						session: { sessionId: args.at(-1), live: true, deleted: false, locator: { cwd: "/tmp/workspace" } },
+					},
+				}),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const { port, repo, database, authority } = await brokerPortFixture(run);
+	database.transaction((tx) => {
+		database.bindings.beginBrokerOperation(tx, authority, {
+			operation: "session.create",
+			scope: oldScope,
+			operationRef: oldOperationRef,
+			requestJson: JSON.stringify({ cwd: repo }),
+		});
+		database.bindings.rotateEpoch(tx, originKey);
+	});
+
+	await expect(port.bind({ originKey, epoch: 1, repo })).resolves.toMatchObject({
+		sessionId: freshSessionId,
+		epoch: 1,
+	});
+	for (
+		let attempt = 0;
+		attempt < 100 && database.bindings.brokerOperation(authority, "session.create", oldScope);
+		attempt++
+	)
+		await Bun.sleep(10);
+
+	expect(createKeys).toContain(oldOperationRef);
+	expect(closedSessionIds).toContain(oldSessionId);
+	expect(database.bindings.brokerOperation(authority, "session.create", oldScope)).toBeUndefined();
+	expect(database.bindings.getSessionRecord(originKey)).toMatchObject({ sessionId: freshSessionId, epoch: 1 });
 });
 
 function createFailure(code: string, message: string) {

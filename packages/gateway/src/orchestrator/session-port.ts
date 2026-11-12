@@ -600,9 +600,14 @@ export class BrokerSessionPort implements SessionPort {
 		const key = `${input.originKey}#${input.epoch}`;
 		const existing = this.#bindings.get(key);
 		if (existing) return existing;
-		const pending = this.#bind(input).finally(() => {
-			if (this.#bindings.get(key) === pending) this.#bindings.delete(key);
-		});
+		const pending = this.#bind(input)
+			.then((binding) => {
+				if (input.epoch > 0) void this.#reconcileRetiredSessionCreates(input.originKey, input.epoch);
+				return binding;
+			})
+			.finally(() => {
+				if (this.#bindings.get(key) === pending) this.#bindings.delete(key);
+			});
 		this.#bindings.set(key, pending);
 		return pending;
 	}
@@ -610,6 +615,35 @@ export class BrokerSessionPort implements SessionPort {
 	hasPendingSessionCreate(input: { readonly originKey: string; readonly epoch: number }): boolean {
 		this.#database.bindings.assertAuthority(this.#authority);
 		return this.#database.bindings.hasPendingSessionCreate(JSON.stringify([input.originKey, input.epoch]));
+	}
+
+	async #reconcileRetiredSessionCreates(originKey: string, epoch: number): Promise<void> {
+		for (let retiredEpoch = 0; retiredEpoch < epoch; retiredEpoch++) {
+			const scope = JSON.stringify([originKey, retiredEpoch]);
+			try {
+				const pendingCreate = this.#database.bindings.brokerOperation(this.#authority, "session.create", scope);
+				if (pendingCreate?.state !== "pending") continue;
+
+				const created = await this.#createSession(pendingCreate.operationRef, pendingCreate.requestJson);
+				if (typeof created.sessionId !== "string" || created.sessionId.length === 0)
+					throw new Error("pending session.create intent did not return a session id");
+
+				const current = this.#database.bindings.getSessionRecord(originKey);
+				if (current?.sessionId !== created.sessionId) {
+					assertControlAllowed("session.close", { operatorApproval: true });
+					try {
+						await this.#closeSessionOperation(created.sessionId);
+					} catch (error) {
+						if (!isSessionGoneCode(sdkErrorCode(error))) throw error;
+					}
+				}
+				this.#releaseOperation(pendingCreate);
+			} catch (error) {
+				console.error(
+					`pending session.create reconciliation failed origin=${originKey} epoch=${retiredEpoch} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error))}`,
+				);
+			}
+		}
 	}
 
 	async #bind(input: SessionBindInput): Promise<SessionBinding> {
