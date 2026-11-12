@@ -4672,13 +4672,13 @@ class OriginActor {
 		}
 		if (!usage || usage.tokens < PERSONA_COMPACTION_TOKENS) return { ...(usage ? { usage } : {}), compacted: false };
 		const startedAt = this.#manager.now();
-		const { status } = await this.#manager.port.runCompaction({
+		const { status, code } = await this.#manager.port.runCompaction({
 			sessionId,
 			repo: this.#manager.repo,
 			originKey: this.originKey,
 		});
 		this.#manager.log(
-			`persona_compaction origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage.tokens} status=${status} elapsedMs=${this.#manager.now() - startedAt}`,
+			`persona_compaction origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage.tokens} status=${status}${code ? ` code=${code}` : ""} elapsedMs=${this.#manager.now() - startedAt}`,
 		);
 		return status === "succeeded" ? { compacted: true } : { usage, compacted: false };
 	}

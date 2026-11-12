@@ -207,7 +207,7 @@ export interface SessionPort {
 		preferSpoken?: boolean;
 	}): Promise<LastAssistantResult | undefined>;
 	attachTail(input: TailAttachInput): Promise<TailHandle>;
-	runCompaction(input: SessionCompactionInput): Promise<{ readonly status: SessionCompactionStatus }>;
+	runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult>;
 	/** Emits live-tail stall signals; the owning actor applies bounded recovery policy. */
 	checkStalls(now?: number): void;
 	/** Sets the tail-silence threshold that triggers stall handling. */
@@ -231,6 +231,12 @@ export interface RunningHostJob {
 }
 
 export type SessionCompactionStatus = "succeeded" | "failed" | "skipped" | "unavailable";
+
+export interface SessionCompactionResult {
+	readonly status: SessionCompactionStatus;
+	/** Stable SDK error code of a run that did not succeed, when gjc reported one. */
+	readonly code?: string;
+}
 
 /** Session context usage: percent of the model's context window and the token count it stands for. */
 export interface SessionContextUsage {
@@ -537,6 +543,12 @@ const CONTEXT_QUERY_TIMEOUT_MS = 5_000;
  * 2026-09-30); the default 30s command bound reported such runs as failed.
  */
 const COMPACTION_TIMEOUT_MS = 5 * 60_000;
+/**
+ * Process budget beyond the SDK request budget, so gjc's own timeout reply can
+ * still be read when the command did not wait long for a CLI slot (the bound
+ * covers the slot wait too).
+ */
+const COMPACTION_PROCESS_GRACE_MS = 30_000;
 
 type SignaledHost = {
 	readonly pid: number;
@@ -1950,13 +1962,28 @@ export class BrokerSessionPort implements SessionPort {
 		return await this.#tailRunner.attach(input);
 	}
 
-	async runCompaction(input: SessionCompactionInput): Promise<{ readonly status: SessionCompactionStatus }> {
+	async runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult> {
 		this.#assertOwned(input);
 		try {
 			const result = parseEnvelope<Record<string, unknown>>(
 				await this.#cli(
-					["sdk", "session", "raw", "control", input.sessionId, "--op", "compaction.run", "--json-input", "{}"],
-					{ timeoutMs: COMPACTION_TIMEOUT_MS },
+					[
+						"sdk",
+						"session",
+						"raw",
+						"control",
+						input.sessionId,
+						"--op",
+						"compaction.run",
+						"--json-input",
+						"{}",
+						// gjc replies only once the compaction is done; without this its
+						// default session request budget (40 s) gives up while the host
+						// keeps compacting.
+						"--timeout-ms",
+						String(COMPACTION_TIMEOUT_MS),
+					],
+					{ timeoutMs: COMPACTION_TIMEOUT_MS + COMPACTION_PROCESS_GRACE_MS },
 				),
 				"compaction.run",
 			);
@@ -1969,8 +1996,8 @@ export class BrokerSessionPort implements SessionPort {
 			if (error instanceof BrokerAuthorityError) throw error;
 			const code = sdkErrorCode(error);
 			if (code === "unsupported_operation" || code === "not_supported" || code === "unknown_operation")
-				return { status: "unavailable" };
-			return { status: "failed" };
+				return { status: "unavailable", code };
+			return { status: "failed", ...(code ? { code } : {}) };
 		}
 	}
 

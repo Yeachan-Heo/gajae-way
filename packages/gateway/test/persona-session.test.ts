@@ -22,6 +22,7 @@ import { formatFailureNotice } from "../src/orchestrator/rebind";
 import {
 	BrokerSessionPort,
 	ModelNotSelectedError,
+	type SessionCompactionResult,
 	type SessionCompactionStatus,
 	type SessionContextUsage,
 } from "../src/orchestrator/session-port";
@@ -5470,6 +5471,8 @@ class ContextUsagePort extends ScriptedSessionPort {
 	readonly failing = new Set<string>();
 	autoComplete = true;
 	compactionStatus: SessionCompactionStatus = "succeeded";
+	/** Replaces the next compaction's reply once, e.g. with an unknown outcome. */
+	nextCompaction: SessionCompactionResult | undefined;
 	/** How many sends had been made when each compaction ran. */
 	readonly compactedAfterSends: number[] = [];
 
@@ -5486,8 +5489,13 @@ class ContextUsagePort extends ScriptedSessionPort {
 		return this.percent === undefined ? undefined : { percent: this.percent, tokens: this.percent * 10_000 };
 	}
 
-	override async runCompaction(): Promise<{ readonly status: SessionCompactionStatus }> {
+	override async runCompaction(): Promise<SessionCompactionResult> {
 		this.compactedAfterSends.push(this.sends.length);
+		const scripted = this.nextCompaction;
+		if (scripted) {
+			this.nextCompaction = undefined;
+			return scripted;
+		}
 		if (this.compactionStatus === "succeeded") this.percent = undefined;
 		return { status: this.compactionStatus };
 	}
@@ -5688,6 +5696,20 @@ test("a compaction that does not succeed still sends the turn on the same sessio
 	expect(
 		logs.filter((line) => line.startsWith("persona_compaction ")).map((line) => line.match(/status=\w+/)?.[0]),
 	).toEqual(["status=failed", "status=unavailable"]);
+});
+
+test("a compaction that fails logs gjc's error code", async () => {
+	const port = new ContextUsagePort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line));
+	port.percent = COMPACTION_PERCENT + 5;
+	port.nextCompaction = { status: "failed", code: "timeout" };
+	await sendTurn(port, "after a timed-out compaction");
+	expect(
+		logs
+			.filter((line) => line.startsWith("persona_compaction "))
+			.map((line) => line.match(/status=\w+( code=\w+)?/)?.[0]),
+	).toEqual(["status=failed code=timeout"]);
 });
 
 test("messages arriving while the actor compacts wait for the compacted send instead of reaching the session", async () => {

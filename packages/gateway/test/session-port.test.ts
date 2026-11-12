@@ -2350,3 +2350,66 @@ test("runCompaction waits minutes for gjc to finish compacting and maps its rece
 	reply = { ok: true, result: {} };
 	expect(await port.runCompaction(target)).toEqual({ status: "failed" });
 });
+
+test("runCompaction gives gjc's own request the compaction budget and keeps its failure code", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database!, join(home, "agent"));
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "compact", epoch: 0 });
+	const calls: { args: string[]; timeoutMs: number | undefined }[] = [];
+	// gjc's public command-error envelope; `timeout` is what its session router
+	// returns when the host has not replied within the request budget.
+	const commandError = (code: string, outcomeCertainty: string) =>
+		JSON.stringify({
+			schema: "gjc.command-error",
+			version: 1,
+			ok: false,
+			command: ["sdk", "session", "raw", "control"],
+			error: { code, category: code, message: "failure", retryability: "unknown", outcomeCertainty, references: [] },
+			complete: true,
+		});
+	let respond: () => Promise<{ exitCode: number; stdout: string; stderr: string }> = async () => ({
+		exitCode: 0,
+		stdout: JSON.stringify({ ok: true, result: { started: true } }),
+		stderr: "",
+	});
+	const run: CliRunner = async (args, options) => {
+		calls.push({ args: [...args], timeoutMs: options?.timeoutMs });
+		return await respond();
+	};
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: run,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	const target = { sessionId: "sdk-1", repo, originKey: "compact" };
+
+	expect(await port.runCompaction(target)).toEqual({ status: "succeeded" });
+	// Without --timeout-ms gjc's session request gives up after 40 s while the host keeps compacting.
+	const args = calls[0]!.args;
+	const flag = args.indexOf("--timeout-ms");
+	expect(flag).toBeGreaterThan(args.indexOf("compaction.run"));
+	const requestBudgetMs = Number(args[flag + 1]);
+	expect(requestBudgetMs).toBe(300_000);
+	// The process bound exceeds gjc's own budget, leaving room to read its timeout reply after a short CLI slot wait.
+	expect(calls[0]!.timeoutMs).toBeGreaterThan(requestBudgetMs);
+
+	// gjc's own timeout reply and a real compaction failure keep their stable codes for the log.
+	respond = async () => ({ exitCode: 1, stdout: commandError("timeout", "unknown"), stderr: "" });
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "timeout" });
+	respond = async () => ({ exitCode: 1, stdout: commandError("operation_failed", "unknown"), stderr: "" });
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "operation_failed" });
+
+	// A process-level failure carries no gjc code.
+	respond = async () => {
+		throw new Error("request timed out after 330000ms");
+	};
+	expect(await port.runCompaction(target)).toEqual({ status: "failed" });
+	respond = async () => ({ exitCode: 1, stdout: "", stderr: "killed" });
+	expect(await port.runCompaction(target)).toEqual({ status: "failed" });
+
+	respond = async () => ({ exitCode: 1, stdout: commandError("unsupported_operation", "not-applied"), stderr: "" });
+	expect(await port.runCompaction(target)).toEqual({ status: "unavailable", code: "unsupported_operation" });
+});
