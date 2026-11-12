@@ -22,6 +22,7 @@ import { formatFailureNotice } from "../src/orchestrator/rebind";
 import {
 	BrokerSessionPort,
 	ModelNotSelectedError,
+	type SessionCompactionInput,
 	type SessionCompactionResult,
 	type SessionCompactionStatus,
 	type SessionContextUsage,
@@ -5494,12 +5495,17 @@ class ContextUsagePort extends ScriptedSessionPort {
 		return this.percent === undefined ? undefined : { percent: this.percent, tokens: this.percent * 10_000 };
 	}
 
-	override async runCompaction(): Promise<SessionCompactionResult> {
+	/** Whether each compaction was sent on the session's relay. */
+	readonly compactedOnRelay: boolean[] = [];
+
+	override async runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult> {
 		this.compactedAfterSends.push(this.sends.length);
+		this.compactedOnRelay.push(input.relay?.sessionId === input.sessionId);
 		const scripted = this.nextCompactions.shift();
 		if (scripted) return scripted;
 		if (this.compactionStatus === "succeeded") this.percent = undefined;
-		return { status: this.compactionStatus };
+		// The host's dispatcher answered, as a relay run reports.
+		return { status: this.compactionStatus, answered: true };
 	}
 }
 
@@ -5665,6 +5671,8 @@ test("a session at the compaction line is compacted before the send, which carri
 	port.percent = COMPACTION_PERCENT;
 	expect(await sendTurn(port, "at the line")).toBe(PERSONA);
 	expect(port.compactedAfterSends).toEqual([2]);
+	// On the session's own relay, so the host's ordered reply comes back unaltered.
+	expect(port.compactedOnRelay).toEqual([true]);
 	expect(
 		logs.some(
 			(line) =>
@@ -5774,9 +5782,9 @@ for (const read of ["throw", "undefined", "above"] as const) {
 			releaseBarrier = resolve;
 		});
 		class BarrierPort extends ContextUsagePort {
-			override async runCompaction(): Promise<SessionCompactionResult> {
+			override async runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult> {
 				const first = this.compactedAfterSends.length === 0;
-				const result = await super.runCompaction();
+				const result = await super.runCompaction(input);
 				// gjc orders the second run behind the first; it answers once both are done.
 				if (!first) await barrier;
 				return result;
@@ -5802,29 +5810,41 @@ for (const read of ["throw", "undefined", "above"] as const) {
 	});
 }
 
-test("an unresolved compaction keeps holding while further runs go unanswered, and a gjc answer releases it", async () => {
+test("behind an unresolved compaction, refused or unanswered runs keep holding and a host answer releases the send with the persona", async () => {
 	const port = new ContextUsagePort();
 	const logs: string[] = [];
 	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
-	// The second run is unanswered too; the third is answered with a failure, so the chain is clear.
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	// None of these prove the first run ended: another unanswered run, a frame
+	// never written, and a refusal before the host's ordered dispatch. The
+	// dispatcher's own failure (e.g. already compacted) does, and the earlier run
+	// may have compacted, so the persona goes back in.
 	await heldByUnresolvedCompaction(
 		port,
 		logs,
 		"held",
 		{ status: "failed", code: "timeout", outcomeUnknown: true },
-		{ status: "failed", code: "timeout", outcomeUnknown: true },
-		{ status: "failed", code: "operation_failed" },
+		{ status: "failed", outcomeUnknown: true },
+		{ status: "failed", code: "relay_unwritten" },
+		{ status: "failed", code: "session_quiescing" },
+		{ status: "failed", code: "internal", answered: true },
 	);
-	await eventually(() => port.sends.length === 1 && manager!.state(KEY) === "idle", "held turn was not sent");
-	expect(port.sends[0]).toMatchObject({ text: "held" });
-	expect(port.compactedAfterSends).toEqual([0, 0, 0]);
-	// Each unanswered run held the turn; only the answered one let it through.
-	expect(logs.filter((line) => line.startsWith("send_pre_send_requeue stage=prepare_context"))).toHaveLength(2);
+	await eventually(() => port.sends.length === 2 && manager!.state(KEY) === "idle", "held turn was not sent");
+	expect(port.sends[1]).toMatchObject({ text: "held", systemPreamble: PERSONA });
+	expect(port.compactedAfterSends).toEqual([1, 1, 1, 1, 1]);
+	expect(logs.filter((line) => line.startsWith("send_pre_send_requeue stage=prepare_context"))).toHaveLength(4);
 	expect(
 		logs
 			.filter((line) => line.startsWith("persona_compaction "))
-			.map((line) => line.match(/code=\w+( outcome=\w+)?/)?.[0]),
-	).toEqual(["code=timeout outcome=unknown", "code=timeout outcome=unknown", "code=operation_failed"]);
+			.map((line) => line.match(/status=\w+( code=\w+)?/)?.[0]),
+	).toEqual([
+		"status=failed code=timeout",
+		"status=failed",
+		"status=failed code=relay_unwritten",
+		"status=failed code=session_quiescing",
+		"status=failed code=internal",
+	]);
 });
 
 test("messages arriving while the actor compacts wait for the compacted send instead of reaching the session", async () => {
@@ -5833,8 +5853,8 @@ test("messages arriving while the actor compacts wait for the compacted send ins
 		releaseCompaction = resolve;
 	});
 	class GatedCompactionPort extends ContextUsagePort {
-		override async runCompaction(): Promise<{ readonly status: SessionCompactionStatus }> {
-			const result = super.runCompaction();
+		override async runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult> {
+			const result = super.runCompaction(input);
 			await compactionGate;
 			return await result;
 		}

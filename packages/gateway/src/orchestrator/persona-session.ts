@@ -4673,9 +4673,10 @@ class OriginActor {
 	 * answer was read) never lets the send through: a prompt sent now queues
 	 * behind it on the session's ordered controls and times out as an ambiguous
 	 * send. The turn goes back to pending, and each retry needs evidence that
-	 * the run is over: a readable context below the line (it landed), or a
-	 * second `compaction.run`, which gjc orders behind the first and answers
-	 * only after both. An unreadable context is not evidence.
+	 * the run is over: a readable context below the line (it landed), or the
+	 * host's answer to a second `compaction.run` sent on the relay, which gjc's
+	 * ordered dispatcher runs only after the first. An unreadable context, a
+	 * refusal before dispatch and a missing reply are not evidence.
 	 */
 	async #prepareContext(sessionId: string, epoch: number, opRef: string, tail: TailHandle): Promise<PreparedContext> {
 		// A run left unresolved on another session says nothing about this one.
@@ -4703,20 +4704,28 @@ class OriginActor {
 		}
 		if (!unresolved && (usage === undefined || belowLine)) return { ...(usage ? { usage } : {}), compacted: false };
 		const startedAt = this.#manager.now();
-		const { status, code, outcomeUnknown } = await this.#manager.port.runCompaction({
+		const { status, code, outcomeUnknown, answered } = await this.#manager.port.runCompaction({
 			sessionId,
 			repo: this.#manager.repo,
 			originKey: this.originKey,
+			relay: tail,
 		});
 		this.#manager.log(
 			`persona_compaction origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage?.tokens ?? "unknown"} status=${status}${code ? ` code=${code}` : ""}${outcomeUnknown ? " outcome=unknown" : ""}${unresolved ? " after=unresolved" : ""} elapsedMs=${this.#manager.now() - startedAt}`,
 		);
-		if (outcomeUnknown) {
+		// Behind an unresolved run, only the host dispatcher's answer to this run
+		// proves the earlier one is over (gjc orders them): a refusal before
+		// dispatch or a reply that never came does not. The hold lasts until such
+		// an answer, a readable context below the line, the host's death or /new.
+		if (outcomeUnknown || (unresolved && answered !== true)) {
 			this.#unresolvedCompaction = sessionId;
 			throw new CompactionUnresolvedError(code);
 		}
 		this.#unresolvedCompaction = undefined;
-		return status === "succeeded" ? { compacted: true } : { ...(usage ? { usage } : {}), compacted: false };
+		// The earlier run may have compacted even if this one failed ("already
+		// compacted"): resolve it as compacted so the persona goes back in.
+		if (unresolved || status === "succeeded") return { compacted: true };
+		return { ...(usage ? { usage } : {}), compacted: false };
 	}
 
 	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {

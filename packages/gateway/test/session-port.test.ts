@@ -13,7 +13,13 @@ import {
 	SessionBusyStalledError,
 	SessionRequestTimeoutError,
 } from "../src/orchestrator/session-port";
-import { type TailHandle, TailRunner } from "../src/orchestrator/tail-runner";
+import {
+	RelayClosedError,
+	RelayRequestTimeoutError,
+	type RelayResponse,
+	type TailHandle,
+	TailRunner,
+} from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, Store } from "../src/store";
 import {
 	attachTestBrokerOwnership,
@@ -2427,4 +2433,62 @@ test("runCompaction gives gjc's own request the compaction budget and reports a 
 
 	respond = async () => ({ exitCode: 1, stdout: commandError("unsupported_operation", "not-applied"), stderr: "" });
 	expect(await port.runCompaction(target)).toEqual({ status: "unavailable", code: "unsupported_operation" });
+});
+
+test("runCompaction on the relay reports whether the host's ordered dispatcher answered", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database!, join(home, "agent"));
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "compact", epoch: 0 });
+	const cliCalls: string[][] = [];
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: async (args) => {
+			cliCalls.push([...args]);
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { started: true } }), stderr: "" };
+		},
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	const controls: { operation: string; timeoutMs: number | undefined }[] = [];
+	let reply: () => Promise<RelayResponse> = async () => ({ ok: true, result: { started: true } });
+	const relay = {
+		control: async (operation: string, _input: Record<string, unknown>, options?: { timeoutMs?: number }) => {
+			controls.push({ operation, timeoutMs: options?.timeoutMs });
+			return await reply();
+		},
+	} as unknown as TailHandle;
+	const target = { sessionId: "sdk-1", repo, originKey: "compact", relay };
+
+	expect(await port.runCompaction(target)).toEqual({ status: "succeeded", answered: true });
+	// Straight to the host on the relay, under the whole five-minute budget; no CLI slot.
+	expect(controls).toEqual([{ operation: "compaction.run", timeoutMs: 300_000 }]);
+	expect(cliCalls).toEqual([]);
+
+	// The dispatcher's own failure for this run (e.g. already compacted) is an answer.
+	reply = async () => ({ ok: false, error: { code: "internal", message: "Control operation failed." } });
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "internal", answered: true });
+	// Refused before ordered dispatch: the run never started and proves nothing about earlier ones.
+	for (const code of ["session_quiescing", "not_activated", "operation_not_session_owned"]) {
+		reply = async () => ({ ok: false, error: { code, message: "refused" } });
+		expect(await port.runCompaction(target)).toEqual({ status: "failed", code });
+	}
+	reply = async () => ({ ok: false, error: { code: "unknown_operation", message: "unknown" } });
+	expect(await port.runCompaction(target)).toEqual({ status: "unavailable", code: "unknown_operation" });
+
+	// No reply: the host may still be compacting.
+	reply = async () => {
+		throw new RelayRequestTimeoutError("sdk-1", "gw-1", 300_000);
+	};
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", outcomeUnknown: true });
+	reply = async () => {
+		throw new RelayClosedError("sdk-1", "stream ended", true);
+	};
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", outcomeUnknown: true });
+	// A frame never written never reached the host.
+	reply = async () => {
+		throw new RelayClosedError("sdk-1", "relay not open", false);
+	};
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "relay_unwritten" });
 });

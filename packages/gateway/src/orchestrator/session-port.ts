@@ -241,6 +241,11 @@ export interface SessionCompactionResult {
 	 * timed out, its outcome is uncertain after send, or no gjc answer was read.
 	 */
 	readonly outcomeUnknown?: boolean;
+	/**
+	 * The host's ordered control dispatcher answered this run (relay runs only):
+	 * the run is over, and so is every ordered control queued before it.
+	 */
+	readonly answered?: boolean;
 }
 
 /** Session context usage: percent of the model's context window and the token count it stands for. */
@@ -253,6 +258,11 @@ export interface SessionCompactionInput {
 	readonly sessionId: string;
 	readonly repo: string;
 	readonly originKey: string;
+	/**
+	 * The session's live relay. When given, the run goes straight to the host,
+	 * whose own control reply tells a finished run from a lost reply (`answered`).
+	 */
+	readonly relay?: TailHandle;
 }
 
 export interface SessionBindInput {
@@ -554,6 +564,16 @@ const COMPACTION_TIMEOUT_MS = 5 * 60_000;
  * bound (CLI slot wait included) of COMPACTION_TIMEOUT_MS.
  */
 const COMPACTION_REPLY_GRACE_MS = 15_000;
+/**
+ * gjc host refusals of a control before its ordered dispatch (host admission,
+ * activation and dispatch preflight in gjc 0.20.0 `sdk/host`).
+ */
+const COMPACTION_PRE_DISPATCH_REFUSALS: ReadonlySet<string> = new Set([
+	"session_quiescing",
+	"not_activated",
+	"operation_not_session_owned",
+	"operation_prohibited",
+]);
 
 type SignaledHost = {
 	readonly pid: number;
@@ -1969,6 +1989,7 @@ export class BrokerSessionPort implements SessionPort {
 
 	async runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult> {
 		this.#assertOwned(input);
+		if (input.relay) return await this.#runCompactionOnRelay(input, input.relay);
 		try {
 			const result = parseEnvelope<Record<string, unknown>>(
 				await this.#cli(
@@ -2012,6 +2033,36 @@ export class BrokerSessionPort implements SessionPort {
 				code === "timeout" || code === "uncertain_after_send" || !(error instanceof GjcCliError && error.details);
 			return { status: "failed", ...(code ? { code } : {}), ...(outcomeUnknown ? { outcomeUnknown } : {}) };
 		}
+	}
+
+	async #runCompactionOnRelay(input: SessionCompactionInput, relay: TailHandle): Promise<SessionCompactionResult> {
+		let response: RelayResponse;
+		try {
+			response = await relay.control("compaction.run", {}, { timeoutMs: COMPACTION_TIMEOUT_MS });
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			// A frame never written never reached the host.
+			if (isUnwrittenRelayRequest(error)) return { status: "failed", code: "relay_unwritten" };
+			// No reply (timeout, relay lost after the write): the host may still be compacting.
+			return { status: "failed", outcomeUnknown: true };
+		}
+		this.#database.bindings.assertAuthority(this.#authority);
+		if (response.ok) {
+			const result = recordOf(response.result) ?? {};
+			this.#tailRunner.recordCompactionReceipt({ sessionId: input.sessionId, originKey: input.originKey, result });
+			if (result.started === true || result.status === "started" || result.status === "completed")
+				return { status: "succeeded", answered: true };
+			if (result.skipped === true || result.status === "skipped") return { status: "skipped", answered: true };
+			return { status: "failed", answered: true };
+		}
+		const code = stableErrorCode(response.error?.code);
+		if (code === "unsupported_operation" || code === "not_supported" || code === "unknown_operation")
+			return { status: "unavailable", code };
+		// Refused before the host's ordered dispatch: the run never started and
+		// proves nothing about controls queued earlier. Any other failure is the
+		// dispatcher's answer for this run, including compaction's own failures.
+		const refusedBeforeDispatch = code !== undefined && COMPACTION_PRE_DISPATCH_REFUSALS.has(code);
+		return { status: "failed", ...(code ? { code } : {}), ...(refusedBeforeDispatch ? {} : { answered: true }) };
 	}
 
 	checkStalls(now = this.#now()): void {
