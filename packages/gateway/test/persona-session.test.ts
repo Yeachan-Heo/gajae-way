@@ -5847,6 +5847,81 @@ test("behind an unresolved compaction, refused or unanswered runs keep holding a
 	]);
 });
 
+test("an unresolved compaction keeps holding the send after a gateway restart until the host answers", async () => {
+	let releaseBarrier!: () => void;
+	const barrier = new Promise<void>((resolve) => {
+		releaseBarrier = resolve;
+	});
+	class BarrierPort extends ContextUsagePort {
+		override async runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult> {
+			const first = this.compactedAfterSends.length === 0;
+			const result = await super.runCompaction(input);
+			if (!first) await barrier;
+			return result;
+		}
+	}
+	const port = new BarrierPort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line));
+	await heldByUnresolvedCompaction(port, logs, "held", { status: "failed", code: "timeout", outcomeUnknown: true });
+
+	// Restart while the host may still be compacting; the recovered actor cannot read the context.
+	await manager!.stop();
+	database!.close();
+	database = await Store.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		log: (line) => logs.push(line),
+		onTurnStart: ({ trigger }) => ({ text: trigger.body, systemPreamble: PERSONA }),
+	});
+	port.nextUsageReads.push("undefined", "undefined");
+	// Recovery dispatches the pending turn itself and then waits in the barrier run.
+	const recovered = manager.recover();
+	await eventually(() => port.compactedAfterSends.length === 2, "the recovered actor did not run a barrier compaction");
+	await Bun.sleep(30);
+	expect(port.sends).toHaveLength(0);
+	expect(port.steers).toHaveLength(0);
+
+	releaseBarrier();
+	await recovered;
+	await eventually(() => port.sends.length === 1 && manager!.state(KEY) === "idle", "held turn was not sent");
+	expect(port.sends[0]).toMatchObject({ text: "held", systemPreamble: PERSONA });
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeUndefined();
+});
+
+test("the unresolved-compaction hold is stored before the first run, so a gateway stopped mid-run comes back holding", async () => {
+	let releaseCompaction!: () => void;
+	const gate = new Promise<void>((resolve) => {
+		releaseCompaction = resolve;
+	});
+	class GatedPort extends ContextUsagePort {
+		override async runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult> {
+			const result = super.runCompaction(input);
+			await gate;
+			return await result;
+		}
+	}
+	const port = new GatedPort();
+	await preambleHarness(port, { persona: () => PERSONA });
+	port.percent = COMPACTION_PERCENT + 1;
+	enqueue("m-full", "lands after compaction");
+	void manager!.notifyInbound(KEY);
+	await eventually(() => port.compactedAfterSends.length === 1, "compaction did not start");
+	// While the host is compacting, the durable hold already names the session;
+	// a restarted gateway reads it (see the restart test) instead of sending.
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBe(
+		database!.bindings.getSessionRecord(KEY)?.sessionId,
+	);
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeDefined();
+	releaseCompaction();
+	await eventually(() => port.sends.length === 1 && manager!.state(KEY) === "idle", "compacted send did not follow");
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeUndefined();
+});
+
 test("messages arriving while the actor compacts wait for the compacted send instead of reaching the session", async () => {
 	let releaseCompaction!: () => void;
 	const compactionGate = new Promise<void>((resolve) => {

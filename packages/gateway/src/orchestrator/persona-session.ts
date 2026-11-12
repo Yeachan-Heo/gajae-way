@@ -161,6 +161,11 @@ function escalatedHoldKey(opRef: string): string {
 	return `escalated-hold:${opRef}`;
 }
 
+/** Session of an origin whose last pre-send compaction may still be running. */
+function unresolvedCompactionKey(originKey: string): string {
+	return `compaction-unresolved:${originKey}`;
+}
+
 /** Track relay unavailable events for a turn to detect unresponsive relays even on live hosts (#766). */
 function relayUnavailableTrackerKey(opRef: string): string {
 	return `relay_unavailable:${opRef}`;
@@ -2996,8 +3001,6 @@ class OriginActor {
 
 	#bindFailures = 0;
 	#preSendFailures = 0;
-	/** Session whose last pre-send compaction may still be running; its sends wait for evidence it is over. */
-	#unresolvedCompaction: string | undefined;
 	/** A terminal_uncertain bind poisons this epoch's idempotency key; retries cannot make that key decidable. */
 	#bindEpochPoisoned = false;
 	/** Identical bind failures before the broker's own discovery file is judged. */
@@ -4679,10 +4682,12 @@ class OriginActor {
 	 * refusal before dispatch and a missing reply are not evidence.
 	 */
 	async #prepareContext(sessionId: string, epoch: number, opRef: string, tail: TailHandle): Promise<PreparedContext> {
+		// Durable, so a restarted gateway keeps holding until the run is proven over.
+		const unresolvedKey = unresolvedCompactionKey(this.originKey);
+		const unresolvedOn = this.#manager.database.core.metaGet(unresolvedKey);
 		// A run left unresolved on another session says nothing about this one.
-		if (this.#unresolvedCompaction !== undefined && this.#unresolvedCompaction !== sessionId)
-			this.#unresolvedCompaction = undefined;
-		const unresolved = this.#unresolvedCompaction === sessionId;
+		if (unresolvedOn !== undefined && unresolvedOn !== sessionId) this.#manager.database.core.metaDelete(unresolvedKey);
+		const unresolved = unresolvedOn === sessionId;
 		let usage: SessionContextUsage | undefined;
 		try {
 			usage = await this.#manager.port.contextUsage?.({ sessionId, repo: this.#manager.repo, relay: tail });
@@ -4696,13 +4701,16 @@ class OriginActor {
 		const belowLine = usage !== undefined && usage.tokens < PERSONA_COMPACTION_TOKENS;
 		if (unresolved && belowLine) {
 			// The earlier run landed: the context is compacted and the persona goes back in.
-			this.#unresolvedCompaction = undefined;
+			this.#manager.database.core.metaDelete(unresolvedKey);
 			this.#manager.log(
 				`persona_compaction_resolved origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage!.tokens} evidence=context_below_line`,
 			);
 			return { compacted: true };
 		}
 		if (!unresolved && (usage === undefined || belowLine)) return { ...(usage ? { usage } : {}), compacted: false };
+		// Written ahead of the run: a gateway that stops while it is in flight must
+		// come back holding, since the host keeps compacting regardless.
+		if (!unresolved) this.#manager.database.core.metaSet(unresolvedKey, sessionId);
 		const startedAt = this.#manager.now();
 		const { status, code, outcomeUnknown, answered } = await this.#manager.port.runCompaction({
 			sessionId,
@@ -4717,11 +4725,13 @@ class OriginActor {
 		// proves the earlier one is over (gjc orders them): a refusal before
 		// dispatch or a reply that never came does not. The hold lasts until such
 		// an answer, a readable context below the line, the host's death or /new.
-		if (outcomeUnknown || (unresolved && answered !== true)) {
-			this.#unresolvedCompaction = sessionId;
-			throw new CompactionUnresolvedError(code);
-		}
-		this.#unresolvedCompaction = undefined;
+		// A receipt is the host's answer on either path, and a host without
+		// compaction.run cannot have one running.
+		const settled = answered === true || status === "succeeded" || status === "skipped" || status === "unavailable";
+		if (outcomeUnknown || (unresolved && !settled)) throw new CompactionUnresolvedError(code);
+		// Answered, or a first run that never reached the host (refused before
+		// dispatch, frame never written): nothing is left compacting.
+		this.#manager.database.core.metaDelete(unresolvedKey);
 		// The earlier run may have compacted even if this one failed ("already
 		// compacted"): resolve it as compacted so the persona goes back in.
 		if (unresolved || status === "succeeded") return { compacted: true };
