@@ -20,6 +20,7 @@ async function harness(
 	inspectErrorCode?: string,
 	omitPid = false,
 	sessionFields: Record<string, unknown> = {},
+	inspectExitCode = 0,
 ) {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-terminate-"));
 	const database = await Store.open(join(home, "gateway.db"));
@@ -44,7 +45,7 @@ async function harness(
 					stderr: "",
 				};
 			return {
-				exitCode: 0,
+				exitCode: inspectExitCode,
 				stdout: JSON.stringify({ ok: true, result: { session: { sessionId, live, pid, ...sessionFields } } }),
 				stderr: "",
 			};
@@ -298,6 +299,17 @@ test("hostExited never treats an ambiguous or mismatched row's exited pid as the
 });
 
 test("hostExited needs a valid host pid in a successful inspect envelope", async () => {
+	// A nonzero inspect exit is a failed invocation even when stdout carries an ok-shaped row.
+	const dead = fakeHost("sdk session-host-internal");
+	const deadPid = dead.pid;
+	dead.kill();
+	await dead.exited;
+	const failed = await harness(() => deadPid, false, undefined, false, {}, 1);
+	try {
+		expect(await failed.port.hostExited({ sessionId: "s-1", repo: failed.repo })).toBe(false);
+	} finally {
+		await failed.close();
+	}
 	for (const pid of [undefined, 0, 1, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
 		const h = await harness(() => pid, false, undefined, true);
 		try {

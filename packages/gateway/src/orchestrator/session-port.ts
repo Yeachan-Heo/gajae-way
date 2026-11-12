@@ -128,7 +128,7 @@ export interface SessionPort {
 	inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined>;
 	liveness?(input: { sessionId: string; repo: string }): Promise<SessionLiveness>;
 	/**
-	 * Read-only: true only when an ok broker inspect envelope names this session,
+	 * Read-only: true only when a successful (exit 0) broker inspect envelope names this session,
 	 * is not flagged `ambiguous` (competing unresolved authority roots), carries a
 	 * safe integer host pid > 1, and OS `ps` reports that pid gone. This proves the
 	 * exit of the broker's selected host row, not of every past incarnation.
@@ -1093,7 +1093,14 @@ export class BrokerSessionPort implements SessionPort {
 			this.#assertOwned(input);
 			const host = await this.#inspectHost(input);
 			// An ambiguous row is one of several hosts claiming the session; its pid speaks for no other.
-			return host.ok && host.exclusive && host.pid !== undefined && (await processCommand(host.pid)).outcome === "gone";
+			// A failed (nonzero) inspect invocation is never exit evidence, whatever its stdout says.
+			return (
+				host.ok &&
+				host.succeeded &&
+				host.exclusive &&
+				host.pid !== undefined &&
+				(await processCommand(host.pid)).outcome === "gone"
+			);
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
 			return false;
@@ -1103,7 +1110,7 @@ export class BrokerSessionPort implements SessionPort {
 	async #inspectHost(input: {
 		sessionId: string;
 	}): Promise<
-		| { ok: true; pid: number | undefined; live: boolean | undefined; exclusive: boolean }
+		| { ok: true; pid: number | undefined; live: boolean | undefined; exclusive: boolean; succeeded: boolean }
 		| { ok: false; code: string | undefined }
 	> {
 		const result = await this.#cli(["sdk", "session", "inspect", input.sessionId], { timeoutMs: 10_000 });
@@ -1123,6 +1130,7 @@ export class BrokerSessionPort implements SessionPort {
 			live: typeof session?.live === "boolean" ? session.live : undefined,
 			// The row names exactly this session and the broker flags no competing authority root.
 			exclusive: session?.sessionId === input.sessionId && session.ambiguous !== true,
+			succeeded: result.exitCode === 0,
 		};
 	}
 
