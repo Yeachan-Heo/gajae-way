@@ -463,6 +463,44 @@ for (const evidence of ["live-process", "unreadable-exit", "failed-exit-probe", 
 	});
 }
 
+for (const [label, operationRef] of [
+	["a mismatched", "other-op-ref"],
+	["a missing", ""],
+] as const) {
+	for (const reported of ["terminal_ok", "unknown"] as const) {
+		test(`a detached escalated hold whose fresh ${reported} report carries ${label} operation identity blocks restart drain on an exited host`, async () => {
+			const clock = new VirtualClock();
+			const f = await heldOrigin(`restart-drain-${operationRef || "missing"}-ref-${reported}`, {
+				heldForMs: 11 * MINUTE,
+				live: false,
+				newerMessage: false,
+				clock,
+			});
+			f.port.attachTail = async () => {
+				throw endpointStale();
+			};
+			try {
+				await f.manager.recover();
+				expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBeDefined();
+				f.port.setHostExited(f.binding.sessionId, true);
+				const status = f.port.status.bind(f.port);
+				f.port.status = async (input) => {
+					const result = await status(input);
+					if (input.opRef !== f.heldOpRef) return result;
+					return { ...result, operationRef, status: { status: reported } };
+				};
+				// A report about another (or no) operation is not evidence that the held one is inactive.
+				await expect(f.manager.drainForRestart(`${operationRef || "missing"}-ref-${reported}`, 20)).resolves.toBe(
+					"timed_out",
+				);
+				expect(f.db.inbox.turnRow(f.heldOpRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+			} finally {
+				await f.manager.stop();
+			}
+		});
+	}
+}
+
 test("a detached escalated hold whose status endpoint is stale drains on a dead host", async () => {
 	// The production shape: `gjc sdk session status` fails with endpoint_stale for good
 	// and the host is gone, so the hold can never settle and no producer is running.

@@ -1570,7 +1570,13 @@ class OriginActor {
 				const report = await this.#statusForRecovery(bound.sessionId, bound.turn.opRef);
 				if (this.#stopped || this.#manager.stopped) return true;
 				const port = this.#manager.port;
-				if (report.status.status !== "accepted" && report.status.status !== "in_flight" && port.hostExited) {
+				// A report for another (or no) operation says nothing about this one, as in recovery.
+				if (
+					report.operationRef === bound.turn.opRef &&
+					report.status.status !== "accepted" &&
+					report.status.status !== "in_flight" &&
+					port.hostExited
+				) {
 					blocked = (await port.hostExited({ sessionId: bound.sessionId, repo: this.#manager.repo })) !== true;
 					if (this.#stopped || this.#manager.stopped) return true;
 				}
