@@ -1091,7 +1091,7 @@ export class PersonaSessionManager {
 		for (;;) {
 			if (this.#stopped || this.#restartDrainId !== restartId) return "stopped";
 			const actors = [...this.#actors.values()];
-			const checks = Promise.all(actors.map((actor) => actor.enqueue(async () => actor.hasUnsettledTurns())));
+			const checks = Promise.all(actors.map((actor) => actor.enqueue(async () => await actor.hasUnsettledTurns())));
 			let timer: ReturnType<typeof setTimeout> | undefined;
 			const timedOut = Symbol("restart drain timed out");
 			let unsettled: (boolean | undefined)[] | typeof timedOut;
@@ -1311,6 +1311,8 @@ type BoundTurn = PersonaTurnIdentity & {
 	 * delivered and its terminal completes the turn like a current one.
 	 */
 	answerWanted: boolean;
+	/** Only blocked restart probes are shared across the drain loop's short polling interval. */
+	restartDrainVerdict?: { checkedAtMs: number; blocked: true };
 	/**
 	 * The relay that owned this turn is gone (died mid-turn, or the turn was
 	 * adopted after a restart): its content will never arrive on a stream, so
@@ -1546,8 +1548,39 @@ class OriginActor {
 		return this.#state;
 	}
 
-	hasUnsettledTurns(): boolean {
-		return this.#state !== "idle" || this.#current !== undefined || this.#retired.size > 0;
+	async hasUnsettledTurns(): Promise<boolean> {
+		if (this.#state !== "idle" || this.#current !== undefined) return true;
+		for (const bound of this.#retired.values()) {
+			// Only a detached escalated hold whose operation is not reported active and
+			// whose host process is proven exited by OS `ps` can be skipped: recovery
+			// readopts it from the durable marker and pending trigger, and no producer
+			// can be lost. Registry liveness alone is not process-exit evidence.
+			if (
+				bound.answerWanted !== true ||
+				bound.detached !== true ||
+				this.#manager.database.core.metaGet(escalatedHoldKey(bound.turn.opRef)) === undefined
+			) {
+				bound.restartDrainVerdict = undefined;
+				return true;
+			}
+			const verdict = bound.restartDrainVerdict;
+			if (verdict && this.#manager.now() - verdict.checkedAtMs < STATUS_RECHECK_MIN_MS) return true;
+			let blocked = true;
+			try {
+				const report = await this.#statusForRecovery(bound.sessionId, bound.turn.opRef);
+				if (this.#stopped || this.#manager.stopped) return true;
+				const port = this.#manager.port;
+				if (report.status.status !== "accepted" && report.status.status !== "in_flight" && port.hostExited) {
+					blocked = (await port.hostExited({ sessionId: bound.sessionId, repo: this.#manager.repo })) !== true;
+					if (this.#stopped || this.#manager.stopped) return true;
+				}
+			} catch {
+				// Unreadable host evidence keeps the producer fence.
+			}
+			bound.restartDrainVerdict = blocked ? { checkedAtMs: this.#manager.now(), blocked: true } : undefined;
+			if (blocked) return true;
+		}
+		return false;
 	}
 
 	enqueue<T>(work: () => Promise<T>): Promise<T | undefined> {

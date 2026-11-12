@@ -127,6 +127,17 @@ export interface SessionPort {
 	bind(input: SessionBindInput): Promise<SessionBinding>;
 	inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined>;
 	liveness?(input: { sessionId: string; repo: string }): Promise<SessionLiveness>;
+	/**
+	 * Read-only: true only when an ok broker inspect envelope names this session,
+	 * is not flagged `ambiguous` (competing unresolved authority roots), carries a
+	 * safe integer host pid > 1, and OS `ps` reports that pid gone. This proves the
+	 * exit of the broker's selected host row, not of every past incarnation.
+	 * False for failed inspect,
+	 * session absence without a pid, an ambiguous or mismatched row, a
+	 * missing/invalid pid, a live (even reused) pid, or unreadable `ps`. Never
+	 * signals a process. BrokerAuthorityError is rethrown.
+	 */
+	hostExited?(input: { sessionId: string; repo: string }): Promise<boolean>;
 	/** True when the session's prompt queue has no pending messages (queue.messages.list empty). */
 	queueEmpty?(input: { sessionId: string; repo: string; relay?: TailHandle }): Promise<boolean>;
 	/** Live execution/queued-turn state from context.get; undefined is not idle proof. */
@@ -1077,6 +1088,44 @@ export class BrokerSessionPort implements SessionPort {
 		return await this.#safe(async () => await inspectSession(this.#controller(input.repo), input.sessionId));
 	}
 
+	async hostExited(input: { sessionId: string; repo: string }): Promise<boolean> {
+		try {
+			this.#assertOwned(input);
+			const host = await this.#inspectHost(input);
+			// An ambiguous row is one of several hosts claiming the session; its pid speaks for no other.
+			return host.ok && host.exclusive && host.pid !== undefined && (await processCommand(host.pid)).outcome === "gone";
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			return false;
+		}
+	}
+
+	async #inspectHost(input: {
+		sessionId: string;
+	}): Promise<
+		| { ok: true; pid: number | undefined; live: boolean | undefined; exclusive: boolean }
+		| { ok: false; code: string | undefined }
+	> {
+		const result = await this.#cli(["sdk", "session", "inspect", input.sessionId], { timeoutMs: 10_000 });
+		const envelope = JSON.parse(result.stdout) as {
+			ok?: unknown;
+			result?: { session?: { sessionId?: unknown; pid?: unknown; live?: unknown; ambiguous?: unknown } };
+			error?: { code?: unknown; message?: unknown };
+		};
+		if (envelope.ok !== true) return { ok: false, code: stableErrorCode(envelope.error?.code) };
+		const session = envelope.result?.session;
+		return {
+			ok: true,
+			pid:
+				typeof session?.pid === "number" && Number.isSafeInteger(session.pid) && session.pid > 1
+					? session.pid
+					: undefined,
+			live: typeof session?.live === "boolean" ? session.live : undefined,
+			// The row names exactly this session and the broker flags no competing authority root.
+			exclusive: session?.sessionId === input.sessionId && session.ambiguous !== true,
+		};
+	}
+
 	/**
 	 * A retired session's host is this gateway's to end: the gateway created the
 	 * session, rebound away from it, and nothing else will ever prompt it again.
@@ -1109,26 +1158,15 @@ export class BrokerSessionPort implements SessionPort {
 		let pid: number | undefined;
 		let live: boolean | undefined;
 		try {
-			const result = await this.#cli(["sdk", "session", "inspect", input.sessionId], {
-				timeoutMs: 10_000,
-			});
-			const envelope = JSON.parse(result.stdout) as {
-				ok?: unknown;
-				result?: { session?: { pid?: unknown; live?: unknown } };
-				error?: { code?: unknown; message?: unknown };
-			};
-			if (envelope.ok !== true) {
-				const code = stableErrorCode(envelope.error?.code);
+			const host = await this.#inspectHost(input);
+			if (!host.ok) {
+				const code = host.code;
 				return isSessionGoneCode(code)
 					? { outcome: "refused", reason: "inspect_failed:session_gone_without_process_identity" }
 					: { outcome: "refused", reason: `inspect_failed:${code ?? "invalid_envelope"}` };
 			}
-			const session = envelope.result?.session;
-			pid =
-				typeof session?.pid === "number" && Number.isSafeInteger(session.pid) && session.pid > 1
-					? session.pid
-					: undefined;
-			live = typeof session?.live === "boolean" ? session.live : undefined;
+			pid = host.pid;
+			live = host.live;
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
 			return isSessionGoneCode(sdkErrorCode(error))
