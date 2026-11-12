@@ -35,7 +35,7 @@ import {
 	type BrokerOperationRecord,
 	isBrokerPromptBusyRefusal,
 } from "../store/groups/bindings";
-import { GjcCliUnavailableError, isBrokerUnavailable } from "./broker";
+import { GjcCliUnavailableError, GjcCommandQueueTimeoutError, isBrokerUnavailable } from "./broker";
 import {
 	type FailedTransportCause,
 	type FailedTurnEvidence,
@@ -236,6 +236,11 @@ export interface SessionCompactionResult {
 	readonly status: SessionCompactionStatus;
 	/** Stable SDK error code of a run that did not succeed, when gjc reported one. */
 	readonly code?: string;
+	/**
+	 * A `failed` run that may still be compacting on the host: gjc's request
+	 * timed out, its outcome is uncertain after send, or no gjc answer was read.
+	 */
+	readonly outcomeUnknown?: boolean;
 }
 
 /** Session context usage: percent of the model's context window and the token count it stands for. */
@@ -543,10 +548,12 @@ const CONTEXT_QUERY_TIMEOUT_MS = 5_000;
  * 2026-09-30); the default 30s command bound reported such runs as failed.
  */
 const COMPACTION_TIMEOUT_MS = 5 * 60_000;
-/** Process budget beyond the SDK request budget, so gjc's own timeout reply can still be read. */
-const COMPACTION_PROCESS_GRACE_MS = 30_000;
-/** Bound on waiting for a CLI slot before the compaction starts; a run that never starts is a plain failure. */
-const COMPACTION_QUEUE_TIMEOUT_MS = 60_000;
+/**
+ * Part of the end-to-end compaction budget left for gjc's own timeout reply:
+ * gjc's request budget is COMPACTION_TIMEOUT_MS minus this, inside a process
+ * bound (CLI slot wait included) of COMPACTION_TIMEOUT_MS.
+ */
+const COMPACTION_REPLY_GRACE_MS = 15_000;
 
 type SignaledHost = {
 	readonly pid: number;
@@ -1979,14 +1986,10 @@ export class BrokerSessionPort implements SessionPort {
 						// default session request budget (40 s) gives up while the host
 						// keeps compacting.
 						"--timeout-ms",
-						String(COMPACTION_TIMEOUT_MS),
+						String(COMPACTION_TIMEOUT_MS - COMPACTION_REPLY_GRACE_MS),
 					],
-					{
-						timeoutMs: COMPACTION_TIMEOUT_MS + COMPACTION_PROCESS_GRACE_MS,
-						// The slot wait has its own bound, so a busy CLI pool cannot eat
-						// into the compaction's request budget.
-						queueTimeoutMs: COMPACTION_QUEUE_TIMEOUT_MS,
-					},
+					// One end-to-end deadline: CLI slot wait and request share it.
+					{ timeoutMs: COMPACTION_TIMEOUT_MS },
 				),
 				"compaction.run",
 			);
@@ -2000,7 +2003,14 @@ export class BrokerSessionPort implements SessionPort {
 			const code = sdkErrorCode(error);
 			if (code === "unsupported_operation" || code === "not_supported" || code === "unknown_operation")
 				return { status: "unavailable", code };
-			return { status: "failed", ...(code ? { code } : {}) };
+			// A run that never got a CLI slot never reached gjc.
+			if (error instanceof GjcCommandQueueTimeoutError) return { status: "failed", code: "queue_timeout" };
+			// gjc's request timeout settles only the client: the host keeps compacting.
+			// So may a run whose process was cut off or never printed gjc's envelope.
+			// A structured gjc failure otherwise means gjc answered.
+			const outcomeUnknown =
+				code === "timeout" || code === "uncertain_after_send" || !(error instanceof GjcCliError && error.details);
+			return { status: "failed", ...(code ? { code } : {}), ...(outcomeUnknown ? { outcomeUnknown } : {}) };
 		}
 	}
 

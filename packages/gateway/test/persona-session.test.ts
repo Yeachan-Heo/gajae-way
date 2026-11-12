@@ -5471,8 +5471,10 @@ class ContextUsagePort extends ScriptedSessionPort {
 	readonly failing = new Set<string>();
 	autoComplete = true;
 	compactionStatus: SessionCompactionStatus = "succeeded";
-	/** Replaces the next compaction's reply once, e.g. with an unknown outcome. */
-	nextCompaction: SessionCompactionResult | undefined;
+	/** Replies for the next compactions, in order, e.g. an unknown outcome; then `compactionStatus`. */
+	readonly nextCompactions: SessionCompactionResult[] = [];
+	/** Outcomes for the next context reads, in order: a thrown read or an unreadable (undefined) usage. */
+	readonly nextUsageReads: Array<"throw" | "undefined" | "real"> = [];
 	/** How many sends had been made when each compaction ran. */
 	readonly compactedAfterSends: number[] = [];
 
@@ -5486,16 +5488,16 @@ class ContextUsagePort extends ScriptedSessionPort {
 	}
 
 	async contextUsage(): Promise<SessionContextUsage | undefined> {
+		const scripted = this.nextUsageReads.shift();
+		if (scripted === "throw") throw new Error("context read failed");
+		if (scripted === "undefined") return undefined;
 		return this.percent === undefined ? undefined : { percent: this.percent, tokens: this.percent * 10_000 };
 	}
 
 	override async runCompaction(): Promise<SessionCompactionResult> {
 		this.compactedAfterSends.push(this.sends.length);
-		const scripted = this.nextCompaction;
-		if (scripted) {
-			this.nextCompaction = undefined;
-			return scripted;
-		}
+		const scripted = this.nextCompactions.shift();
+		if (scripted) return scripted;
 		if (this.compactionStatus === "succeeded") this.percent = undefined;
 		return { status: this.compactionStatus };
 	}
@@ -5507,6 +5509,7 @@ async function preambleHarness(
 	port: ScriptedSessionPort,
 	lifecycle: { persona: () => string; bootstrap?: () => string | undefined },
 	log?: (line: string) => void,
+	timers?: Pick<ConstructorParameters<typeof PersonaSessionManager>[0], "setTimeout" | "clearTimeout">,
 ): Promise<void> {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-preamble-"));
 	database = await Store.open(join(home, "gateway.db"));
@@ -5517,6 +5520,7 @@ async function preambleHarness(
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
 		...(log ? { log } : {}),
+		...timers,
 		onTurnStart: ({ trigger }) => {
 			const bootstrap = lifecycle.bootstrap?.();
 			return {
@@ -5698,18 +5702,129 @@ test("a compaction that does not succeed still sends the turn on the same sessio
 	).toEqual(["status=failed", "status=unavailable"]);
 });
 
-test("a compaction that fails logs gjc's error code", async () => {
+test("a compaction that gjc answered with a failure logs its code and the turn is still sent", async () => {
 	const port = new ContextUsagePort();
 	const logs: string[] = [];
 	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line));
 	port.percent = COMPACTION_PERCENT + 5;
-	port.nextCompaction = { status: "failed", code: "timeout" };
-	await sendTurn(port, "after a timed-out compaction");
+	// gjc reports a finished compaction failure (e.g. nothing to compact) as operation_failed.
+	port.nextCompactions.push({ status: "failed", code: "operation_failed" });
+	await sendTurn(port, "after a failed compaction");
 	expect(
 		logs
 			.filter((line) => line.startsWith("persona_compaction "))
 			.map((line) => line.match(/status=\w+( code=\w+)?/)?.[0]),
-	).toEqual(["status=failed code=timeout"]);
+	).toEqual(["status=failed code=operation_failed"]);
+});
+
+/** Shortens the pre-send retry backoff (2 s, 4 s, ...) so held turns retry within a test. */
+const FAST_RETRY = {
+	setTimeout: (work: () => void, delayMs: number) => setTimeout(work, Math.min(delayMs, 20)),
+	clearTimeout: (timer: unknown) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+};
+
+async function heldByUnresolvedCompaction(
+	port: ContextUsagePort,
+	logs: string[],
+	body: string,
+	...replies: SessionCompactionResult[]
+): Promise<void> {
+	port.nextCompactions.push(...replies);
+	port.percent = COMPACTION_PERCENT + 5;
+	enqueue(`m-${body}`, body);
+	await manager!.notifyInbound(KEY);
+	await eventually(
+		() => logs.some((line) => line.startsWith("send_pre_send_requeue stage=prepare_context")),
+		"an unresolved compaction did not return the turn to pending",
+	);
+}
+
+for (const reply of [
+	{ status: "failed", code: "timeout", outcomeUnknown: true },
+	{ status: "failed", outcomeUnknown: true },
+] as const satisfies readonly SessionCompactionResult[]) {
+	test(`a compaction that may still be running (${reply.code ?? "no gjc answer"}) holds the send until its context lands below the line`, async () => {
+		const port = new ContextUsagePort();
+		const logs: string[] = [];
+		await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line));
+		port.percent = 5;
+		expect(await sendTurn(port, "first")).toBe(PERSONA);
+		// Stays held while the host is still compacting: no send, no steer.
+		await heldByUnresolvedCompaction(port, logs, "held", reply);
+		expect(port.sends.map((send) => send.text)).toEqual(["first"]);
+		expect(port.steers).toHaveLength(0);
+		expect(logs.some((line) => line.startsWith("persona_compaction ") && line.includes("outcome=unknown"))).toBe(true);
+
+		// The run lands; the retry reads the smaller context and sends once,
+		// with the persona again and without a second compaction.
+		port.percent = 3;
+		const retried = () => port.sends.length === 2 && manager!.state(KEY) === "idle";
+		for (let attempt = 0; attempt < 100 && !retried(); attempt++) await Bun.sleep(50);
+		expect(retried(), "held turn was not sent after its compaction landed").toBe(true);
+		expect(port.sends[1]).toMatchObject({ text: "held", systemPreamble: PERSONA });
+		expect(port.compactedAfterSends).toEqual([1]);
+		expect(logs.some((line) => line.startsWith("persona_compaction_resolved "))).toBe(true);
+	});
+}
+
+for (const read of ["throw", "undefined", "above"] as const) {
+	test(`an unresolved compaction with a ${read === "above" ? "context still above the line" : read === "throw" ? "failed context read" : "unreadable context"} sends only after a second compaction answers`, async () => {
+		let releaseBarrier!: () => void;
+		const barrier = new Promise<void>((resolve) => {
+			releaseBarrier = resolve;
+		});
+		class BarrierPort extends ContextUsagePort {
+			override async runCompaction(): Promise<SessionCompactionResult> {
+				const first = this.compactedAfterSends.length === 0;
+				const result = await super.runCompaction();
+				// gjc orders the second run behind the first; it answers once both are done.
+				if (!first) await barrier;
+				return result;
+			}
+		}
+		const port = new BarrierPort();
+		const logs: string[] = [];
+		await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
+		// The first read sees the large context; the retry's read is the case under test.
+		if (read !== "above") port.nextUsageReads.push("real", read);
+		await heldByUnresolvedCompaction(port, logs, "held", { status: "failed", code: "timeout", outcomeUnknown: true });
+		await eventually(() => port.compactedAfterSends.length === 2, "no second compaction was run");
+		// An unreadable or still-large context is not evidence the first run is over.
+		await Bun.sleep(30);
+		expect(port.sends).toHaveLength(0);
+		expect(port.steers).toHaveLength(0);
+
+		releaseBarrier();
+		await eventually(() => port.sends.length === 1 && manager!.state(KEY) === "idle", "held turn was not sent");
+		expect(port.sends[0]).toMatchObject({ text: "held", systemPreamble: PERSONA });
+		expect(port.compactedAfterSends).toEqual([0, 0]);
+		expect(logs.some((line) => line.startsWith("persona_compaction ") && line.includes("after=unresolved"))).toBe(true);
+	});
+}
+
+test("an unresolved compaction keeps holding while further runs go unanswered, and a gjc answer releases it", async () => {
+	const port = new ContextUsagePort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
+	// The second run is unanswered too; the third is answered with a failure, so the chain is clear.
+	await heldByUnresolvedCompaction(
+		port,
+		logs,
+		"held",
+		{ status: "failed", code: "timeout", outcomeUnknown: true },
+		{ status: "failed", code: "timeout", outcomeUnknown: true },
+		{ status: "failed", code: "operation_failed" },
+	);
+	await eventually(() => port.sends.length === 1 && manager!.state(KEY) === "idle", "held turn was not sent");
+	expect(port.sends[0]).toMatchObject({ text: "held" });
+	expect(port.compactedAfterSends).toEqual([0, 0, 0]);
+	// Each unanswered run held the turn; only the answered one let it through.
+	expect(logs.filter((line) => line.startsWith("send_pre_send_requeue stage=prepare_context"))).toHaveLength(2);
+	expect(
+		logs
+			.filter((line) => line.startsWith("persona_compaction "))
+			.map((line) => line.match(/code=\w+( outcome=\w+)?/)?.[0]),
+	).toEqual(["code=timeout outcome=unknown", "code=timeout outcome=unknown", "code=operation_failed"]);
 });
 
 test("messages arriving while the actor compacts wait for the compacted send instead of reaching the session", async () => {
