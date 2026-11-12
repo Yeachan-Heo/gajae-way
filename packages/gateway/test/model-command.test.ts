@@ -41,6 +41,8 @@ function store(initial?: GjcModelSelection) {
 }
 
 const CHANNEL = { platform: "discord" };
+const OWNER_ID = "owner-1";
+const OWNER_DM = { platform: "discord", kind: "dm", conversationId: "owner-dm", peerId: OWNER_ID } as const;
 
 describe("parseModelArgument", () => {
 	test("a bare name is a preset, a slashed name is an explicit selector", () => {
@@ -434,6 +436,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		logVerbosity: "info",
 		model: { preset: "base" },
 		serviceTier: "priority",
+		ownerTarget: { origin: OWNER_DM },
 	};
 	const database = await Store.open(config.dbPath);
 	const port = new ScriptedSessionPort();
@@ -450,7 +453,13 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		await Bun.sleep(5);
 		// Autocomplete source over the socket: no broker agent dir here, so only the
 		// configured selector is offered.
-		client.send({ v: "0.1", type: "request", id: "choices", verb: "session.modelChoices" });
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "choices",
+			verb: "session.modelChoices",
+			params: { authorId: OWNER_ID },
+		});
 		const choicesClient = client;
 		await waitFor(
 			() => choicesClient.frames.some((frame) => frame.id === "choices"),
@@ -553,8 +562,14 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 	}
 });
 
-/** Starts a gateway with the given provider listing and reads `session.modelChoices` once. */
-async function modelChoicesOverSocket(listProviderModels: () => Promise<readonly string[]>): Promise<unknown> {
+/** Starts a gateway owned by OWNER_ID and hands a negotiated client to `body`. */
+async function withModelGateway<T>(
+	body: (client: Awaited<ReturnType<typeof connect>>, database: Store) => Promise<T>,
+	options: {
+		readonly listProviderModels?: () => Promise<readonly string[]>;
+		readonly channels?: GatewayConfig["channels"];
+	} = {},
+): Promise<T> {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-model-choices-server-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -565,6 +580,8 @@ async function modelChoicesOverSocket(listProviderModels: () => Promise<readonly
 		dbPath: join(home, "gateway.db"),
 		logVerbosity: "info",
 		model: { preset: "base" },
+		ownerTarget: { origin: OWNER_DM },
+		...(options.channels ? { channels: options.channels } : {}),
 	};
 	const database = await Store.open(config.dbPath);
 	const port = new ScriptedSessionPort();
@@ -577,18 +594,12 @@ async function modelChoicesOverSocket(listProviderModels: () => Promise<readonly
 			database,
 			sessionPort: port,
 			onStop: () => database.close(),
-			listProviderModels,
+			...(options.listProviderModels ? { listProviderModels: options.listProviderModels } : {}),
 		});
 		client = await connect(config.socketPath);
 		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 		await Bun.sleep(5);
-		client.send({ v: "0.1", type: "request", id: "choices", verb: "session.modelChoices" });
-		const connected = client;
-		await waitFor(
-			() => connected.frames.some((frame) => frame.id === "choices"),
-			"session.modelChoices did not answer",
-		);
-		return connected.frames.find((frame) => frame.id === "choices");
+		return await body(client, database);
 	} finally {
 		client?.close();
 		try {
@@ -598,6 +609,34 @@ async function modelChoicesOverSocket(listProviderModels: () => Promise<readonly
 			await rm(home, { recursive: true, force: true });
 		}
 	}
+}
+
+/** Sends one request and waits for its response frame. */
+async function requestOverSocket(
+	client: Awaited<ReturnType<typeof connect>>,
+	id: string,
+	verb: string,
+	params?: unknown,
+): Promise<Record<string, unknown>> {
+	client.send({ v: "0.1", type: "request", id, verb, ...(params === undefined ? {} : { params }) });
+	await waitFor(
+		() => client.frames.some((frame) => frame.id === id && frame.type !== "event"),
+		`${verb} ${id} did not answer`,
+	);
+	return client.frames.find((frame) => frame.id === id && frame.type !== "event") as Record<string, unknown>;
+}
+
+/** Starts a gateway with the given provider listing and reads `session.modelChoices` once as `authorId`. */
+async function modelChoicesOverSocket(
+	listProviderModels: () => Promise<readonly string[]>,
+	/** `null` sends no params at all. */
+	authorId: string | null = OWNER_ID,
+): Promise<unknown> {
+	return await withModelGateway(
+		(client) =>
+			requestOverSocket(client, "choices", "session.modelChoices", authorId === null ? undefined : { authorId }),
+		{ listProviderModels },
+	);
 }
 
 test("session.modelChoices appends gjc-listed provider models to the named choices", async () => {
@@ -621,4 +660,78 @@ test("session.modelChoices keeps the named choices when the provider listing fai
 		console.error = previousError;
 	}
 	expect(errors).toContain("model_choices_provider_list_failed reason=gjc --list-models exited 1");
+});
+
+test("session.modelChoices lists nothing to anyone but the owner (#796)", async () => {
+	let listed = 0;
+	const listProviderModels = async () => {
+		listed++;
+		return ["xai/grok-4.7"];
+	};
+	expect(await modelChoicesOverSocket(listProviderModels, "member-1")).toMatchObject({
+		type: "response",
+		result: { choices: [] },
+	});
+	// An adapter that names nobody is not the owner either.
+	expect(await modelChoicesOverSocket(listProviderModels, null)).toMatchObject({
+		type: "response",
+		result: { choices: [] },
+	});
+	expect(listed).toBe(0);
+});
+
+test("/model in a public channel is owner-only: a member's set/clear/show change and reveal nothing (#796)", async () => {
+	const channels = { "discord:public": { engagement: "mention-open" as const } };
+	const origin = { platform: "discord", kind: "channel", conversationId: "public" };
+	const key = "discord/channel/public";
+	const as = (authorId: string) => ({ mentioned: true, group: true, authorId });
+	await withModelGateway(
+		async (client, database) => {
+			// The member is engagement-authorised here (mention-open), so only the
+			// owner gate stands between them and the override.
+			for (const [id, text] of [
+				["member-set", "/model set frontier-heavy"],
+				["member-show", "/model"],
+				["member-clear", "/model clear"],
+			] as const) {
+				expect(
+					await requestOverSocket(client, id, "chat.send", { origin, text, engagement: as("member-1") }),
+				).toMatchObject({ type: "response", result: { turnId: null, engaged: false } });
+			}
+			expect(database.bindings.modelGet(key)).toBeUndefined();
+
+			expect(
+				await requestOverSocket(client, "owner-set", "chat.send", {
+					origin,
+					text: "/model set frontier-heavy",
+					engagement: as(OWNER_ID),
+				}),
+			).toMatchObject({ type: "response", result: { engaged: true } });
+			expect(database.bindings.modelGet(key)?.selection).toEqual({ preset: "frontier-heavy" });
+
+			// A member's clear cannot undo the owner's choice either.
+			await requestOverSocket(client, "member-clear-after", "chat.send", {
+				origin,
+				text: "/model clear",
+				engagement: as("member-1"),
+			});
+			expect(database.bindings.modelGet(key)?.selection).toEqual({ preset: "frontier-heavy" });
+
+			expect(
+				await requestOverSocket(client, "owner-clear", "chat.send", {
+					origin,
+					text: "/model clear",
+					engagement: as(OWNER_ID),
+				}),
+			).toMatchObject({ type: "response", result: { engaged: true } });
+			expect(database.bindings.modelGet(key)).toBeUndefined();
+			// Only the owner's two commands produced a channel post.
+			const posts = client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
+			expect(posts.map((frame) => (frame.payload as { text: string }).text)).toEqual([
+				expect.stringContaining("model set to **preset frontier-heavy**"),
+				expect.stringContaining("cleared this conversation's override"),
+			]);
+		},
+		{ channels },
+	);
 });
