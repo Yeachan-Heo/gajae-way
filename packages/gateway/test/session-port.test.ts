@@ -2422,7 +2422,8 @@ test("runCompaction gives gjc's own request the compaction budget and reports a 
 	respond = async () => ({ exitCode: 1, stdout: "", stderr: "killed" });
 	expect(await port.runCompaction(target)).toEqual({ status: "failed", outcomeUnknown: true });
 
-	// gjc answered: a finished compaction failure (reported as operation_failed) is a plain failure.
+	// Other structured CLI failures stay plain failures with their code, but never `answered`:
+	// operation_failed covers both a finished compaction failure and a lost reply.
 	respond = async () => ({ exitCode: 1, stdout: commandError("operation_failed", "unknown"), stderr: "" });
 	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "operation_failed" });
 	// A run that never got a CLI slot never reached gjc.

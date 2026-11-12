@@ -2028,7 +2028,9 @@ export class BrokerSessionPort implements SessionPort {
 			if (error instanceof GjcCommandQueueTimeoutError) return { status: "failed", code: "queue_timeout" };
 			// gjc's request timeout settles only the client: the host keeps compacting.
 			// So may a run whose process was cut off or never printed gjc's envelope.
-			// A structured gjc failure otherwise means gjc answered.
+			// Other structured CLI failures keep their code but do not prove the host
+			// finished (the CLI also reports a lost reply as operation_failed); only the
+			// relay path reports `answered`.
 			const outcomeUnknown =
 				code === "timeout" || code === "uncertain_after_send" || !(error instanceof GjcCliError && error.details);
 			return { status: "failed", ...(code ? { code } : {}), ...(outcomeUnknown ? { outcomeUnknown } : {}) };
