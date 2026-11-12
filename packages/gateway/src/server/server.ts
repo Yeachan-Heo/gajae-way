@@ -2020,6 +2020,12 @@ async function handleRequest(
 			return;
 		}
 		case "session.modelChoices": {
+			// Preset names are the owner's private configuration: anyone else typing
+			// `/model set` gets no suggestions, the same owner gate as `/model` itself.
+			if (!ownerAuthored(runtime.config, request.params)) {
+				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { choices: [] } });
+				return;
+			}
 			const choices = await listModelChoices(
 				options.broker?.agentDir,
 				runtime.config.model,
@@ -2581,11 +2587,15 @@ async function sendChat(
 		typeof params.engagement?.replyTo?.messageId === "string" && params.engagement.replyTo.messageId
 			? params.engagement.replyTo.messageId
 			: undefined;
-	// `/model` is a privileged control path. Apply the same direct-message and
-	// group authorisation policy as ordinary engagement before inspecting or
-	// mutating the durable override.
+	// `/model` is an owner-only control path: it changes the cost and behaviour
+	// of the owner's persona and `show` reveals private preset names. Ordinary
+	// engagement authorisation applies first, then the author must be the
+	// configured owner. Loopback is the local operator socket itself.
 	if (userText === "/model" || userText.startsWith("/model ")) {
-		if (!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp)) {
+		if (
+			!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp) ||
+			(origin.platform !== "loopback" && !ownerAuthored(runtime.config, params.engagement))
+		) {
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
@@ -2631,12 +2641,9 @@ async function sendChat(
 		// Owner-only: restarts the gateway process. The supervisor (launchd
 		// KeepAlive / systemd Restart=always) brings it back; sessions are durable
 		// and resume through recovery, so the persona keeps its transcript.
-		const owner = ownerPeerIdOf(runtime.config);
-		const authorId = (params.engagement as { authorId?: string } | undefined)?.authorId;
 		if (
 			!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp) ||
-			owner === undefined ||
-			authorId !== owner
+			!ownerAuthored(runtime.config, params.engagement)
 		) {
 			connection.write({
 				v: PROFILE_VERSION,
@@ -4884,15 +4891,27 @@ function writeError(connection: Connection, error: unknown, id?: string): void {
 	connection.write({ v: PROFILE_VERSION, type: "error", ...(id ? { id } : {}), error: protocol.toPayload() });
 }
 
+function ownerPeerIdOf(config: GatewayConfig): string | undefined {
+	const owner = config.ownerTarget?.origin;
+	return owner && "peerId" in owner ? (owner as { peerId?: string }).peerId : undefined;
+}
+
+/**
+ * Whether `authorId` in an engagement or request params is the configured
+ * owner (`ownerTarget.origin.peerId`). No configured owner authorises nobody.
+ * Owner-only verbs (`/restart`, `/model`, `session.modelChoices`) require it.
+ */
+function ownerAuthored(config: GatewayConfig, carrier: unknown): boolean {
+	const owner = ownerPeerIdOf(config);
+	const authorId = (carrier as { authorId?: unknown } | undefined)?.authorId;
+	return owner !== undefined && authorId === owner;
+}
+
 /**
  * Command authorization is exactly ordinary engagement authorization: loopback,
  * DM policy, owner identity, allowlist, and group gates apply before `/new`,
  * `/reset`, or `/model` can mutate persistent session state.
  */
-function ownerPeerIdOf(config: GatewayConfig): string | undefined {
-	const owner = config.ownerTarget?.origin;
-	return owner && "peerId" in owner ? (owner as { peerId?: string }).peerId : undefined;
-}
 
 function commandAuthorised(
 	origin: Parameters<typeof decideEngagement>[0],

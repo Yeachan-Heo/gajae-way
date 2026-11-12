@@ -1486,14 +1486,17 @@ export const DISCORD_SLASH_COMMANDS = [
 export interface AutocompleteInteractionLike {
 	isAutocomplete?(): boolean;
 	readonly commandName?: string;
+	readonly user?: { readonly id: string };
 	readonly options: { getFocused(): string };
 	respond(choices: Array<{ name: string; value: string }>): Promise<unknown>;
 }
 
 /**
- * Answers `/model set` autocomplete from the gateway's catalog. Fails soft: an
- * unreachable gateway or unreadable catalog yields an empty list, which Discord
- * shows as "no options" while still accepting a typed choice.
+ * Answers `/model set` autocomplete from the gateway's catalog. The gateway
+ * lists choices only to the configured owner (preset names are private), so
+ * the invoking user is passed along and anyone else sees no suggestions. Fails
+ * soft: an unreachable gateway or unreadable catalog yields an empty list,
+ * which Discord shows as "no options" while still accepting a typed choice.
  */
 export async function handleModelAutocomplete(
 	interaction: AutocompleteInteractionLike,
@@ -1503,7 +1506,7 @@ export async function handleModelAutocomplete(
 	if (!interaction.isAutocomplete?.() || interaction.commandName !== "model") return;
 	let choices: readonly string[] = [];
 	try {
-		choices = await gateway.modelChoices();
+		if (interaction.user) choices = await gateway.modelChoices(interaction.user.id);
 	} catch (error) {
 		log.error(`Discord /model autocomplete failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
@@ -1547,6 +1550,8 @@ export interface SlashInteractionLike {
 	} | null;
 	readonly channel?: DiscordMessageOriginShape["channel"] | null;
 	reply(options: { content: string; ephemeral?: boolean }): Promise<unknown>;
+	deferReply(options: { flags: number }): Promise<unknown>;
+	editReply(options: { content: string }): Promise<unknown>;
 }
 
 /** Same precedence as messages, for a slash command's invoking user. */
@@ -1565,6 +1570,10 @@ export async function handleSlashCommand(
 	const command = interaction.commandName;
 	if (command !== "new" && command !== "reset" && command !== "model") return;
 	if (!interaction.channel || !interaction.user) return;
+	// Discord fails an interaction not acknowledged within 3s ("application did
+	// not respond") even when the command still applies, so the reply is
+	// deferred before the gateway round trip and edited with the outcome.
+	let deferred = false;
 	try {
 		let text = `/${command}`;
 		if (command === "model") {
@@ -1580,6 +1589,8 @@ export async function handleSlashCommand(
 				text = `/model set ${choice}`;
 			} else if (subcommand === "clear") text = "/model clear";
 		}
+		await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+		deferred = true;
 		const origin = discordMessageOrigin({ author: { id: interaction.user.id }, channel: interaction.channel });
 		const interactionServerTag = resolveServerTag(interaction.user);
 		const result = await gateway.requestInbound(`slash-${interaction.id}`, origin, text, {
@@ -1592,16 +1603,23 @@ export async function handleSlashCommand(
 			...(interaction.user.username ? { authorHandle: interaction.user.username } : {}),
 			...(interactionServerTag ? { authorServerTag: interactionServerTag } : {}),
 		});
-		// Honest ack: the gateway allowlist may decline the command (non-owner in a
-		// group surface) — never claim a reset that did not happen. `/model` never
-		// resets the session; the gateway posts the resulting selection itself.
-		await interaction.reply(
-			result?.engaged
-				? { content: command === "model" ? "🦞 model command accepted" : "🦞 session reset", ephemeral: true }
-				: { content: "not authorized for session commands here", ephemeral: true },
-		);
+		// Honest ack: the gateway declines a command its authorization refuses
+		// (non-owner `/model`, non-allowlisted group author) — never claim a change
+		// that did not happen. `/model` never resets the session; the gateway posts
+		// the resulting selection itself.
+		await interaction.editReply({
+			content: result?.engaged
+				? command === "model"
+					? "🦞 model command accepted"
+					: "🦞 session reset"
+				: command === "model"
+					? "not authorized: /model is owner-only"
+					: "not authorized for session commands here",
+		});
 	} catch (error) {
 		log.error(`Discord slash command failed: ${error instanceof Error ? error.message : String(error)}`);
+		// A deferred interaction otherwise stays on "thinking…" forever.
+		if (deferred) await interaction.editReply({ content: `/${command} failed; try again` }).catch(() => undefined);
 	}
 }
 
@@ -2258,11 +2276,11 @@ export class ReconnectingGateway {
 		});
 	}
 
-	/** `/model set` autocomplete source; throws when the gateway link is down. */
-	async modelChoices(): Promise<readonly string[]> {
+	/** `/model set` autocomplete source for `authorId` (empty unless the owner); throws when the gateway link is down. */
+	async modelChoices(authorId: string): Promise<readonly string[]> {
 		const client = this.#client;
 		if (!client) throw new Error("gateway link not connected");
-		const result = await client.request<SessionModelChoicesResult>("session.modelChoices");
+		const result = await client.request<SessionModelChoicesResult>("session.modelChoices", { authorId });
 		return result.choices;
 	}
 
