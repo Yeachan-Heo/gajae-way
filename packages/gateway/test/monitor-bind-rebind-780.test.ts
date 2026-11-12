@@ -10,7 +10,8 @@ import { MonitorRegistry } from "../src/monitors/registry";
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
 import type { SessionPort } from "../src/orchestrator/session-port";
 import { Store } from "../src/store";
-import { sessionPortFromScript } from "./session-port.fake";
+import { MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS } from "../src/store/groups/monitors";
+import { attachTestBrokerOwnership, initializeTestBrokerAuthority, sessionPortFromScript } from "./session-port.fake";
 
 test("repeated bind timeouts on one origin across consecutive events trigger rebind (issue #780)", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-bind-rebind-"));
@@ -26,11 +27,14 @@ test("repeated bind timeouts on one origin across consecutive events trigger reb
 
 		let bindAttempts = 0;
 		let maxEpochReached = 0;
+		const attemptedEpochs: number[] = [];
 		let requestAttempts = 0;
+		const delivered: ChatMessagePayload[] = [];
 
 		const sessionPort: Partial<SessionPort> = {
 			bind: async (input) => {
 				bindAttempts++;
+				attemptedEpochs.push(input.epoch);
 				console.log(`bind attempt ${bindAttempts} for epoch ${input.epoch}`);
 
 				// Fail with timeout for epoch 0, succeed for others
@@ -39,8 +43,12 @@ test("repeated bind timeouts on one origin across consecutive events trigger reb
 				}
 
 				maxEpochReached = Math.max(maxEpochReached, input.epoch);
+				const sessionId = `session-epoch-${input.epoch}`;
+				database.transaction((tx) => {
+					expect(database.bindings.bindAtEpoch(tx, input.originKey, sessionId, input.epoch)).toBe(true);
+				});
 				return {
-					sessionId: `session-epoch-${input.epoch}`,
+					sessionId,
 					originKey: input.originKey,
 					epoch: input.epoch,
 					repo: input.repo,
@@ -54,7 +62,12 @@ test("repeated bind timeouts on one origin across consecutive events trigger reb
 				return {
 					receipt: { sessionId: input.sessionId, operationRef: input.opRef },
 					assistant: {
-						text: JSON.stringify([{ eventId: eventIdMatch ? eventIdMatch[1] : "unknown", note: "[delivered]" }]),
+						text: JSON.stringify([
+							{
+								eventId: eventIdMatch ? eventIdMatch[1] : "unknown",
+								note: "Rebound session delivered the monitor result.",
+							},
+						]),
 					},
 				} as never;
 			},
@@ -71,6 +84,8 @@ test("repeated bind timeouts on one origin across consecutive events trigger reb
 			repo: join(home, "workspace"),
 			model: undefined,
 			serviceTier: undefined,
+			ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "test-owner" } },
+			deliver: (payload) => delivered.push(payload),
 		});
 
 		// Submit multiple events - the first three trigger bind timeouts, the fourth succeeds on rebind
@@ -82,18 +97,29 @@ test("repeated bind timeouts on one origin across consecutive events trigger reb
 			// Wait for dispatch attempt
 			for (let j = 0; j < 200; j++) {
 				const row = database.monitors.eventRows().find((r) => r.event_id === eventId);
-				if (row?.stage === "failed" || row?.stage === "delivered" || row?.stage === "authored_no_delivery") break;
+				if (
+					row?.stage === "failed" ||
+					row?.stage === "delivered" ||
+					row?.stage === "authored" ||
+					row?.stage === "authored_no_delivery"
+				)
+					break;
 				await Bun.sleep(10);
 			}
 		}
 
 		// After 3 consecutive bind timeouts, we should have attempted to rebind to exactly epoch 1 (one rotation)
-		expect(bindAttempts).toBeGreaterThanOrEqual(4); // 3 attempts on epoch 0 + at least 1 attempt on epoch 1
+		expect(bindAttempts).toBe(5);
 		expect(maxEpochReached).toBe(1); // Should have rebound to exactly epoch 1 (one rotation)
+		expect(attemptedEpochs).toEqual([0, 0, 0, 1, 1]);
 
 		// Issue #780 P2 #2: Verify the fourth event (after rebind) succeeds
-		const fourthEventRow = database.monitors.eventRows().find((r) => r.event_id === eventIds[3]);
-		expect(fourthEventRow?.stage).toMatch(/delivered|authored_no_delivery/);
+		const fourthEventId = eventIds[3];
+		if (!fourthEventId) throw new Error("fourth rebind event was not submitted");
+		const fourthEventRow = database.monitors.eventRows().find((r) => r.event_id === fourthEventId);
+		expect(fourthEventRow?.stage).toMatch(/delivered|authored/);
+		expect(database.monitors.authoredOutput(fourthEventId)).toBe("Rebound session delivered the monitor result.");
+		expect(delivered.some((payload) => payload.text.includes("Rebound session delivered"))).toBe(true);
 
 		// Verify the safety state shows the rebind was triggered
 		const originKey = `monitor/eventtype/test.consecutive_timeout/parent=${monitor.monitorId}`;
@@ -103,14 +129,106 @@ test("repeated bind timeouts on one origin across consecutive events trigger reb
 
 		// Issue #780 P2 #2: Verify that the session binding persisted at epoch E+1
 		const sessionRecord = database.bindings.getSessionRecord(originKey);
-		if (sessionRecord?.sessionId) {
-			expect(sessionRecord.epoch).toBeGreaterThanOrEqual(1); // Should be on epoch 1 or higher
-			expect(sessionRecord.sessionId).toMatch(/session-epoch-[0-9]+/); // Should have a session from rebind
-		}
+		expect(sessionRecord).toEqual({ epoch: 1, sessionId: "session-epoch-1" });
 
 		// Verify successful authoring occurred after rebind
 		expect(requestAttempts).toBeGreaterThanOrEqual(1); // At least one successful authoring request
 
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("a stale pending session.create no longer blocks same-process rebind after repeated bind timeouts (#780)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-stale-create-rebind-"));
+	try {
+		const database = await Store.open(join(home, "gateway.db"));
+		const agentDir = join(home, "agent");
+		const authority = initializeTestBrokerAuthority(database, agentDir);
+		const registry = new MonitorRegistry(database);
+		const attemptedEpochs: number[] = [];
+		let requestAttempts = 0;
+		const fakeSessionPort: Partial<SessionPort> = {
+			bind: async (input) => {
+				attemptedEpochs.push(input.epoch);
+				if (input.epoch === 0) throw new GjcCliUnavailableError("broker_unavailable: bind timed out");
+				return {
+					sessionId: `session-epoch-${input.epoch}`,
+					originKey: input.originKey,
+					epoch: input.epoch,
+					repo: input.repo,
+					startupModelApplied: false,
+				};
+			},
+			hasPendingSessionCreate: ({ originKey, epoch }) =>
+				database.bindings.brokerOperation(authority, "session.create", JSON.stringify([originKey, epoch]))?.state ===
+				"pending",
+			request: async (input) => {
+				requestAttempts++;
+				const eventId = input.text.match(/"eventId":"([^"]+)"/)?.[1];
+				return {
+					receipt: { sessionId: input.sessionId, operationRef: input.opRef },
+					assistant: { text: JSON.stringify([{ eventId, note: "Fresh epoch is authoring again." }]) },
+				} as never;
+			},
+			resume: async (input) => ({
+				sessionId: input.sessionId,
+				originKey: input.originKey,
+				epoch: input.epoch,
+				repo: input.repo,
+			}),
+			runExclusive: async (_, fn) => fn(),
+		};
+		const sessionPort = attachTestBrokerOwnership(database, fakeSessionPort as unknown as SessionPort, agentDir);
+		const monitor = registry.add({
+			name: "stale-create-rebind-test",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.stale_create_rebind"],
+			burstPolicy: "serialize",
+		});
+		const originKey = `monitor/eventtype/test.stale_create_rebind/parent=${monitor.monitorId}`;
+		const staleCreateScope = JSON.stringify([originKey, 0]);
+		database.transaction((tx) => {
+			database.bindings.beginBrokerOperation(tx, authority, {
+				operation: "session.create",
+				scope: staleCreateScope,
+				operationRef: "gw-bind-stale-create",
+				requestJson: JSON.stringify({ cwd: join(home, "workspace") }),
+			});
+		});
+
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			repo: join(home, "workspace"),
+			model: undefined,
+			serviceTier: undefined,
+		});
+
+		const eventIds: string[] = [];
+		for (let i = 0; i < 3; i++) {
+			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.stale_create_rebind", {});
+			eventIds.push(eventId);
+			for (let attempt = 0; attempt < 200; attempt++) {
+				const stage = database.monitors.eventGet(eventId)?.stage;
+				if (stage === "failed" || stage === "authored_no_delivery" || stage === "authored") break;
+				await Bun.sleep(10);
+			}
+		}
+
+		expect(attemptedEpochs).toEqual([0, 0, 0, 1]);
+		expect(database.bindings.getSessionRecord(originKey)).toEqual({ epoch: 1, sessionId: "session-epoch-1" });
+		expect(database.bindings.brokerOperation(authority, "session.create", staleCreateScope)?.state).toBe("pending");
+		const recoveredEventId = eventIds[2];
+		if (!recoveredEventId) throw new Error("recovery event was not submitted");
+		expect(database.monitors.eventGet(recoveredEventId)?.stage).toMatch(/authored|delivered/);
+		expect(database.monitors.authoredOutput(recoveredEventId)).toBeDefined();
+		expect(requestAttempts).toBe(1);
 		database.close();
 	} finally {
 		await rm(home, { recursive: true, force: true });
@@ -191,7 +309,7 @@ test("a single transient bind timeout does not trigger rotation or escalation (i
 	}
 });
 
-test("continued failure after rotation eventually emits exactly ONE operator escalation (issue #780)", async () => {
+test("three bind timeouts trigger exactly one epoch rotation without retryable-stage escalation (issue #780)", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-escalation-"));
 	try {
 		const database = await Store.open(join(home, "gateway.db"));
@@ -203,11 +321,12 @@ test("continued failure after rotation eventually emits exactly ONE operator esc
 			burstPolicy: "serialize",
 		});
 
-		// Fail all binds consistently on all epochs to trigger multiple bind-timeout rebinds
+		const attemptedEpochs: number[] = [];
+		// Keep timing out after the rebind so the fixture exercises the timeout predicate on both epochs.
 		const sessionPort: Partial<SessionPort> = {
-			bind: async (_input) => {
-				// Fail all binds with a timeout error (matching the bind-timeout predicate)
-				throw new GjcCliUnavailableError("timeout after 40s");
+			bind: async (input) => {
+				attemptedEpochs.push(input.epoch);
+				throw new GjcCliUnavailableError("broker_unavailable: bind timed out after 40s");
 			},
 			runExclusive: async (_, fn) => fn(),
 		};
@@ -233,9 +352,9 @@ test("continued failure after rotation eventually emits exactly ONE operator esc
 
 		const originKey = `monitor/eventtype/test.escalation/parent=${monitor.monitorId}`;
 
-		// Submit multiple events - they will fail with bind timeouts and not escalate
-		// because bind timeouts don't produce terminal failures (events stay in 'failed')
-		for (let i = 0; i < 5; i++) {
+		// Three retryable failures on epoch 0 trigger one rotation; the immediate
+		// retry on epoch 1 also times out but must not rotate again yet.
+		for (let i = 0; i < 3; i++) {
 			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.escalation", {});
 
 			// Wait for dispatch attempt
@@ -246,6 +365,8 @@ test("continued failure after rotation eventually emits exactly ONE operator esc
 			}
 		}
 
+		expect(attemptedEpochs).toEqual([0, 0, 0, 1]);
+		expect(database.bindings.getSessionRecord(originKey)?.epoch).toBe(1);
 		const safetyState = pipeline.sessionSafetyState(originKey);
 
 		// Observable behavior: multiple bind timeouts should trigger epoch rotation via rebind logic
@@ -269,9 +390,12 @@ test("a successful dispatch after failures clears the failure streak (issue #780
 			name: "success-clear-test",
 			trigger: { kind: "cron", schedule: "* * * * *" },
 			eventTypes: ["test.success_clear"],
+			instruction: "Inspect each event and report new evidence.",
 			burstPolicy: "serialize",
 		});
 
+		const instruction = "Inspect each event and report new evidence.";
+		const escalationMessages: ChatMessagePayload[] = [];
 		let requestCount = 0;
 		const sessionPort: Partial<SessionPort> = {
 			bind: async (input) => {
@@ -283,22 +407,14 @@ test("a successful dispatch after failures clears the failure streak (issue #780
 					startupModelApplied: false,
 				};
 			},
-			// Issue #780 P3: mock authoring to return success for at least one event
 			request: async (input) => {
 				requestCount++;
-				// Third dispatch should succeed (after 2 failures) to test streak clearing
-				if (requestCount === 3) {
-					return {
-						receipt: { sessionId: input.sessionId, operationRef: input.opRef },
-						assistant: {
-							text: JSON.stringify([
-								{ eventId: input.text.match(/"eventId":"([^"]+)"/)?.[1] ?? "unknown", note: "[author note: success]" },
-							]),
-						},
-					} as never;
-				}
-				// First two should fail for streak
-				throw new Error("authoring failed (simulated failure)");
+				const eventId = input.text.match(/"eventId":"([^"]+)"/)?.[1];
+				const note = requestCount === 4 ? "[SILENT]" : instruction;
+				return {
+					receipt: { sessionId: input.sessionId, operationRef: input.opRef },
+					assistant: { text: JSON.stringify([{ eventId, note }]) },
+				} as never;
 			},
 			runExclusive: async (_, fn) => fn(),
 		};
@@ -311,6 +427,10 @@ test("a successful dispatch after failures clears the failure streak (issue #780
 			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
 			delivery: new DeliveryService(database),
 			emit: () => {},
+			deliver: (payload) => {
+				if (payload.text.includes("[monitor escalation]")) escalationMessages.push(payload);
+			},
+			ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "test-owner" } },
 			repo,
 			model: undefined,
 			serviceTier: undefined,
@@ -318,44 +438,30 @@ test("a successful dispatch after failures clears the failure streak (issue #780
 
 		const originKey = `monitor/eventtype/test.success_clear/parent=${monitor.monitorId}`;
 
-		// Submit events: first two will fail (creating a streak), third succeeds to test streak clearing
-		const eventIds: string[] = [];
-		for (let i = 0; i < 3; i++) {
+		const escalationKey = `monitor_escalation:${originKey}:${monitor.monitorId}`;
+		const dispatchUntil = async (stage: string) => {
 			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.success_clear", {});
-			eventIds.push(eventId);
-
-			// Wait for dispatch to complete
-			for (let j = 0; j < 200; j++) {
-				const row = database.monitors.eventRows().find((r) => r.event_id === eventId);
-				if (
-					row?.stage === "failed" ||
-					row?.stage === "failed_no_retry" ||
-					row?.stage === "delivered" ||
-					row?.stage === "authored_no_delivery"
-				) {
-					break;
-				}
+			for (let attempt = 0; attempt < 200; attempt++) {
+				if (database.monitors.eventGet(eventId)?.stage === stage) break;
 				await Bun.sleep(10);
 			}
-		}
+			expect(database.monitors.eventGet(eventId)?.stage).toBe(stage);
+			return eventId;
+		};
 
-		// After three events (2 failed + 1 successful), check that streak is cleared
-		const rows = database.monitors.eventRows();
-		const successRow = rows.find((r) => r.event_id === eventIds[2]);
-		const failureRows = rows.filter(
-			(r) =>
-				(r.event_id === eventIds[0] || r.event_id === eventIds[1]) &&
-				(r.stage === "failed" || r.stage === "failed_no_retry"),
-		);
+		for (let i = 0; i < 3; i++) await dispatchUntil("contract_unmet");
+		expect(escalationMessages).toHaveLength(1);
+		expect(database.core.metaGet(escalationKey)).toBeDefined();
+		expect(pipeline.sessionSafetyState(originKey).escalatedForCurrentStreak).toBe(true);
 
-		// Verify streak was created
-		expect(failureRows.length).toBe(2);
-		// Verify successful dispatch happened
-		expect(successRow?.stage).toMatch(/delivered|authored/);
+		await dispatchUntil("authored_no_delivery");
+		expect(database.core.metaGet(escalationKey)).toBeUndefined();
+		expect(pipeline.sessionSafetyState(originKey).escalatedForCurrentStreak).toBe(false);
 
-		// Verify that successful dispatch cleared the escalation flag
-		const safetyState = pipeline.sessionSafetyState(originKey);
-		expect(safetyState.escalatedForCurrentStreak).toBe(false);
+		for (let i = 0; i < 3; i++) await dispatchUntil("contract_unmet");
+		expect(escalationMessages).toHaveLength(2);
+		expect(database.core.metaGet(escalationKey)).toBeDefined();
+		expect(requestCount).toBe(7);
 
 		database.close();
 	} finally {
@@ -453,6 +559,7 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 					name: "restart-escalation-test",
 					trigger: { kind: "cron", schedule: "* * * * *" },
 					eventTypes: ["test.restart_escalation"],
+					instruction: "Inspect the event and report new evidence.",
 					burstPolicy: "serialize",
 				});
 			}
@@ -481,6 +588,13 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 					repo: input.repo,
 					startupModelApplied: false,
 				}),
+				request: async (input) => {
+					const eventId = input.text.match(/"eventId":"([^"]+)"/)?.[1];
+					return {
+						receipt: { sessionId: input.sessionId, operationRef: input.opRef },
+						assistant: { text: JSON.stringify([{ eventId, note: "Inspect the event and report new evidence." }]) },
+					} as never;
+				},
 				runExclusive: async (_, fn) => fn(),
 			};
 
@@ -507,9 +621,11 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 			// Submit a new event that will trigger the failure check and escalation
 			if (!persistedMonitorId) throw new Error("monitor ID not set after first boot");
 			const triggerEventId = await pipeline.submitAwaitable(persistedMonitorId, "test.restart_escalation", {});
-			database.transaction((tx) => database.monitors.eventUpdate(tx, triggerEventId, "failed_no_retry"));
-
-			await Bun.sleep(100);
+			for (let attempt = 0; attempt < 200; attempt++) {
+				if (database.monitors.eventGet(triggerEventId)?.stage === "contract_unmet") break;
+				await Bun.sleep(10);
+			}
+			expect(database.monitors.eventGet(triggerEventId)?.stage).toBe("contract_unmet");
 
 			firstBootEscalations = deliveredMessages.length;
 			console.error(`First boot escalations: ${firstBootEscalations}`);
@@ -534,6 +650,13 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 					repo: input.repo,
 					startupModelApplied: false,
 				}),
+				request: async (input) => {
+					const eventId = input.text.match(/"eventId":"([^"]+)"/)?.[1];
+					return {
+						receipt: { sessionId: input.sessionId, operationRef: input.opRef },
+						assistant: { text: JSON.stringify([{ eventId, note: "Inspect the event and report new evidence." }]) },
+					} as never;
+				},
 				runExclusive: async (_, fn) => fn(),
 			};
 
@@ -560,9 +683,11 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 			// Submit another event after restart - should NOT trigger a second escalation
 			if (!persistedMonitorId) throw new Error("monitor ID not available for second check");
 			const triggerEventId = await pipeline.submitAwaitable(persistedMonitorId, "test.restart_escalation", {});
-			database.transaction((tx) => database.monitors.eventUpdate(tx, triggerEventId, "failed_no_retry"));
-
-			await Bun.sleep(100);
+			for (let attempt = 0; attempt < 200; attempt++) {
+				if (database.monitors.eventGet(triggerEventId)?.stage === "contract_unmet") break;
+				await Bun.sleep(10);
+			}
+			expect(database.monitors.eventGet(triggerEventId)?.stage).toBe("contract_unmet");
 
 			secondBootEscalations = deliveredMessages.length;
 			console.error(`Second boot escalations: ${secondBootEscalations}`);
@@ -663,87 +788,6 @@ test("a successful dispatch after a failure streak records zero readiness failur
 	}
 });
 
-test("escalation marker is persisted durably and cleared on success, then escalates again on next streak (issue #780, P2 #3)", async () => {
-	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-escalation-marker-"));
-	try {
-		const database = await Store.open(join(home, "gateway.db"));
-		const registry = new MonitorRegistry(database);
-		const monitor = registry.add({
-			name: "escalation-marker-test",
-			trigger: { kind: "cron", schedule: "* * * * *" },
-			eventTypes: ["test.escalation_marker"],
-			burstPolicy: "serialize",
-		});
-
-		// With P2 #1 fix, only TERMINAL failures escalate, not retryable ones.
-		// This test uses authoring errors (retryable 'failed'), which no longer escalate.
-		// Terminal escalation via contract_unmet is tested elsewhere (monitor-codex-780-fixes.test.ts).
-		const escalationMessages: ChatMessagePayload[] = [];
-
-		const sessionPort: Partial<SessionPort> = {
-			bind: async (input) => {
-				return {
-					sessionId: `session-epoch-${input.epoch}`,
-					originKey: input.originKey,
-					epoch: input.epoch,
-					repo: input.repo,
-					startupModelApplied: false,
-				};
-			},
-			request: async (_input) => {
-				// All requests fail (retryable failures) - with P2 #1 fix, these don't escalate
-				throw new Error("authoring failed (simulated)");
-			},
-			runExclusive: async (_, fn) => fn(),
-		};
-
-		const repo = join(home, "workspace");
-		const pipeline = new MonitorPropagator({
-			database,
-			registry,
-			sessionPort: sessionPort as SessionPort,
-			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
-			delivery: new DeliveryService(database),
-			emit: () => {},
-			deliver: (payload) => {
-				if (payload.text.includes("[monitor escalation]")) {
-					escalationMessages.push(payload);
-				}
-			},
-			ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "test-owner" } },
-			repo,
-			model: undefined,
-			serviceTier: undefined,
-		});
-
-		const originKey = `monitor/eventtype/test.escalation_marker/parent=${monitor.monitorId}`;
-
-		// Submit first 3 events that fail with authoring errors (retryable 'failed' stages)
-		// With P2 #1 fix, these do NOT trigger escalation
-		for (let i = 0; i < 3; i++) {
-			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.escalation_marker", {});
-
-			// Wait for dispatch to complete
-			for (let j = 0; j < 200; j++) {
-				const row = database.monitors.eventRows().find((r) => r.event_id === eventId);
-				if (row?.stage === "failed") {
-					break;
-				}
-				await Bun.sleep(10);
-			}
-		}
-
-		// Verify no escalation occurs for retryable failures
-		const safetyState = pipeline.sessionSafetyState(originKey);
-		expect(safetyState.escalatedForCurrentStreak).toBe(false);
-		expect(escalationMessages.length).toBe(0); // No escalation for retryable failures
-
-		database.close();
-	} finally {
-		await rm(home, { recursive: true, force: true });
-	}
-});
-
 test("three retryable 'failed' events do not trigger escalation (issue #780, P2 #1 - failure-escalation streak fix)", async () => {
 	// Regression test: verify that retryable 'failed' stages are excluded from
 	// the escalation streak counter. Only terminal failures ('failed_no_retry' and
@@ -760,10 +804,13 @@ test("three retryable 'failed' events do not trigger escalation (issue #780, P2 
 			name: "retryable-failures-test",
 			trigger: { kind: "cron", schedule: "* * * * *" },
 			eventTypes: ["test.retryable_failures"],
+			instruction: "Inspect each event and report new evidence.",
 			burstPolicy: "serialize",
 		});
 
 		const escalationMessages: ChatMessagePayload[] = [];
+		const instruction = "Inspect each event and report new evidence.";
+		let requestAttempts = 0;
 
 		const sessionPort: Partial<SessionPort> = {
 			bind: async (input) => ({
@@ -773,6 +820,16 @@ test("three retryable 'failed' events do not trigger escalation (issue #780, P2 
 				repo: input.repo,
 				startupModelApplied: false,
 			}),
+			request: async (input) => {
+				requestAttempts++;
+				if (requestAttempts <= 3) throw new Error("retryable authoring failure");
+				const eventId = input.text.match(/"eventId":"([^"]+)"/)?.[1];
+				const note = requestAttempts === 4 ? "[SILENT]" : instruction;
+				return {
+					receipt: { sessionId: input.sessionId, operationRef: input.opRef },
+					assistant: { text: JSON.stringify([{ eventId, note }]) },
+				} as never;
+			},
 			runExclusive: async (_, fn) => fn(),
 		};
 
@@ -794,90 +851,63 @@ test("three retryable 'failed' events do not trigger escalation (issue #780, P2 
 			serviceTier: undefined,
 		});
 
-		// Test 1: Verify that 3 retryable-only 'failed' events do NOT escalate
-		{
-			const retryableIds: string[] = [];
-			for (let i = 0; i < 3; i++) {
-				const eventId = randomUUID();
-				retryableIds.push(eventId);
-				// Create event directly in database with 'failed' (retryable) stage
-				database.transaction((tx) => {
-					database.monitors.eventCreate(tx, {
-						eventId,
-						monitorId: monitor.monitorId,
-						eventType: "test.retryable_failures",
-						payloadJson: JSON.stringify({}),
-						firedAt: new Date(Date.now() - 1000 * i).toISOString(),
-					});
-					database.monitors.eventUpdate(tx, eventId, "failed");
-				});
-			}
-
-			// Interleave a newer 'failed' event (to confirm they're not breaking the scan)
-			const newerFailedId = randomUUID();
+		// Seed a terminal streak without invoking its hook. A retryable dispatch
+		// must not cause an alert just because that threshold is already present.
+		for (let i = 0; i < 3; i++) {
+			const eventId = randomUUID();
 			database.transaction((tx) => {
 				database.monitors.eventCreate(tx, {
-					eventId: newerFailedId,
+					eventId,
 					monitorId: monitor.monitorId,
 					eventType: "test.retryable_failures",
 					payloadJson: JSON.stringify({}),
-					firedAt: new Date().toISOString(),
+					firedAt: new Date(Date.now() - 10_000 + i).toISOString(),
 				});
-				database.monitors.eventUpdate(tx, newerFailedId, "failed");
+				database.monitors.eventUpdate(tx, eventId, "failed_no_retry");
 			});
-
-			// Verify NO escalation for retryable-only failures
-			expect(escalationMessages.length).toBe(0);
 		}
 
-		escalationMessages.length = 0;
-
-		// Test 2: Verify that 3 terminal failures (failed_no_retry) interleaved with 'failed' DO escalate exactly once
-		{
-			const terminalIds: string[] = [];
-			for (let i = 0; i < 3; i++) {
-				const eventId = randomUUID();
-				terminalIds.push(eventId);
-				// Create event at terminal failure stage (failed_no_retry)
-				database.transaction((tx) => {
-					database.monitors.eventCreate(tx, {
-						eventId,
-						monitorId: monitor.monitorId,
-						eventType: "test.retryable_failures",
-						payloadJson: JSON.stringify({}),
-						firedAt: new Date(Date.now() - 2000 * (3 - i)).toISOString(),
-					});
-					database.monitors.eventUpdate(tx, eventId, "failed_no_retry");
-				});
+		const retryableIds: string[] = [];
+		for (let i = 0; i < 3; i++) {
+			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.retryable_failures", {});
+			retryableIds.push(eventId);
+			for (let attempt = 0; attempt < 200; attempt++) {
+				if (database.monitors.eventGet(eventId)?.stage === "failed") break;
+				await Bun.sleep(10);
 			}
-
-			// Interleave newer 'failed' (retry-pending) events
-			for (let i = 0; i < 2; i++) {
-				const eventId = randomUUID();
-				database.transaction((tx) => {
-					database.monitors.eventCreate(tx, {
-						eventId,
-						monitorId: monitor.monitorId,
-						eventType: "test.retryable_failures",
-						payloadJson: JSON.stringify({}),
-						firedAt: new Date(Date.now() + 100 * i).toISOString(),
-					});
-					database.monitors.eventUpdate(tx, eventId, "failed");
-				});
-			}
-
-			// Submit a new event that will trigger dispatch and failure check
-			const triggerEventId = await pipeline.submitAwaitable(monitor.monitorId, "test.retryable_failures", {});
-			// Move it to failed stage to trigger the failure tracking
-			database.transaction((tx) => database.monitors.eventUpdate(tx, triggerEventId, "failed"));
-
-			// Wait for propagator to process
-			await Bun.sleep(100);
-
-			// Verify exactly ONE escalation for terminal failures
-			expect(escalationMessages.length).toBe(1);
-			expect(escalationMessages[0]?.text).toContain("[monitor escalation]");
+			const row = database.monitors.eventGet(eventId);
+			expect(row?.stage).toBe("failed");
+			expect(row?.dispatch_attempts ?? MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS).toBeLessThan(
+				MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS,
+			);
 		}
+		expect(escalationMessages).toHaveLength(0);
+
+		// A successful terminal event resets the seeded failure history.
+		const recoveryEventId = await pipeline.submitAwaitable(monitor.monitorId, "test.retryable_failures", {});
+		for (let attempt = 0; attempt < 200; attempt++) {
+			if (database.monitors.eventGet(recoveryEventId)?.stage === "authored_no_delivery") break;
+			await Bun.sleep(10);
+		}
+		expect(database.monitors.eventGet(recoveryEventId)?.stage).toBe("authored_no_delivery");
+
+		// Three actual contract-unmet terminal transitions, after the success
+		// boundary, produce exactly one observable escalation.
+		const terminalIds: string[] = [];
+		for (let i = 0; i < 3; i++) {
+			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.retryable_failures", {});
+			terminalIds.push(eventId);
+			for (let attempt = 0; attempt < 200; attempt++) {
+				if (database.monitors.eventGet(eventId)?.stage === "contract_unmet") break;
+				await Bun.sleep(10);
+			}
+			expect(database.monitors.eventGet(eventId)?.stage).toBe("contract_unmet");
+		}
+		expect(retryableIds).toHaveLength(3);
+		expect(terminalIds).toHaveLength(3);
+		expect(requestAttempts).toBe(7);
+		expect(escalationMessages).toHaveLength(1);
+		expect(escalationMessages[0]?.text).toContain("[monitor escalation]");
 
 		database.close();
 	} finally {

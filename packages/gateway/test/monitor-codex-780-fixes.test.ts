@@ -23,16 +23,23 @@ test("fix #1: epoch rotation is persisted before rebind attempt (issue #780, cod
 		});
 
 		let bindAttempts = 0;
+		const attemptedEpochs: number[] = [];
 		const sessionPort: Partial<SessionPort> = {
 			bind: async (input) => {
 				bindAttempts++;
+				attemptedEpochs.push(input.epoch);
 				// First 3 attempts on epoch 0 timeout, then succeed on epoch 1
 				if (input.epoch === 0) {
-					throw new GjcCliUnavailableError("timeout");
+					throw new GjcCliUnavailableError("broker_unavailable: bind timed out");
 				}
-				// Epoch 1 succeeds - this verifies the epoch was persisted
+				// The new epoch must be committed before SessionPort is called again.
+				expect(database.bindings.getSessionRecord(input.originKey)?.epoch).toBe(input.epoch);
+				const sessionId = `session-${input.epoch}`;
+				database.transaction((tx) => {
+					expect(database.bindings.bindAtEpoch(tx, input.originKey, sessionId, input.epoch)).toBe(true);
+				});
 				return {
-					sessionId: `session-${input.epoch}`,
+					sessionId,
 					originKey: input.originKey,
 					epoch: input.epoch,
 					repo: input.repo,
@@ -54,17 +61,20 @@ test("fix #1: epoch rotation is persisted before rebind attempt (issue #780, cod
 			serviceTier: undefined,
 		});
 
-		// Submit 3 events to trigger rebind
+		// Three failed epoch-0 binds trigger exactly one rotation and a single epoch-1 bind.
 		for (let i = 0; i < 3; i++) {
-			await pipeline.submitAwaitable(monitor.monitorId, "test.epoch_persist", {});
-			await Bun.sleep(50);
+			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.epoch_persist", {});
+			for (let attempt = 0; attempt < 200; attempt++) {
+				if (database.monitors.eventGet(eventId)?.stage === "failed") break;
+				await Bun.sleep(10);
+			}
 		}
 
-		// Wait for dispatches to complete
-		await Bun.sleep(200);
-
-		// Verify bind was attempted on epoch 1 (at least 3 timeouts on epoch 0 + 1 attempt on epoch 1)
-		expect(bindAttempts).toBeGreaterThanOrEqual(4);
+		expect(bindAttempts).toBe(4);
+		expect(attemptedEpochs).toEqual([0, 0, 0, 1]);
+		expect(
+			database.bindings.getSessionRecord(`monitor/eventtype/test.epoch_persist/parent=${monitor.monitorId}`),
+		).toEqual({ epoch: 1, sessionId: "session-1" });
 
 		database.close();
 	} finally {
@@ -81,10 +91,12 @@ test("fix #2: escalation payload includes deliveryId (issue #780, codex finding 
 			name: "escalation-test",
 			trigger: { kind: "cron", schedule: "* * * * *" },
 			eventTypes: ["test.escalation"],
+			instruction: "Inspect the event and report new evidence.",
 			burstPolicy: "serialize",
 		});
 
 		const deliveredMessages: ChatMessagePayload[] = [];
+		const instruction = "Inspect the event and report new evidence.";
 		const sessionPort: Partial<SessionPort> = {
 			bind: async (input) => ({
 				sessionId: "test-session",
@@ -93,6 +105,13 @@ test("fix #2: escalation payload includes deliveryId (issue #780, codex finding 
 				repo: input.repo,
 				startupModelApplied: false,
 			}),
+			request: async (input) => {
+				const eventId = input.text.match(/"eventId":"([^"]+)"/)?.[1];
+				return {
+					receipt: { sessionId: input.sessionId, operationRef: input.opRef },
+					assistant: { text: JSON.stringify([{ eventId, note: instruction }]) },
+				} as never;
+			},
 			runExclusive: async (_, fn) => fn(),
 		};
 
@@ -109,38 +128,24 @@ test("fix #2: escalation payload includes deliveryId (issue #780, codex finding 
 			deliver: (payload) => {
 				deliveredMessages.push(payload);
 			},
+			ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "test-owner" } },
 		});
 
-		// Simulate 3 failed events to trigger escalation
+		// Real authoring responses echo the instruction, taking the actual terminal
+		// `contract_unmet` transition that triggers escalation.
 		for (let i = 0; i < 3; i++) {
 			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.escalation", {});
-			database.transaction((tx) => {
-				database.monitors.eventFencedFail(
-					tx,
-					eventId,
-					"test-lease",
-					"test-batch",
-					"internal_error",
-					"test failure",
-					Date.now(),
-					false,
-					{},
-				);
-			});
-			await Bun.sleep(50);
+			for (let attempt = 0; attempt < 200; attempt++) {
+				if (database.monitors.eventGet(eventId)?.stage === "contract_unmet") break;
+				await Bun.sleep(10);
+			}
+			expect(database.monitors.eventGet(eventId)?.stage).toBe("contract_unmet");
 		}
 
-		// Wait for escalation to be emitted
-		await Bun.sleep(100);
-
-		// Find the escalation message
-		const escalationMsg = deliveredMessages.find((m) => m.text?.includes("monitor escalation"));
-		if (escalationMsg) {
-			// Verify deliveryId is present in the payload
-			expect(escalationMsg.deliveryId).toBeDefined();
-			expect(typeof escalationMsg.deliveryId).toBe("string");
-			expect(escalationMsg.deliveryId?.length).toBeGreaterThan(0);
-		}
+		const [escalationMsg] = deliveredMessages.filter((message) => message.text.includes("[monitor escalation]"));
+		expect(escalationMsg).toBeDefined();
+		expect(escalationMsg?.deliveryId).toBeString();
+		expect(escalationMsg?.deliveryId?.length).toBeGreaterThan(0);
 
 		database.close();
 	} finally {
@@ -157,9 +162,12 @@ test("fix #3: per-origin failure counting across multiple event types (issue #78
 			name: "multi-eventtype-test",
 			trigger: { kind: "cron", schedule: "* * * * *" },
 			eventTypes: ["test.typeA", "test.typeB"],
+			instruction: "Inspect type A and report new evidence.",
 			burstPolicy: "serialize",
 		});
 
+		const instruction = "Inspect type A and report new evidence.";
+		const escalationMessages: ChatMessagePayload[] = [];
 		const sessionPort: Partial<SessionPort> = {
 			bind: async (input) => ({
 				sessionId: "test-session",
@@ -168,6 +176,15 @@ test("fix #3: per-origin failure counting across multiple event types (issue #78
 				repo: input.repo,
 				startupModelApplied: false,
 			}),
+			request: async (input) => {
+				const eventId = input.text.match(/"eventId":"([^"]+)"/)?.[1];
+				const eventType = input.text.match(/"eventType":"([^"]+)"/)?.[1];
+				const note = eventType === "test.typeA" ? instruction : "Found new evidence for type B.";
+				return {
+					receipt: { sessionId: input.sessionId, operationRef: input.opRef },
+					assistant: { text: JSON.stringify([{ eventId, note }]) },
+				} as never;
+			},
 			runExclusive: async (_, fn) => fn(),
 		};
 
@@ -181,58 +198,32 @@ test("fix #3: per-origin failure counting across multiple event types (issue #78
 			repo: join(home, "workspace"),
 			model: undefined,
 			serviceTier: undefined,
+			ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "test-owner" } },
+			deliver: (payload) => {
+				if (payload.text.includes("[monitor escalation]")) escalationMessages.push(payload);
+			},
 		});
 
-		// Submit events in A/B/A/B/A pattern to test origin filtering
-		const eventIds: string[] = [];
-		const eventTypes = ["test.typeA", "test.typeB", "test.typeA", "test.typeB", "test.typeA"];
-		for (const eventType of eventTypes) {
+		const dispatchUntil = async (eventType: string, expected: "contract_unmet" | "authored") => {
 			const eventId = await pipeline.submitAwaitable(monitor.monitorId, eventType, {});
-			eventIds.push(eventId);
-		}
+			for (let attempt = 0; attempt < 200; attempt++) {
+				const stage = database.monitors.eventGet(eventId)?.stage;
+				if (stage === expected || (expected === "authored" && stage === "delivered")) break;
+				await Bun.sleep(10);
+			}
+			expect(database.monitors.eventGet(eventId)?.stage).toMatch(
+				expected === "authored" ? /authored|delivered/ : expected,
+			);
+		};
 
-		// Mark typeA events as failed (indices 0, 2, 4)
-		database.transaction((tx) => {
-			database.monitors.eventFencedFail(
-				tx,
-				eventIds[0],
-				"test-lease",
-				"test-batch",
-				"internal_error",
-				"test failure",
-				Date.now(),
-				false,
-				{},
-			);
-			database.monitors.eventFencedFail(
-				tx,
-				eventIds[2],
-				"test-lease",
-				"test-batch",
-				"internal_error",
-				"test failure",
-				Date.now(),
-				false,
-				{},
-			);
-			database.monitors.eventFencedFail(
-				tx,
-				eventIds[4],
-				"test-lease",
-				"test-batch",
-				"internal_error",
-				"test failure",
-				Date.now(),
-				false,
-				{},
-			);
-		});
+		await dispatchUntil("test.typeA", "contract_unmet");
+		for (let i = 0; i < 12; i++) await dispatchUntil("test.typeB", "authored");
+		await dispatchUntil("test.typeA", "contract_unmet");
+		for (let i = 0; i < 12; i++) await dispatchUntil("test.typeB", "authored");
+		await dispatchUntil("test.typeA", "contract_unmet");
 
-		// The safety state should show that we're tracking typeA failures correctly
-		// even though typeB events are interspersed
-		const safetyState = pipeline.sessionSafetyState(`monitor/eventtype/test.typeA/parent=${monitor.monitorId}`);
-		// Safety state exists (doesn't crash on multi-type monitors)
-		expect(safetyState).toBeDefined();
+		expect(escalationMessages).toHaveLength(1);
+		expect(escalationMessages[0]?.text).toContain("[monitor escalation]");
 
 		database.close();
 	} finally {
@@ -252,14 +243,20 @@ test("fix #2: bind timeout counter persists across gateway restarts (issue #780,
 			burstPolicy: "serialize",
 		});
 
+		const attemptedEpochs: number[] = [];
 		const sessionPort: Partial<SessionPort> = {
 			bind: async (input) => {
+				attemptedEpochs.push(input.epoch);
 				// Always timeout on epoch 0 to trigger restart scenario
 				if (input.epoch === 0) {
-					throw new GjcCliUnavailableError("timeout");
+					throw new GjcCliUnavailableError("broker_unavailable: bind timed out");
 				}
+				const sessionId = "test-session";
+				database.transaction((tx) => {
+					expect(database.bindings.bindAtEpoch(tx, input.originKey, sessionId, input.epoch)).toBe(true);
+				});
 				return {
-					sessionId: "test-session",
+					sessionId,
 					originKey: input.originKey,
 					epoch: input.epoch,
 					repo: input.repo,
@@ -282,14 +279,19 @@ test("fix #2: bind timeout counter persists across gateway restarts (issue #780,
 			serviceTier: undefined,
 		});
 
-		// Submit events to increment timeout counter
+		const originKey = `monitor/eventtype/test.restart/parent=${monitor.monitorId}`;
+		// Submit events to increment and persist the timeout counter.
 		for (let i = 0; i < 2; i++) {
-			await pipeline.submitAwaitable(monitor.monitorId, "test.restart", {});
-			await Bun.sleep(50);
+			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.restart", {});
+			for (let attempt = 0; attempt < 200; attempt++) {
+				if (database.monitors.eventGet(eventId)?.stage === "failed") break;
+				await Bun.sleep(10);
+			}
 		}
 
-		// Store safety state before restart (for reference if needed)
-		pipeline.sessionSafetyState(`monitor/eventtype/test.restart/parent=${monitor.monitorId}`);
+		const safetyBeforeRestart = pipeline.sessionSafetyState(originKey);
+		expect(safetyBeforeRestart.bindTimeoutFailures).toBe(2);
+		expect(safetyBeforeRestart.bindTimeoutEpoch).toBe(0);
 
 		// Simulate gateway restart by creating a new propagator
 		pipeline = new MonitorPropagator({
@@ -305,13 +307,17 @@ test("fix #2: bind timeout counter persists across gateway restarts (issue #780,
 		});
 
 		// The counter should be restored from persistent storage
-		const safetyAfterRestart = pipeline.sessionSafetyState(
-			`monitor/eventtype/test.restart/parent=${monitor.monitorId}`,
-		);
+		const safetyAfterRestart = pipeline.sessionSafetyState(originKey);
+		expect(safetyAfterRestart.bindTimeoutFailures).toBe(2);
+		expect(safetyAfterRestart.bindTimeoutEpoch).toBe(0);
 
-		// After restart, the safety state should be available (counter may be reset if epoch changed)
-		expect(safetyAfterRestart).toBeDefined();
-		expect(safetyAfterRestart.bindTimeoutEpoch).toBeDefined();
+		const recoveredEventId = await pipeline.submitAwaitable(monitor.monitorId, "test.restart", {});
+		for (let attempt = 0; attempt < 200; attempt++) {
+			if (attemptedEpochs.includes(1) && database.monitors.eventGet(recoveredEventId)?.stage === "failed") break;
+			await Bun.sleep(10);
+		}
+		expect(attemptedEpochs).toEqual([0, 0, 0, 1]);
+		expect(database.bindings.getSessionRecord(originKey)).toEqual({ epoch: 1, sessionId: "test-session" });
 
 		database.close();
 	} finally {
@@ -328,9 +334,16 @@ test("fix #4: escalation persistence ordering is correct (issue #780, codex find
 			name: "escalation-persist-test",
 			trigger: { kind: "cron", schedule: "* * * * *" },
 			eventTypes: ["test.escalation_persist"],
+			instruction: "Inspect the event and report new evidence.",
 			burstPolicy: "serialize",
 		});
 
+		const instruction = "Inspect the event and report new evidence.";
+		const originKey = `monitor/eventtype/test.escalation_persist/parent=${monitor.monitorId}`;
+		const escalationKey = `monitor_escalation:${originKey}:${monitor.monitorId}`;
+		const deliveredMessages: ChatMessagePayload[] = [];
+		let persistedBeforeDelivery = false;
+		let outboxStateBeforeDelivery: string | undefined;
 		const sessionPort: Partial<SessionPort> = {
 			bind: async (input) => ({
 				sessionId: "test-session",
@@ -339,10 +352,16 @@ test("fix #4: escalation persistence ordering is correct (issue #780, codex find
 				repo: input.repo,
 				startupModelApplied: false,
 			}),
+			request: async (input) => {
+				const eventId = input.text.match(/"eventId":"([^"]+)"/)?.[1];
+				return {
+					receipt: { sessionId: input.sessionId, operationRef: input.opRef },
+					assistant: { text: JSON.stringify([{ eventId, note: instruction }]) },
+				} as never;
+			},
 			runExclusive: async (_, fn) => fn(),
 		};
 
-		// The fix ensures that escalation persistence happens before live delivery
 		const pipeline = new MonitorPropagator({
 			database,
 			registry,
@@ -353,35 +372,32 @@ test("fix #4: escalation persistence ordering is correct (issue #780, codex find
 			repo: join(home, "workspace"),
 			model: undefined,
 			serviceTier: undefined,
+			ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "test-owner" } },
+			deliver: (payload) => {
+				if (!payload.text.includes("[monitor escalation]")) return;
+				deliveredMessages.push(payload);
+				if (!payload.deliveryId) throw new Error("escalation payload is missing its deliveryId");
+				const outboxRow = database.outbox.get(payload.deliveryId);
+				outboxStateBeforeDelivery = outboxRow?.state;
+				persistedBeforeDelivery = database.core.metaGet(escalationKey) !== undefined && outboxRow !== undefined;
+			},
 		});
 
-		// Submit 3 failed events to trigger escalation
+		// Reach terminal contract failures through real authoring results.
 		for (let i = 0; i < 3; i++) {
 			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.escalation_persist", {});
-			database.transaction((tx) => {
-				database.monitors.eventFencedFail(
-					tx,
-					eventId,
-					"test-lease",
-					"test-batch",
-					"internal_error",
-					"test failure",
-					Date.now(),
-					false,
-					{},
-				);
-			});
-			await Bun.sleep(50);
+			for (let attempt = 0; attempt < 200; attempt++) {
+				if (database.monitors.eventGet(eventId)?.stage === "contract_unmet") break;
+				await Bun.sleep(10);
+			}
+			expect(database.monitors.eventGet(eventId)?.stage).toBe("contract_unmet");
 		}
 
-		await Bun.sleep(100);
-
-		// Verify that the code doesn't crash and handles the escalation properly
-		// The fix ensures that escalation entry is persisted before live delivery is attempted
-		const safetyState = pipeline.sessionSafetyState(
-			`monitor/eventtype/test.escalation_persist/parent=${monitor.monitorId}`,
-		);
-		expect(safetyState).toBeDefined();
+		expect(deliveredMessages).toHaveLength(1);
+		expect(persistedBeforeDelivery).toBe(true);
+		expect(outboxStateBeforeDelivery).toBe("inflight");
+		expect(database.core.metaGet(escalationKey)).toBeDefined();
+		expect(pipeline.sessionSafetyState(originKey).escalatedForCurrentStreak).toBe(true);
 
 		database.close();
 	} finally {

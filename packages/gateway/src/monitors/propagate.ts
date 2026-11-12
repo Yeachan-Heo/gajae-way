@@ -1423,22 +1423,13 @@ export class MonitorPropagator {
 
 								// If threshold reached, rebind to a fresh epoch (issue #780).
 								if (safety.bindTimeoutFailures >= MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD) {
-									// Before rotating, check for any pending session.create intent.
-									// If session.create succeeded in the broker but SessionPort hasn't recorded it yet,
-									// the create intent will still be pending. Rotate only if there's no pending create
-									// for the current origin+epoch (issue #780: ambiguous session.create).
+									// Query the broker journal through SessionPort. A pending create stays
+									// scoped to the old epoch; it must not keep a poisoned origin dark forever.
 									const pendingCreate = this.#hasPendingCreateIntent(sessionOriginKey, boundEpoch);
-									if (pendingCreate) {
+									if (pendingCreate)
 										console.error(
-											`monitor bind timeout but pending session.create exists for ${sessionOriginKey} epoch=${boundEpoch}, waiting for create to resolve`,
+											`monitor bind timeout with pending session.create for ${sessionOriginKey} epoch=${boundEpoch}; retaining old journal row while rotating`,
 										);
-										// A pending create may eventually succeed; don't rotate the epoch yet.
-										// Reset the timeout counter and persist it (issue #780, P2 #2)
-										safety.bindTimeoutFailures = 0;
-										this.#safety.set(sessionOriginKey, safety);
-										this.#persistBindTimeoutCounter(sessionOriginKey, 0, boundEpoch);
-										throw bindError; // Propagate the error to retry at this epoch
-									}
 
 									// Check if a session was already created.
 									// If session.create succeeded in parallel, preserve and reconcile the created session
@@ -1465,10 +1456,10 @@ export class MonitorPropagator {
 										break; // Exit the retry loop with the preserved session
 									} else {
 										console.error(
-											`monitor bind timeout rebind triggered for ${sessionOriginKey}: epoch=${boundEpoch} -> ${boundEpoch + 1}`,
+											`monitor bind timeout rebind triggered for ${sessionOriginKey}: epoch=${boundEpoch} -> ${boundEpoch + 1} pending_create=${pendingCreate}`,
 										);
-										// No session exists and no pending create, safe to rotate the epoch
-										// rotateEpoch persists the new epoch and clears gjc_session_id so the next bind gets a fresh session.
+										// Keep any pending create journaled under the old scope. Rotation
+										// creates a new scope without overwriting that durable operation.
 										const newEpoch = this.#database.transaction((tx) => {
 											return this.#database.bindings.rotateEpoch(tx, sessionOriginKey);
 										});
@@ -2097,8 +2088,6 @@ export class MonitorPropagator {
 				if (transitionedFailure) readinessFailure = { code, detail: `monitor dispatch failed during ${dispatchPhase}` };
 				flushReadinessFailure();
 				console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
-				// Track consecutive failures for potential escalation (issue #780).
-				this.#trackConsecutiveFailedEvent(sessionOriginKey, monitor.monitorId);
 				await this.#recordAuthoringFailure({
 					sessionOriginKey,
 					failureClass,
@@ -2315,14 +2304,9 @@ export class MonitorPropagator {
 		return fresh;
 	}
 
-	/**
-	 * Check if there is a pending session.create operation for the given origin+epoch.
-	 * Issue #780, P2 #1: Before rotating the epoch, ensure no unresolved create operation exists
-	 * in the broker_operations journal that would be orphaned by the epoch change.
-	 */
+	/** Query the SessionPort-owned create journal before deciding how to handle a bind timeout. */
 	#hasPendingCreateIntent(sessionOriginKey: string, epoch: number): boolean {
-		const createScope = JSON.stringify([sessionOriginKey, epoch]);
-		return this.#database.bindings.hasPendingSessionCreate(createScope);
+		return this.#sessionPort.hasPendingSessionCreate?.({ originKey: sessionOriginKey, epoch }) ?? false;
 	}
 
 	/**
@@ -2381,20 +2365,16 @@ export class MonitorPropagator {
 			for (const row of page) {
 				// Issue #3: only count failures for this specific session origin
 				if (originKey(monitorOriginForEvent(monitor, row.event_type)) !== sessionOriginKey) continue;
-				// Issue #5: in-flight and retry-pending events are undecided: they neither count nor break
-				// the streak. An origin failing every hour always has its newest event still awaiting a
-				// retry backoff, so treating `failed` as a streak break would mean it never escalates (#780).
-				if (row.stage === "admitted" || row.stage === "batched" || row.stage === "dispatched" || row.stage === "failed")
-					continue;
 				// Codex P2 #1: overlap-skipped events are scheduling outcomes, not failures
 				if (row.stage === "skipped") continue;
-				// Codex P2 #1: only count terminal failures (failed_no_retry and contract_unmet)
-				if (row.stage !== "failed_no_retry" && row.stage !== "contract_unmet") {
-					// A successful terminal event ends the streak
-					return count;
+				if (row.stage === "failed_no_retry" || row.stage === "contract_unmet") {
+					count++;
+					if (count >= MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD) return count;
+					continue;
 				}
-				count++;
-				if (count >= MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD) return count;
+				// Only a terminal success closes a streak. Retryable `failed` and every
+				// other nonterminal stage remain undecided until a later transition.
+				if (row.stage === "delivered" || row.stage === "authored_no_delivery") return count;
 			}
 			if (page.length < pageSize) return count;
 		}

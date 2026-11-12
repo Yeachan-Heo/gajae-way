@@ -86,6 +86,37 @@ async function brokerPortFixture(cli: CliRunner, instanceId = "session-port-rebi
 	return { port, repo, database, agentDir };
 }
 
+test("pending session.create observation is scoped to its origin and epoch", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-pending-session-create-"));
+	const store = await Store.open(join(home, "gateway.db"));
+	database = store;
+	const agentDir = join(home, "agent");
+	const authority = initializeTestBrokerAuthority(store, agentDir);
+	const repo = join(home, "workspace");
+	const port = new BrokerSessionPort({
+		database: store,
+		authority,
+		cli: async () => {
+			throw new Error("the journal query must not invoke the broker CLI");
+		},
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	const originKey = "discord/dm/pending-create";
+	const scope = JSON.stringify([originKey, 7]);
+	store.transaction((tx) =>
+		store.bindings.beginBrokerOperation(tx, authority, {
+			operation: "session.create",
+			scope,
+			operationRef: "gw-test-pending-create",
+			requestJson: JSON.stringify({ cwd: repo }),
+		}),
+	);
+
+	expect(port.hasPendingSessionCreate({ originKey, epoch: 7 })).toBe(true);
+	expect(port.hasPendingSessionCreate({ originKey, epoch: 8 })).toBe(false);
+	expect(port.hasPendingSessionCreate({ originKey: `${originKey}-other`, epoch: 7 })).toBe(false);
+});
+
 function createFailure(code: string, message: string) {
 	return {
 		exitCode: 0,

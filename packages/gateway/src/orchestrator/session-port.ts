@@ -125,6 +125,8 @@ export interface SessionPort {
 	/** Positive local non-admission evidence, not native execution-end proof. */
 	promptRefusal?(input: { sessionId: string; repo: string; opRef: string }): "busy" | undefined;
 	bind(input: SessionBindInput): Promise<SessionBinding>;
+	/** Read-only observation of the SessionPort-owned durable create journal. */
+	hasPendingSessionCreate?(input: { readonly originKey: string; readonly epoch: number }): boolean;
 	inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined>;
 	liveness?(input: { sessionId: string; repo: string }): Promise<SessionLiveness>;
 	/** True when the session's prompt queue has no pending messages (queue.messages.list empty). */
@@ -603,6 +605,11 @@ export class BrokerSessionPort implements SessionPort {
 		});
 		this.#bindings.set(key, pending);
 		return pending;
+	}
+
+	hasPendingSessionCreate(input: { readonly originKey: string; readonly epoch: number }): boolean {
+		this.#database.bindings.assertAuthority(this.#authority);
+		return this.#database.bindings.hasPendingSessionCreate(JSON.stringify([input.originKey, input.epoch]));
 	}
 
 	async #bind(input: SessionBindInput): Promise<SessionBinding> {
