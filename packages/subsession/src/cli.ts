@@ -20,7 +20,15 @@ export type CliResult = {
 
 export type CliRunner = (
 	args: readonly string[],
-	options?: { readonly timeoutMs?: number; readonly priority?: "interactive" | "background" },
+	options?: {
+		readonly timeoutMs?: number;
+		readonly priority?: "interactive" | "background";
+		/**
+		 * Bounds the wait for a command slot on its own; `timeoutMs` then bounds
+		 * only the command itself. Without it `timeoutMs` covers both.
+		 */
+		readonly queueTimeoutMs?: number;
+	},
 ) => Promise<CliResult>;
 
 export type BrokerSession = {

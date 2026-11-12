@@ -2357,7 +2357,7 @@ test("runCompaction gives gjc's own request the compaction budget and keeps its 
 	const authority = initializeTestBrokerAuthority(database!, join(home, "agent"));
 	const repo = join(home, "workspace");
 	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "compact", epoch: 0 });
-	const calls: { args: string[]; timeoutMs: number | undefined }[] = [];
+	const calls: { args: string[]; timeoutMs: number | undefined; queueTimeoutMs: number | undefined }[] = [];
 	// gjc's public command-error envelope; `timeout` is what its session router
 	// returns when the host has not replied within the request budget.
 	const commandError = (code: string, outcomeCertainty: string) =>
@@ -2375,7 +2375,7 @@ test("runCompaction gives gjc's own request the compaction budget and keeps its 
 		stderr: "",
 	});
 	const run: CliRunner = async (args, options) => {
-		calls.push({ args: [...args], timeoutMs: options?.timeoutMs });
+		calls.push({ args: [...args], timeoutMs: options?.timeoutMs, queueTimeoutMs: options?.queueTimeoutMs });
 		return await respond();
 	};
 	const port = new BrokerSessionPort({
@@ -2393,8 +2393,11 @@ test("runCompaction gives gjc's own request the compaction budget and keeps its 
 	expect(flag).toBeGreaterThan(args.indexOf("compaction.run"));
 	const requestBudgetMs = Number(args[flag + 1]);
 	expect(requestBudgetMs).toBe(300_000);
-	// The process bound exceeds gjc's own budget, leaving room to read its timeout reply after a short CLI slot wait.
+	// The process outlives gjc's own budget so its timeout reply can still be read, and the
+	// CLI slot wait is bounded separately so a busy pool cannot shorten that budget.
 	expect(calls[0]!.timeoutMs).toBeGreaterThan(requestBudgetMs);
+	expect(calls[0]!.queueTimeoutMs).toBeGreaterThan(0);
+	expect(calls[0]!.queueTimeoutMs).toBeLessThan(requestBudgetMs);
 
 	// gjc's own timeout reply and a real compaction failure keep their stable codes for the log.
 	respond = async () => ({ exitCode: 1, stdout: commandError("timeout", "unknown"), stderr: "" });

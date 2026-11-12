@@ -486,6 +486,7 @@ export class GlobalGjcClient {
 				bindAgentDir(args, this.agentDir),
 				commandOptions?.timeoutMs,
 				commandOptions?.priority ?? "interactive",
+				commandOptions?.queueTimeoutMs,
 			);
 	}
 	get generation(): number {
@@ -871,10 +872,13 @@ export class GlobalGjcClient {
 		args: readonly string[],
 		requestedTimeout?: number,
 		priority: "interactive" | "background" = "interactive",
+		requestedQueueTimeout?: number,
 	): Promise<CliResult> {
 		this.#assertAgentDirIdentity(true);
 		const timeout = integer(requestedTimeout, COMMAND_TIMEOUT_MS, 1);
-		const deadline = Date.now() + timeout;
+		// A separate queue bound leaves the command its whole budget once admitted.
+		const queueTimeout = requestedQueueTimeout === undefined ? undefined : integer(requestedQueueTimeout, timeout, 1);
+		const deadline = Date.now() + (queueTimeout ?? timeout);
 		// Interactive callers may use the whole pool; background commands at most half of it.
 		const maxBackground = Math.ceil(this.#maxPoolSize / 2);
 		const canProceed = (): boolean => {
@@ -900,14 +904,14 @@ export class GlobalGjcClient {
 			// Local pool congestion is a per-call failure, never broker evidence:
 			// reporting it as an outage failed every other caller while the broker
 			// itself was healthy (#675).
-			if (Date.now() >= deadline) throw new GjcCommandQueueTimeoutError(timeout);
+			if (Date.now() >= deadline) throw new GjcCommandQueueTimeoutError(queueTimeout ?? timeout);
 		}
 		this.#assertAgentDirIdentity(true);
 		if (this.#stopped || (this.#started && !this.#available)) this.#unavailable("client stopped or broker unavailable");
 		this.#inflight++;
 		if (priority === "background") this.#backgroundInFlight++;
 		try {
-			const remaining = Math.max(1, deadline - Date.now());
+			const remaining = queueTimeout === undefined ? Math.max(1, deadline - Date.now()) : timeout;
 			const result = await this.#executeCommand(args, remaining, priority);
 			return this.#checkUnavailable(result);
 		} finally {

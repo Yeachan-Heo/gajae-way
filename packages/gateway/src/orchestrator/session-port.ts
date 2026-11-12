@@ -543,12 +543,10 @@ const CONTEXT_QUERY_TIMEOUT_MS = 5_000;
  * 2026-09-30); the default 30s command bound reported such runs as failed.
  */
 const COMPACTION_TIMEOUT_MS = 5 * 60_000;
-/**
- * Process budget beyond the SDK request budget, so gjc's own timeout reply can
- * still be read when the command did not wait long for a CLI slot (the bound
- * covers the slot wait too).
- */
+/** Process budget beyond the SDK request budget, so gjc's own timeout reply can still be read. */
 const COMPACTION_PROCESS_GRACE_MS = 30_000;
+/** Bound on waiting for a CLI slot before the compaction starts; a run that never starts is a plain failure. */
+const COMPACTION_QUEUE_TIMEOUT_MS = 60_000;
 
 type SignaledHost = {
 	readonly pid: number;
@@ -1983,7 +1981,12 @@ export class BrokerSessionPort implements SessionPort {
 						"--timeout-ms",
 						String(COMPACTION_TIMEOUT_MS),
 					],
-					{ timeoutMs: COMPACTION_TIMEOUT_MS + COMPACTION_PROCESS_GRACE_MS },
+					{
+						timeoutMs: COMPACTION_TIMEOUT_MS + COMPACTION_PROCESS_GRACE_MS,
+						// The slot wait has its own bound, so a busy CLI pool cannot eat
+						// into the compaction's request budget.
+						queueTimeoutMs: COMPACTION_QUEUE_TIMEOUT_MS,
+					},
 				),
 				"compaction.run",
 			);

@@ -733,6 +733,51 @@ test("a saturated CLI pool times out only the queued call and never marks the br
 	await expect(value.cli(["sdk", "session", "list"], { timeoutMs: 500 })).resolves.toEqual(healthy);
 });
 
+test("a separate queue bound leaves an admitted command its whole timeout", async () => {
+	let hold = false;
+	const pending: Array<() => void> = [];
+	const budgets: Array<number | undefined> = [];
+	const value = client({
+		command: async (args, options) => {
+			if (!hold) return healthy;
+			if (args.includes("compaction.run")) {
+				budgets.push(options?.timeoutMs);
+				return healthy;
+			}
+			await new Promise<void>((resolve) => pending.push(resolve));
+			return healthy;
+		},
+	});
+	await value.start();
+	hold = true;
+	// Saturate the four-slot pool.
+	const blockers = Array.from({ length: 4 }, () => value.cli(["sdk", "session", "list"], { timeoutMs: 5_000 }));
+	await eventually(() => pending.length === 4);
+
+	// The slot wait is bounded on its own, not by the (much longer) command timeout.
+	const startedAt = Date.now();
+	await expect(
+		value.cli(["sdk", "session", "raw", "control", "s", "--op", "compaction.run"], {
+			timeoutMs: 60_000,
+			queueTimeoutMs: 20,
+		}),
+	).rejects.toBeInstanceOf(GjcCommandQueueTimeoutError);
+	expect(Date.now() - startedAt).toBeLessThan(5_000);
+
+	// Admitted after waiting, the command still gets its full timeout.
+	const queued = value.cli(["sdk", "session", "raw", "control", "s", "--op", "compaction.run"], {
+		timeoutMs: 60_000,
+		queueTimeoutMs: 5_000,
+	});
+	await Bun.sleep(50);
+	pending.shift()?.();
+	await expect(queued).resolves.toEqual(healthy);
+	expect(budgets).toEqual([60_000]);
+
+	for (const resolve of pending) resolve();
+	await Promise.all(blockers);
+});
+
 test("the CLI pool is sized from maxPoolSize within [4, 16]", async () => {
 	for (const [requested, expected] of [
 		[1, 4],
