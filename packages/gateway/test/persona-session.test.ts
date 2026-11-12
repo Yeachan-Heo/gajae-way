@@ -3885,6 +3885,59 @@ test("a stalled turn with a reply ending in stopReason stop does not post a fail
 	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
 });
 
+test("a steered turn whose host ends it uncorrelated is cut off as answered while its transcript is still readable", async () => {
+	// Production shape (yun-gajae 2026-11-11 08:52Z / 2026-11-12 01:02Z): a steer
+	// lands mid-turn, the final reply reaches the owned relay, then the host
+	// publishes the run's agent_end WITHOUT correlation and never terminalizes the
+	// prompt (turn.result stays in_flight). Per #733 that end is not terminal
+	// evidence, so the stall cutoff stops the host. The stopReason "stop" proof
+	// (#769) must be read before that: a stopped host answers no transcript read.
+	class StoppedHostHidesTranscript extends ScriptedSessionPort {
+		override async fetchAssistantSince(input: Parameters<ScriptedSessionPort["fetchAssistantSince"]>[0]) {
+			if (this.closes.some((closed) => closed.sessionId === input.sessionId))
+				throw new Error("gjc sdk session raw reported failure: endpoint_stale");
+			return await super.fetchAssistantSince(input);
+		}
+	}
+	const port = new StoppedHostHidesTranscript();
+	const clock = { now: Date.now() };
+	const failures: Array<boolean | undefined> = [];
+	const logs: string[] = [];
+	await harness(
+		port,
+		{ failure: (_message, forceFailureNotice) => failures.push(forceFailureNotice) },
+		(line) => logs.push(line),
+		{ now: () => clock.now },
+	);
+	enqueue("steered-root-trigger", "summarize the contract");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const send = port.sends[0]!;
+	enqueue("steered-root-edit", "edited: also list the owners");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.steers.length === 1, "mid-turn message was not steered");
+
+	port.appendAssistant(send.sessionId, "Here is the summary with owners", clock.now, "stop");
+	port.emitAssistant(send.sessionId, "Here is the summary with owners", "steered-answer", send.opRef);
+	const readsBeforeEnd = port.statusReads.length;
+	for (const tail of port.tailsOf(send.sessionId))
+		tail.emit({ kind: "agent_end", rawKind: "agent_end", payload: {}, steerEcho: false, idle: true });
+	await eventually(() => port.statusReads.length > readsBeforeEnd, "uncorrelated end did not wake a status reconcile");
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("accepted");
+
+	port.setActivity(send.sessionId, "idle", clock.now);
+	const statusReads = port.statusReads.length;
+	port.emitStall(send.sessionId);
+	await eventually(() => port.statusReads.length > statusReads, "stall did not check operation status");
+	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+	await manager!.tick(KEY);
+
+	await eventually(() => database!.inbox.turnRow(send.opRef)?.turn_state === "done", "stalled turn was not closed");
+	expect(port.closes.map((closed) => closed.sessionId)).toContain(send.sessionId);
+	expect(failures).toEqual([false]);
+	expect(logs.some((line) => line.startsWith("stall_turn_answered_properly "))).toBe(true);
+});
+
 test("a stalled turn with interim speech still posts a failure notice", async () => {
 	const port = new ScriptedSessionPort();
 	const clock = { now: Date.now() };

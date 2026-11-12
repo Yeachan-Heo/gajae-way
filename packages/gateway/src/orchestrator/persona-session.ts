@@ -1334,6 +1334,12 @@ type BoundTurn = PersonaTurnIdentity & {
 	stallHostTerminated?: boolean;
 	/** SIGTERM was accepted, but the host process has not yet been confirmed exited. */
 	stallHostTerminating?: boolean;
+	/**
+	 * The transcript showed, before the stall cutoff stopped the host, that the
+	 * reply the owned relay delivered ended with stopReason "stop" (#768). A
+	 * stopped host answers no transcript read, so closure cannot probe it later.
+	 */
+	stallReplyConcluded?: boolean;
 	/** Original authority captured before signalling; never refreshed into a new broker's proof. */
 	stallExitOwner?: NonNullable<ReturnType<typeof stalledExitOwner>>;
 	/** A stalled retired hold already attempted its one allowed host termination. */
@@ -3842,6 +3848,13 @@ class OriginActor {
 			this.#clearStallReconciliation(bound);
 			return false;
 		}
+		// Read the stopReason proof while the host can still serve the transcript.
+		bound.stallReplyConcluded =
+			bound.lastAssistantText !== undefined && (await this.#lastAssistantIsAnswering(bound)) === true;
+		if (!canTerminate()) {
+			this.#clearStallReconciliation(bound);
+			return false;
+		}
 		const authorizeTermination = async () => {
 			if (!canTerminate()) return false;
 			try {
@@ -4789,21 +4802,14 @@ class OriginActor {
 			const message =
 				"the session running this turn produced no terminal event before the stall deadline; the request was not resent";
 			try {
-				// Check if the turn delivered a reply that properly concluded (stopReason "stop").
-				// If it did, don't post the failure notice, as the user has their answer.
-				let forceFailureNotice = true;
-				if (bound.lastAssistantText !== undefined) {
-					const isAnswering = await this.#lastAssistantIsAnswering(bound);
-					// isAnswering === true: last message has stopReason "stop" → no notice needed
-					// isAnswering === false: last message has different stopReason → keep notice
-					// isAnswering === undefined: read failed → keep notice (fail safe)
-					if (isAnswering === true) {
-						forceFailureNotice = false;
-						this.#manager.log(
-							`stall_turn_answered_properly origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} last_stop_reason=stop`,
-						);
-					}
-				}
+				// A delivered reply that properly concluded (stopReason "stop", probed
+				// before the host was stopped) already answered the user: no notice.
+				// An unreadable or non-"stop" transcript keeps the notice (fail safe).
+				const forceFailureNotice = bound.stallReplyConcluded !== true;
+				if (!forceFailureNotice)
+					this.#manager.log(
+						`stall_turn_answered_properly origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} last_stop_reason=stop`,
+					);
 				await bound.lifecycle.onFailure?.({
 					...bound,
 					error: new GjcRuntimeError(`session_unavailable: ${message}`, { code: "session_unavailable", message }),
