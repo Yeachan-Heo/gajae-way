@@ -222,6 +222,8 @@ A template is 1–1000 characters, may use `{name}` any number of times, and is 
 
 `monitorCatchUp` bounds cron replay after downtime: `maxSlots` is the newest due slots to admit (1–1000, default 24), and `maxAgeMs` excludes slots older than the lookback (60000–604800000 ms, default 86400000 / 24 hours). Refused slots advance the durable monitor cursor, are counted and logged, and appear in `gajaeway monitors inspect <id>` as `catchUp`; the setting is restart-required.
 
+`memory.seedDefaultMonitors` is an optional boolean (default `true`). Set it to `false` in `config.json` before the first boot to skip creation of the three built-in memory-maintenance monitors and their seed markers. It does not disable or remove existing monitors. Changing it requires restart; switching back to `true` or omitting it uses the normal seed-once behavior, preserving removals and disabled records. See [default memory monitors](monitors.md#default-memory-monitors).
+
 ### Private broker runtime
 
 `gjc.agentDir` is optional and must be absolute when set. Its default is `$GAJAEWAY_HOME/broker/agent`, the private directory owned by the broker service. The gateway uses the pinned GJC executable from `$GAJAEWAY_HOME/gjc/current/bin/gjc`; it does not fall back to a system executable or mutate the operator's source profile.
