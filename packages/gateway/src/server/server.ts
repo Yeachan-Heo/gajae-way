@@ -1053,6 +1053,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			);
 			if (payload) broadcastDelivery(runtime, payload);
 		},
+		// A dead retired hold is abandoned only once its origin confirmed the
+		// escalation notice; a queued or expired notice is not proof the user was told.
+		escalationNoticeConfirmed: ({ originKey, trigger }) =>
+			escalationNoticeConfirmedInLedger(options.database, originKey, trigger),
 		onTurnStart: async (input) => await createInboundTurnLifecycle(input, options, runtime),
 		// A steer whose acceptance was learnt after its turn's lifecycle is gone
 		// (resolved at terminal or after a restart) is finalized exactly like a
@@ -4653,7 +4657,28 @@ function deterministicDeliveryExpiredNoticeId(deliveryId: string): string {
 }
 
 /** One bind-hold notice per trigger, and one separate notice when that trigger's unresolved hold is escalated (#686). */
-function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string, reason: string): string {
+/**
+ * Whether the origin adapter confirmed the escalation notice of this trigger
+ * (#686). Queued, in-flight, ambiguous or expired is not confirmed. Loopback
+ * notices are only logged, so the hook itself is final there.
+ */
+export function escalationNoticeConfirmedInLedger(
+	database: Pick<Store, "outbox">,
+	originKey: string,
+	trigger: Pick<InboundMessageRow, "message_id" | "origin_ref_json">,
+): boolean {
+	let origin: OriginRef;
+	try {
+		origin = validateOriginRef(JSON.parse(trigger.origin_ref_json) as OriginRef);
+	} catch {
+		return false;
+	}
+	if (origin.platform === "loopback") return true;
+	const deliveryId = deterministicBindHoldDeliveryId(originKey, trigger.message_id, UNRESOLVED_HOLD_ESCALATED);
+	return database.outbox.get(deliveryId)?.state === "confirmed";
+}
+
+export function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string, reason: string): string {
 	const kind = reason === UNRESOLVED_HOLD_ESCALATED ? UNRESOLVED_HOLD_ESCALATED : "bind_hold";
 	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|${kind}`).digest("hex").slice(0, 32)}`;
 }

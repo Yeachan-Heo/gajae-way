@@ -155,11 +155,45 @@ function escalatedHoldKey(opRef: string): string {
 }
 
 /**
- * When an escalated retired hold was first seen with its host provably not live.
- * Cleared when the host is seen live or the op reports a readable status again.
+ * When an escalated retired hold was first seen with its host provably not live,
+ * and which host identity it saw then (a {@link DeadHostMark}). Cleared when the
+ * host is seen live or the op reports a status other than unknown.
  */
 function retiredHoldDeadSinceKey(opRef: string): string {
 	return `retired-hold-dead-since:${opRef}`;
+}
+
+/**
+ * Set once the origin confirmed the escalation notice of a hold. Kept apart from
+ * the delivery ledger, which prunes confirmed rows after a week.
+ */
+function escalationNoticeConfirmedKey(opRef: string): string {
+	return `escalation-notice-confirmed:${opRef}`;
+}
+
+/** The not-live host a dead retired hold's abandonment window opened on. */
+interface DeadHostMark {
+	readonly at: number;
+	readonly hostIncarnation: string;
+	readonly activityAt?: number;
+}
+
+function parseDeadHostMark(value: string | undefined): DeadHostMark | undefined {
+	if (value === undefined) return undefined;
+	try {
+		const mark = JSON.parse(value) as Partial<DeadHostMark>;
+		if (typeof mark.at !== "number" || !Number.isFinite(mark.at)) return undefined;
+		if (typeof mark.hostIncarnation !== "string" || mark.hostIncarnation === "") return undefined;
+		if (mark.activityAt !== undefined && (typeof mark.activityAt !== "number" || !Number.isFinite(mark.activityAt)))
+			return undefined;
+		return {
+			at: mark.at,
+			hostIncarnation: mark.hostIncarnation,
+			...(mark.activityAt === undefined ? {} : { activityAt: mark.activityAt }),
+		};
+	} catch {
+		return undefined;
+	}
 }
 
 /** Track relay unavailable events for a turn to detect unresponsive relays even on live hosts (#766). */
@@ -301,6 +335,7 @@ function completeInboundTurn(
 	// Clean up relay unavailability tracker when turn completes (#766)
 	if (changed === 1) store.core.metaDelete(relayUnavailableTrackerKey(opRef));
 	if (changed === 1) store.core.metaDelete(retiredHoldDeadSinceKey(opRef));
+	if (changed === 1) store.core.metaDelete(escalationNoticeConfirmedKey(opRef));
 	return changed;
 }
 
@@ -683,6 +718,12 @@ export interface PersonaSessionManagerOptions {
 	readonly unresolvedHoldMs?: number;
 	/** Escalated retired hold on a host not live this long is closed; default DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS. */
 	readonly retiredHoldAbandonMs?: number;
+	/**
+	 * Whether the origin confirmed the escalation notice posted for this trigger.
+	 * A retired hold is abandoned only after it did. Unset means there is no
+	 * delivery ledger (the notice hook itself is final), which counts as confirmed.
+	 */
+	readonly escalationNoticeConfirmed?: (input: { originKey: string; trigger: InboundMessageRow }) => boolean;
 	/** Called when a reverse request from the SDK host arrives. */
 	readonly onReverseRequest?: (input: {
 		originKey: string;
@@ -727,6 +768,7 @@ export class PersonaSessionManager {
 	readonly #heldSteerContextMessageId: PersonaSessionManagerOptions["heldSteerContextMessageId"];
 	readonly #brokerLiveness: BrokerLivenessProbe | undefined;
 	readonly #onBindHold: PersonaSessionManagerOptions["onBindHold"];
+	readonly #escalationNoticeConfirmed: PersonaSessionManagerOptions["escalationNoticeConfirmed"];
 	readonly #onReverseRequest: PersonaSessionManagerOptions["onReverseRequest"];
 	readonly #onSloEvent: PersonaSessionManagerOptions["onSloEvent"];
 	readonly #onBindFailure: PersonaSessionManagerOptions["onBindFailure"];
@@ -774,6 +816,7 @@ export class PersonaSessionManager {
 		this.#heldSteerContextMessageId = options.heldSteerContextMessageId;
 		this.#brokerLiveness = options.brokerLiveness;
 		this.#onBindHold = options.onBindHold;
+		this.#escalationNoticeConfirmed = options.escalationNoticeConfirmed;
 		this.#onReverseRequest = options.onReverseRequest;
 		this.#maxLiveHosts = positiveInteger(options.maxLiveHosts, DEFAULT_SESSIONS_MAX_LIVE_HOSTS, "maxLiveHosts");
 		this.#hostIdleRetireMs = positiveInteger(
@@ -1300,6 +1343,17 @@ export class PersonaSessionManager {
 		input: Parameters<NonNullable<PersonaSessionManagerOptions["onHeldSteerAccepted"]>>[0],
 	): Promise<void> {
 		await this.#onHeldSteerAccepted?.(input);
+	}
+
+	/** Whether the origin confirmed this trigger's escalation notice; true without a delivery ledger. */
+	escalationNoticeConfirmed(originKey: string, trigger: InboundMessageRow): boolean {
+		if (!this.#escalationNoticeConfirmed) return true;
+		try {
+			return this.#escalationNoticeConfirmed({ originKey, trigger });
+		} catch (error) {
+			this.#log(`escalation_notice_confirm_failed origin=${originKey} detail=${safeDiagnostic(error)}`, "error");
+			return false;
+		}
 	}
 
 	/** False when the notice hook failed; a durable notice intent is then retried. */
@@ -2310,6 +2364,8 @@ class OriginActor {
 		readonly deleted?: boolean;
 		readonly workspace?: string;
 		readonly disowned?: boolean;
+		readonly hostIncarnation?: string;
+		readonly activity?: { readonly state: string; readonly at: number };
 	}> {
 		const port = this.#manager.port;
 		if (port.liveness) {
@@ -4888,11 +4944,18 @@ class OriginActor {
 	 * unreadable. #718 keeps such a hold open so a late answer can still land,
 	 * but a host that is gone cannot produce one: the hold only adds per-minute
 	 * status and liveness CLI spawns, and on a long-lived gateway those piled up
-	 * until the broker stopped answering live turns. The user was already told at
-	 * escalation and the claimed inputs are closed, so no second notice is sent
-	 * and nothing is resent. A host seen live, or any status other than unknown,
-	 * restarts the window; a disowned id is not proof of exit. Liveness is read
-	 * only when the window opens and when it closes.
+	 * until the broker stopped answering live turns.
+	 *
+	 * Closing needs all of:
+	 * - the origin confirmed the escalation notice (not merely queued it), so the
+	 *   user was told before the hold goes quiet; no second notice is sent;
+	 * - a positive `live=false` read when the window opened and when it closed;
+	 *   a disowned id or unanswerable liveness proves nothing and keeps waiting;
+	 * - the same host incarnation, and the same activity stamp, at both reads:
+	 *   a host that revived in between (and might have finished the op while
+	 *   status was unreadable) is a new incarnation, and opens a new window;
+	 * - no status other than unknown in between (cleared by the caller).
+	 * Liveness is read only when the window opens and when it closes.
 	 */
 	async #abandonDeadRetiredHold(bound: BoundTurn): Promise<boolean> {
 		if (!bound.retired || !bound.answerWanted) return false;
@@ -4901,11 +4964,19 @@ class OriginActor {
 		if (database.core.metaGet(escalatedHoldKey(opRef)) === undefined) return false;
 		// An escalation notice not yet handed to delivery keeps its trigger, as retention does.
 		if (database.core.metaGet(escalationNoticeKey(this.originKey, opRef)) !== undefined) return false;
+		const trigger = database.inbox.turnRow(opRef);
+		if (!trigger) return false;
+		const confirmedKey = escalationNoticeConfirmedKey(opRef);
+		if (database.core.metaGet(confirmedKey) === undefined) {
+			// Queued is not delivered: an adapter offline past the outbox TTL expires
+			// the notice, and closing then would leave the user told nothing.
+			if (!this.#manager.escalationNoticeConfirmed(this.originKey, trigger)) return false;
+			database.core.metaSet(confirmedKey, "1");
+		}
 		const now = this.#manager.now();
 		const deadSinceKey = retiredHoldDeadSinceKey(opRef);
-		const recorded = database.core.metaGet(deadSinceKey);
-		const deadSince = recorded === undefined ? Number.NaN : Number.parseInt(recorded, 10);
-		if (Number.isFinite(deadSince) && now - deadSince < this.#manager.retiredHoldAbandonMs) return false;
+		const mark = parseDeadHostMark(database.core.metaGet(deadSinceKey));
+		if (mark && now - mark.at < this.#manager.retiredHoldAbandonMs) return false;
 		const host = await this.#bindingState(bound.sessionId);
 		if (host.live === true) {
 			// A live host may still produce the answer: the window starts over.
@@ -4916,12 +4987,29 @@ class OriginActor {
 		// disowned id (the broker lost the route; a detached host may still run),
 		// proves nothing: keep the window and ask again next sweep.
 		if (host.live !== false) return false;
-		if (!Number.isFinite(deadSince)) {
-			database.core.metaSet(deadSinceKey, String(now));
+		// Without a host identity, a revival in between could not be ruled out.
+		if (!host.hostIncarnation) return false;
+		const activityAt = host.activity?.at;
+		const sameHost =
+			mark !== undefined &&
+			mark.hostIncarnation === host.hostIncarnation &&
+			(mark.activityAt === undefined || mark.activityAt === activityAt);
+		if (!sameHost) {
+			// First dead read, or the host ran in between: (re)open the window on what is seen now.
+			const next: DeadHostMark = {
+				at: now,
+				hostIncarnation: host.hostIncarnation,
+				...(activityAt === undefined ? {} : { activityAt }),
+			};
+			database.core.metaSet(deadSinceKey, JSON.stringify(next));
+			if (mark)
+				this.#manager.log(
+					`retired_hold_window_restarted origin=${this.originKey} opRef=${opRef} reason=host_changed`,
+					"warn",
+				);
 			return false;
 		}
-		const open = database.inbox.turnRow(opRef);
-		if (open?.state !== "pending" || (open.turn_state !== "accepted" && open.turn_state !== "bound")) {
+		if (trigger.state !== "pending" || (trigger.turn_state !== "accepted" && trigger.turn_state !== "bound")) {
 			this.#clearRetiredHoldDeadSince(opRef);
 			await this.#forgetClosed(bound);
 			return true;
@@ -4929,14 +5017,10 @@ class OriginActor {
 		bound.tail?.setTurnRunning(false);
 		this.#flushStaleOutput(bound, "session_gone");
 		await bound.tail?.close();
-		const completed = database.transaction((tx) => {
-			const changed = completeInboundTurn(database, tx, opRef, "turn_failed");
-			database.core.metaDelete(deadSinceKey);
-			return changed;
-		});
+		const completed = database.transaction((tx) => completeInboundTurn(database, tx, opRef, "turn_failed"));
 		for (const held of database.inbox.steersHeld(opRef)) await this.#abandonHeldSteer(held, opRef, bound);
 		this.#manager.log(
-			`retired_hold_abandoned origin=${this.originKey} epoch=${bound.epoch} opRef=${opRef} session=${bound.sessionId} notLiveMs=${now - deadSince} reason=host_not_live`,
+			`retired_hold_abandoned origin=${this.originKey} epoch=${bound.epoch} opRef=${opRef} session=${bound.sessionId} notLiveMs=${now - mark.at} host=${host.hostIncarnation} reason=host_not_live`,
 			"warn",
 		);
 		if (completed === 1) await this.#notifySettled(bound);

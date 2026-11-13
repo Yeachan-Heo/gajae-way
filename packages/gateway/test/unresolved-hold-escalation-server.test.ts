@@ -4,7 +4,13 @@ import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
-import { type GatewayServer, startUnixServer } from "../src/server/server";
+import { UNRESOLVED_HOLD_ESCALATED } from "../src/orchestrator/persona-session";
+import {
+	deterministicBindHoldDeliveryId,
+	escalationNoticeConfirmedInLedger,
+	type GatewayServer,
+	startUnixServer,
+} from "../src/server/server";
 import { Store } from "../src/store";
 import { ScriptedSessionPort } from "./session-port.fake";
 
@@ -388,3 +394,53 @@ test("a queued message the held prompt carried as context is closed as its input
 	expect(queued).toMatchObject({ state: "done", turn_role: "steer", turn_state: "done" });
 	expect(f.port.sendAttempts.filter((send) => send.opRef === heldOpRef)).toHaveLength(1);
 }, 30_000);
+
+test("an escalation notice counts as confirmed only once its origin adapter confirmed the delivery", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-escalation-confirmed-"));
+	const db = await Store.open(join(home, "gateway.db"));
+	try {
+		const originKey = "discord/dm/escalation/peer=owner";
+		const trigger = {
+			message_id: "m-held",
+			origin_ref_json: JSON.stringify({
+				platform: "discord",
+				kind: "dm",
+				conversationId: "escalation",
+				peerId: "owner",
+			}),
+		};
+		const deliveryId = deterministicBindHoldDeliveryId(originKey, trigger.message_id, UNRESOLVED_HOLD_ESCALATED);
+		// No row yet, then queued, then in flight: none of these is proof the user saw it.
+		expect(escalationNoticeConfirmedInLedger(db, originKey, trigger)).toBe(false);
+		db.transaction((tx) => db.outbox.create(tx, { deliveryId, turnId: "t", originKey, payloadJson: "{}" }));
+		expect(escalationNoticeConfirmedInLedger(db, originKey, trigger)).toBe(false);
+		db.transaction((tx) => db.outbox.markInflight(tx, deliveryId));
+		expect(escalationNoticeConfirmedInLedger(db, originKey, trigger)).toBe(false);
+		db.transaction((tx) => db.outbox.confirm(tx, deliveryId));
+		expect(escalationNoticeConfirmedInLedger(db, originKey, trigger)).toBe(true);
+		// An expired notice (adapter offline past the outbox TTL) is never confirmed.
+		const expiredId = deterministicBindHoldDeliveryId(originKey, "m-expired", UNRESOLVED_HOLD_ESCALATED);
+		db.transaction((tx) =>
+			db.outbox.create(
+				tx,
+				{ deliveryId: expiredId, turnId: "t", originKey, payloadJson: "{}" },
+				Date.now() - 2 * 86_400_000,
+			),
+		);
+		db.transaction((tx) => db.outbox.expireStale(tx, 86_400_000));
+		expect(db.outbox.get(expiredId)?.state).toBe("expired");
+		expect(escalationNoticeConfirmedInLedger(db, originKey, { ...trigger, message_id: "m-expired" })).toBe(false);
+		// Loopback notices are only logged: the hook is final.
+		expect(
+			escalationNoticeConfirmedInLedger(db, "loopback/loopback/x", {
+				message_id: "m",
+				origin_ref_json: JSON.stringify({ platform: "loopback", kind: "loopback", conversationId: "x" }),
+			}),
+		).toBe(true);
+		expect(escalationNoticeConfirmedInLedger(db, originKey, { message_id: "m", origin_ref_json: "not json" })).toBe(
+			false,
+		);
+	} finally {
+		db.close();
+	}
+});
