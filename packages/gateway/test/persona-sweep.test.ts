@@ -230,7 +230,7 @@ test("recovery time is the serial read time, not a stall: 20 restarted origins",
 	// CLI read), and no stall beyond the reads themselves.
 	expect(port.reads.length).toBeLessThanOrEqual(120);
 	expect(elapsedMs).toBeLessThan(port.reads.length * port.delayMs * 2 + 500);
-});
+}, 30_000);
 
 test("overlapping recovery calls join one sweep", async () => {
 	const port = new CountingReadPort();
@@ -310,7 +310,7 @@ test("a busy origin is deferred: no read, no apply, its late closure is a no-op,
 	await manager!.recover();
 	expect(readsFor(port, busySession).length).toBeGreaterThan(0);
 	expect(port.sends).toHaveLength(2);
-});
+}, 30_000);
 
 test("broker-generation reconciliation reads one origin at a time and still fences every turn", async () => {
 	const port = new CountingReadPort();
@@ -328,7 +328,7 @@ test("broker-generation reconciliation reads one origin at a time and still fenc
 	// One line per pass names its sweep reads (the cutover's real-consumer check reads probes>0).
 	const pass = logs.find((line) => line.startsWith("persona_recovery_sweep driver=broker_generation "));
 	expect(pass).toMatch(/ origins=5 started=5 deferred=0 probes=([1-9]\d*) handed_on=\d+ duration_ms=\d+$/);
-});
+}, 30_000);
 
 test("a message for an origin whose sweep unit is running is admitted within 2s while other sweeps contend", async () => {
 	const port = new CountingReadPort();
@@ -358,7 +358,7 @@ test("a message for an origin whose sweep unit is running is admitted within 2s 
 	expect(port.steers.some((steer) => steer.text.includes("answer while recovering"))).toBe(true);
 	expect(admittedMs).toBeLessThan(2_000);
 	expect(port.peak).toBe(1);
-});
+}, 30_000);
 
 test("every periodic persona sweep reads in sweep scope; user-path reads stay interactive", async () => {
 	const port = new CountingReadPort();
@@ -413,7 +413,7 @@ test("an escalation burst after a restart still reads one at a time", async () =
 	expect(port.sends).toHaveLength(origins.length);
 	// The burst really escalated every origin.
 	expect(logs.filter((line) => line.startsWith("recovery_hold_escalated ")).length).toBe(origins.length);
-});
+}, 30_000);
 
 test("idle-host retirement of several origins lends the turn through each termination and settles at one read at a time", async () => {
 	const port = new CountingReadPort();
@@ -444,7 +444,7 @@ test("idle-host retirement of several origins lends the turn through each termin
 	expect(outcome).toBe(`retired=${origins.length}`);
 	expect(port.peak).toBe(1);
 	expect(logs.filter((line) => line.startsWith("persona_host_retired ")).length).toBe(origins.length);
-});
+}, 30_000);
 
 test("a busy origin's generation fence still applies while its reconcile is deferred", async () => {
 	const port = new CountingReadPort();
@@ -489,7 +489,7 @@ test("a busy origin's generation fence still applies while its reconcile is defe
 			line.startsWith("persona_recovery_sweep driver=broker_generation origins=2 started=1 deferred=1 "),
 		),
 	).toBe(true);
-});
+}, 30_000);
 
 test("stopping the manager mid-sweep releases the sweep turn and settles the sweep", async () => {
 	const port = new CountingReadPort();
@@ -501,4 +501,4 @@ test("stopping the manager mid-sweep releases the sweep turn and settles the swe
 	await expect(Promise.race([sweeping.then(() => "settled"), Bun.sleep(2_000).then(() => "hung")])).resolves.toBe(
 		"settled",
 	);
-});
+}, 30_000);

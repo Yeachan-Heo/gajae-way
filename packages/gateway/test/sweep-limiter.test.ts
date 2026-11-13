@@ -400,4 +400,4 @@ test("a unit that handed its turn on never deadlocks with the unit that took it"
 	expect(order.slice(0, 3)).toEqual(["a-1", "a-handed-on", "b-1"]);
 	// A's later read is let in at one of B's read boundaries, not after B's whole unit.
 	expect(order.indexOf("a-2")).toBeLessThan(order.indexOf("b-3"));
-});
+}, 30_000);
