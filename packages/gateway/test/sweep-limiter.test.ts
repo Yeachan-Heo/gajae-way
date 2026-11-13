@@ -11,7 +11,7 @@ import {
 	SweepTurns,
 	singleFlight,
 	sweepControl,
-	sweepLend,
+	sweepHandOn,
 } from "../src/orchestrator/sweep-limiter";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { Store } from "../src/store";
@@ -60,7 +60,7 @@ test("sweep reads share one slot process-wide; nested scopes join, control leave
 	expect(inSweep()).toBe(false);
 });
 
-test("a sweep turn is lent to the next unit during a control operation and reclaimed first in line", async () => {
+test("a control operation hands the turn to the next unit; the unit continues without it", async () => {
 	const limiter = new SweepLimiter();
 	const turns = new SweepTurns();
 	const order: string[] = [];
@@ -78,40 +78,16 @@ test("a sweep turn is lent to the next unit during a control operation and recla
 	// B takes the turn while A is inside its control operation.
 	const second = await turns.take();
 	order.push("B:took-turn");
-	// A newcomer queued behind B must not overtake A's reclaim.
-	const newcomer = turns.take().then((turn) => {
-		order.push("C:took-turn");
-		turn.release();
-	});
 	control.resolve();
-	await Bun.sleep(1);
-	expect(order).toEqual(["A:read", "A:control-start", "B:took-turn", "A:control-end"]);
-	second.release();
+	// A finishes without waiting for the turn back, while B still holds it.
 	await unitA;
+	expect(order).toEqual(["A:read", "A:control-start", "B:took-turn", "A:control-end", "A:after-control"]);
+	expect(first.held).toBe(false);
+	expect(second.held).toBe(true);
+	// Releasing a handed-on turn is a no-op; only the holder frees the slot.
 	first.release();
-	await newcomer;
-	expect(order).toEqual([
-		"A:read",
-		"A:control-start",
-		"B:took-turn",
-		"A:control-end",
-		"A:after-control",
-		"C:took-turn",
-	]);
-	// Releasing a lent turn leaks nothing: the slot is free again.
-	expect(turns.tryTake()).toBeDefined();
-});
-
-test("a turn released while lent does not reclaim the slot", async () => {
-	const turns = new SweepTurns();
-	const limiter = new SweepLimiter();
-	const turn = await turns.take();
-	const control = deferred();
-	const unit = limiter.runTurn(turn, async () => await sweepControl(async () => await control.promise));
-	await Bun.sleep(1);
-	turn.release();
-	control.resolve();
-	await unit;
+	expect(turns.tryTake()).toBeUndefined();
+	second.release();
 	const next = turns.tryTake();
 	expect(next).toBeDefined();
 	expect(turns.tryTake()).toBeUndefined();
@@ -255,7 +231,7 @@ test("a persona unit keeps the read slot across its reads; other sweeps read bet
 	expect(order).toEqual(["unit-1", "unit-2", "unit-3", "lane"]);
 });
 
-test("a unit lends the read slot with its turn and a finished unit leaks no slot", async () => {
+test("a unit gives the read slot up with its turn and a finished unit leaks no slot", async () => {
 	const limiter = new SweepLimiter();
 	const turns = new SweepTurns();
 	const order: string[] = [];
@@ -283,24 +259,24 @@ test("a unit lends the read slot with its turn and a finished unit leaks no slot
 	expect(order).toEqual(["unit-1", "control", "lane-during-control", "unit-2", "late", "after"]);
 });
 
-test("sweepLend keeps the sweep scope while lending the turn", async () => {
+test("sweepHandOn keeps the sweep scope while handing the turn on", async () => {
 	const limiter = new SweepLimiter();
 	const turns = new SweepTurns();
 	const turn = await turns.take();
 	const seen: boolean[] = [];
-	const lending = Promise.withResolvers<void>();
+	const step = Promise.withResolvers<void>();
 	const unit = limiter.runTurn(turn, async () => {
-		await sweepLend(async () => {
+		await sweepHandOn(async () => {
 			seen.push(inSweep());
-			await lending.promise;
+			await step.promise;
 		});
 	});
 	await Bun.sleep(1);
 	const next = turns.tryTake();
 	expect(next).toBeDefined();
-	next?.release();
-	lending.resolve();
+	step.resolve();
 	await unit;
+	next?.release();
 	turn.release();
 	expect(seen).toEqual([true]);
 });
@@ -330,7 +306,7 @@ test("singleFlight skips a run while one is in flight and a failed run clears th
 	expect(runs).toBe(2);
 });
 
-test("BrokerSessionPort control methods leave the sweep scope; host termination lends but keeps its reads in scope", async () => {
+test("BrokerSessionPort control methods leave the sweep scope; host termination hands the turn on but keeps its reads in scope", async () => {
 	const file = await readFile(join(import.meta.dir, "../src/orchestrator/session-port.ts"), "utf8");
 	const source = file.slice(file.indexOf("export class BrokerSessionPort"));
 	const control = [
@@ -355,7 +331,7 @@ test("BrokerSessionPort control methods leave the sweep scope; host termination 
 		);
 	}
 	const terminate = source.slice(source.search(/\n\tasync terminateHost\(/));
-	expect(terminate.slice(0, 600)).toContain("return await sweepLend(");
+	expect(terminate.slice(0, 600)).toContain("return await sweepHandOn(");
 });
 
 test("a sweep read keeps a caller's own longer budget", async () => {
@@ -379,4 +355,49 @@ test("a sweep read keeps a caller's own longer budget", async () => {
 		{ op: "turn.result", timeoutMs: 15_000 },
 		{ op: "inspect", timeoutMs: SWEEP_READ_TIMEOUT_MS },
 	]);
+});
+
+test("a unit that handed its turn on never deadlocks with the unit that took it", async () => {
+	const limiter = new SweepLimiter();
+	const turns = new SweepTurns();
+	const order: string[] = [];
+	let inFlight = 0;
+	let peak = 0;
+	const read = (label: string, ms = 2) =>
+		limiter.read(async () => {
+			inFlight++;
+			peak = Math.max(peak, inFlight);
+			order.push(label);
+			await Bun.sleep(ms);
+			inFlight--;
+		});
+	const first = await turns.take();
+	const unitA = limiter.runTurn(first, async () => {
+		await read("a-1");
+		// Host termination: the turn goes on, and the termination still reads and
+		// then waits through its grace while the next unit runs.
+		await sweepHandOn(async () => {
+			await read("a-handed-on");
+			await Bun.sleep(20);
+		});
+		await read("a-2");
+	});
+	const second = await turns.take();
+	const unitB = limiter
+		.runTurn(second, async () => {
+			await read("b-1", 10);
+			await read("b-2", 10);
+			await read("b-3", 10);
+		})
+		.finally(() => second.release());
+	const outcome = await Promise.race([
+		Promise.all([unitA, unitB]).then(() => "settled"),
+		Bun.sleep(2_000).then(() => "deadlock"),
+	]);
+	first.release();
+	expect(outcome).toBe("settled");
+	expect(peak).toBe(1);
+	expect(order.slice(0, 3)).toEqual(["a-1", "a-handed-on", "b-1"]);
+	// A's later read is let in at one of B's read boundaries, not after B's whole unit.
+	expect(order.indexOf("a-2")).toBeLessThan(order.indexOf("b-3"));
 });

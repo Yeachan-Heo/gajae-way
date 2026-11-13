@@ -46,7 +46,7 @@ import {
 } from "./failed-turn-evidence";
 import { isSessionGoneCode } from "./gjc-contract";
 import { isRebindableCode, sanitizeDiagnostic } from "./rebind";
-import { currentSweep, inSweep, SWEEP_READ_TIMEOUT_MS, sweepControl, sweepLend } from "./sweep-limiter";
+import { currentSweep, inSweep, SWEEP_READ_TIMEOUT_MS, sweepControl, sweepHandOn } from "./sweep-limiter";
 import {
 	isRelayTransportFailure,
 	isUnwrittenRelayRequest,
@@ -1217,9 +1217,9 @@ export class BrokerSessionPort implements SessionPort {
 		repo: string;
 		shouldTerminate?: () => boolean | Promise<boolean>;
 	}): Promise<TerminateHostOutcome> {
-		// Termination waits through its signal grace, so a sweep lends its turn
-		// meanwhile; the inspect and guard reads stay sweep reads.
-		return await sweepLend(async () => await this.#terminateHost(input));
+		// Termination waits through its signal grace, so a sweep hands its turn to
+		// the next origin; the inspect and guard reads stay sweep reads.
+		return await sweepHandOn(async () => await this.#terminateHost(input));
 	}
 
 	async #terminateHost(input: {

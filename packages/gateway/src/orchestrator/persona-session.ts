@@ -903,7 +903,7 @@ export class PersonaSessionManager {
 		work: (actor: OriginActor) => Promise<void>,
 	): Promise<OriginActor[]> {
 		const startedAt = this.#now();
-		const readsBefore = this.#sweep.unitReads;
+		const turns: SweepTurn[] = [];
 		let deferred = 0;
 		const started: Array<Promise<OriginActor>> = [];
 		for (const actor of actors) {
@@ -911,6 +911,7 @@ export class PersonaSessionManager {
 				break;
 			}
 			const turn = this.#sweepTurns.tryTake() ?? (await this.#sweepTurns.take());
+			turns.push(turn);
 			// An idle mailbox starts the unit on its next turn; only a busy one can defer it.
 			const unit = actor.mailboxBusy
 				? await this.#startBusySweepUnit(driver, actor, turn, work)
@@ -935,7 +936,7 @@ export class PersonaSessionManager {
 		} finally {
 			if (actors.length > 0)
 				this.#log(
-					`persona_recovery_sweep driver=${driver} origins=${actors.length} started=${started.length} deferred=${deferred} probes=${this.#sweep.unitReads - readsBefore} duration_ms=${this.#now() - startedAt}`,
+					`persona_recovery_sweep driver=${driver} origins=${actors.length} started=${started.length} deferred=${deferred} probes=${turns.reduce((sum, turn) => sum + turn.readCount, 0)} handed_on=${turns.filter((turn) => turn.handedOn).length} duration_ms=${this.#now() - startedAt}`,
 				);
 		}
 	}

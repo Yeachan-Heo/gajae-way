@@ -3,7 +3,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
-import { currentSweep, inSweep, SWEEP_MAILBOX_WAIT_MS } from "../src/orchestrator/sweep-limiter";
+import {
+	currentSweep,
+	inSweep,
+	SWEEP_MAILBOX_WAIT_MS,
+	sweepControl,
+	sweepHandOn,
+} from "../src/orchestrator/sweep-limiter";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
@@ -72,6 +78,44 @@ class CountingReadPort extends ScriptedSessionPort {
 		return await this.#counted("status", input.sessionId, async () => await super.status(input));
 	}
 
+	override async runningJobs(input: Parameters<ScriptedSessionPort["runningJobs"]>[0]) {
+		return await this.#counted("jobs", input.sessionId, async () => await super.runningJobs(input));
+	}
+
+	/** Grace a termination waits through after its inspect read (the real port's signal grace). */
+	terminationGraceMs = 0;
+
+	// Control operations and host termination behave like BrokerSessionPort's in a
+	// sweep: control leaves the sweep scope, termination lends the turn and keeps
+	// its own inspect read in scope.
+	override async terminateHost(input: Parameters<ScriptedSessionPort["terminateHost"]>[0]) {
+		return await sweepHandOn(async () => {
+			await this.#counted("inspect", input.sessionId, async () => undefined);
+			if (this.terminationGraceMs > 0) await Bun.sleep(this.terminationGraceMs);
+			return await super.terminateHost(input);
+		});
+	}
+
+	override async bind(input: Parameters<ScriptedSessionPort["bind"]>[0]) {
+		return await sweepControl(async () => await super.bind(input));
+	}
+
+	override async send(input: Parameters<ScriptedSessionPort["send"]>[0]) {
+		return await sweepControl(async () => await super.send(input));
+	}
+
+	override async steer(input: Parameters<ScriptedSessionPort["steer"]>[0]) {
+		return await sweepControl(async () => await super.steer(input));
+	}
+
+	override async resume(input: Parameters<ScriptedSessionPort["resume"]>[0]) {
+		return await sweepControl(async () => await super.resume(input));
+	}
+
+	override async attachTail(input: Parameters<ScriptedSessionPort["attachTail"]>[0]) {
+		return await sweepControl(async () => await super.attachTail(input));
+	}
+
 	resetCounts(): void {
 		this.reads.length = 0;
 		this.scopes.length = 0;
@@ -109,6 +153,7 @@ function newManager(
 		log?: (line: string) => void;
 		brokerGeneration?: () => number;
 		unresolvedHoldMs?: number;
+		hostIdleRetireMs?: number;
 	} = {},
 ): PersonaSessionManager {
 	return new PersonaSessionManager({
@@ -119,6 +164,7 @@ function newManager(
 		maxLiveHosts: 32,
 		...(extra.brokerGeneration ? { brokerGeneration: extra.brokerGeneration } : {}),
 		...(extra.unresolvedHoldMs ? { unresolvedHoldMs: extra.unresolvedHoldMs } : {}),
+		...(extra.hostIdleRetireMs ? { hostIdleRetireMs: extra.hostIdleRetireMs } : {}),
 		...(extra.setTimeout ? { setTimeout: extra.setTimeout, clearTimeout: () => {} } : {}),
 		log: extra.log ?? (() => {}),
 		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
@@ -180,9 +226,9 @@ test("recovery time is the serial read time, not a stall: 20 restarted origins",
 	const perOrigin = port.reads.length / origins.length;
 	expect(perOrigin).toBeGreaterThanOrEqual(4);
 	expect(perOrigin).toBeLessThanOrEqual(6);
-	// The contract's bound in read-latency units: 20 origins within 120 serial reads
-	// (<= 120s at a 1s gjc CLI read), and no stall beyond the reads themselves.
-	expect(elapsedMs / port.delayMs).toBeLessThanOrEqual(120);
+	// The contract's bound: 20 origins within 120 serial reads (<= 120s at a 1s gjc
+	// CLI read), and no stall beyond the reads themselves.
+	expect(port.reads.length).toBeLessThanOrEqual(120);
 	expect(elapsedMs).toBeLessThan(port.reads.length * port.delayMs * 2 + 500);
 });
 
@@ -281,7 +327,7 @@ test("broker-generation reconciliation reads one origin at a time and still fenc
 	expect(port.sends).toHaveLength(origins.length);
 	// One line per pass names its sweep reads (the cutover's real-consumer check reads probes>0).
 	const pass = logs.find((line) => line.startsWith("persona_recovery_sweep driver=broker_generation "));
-	expect(pass).toMatch(/ origins=5 started=5 deferred=0 probes=([1-9]\d*) duration_ms=\d+$/);
+	expect(pass).toMatch(/ origins=5 started=5 deferred=0 probes=([1-9]\d*) handed_on=\d+ duration_ms=\d+$/);
 });
 
 test("a message for an origin whose sweep unit is running is admitted within 2s while other sweeps contend", async () => {
@@ -365,6 +411,39 @@ test("an escalation burst after a restart still reads one at a time", async () =
 	expect(port.reads.length).toBeGreaterThanOrEqual(origins.length * 4);
 	expect(port.peak).toBe(1);
 	expect(port.sends).toHaveLength(origins.length);
+	// The burst really escalated every origin.
+	expect(logs.filter((line) => line.startsWith("recovery_hold_escalated ")).length).toBe(origins.length);
+});
+
+test("idle-host retirement of several origins lends the turn through each termination and settles at one read at a time", async () => {
+	const port = new CountingReadPort();
+	const logs: string[] = [];
+	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-sweep-"));
+	database = await Store.open(join(home, "gateway.db"));
+	attachTestBrokerOwnership(database, port, join(home, "agent"));
+	manager = newManager(port, { log: (line) => logs.push(line), hostIdleRetireMs: 1 });
+	const origins = Array.from({ length: 4 }, (_, index) => sweepOrigin(index));
+	for (const origin of origins) {
+		enqueueAt(origin, `idle-${origin.key}`, "answer once");
+		await manager.notifyInbound(origin.key);
+	}
+	for (const send of port.sends) port.complete(send.opRef, "done");
+	for (const origin of origins) await manager.tick(origin.key);
+	await eventually(
+		() => port.sends.every((send) => database!.inbox.turnRow(send.opRef)?.turn_state === "done"),
+		"turns did not settle",
+	);
+	await Bun.sleep(5);
+	port.resetCounts();
+	port.delayMs = 5;
+	port.terminationGraceMs = 20;
+	const outcome = await Promise.race([
+		manager.sweepIdleHosts().then((retired) => `retired=${retired}`),
+		Bun.sleep(5_000).then(() => "hung"),
+	]);
+	expect(outcome).toBe(`retired=${origins.length}`);
+	expect(port.peak).toBe(1);
+	expect(logs.filter((line) => line.startsWith("persona_host_retired ")).length).toBe(origins.length);
 });
 
 test("a busy origin's generation fence still applies while its reconcile is deferred", async () => {

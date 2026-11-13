@@ -16,16 +16,16 @@ export const SWEEP_MAILBOX_WAIT_MS = 2_000;
 /** Default bound for a sweep-scope CLI read that brings none; a caller's own budget is kept. */
 export const SWEEP_READ_TIMEOUT_MS = 10_000;
 /**
- * A persona sweep unit holding its turn this long is logged (`sweep_unit_slow`).
- * A unit is the origin's existing sequential recovery chain, so it is never cut
- * off mid-way (that would apply half of an authority decision); its length is
+ * A persona sweep unit running this long is logged (`sweep_unit_slow`). A unit
+ * is the origin's existing sequential recovery chain, so it is never cut off
+ * mid-way (that would apply half of an authority decision); its length is
  * bounded by its reads, each a single sweep read with its own bound.
  */
 export const SWEEP_UNIT_SLOW_MS = 10_000;
 
 interface SweepScope {
 	readonly limiter: SweepLimiter;
-	/** The persona sweep turn held by this unit, released around control operations. */
+	/** The persona sweep turn of this unit (held until the unit ends or hands it on). */
 	readonly turn?: SweepTurn;
 }
 
@@ -33,27 +33,28 @@ const scope = new AsyncLocalStorage<SweepScope>();
 
 /**
  * How many priority grants in a row may pass over a waiting ordinary sweep
- * read: enough for one persona unit's reads (inspect, status, inspect,
- * liveness, reconcile, observer) to finish without interleaving, so the
- * mailbox a user message waits on is released quickly, while lane, monitor
- * and work-observer reads still get every ninth grant.
+ * read, so lane, monitor and work-observer reads still progress while persona
+ * units read back to back.
  */
 const PRIORITY_RUN = 8;
 
 /**
- * FIFO counting slot. A resuming holder is served first; then priority
- * waiters, except that an ordinary waiter is served after PRIORITY_RUN
- * priority grants passed it over, so neither class can starve the other.
+ * FIFO counting slot with two waiter classes: priority waiters are served
+ * first, except that an ordinary waiter is served after PRIORITY_RUN priority
+ * grants passed it over, so neither class can starve the other.
  */
 class Slot {
 	#available: number;
 	readonly #waiting: Array<() => void> = [];
 	readonly #priority: Array<() => void> = [];
-	readonly #resuming: Array<() => void> = [];
 	#passedOver = 0;
 
 	constructor(capacity: number) {
 		this.#available = capacity;
+	}
+
+	get priorityWaiting(): boolean {
+		return this.#priority.length > 0;
 	}
 
 	tryAcquire(): boolean {
@@ -62,17 +63,17 @@ class Slot {
 		return true;
 	}
 
-	acquire(lane: "ordinary" | "priority" | "resume" = "ordinary"): Promise<void> {
+	acquire(lane: "ordinary" | "priority" = "ordinary"): Promise<void> {
 		if (this.#available > 0) {
 			this.#available--;
 			return Promise.resolve();
 		}
-		const queue = lane === "resume" ? this.#resuming : lane === "priority" ? this.#priority : this.#waiting;
+		const queue = lane === "priority" ? this.#priority : this.#waiting;
 		return new Promise<void>((resolve) => queue.push(resolve));
 	}
 
 	release(): void {
-		const next = this.#resuming.shift() ?? this.#nextWaiter();
+		const next = this.#nextWaiter();
 		if (next) next();
 		else this.#available++;
 	}
@@ -96,22 +97,21 @@ class Slot {
  * is sweep scope: every SDK CLI call it makes (and that is not a control
  * operation) waits for the shared read slot, so the gateway never has more than
  * SWEEP_READ_CONCURRENCY sweep children alive whatever the number of origins,
- * lanes or monitors being swept. Other sweeps hold the slot only for the leaf
- * CLI call. A persona sweep unit occupies an origin mailbox a user message may
- * be waiting on, so it keeps the slot from its first read until it ends or
- * lends its turn, and its reads run one at a time without queueing behind other
- * sweeps; it never waits on anything else while holding the slot, so no sweep
- * can deadlock on it. Control operations (send, bind, resume, relay attach)
- * leave the sweep scope and run as ordinary interactive work.
+ * lanes or monitors being swept.
+ *
+ * Lane, monitor and work-observer sweeps hold the slot only for the leaf CLI
+ * call. A persona sweep unit occupies an origin mailbox a user message may be
+ * waiting on, so its reads are served ahead of those, one at a time, and while
+ * it holds its turn it keeps the slot between its reads rather than queueing
+ * behind other sweeps (it gives the slot up at a read boundary when another
+ * unit's read is waiting). A unit that hands its turn on (a control operation
+ * or host termination) gives the slot up too and continues with per-read
+ * acquisition, so nothing that holds the slot ever waits for a turn: there is
+ * no cycle to deadlock on. Control operations (send, bind, resume, relay
+ * attach) leave the sweep scope and run as ordinary interactive work.
  */
 export class SweepLimiter {
 	readonly #reads = new Slot(SWEEP_READ_CONCURRENCY);
-	#unitReads = 0;
-
-	/** Sweep CLI reads persona sweep units have made (for the per-pass log line). */
-	get unitReads(): number {
-		return this.#unitReads;
-	}
 
 	/** Runs `work` in sweep scope. Nested calls join the enclosing scope. */
 	run<T>(work: () => Promise<T>): Promise<T> {
@@ -126,18 +126,19 @@ export class SweepLimiter {
 		// A read a finished unit left behind (a fire-and-forget promise) is an ordinary sweep read.
 		if (turn && !turn.finished)
 			return await turn.serialRead(async () => {
-				this.#unitReads++;
-				if (!turn.readSlotHeld) {
-					await this.#reads.acquire("priority");
-					if (turn.finished) {
-						try {
-							return await work();
-						} finally {
-							this.#reads.release();
-						}
+				// Another unit's read is waiting (e.g. a unit that handed its turn on): let it in.
+				if (turn.readSlotHeld && this.#reads.priorityWaiting) turn.dropReadSlot();
+				if (turn.readSlotHeld) return await work();
+				await this.#reads.acquire("priority");
+				// Only a unit that holds its turn keeps the slot between reads.
+				if (!turn.held) {
+					try {
+						return await work();
+					} finally {
+						this.#reads.release();
 					}
-					turn.holdReadSlot(() => this.#reads.release());
 				}
+				turn.holdReadSlot(() => this.#reads.release());
 				return await work();
 			});
 		await this.#reads.acquire("ordinary");
@@ -155,10 +156,10 @@ export class SweepLimiter {
 }
 
 /**
- * Serializes persona sweep units across origins: a driver hands the next origin
- * its unit only when the current unit finished or is inside a control
- * operation. The turn is acquired outside every mailbox; it schedules units,
- * while the read slot is what bounds children.
+ * Serializes the start of persona sweep units across origins: a driver starts
+ * the next origin's unit only when the current unit finished or handed its
+ * turn on. The turn is taken outside every mailbox; it schedules units, while
+ * the read slot is what bounds children.
  */
 export class SweepTurns {
 	readonly #slot = new Slot(1);
@@ -178,15 +179,19 @@ export class SweepTurn {
 	readonly #slot: Slot;
 	#held = true;
 	#released = false;
-	#resuming: Promise<void> | undefined;
 	/** Releases the sweep read slot this unit holds between its reads. */
 	#releaseReadSlot: (() => void) | undefined;
 	#reads: Promise<void> = Promise.resolve();
+	/** Unit reads running now (at most one: reads are serialized). */
+	#activeReads = 0;
+	#readCount = 0;
+	#handedOn = false;
 
 	constructor(slot: Slot) {
 		this.#slot = slot;
 	}
 
+	/** True while this unit still holds the turn (not ended, not handed on). */
 	get held(): boolean {
 		return this.#held && !this.#released;
 	}
@@ -196,14 +201,31 @@ export class SweepTurn {
 		return this.#released;
 	}
 
+	/** True once the unit handed its turn on before ending (the per-pass `handed_on=` count). */
+	get handedOn(): boolean {
+		return this.#handedOn;
+	}
+
+	/** CLI reads this unit made (the per-pass `probes=` count). */
+	get readCount(): number {
+		return this.#readCount;
+	}
+
 	/** @internal True while this unit holds the sweep read slot. */
 	get readSlotHeld(): boolean {
 		return this.#releaseReadSlot !== undefined;
 	}
 
-	/** @internal Keeps the read slot until the unit ends or lends its turn. */
+	/** @internal Keeps the read slot until the unit ends, hands its turn on or lets another unit read. */
 	holdReadSlot(release: () => void): void {
 		this.#releaseReadSlot = release;
+	}
+
+	/** @internal Gives up the read slot this unit holds between reads. */
+	dropReadSlot(): void {
+		const release = this.#releaseReadSlot;
+		this.#releaseReadSlot = undefined;
+		release?.();
 	}
 
 	/** @internal Runs the unit's reads one at a time, fire-and-forget ones included. */
@@ -214,51 +236,41 @@ export class SweepTurn {
 			done = resolve;
 		});
 		await previous;
+		this.#readCount++;
+		this.#activeReads++;
 		try {
 			return await work();
 		} finally {
+			this.#activeReads--;
+			// A unit that handed its turn on or ended while this read ran gives the slot up now.
+			if (!this.held) this.dropReadSlot();
 			done();
 		}
 	}
 
+	/** Ends the unit: the turn goes to the next origin and the read slot is given up. */
 	release(): void {
-		this.#dropReadSlot();
-		if (this.#released) return;
+		if (this.#activeReads === 0) this.dropReadSlot();
+		this.#handOn();
 		this.#released = true;
-		if (this.#held) {
-			this.#held = false;
-			this.#slot.release();
-		}
 	}
 
-	/** Gives the turn to the next origin for the duration of `work`, then takes it back first in line. */
-	async lend<T>(work: () => Promise<T>): Promise<T> {
-		this.#dropReadSlot();
-		if (this.held) {
-			this.#held = false;
-			this.#slot.release();
-		}
-		try {
-			return await work();
-		} finally {
-			await this.#reclaim();
-		}
+	/**
+	 * Hands the turn to the next origin for the rest of this unit (a control
+	 * operation, host termination). The unit keeps running in its own mailbox;
+	 * its later reads take the read slot one leaf call at a time.
+	 */
+	handOn(): void {
+		if (this.held) this.#handedOn = true;
+		this.#handOn();
+		// A read still running keeps the slot until it ends (then drops it).
+		if (this.#activeReads === 0) this.dropReadSlot();
 	}
 
-	#dropReadSlot(): void {
-		const release = this.#releaseReadSlot;
-		this.#releaseReadSlot = undefined;
-		release?.();
-	}
-
-	async #reclaim(): Promise<void> {
-		if (this.#released || this.#held) return;
-		this.#resuming ??= this.#slot.acquire("resume").then(() => {
-			this.#resuming = undefined;
-			if (this.#released) this.#slot.release();
-			else this.#held = true;
-		});
-		await this.#resuming;
+	#handOn(): void {
+		if (!this.#held || this.#released) return;
+		this.#held = false;
+		this.#slot.release();
 	}
 }
 
@@ -280,11 +292,11 @@ export function outsideSweep<T>(work: () => T): T {
 /**
  * A long sweep step that is not a control operation (host termination waits
  * through its signal grace): it stays in sweep scope, so its CLI reads remain
- * sweep reads, but the persona sweep turn is lent to the next origin meanwhile.
+ * sweep reads, but the unit hands its persona sweep turn to the next origin.
  */
-export async function sweepLend<T>(work: () => Promise<T>): Promise<T> {
-	const turn = scope.getStore()?.turn;
-	return turn ? await turn.lend(work) : await work();
+export async function sweepHandOn<T>(work: () => Promise<T>): Promise<T> {
+	scope.getStore()?.turn?.handOn();
+	return await work();
 }
 
 /**
@@ -308,12 +320,12 @@ export function singleFlight(subsystem: string, run: () => Promise<void>, log: (
 
 /**
  * A control operation. Inside sweep scope it runs as ordinary interactive work
- * (its CLI calls do not take the sweep read slot) and lends the persona sweep
- * turn to the next origin while it runs.
+ * (its CLI calls do not take the sweep read slot), and the unit hands its
+ * persona sweep turn to the next origin.
  */
 export async function sweepControl<T>(work: () => Promise<T>): Promise<T> {
 	const current = scope.getStore();
 	if (!current) return await work();
-	const run = () => scope.exit(work);
-	return current.turn ? await current.turn.lend(run) : await run();
+	current.turn?.handOn();
+	return await scope.exit(work);
 }
