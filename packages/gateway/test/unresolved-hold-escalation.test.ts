@@ -129,6 +129,7 @@ async function heldOrigin(
 	});
 	port.setSessionState(binding.sessionId, { live: options.live });
 	port.setHostIncarnation(binding.sessionId, "linux:1001");
+	port.setActivity(binding.sessionId, "idle", 500);
 	if (options.newerMessage !== false) enqueue("m-next", "a newer message", new Date().toISOString());
 	const logs: string[] = [];
 	const notices: PersonaBindHoldInput[] = [];
@@ -582,6 +583,9 @@ test("an escalated hold whose host stays not live past retiredHoldAbandonMs is c
 		await f.manager.recover();
 		await until(() => f.port.sends.length === 1);
 		expect(f.notices).toHaveLength(1);
+		// The notice's delivery row is linked to the open hold, so outbox retention keeps its proof.
+		const links = () => f.db.core.metaKeysInRange("escalation-notice-delivery:", "escalation-notice-delivery:\uffff");
+		expect(links()).toHaveLength(1);
 		let statusReads = 0;
 		const status = f.port.status.bind(f.port);
 		f.port.status = async (input) => {
@@ -614,6 +618,8 @@ test("an escalated hold whose host stays not live past retiredHoldAbandonMs is c
 			expect(f.db.inbox.turnRow(f.heldOpRef)?.terminal_delivery_id).toBe(JSON.stringify({ none: "turn_failed" }));
 			expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBeUndefined();
 			expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeUndefined();
+			// Closing the hold releases its notice row to ordinary retention.
+			expect(links()).toHaveLength(0);
 			const abandoned = f.logs.filter(
 				(line) => line.startsWith("retired_hold_abandoned ") && line.includes(f.heldOpRef),
 			);
@@ -939,6 +945,50 @@ test("a not-live read without a host identity never abandons the hold", async ()
 		await sweepMinutes(clock, f.manager, f.originKey, 180);
 		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
 		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeUndefined();
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a not-live read without an activity stamp never opens or closes the window", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-no-activity", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		// Same incarnation throughout, but inspect may report no activity stamp.
+		const liveness = f.port.liveness.bind(f.port);
+		let stamp: number | undefined;
+		f.port.liveness = async (input) =>
+			input.sessionId === f.binding.sessionId
+				? {
+						live: false,
+						disowned: false,
+						hostIncarnation: "linux:1001",
+						...(stamp === undefined ? {} : { activity: { state: "idle", at: stamp } }),
+					}
+				: await liveness(input);
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		staleStatus(f);
+		await sweepMinutes(clock, f.manager, f.originKey, 120);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeUndefined();
+		// A stamp seen only later is not the same activity at both ends: it opens a fresh window.
+		stamp = 7_000;
+		await sweepMinutes(clock, f.manager, f.originKey, 2);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toContain('"activityAt":7000');
+		// The stamp vanishing at the window's end proves nothing either.
+		stamp = undefined;
+		await sweepMinutes(clock, f.manager, f.originKey, 70);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		stamp = 7_000;
+		await sweepMinutes(clock, f.manager, f.originKey, 2);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).toBe("done");
 	} finally {
 		await f.manager.stop();
 	}

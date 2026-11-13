@@ -9,6 +9,15 @@ import {
 	type WorkJournalEventType,
 } from "./journal";
 
+/**
+ * A delivery that is not the escalation notice of a still-open hold. The persona
+ * layer links such a notice with an `escalation-notice-delivery:<deliveryId>`
+ * meta key and deletes it when the hold completes; until then the confirmed row
+ * is the proof that the user was told, so retention keeps it.
+ */
+const UNLINKED_ESCALATION_NOTICE =
+	"NOT EXISTS (SELECT 1 FROM meta m WHERE m.key = 'escalation-notice-delivery:' || deliveries.delivery_id)";
+
 export type DeliveryState = "pending" | "inflight" | "confirmed" | "failed_ambiguous" | "expired";
 export type LedgerOutcome = "unknown" | "transitioned" | "already_terminal";
 const MAX_DEFINITIVE_FAILURES = 5;
@@ -274,7 +283,9 @@ export class OutboxGroup {
 
 	prune(tx: WriteTx, deliveredOlderThanMs: number, now = Date.now()): number {
 		const ids = this.#db
-			.prepare("SELECT delivery_id FROM deliveries WHERE state = 'confirmed' AND updated_at < ?")
+			.prepare(
+				`SELECT delivery_id FROM deliveries WHERE state = 'confirmed' AND updated_at < ? AND ${UNLINKED_ESCALATION_NOTICE}`,
+			)
 			.all(new Date(now - deliveredOlderThanMs).toISOString()) as Array<{ delivery_id: string }>;
 		return this.#delete(tx, ids);
 	}
@@ -398,7 +409,7 @@ export class OutboxGroup {
 	sweep(tx: WriteTx, cutoffs: { deliveryCutoff: string; historyCutoff: string; batch: number }): number {
 		const ids = this.#db
 			.prepare(
-				"SELECT delivery_id FROM deliveries WHERE (state = 'confirmed' AND updated_at < ?) OR (state = 'expired' AND updated_at < ?) ORDER BY rowid LIMIT ?",
+				`SELECT delivery_id FROM deliveries WHERE ((state = 'confirmed' AND updated_at < ?) OR (state = 'expired' AND updated_at < ?)) AND ${UNLINKED_ESCALATION_NOTICE} ORDER BY rowid LIMIT ?`,
 			)
 			.all(cutoffs.deliveryCutoff, cutoffs.historyCutoff, cutoffs.batch) as Array<{ delivery_id: string }>;
 		return this.#delete(tx, ids);

@@ -430,16 +430,46 @@ test("an escalation notice counts as confirmed only once its origin adapter conf
 		db.transaction((tx) => db.outbox.expireStale(tx, 86_400_000));
 		expect(db.outbox.get(expiredId)?.state).toBe("expired");
 		expect(escalationNoticeConfirmedInLedger(db, originKey, { ...trigger, message_id: "m-expired" })).toBe(false);
-		// Loopback notices are only logged: the hook is final.
+		// A loopback notice only reaches the gateway log, never the chat client: never confirmed.
 		expect(
 			escalationNoticeConfirmedInLedger(db, "loopback/loopback/x", {
 				message_id: "m",
 				origin_ref_json: JSON.stringify({ platform: "loopback", kind: "loopback", conversationId: "x" }),
 			}),
-		).toBe(true);
+		).toBe(false);
 		expect(escalationNoticeConfirmedInLedger(db, originKey, { message_id: "m", origin_ref_json: "not json" })).toBe(
 			false,
 		);
+	} finally {
+		db.close();
+	}
+});
+
+test("outbox retention keeps a confirmed escalation notice while its hold is linked, then prunes it", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-escalation-retention-"));
+	const db = await Store.open(join(home, "gateway.db"));
+	try {
+		const originKey = "discord/dm/escalation/peer=owner";
+		const linked = deterministicBindHoldDeliveryId(originKey, "m-linked", UNRESOLVED_HOLD_ESCALATED);
+		const unlinked = deterministicBindHoldDeliveryId(originKey, "m-unlinked", UNRESOLVED_HOLD_ESCALATED);
+		for (const deliveryId of [linked, unlinked])
+			db.transaction((tx) => {
+				db.outbox.create(tx, { deliveryId, turnId: "t", originKey, payloadJson: "{}" });
+				db.outbox.confirm(tx, deliveryId);
+			});
+		db.core.metaSet(`escalation-notice-delivery:${linked}`, "gw-p-held");
+		// A gateway down past the confirmed-row retention prunes at boot, before persona recovery.
+		const later = Date.now() + 30 * 86_400_000;
+		db.transaction((tx) => db.outbox.prune(tx, 7 * 86_400_000, later));
+		expect(db.outbox.get(unlinked)).toBeUndefined();
+		expect(db.outbox.get(linked)?.state).toBe("confirmed");
+		const cutoff = new Date(later).toISOString();
+		db.transaction((tx) => db.outbox.sweep(tx, { deliveryCutoff: cutoff, historyCutoff: cutoff, batch: 100 }));
+		expect(db.outbox.get(linked)?.state).toBe("confirmed");
+		// Once the hold completes and drops the link, ordinary retention applies.
+		db.core.metaDelete(`escalation-notice-delivery:${linked}`);
+		db.transaction((tx) => db.outbox.prune(tx, 7 * 86_400_000, later));
+		expect(db.outbox.get(linked)).toBeUndefined();
 	} finally {
 		db.close();
 	}

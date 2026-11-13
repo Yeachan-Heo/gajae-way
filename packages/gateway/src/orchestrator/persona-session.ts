@@ -171,11 +171,27 @@ function escalationNoticeConfirmedKey(opRef: string): string {
 	return `escalation-notice-confirmed:${opRef}`;
 }
 
+/**
+ * Links an escalation notice's delivery row to its open hold. Outbox retention
+ * keeps a confirmed row while this key exists, so the proof that the user was
+ * told outlives a gateway that stayed down past the confirmed-row retention.
+ * Deleted when the hold's turn completes.
+ */
+function escalationNoticeDeliveryKey(deliveryId: string): string {
+	return `escalation-notice-delivery:${deliveryId}`;
+}
+
+/** Deterministic delivery id of a bind-hold or escalation notice, so a replayed notice posts once. */
+export function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string, reason: string): string {
+	const kind = reason === UNRESOLVED_HOLD_ESCALATED ? UNRESOLVED_HOLD_ESCALATED : "bind_hold";
+	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|${kind}`).digest("hex").slice(0, 32)}`;
+}
+
 /** The not-live host a dead retired hold's abandonment window opened on. */
 interface DeadHostMark {
 	readonly at: number;
 	readonly hostIncarnation: string;
-	readonly activityAt?: number;
+	readonly activityAt: number;
 }
 
 function parseDeadHostMark(value: string | undefined): DeadHostMark | undefined {
@@ -184,13 +200,8 @@ function parseDeadHostMark(value: string | undefined): DeadHostMark | undefined 
 		const mark = JSON.parse(value) as Partial<DeadHostMark>;
 		if (typeof mark.at !== "number" || !Number.isFinite(mark.at)) return undefined;
 		if (typeof mark.hostIncarnation !== "string" || mark.hostIncarnation === "") return undefined;
-		if (mark.activityAt !== undefined && (typeof mark.activityAt !== "number" || !Number.isFinite(mark.activityAt)))
-			return undefined;
-		return {
-			at: mark.at,
-			hostIncarnation: mark.hostIncarnation,
-			...(mark.activityAt === undefined ? {} : { activityAt: mark.activityAt }),
-		};
+		if (typeof mark.activityAt !== "number" || !Number.isFinite(mark.activityAt)) return undefined;
+		return { at: mark.at, hostIncarnation: mark.hostIncarnation, activityAt: mark.activityAt };
 	} catch {
 		return undefined;
 	}
@@ -328,6 +339,7 @@ function completeInboundTurn(
 ): number {
 	const prompt = ownedTurnPrompt(store, opRef);
 	const consumeExit = prompt !== undefined && confirmedStalledExit(store, prompt);
+	const trigger = store.inbox.turnRow(opRef);
 	const changed = store.inbox.turnComplete(tx, opRef, unlinkedReason);
 	if (changed === 1 && prompt) store.bindings.abandonBrokerPromptBusyRefusal(tx, prompt);
 	if (changed === 1 && consumeExit) store.core.metaDelete(stalledExitProofKey(opRef));
@@ -336,6 +348,12 @@ function completeInboundTurn(
 	if (changed === 1) store.core.metaDelete(relayUnavailableTrackerKey(opRef));
 	if (changed === 1) store.core.metaDelete(retiredHoldDeadSinceKey(opRef));
 	if (changed === 1) store.core.metaDelete(escalationNoticeConfirmedKey(opRef));
+	if (changed === 1 && trigger)
+		store.core.metaDelete(
+			escalationNoticeDeliveryKey(
+				deterministicBindHoldDeliveryId(trigger.origin_key, trigger.message_id, UNRESOLVED_HOLD_ESCALATED),
+			),
+		);
 	return changed;
 }
 
@@ -2064,6 +2082,7 @@ class OriginActor {
 				this.#manager.log(`escalation_notice_unresolvable origin=${this.originKey} opRef=${opRef}`, "error");
 				continue;
 			}
+			this.#linkEscalationNotice(trigger);
 			const delivered = await this.#manager.emitBindHold({
 				originKey: this.originKey,
 				trigger,
@@ -4966,6 +4985,8 @@ class OriginActor {
 		if (database.core.metaGet(escalationNoticeKey(this.originKey, opRef)) !== undefined) return false;
 		const trigger = database.inbox.turnRow(opRef);
 		if (!trigger) return false;
+		// A hold escalated before the link existed gets it now, so retention keeps its proof from here on.
+		this.#linkEscalationNotice(trigger);
 		const confirmedKey = escalationNoticeConfirmedKey(opRef);
 		if (database.core.metaGet(confirmedKey) === undefined) {
 			// Queued is not delivered: an adapter offline past the outbox TTL expires
@@ -4987,20 +5008,15 @@ class OriginActor {
 		// disowned id (the broker lost the route; a detached host may still run),
 		// proves nothing: keep the window and ask again next sweep.
 		if (host.live !== false) return false;
-		// Without a host identity, a revival in between could not be ruled out.
-		if (!host.hostIncarnation) return false;
+		// Without a host identity and an activity stamp, a revival or late work in
+		// between could not be ruled out: keep the window and ask again next sweep.
 		const activityAt = host.activity?.at;
+		if (!host.hostIncarnation || activityAt === undefined) return false;
 		const sameHost =
-			mark !== undefined &&
-			mark.hostIncarnation === host.hostIncarnation &&
-			(mark.activityAt === undefined || mark.activityAt === activityAt);
+			mark !== undefined && mark.hostIncarnation === host.hostIncarnation && mark.activityAt === activityAt;
 		if (!sameHost) {
 			// First dead read, or the host ran in between: (re)open the window on what is seen now.
-			const next: DeadHostMark = {
-				at: now,
-				hostIncarnation: host.hostIncarnation,
-				...(activityAt === undefined ? {} : { activityAt }),
-			};
+			const next: DeadHostMark = { at: now, hostIncarnation: host.hostIncarnation, activityAt };
 			database.core.metaSet(deadSinceKey, JSON.stringify(next));
 			if (mark)
 				this.#manager.log(
@@ -5026,6 +5042,14 @@ class OriginActor {
 		if (completed === 1) await this.#notifySettled(bound);
 		await this.#forgetClosed(bound);
 		return true;
+	}
+
+	#linkEscalationNotice(trigger: InboundMessageRow): void {
+		const key = escalationNoticeDeliveryKey(
+			deterministicBindHoldDeliveryId(this.originKey, trigger.message_id, UNRESOLVED_HOLD_ESCALATED),
+		);
+		const database = this.#manager.database;
+		if (database.core.metaGet(key) === undefined) database.core.metaSet(key, trigger.turn_op_ref ?? "");
 	}
 
 	#clearRetiredHoldDeadSince(opRef: string): void {

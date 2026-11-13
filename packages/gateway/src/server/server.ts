@@ -94,6 +94,7 @@ import type { GlobalGjcClient } from "../orchestrator/broker";
 import { ghCheckStatusClient } from "../orchestrator/gh-checks";
 import { LaneGovernor } from "../orchestrator/lane-governor";
 import {
+	deterministicBindHoldDeliveryId,
 	PERSONA_RESTART_DRAIN_MAX_WAIT_MS,
 	PERSONA_RESTART_DRAIN_WAIT_MS,
 	type PersonaBindHoldInput,
@@ -4659,8 +4660,9 @@ function deterministicDeliveryExpiredNoticeId(deliveryId: string): string {
 /** One bind-hold notice per trigger, and one separate notice when that trigger's unresolved hold is escalated (#686). */
 /**
  * Whether the origin adapter confirmed the escalation notice of this trigger
- * (#686). Queued, in-flight, ambiguous or expired is not confirmed. Loopback
- * notices are only logged, so the hook itself is final there.
+ * (#686). Queued, in-flight, ambiguous or expired is not confirmed. A loopback
+ * notice is only written to the gateway log, which the chat client never shows,
+ * so it is never confirmed and a loopback hold is never abandoned.
  */
 export function escalationNoticeConfirmedInLedger(
 	database: Pick<Store, "outbox">,
@@ -4673,15 +4675,12 @@ export function escalationNoticeConfirmedInLedger(
 	} catch {
 		return false;
 	}
-	if (origin.platform === "loopback") return true;
+	if (origin.platform === "loopback") return false;
 	const deliveryId = deterministicBindHoldDeliveryId(originKey, trigger.message_id, UNRESOLVED_HOLD_ESCALATED);
 	return database.outbox.get(deliveryId)?.state === "confirmed";
 }
 
-export function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string, reason: string): string {
-	const kind = reason === UNRESOLVED_HOLD_ESCALATED ? UNRESOLVED_HOLD_ESCALATED : "bind_hold";
-	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|${kind}`).digest("hex").slice(0, 32)}`;
-}
+export { deterministicBindHoldDeliveryId };
 
 /** One deliverable part of a persona answer: here (optionally threaded) or posted to another conversation. */
 interface PlannedPart {
