@@ -2598,10 +2598,14 @@ async function waitForProcessExit(
 	}
 }
 
-/** `ps` is the portable process read on macOS and Linux; only a clean no-match proves the pid is gone. */
+/**
+ * `ps` is the portable process read on macOS and Linux. Gone is a clean
+ * no-match, or a zombie without live threads: it runs nothing, and its pid
+ * cannot be reused until its parent reaps it.
+ */
 async function processCommand(pid: number): Promise<ProcessCommandInspection> {
 	try {
-		const proc = Bun.spawn(["ps", "-o", "pid=,ppid=,pgid=,lstart=,command=", "-p", String(pid)], {
+		const proc = Bun.spawn(["ps", "-o", "pid=,ppid=,pgid=,stat=,lstart=,command=", "-p", String(pid)], {
 			stdout: "pipe",
 			stderr: "pipe",
 			env: { ...process.env, LC_ALL: "C" },
@@ -2614,15 +2618,20 @@ async function processCommand(pid: number): Promise<ProcessCommandInspection> {
 		const line = stdout.trim();
 		if (exitCode === 0 && line.length > 0) {
 			const match =
-				/^(\d+)\s+(\d+)\s+(\d+)\s+([A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})(?:\s+(.*))?$/.exec(
+				/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+([A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})(?:\s+(.*))?$/.exec(
 					line,
 				);
 			if (!match || Number(match[1]) !== pid) return { outcome: "unreadable", reason: "ps_pid_mismatch" };
+			if (match[4]!.startsWith("Z")) {
+				// Linux keeps an exited thread-group leader as a zombie while sibling
+				// threads still run; ps marks that with "l". Neither live nor gone.
+				return match[4]!.includes("l") ? { outcome: "unreadable", reason: "ps_zombie_threads" } : { outcome: "gone" };
+			}
 			return {
 				outcome: "live",
-				identity: `${match[1]}:${match[4]}`,
+				identity: `${match[1]}:${match[5]}`,
 				context: `${match[2]}:${match[3]}`,
-				command: match[5]?.trim() ?? "",
+				command: match[6]?.trim() ?? "",
 			};
 		}
 		if (exitCode === 1 && line.length === 0 && stderr.trim().length === 0) return { outcome: "gone" };
