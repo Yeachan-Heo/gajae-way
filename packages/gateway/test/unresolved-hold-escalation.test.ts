@@ -626,6 +626,53 @@ test("restart drain uses process exit rather than registry liveness", async () =
 });
 
 for (const probe of ["status", "hostExited"] as const) {
+	test(`a ${probe} probe still running at the drain deadline blocks the drain and frees the origin's queue`, async () => {
+		const clock = new VirtualClock();
+		const f = await heldOrigin(`restart-drain-deadline-${probe}`, {
+			heldForMs: 11 * MINUTE,
+			live: false,
+			newerMessage: false,
+			clock,
+		});
+		f.port.attachTail = async () => {
+			throw endpointStale();
+		};
+		const release = Promise.withResolvers<void>();
+		try {
+			await f.manager.recover();
+			const status = f.port.status.bind(f.port);
+			let statusReads = 0;
+			let exitReads = 0;
+			let hung = 0;
+			f.port.status = async (input) => {
+				statusReads++;
+				if (probe === "status" && hung++ === 0) await release.promise;
+				return await status(input);
+			};
+			f.port.hostExited = async () => {
+				exitReads++;
+				if (probe === "hostExited" && hung++ === 0) await release.promise;
+				return true;
+			};
+			// A hung probe is not exit evidence, and the drain returns at its own deadline.
+			await expect(f.manager.drainForRestart("deadline-drain", 30)).resolves.toBe("timed_out");
+			expect(probe === "status" ? statusReads : exitReads).toBe(1);
+			// The origin's actor queue is free while the probe is still hung.
+			await expect(
+				Promise.race([f.manager.reconcile(f.originKey).then(() => "ran"), Bun.sleep(1_000).then(() => "blocked")]),
+			).resolves.toBe("ran");
+			// Nothing was cached from the unfinished probe: the next drain probes again.
+			const before = probe === "status" ? statusReads : exitReads;
+			await expect(f.manager.drainForRestart("deadline-drain", 1_000)).resolves.toBe("drained");
+			expect(probe === "status" ? statusReads : exitReads).toBe(before + 1);
+		} finally {
+			release.resolve();
+			await f.manager.stop();
+		}
+	});
+}
+
+for (const probe of ["status", "hostExited"] as const) {
 	test(`restart drain stops after an in-progress ${probe} probe when the manager stops`, async () => {
 		const clock = new VirtualClock();
 		const f = await heldOrigin(`restart-drain-stop-${probe}`, {

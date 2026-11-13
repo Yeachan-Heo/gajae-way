@@ -156,6 +156,22 @@ function providerTransportRetryAttempt(
 	return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
+/** `work`'s result, or undefined when it is still running at `deadlineMs` (epoch ms). */
+async function beforeDeadline<T>(work: Promise<T>, deadlineMs: number): Promise<T | undefined> {
+	if (!Number.isFinite(deadlineMs)) return await work;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			work,
+			new Promise<undefined>((resolve) => {
+				timer = setTimeout(() => resolve(undefined), Math.max(0, deadlineMs - Date.now()));
+			}),
+		]);
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+	}
+}
+
 /** An escalated hold (#686) whose late answer is still wanted; restored on adoption after a restart. */
 function escalatedHoldKey(opRef: string): string {
 	return `escalated-hold:${opRef}`;
@@ -1104,7 +1120,9 @@ export class PersonaSessionManager {
 		for (;;) {
 			if (this.#stopped || this.#restartDrainId !== restartId) return "stopped";
 			const actors = [...this.#actors.values()];
-			const checks = Promise.all(actors.map((actor) => actor.enqueue(async () => await actor.hasUnsettledTurns())));
+			const checks = Promise.all(
+				actors.map((actor) => actor.enqueue(async () => await actor.hasUnsettledTurns(deadline))),
+			);
 			let timer: ReturnType<typeof setTimeout> | undefined;
 			const timedOut = Symbol("restart drain timed out");
 			let unsettled: (boolean | undefined)[] | typeof timedOut;
@@ -1561,7 +1579,13 @@ class OriginActor {
 		return this.#state;
 	}
 
-	async hasUnsettledTurns(): Promise<boolean> {
+	/**
+	 * Restart-drain check. `deadlineMs` (epoch ms) is the drain's own deadline: a
+	 * host probe still running then counts as blocked and releases this actor's
+	 * queue, so a hung status read or inspect cannot hold up the origin after
+	 * the drain has given up.
+	 */
+	async hasUnsettledTurns(deadlineMs = Number.POSITIVE_INFINITY): Promise<boolean> {
 		if (this.#state !== "idle" || this.#current !== undefined) return true;
 		for (const bound of this.#retired.values()) {
 			// Only a detached escalated hold whose operation is not reported active and
@@ -1576,30 +1600,39 @@ class OriginActor {
 				bound.restartDrainVerdict = undefined;
 				return true;
 			}
+			// Only a blocked verdict is cached. An exemption is re-proven on every
+			// drain poll, because it lets the restart go ahead while this turn's
+			// producer would be lost if the host were in fact still running.
 			const verdict = bound.restartDrainVerdict;
 			if (verdict && this.#manager.now() - verdict.checkedAtMs < STATUS_RECHECK_MIN_MS) return true;
-			let blocked = true;
-			try {
-				const report = await this.#statusForRecovery(bound.sessionId, bound.turn.opRef);
-				if (this.#stopped || this.#manager.stopped) return true;
-				const port = this.#manager.port;
-				// A report for another (or no) operation says nothing about this one, as in recovery.
-				if (
-					report.operationRef === bound.turn.opRef &&
-					report.status.status !== "accepted" &&
-					report.status.status !== "in_flight" &&
-					port.hostExited
-				) {
-					blocked = (await port.hostExited({ sessionId: bound.sessionId, repo: this.#manager.repo })) !== true;
-					if (this.#stopped || this.#manager.stopped) return true;
-				}
-			} catch {
-				// Unreadable host evidence keeps the producer fence.
-			}
+			const blocked = await beforeDeadline(this.#restartDrainProbe(bound), deadlineMs);
+			if (blocked === undefined) return true;
+			if (this.#stopped || this.#manager.stopped) return true;
 			bound.restartDrainVerdict = blocked ? { checkedAtMs: this.#manager.now(), blocked: true } : undefined;
 			if (blocked) return true;
 		}
 		return false;
+	}
+
+	/** True unless the held operation is reported settled and its host process is proven exited. */
+	async #restartDrainProbe(bound: BoundTurn): Promise<boolean> {
+		try {
+			const report = await this.#statusForRecovery(bound.sessionId, bound.turn.opRef);
+			if (this.#stopped || this.#manager.stopped) return true;
+			const port = this.#manager.port;
+			// A report for another (or no) operation says nothing about this one, as in recovery.
+			if (
+				report.operationRef !== bound.turn.opRef ||
+				report.status.status === "accepted" ||
+				report.status.status === "in_flight" ||
+				port.hostExited === undefined
+			)
+				return true;
+			return (await port.hostExited({ sessionId: bound.sessionId, repo: this.#manager.repo })) !== true;
+		} catch {
+			// Unreadable host evidence keeps the producer fence.
+			return true;
+		}
 	}
 
 	enqueue<T>(work: () => Promise<T>): Promise<T | undefined> {

@@ -268,6 +268,83 @@ test("hostExited proves an exited pid gone independently of broker liveness", as
 	}
 });
 
+/** A real zombie: a parent that never reaps its exited child. Resolves with the zombie's pid. */
+async function zombieHost(): Promise<{ readonly pid: number; readonly parent: ReturnType<typeof Bun.spawn> }> {
+	const parent = Bun.spawn(["perl", "-e", '$|=1; my $p = fork(); if ($p == 0) { exit 0 } print "$p\\n"; sleep 30'], {
+		stdout: "pipe",
+		stderr: "ignore",
+	});
+	const reader = (parent.stdout as ReadableStream<Uint8Array>).getReader();
+	const { value } = await reader.read();
+	reader.releaseLock();
+	const pid = Number(new TextDecoder().decode(value).trim());
+	// Wait until ps reports it as a zombie.
+	for (let i = 0; i < 100; i++) {
+		const ps = Bun.spawnSync(["ps", "-o", "stat=", "-p", String(pid)]);
+		if (ps.stdout.toString().trim().startsWith("Z")) break;
+		await Bun.sleep(10);
+	}
+	return { pid, parent };
+}
+
+test("a zombie host counts as exited: hostExited is true and terminateHost sends no signal", async () => {
+	const zombie = await zombieHost();
+	try {
+		expect(
+			Bun.spawnSync(["ps", "-o", "stat=", "-p", String(zombie.pid)])
+				.stdout.toString()
+				.trim(),
+		).toStartWith("Z");
+		for (const live of [true, false]) {
+			const h = await harness(() => zombie.pid, live);
+			try {
+				expect(await h.port.hostExited({ sessionId: "s-1", repo: h.repo })).toBe(true);
+				expect(await h.port.terminateHost({ sessionId: "s-1", repo: h.repo })).toEqual({ outcome: "already_gone" });
+			} finally {
+				await h.close();
+			}
+		}
+		// Its unreaped parent is still running and was never touched.
+		expect(await Promise.race([zombie.parent.exited, Bun.sleep(50).then(() => "alive")])).toBe("alive");
+	} finally {
+		zombie.parent.kill();
+		await zombie.parent.exited;
+	}
+});
+
+test("a zombie leader with live threads (Linux Zl) is not exit evidence; other zombie states are", async () => {
+	const pid = 4242;
+	const h = await harness(() => pid, false);
+	let stat = "Zl";
+	const spawn = spyOn(Bun, "spawn").mockImplementation((() => ({
+		stdout: new Response(`${pid}     1  ${pid} ${stat}    Fri Nov 13 11:40:54 2026     [host] <defunct>\n`).body,
+		stderr: new Response("").body,
+		exited: Promise.resolve(0),
+	})) as unknown as typeof Bun.spawn);
+	try {
+		for (const [state, exited] of [
+			["Zl", false],
+			["Zsl", false],
+			["Zl+", false],
+			["Z", true],
+			["Z+", true],
+			["Zs", true],
+			["ZN", true],
+		] as const) {
+			stat = state;
+			expect([state, await h.port.hostExited({ sessionId: "s-1", repo: h.repo })]).toEqual([state, exited]);
+		}
+		stat = "Zl";
+		expect(await h.port.terminateHost({ sessionId: "s-1", repo: h.repo })).toEqual({
+			outcome: "refused",
+			reason: "process_inspection_failed:ps_zombie_threads",
+		});
+	} finally {
+		spawn.mockRestore();
+		await h.close();
+	}
+});
+
 test("hostExited never treats an ambiguous or mismatched row's exited pid as the session's exit", async () => {
 	// Several state roots can claim one session; the broker projects one representative row
 	// (`ambiguous: true`). Its dead pid says nothing about the other, possibly live, host.
@@ -355,7 +432,7 @@ test("hostExited returns false when the OS process probe is unreadable", async (
 		expect(spawn.mock.calls[0]?.[0]).toEqual([
 			"ps",
 			"-o",
-			"pid=,ppid=,pgid=,lstart=,command=",
+			"pid=,ppid=,pgid=,stat=,lstart=,command=",
 			"-p",
 			String(process.pid),
 		]);
