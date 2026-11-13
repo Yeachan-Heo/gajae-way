@@ -35,7 +35,7 @@ import {
 	type BrokerOperationRecord,
 	isBrokerPromptBusyRefusal,
 } from "../store/groups/bindings";
-import { GjcCliUnavailableError, isBrokerUnavailable } from "./broker";
+import { GjcCliUnavailableError, GjcCommandQueueTimeoutError, isBrokerUnavailable } from "./broker";
 import {
 	type FailedTransportCause,
 	type FailedTurnEvidence,
@@ -218,7 +218,7 @@ export interface SessionPort {
 		preferSpoken?: boolean;
 	}): Promise<LastAssistantResult | undefined>;
 	attachTail(input: TailAttachInput): Promise<TailHandle>;
-	runCompaction(input: SessionCompactionInput): Promise<{ readonly status: SessionCompactionStatus }>;
+	runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult>;
 	/** Emits live-tail stall signals; the owning actor applies bounded recovery policy. */
 	checkStalls(now?: number): void;
 	/** Sets the tail-silence threshold that triggers stall handling. */
@@ -243,6 +243,22 @@ export interface RunningHostJob {
 
 export type SessionCompactionStatus = "succeeded" | "failed" | "skipped" | "unavailable";
 
+export interface SessionCompactionResult {
+	readonly status: SessionCompactionStatus;
+	/** Stable SDK error code of a run that did not succeed, when gjc reported one. */
+	readonly code?: string;
+	/**
+	 * A `failed` run that may still be compacting on the host: gjc's request
+	 * timed out, its outcome is uncertain after send, or no gjc answer was read.
+	 */
+	readonly outcomeUnknown?: boolean;
+	/**
+	 * The host's ordered control dispatcher answered this run (relay runs only):
+	 * the run is over, and so is every ordered control queued before it.
+	 */
+	readonly answered?: boolean;
+}
+
 /** Session context usage: percent of the model's context window and the token count it stands for. */
 export interface SessionContextUsage {
 	readonly percent: number;
@@ -253,6 +269,11 @@ export interface SessionCompactionInput {
 	readonly sessionId: string;
 	readonly repo: string;
 	readonly originKey: string;
+	/**
+	 * The session's live relay. When given, the run goes straight to the host,
+	 * whose own control reply tells a finished run from a lost reply (`answered`).
+	 */
+	readonly relay?: TailHandle;
 }
 
 export interface SessionBindInput {
@@ -548,6 +569,22 @@ const CONTEXT_QUERY_TIMEOUT_MS = 5_000;
  * 2026-09-30); the default 30s command bound reported such runs as failed.
  */
 const COMPACTION_TIMEOUT_MS = 5 * 60_000;
+/**
+ * Part of the end-to-end compaction budget left for gjc's own timeout reply:
+ * gjc's request budget is COMPACTION_TIMEOUT_MS minus this, inside a process
+ * bound (CLI slot wait included) of COMPACTION_TIMEOUT_MS.
+ */
+const COMPACTION_REPLY_GRACE_MS = 15_000;
+/**
+ * gjc host refusals of a control before its ordered dispatch (host admission,
+ * activation and dispatch preflight in gjc 0.20.0 `sdk/host`).
+ */
+const COMPACTION_PRE_DISPATCH_REFUSALS: ReadonlySet<string> = new Set([
+	"session_quiescing",
+	"not_activated",
+	"operation_not_session_owned",
+	"operation_prohibited",
+]);
 
 type SignaledHost = {
 	readonly pid: number;
@@ -1996,12 +2033,29 @@ export class BrokerSessionPort implements SessionPort {
 		return await this.#tailRunner.attach(input);
 	}
 
-	async runCompaction(input: SessionCompactionInput): Promise<{ readonly status: SessionCompactionStatus }> {
+	async runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult> {
 		this.#assertOwned(input);
+		if (input.relay) return await this.#runCompactionOnRelay(input, input.relay);
 		try {
 			const result = parseEnvelope<Record<string, unknown>>(
 				await this.#cli(
-					["sdk", "session", "raw", "control", input.sessionId, "--op", "compaction.run", "--json-input", "{}"],
+					[
+						"sdk",
+						"session",
+						"raw",
+						"control",
+						input.sessionId,
+						"--op",
+						"compaction.run",
+						"--json-input",
+						"{}",
+						// gjc replies only once the compaction is done; without this its
+						// default session request budget (40 s) gives up while the host
+						// keeps compacting.
+						"--timeout-ms",
+						String(COMPACTION_TIMEOUT_MS - COMPACTION_REPLY_GRACE_MS),
+					],
+					// One end-to-end deadline: CLI slot wait and request share it.
 					{ timeoutMs: COMPACTION_TIMEOUT_MS },
 				),
 				"compaction.run",
@@ -2015,9 +2069,48 @@ export class BrokerSessionPort implements SessionPort {
 			if (error instanceof BrokerAuthorityError) throw error;
 			const code = sdkErrorCode(error);
 			if (code === "unsupported_operation" || code === "not_supported" || code === "unknown_operation")
-				return { status: "unavailable" };
-			return { status: "failed" };
+				return { status: "unavailable", code };
+			// A run that never got a CLI slot never reached gjc.
+			if (error instanceof GjcCommandQueueTimeoutError) return { status: "failed", code: "queue_timeout" };
+			// gjc's request timeout settles only the client: the host keeps compacting.
+			// So may a run whose process was cut off or never printed gjc's envelope.
+			// Other structured CLI failures keep their code but do not prove the host
+			// finished (the CLI also reports a lost reply as operation_failed); only the
+			// relay path reports `answered`.
+			const outcomeUnknown =
+				code === "timeout" || code === "uncertain_after_send" || !(error instanceof GjcCliError && error.details);
+			return { status: "failed", ...(code ? { code } : {}), ...(outcomeUnknown ? { outcomeUnknown } : {}) };
 		}
+	}
+
+	async #runCompactionOnRelay(input: SessionCompactionInput, relay: TailHandle): Promise<SessionCompactionResult> {
+		let response: RelayResponse;
+		try {
+			response = await relay.control("compaction.run", {}, { timeoutMs: COMPACTION_TIMEOUT_MS });
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			// A frame never written never reached the host.
+			if (isUnwrittenRelayRequest(error)) return { status: "failed", code: "relay_unwritten" };
+			// No reply (timeout, relay lost after the write): the host may still be compacting.
+			return { status: "failed", outcomeUnknown: true };
+		}
+		this.#database.bindings.assertAuthority(this.#authority);
+		if (response.ok) {
+			const result = recordOf(response.result) ?? {};
+			this.#tailRunner.recordCompactionReceipt({ sessionId: input.sessionId, originKey: input.originKey, result });
+			if (result.started === true || result.status === "started" || result.status === "completed")
+				return { status: "succeeded", answered: true };
+			if (result.skipped === true || result.status === "skipped") return { status: "skipped", answered: true };
+			return { status: "failed", answered: true };
+		}
+		const code = stableErrorCode(response.error?.code);
+		if (code === "unsupported_operation" || code === "not_supported" || code === "unknown_operation")
+			return { status: "unavailable", code };
+		// Refused before the host's ordered dispatch: the run never started and
+		// proves nothing about controls queued earlier. Any other failure is the
+		// dispatcher's answer for this run, including compaction's own failures.
+		const refusedBeforeDispatch = code !== undefined && COMPACTION_PRE_DISPATCH_REFUSALS.has(code);
+		return { status: "failed", ...(code ? { code } : {}), ...(refusedBeforeDispatch ? {} : { answered: true }) };
 	}
 
 	checkStalls(now = this.#now()): void {

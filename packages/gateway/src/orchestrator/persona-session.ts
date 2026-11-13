@@ -103,6 +103,14 @@ const PROMPT_TOO_LARGE_CODE = "prompt_too_large";
 
 class SendTurnNoLongerBoundError extends Error {}
 
+/** The pre-send compaction may still be running on the host; the send must wait for evidence it is over. */
+class CompactionUnresolvedError extends Error {
+	constructor(code: string | undefined) {
+		super(`compaction may still be running${code ? ` (${code})` : ""}`);
+		this.name = "CompactionUnresolvedError";
+	}
+}
+
 function localPreflightRejectionKey(opRef: string): string {
 	return `${LOCAL_PREFLIGHT_REJECTION_PREFIX}${opRef}`;
 }
@@ -151,6 +159,11 @@ function providerTransportRetryAttempt(
 /** An escalated hold (#686) whose late answer is still wanted; restored on adoption after a restart. */
 function escalatedHoldKey(opRef: string): string {
 	return `escalated-hold:${opRef}`;
+}
+
+/** Session of an origin whose last pre-send compaction may still be running. */
+function unresolvedCompactionKey(originKey: string): string {
+	return `compaction-unresolved:${originKey}`;
 }
 
 /** Track relay unavailable events for a turn to detect unresponsive relays even on live hosts (#766). */
@@ -4697,8 +4710,23 @@ class OriginActor {
 	 * send, so no prompt ever lands on a session gjc would compact first. A
 	 * compaction that fails or is unavailable is logged and the send goes ahead:
 	 * gjc's own compaction and the wedged-submission reset stay the fallback.
+	 *
+	 * A compaction that may still be running (gjc's request timed out, or no gjc
+	 * answer was read) never lets the send through: a prompt sent now queues
+	 * behind it on the session's ordered controls and times out as an ambiguous
+	 * send. The turn goes back to pending, and each retry needs evidence that
+	 * the run is over: a readable context below the line (it landed), or the
+	 * host's answer to a second `compaction.run` sent on the relay, which gjc's
+	 * ordered dispatcher runs only after the first. An unreadable context, a
+	 * refusal before dispatch and a missing reply are not evidence.
 	 */
 	async #prepareContext(sessionId: string, epoch: number, opRef: string, tail: TailHandle): Promise<PreparedContext> {
+		// Durable, so a restarted gateway keeps holding until the run is proven over.
+		const unresolvedKey = unresolvedCompactionKey(this.originKey);
+		const unresolvedOn = this.#manager.database.core.metaGet(unresolvedKey);
+		// A run left unresolved on another session says nothing about this one.
+		if (unresolvedOn !== undefined && unresolvedOn !== sessionId) this.#manager.database.core.metaDelete(unresolvedKey);
+		const unresolved = unresolvedOn === sessionId;
 		let usage: SessionContextUsage | undefined;
 		try {
 			usage = await this.#manager.port.contextUsage?.({ sessionId, repo: this.#manager.repo, relay: tail });
@@ -4707,19 +4735,46 @@ class OriginActor {
 			this.#manager.log(
 				`persona_context_unreadable origin=${this.originKey} session=${sessionId} detail=${safeDiagnostic(error)}`,
 			);
-			return { compacted: false };
+			if (!unresolved) return { compacted: false };
 		}
-		if (!usage || usage.tokens < PERSONA_COMPACTION_TOKENS) return { ...(usage ? { usage } : {}), compacted: false };
+		const belowLine = usage !== undefined && usage.tokens < PERSONA_COMPACTION_TOKENS;
+		if (unresolved && belowLine) {
+			// The earlier run landed: the context is compacted and the persona goes back in.
+			this.#manager.database.core.metaDelete(unresolvedKey);
+			this.#manager.log(
+				`persona_compaction_resolved origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage!.tokens} evidence=context_below_line`,
+			);
+			return { compacted: true };
+		}
+		if (!unresolved && (usage === undefined || belowLine)) return { ...(usage ? { usage } : {}), compacted: false };
+		// Written ahead of the run: a gateway that stops while it is in flight must
+		// come back holding, since the host keeps compacting regardless.
+		if (!unresolved) this.#manager.database.core.metaSet(unresolvedKey, sessionId);
 		const startedAt = this.#manager.now();
-		const { status } = await this.#manager.port.runCompaction({
+		const { status, code, outcomeUnknown, answered } = await this.#manager.port.runCompaction({
 			sessionId,
 			repo: this.#manager.repo,
 			originKey: this.originKey,
+			relay: tail,
 		});
 		this.#manager.log(
-			`persona_compaction origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage.tokens} status=${status} elapsedMs=${this.#manager.now() - startedAt}`,
+			`persona_compaction origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage?.tokens ?? "unknown"} status=${status}${code ? ` code=${code}` : ""}${outcomeUnknown ? " outcome=unknown" : ""}${unresolved ? " after=unresolved" : ""} elapsedMs=${this.#manager.now() - startedAt}`,
 		);
-		return status === "succeeded" ? { compacted: true } : { usage, compacted: false };
+		// Behind an unresolved run, only the host dispatcher's answer to this run
+		// proves the earlier one is over (gjc orders them): a refusal before
+		// dispatch or a reply that never came does not. The hold lasts until such
+		// an answer, a readable context below the line, the host's death or /new.
+		// A receipt is the host's answer on either path, and a host without
+		// compaction.run cannot have one running.
+		const settled = answered === true || status === "succeeded" || status === "skipped" || status === "unavailable";
+		if (outcomeUnknown || (unresolved && !settled)) throw new CompactionUnresolvedError(code);
+		// Answered, or a first run that never reached the host (refused before
+		// dispatch, frame never written): nothing is left compacting.
+		this.#manager.database.core.metaDelete(unresolvedKey);
+		// The earlier run may have compacted even if this one failed ("already
+		// compacted"): resolve it as compacted so the persona goes back in.
+		if (unresolved || status === "succeeded") return { compacted: true };
+		return { ...(usage ? { usage } : {}), compacted: false };
 	}
 
 	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {
