@@ -278,6 +278,397 @@ test("an escalated hold keeps its late answer across a restart (#686)", async ()
 	}
 });
 
+test("a detached escalated hold on a dead host drains, is readopted and delivers its late answer once", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("restart-drain-escalated", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		newerMessage: false,
+		clock,
+	});
+	const attachTail = f.port.attachTail.bind(f.port);
+	f.port.setHostExited(f.binding.sessionId, true);
+	f.port.attachTail = async (input) => {
+		if (input.sessionId === f.binding.sessionId) throw endpointStale();
+		return await attachTail(input);
+	};
+	try {
+		await f.manager.recover();
+		expect(f.notices).toHaveLength(1);
+		// Exercise the failed reattach and the still-unknown periodic status read (#715).
+		await clock.advance(25);
+		await f.manager.reconcile(f.originKey);
+		expect(f.port.getTailHandles(f.binding.sessionId).size).toBe(0);
+		expect(f.logs.some((line) => line.includes("reason=retired_tail_reattach_failed"))).toBe(true);
+		await expect(f.manager.drainForRestart("escalated-drain", 20)).resolves.toBe("drained");
+		expect(f.db.inbox.turnRow(f.heldOpRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBeDefined();
+		await f.manager.stop();
+		const restarted = f.startManager();
+		try {
+			await restarted.recover();
+			expect(f.logs).toContainEqual(expect.stringContaining(`opRef=${f.heldOpRef} reason=unresolved_hold_readopted`));
+			await expect(restarted.drainForRestart("readopted-drain", 20)).resolves.toBe("drained");
+			expect(f.db.inbox.turnRow(f.heldOpRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+			expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBeDefined();
+			expect(f.port.sendAttempts).toHaveLength(0);
+			expect(f.notices).toHaveLength(1);
+			// The same operation later completes; recovery must deliver it, never resend it.
+			f.port.setSessionState(f.binding.sessionId, { live: true });
+			f.port.setHostExited(f.binding.sessionId, false);
+			f.port.seedAcceptedSend({ sessionId: f.binding.sessionId, repo: "", text: "", opRef: f.heldOpRef });
+			const sendsBeforeCompletion = f.port.sendAttempts.length;
+			f.port.complete(f.heldOpRef, "late answer after drained restart");
+			await restarted.reconcile(f.originKey);
+			// A second sweep settles the existing one-read terminal-evidence grace.
+			await restarted.reconcile(f.originKey);
+			await until(() => f.db.inbox.turnRow(f.heldOpRef)?.turn_state === "done");
+			await restarted.reconcile(f.originKey);
+			expect(f.answers).toEqual([{ opRef: f.heldOpRef, text: "late answer after drained restart" }]);
+			expect(f.db.inbox.turnRow(f.heldOpRef)).toMatchObject({ state: "done", turn_state: "done" });
+			expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBeUndefined();
+			expect(f.port.sendAttempts).toHaveLength(sendsBeforeCompletion);
+		} finally {
+			await restarted.stop();
+		}
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a detached retired hold without an escalation marker still blocks restart drain", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("restart-drain-retired", {
+		heldForMs: 2 * MINUTE,
+		live: true,
+		newerMessage: false,
+		clock,
+	});
+	f.port.seedAcceptedSend({ sessionId: f.binding.sessionId, repo: "", text: "", opRef: f.heldOpRef });
+	try {
+		await f.manager.recover();
+		await f.manager.reset(
+			f.originKey,
+			JSON.stringify({ platform: "loopback", kind: "loopback", conversationId: "restart-drain-retired" }),
+		);
+		expect(f.logs.some((line) => line.includes(`opRef=${f.heldOpRef}`) && line.includes("reason=/new"))).toBe(true);
+		expect(f.port.getTailHandles(f.binding.sessionId).size).toBe(0);
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBeUndefined();
+		await expect(f.manager.drainForRestart("retired-drain", 20)).resolves.toBe("timed_out");
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).toBe("accepted");
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("an escalated hold with a successfully reattached tail still blocks restart drain", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("restart-drain-reattached", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		newerMessage: false,
+		clock,
+	});
+	f.port.setHostExited(f.binding.sessionId, true);
+	try {
+		await f.manager.recover();
+		expect(f.notices).toHaveLength(1);
+		expect(f.port.getTailHandles(f.binding.sessionId).size).toBe(0);
+		await expect(f.manager.drainForRestart("reattached-drain", 20)).resolves.toBe("drained");
+		// The real retired-reattach timer opens a tail and clears detached.
+		f.port.setSessionState(f.binding.sessionId, { live: true });
+		await clock.advance(25);
+		expect(f.port.getTailHandles(f.binding.sessionId).size).toBe(1);
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBeDefined();
+		await expect(f.manager.drainForRestart("reattached-drain", 20)).resolves.toBe("timed_out");
+		expect(f.db.inbox.turnRow(f.heldOpRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+for (const live of [true, false]) {
+	test(`a detached escalated in-flight hold blocks restart drain on a ${live ? "live" : "dead"} host`, async () => {
+		const clock = new VirtualClock();
+		const f = await heldOrigin(`restart-drain-in-flight-${live}`, {
+			heldForMs: 11 * MINUTE,
+			live: true,
+			newerMessage: false,
+			clock,
+		});
+		f.port.seedAcceptedSend({ sessionId: f.binding.sessionId, repo: "", text: "", opRef: f.heldOpRef });
+		try {
+			await f.manager.recover();
+			const handle = [...f.port.getTailHandles(f.binding.sessionId)][0] as ScriptedTailHandle | undefined;
+			expect(handle).toBeDefined();
+			f.port.attachTail = async () => {
+				throw endpointStale();
+			};
+			handle?.die();
+			await clock.advance(0);
+			// CLI status stays in_flight while real relay-loss evidence ages into escalation.
+			for (let i = 0; i < 22; i++) {
+				await clock.advance(30_000);
+				await f.manager.reconcile(f.originKey);
+			}
+			expect(f.notices.map((notice) => notice.reason)).toEqual([UNRESOLVED_HOLD_ESCALATED]);
+			expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBeDefined();
+			expect(f.port.getTailHandles(f.binding.sessionId).size).toBe(0);
+			expect(f.logs.some((line) => line.includes("reason=retired_tail_reattach_failed"))).toBe(true);
+			// Even a subsequently dead host cannot override the operation's active status.
+			f.port.setSessionState(f.binding.sessionId, { live });
+			f.port.setHostExited(f.binding.sessionId, !live);
+			await expect(
+				f.port.status({ sessionId: f.binding.sessionId, repo: "", opRef: f.heldOpRef }),
+			).resolves.toMatchObject({ status: { status: "in_flight" } });
+			await expect(f.manager.drainForRestart(`in-flight-drain-${live}`, 20)).resolves.toBe("timed_out");
+			expect(f.answers).toHaveLength(0);
+		} finally {
+			await f.manager.stop();
+		}
+	});
+}
+
+for (const evidence of ["live-process", "unreadable-exit", "failed-exit-probe", "missing-exit-probe"] as const) {
+	test(`a detached escalated hold blocks restart drain with ${evidence} evidence`, async () => {
+		const clock = new VirtualClock();
+		const f = await heldOrigin(`restart-drain-${evidence}`, {
+			heldForMs: 11 * MINUTE,
+			live: false,
+			newerMessage: false,
+			clock,
+		});
+		f.port.attachTail = async () => {
+			throw endpointStale();
+		};
+		try {
+			await f.manager.recover();
+			expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBeDefined();
+			if (evidence === "live-process") {
+				f.port.setSessionState(f.binding.sessionId, { live: true });
+				f.port.setHostExited(f.binding.sessionId, false);
+			} else if (evidence === "unreadable-exit") {
+				f.port.hostExited = async () => false;
+			} else if (evidence === "failed-exit-probe") {
+				f.port.hostExited = async () => {
+					throw new Error("ps unreadable");
+				};
+			} else {
+				Object.defineProperty(f.port, "hostExited", { value: undefined });
+			}
+			await expect(f.manager.drainForRestart(`evidence-${evidence}`, 20)).resolves.toBe("timed_out");
+		} finally {
+			await f.manager.stop();
+		}
+	});
+}
+
+for (const [label, operationRef] of [
+	["a mismatched", "other-op-ref"],
+	["a missing", ""],
+] as const) {
+	for (const reported of ["terminal_ok", "unknown"] as const) {
+		test(`a detached escalated hold whose fresh ${reported} report carries ${label} operation identity blocks restart drain on an exited host`, async () => {
+			const clock = new VirtualClock();
+			const f = await heldOrigin(`restart-drain-${operationRef || "missing"}-ref-${reported}`, {
+				heldForMs: 11 * MINUTE,
+				live: false,
+				newerMessage: false,
+				clock,
+			});
+			f.port.attachTail = async () => {
+				throw endpointStale();
+			};
+			try {
+				await f.manager.recover();
+				expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBeDefined();
+				f.port.setHostExited(f.binding.sessionId, true);
+				const status = f.port.status.bind(f.port);
+				f.port.status = async (input) => {
+					const result = await status(input);
+					if (input.opRef !== f.heldOpRef) return result;
+					return { ...result, operationRef, status: { status: reported } };
+				};
+				// A report about another (or no) operation is not evidence that the held one is inactive.
+				await expect(f.manager.drainForRestart(`${operationRef || "missing"}-ref-${reported}`, 20)).resolves.toBe(
+					"timed_out",
+				);
+				expect(f.db.inbox.turnRow(f.heldOpRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+			} finally {
+				await f.manager.stop();
+			}
+		});
+	}
+}
+
+test("a detached escalated hold whose status endpoint is stale drains on a dead host", async () => {
+	// The production shape: `gjc sdk session status` fails with endpoint_stale for good
+	// and the host is gone, so the hold can never settle and no producer is running.
+	const clock = new VirtualClock();
+	const f = await heldOrigin("restart-drain-stale-endpoint", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		newerMessage: false,
+		clock,
+	});
+	f.port.setHostExited(f.binding.sessionId, true);
+	f.port.attachTail = async () => {
+		throw endpointStale();
+	};
+	f.port.status = async () => {
+		throw endpointStale();
+	};
+	try {
+		await f.manager.recover();
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBeDefined();
+		await expect(f.manager.drainForRestart("stale-endpoint-drain", 20)).resolves.toBe("drained");
+		expect(f.db.inbox.turnRow(f.heldOpRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a stale endpoint and live:false cannot drain while the host process has not exited", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("restart-drain-stale-live-process", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		newerMessage: false,
+		clock,
+	});
+	f.port.setHostExited(f.binding.sessionId, false);
+	f.port.attachTail = async () => {
+		throw endpointStale();
+	};
+	f.port.status = async () => {
+		throw endpointStale();
+	};
+	try {
+		await f.manager.recover();
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBeDefined();
+		await expect(f.manager.drainForRestart("stale-live-process-drain", 20)).resolves.toBe("timed_out");
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("restart drain caches only blocked probes briefly and never reuses an exempt verdict", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("restart-drain-cache", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		newerMessage: false,
+		clock,
+	});
+	f.port.attachTail = async () => {
+		throw endpointStale();
+	};
+	try {
+		await f.manager.recover();
+		await clock.advance(25);
+		const status = f.port.status.bind(f.port);
+		const hostExited = f.port.hostExited.bind(f.port);
+		let statusReads = 0;
+		let exitReads = 0;
+		f.port.status = async (input) => {
+			statusReads++;
+			return await status(input);
+		};
+		f.port.hostExited = async (input) => {
+			exitReads++;
+			return await hostExited(input);
+		};
+		await expect(f.manager.drainForRestart("cached-drain", 20)).resolves.toBe("timed_out");
+		await expect(f.manager.drainForRestart("cached-drain", 20)).resolves.toBe("timed_out");
+		expect({ statusReads, exitReads }).toEqual({ statusReads: 1, exitReads: 1 });
+		await clock.advance(250);
+		f.port.setHostExited(f.binding.sessionId, true);
+		await expect(f.manager.drainForRestart("cached-drain", 20)).resolves.toBe("drained");
+		expect({ statusReads, exitReads }).toEqual({ statusReads: 2, exitReads: 2 });
+		// No virtual time passes: an exemption must be re-proven even inside the interval.
+		f.port.setHostExited(f.binding.sessionId, false);
+		await expect(f.manager.drainForRestart("cached-drain", 20)).resolves.toBe("timed_out");
+		expect({ statusReads, exitReads }).toEqual({ statusReads: 3, exitReads: 3 });
+		// Repeated blocked iterations use the same verdict rather than spawning more probes.
+		await expect(f.manager.drainForRestart("cached-drain", 20)).resolves.toBe("timed_out");
+		expect({ statusReads, exitReads }).toEqual({ statusReads: 3, exitReads: 3 });
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("restart drain uses process exit rather than registry liveness", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("restart-drain-process-proof", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		newerMessage: false,
+		clock,
+	});
+	f.port.attachTail = async () => {
+		throw endpointStale();
+	};
+	try {
+		await f.manager.recover();
+		f.port.setHostExited(f.binding.sessionId, true);
+		f.port.setSessionState(f.binding.sessionId, { live: true });
+		await expect(f.manager.drainForRestart("process-proof-drain", 20)).resolves.toBe("drained");
+		let livenessReads = 0;
+		f.port.liveness = async () => {
+			livenessReads++;
+			throw endpointStale();
+		};
+		await expect(f.manager.drainForRestart("process-proof-drain", 20)).resolves.toBe("drained");
+		expect(livenessReads).toBe(0);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+for (const probe of ["status", "hostExited"] as const) {
+	test(`restart drain stops after an in-progress ${probe} probe when the manager stops`, async () => {
+		const clock = new VirtualClock();
+		const f = await heldOrigin(`restart-drain-stop-${probe}`, {
+			heldForMs: 11 * MINUTE,
+			live: false,
+			newerMessage: false,
+			clock,
+		});
+		f.port.attachTail = async () => {
+			throw endpointStale();
+		};
+		const release = Promise.withResolvers<void>();
+		let stop: Promise<void> | undefined;
+		try {
+			await f.manager.recover();
+			const status = f.port.status.bind(f.port);
+			let statusReads = 0;
+			let exitReads = 0;
+			f.port.status = async (input) => {
+				statusReads++;
+				if (probe === "status") await release.promise;
+				return await status(input);
+			};
+			f.port.hostExited = async () => {
+				exitReads++;
+				if (probe === "hostExited") await release.promise;
+				return true;
+			};
+			const drain = f.manager.drainForRestart("stop-during-probe", 1_000);
+			await until(() => (probe === "status" ? statusReads : exitReads) === 1);
+			stop = f.manager.stop();
+			release.resolve();
+			await expect(drain).resolves.toBe("stopped");
+			await stop;
+			expect(statusReads).toBe(1);
+			expect(exitReads).toBe(probe === "status" ? 0 : 1);
+		} finally {
+			release.resolve();
+			await (stop ?? f.manager.stop());
+		}
+	});
+}
+
 test("a failed escalation notice is durable and posted by the next recovery sweep, once (#686)", async () => {
 	const f = await heldOrigin("notice-retry", { heldForMs: 11 * MINUTE, live: false });
 	f.failNotices(1);
