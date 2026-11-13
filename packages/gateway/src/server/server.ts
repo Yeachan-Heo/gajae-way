@@ -114,7 +114,7 @@ import {
 	sanitizeDiagnosticDetail,
 } from "../orchestrator/rebind";
 import type { SessionPort } from "../orchestrator/session-port";
-import { SweepLimiter } from "../orchestrator/sweep-limiter";
+import { SweepLimiter, singleFlight } from "../orchestrator/sweep-limiter";
 import {
 	deterministicHeldPostDeliveryId,
 	deterministicInterimDeliveryId,
@@ -1188,6 +1188,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const lanes = new LaneGovernor({
 		database: options.database,
 		sessionPort,
+		sweep,
 		laneRoot: options.config.home,
 		maxLanes: options.config.work?.maxLanes,
 		idleRetireMs: options.config.work?.idleRetireMs,
@@ -1212,26 +1213,22 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const originSilent = new OriginSilentAlerter(options.database, () => runtime.config.ownerTarget?.origin);
 	// Each chain runs at most once at a time: a sweep still in flight when the
 	// next tick fires is not started a second time (the slow sweep is the load).
-	let personaSweep: Promise<void> | undefined;
-	let laneSweep: Promise<void> | undefined;
-	const reconcileTimer = setInterval(() => {
-		alertSilentOrigins(runtime, originSilent);
-		void monitors.reconcile();
-		if (personaSweep) console.info("reconcile_sweep_skipped subsystem=persona reason=in_flight");
-		else
-			personaSweep = personaSessions
+	const personaSweep = singleFlight(
+		"persona",
+		async () =>
+			await personaSessions
 				.recover()
 				.then(async () => {
 					await personaSessions.sweepIdleHosts();
 					await sweepIdleSessions(runtime, options.database);
 				})
-				.catch((error: unknown) => console.error(`persona recovery sweep failed: ${diagnostic(error)}`))
-				.finally(() => {
-					personaSweep = undefined;
-				});
-		if (laneSweep) console.info("reconcile_sweep_skipped subsystem=lane reason=in_flight");
-		else
-			laneSweep = work
+				.catch((error: unknown) => console.error(`persona recovery sweep failed: ${diagnostic(error)}`)),
+		console.info,
+	);
+	const laneSweep = singleFlight(
+		"lane",
+		async () =>
+			await work
 				.recover()
 				.then(async () => {
 					await lanes.sweep();
@@ -1239,10 +1236,14 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 					// probes are sweep reads, its retirements ordinary work.
 					await sweep.run(async () => await lanes.retireAllDead());
 				})
-				.catch((error: unknown) => console.error(`lane recovery/sweep failed: ${diagnostic(error)}`))
-				.finally(() => {
-					laneSweep = undefined;
-				});
+				.catch((error: unknown) => console.error(`lane recovery/sweep failed: ${diagnostic(error)}`)),
+		console.info,
+	);
+	const reconcileTimer = setInterval(() => {
+		alertSilentOrigins(runtime, originSilent);
+		void monitors.reconcile();
+		personaSweep();
+		laneSweep();
 	}, options.reconcileIntervalMs ?? 60_000);
 	const deliverySweepTimer = setInterval(() => {
 		try {

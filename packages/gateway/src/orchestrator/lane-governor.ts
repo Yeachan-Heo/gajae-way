@@ -8,7 +8,7 @@ import type { Store } from "../store";
 import { runGit } from "./git-command";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionPort } from "./session-port";
-import { inSweep, sweepControl } from "./sweep-limiter";
+import { inSweep, SweepLimiter, sweepControl } from "./sweep-limiter";
 
 export const WORK_LANE_PREFIX = "work/task/";
 
@@ -98,6 +98,8 @@ export interface LaneGovernorOptions {
 	readonly idleRetireMs?: number;
 	readonly now?: () => number;
 	readonly log?: (line: string, level?: LogLevel) => void;
+	/** Process-wide sweep read bound shared with the other sweep drivers; a private one when omitted. */
+	readonly sweep?: SweepLimiter;
 }
 
 /**
@@ -112,6 +114,7 @@ export interface LaneGovernorOptions {
 export class LaneGovernor {
 	readonly #database: Store;
 	readonly #port: SessionPort;
+	readonly #sweep: SweepLimiter;
 	readonly #laneRoot: string | undefined;
 	readonly maxLanes: number;
 	readonly idleRetireMs: number;
@@ -125,6 +128,7 @@ export class LaneGovernor {
 	constructor(options: LaneGovernorOptions) {
 		this.#database = options.database;
 		this.#port = options.sessionPort;
+		this.#sweep = options.sweep ?? new SweepLimiter();
 		this.#laneRoot = options.laneRoot === undefined ? undefined : resolve(options.laneRoot);
 		this.maxLanes = positiveInteger(options.maxLanes, DEFAULT_WORK_MAX_LANES, "maxLanes");
 		this.idleRetireMs = positiveInteger(options.idleRetireMs, DEFAULT_WORK_IDLE_RETIRE_MS, "idleRetireMs");
@@ -284,7 +288,9 @@ export class LaneGovernor {
 			// The ledger's last attempt ended, but only the broker knows whether
 			// its operation actually reached a terminal state: a timed-out wait
 			// or a crash-left attempt may still be running.
-			const runtime = await this.#runtimeSettled(record, lane.sessionId, repo);
+			// A sweep-nominated retirement probes the broker as sweep reads; an operator's does not.
+			const probe = <T>(read: () => Promise<T>): Promise<T> => (expected ? this.#sweep.run(read) : read());
+			const runtime = await probe(() => this.#runtimeSettled(record, lane.sessionId, repo));
 			if (!runtime.settled) return { retired: false, sessionKey, reason: runtime.reason };
 			let closed = false;
 			try {
@@ -296,7 +302,7 @@ export class LaneGovernor {
 				// this governor exists to prevent. Only broker liveness proving the
 				// session gone lets the binding clear.
 				const detail = sanitizeDiagnostic(diagnostic(error));
-				const liveness = await this.#safeLiveness(lane.sessionId, repo);
+				const liveness = await probe(() => this.#safeLiveness(lane.sessionId, repo));
 				if (liveness.live !== false && !liveness.disowned) {
 					this.#log(
 						`lane_close_failed name=${name} session=${lane.sessionId} detail=${detail} action=retained`,

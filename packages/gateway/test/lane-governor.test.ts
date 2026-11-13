@@ -952,6 +952,68 @@ test("retireAllDead from a sweep probes in sweep scope but retires as ordinary w
 	expect(scopes.every((entry) => entry.endsWith(":false"))).toBe(true);
 });
 
+test("a sweep-nominated retirement probes as sweep reads; an operator retirement does not", async () => {
+	database = await Store.open(":memory:");
+	const sessions = { swept: SESSION_ID, operated: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d" } as const;
+	const persist = (name: keyof typeof sessions) => {
+		const opRef = newOpRef("governor-sweep-scope");
+		bind(name, NOW - 10 * 60_000, sessions[name]);
+		const identity = laneJobIdentity(name);
+		let record: LaneJobRecord = createLaneJobRecord({
+			jobId: identity.jobId,
+			branch: `work/${name}`,
+			worktreePath: "/tmp/worker-repo",
+			now: () => new Date(NOW - 300_000),
+		});
+		record = appendAttempt(record, {
+			opRef,
+			sessionId: sessions[name],
+			startedAt: new Date(NOW - 240_000).toISOString(),
+		});
+		record = closeAttempt({
+			record,
+			opRef,
+			endState: "attempt_ended",
+			errorCode: "gateway_turn_reaped",
+			endedAt: new Date(NOW - 120_000).toISOString(),
+		});
+		database.transaction((tx) =>
+			database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }),
+		);
+	};
+	persist("swept");
+	persist("operated");
+	const scopes: string[] = [];
+	class ScopeRecordingPort extends ScriptedSessionPort {
+		override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
+			scopes.push(`status:${input.sessionId}:${inSweep()}`);
+			return await super.status(input);
+		}
+		override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
+			scopes.push(`liveness:${input.sessionId}:${inSweep()}`);
+			return await super.liveness(input);
+		}
+	}
+	const port = new ScopeRecordingPort();
+	port.setSessionState(sessions.swept, { live: false, repo: "/tmp/worker-repo" });
+	port.setSessionState(sessions.operated, { live: false, repo: "/tmp/worker-repo" });
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		idleRetireMs: 60_000,
+		now: () => NOW,
+		log: () => {},
+	});
+	const operated = await governor.retire("operated", "operator");
+	expect(operated).toMatchObject({ retired: true });
+	const operatorReads = scopes.splice(0);
+	expect(operatorReads.length).toBeGreaterThan(0);
+	expect(operatorReads.every((entry) => entry.endsWith(":false"))).toBe(true);
+	expect(await governor.sweep()).toBe(1);
+	expect(scopes.length).toBeGreaterThan(0);
+	expect(scopes.every((entry) => entry.includes(sessions.swept) && entry.endsWith(":true"))).toBe(true);
+});
+
 test("#778: forceRetire settles an open idle attempt on a live session as operator abandonment with broker evidence", async () => {
 	database = await Store.open(":memory:");
 	// Stuck lane: session is live but idle, attempt is open with idle broker activity and unknown status

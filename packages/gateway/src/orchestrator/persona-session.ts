@@ -49,6 +49,7 @@ import {
 import {
 	outsideSweep,
 	SWEEP_MAILBOX_WAIT_MS,
+	SWEEP_UNIT_SLOW_MS,
 	SweepLimiter,
 	type SweepTurn,
 	SweepTurns,
@@ -901,9 +902,14 @@ export class PersonaSessionManager {
 		actors: readonly OriginActor[],
 		work: (actor: OriginActor) => Promise<void>,
 	): Promise<OriginActor[]> {
+		const startedAt = this.#now();
+		const readsBefore = this.#sweep.unitReads;
+		let deferred = 0;
 		const started: Array<Promise<OriginActor>> = [];
 		for (const actor of actors) {
-			if (this.#stopped) break;
+			if (this.#stopped) {
+				break;
+			}
 			const turn = this.#sweepTurns.tryTake() ?? (await this.#sweepTurns.take());
 			// An idle mailbox starts the unit on its next turn; only a busy one can defer it.
 			const unit = actor.mailboxBusy
@@ -915,13 +921,23 @@ export class PersonaSessionManager {
 							async () => await work(actor),
 						),
 					};
-			if (!unit) continue;
+			if (!unit) {
+				deferred++;
+				continue;
+			}
 			const finished = unit.done.then(() => actor);
 			// Observed by Promise.all below; the loop keeps starting other units meanwhile.
 			finished.catch(() => {});
 			started.push(finished);
 		}
-		return await Promise.all(started);
+		try {
+			return await Promise.all(started);
+		} finally {
+			if (actors.length > 0)
+				this.#log(
+					`persona_recovery_sweep driver=${driver} origins=${actors.length} started=${started.length} deferred=${deferred} probes=${this.#sweep.unitReads - readsBefore} duration_ms=${this.#now() - startedAt}`,
+				);
+		}
 	}
 
 	/**
@@ -1092,10 +1108,11 @@ export class PersonaSessionManager {
 		const stale = [...this.#actors.values()].filter(
 			(actor) => actor.hostIdle && now - actor.hostLastActiveAt >= this.#hostIdleRetireMs,
 		);
+		// Idle retirement reads the host's running jobs before ending it: sweep reads too.
 		let retired = 0;
-		for (const actor of stale) {
-			if (await actor.enqueue(async () => await actor.retireIdleHost("host_idle"))) retired++;
-		}
+		await this.#sweepActors("host_idle", stale, async (actor) => {
+			if (await actor.retireIdleHost("host_idle")) retired++;
+		});
 		return retired;
 	}
 
@@ -1772,17 +1789,19 @@ class OriginActor {
 	 * which is released when it ends.
 	 */
 	enqueueSweep(turn: SweepTurn, begin: () => boolean, work: () => Promise<void>): Promise<unknown> {
-		return this.#enqueueTask(async () => {
+		const unit = this.#enqueueTask(async () => {
 			if (!begin() || !turn.held) {
 				this.#manager.log(`sweep_closure_abandoned origin=${this.originKey}`, "warn");
 				return;
 			}
-			try {
-				await this.#manager.sweepLimiter.runTurn(turn, work);
-			} finally {
-				turn.release();
-			}
+			const startedAt = this.#manager.now();
+			await this.#manager.sweepLimiter.runTurn(turn, work);
+			const heldMs = this.#manager.now() - startedAt;
+			if (heldMs >= SWEEP_UNIT_SLOW_MS)
+				this.#manager.log(`sweep_unit_slow origin=${this.originKey} held_ms=${heldMs}`, "warn");
 		});
+		// A unit that never runs (a stopped actor or manager) must not keep the turn.
+		return unit.finally(() => turn.release());
 	}
 
 	get stopped(): boolean {

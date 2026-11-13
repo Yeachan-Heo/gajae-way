@@ -192,6 +192,26 @@ test("observer polling reads in sweep scope; a work.status read stays ordinary w
 	expect(verbReads.length).toBeGreaterThan(0);
 });
 
+test("restart recovery probes of open attempts run in sweep scope", async () => {
+	const f = await fixture();
+	await started(f);
+	const scopes: Array<{ readonly kind: string; readonly sweep: boolean }> = [];
+	const status = f.port.status.bind(f.port);
+	f.port.status = async (input) => {
+		scopes.push({ kind: "status", sweep: inSweep() });
+		return await status(input);
+	};
+	const liveness = f.port.liveness.bind(f.port);
+	f.port.liveness = async (input) => {
+		scopes.push({ kind: "liveness", sweep: inSweep() });
+		return await liveness(input);
+	};
+	await f.restart();
+	const recoveryReads = scopes.slice();
+	expect(recoveryReads.length).toBeGreaterThan(0);
+	expect(recoveryReads.every((entry) => entry.sweep)).toBe(true);
+});
+
 test("work.start during a broker restart waits for broker readiness and starts the lane", async () => {
 	const logs: string[] = [];
 	const sleeps: number[] = [];

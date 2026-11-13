@@ -46,7 +46,7 @@ import {
 } from "./failed-turn-evidence";
 import { isSessionGoneCode } from "./gjc-contract";
 import { isRebindableCode, sanitizeDiagnostic } from "./rebind";
-import { currentSweep, inSweep, SWEEP_READ_TIMEOUT_MS, sweepControl } from "./sweep-limiter";
+import { currentSweep, inSweep, SWEEP_READ_TIMEOUT_MS, sweepControl, sweepLend } from "./sweep-limiter";
 import {
 	isRelayTransportFailure,
 	isUnwrittenRelayRequest,
@@ -626,10 +626,10 @@ export class BrokerSessionPort implements SessionPort {
 			return args.includes("turn.steer") ? result : normalizeSdkEnvelopeFailure(result);
 		};
 		const generation = options.brokerGeneration ?? (() => 0);
-		// Inside a sweep unit every CLI call is a read (control operations yield the
-		// unit's slot and run outside the sweep scope): it runs at background
-		// priority, one at a time, under the sweep read bound, and a read that
-		// straddles a broker replacement is unknown rather than evidence.
+		// Inside a sweep unit every CLI call is a read (control operations leave the
+		// sweep scope): it runs at background priority, one at a time process-wide,
+		// with a 10s default bound, and a read that straddles a broker replacement
+		// is unknown rather than evidence.
 		this.#cli = async (args, commandOptions) => {
 			const sweep = currentSweep();
 			if (!sweep) return await run(args, commandOptions);
@@ -638,9 +638,16 @@ export class BrokerSessionPort implements SessionPort {
 				const result = await run(args, {
 					...commandOptions,
 					priority: "background",
-					timeoutMs: Math.min(commandOptions?.timeoutMs ?? SWEEP_READ_TIMEOUT_MS, SWEEP_READ_TIMEOUT_MS),
+					// A default for reads that bring no bound; a caller's own budget is never shortened.
+					timeoutMs: commandOptions?.timeoutMs ?? SWEEP_READ_TIMEOUT_MS,
 				});
-				if (generation() !== before) throw new GjcCliUnavailableError("broker generation changed during a sweep read");
+				const after = generation();
+				if (after !== before) {
+					console.warn(
+						`probe_generation_changed command=${args.slice(0, 3).join("_")} before=${before} after=${after}`,
+					);
+					throw new GjcCliUnavailableError("broker generation changed during a sweep read");
+				}
 				return result;
 			});
 		};
@@ -1210,7 +1217,16 @@ export class BrokerSessionPort implements SessionPort {
 		repo: string;
 		shouldTerminate?: () => boolean | Promise<boolean>;
 	}): Promise<TerminateHostOutcome> {
-		if (inSweep()) return await sweepControl(() => this.terminateHost(input));
+		// Termination waits through its signal grace, so a sweep lends its turn
+		// meanwhile; the inspect and guard reads stay sweep reads.
+		return await sweepLend(async () => await this.#terminateHost(input));
+	}
+
+	async #terminateHost(input: {
+		sessionId: string;
+		repo: string;
+		shouldTerminate?: () => boolean | Promise<boolean>;
+	}): Promise<TerminateHostOutcome> {
 		this.#assertOwned(input);
 		const finalGuardRefusal = async () => {
 			if (!input.shouldTerminate) return undefined;

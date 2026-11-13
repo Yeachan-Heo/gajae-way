@@ -4,12 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CliResult, CliRunner } from "@gajae-gateway/subsession";
 import { BrokerSessionPort } from "../src/orchestrator/session-port";
+import { readFile } from "node:fs/promises";
 import {
 	inSweep,
 	SWEEP_READ_TIMEOUT_MS,
 	SweepLimiter,
 	SweepTurns,
+	singleFlight,
 	sweepControl,
+	sweepLend,
 } from "../src/orchestrator/sweep-limiter";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { Store } from "../src/store";
@@ -227,4 +230,154 @@ test("a control operation inside a sweep never waits for the sweep read slot", a
 	expect(closed).toEqual([undefined]);
 	readGate.resolve();
 	expect((await reading).live).toBe(true);
+});
+
+test("a persona unit keeps the read slot across its reads; other sweeps read between units", async () => {
+	const limiter = new SweepLimiter();
+	const turns = new SweepTurns();
+	const order: string[] = [];
+	const read = (label: string) =>
+		limiter.read(async () => {
+			order.push(label);
+			await Bun.sleep(2);
+		});
+	const turn = await turns.take();
+	const unit = limiter.runTurn(turn, async () => {
+		await read("unit-1");
+		await Bun.sleep(5); // non-read work between reads: the slot stays with the unit
+		await read("unit-2");
+		await read("unit-3");
+	});
+	await Bun.sleep(1);
+	const other = limiter.run(async () => await read("lane"));
+	await unit;
+	turn.release();
+	await other;
+	expect(order).toEqual(["unit-1", "unit-2", "unit-3", "lane"]);
+});
+
+test("a unit lends the read slot with its turn and a finished unit leaks no slot", async () => {
+	const limiter = new SweepLimiter();
+	const turns = new SweepTurns();
+	const order: string[] = [];
+	const control = Promise.withResolvers<void>();
+	const turn = await turns.take();
+	let late: Promise<void> | undefined;
+	const unit = limiter.runTurn(turn, async () => {
+		await limiter.read(async () => void order.push("unit-1"));
+		await sweepControl(async () => {
+			order.push("control");
+			await control.promise;
+		});
+		await limiter.read(async () => void order.push("unit-2"));
+		// A fire-and-forget read that outlives the unit.
+		late = Bun.sleep(5).then(async () => await limiter.read(async () => void order.push("late")));
+	});
+	await Bun.sleep(1);
+	// While the unit is inside its control operation another sweep can read.
+	await limiter.run(async () => await limiter.read(async () => void order.push("lane-during-control")));
+	control.resolve();
+	await unit;
+	turn.release();
+	await late;
+	await limiter.run(async () => await limiter.read(async () => void order.push("after")));
+	expect(order).toEqual(["unit-1", "control", "lane-during-control", "unit-2", "late", "after"]);
+});
+
+test("sweepLend keeps the sweep scope while lending the turn", async () => {
+	const limiter = new SweepLimiter();
+	const turns = new SweepTurns();
+	const turn = await turns.take();
+	const seen: boolean[] = [];
+	const lending = Promise.withResolvers<void>();
+	const unit = limiter.runTurn(turn, async () => {
+		await sweepLend(async () => {
+			seen.push(inSweep());
+			await lending.promise;
+		});
+	});
+	await Bun.sleep(1);
+	const next = turns.tryTake();
+	expect(next).toBeDefined();
+	next?.release();
+	lending.resolve();
+	await unit;
+	turn.release();
+	expect(seen).toEqual([true]);
+});
+
+test("singleFlight skips a run while one is in flight and a failed run clears the guard", async () => {
+	const logs: string[] = [];
+	let runs = 0;
+	const gate = Promise.withResolvers<void>();
+	let fail = true;
+	const tick = singleFlight(
+		"persona",
+		async () => {
+			runs++;
+			await gate.promise;
+			if (fail) throw new Error("sweep failed");
+		},
+		(line) => logs.push(line),
+	);
+	tick();
+	tick();
+	expect(runs).toBe(1);
+	expect(logs).toEqual(["reconcile_sweep_skipped subsystem=persona reason=in_flight"]);
+	gate.resolve();
+	await Bun.sleep(1);
+	fail = false;
+	tick();
+	expect(runs).toBe(2);
+});
+
+test("BrokerSessionPort control methods leave the sweep scope; host termination lends but keeps its reads in scope", async () => {
+	const file = await readFile(join(import.meta.dir, "../src/orchestrator/session-port.ts"), "utf8");
+	const source = file.slice(file.indexOf("export class BrokerSessionPort"));
+	const control = [
+		"bind",
+		"resume",
+		"send",
+		"steer",
+		"setModel",
+		"setServiceTier",
+		"close",
+		"attachTail",
+		"runCompaction",
+		"runExclusive",
+		"request",
+	];
+	for (const method of control) {
+		const at = source.search(new RegExp(`\\n\\t(async )?${method}(<T>)?\\(`));
+		expect(at, `${method} not found`).toBeGreaterThan(0);
+		const body = source.slice(at, source.indexOf("\n\t}\n", at));
+		expect(body, `${method} must leave sweep scope first`).toMatch(
+			new RegExp(`\\{\\n(\\t\\t//[^\\n]*\\n)*\\t\\tif \\(inSweep\\(\\)\\) return (await )?sweepControl\\(`),
+		);
+	}
+	const terminate = source.slice(source.search(/\n\tasync terminateHost\(/));
+	expect(terminate.slice(0, 600)).toContain("return await sweepLend(");
+});
+
+test("a sweep read keeps a caller's own longer budget", async () => {
+	const timeouts: Array<{ readonly op: string; readonly timeoutMs?: number }> = [];
+	const cli: CliRunner = async (args, options) => {
+		timeouts.push({ op: args.includes("turn.result") ? "turn.result" : "inspect", timeoutMs: options?.timeoutMs });
+		if (args.includes("inspect")) return liveInspect();
+		return { exitCode: 0, stdout: JSON.stringify({ ok: false, error: { code: "not_found" } }), stderr: "" };
+	};
+	const { port, repo, sessionIds } = await ownedPort(cli);
+	const limiter = new SweepLimiter();
+	const sessionId = sessionIds[0]!;
+	// turn.result brings a 15s budget: a sweep must not cut it to 10s and turn
+	// a slow-but-answering read into a spent output attempt.
+	await limiter.run(
+		async () =>
+			await port.fetchWorkerOutput({ sessionId, repo, opRef: "gw-w-sweep-budget", notBeforeMs: Date.now() - 1_000 }),
+	);
+	await limiter.run(async () => await port.liveness({ sessionId, repo }));
+	expect(timeouts).toEqual([
+		{ op: "turn.result", timeoutMs: 15_000 },
+		{ op: "inspect", timeoutMs: SWEEP_READ_TIMEOUT_MS },
+	]);
 });
