@@ -810,6 +810,62 @@ test("an archived thread that cannot be unarchived fails the delivery and posts 
 	]);
 });
 
+test("an archived thread whose reopen fails transiently is a definitive lookup failure, not unrestorable", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const sent: Array<[string, unknown]> = [];
+	const thread = {
+		archived: true,
+		setArchived: async () => Promise.reject(new Error("fetch failed")),
+		send: async (payload: unknown) => void sent.push(["thread-1", payload]),
+	};
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async (id: string) =>
+				id === "thread-1" ? thread : { send: async (payload: unknown) => void sent.push([id, payload]) },
+		},
+	};
+	const original = console.error;
+	console.error = () => {};
+	try {
+		await settleDiscordDelivery(mockGateway(requests), discord, threadDelivery("monitor result"));
+	} finally {
+		console.error = original;
+	}
+	expect(sent).toEqual([]);
+	expect(requests).toEqual([
+		{
+			verb: "delivery.fail",
+			params: { deliveryId: "delivery-1", reason: "resolve_failed: fetch failed", ambiguous: false },
+		},
+	]);
+});
+
+test("a thread archived before the post landed (50083) is definitive, not an unknown send", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async () => ({
+				send: async () =>
+					Promise.reject(
+						Object.assign(new Error("Thread is archived"), {
+							code: 50083,
+						}),
+					),
+			}),
+		},
+	};
+	const original = console.error;
+	console.error = () => {};
+	try {
+		await settleDiscordDelivery(mockGateway(requests), discord, threadDelivery("reply"));
+	} finally {
+		console.error = original;
+	}
+	expect(requests).toEqual([
+		{ verb: "delivery.fail", params: { deliveryId: "delivery-1", reason: "Thread is archived", ambiguous: false } },
+	]);
+});
+
 test("a missing public thread fails the delivery as thread_missing and never reaches the parent channel", async () => {
 	const requests: Array<{ verb: string; params: unknown }> = [];
 	const fetched: string[] = [];

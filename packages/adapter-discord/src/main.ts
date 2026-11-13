@@ -549,8 +549,9 @@ export function deliveryFailureIsAmbiguous(error: unknown): boolean {
 	const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
 	// Discord's known permanent errors have not dispatched anything: unknown channel
 	// (10003), unknown message (10008), missing access/permissions (50001, 50013),
-	// and a request Discord will reject identically forever (50035 Invalid Form Body).
-	return !new Set(["10003", "10008", "50001", "50013", "50035"]).has(code);
+	// a request Discord will reject identically forever (50035 Invalid Form Body),
+	// and a thread that was archived before the post landed (50083).
+	return !new Set(["10003", "10008", "50001", "50013", "50035", "50083"]).has(code);
 }
 
 /**
@@ -1195,7 +1196,9 @@ async function resolveDeliveryChannel(
 		await channel.setArchived(false);
 		return { channel };
 	} catch (error) {
-		if (origin.threadVisibility !== "public") throw error;
+		// A transient failure to reopen it is a definitive lookup failure (nothing was
+		// sent), retried later; only Discord's refusal makes the thread unrestorable.
+		if (origin.threadVisibility !== "public" || deliveryFailureIsAmbiguous(error)) throw error;
 		throw new DeliveryDestinationError("thread_archived_unrestorable", error);
 	}
 }
