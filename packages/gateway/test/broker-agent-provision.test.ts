@@ -754,4 +754,262 @@ describe("broker agent allowlist provisioning", () => {
 			}
 		}
 	});
+
+	test("rotating OAuth credentials are filtered out during provision", async () => {
+		const f = await fixture();
+		// Create a source agent.db with rotating OAuth credentials
+		const sourceDb = new Database(join(f.source, "agent.db"));
+		sourceDb.query("DELETE FROM auth_credentials").run();
+		// Add a rotating OAuth provider credential (anthropic)
+		sourceDb.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)").run("anthropic", "anthropic-token");
+		// Add another rotating OAuth provider credential (openai-codex)
+		sourceDb
+			.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)")
+			.run("openai-codex", "openai-codex-token");
+		// Add a non-rotating credential (should be kept)
+		sourceDb.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)").run("github", "github-token");
+		sourceDb.close();
+
+		const filtered: string[] = [];
+		const lease = await acquireLease(f.home, "broker");
+		try {
+			await provisionBrokerAgent({
+				home: f.home,
+				agentDir: f.agentDir,
+				source: f.source,
+				mode: "force",
+				lease,
+				onFilteredCredentials: (providers) => filtered.push(...providers),
+			});
+		} finally {
+			await lease.release();
+		}
+
+		// Verify that rotating OAuth credentials were filtered
+		expect(filtered.sort()).toEqual(["anthropic", "openai-codex"]);
+
+		// Verify the broker agent.db does not contain the filtered credentials
+		const brokerDb = new Database(join(f.agentDir, "agent.db"), { readonly: true });
+		try {
+			const anthropic = brokerDb.query("SELECT token FROM auth_credentials WHERE provider = 'anthropic'").get() as
+				| { token: unknown }
+				| undefined;
+			const openaiCodex = brokerDb.query("SELECT token FROM auth_credentials WHERE provider = 'openai-codex'").get() as
+				| { token: unknown }
+				| undefined;
+			const github = brokerDb.query("SELECT token FROM auth_credentials WHERE provider = 'github'").get() as
+				| { token: unknown }
+				| undefined;
+
+			expect(anthropic).toBeNull();
+			expect(openaiCodex).toBeNull();
+			expect(github?.token).toBe("github-token");
+		} finally {
+			brokerDb.close();
+		}
+	});
+
+	test("re-provision keeps the broker's own OAuth login without clobbering operator rows (gjc schema)", async () => {
+		const f = await fixture();
+		const schema =
+			"DROP TABLE auth_credentials; CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, credential_type TEXT NOT NULL, data TEXT NOT NULL, identity_key TEXT DEFAULT NULL, revision INTEGER NOT NULL DEFAULT 1);";
+		const sourceDb = new Database(join(f.source, "agent.db"));
+		sourceDb.exec(schema);
+		const insert = "INSERT INTO auth_credentials (id, provider, credential_type, data) VALUES (?, ?, ?, ?)";
+		sourceDb.query(insert).run(1, "anthropic", "api_key", "operator-anthropic-key");
+		sourceDb.query(insert).run(2, "anthropic", "oauth", "operator-anthropic-oauth");
+		sourceDb.query(insert).run(3, "github", "api_key", "operator-github-key");
+		sourceDb.close();
+
+		const provision = async () => {
+			const lease = await acquireLease(f.home, "broker");
+			try {
+				return await provisionBrokerAgent({
+					home: f.home,
+					agentDir: f.agentDir,
+					source: f.source,
+					mode: "force",
+					lease,
+				});
+			} finally {
+				await lease.release();
+			}
+		};
+		const rows = () => {
+			const db = new Database(join(f.agentDir, "agent.db"), { readonly: true });
+			try {
+				return db
+					.query(
+						"SELECT provider, credential_type, data FROM auth_credentials ORDER BY provider, credential_type, data",
+					)
+					.all();
+			} finally {
+				db.close();
+			}
+		};
+		const { brokerAgentDrift } = await import("../src/broker-agent/drift");
+		const agentDbState = async () =>
+			(await brokerAgentDrift({ home: f.home, agentDir: f.agentDir, source: f.source })).entries.find(
+				(entry) => entry.name === "agent.db",
+			)?.state;
+
+		await provision();
+		expect(rows()).toEqual([
+			{ provider: "anthropic", credential_type: "api_key", data: "operator-anthropic-key" },
+			{ provider: "github", credential_type: "api_key", data: "operator-github-key" },
+		]);
+
+		// The broker logs in on its own after provisioning.
+		const brokerDb = new Database(join(f.agentDir, "agent.db"));
+		brokerDb
+			.query("INSERT INTO auth_credentials (provider, credential_type, data) VALUES (?, ?, ?)")
+			.run("anthropic", "oauth", "broker-anthropic-oauth");
+		const brokerRowId = (brokerDb.query("SELECT last_insert_rowid() AS id").get() as { id: number }).id;
+		brokerDb.close();
+		expect(await agentDbState()).toBe("in_sync");
+
+		// Token rotation in either store is not drift.
+		const rotated = new Database(join(f.agentDir, "agent.db"));
+		rotated
+			.query("UPDATE auth_credentials SET data = 'broker-anthropic-oauth-rotated' WHERE credential_type = 'oauth'")
+			.run();
+		rotated.close();
+		const operator = new Database(join(f.source, "agent.db"));
+		operator
+			.query("UPDATE auth_credentials SET data = 'operator-anthropic-oauth-rotated' WHERE credential_type = 'oauth'")
+			.run();
+		operator.close();
+		expect(await agentDbState()).toBe("in_sync");
+
+		// The operator adds a credential whose rowid equals the broker's login row.
+		const added = new Database(join(f.source, "agent.db"));
+		added.query(insert).run(brokerRowId, "openrouter", "api_key", "operator-openrouter-key");
+		added.close();
+		expect(await agentDbState()).toBe("source_changed");
+
+		await provision();
+		expect(rows()).toEqual([
+			{ provider: "anthropic", credential_type: "api_key", data: "operator-anthropic-key" },
+			{ provider: "anthropic", credential_type: "oauth", data: "broker-anthropic-oauth-rotated" },
+			{ provider: "github", credential_type: "api_key", data: "operator-github-key" },
+			{ provider: "openrouter", credential_type: "api_key", data: "operator-openrouter-key" },
+		]);
+		expect(await agentDbState()).toBe("in_sync");
+	});
+
+	test("drift is in_sync right after filtered provision", async () => {
+		const f = await fixture();
+		// Create a source agent.db with rotating OAuth credentials
+		const sourceDb = new Database(join(f.source, "agent.db"));
+		sourceDb.query("DELETE FROM auth_credentials").run();
+		// Add a rotating OAuth provider credential (anthropic)
+		sourceDb.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)").run("anthropic", "anthropic-token");
+		// Add a non-rotating credential (should be kept)
+		sourceDb.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)").run("github", "github-token");
+		sourceDb.close();
+
+		const lease = await acquireLease(f.home, "broker");
+		try {
+			// Provision the broker
+			await provisionBrokerAgent({
+				home: f.home,
+				agentDir: f.agentDir,
+				source: f.source,
+				mode: "force",
+				lease,
+			});
+
+			// Check drift - should be in_sync
+			const { brokerAgentDrift } = await import("../src/broker-agent/drift");
+			const drift = await brokerAgentDrift({ home: f.home, agentDir: f.agentDir, source: f.source });
+			const agentDbEntry = drift.entries.find((e: any) => e.name === "agent.db");
+			expect(agentDbEntry?.state).toBe("in_sync");
+		} finally {
+			await lease.release();
+		}
+	});
+
+	test("update with unchanged source returns nothing_to_do", async () => {
+		const f = await fixture();
+		// Create a source agent.db
+		const sourceDb = new Database(join(f.source, "agent.db"));
+		sourceDb.query("DELETE FROM auth_credentials").run();
+		sourceDb.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)").run("github", "github-token");
+		sourceDb.close();
+
+		const lease = await acquireLease(f.home, "broker");
+		try {
+			// First provision
+			const result1 = await provisionBrokerAgent({
+				home: f.home,
+				agentDir: f.agentDir,
+				source: f.source,
+				mode: "force",
+				lease,
+			});
+			expect(result1.status).toBe("ok");
+
+			// Second provision with update mode, source unchanged
+			const result2 = await provisionBrokerAgent({
+				home: f.home,
+				agentDir: f.agentDir,
+				source: f.source,
+				mode: "update",
+				lease,
+			});
+			expect(result2.status).toBe("nothing_to_do");
+		} finally {
+			await lease.release();
+		}
+	});
+
+	test("force re-provision keeps broker-side anthropic row", async () => {
+		const f = await fixture();
+		// Create a source agent.db with only non-rotating credential
+		const sourceDb = new Database(join(f.source, "agent.db"));
+		sourceDb.query("DELETE FROM auth_credentials").run();
+		sourceDb.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)").run("github", "github-token");
+		sourceDb.close();
+
+		const lease = await acquireLease(f.home, "broker");
+		try {
+			// First provision
+			await provisionBrokerAgent({
+				home: f.home,
+				agentDir: f.agentDir,
+				source: f.source,
+				mode: "force",
+				lease,
+			});
+
+			// Manually add anthropic credential to broker agent.db (broker logs in separately)
+			const brokerDb = new Database(join(f.agentDir, "agent.db"));
+			brokerDb
+				.query("INSERT INTO auth_credentials (provider, token) VALUES (?, ?)")
+				.run("anthropic", "broker-anthropic-token");
+			brokerDb.close();
+
+			// Force re-provision
+			await provisionBrokerAgent({
+				home: f.home,
+				agentDir: f.agentDir,
+				source: f.source,
+				mode: "force",
+				lease,
+			});
+
+			// Verify broker's anthropic row is still there
+			const brokerDb2 = new Database(join(f.agentDir, "agent.db"), { readonly: true });
+			try {
+				const anthropic = brokerDb2.query("SELECT token FROM auth_credentials WHERE provider = 'anthropic'").get() as
+					| { token: unknown }
+					| undefined;
+				expect(anthropic?.token).toBe("broker-anthropic-token");
+			} finally {
+				brokerDb2.close();
+			}
+		} finally {
+			await lease.release();
+		}
+	});
 });
