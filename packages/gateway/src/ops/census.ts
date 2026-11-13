@@ -35,6 +35,9 @@ export interface CensusReport {
 	>;
 	readonly journalRowCount: number;
 	readonly journalByteSize: number;
+	readonly pageCount: number;
+	readonly freelistCount: number;
+	readonly freelistByteSize: number;
 }
 
 function addCutoverCount(
@@ -114,6 +117,12 @@ export async function runCensus(config: GatewayConfig): Promise<CensusReport> {
 			// Measure work_journal row count and byte size
 			const { rowCount: journalRowCount, byteSize: journalByteSize } = database.journal.measure();
 
+			// Measure database page count and freelist
+			const pageCount = database.core.getPageCount();
+			const freelistCount = database.core.getFreelistCount();
+			const pageSize = database.core.getPageSize();
+			const freelistByteSize = freelistCount * pageSize;
+
 			const report: CensusReport = {
 				schemaVersion: database.schemaVersion,
 				authority: authorityCounts.authority,
@@ -126,6 +135,9 @@ export async function runCensus(config: GatewayConfig): Promise<CensusReport> {
 				),
 				journalRowCount,
 				journalByteSize,
+				pageCount,
+				freelistCount,
+				freelistByteSize,
 			};
 			console.log(JSON.stringify(report, null, 2));
 			return report;
