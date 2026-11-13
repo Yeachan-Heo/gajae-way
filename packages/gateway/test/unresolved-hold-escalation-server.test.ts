@@ -4,7 +4,13 @@ import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
-import { type GatewayServer, startUnixServer } from "../src/server/server";
+import { UNRESOLVED_HOLD_ESCALATED } from "../src/orchestrator/persona-session";
+import {
+	deterministicBindHoldDeliveryId,
+	escalationNoticeConfirmedInLedger,
+	type GatewayServer,
+	startUnixServer,
+} from "../src/server/server";
 import { Store } from "../src/store";
 import { ScriptedSessionPort } from "./session-port.fake";
 
@@ -388,3 +394,83 @@ test("a queued message the held prompt carried as context is closed as its input
 	expect(queued).toMatchObject({ state: "done", turn_role: "steer", turn_state: "done" });
 	expect(f.port.sendAttempts.filter((send) => send.opRef === heldOpRef)).toHaveLength(1);
 }, 30_000);
+
+test("an escalation notice counts as confirmed only once its origin adapter confirmed the delivery", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-escalation-confirmed-"));
+	const db = await Store.open(join(home, "gateway.db"));
+	try {
+		const originKey = "discord/dm/escalation/peer=owner";
+		const trigger = {
+			message_id: "m-held",
+			origin_ref_json: JSON.stringify({
+				platform: "discord",
+				kind: "dm",
+				conversationId: "escalation",
+				peerId: "owner",
+			}),
+		};
+		const deliveryId = deterministicBindHoldDeliveryId(originKey, trigger.message_id, UNRESOLVED_HOLD_ESCALATED);
+		// No row yet, then queued, then in flight: none of these is proof the user saw it.
+		expect(escalationNoticeConfirmedInLedger(db, originKey, trigger)).toBe(false);
+		db.transaction((tx) => db.outbox.create(tx, { deliveryId, turnId: "t", originKey, payloadJson: "{}" }));
+		expect(escalationNoticeConfirmedInLedger(db, originKey, trigger)).toBe(false);
+		db.transaction((tx) => db.outbox.markInflight(tx, deliveryId));
+		expect(escalationNoticeConfirmedInLedger(db, originKey, trigger)).toBe(false);
+		db.transaction((tx) => db.outbox.confirm(tx, deliveryId));
+		expect(escalationNoticeConfirmedInLedger(db, originKey, trigger)).toBe(true);
+		// An expired notice (adapter offline past the outbox TTL) is never confirmed.
+		const expiredId = deterministicBindHoldDeliveryId(originKey, "m-expired", UNRESOLVED_HOLD_ESCALATED);
+		db.transaction((tx) =>
+			db.outbox.create(
+				tx,
+				{ deliveryId: expiredId, turnId: "t", originKey, payloadJson: "{}" },
+				Date.now() - 2 * 86_400_000,
+			),
+		);
+		db.transaction((tx) => db.outbox.expireStale(tx, 86_400_000));
+		expect(db.outbox.get(expiredId)?.state).toBe("expired");
+		expect(escalationNoticeConfirmedInLedger(db, originKey, { ...trigger, message_id: "m-expired" })).toBe(false);
+		// A loopback notice only reaches the gateway log, never the chat client: never confirmed.
+		expect(
+			escalationNoticeConfirmedInLedger(db, "loopback/loopback/x", {
+				message_id: "m",
+				origin_ref_json: JSON.stringify({ platform: "loopback", kind: "loopback", conversationId: "x" }),
+			}),
+		).toBe(false);
+		expect(escalationNoticeConfirmedInLedger(db, originKey, { message_id: "m", origin_ref_json: "not json" })).toBe(
+			false,
+		);
+	} finally {
+		db.close();
+	}
+});
+
+test("outbox retention keeps a confirmed escalation notice while its hold is linked, then prunes it", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-escalation-retention-"));
+	const db = await Store.open(join(home, "gateway.db"));
+	try {
+		const originKey = "discord/dm/escalation/peer=owner";
+		const linked = deterministicBindHoldDeliveryId(originKey, "m-linked", UNRESOLVED_HOLD_ESCALATED);
+		const unlinked = deterministicBindHoldDeliveryId(originKey, "m-unlinked", UNRESOLVED_HOLD_ESCALATED);
+		for (const deliveryId of [linked, unlinked])
+			db.transaction((tx) => {
+				db.outbox.create(tx, { deliveryId, turnId: "t", originKey, payloadJson: "{}" });
+				db.outbox.confirm(tx, deliveryId);
+			});
+		db.core.metaSet(`escalation-notice-delivery:${linked}`, "gw-p-held");
+		// A gateway down past the confirmed-row retention prunes at boot, before persona recovery.
+		const later = Date.now() + 30 * 86_400_000;
+		db.transaction((tx) => db.outbox.prune(tx, 7 * 86_400_000, later));
+		expect(db.outbox.get(unlinked)).toBeUndefined();
+		expect(db.outbox.get(linked)?.state).toBe("confirmed");
+		const cutoff = new Date(later).toISOString();
+		db.transaction((tx) => db.outbox.sweep(tx, { deliveryCutoff: cutoff, historyCutoff: cutoff, batch: 100 }));
+		expect(db.outbox.get(linked)?.state).toBe("confirmed");
+		// Once the hold completes and drops the link, ordinary retention applies.
+		db.core.metaDelete(`escalation-notice-delivery:${linked}`);
+		db.transaction((tx) => db.outbox.prune(tx, 7 * 86_400_000, later));
+		expect(db.outbox.get(linked)).toBeUndefined();
+	} finally {
+		db.close();
+	}
+});

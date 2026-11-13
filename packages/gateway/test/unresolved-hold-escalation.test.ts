@@ -3,7 +3,11 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_SESSIONS_BUSY_STALL_MS, DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS } from "../src/config";
+import {
+	DEFAULT_SESSIONS_BUSY_STALL_MS,
+	DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS,
+	DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
+} from "../src/config";
 import {
 	type PersonaBindHoldInput,
 	PersonaSessionManager,
@@ -83,7 +87,15 @@ function endpointStale(): Error {
 
 async function heldOrigin(
 	name: string,
-	options: { heldForMs: number; live: boolean; reuseHome?: boolean; newerMessage?: boolean; clock?: VirtualClock },
+	options: {
+		heldForMs: number;
+		live: boolean;
+		reuseHome?: boolean;
+		newerMessage?: boolean;
+		clock?: VirtualClock;
+		retiredHoldAbandonMs?: number;
+		noticeConfirmed?: () => boolean;
+	},
 ) {
 	if (!options.reuseHome) home = await mkdtemp(join(tmpdir(), "gajaeway-unresolved-hold-"));
 	database = await Store.open(join(home, "gateway.db"));
@@ -116,6 +128,8 @@ async function heldOrigin(
 		expect(db.inbox.markSendAttempted(tx, heldOpRef, [], sentAt)).toBe(true);
 	});
 	port.setSessionState(binding.sessionId, { live: options.live });
+	port.setHostIncarnation(binding.sessionId, "linux:1001");
+	port.setActivity(binding.sessionId, "idle", 500);
 	if (options.newerMessage !== false) enqueue("m-next", "a newer message", new Date().toISOString());
 	const logs: string[] = [];
 	const notices: PersonaBindHoldInput[] = [];
@@ -128,6 +142,8 @@ async function heldOrigin(
 			instanceId: "hold-test",
 			repo,
 			unresolvedHoldMs: 10 * MINUTE,
+			...(options.retiredHoldAbandonMs ? { retiredHoldAbandonMs: options.retiredHoldAbandonMs } : {}),
+			...(options.noticeConfirmed ? { escalationNoticeConfirmed: options.noticeConfirmed } : {}),
 			...(options.clock ? options.clock.managerOptions() : {}),
 			log: (line: string) => logs.push(line),
 			onBindHold: (input) => {
@@ -930,6 +946,480 @@ test("an escalated hold whose status is only transiently unreadable keeps holdin
 		expect(reads).toBeGreaterThanOrEqual(60);
 		expect(reads).toBeLessThanOrEqual(64);
 		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+/** Counts liveness reads of one session, the extra CLI spawn an abandonment check costs. */
+function countLiveness(port: HoldPort, sessionId: string): () => number {
+	let reads = 0;
+	const liveness = port.liveness.bind(port);
+	port.liveness = async (input) => {
+		if (input.sessionId === sessionId) reads++;
+		return await liveness(input);
+	};
+	return () => reads;
+}
+
+test("an escalated hold whose host stays not live past retiredHoldAbandonMs is closed once, never resent or re-noticed, also across a restart", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-abandoned", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		clock,
+		retiredHoldAbandonMs: 120 * MINUTE,
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		expect(f.notices).toHaveLength(1);
+		// The notice's delivery row is linked to the open hold, so outbox retention keeps its proof.
+		const links = () => f.db.core.metaKeysInRange("escalation-notice-delivery:", "escalation-notice-delivery:\uffff");
+		expect(links()).toHaveLength(1);
+		let statusReads = 0;
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			statusReads++;
+			throw endpointStale();
+		};
+		const livenessReads = countLiveness(f.port, f.binding.sessionId);
+		// Inside the window the hold keeps its #715 contract: open, durable, swept once a minute.
+		for (let minute = 0; minute < 60; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeDefined();
+		// The window, opened by the first sweep's read, costs no liveness read per sweep.
+		expect(livenessReads()).toBe(0);
+
+		// The dead-since mark is durable: a restart does not restart the window.
+		await f.manager.stop();
+		const restarted = f.startManager();
+		try {
+			await restarted.recover();
+			for (let minute = 0; minute < 61; minute++) {
+				await clock.advance(MINUTE);
+				await restarted.reconcile(f.originKey);
+			}
+			expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).toBe("done");
+			// Closed as a failed turn with no delivery, like the stall cutoff, not as a /new discard.
+			expect(f.db.inbox.turnRow(f.heldOpRef)?.terminal_delivery_id).toBe(JSON.stringify({ none: "turn_failed" }));
+			expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBeUndefined();
+			expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeUndefined();
+			// Closing the hold releases its notice row to ordinary retention.
+			expect(links()).toHaveLength(0);
+			const abandoned = f.logs.filter(
+				(line) => line.startsWith("retired_hold_abandoned ") && line.includes(f.heldOpRef),
+			);
+			expect(abandoned).toHaveLength(1);
+			expect(abandoned[0]).toContain("reason=host_not_live");
+			// The user was told once, at escalation; the held request is never resent.
+			expect(f.notices).toHaveLength(1);
+			expect(f.port.sends.filter((send) => send.opRef === f.heldOpRef)).toHaveLength(0);
+
+			// Once closed, the sweep stops reading it.
+			const readsAtClose = statusReads;
+			for (let minute = 0; minute < 10; minute++) {
+				await clock.advance(MINUTE);
+				await restarted.reconcile(f.originKey);
+			}
+			expect(statusReads).toBe(readsAtClose);
+		} finally {
+			await restarted.stop();
+		}
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("an escalated hold whose host is seen live again restarts the abandonment window", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-revived", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			throw endpointStale();
+		};
+		await clock.advance(MINUTE);
+		await f.manager.reconcile(f.originKey);
+		const firstMark = f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`);
+		expect(firstMark).toBeDefined();
+		// The window closes with the host live: no proof the producer is gone.
+		f.port.setSessionState(f.binding.sessionId, { live: true });
+		for (let minute = 0; minute < 61; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeUndefined();
+		// Dead again: a fresh full window is required.
+		f.port.setSessionState(f.binding.sessionId, { live: false });
+		for (let minute = 0; minute < 30; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		for (let minute = 0; minute < 32; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).toBe("done");
+		expect(f.notices).toHaveLength(1);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("unanswerable liveness at the end of the abandonment window neither closes nor restarts it", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-unanswerable", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			throw endpointStale();
+		};
+		await clock.advance(MINUTE);
+		await f.manager.reconcile(f.originKey);
+		const mark = f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`);
+		expect(mark).toBeDefined();
+		// A saturated broker cannot answer liveness when the window closes.
+		const liveness = f.port.liveness.bind(f.port);
+		let unanswerable = true;
+		f.port.liveness = async (input) => {
+			if (unanswerable && input.sessionId === f.binding.sessionId) throw new Error("broker_unavailable: timed out");
+			return await liveness(input);
+		};
+		for (let minute = 0; minute < 90; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBe(mark);
+		// The first answerable read that still finds the host gone closes it.
+		unanswerable = false;
+		await clock.advance(MINUTE);
+		await f.manager.reconcile(f.originKey);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).toBe("done");
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("an in-flight status read during the abandonment window restarts it, also when relay evidence keeps the hold (#772)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-in-flight-reset", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		let inFlight = false;
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			if (!inFlight) throw endpointStale();
+			// The reattached relay stays unresponsive; only the CLI status answers (#766).
+			if (input.relay) throw new RelayClosedError(f.binding.sessionId, "relay unavailable", false);
+			return { operationRef: input.opRef, status: { status: "in_flight" as const }, summaryCompleted: false };
+		};
+		await clock.advance(MINUTE);
+		await f.manager.reconcile(f.originKey);
+		const firstMark = f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`);
+		expect(firstMark).toBeDefined();
+		// Aged relay evidence routes an in-flight read through the hold branch (#766).
+		f.db.core.metaSet(`relay_unavailable:${f.heldOpRef}`, String(clock.managerOptions().now() - 20 * MINUTE));
+		await clock.advance(30 * MINUTE);
+		inFlight = true;
+		await f.manager.reconcile(f.originKey);
+		// The read did take the relay-evidence hold branch, not the readable-status path.
+		expect(f.db.core.metaGet(`relay_unavailable:${f.heldOpRef}`)).toBeDefined();
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeUndefined();
+		// Unknown again: the old mark has not come back, so a full new window is required.
+		inFlight = false;
+		for (let minute = 0; minute < 45; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		const secondMark = f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`);
+		expect(secondMark).toBeDefined();
+		expect(secondMark).not.toBe(firstMark);
+		for (let minute = 0; minute < 20; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).toBe("done");
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a disowned session id is not proof its host exited: the hold stays open past the window", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-disowned", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			throw endpointStale();
+		};
+		await clock.advance(MINUTE);
+		await f.manager.reconcile(f.originKey);
+		const mark = f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`);
+		expect(mark).toBeDefined();
+		// The broker stops serving the id; a detached host may still be running it.
+		const liveness = f.port.liveness.bind(f.port);
+		f.port.liveness = async (input) =>
+			input.sessionId === f.binding.sessionId ? { live: undefined, disowned: true } : await liveness(input);
+		for (let minute = 0; minute < 180; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBe(mark);
+		expect(f.logs.some((line) => line.startsWith("retired_hold_abandoned "))).toBe(false);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+/** Holds whose status stays endpoint_stale, so only the abandonment window can settle them. */
+function staleStatus(f: { port: HoldPort; heldOpRef: string }): void {
+	const status = f.port.status.bind(f.port);
+	f.port.status = async (input) => {
+		if (input.opRef !== f.heldOpRef) return await status(input);
+		throw endpointStale();
+	};
+}
+
+async function sweepMinutes(clock: VirtualClock, manager: PersonaSessionManager, originKey: string, minutes: number) {
+	for (let minute = 0; minute < minutes; minute++) {
+		await clock.advance(MINUTE);
+		await manager.reconcile(originKey);
+	}
+}
+
+test("a hold whose escalation notice the origin never confirmed is not abandoned; a later confirmation is kept durably", async () => {
+	const clock = new VirtualClock();
+	let confirmed = false;
+	let asks = 0;
+	const f = await heldOrigin("dead-hold-unconfirmed-notice", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+		noticeConfirmed: () => {
+			asks++;
+			return confirmed;
+		},
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		staleStatus(f);
+		// Queued but unconfirmed (adapter offline past the outbox TTL): the hold keeps waiting.
+		await sweepMinutes(clock, f.manager, f.originKey, 180);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeUndefined();
+		expect(asks).toBeGreaterThan(0);
+		// Confirmed once: recorded, so a ledger that later prunes the row cannot undo it.
+		confirmed = true;
+		await sweepMinutes(clock, f.manager, f.originKey, 1);
+		expect(f.db.core.metaGet(`escalation-notice-confirmed:${f.heldOpRef}`)).toBe("1");
+		confirmed = false;
+		await sweepMinutes(clock, f.manager, f.originKey, 61);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).toBe("done");
+		expect(f.db.core.metaGet(`escalation-notice-confirmed:${f.heldOpRef}`)).toBeUndefined();
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a host that revived and died again inside the window is a new incarnation and restarts the window", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-new-incarnation", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		staleStatus(f);
+		await sweepMinutes(clock, f.manager, f.originKey, 1);
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toContain("linux:1001");
+		// Between the two reads a new host ran the session (and may have finished
+		// the op while status stayed unreadable), then exited; no read saw it live.
+		f.port.setHostIncarnation(f.binding.sessionId, "linux:2002");
+		await sweepMinutes(clock, f.manager, f.originKey, 61);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toContain("linux:2002");
+		expect(f.logs.filter((line) => line.startsWith("retired_hold_window_restarted "))).toHaveLength(1);
+		// The same dead host for a full new window closes it.
+		await sweepMinutes(clock, f.manager, f.originKey, 61);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).toBe("done");
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("an activity stamp that moved inside the window restarts it, even on the same host identity", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-activity-moved", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		f.port.setActivity(f.binding.sessionId, "idle", 1_000);
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		staleStatus(f);
+		await sweepMinutes(clock, f.manager, f.originKey, 1);
+		f.port.setActivity(f.binding.sessionId, "idle", 2_000);
+		await sweepMinutes(clock, f.manager, f.originKey, 61);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		await sweepMinutes(clock, f.manager, f.originKey, 61);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).toBe("done");
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a not-live read without a host identity never abandons the hold", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-no-incarnation", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		// The broker reports the host gone but no identity for it.
+		const liveness = f.port.liveness.bind(f.port);
+		f.port.liveness = async (input) =>
+			input.sessionId === f.binding.sessionId ? { live: false, disowned: false } : await liveness(input);
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		staleStatus(f);
+		await sweepMinutes(clock, f.manager, f.originKey, 180);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeUndefined();
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a not-live read without an activity stamp never opens or closes the window", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-no-activity", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		// Same incarnation throughout, but inspect may report no activity stamp.
+		const liveness = f.port.liveness.bind(f.port);
+		let stamp: number | undefined;
+		f.port.liveness = async (input) =>
+			input.sessionId === f.binding.sessionId
+				? {
+						live: false,
+						disowned: false,
+						hostIncarnation: "linux:1001",
+						...(stamp === undefined ? {} : { activity: { state: "idle", at: stamp } }),
+					}
+				: await liveness(input);
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		staleStatus(f);
+		await sweepMinutes(clock, f.manager, f.originKey, 120);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeUndefined();
+		// A stamp seen only later is not the same activity at both ends: it opens a fresh window.
+		stamp = 7_000;
+		await sweepMinutes(clock, f.manager, f.originKey, 2);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toContain('"activityAt":7000');
+		// The stamp vanishing at the window's end proves nothing either.
+		stamp = undefined;
+		await sweepMinutes(clock, f.manager, f.originKey, 70);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		stamp = 7_000;
+		await sweepMinutes(clock, f.manager, f.originKey, 2);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).toBe("done");
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a reloaded sessions.retiredHoldAbandonMs applies to the live manager", async () => {
+	const f = await heldOrigin("dead-hold-reload", { heldForMs: 11 * MINUTE, live: false });
+	try {
+		expect(f.manager.retiredHoldAbandonMs).toBe(DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS);
+		f.manager.setHostLimits({ retiredHoldAbandonMs: 2 * 60 * MINUTE });
+		expect(f.manager.retiredHoldAbandonMs).toBe(2 * 60 * MINUTE);
+		f.manager.setHostLimits(undefined);
+		expect(f.manager.retiredHoldAbandonMs).toBe(DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("an escalated hold whose status reads in_flight is never abandoned, even with its host not live (#772)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-in-flight", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			return { operationRef: input.opRef, status: { status: "in_flight" as const }, summaryCompleted: false };
+		};
+		for (let minute = 0; minute < 180; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		expect(f.logs.some((line) => line.startsWith("retired_hold_abandoned "))).toBe(false);
 	} finally {
 		await f.manager.stop();
 	}
