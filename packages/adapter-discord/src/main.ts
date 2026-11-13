@@ -977,8 +977,13 @@ export async function settleDiscordDelivery(
 		await settleDiscordReaction(gateway, discord, message, reactions.resolver, reactions.limiter);
 		return;
 	}
+	// Parts Discord accepted for this delivery: once one landed, a later failure
+	// cannot be retried as if nothing was sent.
+	let sentParts = 0;
+	let resolved = false;
 	try {
 		const { channel, notice } = await resolveDeliveryChannel(discord, message.origin, deliveryId);
+		resolved = true;
 		const parsed = parseDiscordMedia(message.text);
 		const body = message.duplicateWarning ? `[recovered - may be a duplicate] ${parsed.text}` : parsed.text;
 		const mediaResult = await loadDiscordMedia(parsed.paths, mediaDirectories);
@@ -998,6 +1003,7 @@ export async function settleDiscordDelivery(
 		try {
 			if (files.length > 0 && chunks.length === 0) {
 				await sendFirstDiscordPart(channel, { files, content: "" }, reference);
+				sentParts++;
 			} else {
 				for (let index = 0; index < chunks.length; index++) {
 					const chunk = chunks[index] as string;
@@ -1008,11 +1014,16 @@ export async function settleDiscordDelivery(
 							reference,
 						);
 					else await channel.send(chunk);
+					sentParts++;
 				}
 			}
 		} finally {
 			if (!message.final) typing?.refresh(message.origin.conversationId);
 		}
+		if (sentParts === 0)
+			// Nothing to post (an empty reply): confirming settles it; failing it would
+			// report a lost delivery for a message that never had content.
+			console.log(`discord_delivery_empty deliveryId=${deliveryId} origin=${message.origin.conversationId}`);
 		if (message.final) endDiscordWorkingState(message.origin.conversationId, status, typing);
 		// Voice rides AFTER the text, and only after the text actually landed:
 		// pairing them is for a readable history, so the readable half must be
@@ -1023,16 +1034,79 @@ export async function settleDiscordDelivery(
 			// A voice post clears Discord's typing hint just like a text post.
 			if (!message.final) typing?.refresh(message.origin.conversationId);
 		}
-		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
 		if (message.final) endDiscordWorkingState(message.origin.conversationId, status, typing);
-		const failReason = error instanceof Error ? error.message : String(error);
-		console.error(`discord delivery failed origin=${message.origin.conversationId}: ${failReason}`);
-		await gateway.request("delivery.fail", {
-			deliveryId,
-			reason: error instanceof Error ? error.message : String(error),
-			ambiguous: deliveryFailureIsAmbiguous(error),
-		});
+		const failure = deliveryFailure(error, resolved, sentParts);
+		console.error(
+			`discord delivery failed origin=${message.origin.conversationId} stage=${failure.stage} ambiguous=${failure.ambiguous}: ${failure.reason}`,
+		);
+		await gateway.request("delivery.fail", { deliveryId, reason: failure.reason, ambiguous: failure.ambiguous });
+		return;
+	}
+	await confirmDiscordDelivery(gateway, deliveryId);
+}
+
+/** Pause before each re-send of a lost `delivery.confirm` (the ledger transition is idempotent). */
+const DELIVERY_CONFIRM_RETRY_DELAYS_MS = [100, 500] as const;
+
+/**
+ * Every part landed, so the delivery is never reported failed from here. A
+ * confirm the gateway does not acknowledge is retried; once retries run out the
+ * row stays inflight and the ACK-timeout replay carries the duplicate label.
+ */
+async function confirmDiscordDelivery(gateway: Pick<GatewayClientLike, "request">, deliveryId: string): Promise<void> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			await gateway.request("delivery.confirm", { deliveryId });
+			return;
+		} catch (error) {
+			const delay = DELIVERY_CONFIRM_RETRY_DELAYS_MS[attempt];
+			if (delay === undefined) {
+				console.error(
+					`discord delivery_confirm_unconfirmed deliveryId=${deliveryId}: ${error instanceof Error ? error.message : String(error)}`,
+				);
+				return;
+			}
+			await Bun.sleep(delay);
+		}
+	}
+}
+
+/**
+ * The exact failure a delivery reports. Before any part landed nothing was
+ * dispatched: a destination that could not be resolved is a definitive failure
+ * (`thread_missing`, `thread_archived_unrestorable`, `resolve_failed`). After a
+ * part landed the retry may duplicate it (`partial_send`, ambiguous). A send
+ * that failed in an unknown way is ambiguous (`send_unknown`), unless Discord
+ * answered with a known permanent refusal, which keeps its own message.
+ */
+function deliveryFailure(
+	error: unknown,
+	resolved: boolean,
+	sentParts: number,
+): { readonly stage: "resolve" | "send"; readonly reason: string; readonly ambiguous: boolean } {
+	const message = error instanceof Error ? error.message : String(error);
+	if (!resolved) {
+		if (error instanceof DeliveryDestinationError) return { stage: "resolve", reason: error.message, ambiguous: false };
+		return {
+			stage: "resolve",
+			reason: deliveryFailureIsAmbiguous(error) ? `resolve_failed: ${message}` : message,
+			ambiguous: false,
+		};
+	}
+	if (sentParts > 0) return { stage: "send", reason: `partial_send: ${message}`, ambiguous: true };
+	if (deliveryFailureIsAmbiguous(error)) return { stage: "send", reason: `send_unknown: ${message}`, ambiguous: true };
+	return { stage: "send", reason: message, ambiguous: false };
+}
+
+/** A thread the delivery addressed that cannot receive it; the reply is not moved elsewhere. */
+class DeliveryDestinationError extends Error {
+	readonly code: unknown;
+
+	constructor(kind: "thread_missing" | "thread_archived_unrestorable", cause: unknown) {
+		super(`${kind}: ${errorMessage(cause)}`);
+		this.name = "DeliveryDestinationError";
+		this.code = typeof cause === "object" && cause !== null && "code" in cause ? cause.code : undefined;
 	}
 }
 
@@ -1082,13 +1156,15 @@ async function fetchTextChannel(discord: DiscordClientLike, id: string): Promise
 /**
  * Resolves where a delivery is posted. A thread archives after inactivity, and
  * posting into it only auto-unarchives when the bot holds the right permission,
- * so an archived thread is explicitly unarchived first. When that fails the
- * reply goes to the parent channel with a visible notice and a log line: a
- * monitor result that silently vanishes behind an archived thread is the worst
- * outcome, because its schedule still looks healthy. Public threads may fall
- * back to their parent. Synthetic handoff/work ids are not Discord thread ids,
- * so they also fall back when visibility is unknown; explicitly private threads
- * never fall back into a broader channel.
+ * so an archived thread is explicitly unarchived first. A real thread that is
+ * gone or stays archived fails the delivery with that exact reason: the reply
+ * is never moved into the parent channel, where it would answer a conversation
+ * the user did not address and the ledger would report a success that did not
+ * happen. The failure stays visible through the ledger (pending, then expired
+ * with the owner's lost-delivery notice and `ops redeliver`), readiness and the
+ * logs. Synthetic handoff/work ids are not Discord threads at all, so their
+ * parent channel is their real destination; explicitly private ones never
+ * fall back into a broader channel.
  */
 async function resolveDeliveryChannel(
 	discord: DiscordClientLike,
@@ -1099,23 +1175,19 @@ async function resolveDeliveryChannel(
 	try {
 		channel = await fetchTextChannel(discord, origin.conversationId);
 	} catch (error) {
-		const syntheticThread = isSyntheticDiscordThreadId(origin.conversationId);
-		if (
-			origin.kind !== "thread" ||
-			(origin.threadVisibility !== "public" && !(syntheticThread && origin.threadVisibility !== "private")) ||
-			!origin.parentId ||
-			!isChannelNotFoundError(error)
-		)
-			throw error;
-		const reason = `${syntheticThread ? "synthetic " : ""}thread ${origin.conversationId} does not exist`;
-		const noticeThread = syntheticThread
-			? `synthetic thread ${origin.conversationId}`
-			: `thread <#${origin.conversationId}>`;
+		if (origin.kind !== "thread" || !origin.parentId || !isChannelNotFoundError(error)) throw error;
+		if (!isSyntheticDiscordThreadId(origin.conversationId)) {
+			if (origin.threadVisibility !== "public") throw error;
+			throw new DeliveryDestinationError("thread_missing", error);
+		}
+		if (origin.threadVisibility === "private") throw error;
 		const parent = await fetchTextChannel(discord, origin.parentId);
-		console.error(`Discord delivery ${deliveryId}: ${reason}; delivered to parent channel ${origin.parentId} instead.`);
+		console.error(
+			`Discord delivery ${deliveryId}: synthetic thread ${origin.conversationId} does not exist; delivered to parent channel ${origin.parentId} instead.`,
+		);
 		return {
 			channel: parent,
-			notice: `[${noticeThread} does not exist; posting here instead]`,
+			notice: `[synthetic thread ${origin.conversationId} does not exist; posting here instead]`,
 		};
 	}
 	if (origin.kind !== "thread" || !origin.parentId || !isArchivedThread(channel)) return { channel };
@@ -1124,13 +1196,7 @@ async function resolveDeliveryChannel(
 		return { channel };
 	} catch (error) {
 		if (origin.threadVisibility !== "public") throw error;
-		const reason = `thread ${origin.conversationId} is archived and could not be unarchived (${errorMessage(error)})`;
-		const parent = await fetchTextChannel(discord, origin.parentId);
-		console.error(`Discord delivery ${deliveryId}: ${reason}; delivered to parent channel ${origin.parentId} instead.`);
-		return {
-			channel: parent,
-			notice: `[thread <#${origin.conversationId}> is archived and could not be unarchived (${errorMessage(error)}); posting here instead]`,
-		};
+		throw new DeliveryDestinationError("thread_archived_unrestorable", error);
 	}
 }
 

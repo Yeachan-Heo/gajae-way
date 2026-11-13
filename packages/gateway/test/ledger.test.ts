@@ -30,6 +30,65 @@ test("delivery ledger expires only after the fifth definitive failure", async ()
 	}
 });
 
+test("adapter failure stages map to the replay label: only a possibly-landed send is labeled", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
+	try {
+		const database = await Store.open(join(directory, "gateway.db"));
+		const ledger = new DeliveryService(database);
+		const cases = [
+			{
+				id: "missing",
+				reason: "thread_missing: Unknown Channel",
+				ambiguous: false,
+				state: "pending",
+				code: "not_found",
+			},
+			{
+				id: "archived",
+				reason: "thread_archived_unrestorable: Missing Permissions",
+				ambiguous: false,
+				state: "pending",
+				code: "forbidden",
+			},
+			{ id: "lookup", reason: "resolve_failed: fetch failed", ambiguous: false, state: "pending", code: "network" },
+			{
+				id: "partial",
+				reason: "partial_send: Missing Permissions",
+				ambiguous: true,
+				state: "failed_ambiguous",
+				code: "forbidden",
+			},
+			{
+				id: "unknown",
+				reason: "send_unknown: timeout after dispatch",
+				ambiguous: true,
+				state: "failed_ambiguous",
+				code: "timeout",
+			},
+		] as const;
+		for (const item of cases) {
+			ledger.createPending({
+				deliveryId: item.id,
+				turnId: "turn",
+				originKey: "discord/thread/t",
+				payloadJson: JSON.stringify({ deliveryId: item.id, text: item.id }),
+			});
+			ledger.markInflight(item.id);
+			ledger.fail(item.id, item.ambiguous, item.reason);
+			expect(ledger.get(item.id)).toMatchObject({ state: item.state, lastError: item.code });
+		}
+		const replay = new Map(ledger.sweep(Date.now(), true).payloads.map((payload) => [payload.deliveryId, payload]));
+		for (const item of cases) {
+			const payload = replay.get(item.id);
+			expect(payload?.redelivered).toBe(true);
+			expect(payload?.duplicateWarning === true).toBe(item.ambiguous);
+		}
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
 test("restart barriers can seed every retained unresolved terminal delivery", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
 	try {

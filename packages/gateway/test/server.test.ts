@@ -549,6 +549,41 @@ test("a connected adapter receives a failed delivery again on the periodic sweep
 	client.close();
 });
 
+test("delivery destination: delivery.fail logs the adapter's exact stage reason with the ledger code and state", async () => {
+	const { client, database } = await startDeliveryServer();
+	const origin = { platform: "discord", kind: "dm", conversationId: "exact-failure", peerId: "owner" } as const;
+	const delivery = new DeliveryService(database);
+	expect(delivery.prepare("turn-exact", origin, "reply", undefined, "exact-failed")).toBeDefined();
+	expect(delivery.prepare("turn-partial", origin, "reply", undefined, "partial-failed")).toBeDefined();
+	const errors: string[] = [];
+	const original = console.error;
+	console.error = (line: string) => void errors.push(String(line));
+	try {
+		for (const [id, reason, ambiguous] of [
+			["exact-failed", "thread_missing: Unknown Channel", false],
+			["partial-failed", "partial_send: Missing Permissions", true],
+		] as const) {
+			client.send({
+				v: "0.1",
+				type: "request",
+				id: `fail-${id}`,
+				verb: "delivery.fail",
+				params: { deliveryId: id, reason, ambiguous },
+			});
+			await waitFrame(client.frames, `fail-${id}`);
+		}
+	} finally {
+		console.error = original;
+	}
+	expect(errors).toContain(
+		"delivery_failed deliveryId=exact-failed code=not_found state=pending reason=thread_missing:_Unknown_Channel",
+	);
+	expect(errors).toContain(
+		"delivery_failed deliveryId=partial-failed code=forbidden state=failed_ambiguous reason=partial_send:_Missing_Permissions",
+	);
+	client.close();
+});
+
 test("status readiness degrades on sustained delivery failure and recovers after a confirmed delivery", async () => {
 	const { client, database } = await startDeliveryServer();
 	const origin = { platform: "discord", kind: "dm", conversationId: "readiness-test", peerId: "owner" } as const;
