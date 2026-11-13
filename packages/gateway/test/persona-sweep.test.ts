@@ -98,6 +98,7 @@ function newManager(
 		port,
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
+		maxLiveHosts: 32,
 		...(extra.setTimeout ? { setTimeout: extra.setTimeout, clearTimeout: () => {} } : {}),
 		log: extra.log ?? (() => {}),
 		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
@@ -142,6 +143,24 @@ test("restart recovery reads one origin at a time instead of fanning out per ori
 	// Recovery still adopts every running turn and resends nothing.
 	expect(port.sends).toHaveLength(origins.length);
 	for (const origin of origins) expect(manager!.state(origin.key)).toBe("turn-running");
+});
+
+test("recovery time is the serial read time, not a stall: 20 restarted origins", async () => {
+	const port = new CountingReadPort();
+	const origins = await restartWithRunningTurns(port, 20);
+	port.delayMs = 10;
+	const startedAt = performance.now();
+	await manager!.recover();
+	const elapsedMs = performance.now() - startedAt;
+	for (const origin of origins) expect(manager!.state(origin.key)).toBe("turn-running");
+	expect(port.peak).toBe(1);
+	// Recovery cost is reads x read latency (4 authority reads plus the adopted turn's
+	// reconcile per origin): at a 1s gjc CLI read, 20 origins x 5 reads ~ 100s per
+	// post-restart sweep. Nothing else may wait: allow 2x scheduling slack.
+	const perOrigin = port.reads.length / origins.length;
+	expect(perOrigin).toBeGreaterThanOrEqual(4);
+	expect(perOrigin).toBeLessThanOrEqual(6);
+	expect(elapsedMs).toBeLessThan(port.reads.length * port.delayMs * 2 + 500);
 });
 
 test("overlapping recovery calls join one sweep", async () => {
