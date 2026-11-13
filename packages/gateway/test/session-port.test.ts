@@ -4,6 +4,7 @@ import { appendFile, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
+import { GjcCommandQueueTimeoutError } from "../src/orchestrator/broker";
 import { isDefinitiveSteerRejection } from "../src/orchestrator/persona-session";
 import {
 	BrokerSessionPort,
@@ -331,6 +332,20 @@ test("session.create diagnostics are sanitized before failures reach callers", a
 	expect(String((failure as Error).message)).not.toContain(secret);
 	expect(JSON.stringify((failure as GjcCliError).details)).not.toContain(secret);
 	expect((failure as GjcCliError).details).toMatchObject({ code: "invalid_params" });
+});
+
+test("a local CLI queue timeout keeps its type through the session port sanitizer (#748)", async () => {
+	const run: CliRunner = async (args) => {
+		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
+		throw new GjcCommandQueueTimeoutError(30000, 4, 16, 16, "session.create");
+	};
+	const { port, repo } = await brokerPortFixture(run);
+	const failure = await port
+		.bind({ originKey: "discord/dm/queue-timeout-bind", epoch: 0, repo })
+		.catch((error: unknown) => error);
+
+	expect(failure).toBeInstanceOf(GjcCommandQueueTimeoutError);
+	expect((failure as GjcCommandQueueTimeoutError).timeoutMs).toBe(30000);
 });
 
 test("a binding recorded under a symlinked workspace stays owned when the runtime asks with the resolved path", async () => {

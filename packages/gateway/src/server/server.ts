@@ -1148,13 +1148,14 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		},
 		onReadinessFailure: ({ code, detail, originKey, at }) =>
 			readiness.recordFailure({
-				category: "monitor_delivery",
+				category: code === "monitor_bind_degraded" ? "monitor_bind" : "monitor_delivery",
 				code,
 				detail,
 				origin: originKey,
 				at,
 			}),
 		onReadinessSuccess: () => readiness.recordSuccess("monitor_delivery"),
+		onFirstAttemptBindSuccess: () => readiness.recordSuccess("monitor_bind"),
 		// AC7: the ONE production compaction seam. Native compaction runs through the
 		// broker-bound SessionPort, whose authenticated control receipt is the only
 		// affirmative compaction observation (logged by the TailRunner); the monitor
