@@ -8,6 +8,7 @@ import type { Store } from "../store";
 import { runGit } from "./git-command";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionPort } from "./session-port";
+import { inSweep, sweepControl } from "./sweep-limiter";
 
 export const WORK_LANE_PREFIX = "work/task/";
 
@@ -382,6 +383,8 @@ export class LaneGovernor {
 	 * the epoch with reason operator_force.
 	 */
 	forceRetire(name: string): Promise<LaneRetireOutcome> {
+		// Retirement is a control operation: from a sweep it runs as ordinary work.
+		if (inSweep()) return sweepControl(() => this.forceRetire(name));
 		if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 			return Promise.resolve({
 				retired: false,

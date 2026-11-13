@@ -74,6 +74,7 @@ import {
 } from "./lane-governor";
 import { sanitizeDiagnostic } from "./rebind";
 import { isSessionUnavailable, type SessionLiveness, type SessionPort } from "./session-port";
+import { SweepLimiter } from "./sweep-limiter";
 import { isRelayTransportFailure, type TailHandle } from "./tail-runner";
 
 const owners = new WeakSet<Store>();
@@ -216,6 +217,8 @@ export interface WorkLaneManagerOptions {
 	readonly notifyPersona?: (originKey: string) => void;
 	readonly deliverFallback?: (payload: ChatMessagePayload) => void;
 	readonly brokerGeneration?: () => number;
+	/** Process-wide sweep read bound shared with the other sweep drivers; a private one when omitted. */
+	readonly sweep?: SweepLimiter;
 	readonly pollMs?: number;
 	readonly waitTimeoutMs?: number;
 	/** How long consecutive host-gone verdicts must persist before a live observer settles `host_lost`. */
@@ -299,6 +302,7 @@ export class WorkLaneManager {
 	readonly #options: WorkLaneManagerOptions;
 	readonly #db: Store;
 	readonly #port: SessionPort;
+	readonly #sweep: SweepLimiter;
 	readonly #observers = new Map<string, Observer>();
 	/** Includes dropped observers no longer reachable through #observers. */
 	readonly #observerDisposals = new Set<Promise<void>>();
@@ -324,6 +328,7 @@ export class WorkLaneManager {
 		this.#options = options;
 		this.#db = options.database;
 		this.#port = options.port;
+		this.#sweep = options.sweep ?? new SweepLimiter();
 		options.lanes.setRecoveryGate(() => this.recover());
 		options.lanes.setForceRetireSettlement((name, opRef, reason, endedAt) =>
 			this.settleForceRetiredAttempt(name, opRef, reason, endedAt),
@@ -1477,7 +1482,9 @@ export class WorkLaneManager {
 		observer.timer = setTimeout(() => {
 			observer.timer = undefined;
 			if (!this.#current(observer)) return;
-			observer.task = this.#tick(observer)
+			// Observer polling is a sweep: its CLI reads share the process-wide sweep read bound.
+			observer.task = this.#sweep
+				.run(() => this.#tick(observer))
 				.then(
 					() => {
 						this.#failures.delete(opRef);
@@ -2807,7 +2814,7 @@ export class WorkLaneManager {
 				let status: PromptStatusBody | undefined;
 				let statusError: unknown;
 				try {
-					status = await this.#query(runtime, observer.tail);
+					status = await this.#sweep.run(() => this.#query(runtime, observer.tail));
 				} catch (error) {
 					/* Liveness decides whether authority can be recovered. */
 					statusError = error;
@@ -2865,7 +2872,10 @@ export class WorkLaneManager {
 				}
 				let live: { live: boolean | undefined; disowned: boolean } = { live: undefined, disowned: false };
 				try {
-					live = (await this.#port.liveness?.({ sessionId: runtime.sessionId, repo: runtime.cwd })) ?? live;
+					live =
+						(await this.#sweep.run(
+							async () => await this.#port.liveness?.({ sessionId: runtime.sessionId, repo: runtime.cwd }),
+						)) ?? live;
 				} catch {
 					/* Indeterminate authority is not a replay permit. */
 				}

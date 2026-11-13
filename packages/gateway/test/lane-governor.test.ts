@@ -13,6 +13,7 @@ import {
 	parseLaneJobRecord,
 } from "@gajae-gateway/subsession";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
+import { inSweep, SweepLimiter } from "../src/orchestrator/sweep-limiter";
 import { BrokerAuthorityError, Store } from "../src/store";
 import type { WorkAttemptSettlement, WorkAttemptTerminalEvidence } from "../src/store/groups/work";
 import { ScriptedSessionPort } from "./session-port.fake";
@@ -911,6 +912,44 @@ test("#360: retireAllDead retires only dead lanes, skipping live and quarantined
 
 	expect(port.closes.length).toBe(2);
 	expect(port.closes.map((c) => c.sessionId).sort()).toEqual(["sess-dead1", "sess-dead2"]);
+});
+
+test("retireAllDead from a sweep probes in sweep scope but retires as ordinary work", async () => {
+	database = await Store.open(":memory:");
+	bind("dead", NOW - 120_000, "sess-dead");
+	bind("live", NOW - 10_000, "sess-live");
+	const scopes: string[] = [];
+	class ScopeRecordingPort extends ScriptedSessionPort {
+		override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
+			scopes.push(`liveness:${input.sessionId}:${inSweep()}`);
+			return await super.liveness(input);
+		}
+		override async close(input: Parameters<ScriptedSessionPort["close"]>[0]) {
+			scopes.push(`close:${input.sessionId}:${inSweep()}`);
+			return await super.close(input);
+		}
+	}
+	const port = new ScopeRecordingPort();
+	port.setSessionState("sess-dead", { live: false });
+	port.setSessionState("sess-live", { live: true });
+	const governor = new LaneGovernor({ database, sessionPort: port, now: () => NOW, log: () => {} });
+	const sweep = new SweepLimiter();
+
+	const result = await sweep.run(async () => await governor.retireAllDead());
+
+	expect(result.names).toEqual(["dead"]);
+	// The nominating probes are sweep reads; forceRetire's own probe and close are not.
+	expect(scopes).toContain("liveness:sess-dead:true");
+	expect(scopes).toContain("liveness:sess-live:true");
+	expect(scopes).toContain("close:sess-dead:false");
+	expect(scopes.filter((entry) => entry.startsWith("close:")).every((entry) => entry.endsWith(":false"))).toBe(true);
+	// An operator call is ordinary work throughout.
+	scopes.length = 0;
+	bind("dead-2", NOW - 120_000, "sess-dead-2");
+	port.setSessionState("sess-dead-2", { live: false });
+	await governor.retireAllDead();
+	expect(scopes.length).toBeGreaterThan(0);
+	expect(scopes.every((entry) => entry.endsWith(":false"))).toBe(true);
 });
 
 test("#778: forceRetire settles an open idle attempt on a live session as operator abandonment with broker evidence", async () => {

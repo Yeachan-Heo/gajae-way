@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -5192,3 +5192,78 @@ for (const state of ["running", "indeterminate"] as const) {
 		}
 	});
 }
+
+describe("periodic reconcile sweep (sweep bounds)", () => {
+	test("a persona sweep still in flight is not started again by the next tick", async () => {
+		directory = await mkdtemp(join(tmpdir(), "gajaeway-reconcile-sweep-"));
+		const config: GatewayConfig = {
+			schemaVersion: 1,
+			home: directory,
+			gjc: { agentDir: join(directory, "agent") },
+			configPath: join(directory, "config.json"),
+			socketPath: join(directory, "gateway.sock"),
+			dbPath: join(directory, "gateway.db"),
+			logVerbosity: "info",
+			dmPolicy: "open",
+		};
+		const database = await Store.open(config.dbPath);
+		const sessionPort = sessionPortFromResponder({
+			bind: (key, epoch) => bindWorkFixture(key, epoch),
+			respond: async () => "observed reply",
+		});
+		attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+		const info = spyOn(console, "info");
+		server = await startUnixServer({
+			config,
+			database,
+			sessionPort,
+			onStop: () => database.close(),
+			reconcileIntervalMs: 20,
+		});
+		const client = await connect(config.socketPath);
+		try {
+			client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+			await waitFor(client.frames, 1);
+			const origin = { platform: "discord", kind: "dm", conversationId: "sweep-tick", peerId: "owner" };
+			client.send({
+				v: "0.1",
+				type: "request",
+				id: "turn",
+				verb: "chat.send",
+				params: { origin, text: "hello", engagement: { mentioned: false, group: false, authorId: "owner" } },
+			});
+			await waitFrame(client.frames, "turn");
+			await waitForCompletedSend(database, sessionPort, 0);
+			// The settled turn leaves an agent-run observer, which every persona sweep reads.
+			let inFlight = 0;
+			let peak = 0;
+			let reads = 0;
+			const runningJobs = sessionPort.runningJobs.bind(sessionPort);
+			sessionPort.runningJobs = async (input) => {
+				reads++;
+				inFlight++;
+				peak = Math.max(peak, inFlight);
+				try {
+					await Bun.sleep(80);
+					return await runningJobs(input);
+				} finally {
+					inFlight--;
+				}
+			};
+			const skipped = () =>
+				info.mock.calls.some(([line]) => String(line) === "reconcile_sweep_skipped subsystem=persona reason=in_flight");
+			for (let attempt = 0; attempt < 200 && !skipped(); attempt++) await Bun.sleep(5);
+			expect(skipped()).toBe(true);
+			await Bun.sleep(200);
+			expect(reads).toBeGreaterThan(0);
+			expect(peak).toBe(1);
+			// One chain at a time: no backlog of ticks queued behind the slow read.
+			expect(reads).toBeLessThanOrEqual(6);
+		} finally {
+			info.mockRestore();
+			client.close();
+			await server?.stop();
+			server = undefined;
+		}
+	});
+});

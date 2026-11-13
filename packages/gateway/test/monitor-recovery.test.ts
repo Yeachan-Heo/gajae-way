@@ -23,6 +23,7 @@ import {
 	SessionRequestTimeoutError,
 	SessionTerminalError,
 } from "../src/orchestrator/session-port";
+import { inSweep } from "../src/orchestrator/sweep-limiter";
 import { RelayHelloError, RelayRefusedError } from "../src/orchestrator/tail-runner";
 import { startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
@@ -2440,6 +2441,24 @@ describe("#702: an exhausted event held on an unresolvable authoring turn", () =
 			expect(prompts()).toBe(0);
 		});
 	}
+
+	test("reconcile reads exhausted and given-up turns in sweep scope", async () => {
+		const { sessionPort, propagator, advance } = await heldSkipMonitor("unknown");
+		const scopes: boolean[] = [];
+		const status = sessionPort.status.bind(sessionPort);
+		sessionPort.status = async (input) => {
+			scopes.push(inSweep());
+			return await status(input);
+		};
+		// Held on the exhausted-turn disposition read, then given up and rescanned as a late result.
+		await propagator.reconcile();
+		advance(MONITOR_EVENT_MAX_OPEN_AGE_MS + 60_000);
+		await propagator.reconcile();
+		await propagator.reconcile();
+		expect(scopes.length).toBeGreaterThanOrEqual(3);
+		expect(scopes.every(Boolean)).toBe(true);
+		expect(inSweep()).toBe(false);
+	});
 
 	test("a late result reopens the whole given-up batch and is harvested from its own op, never resent", async () => {
 		const { db, eventIds, opRef, sessionPort, propagator, prompts, advance } = await heldSkipMonitor("unknown", 2);

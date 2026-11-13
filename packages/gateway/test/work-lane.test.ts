@@ -37,6 +37,7 @@ import {
 	type SessionSendInput,
 	type WorkerOutputResult,
 } from "../src/orchestrator/session-port";
+import { inSweep } from "../src/orchestrator/sweep-limiter";
 import { RelayClosedError, type TailHandle, TailRunner } from "../src/orchestrator/tail-runner";
 import {
 	assertOutsideServiceDirectory,
@@ -172,6 +173,24 @@ async function started(f: Awaited<ReturnType<typeof fixture>>, name = "a", paren
 	if (!result.started) throw new Error("unexpected hold");
 	return result;
 }
+
+test("observer polling reads in sweep scope; a work.status read stays ordinary work", async () => {
+	const f = await fixture();
+	const scopes: Array<{ readonly sweep: boolean; readonly source: string }> = [];
+	let source = "observer";
+	const status = f.port.status.bind(f.port);
+	f.port.status = async (input) => {
+		scopes.push({ sweep: inSweep(), source });
+		return await status(input);
+	};
+	await started(f);
+	await until(() => scopes.some((entry) => entry.source === "observer" && entry.sweep));
+	source = "verb";
+	const before = scopes.length;
+	await f.manager.status({ name: "a" });
+	const verbReads = scopes.slice(before).filter((entry) => entry.source === "verb" && !entry.sweep);
+	expect(verbReads.length).toBeGreaterThan(0);
+});
 
 test("work.start during a broker restart waits for broker readiness and starts the lane", async () => {
 	const logs: string[] = [];

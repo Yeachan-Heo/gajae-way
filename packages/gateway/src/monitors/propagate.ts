@@ -27,6 +27,7 @@ import {
 	sessionRequestStep,
 	type WorkerOutputResult,
 } from "../orchestrator/session-port";
+import { SweepLimiter } from "../orchestrator/sweep-limiter";
 import { RelayClosedError, RelayHelloError, RelayRefusedError } from "../orchestrator/tail-runner";
 import { BrokerAuthorityError, type Store } from "../store";
 import { isBrokerPromptBusyRefusal } from "../store/groups/bindings";
@@ -290,6 +291,7 @@ export class MonitorPropagator {
 	readonly #database: Store;
 	readonly #registry: MonitorRegistry;
 	readonly #sessionPort: SessionPort;
+	readonly #sweep: SweepLimiter;
 	readonly #memory: MemoryClosureQueue;
 	readonly #delivery: DeliveryService;
 	readonly #emit: (event: MonitorEventRecord) => void;
@@ -394,8 +396,11 @@ export class MonitorPropagator {
 		 * MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD.
 		 */
 		protocolFailureRollThreshold?: number;
+		/** Process-wide sweep read bound shared with the other sweep drivers; a private one when omitted. */
+		sweep?: SweepLimiter;
 	}) {
 		this.#database = options.database;
+		this.#sweep = options.sweep ?? new SweepLimiter();
 		this.#model = options.model;
 		this.#serviceTier = options.serviceTier;
 		this.#registry = options.registry;
@@ -689,7 +694,8 @@ export class MonitorPropagator {
 						if (row.stage === "authored") this.#database.monitors.eventUpdate(tx, row.event_id, "delivered");
 				});
 			}
-			await this.#recoverUnresolvedTurns();
+			// The late-result scan only reads: its status/output reads share the sweep read bound.
+			await this.#sweep.run(() => this.#recoverUnresolvedTurns());
 			// Replay oldest-first: recovery must re-author events in the order they fired.
 			const resumedAuthoringEvents = new Set<string>();
 			for (const candidate of this.#database.monitors.eventsOpen()) {
@@ -718,7 +724,7 @@ export class MonitorPropagator {
 					if (this.#database.monitors.eventLiveLeaseOwner(row.event_id, this.#now())) continue;
 					if (row.dispatch_attempts >= MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS) {
 						// Exhausting dispatch attempts does not settle the turn they may have started.
-						const disposition = await this.#exhaustedTurnDisposition(row);
+						const disposition = await this.#sweep.run(() => this.#exhaustedTurnDisposition(row));
 						if (disposition.kind === "hold") {
 							// Bound the unresolved hold (#702). The authoring-turn pointer exempts this
 							// event from supersession and from the stale reaper, and overlap=skip counts

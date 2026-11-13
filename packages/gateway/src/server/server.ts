@@ -114,6 +114,7 @@ import {
 	sanitizeDiagnosticDetail,
 } from "../orchestrator/rebind";
 import type { SessionPort } from "../orchestrator/session-port";
+import { SweepLimiter } from "../orchestrator/sweep-limiter";
 import {
 	deterministicHeldPostDeliveryId,
 	deterministicInterimDeliveryId,
@@ -319,6 +320,8 @@ export interface GatewayServerOptions {
 	readonly personaNow?: () => number;
 	/** Test seam for periodic delivery recovery; production sweeps every 15s. */
 	readonly deliverySweepIntervalMs?: number;
+	/** Test seam for the periodic persona/lane reconciliation sweep; production runs it every 60s. */
+	readonly reconcileIntervalMs?: number;
 	/** Mid-work speech gating configuration (issue #71). */
 	readonly interimSpeech?: { readonly maxPerTurn?: number; readonly minGapMs?: number };
 	/** Test seam: outbound secret redaction; production reads its sources from the process env and the broker agent dir. */
@@ -974,6 +977,9 @@ export async function sweepIdleSessions(
 
 function createRuntime(options: GatewayServerOptions): Runtime {
 	const sessionPort = options.sessionPort;
+	// One sweep read bound for every periodic sweep in this process (persona,
+	// observers, work lanes, lane retirement, monitors).
+	const sweep = new SweepLimiter();
 	const connections = new Set<Connection>();
 	const restartDrainOwners = new Map<string, Connection>();
 	const restartTerminalDeliveryIds = new Set<string>();
@@ -1015,6 +1021,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const personaSessions = new PersonaSessionManager({
 		database: options.database,
 		port: sessionPort,
+		sweep,
 		instanceId: options.database.instanceId,
 		repo: workspace,
 		brokerAgentDir: options.broker?.agentDir,
@@ -1134,6 +1141,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		database: options.database,
 		registry,
 		sessionPort,
+		sweep,
 		memory,
 		delivery,
 		ownerTarget: options.config.ownerTarget,
@@ -1187,6 +1195,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const work = new WorkLaneManager({
 		database: options.database,
 		port: sessionPort,
+		sweep,
 		lanes,
 		gajaewayHome: options.config.home,
 		serviceDirectory: getServiceDirectory(),
@@ -1201,25 +1210,40 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		checkStatusClient: ghCheckStatusClient(),
 	});
 	const originSilent = new OriginSilentAlerter(options.database, () => runtime.config.ownerTarget?.origin);
+	// Each chain runs at most once at a time: a sweep still in flight when the
+	// next tick fires is not started a second time (the slow sweep is the load).
+	let personaSweep: Promise<void> | undefined;
+	let laneSweep: Promise<void> | undefined;
 	const reconcileTimer = setInterval(() => {
 		alertSilentOrigins(runtime, originSilent);
 		void monitors.reconcile();
-		void personaSessions
-			.recover()
-			.then(async () => {
-				await personaSessions.sweepIdleHosts();
-				await sweepIdleSessions(runtime, options.database);
-			})
-			.catch((error: unknown) => console.error(`persona recovery sweep failed: ${diagnostic(error)}`));
-		void work
-			.recover()
-			.then(async () => {
-				await lanes.sweep();
-				// Also release dead/disowned lanes via reconciliation
-				await lanes.retireAllDead();
-			})
-			.catch((error: unknown) => console.error(`lane recovery/sweep failed: ${diagnostic(error)}`));
-	}, 60_000);
+		if (personaSweep) console.info("reconcile_sweep_skipped subsystem=persona reason=in_flight");
+		else
+			personaSweep = personaSessions
+				.recover()
+				.then(async () => {
+					await personaSessions.sweepIdleHosts();
+					await sweepIdleSessions(runtime, options.database);
+				})
+				.catch((error: unknown) => console.error(`persona recovery sweep failed: ${diagnostic(error)}`))
+				.finally(() => {
+					personaSweep = undefined;
+				});
+		if (laneSweep) console.info("reconcile_sweep_skipped subsystem=lane reason=in_flight");
+		else
+			laneSweep = work
+				.recover()
+				.then(async () => {
+					await lanes.sweep();
+					// Also release dead/disowned lanes via reconciliation; its liveness
+					// probes are sweep reads, its retirements ordinary work.
+					await sweep.run(async () => await lanes.retireAllDead());
+				})
+				.catch((error: unknown) => console.error(`lane recovery/sweep failed: ${diagnostic(error)}`))
+				.finally(() => {
+					laneSweep = undefined;
+				});
+	}, options.reconcileIntervalMs ?? 60_000);
 	const deliverySweepTimer = setInterval(() => {
 		try {
 			// The age TTL runs with or without an adapter: an unsettled row must reach
