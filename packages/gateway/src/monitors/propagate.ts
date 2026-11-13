@@ -174,7 +174,7 @@ const BACKOFF_EXEMPT_FAILURES: ReadonlySet<string> = new Set<DispatchFailureCode
 export const MONITOR_SHUTDOWN_DRAIN_MS = 10_000;
 
 /**
- * Consecutive bind timeout attempts on the same origin+epoch before triggering
+ * Consecutive scoped bind failures on the same origin+epoch before triggering
  * a rebind to a fresh epoch. Issue #780: one poisoned session key caused 6
  * consecutive events to drop with no escalation until restarted.
  */
@@ -299,9 +299,9 @@ export interface MonitorSessionSafetyState {
 	pendingRoll: SessionRollReason | undefined;
 	/** Reason of the last roll actually performed. */
 	lastRoll: SessionRollReason | undefined;
-	/** Consecutive bind timeout failures for the current epoch. Issue #780 rebind. */
+	/** Consecutive scoped bind failures for the current epoch. Issue #780 rebind. */
 	bindTimeoutFailures: number;
-	/** Epoch number when bind timeouts started being tracked. */
+	/** Epoch number when bind failures started being tracked. */
 	bindTimeoutEpoch: number | undefined;
 	/** Whether we've escalated for the current streak of failed events. */
 	escalatedForCurrentStreak: boolean;
@@ -709,6 +709,7 @@ export class MonitorPropagator {
 					for (const row of batch)
 						if (row.stage === "authored") this.#database.monitors.eventUpdate(tx, row.event_id, "delivered");
 				});
+				this.deliveryConfirmed(delivery.turn_id);
 			}
 			await this.#recoverUnresolvedTurns();
 			// Replay oldest-first: recovery must re-author events in the order they fired.
@@ -1405,75 +1406,47 @@ export class MonitorPropagator {
 						} catch (bindError) {
 							lastBindError = bindError;
 							const safety = this.#safetyState(sessionOriginKey);
-
-							// Check if this is a bind timeout for the current epoch.
-							if (isBindTimeoutError(bindError)) {
-								// Reset counter if this is a different epoch
+							const pendingCreate = this.#hasPendingCreateIntent(sessionOriginKey, boundEpoch);
+							const currentSession = this.#database.bindings.getSessionRecord(sessionOriginKey);
+							const sessionExists = currentSession?.epoch === boundEpoch && Boolean(currentSession.sessionId);
+							// A pending create can fail with an ordinary bind-frame Error in production;
+							// an existing binding can also fail inspection without timeout text. Count
+							// either scoped condition, while retaining timeout recovery for a missing
+							// binding with no pending create.
+							const countBindFailure = isBindTimeoutError(bindError) || pendingCreate || sessionExists;
+							if (countBindFailure) {
 								if (safety.bindTimeoutEpoch !== boundEpoch) {
 									safety.bindTimeoutFailures = 0;
 									safety.bindTimeoutEpoch = boundEpoch;
 								}
 								safety.bindTimeoutFailures++;
 								this.#safety.set(sessionOriginKey, safety);
-								// Persist the incremented counter to survive restarts (issue #780, P2 #2)
 								this.#persistBindTimeoutCounter(sessionOriginKey, safety.bindTimeoutFailures, boundEpoch);
 								console.error(
-									`monitor bind timeout for ${sessionOriginKey}: count=${safety.bindTimeoutFailures}/${MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD} epoch=${boundEpoch}`,
+									`monitor bind failure for ${sessionOriginKey}: count=${safety.bindTimeoutFailures}/${MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD} epoch=${boundEpoch} pending_create=${pendingCreate} existing_session=${sessionExists}`,
 								);
 
-								// If threshold reached, rebind to a fresh epoch (issue #780).
 								if (safety.bindTimeoutFailures >= MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD) {
-									// Query the broker journal through SessionPort. A pending create stays
-									// scoped to the old epoch; it must not keep a poisoned origin dark forever.
-									const pendingCreate = this.#hasPendingCreateIntent(sessionOriginKey, boundEpoch);
 									if (pendingCreate)
 										console.error(
-											`monitor bind timeout with pending session.create for ${sessionOriginKey} epoch=${boundEpoch}; retaining old journal row while rotating`,
+											`monitor bind failure with pending session.create for ${sessionOriginKey} epoch=${boundEpoch}; retaining old journal row while rotating`,
 										);
-
-									// Check if a session was already created.
-									// If session.create succeeded in parallel, preserve and reconcile the created session
-									// instead of rotating (issue #780: ambiguous session.create).
-									const currentSession = this.#database.bindings.getSessionRecord(sessionOriginKey);
-									const sessionExists =
-										currentSession && currentSession.epoch === boundEpoch && currentSession.sessionId;
-
-									if (sessionExists) {
-										console.error(
-											`monitor bind timeout but session was created: preserving ${currentSession.sessionId} at epoch=${boundEpoch}`,
-										);
-										// Session exists at this epoch, use it instead of rotating
-										binding = {
-											sessionId: currentSession.sessionId,
-											originKey: sessionOriginKey,
-											epoch: currentSession.epoch,
-											repo: this.#repo,
-											startupModelApplied: false,
-										};
-										safety.bindTimeoutFailures = 0;
-										safety.bindTimeoutEpoch = undefined;
-										this.#safety.set(sessionOriginKey, safety);
-										break; // Exit the retry loop with the preserved session
-									} else {
-										console.error(
-											`monitor bind timeout rebind triggered for ${sessionOriginKey}: epoch=${boundEpoch} -> ${boundEpoch + 1} pending_create=${pendingCreate}`,
-										);
-										// Keep any pending create journaled under the old scope. Rotation
-										// creates a new scope without overwriting that durable operation.
-										const newEpoch = this.#database.transaction((tx) => {
-											return this.#database.bindings.rotateEpoch(tx, sessionOriginKey);
-										});
-										boundEpoch = newEpoch;
-										// Persist the bind timeout counter reset and new epoch to survive restarts (issue #780, P2 #2)
-										this.#persistBindTimeoutCounter(sessionOriginKey, 0, newEpoch);
-										safety.bindTimeoutFailures = 0; // Reset counter for new epoch
-										safety.bindTimeoutEpoch = boundEpoch;
-										this.#safety.set(sessionOriginKey, safety);
-										continue; // Retry bind with new epoch
-									}
+									console.error(
+										`monitor bind recovery triggered for ${sessionOriginKey}: epoch=${boundEpoch} -> ${boundEpoch + 1} pending_create=${pendingCreate} existing_session=${sessionExists}`,
+									);
+									// Keep any pending create journaled under the old scope. The fresh
+									// SessionPort bind reconciles it after the new binding is ready.
+									const newEpoch = this.#database.transaction((tx) =>
+										this.#database.bindings.rotateEpoch(tx, sessionOriginKey),
+									);
+									boundEpoch = newEpoch;
+									this.#persistBindTimeoutCounter(sessionOriginKey, 0, newEpoch);
+									safety.bindTimeoutFailures = 0;
+									safety.bindTimeoutEpoch = newEpoch;
+									this.#safety.set(sessionOriginKey, safety);
+									continue;
 								}
 							}
-							// Non-timeout or threshold not reached: propagate the error.
 							throw bindError;
 						}
 					}
@@ -2271,6 +2244,19 @@ export class MonitorPropagator {
 	sessionSafetyState(sessionOriginKey: string): MonitorSessionSafetyState {
 		return { ...this.#safetyState(sessionOriginKey) };
 	}
+
+	/** Clear the per-origin alert marker after the adapter-confirmed stage is durable. */
+	deliveryConfirmed(turnId: string): void {
+		for (const row of this.#database.monitors.eventsByBatch(turnId)) {
+			if (row.stage !== "delivered") continue;
+			const monitor = this.#registry.get(row.monitor_id);
+			if (!monitor) continue;
+			this.#clearConsecutiveFailedEventCount(
+				originKey(monitorOriginForEvent(monitor, row.event_type)),
+				monitor.monitorId,
+			);
+		}
+	}
 	#safetyState(sessionOriginKey: string): MonitorSessionSafetyState {
 		const existing = this.#safety.get(sessionOriginKey);
 		if (existing) return existing;
@@ -2304,14 +2290,14 @@ export class MonitorPropagator {
 		return fresh;
 	}
 
-	/** Query the SessionPort-owned create journal before deciding how to handle a bind timeout. */
+	/** Query the SessionPort-owned create journal for the exact origin and epoch. */
 	#hasPendingCreateIntent(sessionOriginKey: string, epoch: number): boolean {
 		return this.#sessionPort.hasPendingSessionCreate?.({ originKey: sessionOriginKey, epoch }) ?? false;
 	}
 
 	/**
-	 * Persist the bind timeout counter for this origin to survive gateway restarts.
-	 * Issue #780, P2 #2: The counter must be persisted in durable storage, not just in memory.
+	 * Persist the scoped bind-failure counter for this origin to survive gateway restarts.
+	 * Issue #780: the counter must be durable, not just in memory.
 	 */
 	#persistBindTimeoutCounter(sessionOriginKey: string, count: number, epoch: number): void {
 		const key = `monitor_bind_timeout:${sessionOriginKey}`;
@@ -2323,7 +2309,7 @@ export class MonitorPropagator {
 	}
 
 	/**
-	 * Load the persisted bind timeout counter from durable storage.
+	 * Load the persisted bind-failure counter from durable storage.
 	 * Returns the count if it's still valid for the current epoch, 0 otherwise.
 	 */
 	#loadBindTimeoutCounter(sessionOriginKey: string, currentEpoch: number): number {
@@ -2978,18 +2964,25 @@ export class MonitorPropagator {
 				return undefined;
 			}
 		}
-		// Check for any pending session.create operation before rotating the epoch.
-		// Issue #780, P2 #1: If broker applied a create but response was lost,
-		// the pending operation remains in broker_operations. Rotating would orphan it.
+		// Keep a still-starting create on its current scope, but don't let a create
+		// that exceeded the same readiness budget used by SessionPort block recovery.
 		const boundEpoch = this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
-		if (this.#hasPendingCreateIntent(sessionOriginKey, boundEpoch)) {
+		const pendingCreate = this.#hasPendingCreateIntent(sessionOriginKey, boundEpoch);
+		const pendingCreateExceededReadiness =
+			pendingCreate &&
+			(this.#sessionPort.pendingSessionCreateExceededReadiness?.({ originKey: sessionOriginKey, epoch: boundEpoch }) ??
+				false);
+		if (pendingCreate && !pendingCreateExceededReadiness) {
 			console.error(
 				`monitor session roll blocked for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} pending_create=true epoch=${boundEpoch}`,
 			);
-			// Keep the roll armed but don't execute it yet. The pending create may
-			// eventually succeed or timeout, allowing the roll to proceed then.
+			// A create still within its readiness budget may resolve under this scope.
 			return undefined;
 		}
+		if (pendingCreateExceededReadiness)
+			console.warn(
+				`monitor session roll proceeding for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} pending_create=readiness_exceeded epoch=${boundEpoch}`,
+			);
 
 		// Build the digest BEFORE the roll: it reads durable authored notes, which
 		// the roll does not touch, but reading first keeps the ordering obvious.

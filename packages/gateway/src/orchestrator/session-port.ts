@@ -127,6 +127,8 @@ export interface SessionPort {
 	bind(input: SessionBindInput): Promise<SessionBinding>;
 	/** Read-only observation of the SessionPort-owned durable create journal. */
 	hasPendingSessionCreate?(input: { readonly originKey: string; readonly epoch: number }): boolean;
+	/** True when the pending create has outlived the session-create readiness budget. */
+	pendingSessionCreateExceededReadiness?(input: { readonly originKey: string; readonly epoch: number }): boolean;
 	inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined>;
 	liveness?(input: { sessionId: string; repo: string }): Promise<SessionLiveness>;
 	/** True when the session's prompt queue has no pending messages (queue.messages.list empty). */
@@ -615,6 +617,14 @@ export class BrokerSessionPort implements SessionPort {
 	hasPendingSessionCreate(input: { readonly originKey: string; readonly epoch: number }): boolean {
 		this.#database.bindings.assertAuthority(this.#authority);
 		return this.#database.bindings.hasPendingSessionCreate(JSON.stringify([input.originKey, input.epoch]));
+	}
+
+	pendingSessionCreateExceededReadiness(input: { readonly originKey: string; readonly epoch: number }): boolean {
+		const createdAt = this.#database.bindings.pendingSessionCreateCreatedAt(
+			this.#authority,
+			JSON.stringify([input.originKey, input.epoch]),
+		);
+		return createdAt !== undefined && this.#now() - createdAt > SESSION_CREATE_READINESS_MS;
 	}
 
 	async #reconcileRetiredSessionCreates(originKey: string, epoch: number): Promise<void> {

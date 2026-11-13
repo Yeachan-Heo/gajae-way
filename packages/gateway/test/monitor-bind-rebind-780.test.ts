@@ -9,6 +9,7 @@ import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
 import type { SessionPort } from "../src/orchestrator/session-port";
+import { RelayHelloError } from "../src/orchestrator/tail-runner";
 import { Store } from "../src/store";
 import { MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS } from "../src/store/groups/monitors";
 import { attachTestBrokerOwnership, initializeTestBrokerAuthority, sessionPortFromScript } from "./session-port.fake";
@@ -140,7 +141,7 @@ test("repeated bind timeouts on one origin across consecutive events trigger reb
 	}
 });
 
-test("a stale pending session.create no longer blocks same-process rebind after repeated bind timeouts (#780)", async () => {
+test("a stale pending session.create no longer blocks same-process rebind after plain bind errors (#780)", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-stale-create-rebind-"));
 	try {
 		const database = await Store.open(join(home, "gateway.db"));
@@ -148,11 +149,12 @@ test("a stale pending session.create no longer blocks same-process rebind after 
 		const authority = initializeTestBrokerAuthority(database, agentDir);
 		const registry = new MonitorRegistry(database);
 		const attemptedEpochs: number[] = [];
+		const delivered: ChatMessagePayload[] = [];
 		let requestAttempts = 0;
 		const fakeSessionPort: Partial<SessionPort> = {
 			bind: async (input) => {
 				attemptedEpochs.push(input.epoch);
-				if (input.epoch === 0) throw new GjcCliUnavailableError("broker_unavailable: bind timed out");
+				if (input.epoch === 0) throw new Error("session create is not indexed yet");
 				return {
 					sessionId: `session-epoch-${input.epoch}`,
 					originKey: input.originKey,
@@ -205,6 +207,8 @@ test("a stale pending session.create no longer blocks same-process rebind after 
 			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
 			delivery: new DeliveryService(database),
 			emit: () => {},
+			ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "test-owner" } },
+			deliver: (payload) => delivered.push(payload),
 			repo: join(home, "workspace"),
 			model: undefined,
 			serviceTier: undefined,
@@ -227,8 +231,194 @@ test("a stale pending session.create no longer blocks same-process rebind after 
 		const recoveredEventId = eventIds[2];
 		if (!recoveredEventId) throw new Error("recovery event was not submitted");
 		expect(database.monitors.eventGet(recoveredEventId)?.stage).toMatch(/authored|delivered/);
-		expect(database.monitors.authoredOutput(recoveredEventId)).toBeDefined();
+		expect(database.monitors.authoredOutput(recoveredEventId)).toBe("Fresh epoch is authoring again.");
+		expect(delivered.some((payload) => payload.text.includes("Fresh epoch is authoring again"))).toBe(true);
 		expect(requestAttempts).toBe(1);
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("an existing unverified session binding rotates after repeated inspect failures (#780 P2 #1)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-existing-binding-rebind-"));
+	try {
+		const database = await Store.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "existing-binding-rebind-test",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.existing_binding_rebind"],
+			burstPolicy: "serialize",
+		});
+		const originKey = `monitor/eventtype/test.existing_binding_rebind/parent=${monitor.monitorId}`;
+		database.transaction((tx) => {
+			expect(database.bindings.bindAtEpoch(tx, originKey, "unverified-old-session", 0)).toBe(true);
+		});
+
+		const attemptedEpochs: number[] = [];
+		const delivered: ChatMessagePayload[] = [];
+		let requestAttempts = 0;
+		const repo = join(home, "workspace");
+		const sessionPort: Partial<SessionPort> = {
+			bind: async (input) => {
+				attemptedEpochs.push(input.epoch);
+				if (input.epoch === 0) throw new Error("session inspect failed");
+				database.transaction((tx) => {
+					expect(database.bindings.bindAtEpoch(tx, originKey, `session-epoch-${input.epoch}`, input.epoch)).toBe(true);
+				});
+				return {
+					sessionId: `session-epoch-${input.epoch}`,
+					originKey: input.originKey,
+					epoch: input.epoch,
+					repo: input.repo,
+					startupModelApplied: false,
+				};
+			},
+			request: async (input) => {
+				requestAttempts++;
+				const eventId = input.text.match(/"eventId":"([^"]+)"/)?.[1];
+				return {
+					receipt: { sessionId: input.sessionId, operationRef: input.opRef },
+					assistant: { text: JSON.stringify([{ eventId, note: "A fresh session delivered the result." }]) },
+				} as never;
+			},
+			runExclusive: async (_, fn) => fn(),
+		};
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: sessionPort as SessionPort,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "test-owner" } },
+			deliver: (payload) => delivered.push(payload),
+			repo,
+			model: undefined,
+			serviceTier: undefined,
+		});
+
+		const eventIds: string[] = [];
+		for (let i = 0; i < 3; i++) {
+			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.existing_binding_rebind", {});
+			eventIds.push(eventId);
+			for (let attempt = 0; attempt < 200; attempt++) {
+				const stage = database.monitors.eventGet(eventId)?.stage;
+				if (stage === "failed" || stage === "authored" || stage === "delivered") break;
+				await Bun.sleep(10);
+			}
+		}
+
+		expect(attemptedEpochs).toEqual([0, 0, 0, 1]);
+		expect(database.bindings.getSessionRecord(originKey)).toEqual({ epoch: 1, sessionId: "session-epoch-1" });
+		const recoveredEventId = eventIds[2];
+		if (!recoveredEventId) throw new Error("existing-binding recovery event was not submitted");
+		expect(database.monitors.authoredOutput(recoveredEventId)).toBe("A fresh session delivered the result.");
+		expect(requestAttempts).toBe(1);
+		expect(delivered.some((payload) => payload.text.includes("A fresh session delivered"))).toBe(true);
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("an armed session roll proceeds past a pending create beyond readiness (#780)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-stale-roll-"));
+	try {
+		const database = await Store.open(join(home, "gateway.db"));
+		const agentDir = join(home, "agent");
+		const authority = initializeTestBrokerAuthority(database, agentDir);
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "stale-roll-test",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.stale_roll"],
+			burstPolicy: "serialize",
+		});
+		const originKey = `monitor/eventtype/test.stale_roll/parent=${monitor.monitorId}`;
+		const scope = JSON.stringify([originKey, 0]);
+		database.transaction((tx) =>
+			database.bindings.beginBrokerOperation(tx, authority, {
+				operation: "session.create",
+				scope,
+				operationRef: "gw-bind-stale-roll",
+				requestJson: JSON.stringify({ cwd: join(home, "workspace") }),
+			}),
+		);
+
+		const attemptedEpochs: number[] = [];
+		const delivered: ChatMessagePayload[] = [];
+		let staleReadinessChecks = 0;
+		let requests = 0;
+		const fakePort: Partial<SessionPort> = {
+			bind: async (input) => {
+				attemptedEpochs.push(input.epoch);
+				return {
+					sessionId: `session-epoch-${input.epoch}`,
+					originKey: input.originKey,
+					epoch: input.epoch,
+					repo: input.repo,
+					startupModelApplied: false,
+				};
+			},
+			hasPendingSessionCreate: ({ originKey: key, epoch }) =>
+				database.bindings.hasPendingSessionCreate(JSON.stringify([key, epoch])),
+			pendingSessionCreateExceededReadiness: ({ originKey: key, epoch }) => {
+				staleReadinessChecks++;
+				return key === originKey && epoch === 0;
+			},
+			request: async (input) => {
+				requests++;
+				if (requests === 1) throw new RelayHelloError(1, "stream_ended");
+				const eventId = input.text.match(/"eventId":"([^"]+)"/)?.[1];
+				return {
+					receipt: { sessionId: input.sessionId, operationRef: input.opRef },
+					assistant: { text: JSON.stringify([{ eventId, note: "The stale-create roll delivered." }]) },
+				} as never;
+			},
+			resume: async (input) => ({
+				sessionId: input.sessionId,
+				originKey: input.originKey,
+				epoch: input.epoch,
+				repo: input.repo,
+			}),
+			runExclusive: async (_, fn) => fn(),
+		};
+		const sessionPort = attachTestBrokerOwnership(database, fakePort as SessionPort, agentDir);
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "test-owner" } },
+			deliver: (payload) => delivered.push(payload),
+			repo: join(home, "workspace"),
+			model: undefined,
+			serviceTier: undefined,
+		});
+
+		const failedEventId = await pipeline.submitAwaitable(monitor.monitorId, "test.stale_roll", {});
+		for (let attempt = 0; attempt < 200; attempt++) {
+			if (database.monitors.eventGet(failedEventId)?.stage === "failed") break;
+			await Bun.sleep(10);
+		}
+		expect(pipeline.sessionSafetyState(originKey).pendingRoll).toBe("session_host_unavailable");
+
+		const recoveredEventId = await pipeline.submitAwaitable(monitor.monitorId, "test.stale_roll", {});
+		for (let attempt = 0; attempt < 200; attempt++) {
+			const stage = database.monitors.eventGet(recoveredEventId)?.stage;
+			if (stage === "authored" || stage === "delivered" || stage === "failed") break;
+			await Bun.sleep(10);
+		}
+		expect(staleReadinessChecks).toBe(1);
+		expect(attemptedEpochs).toEqual([0, 1]);
+		expect(database.bindings.getSessionRecord(originKey)?.epoch).toBe(1);
+		expect(pipeline.sessionSafetyState(originKey).lastRoll).toBe("session_host_unavailable");
+		expect(database.monitors.authoredOutput(recoveredEventId)).toBe("The stale-create roll delivered.");
+		expect(delivered.some((payload) => payload.text.includes("The stale-create roll delivered"))).toBe(true);
 		database.close();
 	} finally {
 		await rm(home, { recursive: true, force: true });
@@ -396,6 +586,7 @@ test("a successful dispatch after failures clears the failure streak (issue #780
 
 		const instruction = "Inspect each event and report new evidence.";
 		const escalationMessages: ChatMessagePayload[] = [];
+		const delivered: ChatMessagePayload[] = [];
 		let requestCount = 0;
 		const sessionPort: Partial<SessionPort> = {
 			bind: async (input) => {
@@ -410,7 +601,7 @@ test("a successful dispatch after failures clears the failure streak (issue #780
 			request: async (input) => {
 				requestCount++;
 				const eventId = input.text.match(/"eventId":"([^"]+)"/)?.[1];
-				const note = requestCount === 4 ? "[SILENT]" : instruction;
+				const note = requestCount === 4 ? "A normal report found new evidence." : instruction;
 				return {
 					receipt: { sessionId: input.sessionId, operationRef: input.opRef },
 					assistant: { text: JSON.stringify([{ eventId, note }]) },
@@ -428,6 +619,7 @@ test("a successful dispatch after failures clears the failure streak (issue #780
 			delivery: new DeliveryService(database),
 			emit: () => {},
 			deliver: (payload) => {
+				delivered.push(payload);
 				if (payload.text.includes("[monitor escalation]")) escalationMessages.push(payload);
 			},
 			ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "test-owner" } },
@@ -454,7 +646,16 @@ test("a successful dispatch after failures clears the failure streak (issue #780
 		expect(database.core.metaGet(escalationKey)).toBeDefined();
 		expect(pipeline.sessionSafetyState(originKey).escalatedForCurrentStreak).toBe(true);
 
-		await dispatchUntil("authored_no_delivery");
+		const recoveredEventId = await dispatchUntil("authored");
+		const recoveredEvent = database.monitors.eventGet(recoveredEventId);
+		const report = delivered.find((payload) => payload.turnId === recoveredEvent?.batch_id);
+		if (!report?.deliveryId) throw new Error("successful monitor report did not enter delivery");
+		database.transaction((tx) => {
+			database.outbox.confirm(tx, report.deliveryId!);
+			database.monitors.settleForTurn(tx, report.turnId, "delivered");
+		});
+		pipeline.deliveryConfirmed(report.turnId);
+		expect(database.monitors.eventGet(recoveredEventId)?.stage).toBe("delivered");
 		expect(database.core.metaGet(escalationKey)).toBeUndefined();
 		expect(pipeline.sessionSafetyState(originKey).escalatedForCurrentStreak).toBe(false);
 

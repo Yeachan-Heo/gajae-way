@@ -116,6 +116,28 @@ test("pending session.create observation is scoped to its origin and epoch", asy
 	expect(port.hasPendingSessionCreate({ originKey, epoch: 7 })).toBe(true);
 	expect(port.hasPendingSessionCreate({ originKey, epoch: 8 })).toBe(false);
 	expect(port.hasPendingSessionCreate({ originKey: `${originKey}-other`, epoch: 7 })).toBe(false);
+	const createdAt = store.bindings.pendingSessionCreateCreatedAt(authority, scope);
+	if (createdAt === undefined) throw new Error("pending create timestamp was not recorded");
+	const readinessExpiredPort = new BrokerSessionPort({
+		database: store,
+		authority,
+		cli: async () => {
+			throw new Error("the readiness query must not invoke the broker CLI");
+		},
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+		now: () => createdAt + 60_001,
+	});
+	const readinessBudgetPort = new BrokerSessionPort({
+		database: store,
+		authority,
+		cli: async () => {
+			throw new Error("the readiness query must not invoke the broker CLI");
+		},
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+		now: () => createdAt + 60_000,
+	});
+	expect(readinessExpiredPort.pendingSessionCreateExceededReadiness({ originKey, epoch: 7 })).toBe(true);
+	expect(readinessBudgetPort.pendingSessionCreateExceededReadiness({ originKey, epoch: 7 })).toBe(false);
 });
 
 test("binding a fresh epoch replays and retires an orphaned pending create", async () => {

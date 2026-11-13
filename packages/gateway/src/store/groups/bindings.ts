@@ -1070,6 +1070,18 @@ export class BindingsGroup {
 				.get(scope) !== null
 		);
 	}
+
+	pendingSessionCreateCreatedAt(authority: BrokerAuthority, scope: string): number | undefined {
+		this.assertAuthority(authority);
+		const row = this.#db
+			.prepare(
+				"SELECT created_at FROM broker_operations WHERE authority_key = ? AND operation = 'session.create' AND scope = ? AND state = 'pending'",
+			)
+			.get(brokerAuthorityKey(authority), scope) as { created_at: string } | null;
+		if (!row) return undefined;
+		const createdAt = Date.parse(row.created_at);
+		return Number.isFinite(createdAt) ? createdAt : undefined;
+	}
 }
 
 export type BrokerOperationKind = "session.create" | "turn.prompt" | "session.close";
