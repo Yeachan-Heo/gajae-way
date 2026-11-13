@@ -171,6 +171,64 @@ test("work lane limit changes require restart and retain the live limits", async
 	expect(result.config.work).toEqual({ maxLanes: 4 });
 });
 
+test("work.completionCheck parses its argv and bounds without materializing omitted settings", () => {
+	const full = { command: ["/usr/local/bin/lane-check", "--issue", "from-env"], timeoutMs: 120_000, maxResteers: 10 };
+	expect(parseConfigFile({ schemaVersion: 1, work: { completionCheck: full } }).work).toEqual({
+		completionCheck: full,
+	});
+	const minimal = { command: ["/bin/true"] };
+	expect(parseConfigFile({ schemaVersion: 1, work: { completionCheck: minimal } }).work).toEqual({
+		completionCheck: minimal,
+	});
+	expect(parseConfigFile({ schemaVersion: 1, work: { maxLanes: 4 } }).work).not.toHaveProperty("completionCheck");
+});
+
+for (const [completionCheck, field] of [
+	["/bin/true", "work.completionCheck must be an object"],
+	[{}, "work.completionCheck.command"],
+	[{ command: [] }, "work.completionCheck.command must be a non-empty string array"],
+	[{ command: "/bin/true" }, "work.completionCheck.command"],
+	[{ command: ["/bin/true", 1] }, "work.completionCheck.command"],
+	[{ command: ["/bin/true", ""] }, "work.completionCheck.command"],
+	[{ command: ["bin/check"] }, "work.completionCheck.command[0] must be an absolute path"],
+	[{ command: ["/bin/true", "a\0b"] }, "work.completionCheck.command entries must not contain NUL"],
+	[{ command: Array(33).fill("/x") }, "work.completionCheck.command must contain at most 32 entries"],
+	[{ command: ["/bin/true"], timeoutMs: 999 }, "work.completionCheck.timeoutMs"],
+	[{ command: ["/bin/true"], timeoutMs: 120_001 }, "work.completionCheck.timeoutMs"],
+	[{ command: ["/bin/true"], timeoutMs: 1_000.5 }, "work.completionCheck.timeoutMs"],
+	[{ command: ["/bin/true"], maxResteers: 0 }, "work.completionCheck.maxResteers"],
+	[{ command: ["/bin/true"], maxResteers: 11 }, "work.completionCheck.maxResteers"],
+	[
+		{ command: ["/bin/true"], shell: true },
+		"work.completionCheck may only contain command, timeoutMs, and maxResteers",
+	],
+] as const) {
+	test(`rejects invalid work.completionCheck ${JSON.stringify(completionCheck)}`, () => {
+		const parse = () => parseConfigFile({ schemaVersion: 1, work: { completionCheck } });
+		expect(parse).toThrow(ConfigError);
+		expect(parse).toThrow(field);
+		try {
+			parse();
+		} catch (error) {
+			expect(error).toMatchObject({ code: "config_invalid" });
+		}
+	});
+}
+
+test("work.completionCheck changes require restart and retain the live check", async () => {
+	const path = await home();
+	const live = { completionCheck: { command: ["/bin/true"] } };
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, work: live }));
+	const current = await loadConfig({ home: path });
+	await Bun.write(
+		join(path, "config.json"),
+		JSON.stringify({ schemaVersion: 1, work: { completionCheck: { command: ["/bin/false"], maxResteers: 1 } } }),
+	);
+	const result = await reloadConfig(current);
+	expect(result).toMatchObject({ ok: true, changed: [], restartRequired: ["work"] });
+	if (result.ok) expect(result.config.work).toEqual(live);
+});
+
 test("bot audience budgets parse, default to unset, and reject non-positive counts", () => {
 	expect(parseConfigFile({ schemaVersion: 1 })).not.toHaveProperty("botAudience");
 	expect(parseConfigFile({ schemaVersion: 1, botAudience: { maxConsecutiveTurns: 3 } }).botAudience).toEqual({

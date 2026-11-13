@@ -70,7 +70,8 @@ function subcommand(args: readonly string[]): string {
 	return args[index] ?? "git";
 }
 
-function killGroup(pid: number): void {
+/** SIGKILLs a detached child's whole process group, falling back to the child alone. */
+export function killGroup(pid: number): void {
 	try {
 		process.kill(-pid, "SIGKILL");
 	} catch {
