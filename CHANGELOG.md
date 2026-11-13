@@ -20,23 +20,24 @@
 - **adapter-slack**: Complete command routing, interactions, and delivery lifecycle; route explicitly bot-addressed session commands through gateway authorization without creating a top-level mention thread; dispatch Socket Mode interactive envelopes, preserve panel origin and underscore-containing option ids (#777)
 - **adapter-telegram**: Send persona Markdown as Telegram HTML, split without breaking tags or entities; syntax the renderer cannot place exactly stays literal text; a retried multi-chunk reply resumes after chunks already accepted and respects Telegram flood-control (#774)
 
-## [Unreleased]
+## [0.4.4] - 2026-11-04
 
 ### Fixes
-- **adapter-slack/gateway**: Keep rejected panel clicks out of model-visible context and omit untrusted Slack display names from accepted-choice attribution; acknowledge definitive panel rejections without reconnecting, while retaining retry behavior for transport failures, local timeouts, and uncertain coordinator failures.
-- **adapter-slack/gateway**: Retain bot-root threads for later recovery even when they use a channel session; acknowledge panel actions only after a gateway decision, coalesce in-flight retries, keep command confirmations in their inbound thread, and normalize tab-separated command arguments.
-- **adapter-slack**: Route explicitly bot-addressed session commands through gateway authorization without creating a top-level mention thread; dispatch Socket Mode interactive envelopes, preserve panel origin and underscore-containing option ids, and show duplicate-recovery warnings on panels. Unify live/recovery routing, retain edit origins and recovered parent authors, serialize complete delivery settlements per origin, classify partial writes and Slack server errors as uncertain, retain recovery cursors on local timeouts, and retry failed presence cleanup without treating it as confirmed.
-- **gateway**: Preserve logical turn ids across streaming outputs and progress so Slack live replies update one message; terminal progress waits for queued Slack settlements and live edits before closing the reply.
-- **monitors**: Retire size-rolled sessions through the broker's journaled `session.close`, a forced shutdown rather than an idle-only operation, preserving transcripts but aborting active work. Retirement records survive monitor removal and restart, and are swept on later fresh dispatches of their origin and by the gateway's 60-second monitor reconcile. The background sweep takes no origin lock, so a busy origin delays neither event recovery nor its own dispatch through the sweep. Inline retirement retains the existing dispatch lock. Both paths attempt at most two records per pass (globally across origins for reconcile), with persisted fair ordering, safe-integer counter repair, the same ownership, saved-pointer and idle checks, and an in-process guard against concurrent attempts on one record. Every attempt requires resolved saved operations, no saved pointer or live binding, positive idle evidence from three independent probes (turn, queue when implemented, then jobs), and synchronous final authorization immediately before invoking close. Active, unknown, throwing or missing required probes hold, including after failed closes or restart; diagnostic closing state grants no authority. Every close failure keeps the record for a later pass; nothing is deleted on inferred absence. Only a successful close removes an unchanged record; ports without close support relinquish unsupported records. Hosts that never answer retain their records indefinitely. Removing a monitor no longer abandons its retired sessions, but still clears its size arms and handoff rows. Clearing `contextRollTokens` still allows earlier roll cleanup. A background job can finish and wake an autonomous turn between probes, or work can start between the last probe and broker close, which may wait in the CLI pool. Such work is aborted by close. Fixing this known race requires an idle-fenced broker close, tracked in [Yeachan-Heo/gajae-code#7540](https://github.com/Yeachan-Heo/gajae-code/issues/7540). Retries may replay a stored refusal; cleanup has no bounded completion guarantee. Failure rolls retain immediate host termination.
+- **gateway**: Pin GJC 0.19.3, which bounds and rotates the session-index rejection audit log, exits a broker wedged on a stalled discovery write, and keeps publication liveness SIGKILL off a full stderr (#752)
+- **docs**: Move an oversized pre-0.19.3 `index-audit.jsonl` aside before the first 0.19.3 start, since 0.19.0 re-read the whole log at host startup (#752)
+- **cli**: `services install|repair` installs and verifies the pinned GJC from the checkout (or the manifest beside release binaries) before writing service definitions, and fails instead of falling through to another pin (#753)
+- **gateway**: A lane started from a monitor turn reports to the monitor's channel target (#739)
+- **gateway**: Keep the authoring-turn pointer through a lease-fenced update, retire it in the same transaction as the `dispatched` transition so a stale attempt cannot erase a successor's pointer, and retire it before throwing on an empty response (#743, #744)
 
-### Features
-- **gateway/images**: Forward static PNG/JPEG attachments from Discord, Slack, and Telegram as durable native model inputs through the `chat.images` capability; persist inbound image rows in schema 42 and keep non-native formats as attachment descriptions.
-- **monitors**: Opt in to digest-seeded session rolls with per-monitor observed-usage threshold `contextRollTokens` to reduce carried-context cost; sampled after the turn only when configured, this is not a hard limit and a stale reading can still roll after native compaction. Persisted arms and handoffs survive restart, failure rolls take precedence, and internal diagnostics emit armed, disarmed, deferred, and rolled lifecycle logs. Size-retired saved results are harvested or held on their original session, and removing a monitor clears its size arms and handoffs while preserving pending retirement records.
-- **adapter-telegram**: Send persona Markdown as Telegram HTML, split without breaking tags or entities; syntax the renderer cannot place exactly (images, link titles, unbalanced link parentheses, `_underscore_` emphasis) stays literal text. A retried multi-chunk reply resumes after the chunks Telegram already accepted, waits out short flood-control `retry_after` pauses, and expires once Telegram keeps refusing the same chunk (#654)
+## [0.4.3] - 2026-11-03
 
 ### Fixes
-- **gateway**: Keep pending image-bearing messages out of text steering, include image payloads in prompt fingerprints, and validate exact relay frames before the durable send fence so oversized local prompts settle crash-safely as `prompt_too_large` with a visible failure notice instead of remaining uncertain.
-- **adapters**: Preserve non-native image attachments, captions, sibling files, and GIF/WebP caption edits; restrict Slack image redirects, globally bound Slack/Discord image retrieval and decoding, and advance Telegram past durably recorded terminal protocol rejections while retaining transient retries.
+- **cli**: `gajaeway update` with `SHELL` unset no longer assumes `/bin/zsh`; it tries the passwd shell, `/bin/bash`, then `/bin/sh`, and falls back to the default PATH instead of exiting 1 after the release is installed (#734)
+- **adapter-discord**: A reply with a refused `MEDIA:` attachment still sends its text plus a `(file not sent: …)` note, without exposing host paths (#730)
+- **gateway**: An uncorrelated `agent_end` is no longer treated as owned terminal evidence (#733)
+
+### CI
+- Move darwin-arm64 runners off the retiring macos-14 image (#732)
 
 ## [0.4.2] - 2026-10-29
 
@@ -47,25 +48,22 @@
 - **gateway**: A held restart drain reports not-ready with its restart id; an inherited drain is held and reported at boot instead of silently fencing dispatch (#713)
 - **gateway**: Escalate an unresolved hold on a retired epoch too, and bound status polling on escalated retired holds (#705, #715)
 - **gateway**: Make `work.start` admission visible and idempotent across a caller timeout (#707)
-- **gateway**: Settle `awaiting_checks` on `work.retire` so retired lanes cannot respawn (#716)
-- **work**: Preserve SDK failure causes independently of receipts (#696)
-- **monitors**: A failed event can no longer wedge an `overlap=skip` monitor; a running authoring turn is never aged out (#702)
-- **adapter-slack**: Recover a closed socket and detect deaf event delivery (#710)
 
 ## [0.4.1] - 2026-10-27
 
 ### Fixes
-- **gateway**: Requeue bound turns that never reached `turn.prompt` under a fresh op-ref; a CLI queue timeout is no longer treated as a broker outage (#675, #685)
-- **gateway**: Bound unresolved recovery holds, fence escalated holds' inputs, and keep their late answers and escalation notices durable (#686)
-- **gateway**: Detect busy-wait stalls and preserve a busy refusal only when the retry provably never reached the host (#687, #689)
-- **gateway**: Alert the owner when an origin goes silent (#688)
-- **gateway**: Keep an AGENTS.md update pending until a turn carrying it succeeds, and size the CLI pool from the effective host cap (#676)
-- **gateway**: The schema 39 migration skips turns quarantined by a broker-authority cutover instead of failing boot
+- **gateway**: Gate `ops cycle` and repair-step `monitor_failed` event isolation and require a submitted-turn repair base (#712)
+- **gateway**: Suppress `broker_unavailable` when the broker is visible but unreachable and surface what caused the failed endpoint fetch (#714)
 
 ## [0.4.0] - 2026-10-26
 
 ### Features
-- **gateway**: Support the GJC 0.19.0 runtime contracts and lifecycle fences; the pinned GJC is now 0.19.0 (#663)
+- **gateway**: Ledger operator directives (`/directive`) with outcomes and durable routing; directives reach monitors (#694, #695)
+- **gateway**: `gajaeway stop` waits for stalled-turn repair and drains turns (#710)
+- **gateway**: Deliver a monitor's *inferred* outcome from a still-valid cached result when GJC cannot be reached (#706)
+
+### Fixes
+- **gateway**: Pin GJC 0.19.0 (#663)
 - **gateway**: Announce stack restarts to active conversations ("restarting", then "back online" or "restart cancelled"), configurable via `restartNotice` (#662)
 - **gateway**: Default daily memory de-bloat cron for Markdown memory files over 100KB (#651)
 - **gateway**: Suggest gjc-listed models in `/model set` autocomplete (#647)

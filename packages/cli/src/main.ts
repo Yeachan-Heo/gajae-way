@@ -29,6 +29,7 @@ import { LOOPBACK_ORIGIN, OPS_CYCLE_MAX_LIMIT, originKey, WORK_JOBS_MAX_LIMIT } 
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 
+import type { GjcInstallRunner } from "./gjc-install";
 import {
 	columnNames,
 	type ListOptions,
@@ -50,7 +51,14 @@ import {
 	renderRestartReceipt,
 	runRestartStack,
 } from "./restart-stack";
-import { type InstallServicesOptions, installServices, type ServicePlatform, serviceUsage } from "./services";
+import {
+	type InstallServicesOptions,
+	installPinnedGjcForServices,
+	installServices,
+	type ServicePlatform,
+	servicePinCandidates,
+	serviceUsage,
+} from "./services";
 import { type RunSetupOptions, runSetup } from "./setup";
 import { parseUpdateArgs, renderUpdate, runUpdate, type UpdateDeps } from "./update";
 
@@ -113,7 +121,9 @@ function gatewayHome(): string {
 }
 
 export interface MainOptions {
-	readonly services?: Pick<InstallServicesOptions, "loginPathRunner" | "writeFile">;
+	readonly services?: Pick<InstallServicesOptions, "loginPathRunner" | "writeFile"> & {
+		gjcInstallRunner?: GjcInstallRunner;
+	};
 	/** Test seams for `setup`: the platform fetch and the prompter. */
 	readonly setup?: Pick<RunSetupOptions, "fetch" | "prompter" | "env" | "binDir" | "runBrokerAgent">;
 	/** Test seams for `ops restart-stack`; the real path spawns the service manager. */
@@ -1207,6 +1217,12 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			}
 			case "services": {
 				const service = parseServicesArgs(parsed.rest);
+				const gjcVersion = await installPinnedGjcForServices({
+					home: gatewayHome(),
+					candidates: servicePinCandidates(service.binDir),
+					...(options.services?.gjcInstallRunner === undefined ? {} : { runner: options.services.gjcInstallRunner }),
+				});
+				console.log(`installed pinned gjc ${gjcVersion}`);
 				const written = await installServices({
 					binDir: service.binDir,
 					...(service.launchAgentsDir === undefined ? {} : { launchAgentsDir: service.launchAgentsDir }),
