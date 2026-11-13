@@ -46,6 +46,7 @@ import {
 } from "./failed-turn-evidence";
 import { isSessionGoneCode } from "./gjc-contract";
 import { isRebindableCode, sanitizeDiagnostic } from "./rebind";
+import { currentSweep, inSweep, SWEEP_READ_TIMEOUT_MS, sweepControl, sweepHandOn } from "./sweep-limiter";
 import {
 	isRelayTransportFailure,
 	isUnwrittenRelayRequest,
@@ -527,6 +528,8 @@ export interface BrokerSessionPortOptions {
 	readonly authority: BrokerAuthority;
 	readonly now?: () => number;
 	readonly sleep?: (ms: number) => Promise<void>;
+	/** Broker incarnation counter; a sweep read that straddles a change is rejected as unknown. */
+	readonly brokerGeneration?: () => number;
 }
 
 const DEFAULT_REQUEST_WAIT_MS = 30 * 60_000;
@@ -614,13 +617,39 @@ export class BrokerSessionPort implements SessionPort {
 		this.#database = options.database;
 		this.#authority = { ...options.authority };
 		this.#database.bindings.assertAuthority(this.#authority);
-		this.#cli = async (args, commandOptions) => {
+		const run: CliRunner = async (args, commandOptions) => {
 			this.#database.bindings.assertAuthority(this.#authority);
 			const result = await options.cli(args, commandOptions);
 			this.#database.bindings.assertAuthority(this.#authority);
 			// Steering requires an unambiguous control receipt: do not promote a
 			// failed transport to a definitive rejection merely because stdout is JSON.
 			return args.includes("turn.steer") ? result : normalizeSdkEnvelopeFailure(result);
+		};
+		const generation = options.brokerGeneration ?? (() => 0);
+		// Inside a sweep unit every CLI call is a read (control operations leave the
+		// sweep scope): it runs at background priority, one at a time process-wide,
+		// with a 10s default bound, and a read that straddles a broker replacement
+		// is unknown rather than evidence.
+		this.#cli = async (args, commandOptions) => {
+			const sweep = currentSweep();
+			if (!sweep) return await run(args, commandOptions);
+			return await sweep.read(async () => {
+				const before = generation();
+				const result = await run(args, {
+					...commandOptions,
+					priority: "background",
+					// A default for reads that bring no bound; a caller's own budget is never shortened.
+					timeoutMs: commandOptions?.timeoutMs ?? SWEEP_READ_TIMEOUT_MS,
+				});
+				const after = generation();
+				if (after !== before) {
+					console.warn(
+						`probe_generation_changed command=${args.slice(0, 3).join("_")} before=${before} after=${after}`,
+					);
+					throw new GjcCliUnavailableError("broker generation changed during a sweep read");
+				}
+				return result;
+			});
 		};
 		this.#tailRunner = options.tailRunner;
 		this.#now = options.now ?? (() => Date.now());
@@ -643,6 +672,7 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	bind(input: SessionBindInput): Promise<SessionBinding> {
+		if (inSweep()) return sweepControl(() => this.bind(input));
 		const key = `${input.originKey}#${input.epoch}`;
 		const existing = this.#bindings.get(key);
 		if (existing) return existing;
@@ -1187,6 +1217,16 @@ export class BrokerSessionPort implements SessionPort {
 		repo: string;
 		shouldTerminate?: () => boolean | Promise<boolean>;
 	}): Promise<TerminateHostOutcome> {
+		// Termination waits through its signal grace, so a sweep hands its turn to
+		// the next origin; the inspect and guard reads stay sweep reads.
+		return await sweepHandOn(async () => await this.#terminateHost(input));
+	}
+
+	async #terminateHost(input: {
+		sessionId: string;
+		repo: string;
+		shouldTerminate?: () => boolean | Promise<boolean>;
+	}): Promise<TerminateHostOutcome> {
 		this.#assertOwned(input);
 		const finalGuardRefusal = async () => {
 			if (!input.shouldTerminate) return undefined;
@@ -1360,6 +1400,7 @@ export class BrokerSessionPort implements SessionPort {
 	 * reports, which made every resume fail as "saved authority unavailable".
 	 */
 	async resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding> {
+		if (inSweep()) return await sweepControl(() => this.resume(input));
 		this.#assertOwned(input);
 		const resumable = (state: SessionLiveness) =>
 			!state.disowned &&
@@ -1425,6 +1466,7 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async send(input: SessionSendInput): Promise<SendReceipt> {
+		if (inSweep()) return await sweepControl(() => this.send(input));
 		this.#assertOwned(input);
 		assertValidOpRef(input.opRef);
 		if (input.text.trim().length === 0) throw new OpRefError("prompt text must not be empty");
@@ -1663,6 +1705,7 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async steer(input: SessionSteerInput): Promise<void> {
+		if (inSweep()) return await sweepControl(() => this.steer(input));
 		this.#assertOwned(input);
 		assertControlAllowed("turn.steer", { operatorApproval: true });
 		if (input.text.trim().length === 0) throw new OpRefError("steer text must not be empty");
@@ -1712,6 +1755,7 @@ export class BrokerSessionPort implements SessionPort {
 		selection: GjcModelSelection;
 		relay?: TailHandle;
 	}): Promise<{ readonly changed: boolean }> {
+		if (inSweep()) return await sweepControl(() => this.setModel(input));
 		this.#assertOwned(input);
 		const selection = input.selection;
 		if (typeof selection !== "string") {
@@ -1755,6 +1799,7 @@ export class BrokerSessionPort implements SessionPort {
 		tier: GjcServiceTier;
 		relay?: TailHandle;
 	}): Promise<{ readonly changed: boolean }> {
+		if (inSweep()) return await sweepControl(() => this.setServiceTier(input));
 		this.#assertOwned(input);
 		return await this.#overRelay(input, "service_tier.set", async (sdk) => {
 			const result = parseEnvelope<{ changed?: unknown } | undefined>(
@@ -1913,6 +1958,7 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async close(input: { sessionId: string; repo: string }): Promise<void> {
+		if (inSweep()) return await sweepControl(() => this.close(input));
 		this.#assertOwned(input);
 		assertControlAllowed("session.close", { operatorApproval: true });
 		await this.#closeSessionOperation(input.sessionId);
@@ -2029,11 +2075,13 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async attachTail(input: TailAttachInput): Promise<TailHandle> {
+		if (inSweep()) return await sweepControl(() => this.attachTail(input));
 		this.#assertOwned(input);
 		return await this.#tailRunner.attach(input);
 	}
 
 	async runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult> {
+		if (inSweep()) return await sweepControl(() => this.runCompaction(input));
 		this.#assertOwned(input);
 		if (input.relay) return await this.#runCompactionOnRelay(input, input.relay);
 		try {
@@ -2122,6 +2170,8 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async runExclusive<T>(key: string, work: () => Promise<T>): Promise<T> {
+		// Waiting behind another holder of `key` must never hold a sweep slot.
+		if (inSweep()) return await sweepControl(() => this.runExclusive(key, work));
 		const previous = this.#chains.get(key);
 		if (!previous) {
 			const task = work();
@@ -2152,6 +2202,7 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async request(input: SessionRequestInput): Promise<SessionRequestResult> {
+		if (inSweep()) return await sweepControl(() => this.request(input));
 		try {
 			this.#assertOwned(input);
 		} catch (error) {
