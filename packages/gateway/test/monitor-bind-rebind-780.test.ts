@@ -774,6 +774,7 @@ test("a restart mid-streak does not send a second escalation (issue #780)", asyn
 						eventId,
 						monitorId: monitor.monitorId,
 						eventType: "test.restart_escalation",
+						sessionOriginKey: `monitor/eventtype/test.restart_escalation/parent=${monitor.monitorId}`,
 						payloadJson: JSON.stringify({}),
 						firedAt: new Date(Date.now() - 1000 * (3 - i)).toISOString(),
 					});
@@ -1061,6 +1062,7 @@ test("three retryable 'failed' events do not trigger escalation (issue #780, P2 
 					eventId,
 					monitorId: monitor.monitorId,
 					eventType: "test.retryable_failures",
+					sessionOriginKey: `monitor/eventtype/test.retryable_failures/parent=${monitor.monitorId}`,
 					payloadJson: JSON.stringify({}),
 					firedAt: new Date(Date.now() - 10_000 + i).toISOString(),
 				});
@@ -1109,6 +1111,127 @@ test("three retryable 'failed' events do not trigger escalation (issue #780, P2 
 		expect(requestAttempts).toBe(7);
 		expect(escalationMessages).toHaveLength(1);
 		expect(escalationMessages[0]?.text).toContain("[monitor escalation]");
+
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("bind recovery retires an existing session before rotating its epoch (#780 review P2)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-bind-retire-existing-"));
+	try {
+		const database = await Store.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "retire-existing-binding-test",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.retire_existing_binding"],
+			burstPolicy: "serialize",
+		});
+		const originKey = `monitor/eventtype/test.retire_existing_binding/parent=${monitor.monitorId}`;
+		const oldSessionId = "unverified-old-monitor-session";
+		database.transaction((tx) => {
+			expect(database.bindings.bindAtEpoch(tx, originKey, oldSessionId, 0)).toBe(true);
+		});
+
+		const sessionPort: Partial<SessionPort> = {
+			bind: async (input) => {
+				if (input.epoch === 0) throw new Error("broker unavailable while inspecting existing session");
+				const sessionId = `session-epoch-${input.epoch}`;
+				database.transaction((tx) => {
+					expect(database.bindings.bindAtEpoch(tx, input.originKey, sessionId, input.epoch)).toBe(true);
+				});
+				return {
+					sessionId,
+					originKey: input.originKey,
+					epoch: input.epoch,
+					repo: input.repo,
+					startupModelApplied: false,
+				};
+			},
+			turnRunning: async () => true,
+			runExclusive: async (_, fn) => fn(),
+		};
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: sessionPort as SessionPort,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			repo: join(home, "workspace"),
+			model: undefined,
+			serviceTier: undefined,
+		});
+
+		for (let i = 0; i < 3; i++) await pipeline.submitAwaitable(monitor.monitorId, "test.retire_existing_binding", {});
+
+		expect(database.bindings.getSessionRecord(originKey)).toEqual({ epoch: 1, sessionId: "session-epoch-1" });
+		const retiredKey = `monitor_retired_session:${originKey}:${oldSessionId}`;
+		expect(JSON.parse(database.core.metaGet(retiredKey) ?? "null")).toMatchObject({
+			sessionId: oldSessionId,
+			epoch: 0,
+		});
+
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("pending session.create scopes stay capped across repeated bind rotations (#780 review P2)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-pending-create-cap-"));
+	try {
+		const database = await Store.open(join(home, "gateway.db"));
+		const agentDir = join(home, "agent");
+		const authority = initializeTestBrokerAuthority(database, agentDir);
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "pending-create-cap-test",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.pending_create_cap"],
+			burstPolicy: "serialize",
+		});
+		const originKey = `monitor/eventtype/test.pending_create_cap/parent=${monitor.monitorId}`;
+		const attemptedEpochs: number[] = [];
+		const sessionPort: Partial<SessionPort> = {
+			bind: async (input) => {
+				attemptedEpochs.push(input.epoch);
+				const scope = JSON.stringify([input.originKey, input.epoch]);
+				database.transaction((tx) =>
+					database.bindings.beginBrokerOperation(tx, authority, {
+						operation: "session.create",
+						scope,
+						operationRef: `gw-pending-create-${input.epoch}`,
+						requestJson: JSON.stringify({ cwd: input.repo }),
+					}),
+				);
+				throw new GjcCliUnavailableError("broker_unavailable: session.create outcome is unknown");
+			},
+			hasPendingSessionCreate: ({ originKey: key, epoch }) =>
+				database.bindings.hasPendingSessionCreate(JSON.stringify([key, epoch])),
+			runExclusive: async (_, fn) => fn(),
+		};
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: sessionPort as SessionPort,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			repo: join(home, "workspace"),
+			model: undefined,
+			serviceTier: undefined,
+		});
+
+		for (let i = 0; i < 12; i++) await pipeline.submitAwaitable(monitor.monitorId, "test.pending_create_cap", {});
+
+		expect(database.bindings.getSessionRecord(originKey)?.epoch).toBe(1);
+		expect(attemptedEpochs.every((epoch) => epoch <= 1)).toBe(true);
+		expect(
+			[0, 1, 2].filter((epoch) => database.bindings.hasPendingSessionCreate(JSON.stringify([originKey, epoch]))),
+		).toHaveLength(2);
 
 		database.close();
 	} finally {

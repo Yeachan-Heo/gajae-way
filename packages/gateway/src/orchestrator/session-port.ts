@@ -519,6 +519,8 @@ const BROKER_OPERATION_RETENTION_MS = 60 * 60_000;
 const BROKER_INTENT_RETENTION_MS = 24 * 60 * 60_000;
 /** Maximum poisoned-create-key epoch rotations permitted per origin. */
 export const MAX_POISONED_CREATE_ROTATIONS = 3;
+/** A bind only reconciles a bounded batch of pending creates from retired epochs. */
+const RETIRED_SESSION_CREATE_RECONCILIATION_LIMIT = 32;
 
 function createRotationMetaKey(originKey: string): string {
 	return `create_rotation:${originKey}`;
@@ -628,8 +630,13 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async #reconcileRetiredSessionCreates(originKey: string, epoch: number): Promise<void> {
-		for (let retiredEpoch = 0; retiredEpoch < epoch; retiredEpoch++) {
-			const scope = JSON.stringify([originKey, retiredEpoch]);
+		const pendingScopes = this.#database.bindings.pendingSessionCreateScopes(
+			this.#authority,
+			originKey,
+			epoch,
+			RETIRED_SESSION_CREATE_RECONCILIATION_LIMIT,
+		);
+		for (const { scope, epoch: retiredEpoch } of pendingScopes) {
 			try {
 				const pendingCreate = this.#database.bindings.brokerOperation(this.#authority, "session.create", scope);
 				if (pendingCreate?.state !== "pending") continue;

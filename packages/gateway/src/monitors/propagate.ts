@@ -179,6 +179,8 @@ export const MONITOR_SHUTDOWN_DRAIN_MS = 10_000;
  * consecutive events to drop with no escalation until restarted.
  */
 export const MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD = 3;
+/** One retired and one active uncertain create scope per monitor origin at most. */
+const MAX_PENDING_MONITOR_SESSION_CREATE_SCOPES = 2;
 
 /**
  * Consecutive terminal failed events per origin before emitting an escalation.
@@ -530,6 +532,7 @@ export class MonitorPropagator {
 				eventId,
 				monitorId,
 				eventType,
+				sessionOriginKey: sessionOriginKeyForEvent(monitor, eventType),
 				payloadJson: JSON.stringify(payload ?? null),
 				firedAt,
 				overlap: monitor.overlap,
@@ -610,6 +613,7 @@ export class MonitorPropagator {
 				slotAt: slotAt.toISOString(),
 				eventId,
 				eventType,
+				sessionOriginKey: sessionOriginKeyForEvent(monitor, eventType),
 				payloadJson: JSON.stringify(payload ?? null),
 				overlap: monitor.overlap,
 			}),
@@ -1238,16 +1242,24 @@ export class MonitorPropagator {
 			return;
 		}
 		for (const row of claimed) this.#emitStage(row, "batched");
-		const claimedEventType = claimed[0]?.event_type;
 		let sessionOrigin: OriginRef;
 		let sessionOriginKey: string;
 		try {
-			if (!claimedEventType) throw new Error("missing event type");
-			originKey(eventTypeOrigin(claimedEventType));
-			// The session is owned by THIS monitor (#177): monitors that declare the
-			// same event type must not share history, instruction, or failure domain.
-			sessionOrigin = monitorOriginForEvent(monitor, claimedEventType);
+			const claimedOrigins = claimed.map((row) => {
+				const key = row.session_origin_key ?? sessionOriginKeyForEvent(monitor, row.event_type);
+				if (!key) throw new Error("missing monitor event session origin");
+				return key;
+			});
+			const claimedOrigin = claimedOrigins[0];
+			if (!claimedOrigin || claimedOrigins.some((key) => key !== claimedOrigin))
+				throw new Error("monitor batch spans multiple session origins");
+			sessionOrigin = parseOriginKey(claimedOrigin);
 			sessionOriginKey = originKey(sessionOrigin);
+			if (sessionOriginKey !== claimedOrigin) throw new Error("monitor event session origin is not canonical");
+			const originsRecorded = this.#database.transaction((tx) =>
+				claimed.every((row) => this.#database.monitors.eventSetSessionOrigin(tx, row.event_id, sessionOriginKey)),
+			);
+			if (!originsRecorded) throw new Error("monitor event session origin changed during dispatch");
 		} catch {
 			const transitionedFailure = this.#database.transaction((tx) => {
 				let transitioned = false;
@@ -1427,22 +1439,45 @@ export class MonitorPropagator {
 								);
 
 								if (safety.bindTimeoutFailures >= MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD) {
+									const rotation = this.#database.transaction((tx) => {
+										const pendingCreateScopeCount = this.#database.bindings.pendingSessionCreateCount(
+											sessionOriginKey,
+											MAX_PENDING_MONITOR_SESSION_CREATE_SCOPES,
+											tx,
+										);
+										if (pendingCreateScopeCount >= MAX_PENDING_MONITOR_SESSION_CREATE_SCOPES)
+											return { rotated: false as const, pendingCreateScopeCount };
+
+										const retired = this.#database.bindings.getSessionRecord(sessionOriginKey);
+										if (retired?.sessionId) {
+											this.#database.core.metaSet(
+												`monitor_retired_session:${sessionOriginKey}:${retired.sessionId}`,
+												JSON.stringify({ sessionId: retired.sessionId, epoch: retired.epoch, retiredAt: this.#now() }),
+											);
+										}
+										return {
+											rotated: true as const,
+											pendingCreateScopeCount,
+											epoch: this.#database.bindings.rotateEpoch(tx, sessionOriginKey),
+										};
+									});
+									if (!rotation.rotated) {
+										console.error(
+											`monitor bind recovery held for ${sessionOriginKey}: pending session.create scopes=${rotation.pendingCreateScopeCount}/${MAX_PENDING_MONITOR_SESSION_CREATE_SCOPES}; retrying the current epoch`,
+										);
+										throw bindError;
+									}
 									if (pendingCreate)
 										console.error(
 											`monitor bind failure with pending session.create for ${sessionOriginKey} epoch=${boundEpoch}; retaining old journal row while rotating`,
 										);
 									console.error(
-										`monitor bind recovery triggered for ${sessionOriginKey}: epoch=${boundEpoch} -> ${boundEpoch + 1} pending_create=${pendingCreate} existing_session=${sessionExists}`,
+										`monitor bind recovery triggered for ${sessionOriginKey}: epoch=${boundEpoch} -> ${rotation.epoch} pending_create=${pendingCreate} existing_session=${sessionExists}`,
 									);
-									// Keep any pending create journaled under the old scope. The fresh
-									// SessionPort bind reconciles it after the new binding is ready.
-									const newEpoch = this.#database.transaction((tx) =>
-										this.#database.bindings.rotateEpoch(tx, sessionOriginKey),
-									);
-									boundEpoch = newEpoch;
-									this.#persistBindTimeoutCounter(sessionOriginKey, 0, newEpoch);
+									boundEpoch = rotation.epoch;
+									this.#persistBindTimeoutCounter(sessionOriginKey, 0, boundEpoch);
 									safety.bindTimeoutFailures = 0;
-									safety.bindTimeoutEpoch = newEpoch;
+									safety.bindTimeoutEpoch = boundEpoch;
 									this.#safety.set(sessionOriginKey, safety);
 									continue;
 								}
@@ -2249,12 +2284,8 @@ export class MonitorPropagator {
 	deliveryConfirmed(turnId: string): void {
 		for (const row of this.#database.monitors.eventsByBatch(turnId)) {
 			if (row.stage !== "delivered") continue;
-			const monitor = this.#registry.get(row.monitor_id);
-			if (!monitor) continue;
-			this.#clearConsecutiveFailedEventCount(
-				originKey(monitorOriginForEvent(monitor, row.event_type)),
-				monitor.monitorId,
-			);
+			if (!row.session_origin_key) continue;
+			this.#clearConsecutiveFailedEventCount(row.session_origin_key, row.monitor_id);
 		}
 	}
 	#safetyState(sessionOriginKey: string): MonitorSessionSafetyState {
@@ -2350,7 +2381,7 @@ export class MonitorPropagator {
 			const page = this.#database.monitors.eventRows(monitorId, "newest", false, pageSize, offset);
 			for (const row of page) {
 				// Issue #3: only count failures for this specific session origin
-				if (originKey(monitorOriginForEvent(monitor, row.event_type)) !== sessionOriginKey) continue;
+				if (row.session_origin_key !== sessionOriginKey) continue;
 				// Codex P2 #1: overlap-skipped events are scheduling outcomes, not failures
 				if (row.stage === "skipped") continue;
 				if (row.stage === "failed_no_retry" || row.stage === "contract_unmet") {
@@ -2371,10 +2402,10 @@ export class MonitorPropagator {
 	 * Issue #780: when K consecutive events fail, escalate once per streak.
 	 */
 	/** Feed a terminal failure into the escalation streak; a removed monitor has no origin left to escalate. */
-	#trackTerminalFailure(row: { monitor_id: string; event_type: string }): void {
+	#trackTerminalFailure(row: Pick<MonitorEventDbRow, "monitor_id" | "session_origin_key">): void {
 		const monitor = this.#registry.get(row.monitor_id);
-		if (!monitor) return;
-		this.#trackConsecutiveFailedEvent(originKey(monitorOriginForEvent(monitor, row.event_type)), row.monitor_id);
+		if (!monitor || !row.session_origin_key) return;
+		this.#trackConsecutiveFailedEvent(row.session_origin_key, row.monitor_id);
 	}
 
 	#trackConsecutiveFailedEvent(sessionOriginKey: string, monitorId: string): void {
@@ -3537,6 +3568,14 @@ function monitorOriginForEvent(monitor: MonitorRecord, eventType: string): Origi
 		monitor.monitorId,
 		monitor.eventTypes.includes(eventType) ? eventType : CATCH_ALL_EVENT_ORIGIN.conversationId,
 	);
+}
+
+function sessionOriginKeyForEvent(monitor: MonitorRecord, eventType: string): string | undefined {
+	try {
+		return originKey(monitorOriginForEvent(monitor, eventType));
+	} catch {
+		return undefined;
+	}
 }
 
 function monitorReadinessOriginKey(monitorId: string): string {

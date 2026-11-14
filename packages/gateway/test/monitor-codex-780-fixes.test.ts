@@ -511,3 +511,97 @@ test("eventRows pages newest-first with limit and offset (issue #780, P2 per-ori
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+test("failure streaks and delivery confirmation keep the event's admitted origin (#780 review P2)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-event-origin-streak-"));
+	try {
+		const database = await Store.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const instruction = "Inspect each event and report new evidence.";
+		const monitor = registry.add({
+			name: "event-origin-streak-test",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.origin_A", "test.origin_B"],
+			instruction,
+			burstPolicy: "serialize",
+		});
+		const delivered: ChatMessagePayload[] = [];
+		let response: "failure" | "success" = "failure";
+		const sessionPort: Partial<SessionPort> = {
+			bind: async (input) => ({
+				sessionId: `session-${input.epoch}`,
+				originKey: input.originKey,
+				epoch: input.epoch,
+				repo: input.repo,
+				startupModelApplied: false,
+			}),
+			request: async (input) => {
+				const eventId = input.text.match(/"eventId":"([^"]+)"/)?.[1];
+				return {
+					receipt: { sessionId: input.sessionId, operationRef: input.opRef },
+					assistant: {
+						text: JSON.stringify([
+							{ eventId, note: response === "failure" ? instruction : "The monitor found new deployment evidence." },
+						]),
+					},
+				} as never;
+			},
+			runExclusive: async (_, fn) => fn(),
+		};
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: sessionPort as SessionPort,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			repo: join(home, "workspace"),
+			model: undefined,
+			serviceTier: undefined,
+			ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "test-owner" } },
+			deliver: (payload) => delivered.push(payload),
+		});
+		const submit = async (eventType: string, expected: "contract_unmet" | "authored") => {
+			const eventId = await pipeline.submitAwaitable(monitor.monitorId, eventType, {});
+			expect(database.monitors.eventGet(eventId)?.stage).toBe(expected);
+			return eventId;
+		};
+
+		await submit("test.origin_A", "contract_unmet");
+		await submit("test.origin_A", "contract_unmet");
+		registry.update({ monitorId: monitor.monitorId, eventTypes: ["test.origin_B"] });
+		await submit("test.unmapped_X", "contract_unmet");
+		// Must not combine the two historical A failures with the catch-all X failure.
+		expect(delivered.filter((payload) => payload.text.includes("[monitor escalation]"))).toHaveLength(0);
+
+		const clearMonitor = registry.add({
+			name: "delivery-origin-clear-test",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.confirmed_A", "test.confirmed_B"],
+			instruction,
+			burstPolicy: "serialize",
+		});
+		const clearOriginA = `monitor/eventtype/test.confirmed_A/parent=${clearMonitor.monitorId}`;
+		const clearEscalation = `monitor_escalation:${clearOriginA}:${clearMonitor.monitorId}`;
+		response = "success";
+		const successfulEventId = await pipeline.submitAwaitable(clearMonitor.monitorId, "test.confirmed_A", {});
+		expect(database.monitors.eventGet(successfulEventId)?.stage).toBe("authored");
+		const successfulEvent = database.monitors.eventGet(successfulEventId);
+		if (!successfulEvent?.batch_id) throw new Error("successful event has no delivery batch");
+		const successfulDelivery = delivered.find((payload) => payload.turnId === successfulEvent.batch_id);
+		if (!successfulDelivery?.deliveryId) throw new Error("successful event has no durable delivery");
+
+		database.core.metaSet(clearEscalation, "stale-marker");
+		registry.update({ monitorId: clearMonitor.monitorId, eventTypes: ["test.confirmed_B"] });
+		database.transaction((tx) => {
+			database.outbox.confirm(tx, successfulDelivery.deliveryId!);
+			database.monitors.settleForTurn(tx, successfulDelivery.turnId, "delivered");
+		});
+		pipeline.deliveryConfirmed(successfulDelivery.turnId);
+		expect(database.core.metaGet(clearEscalation)).toBeUndefined();
+
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});

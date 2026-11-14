@@ -140,6 +140,37 @@ test("pending session.create observation is scoped to its origin and epoch", asy
 	expect(readinessBudgetPort.pendingSessionCreateExceededReadiness({ originKey, epoch: 7 })).toBe(false);
 });
 
+test("retired-create reconciliation queries pending scopes instead of scanning every prior epoch", async () => {
+	const originKey = "discord/dm/bounded-retired-create-reconciliation";
+	const epoch = 1_000;
+	const sessionId = "fresh-bounded-reconciliation-session";
+	const { port, repo, database } = await brokerPortFixture(async (args) => {
+		if (args.includes("session.create")) return createSuccess(sessionId);
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: { session: { sessionId, live: true, deleted: false, locator: { cwd: repo } } },
+				}),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	});
+	database.transaction((tx) => {
+		for (let priorEpoch = 0; priorEpoch < epoch; priorEpoch++) database.bindings.rotateEpoch(tx, originKey);
+	});
+	const brokerOperation = database.bindings.brokerOperation.bind(database.bindings);
+	let operationLookups = 0;
+	database.bindings.brokerOperation = (authority, operation, scope) => {
+		operationLookups++;
+		return brokerOperation(authority, operation, scope);
+	};
+
+	await expect(port.bind({ originKey, epoch, repo })).resolves.toMatchObject({ sessionId, epoch });
+	expect(operationLookups).toBeLessThan(8);
+});
+
 test("binding a fresh epoch replays and retires an orphaned pending create", async () => {
 	const originKey = "discord/dm/retired-pending-create";
 	const oldScope = JSON.stringify([originKey, 0]);
