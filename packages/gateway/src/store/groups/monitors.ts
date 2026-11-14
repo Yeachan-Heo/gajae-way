@@ -122,6 +122,7 @@ export interface MonitorEventDbRow {
 	readonly event_id: string;
 	readonly monitor_id: string;
 	readonly event_type: string;
+	readonly session_origin_key: string | null;
 	readonly payload_json: string;
 	readonly fired_at: string;
 	readonly stage: string;
@@ -344,6 +345,7 @@ export class MonitorsGroup {
 			eventId: string;
 			monitorId: string;
 			eventType: string;
+			sessionOriginKey?: string;
 			payloadJson: string;
 			firedAt: string;
 			overlap?: "queue" | "skip";
@@ -356,19 +358,34 @@ export class MonitorsGroup {
 				: "NULL";
 		const inserted = this.#db
 			.prepare(
-				`INSERT INTO monitor_events (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, skipped_by, updated_at) SELECT ?, ?, ?, ?, ?, CASE WHEN p.id IS NULL THEN 'admitted' ELSE 'skipped' END, NULL, p.id, ? FROM (SELECT ${predecessor} AS id) AS p RETURNING skipped_by`,
+				`INSERT INTO monitor_events (event_id, monitor_id, event_type, session_origin_key, payload_json, fired_at, stage, batch_id, skipped_by, updated_at) SELECT ?, ?, ?, ?, ?, ?, CASE WHEN p.id IS NULL THEN 'admitted' ELSE 'skipped' END, NULL, p.id, ? FROM (SELECT ${predecessor} AS id) AS p RETURNING skipped_by`,
 			)
 			.getWithWrite(
 				tx,
 				row.eventId,
 				row.monitorId,
 				row.eventType,
+				row.sessionOriginKey ?? null,
 				row.payloadJson,
 				row.firedAt,
 				new Date().toISOString(),
 				...(row.overlap === "skip" ? [row.monitorId] : []),
 			) as { skipped_by: string | null } | null;
 		return inserted?.skipped_by ?? undefined;
+	}
+
+	/** Capture an event's dispatch scope once; a later monitor update cannot reassign it. */
+	eventSetSessionOrigin(tx: WriteTx, eventId: string, sessionOriginKey: string): boolean {
+		const row = this.#db
+			.prepare("SELECT session_origin_key FROM monitor_events WHERE event_id = ?")
+			.getWithWrite(tx, eventId) as { session_origin_key: string | null } | null;
+		if (!row) return false;
+		if (row.session_origin_key !== null) return row.session_origin_key === sessionOriginKey;
+		return (
+			this.#db
+				.prepare("UPDATE monitor_events SET session_origin_key = ? WHERE event_id = ? AND session_origin_key IS NULL")
+				.run(tx, sessionOriginKey, eventId).changes === 1
+		);
 	}
 
 	#supersedeFailedPredecessors(tx: WriteTx, monitorId: string, successorId: string): void {
@@ -779,6 +796,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		order: "newest" | "oldest" = "newest",
 		includeQuarantined = false,
 		limit?: number,
+		offset = 0,
 	): MonitorEventDbRow[] {
 		const direction = order === "oldest" ? "ASC" : "DESC";
 		const terms = [
@@ -787,10 +805,10 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		];
 		const where = terms.filter((term) => term !== undefined).join(" AND ") || "1=1";
 		const params: Array<string | number> = monitorId === undefined ? [] : [monitorId];
-		if (limit !== undefined) params.push(limit);
+		if (limit !== undefined) params.push(limit, offset);
 		return this.#db
 			.prepare(
-				`SELECT * FROM monitor_events WHERE ${where} ORDER BY fired_at ${direction}, rowid ${direction}${limit === undefined ? "" : " LIMIT ?"}`,
+				`SELECT * FROM monitor_events WHERE ${where} ORDER BY fired_at ${direction}, rowid ${direction}${limit === undefined ? "" : " LIMIT ? OFFSET ?"}`,
 			)
 			.all(...params) as MonitorEventDbRow[];
 	}
@@ -1059,6 +1077,7 @@ ORDER BY monitor_failures.rowid DESC LIMIT ?`,
 			slotAt: string;
 			eventId: string;
 			eventType: string;
+			sessionOriginKey?: string;
 			payloadJson: string;
 			overlap?: "queue" | "skip";
 		},
@@ -1073,6 +1092,7 @@ ORDER BY monitor_failures.rowid DESC LIMIT ?`,
 			eventId: row.eventId,
 			monitorId: row.monitorId,
 			eventType: row.eventType,
+			sessionOriginKey: row.sessionOriginKey,
 			payloadJson: row.payloadJson,
 			firedAt: row.slotAt,
 			...(row.overlap ? { overlap: row.overlap } : {}),

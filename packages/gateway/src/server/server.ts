@@ -1700,6 +1700,7 @@ async function handleRequest(
 			const authoredEvents = batchEvents.filter((row) => row.stage === "authored").map((row) => row.event_id);
 			const confirmOutcome = confirmAndSettleMonitorDelivery(options.database, id, "delivered");
 			if (confirmOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
+			if (delivery) runtime.monitors.deliveryConfirmed(delivery.turnId);
 			if (runtime.delivery.get(id)?.state === "confirmed") runtime.restartTerminalDeliveryIds.delete(id);
 			if (confirmOutcome === "transitioned") {
 				runtime.readiness.recordSuccess("delivery");
