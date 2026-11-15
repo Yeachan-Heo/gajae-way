@@ -14,7 +14,8 @@
  * Dry-run mode stops there and never touches the registry. Publish mode
  * uploads that exact tarball with the npm CLI, because npm (>= 11.5.1)
  * supports OIDC trusted publishing from GitHub Actions and `bun publish`
- * does not.
+ * does not. For OIDC dist-tag updates, enable "Allow npm dist-tag" for each
+ * package's trusted publisher and use npm 11.21.0+ (11.x) or 12.2.0+ (12.x).
  */
 
 import { mkdir, readdir } from "node:fs/promises";
@@ -95,6 +96,60 @@ export async function checkNpmRegistry(
 	return parseNpmViewResult(stdout, stderr, code, version);
 }
 
+async function npmOutput(args: string[], cwd: string): Promise<{ stdout: string; stderr: string; code: number }> {
+	const proc = Bun.spawn(["npm", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	const [stdout, stderr, code] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	return { stdout: stdout.trim(), stderr: stderr.trim(), code };
+}
+
+async function resumeTag(
+	name: string,
+	version: string,
+	tag: string | undefined,
+	manifest: PackedPackageManifest,
+	cwd: string,
+): Promise<void> {
+	let effectiveTag = tag ?? manifest.publishConfig?.tag;
+	if (!effectiveTag) {
+		const result = await npmOutput(["config", "get", "tag"], cwd);
+		if (result.code !== 0 || !result.stdout) {
+			throw new Error(`npm tag configuration failed for ${name}: ${result.stderr || result.stdout}`);
+		}
+		effectiveTag = result.stdout;
+	}
+	if (!tag && effectiveTag === "latest" && version.split("+")[0]?.includes("-")) {
+		throw new Error(`refusing to implicitly tag prerelease ${name}@${version} as latest; specify --tag explicitly`);
+	}
+
+	const current = await npmOutput(["view", `${name}@${effectiveTag}`, "version"], cwd);
+	if (current.code !== 0 && !current.stderr.includes("404")) {
+		throw new Error(`npm dist-tag lookup failed for ${name}@${effectiveTag}: ${current.stderr || current.stdout}`);
+	}
+	if (current.code === 0) {
+		if (!current.stdout) throw new Error(`npm dist-tag lookup returned an empty version for ${name}@${effectiveTag}`);
+		if (current.stdout === version) {
+			console.log(`\n${name}@${version} already has dist-tag ${effectiveTag}.`);
+			return;
+		}
+		if (Bun.semver.order(current.stdout, version) > 0) {
+			throw new Error(`refusing to move ${name}@${effectiveTag} backwards from ${current.stdout} to ${version}`);
+		}
+	}
+
+	try {
+		await run(["npm", "dist-tag", "add", `${name}@${version}`, effectiveTag], cwd);
+	} catch (error) {
+		throw new Error(
+			`npm dist-tag update failed for ${name}@${version}. OIDC requires npm 11.21.0+ (11.x) or 12.2.0+ (12.x) and "Allow npm dist-tag" on this package's trusted publisher.`,
+			{ cause: error },
+		);
+	}
+}
+
 async function main(): Promise<void> {
 	const { publish, tag } = parseArgs(process.argv.slice(2));
 	const root = new URL("..", import.meta.url).pathname;
@@ -124,8 +179,7 @@ async function main(): Promise<void> {
 			const registryCheck = await checkNpmRegistry(packageName, packageVersion);
 
 			if (registryCheck.alreadyPublished) {
-				console.log(`\n${packageName}@${packageVersion} already published on npm; applying dist-tag.`);
-				await run(["npm", "dist-tag", "add", `${packageName}@${packageVersion}`, tag ?? "latest"], dir);
+				await resumeTag(packageName, packageVersion, tag, packedManifest, dir);
 			} else if (registryCheck.error) {
 				throw new Error(`registry check failed for ${packageName}@${packageVersion}: ${registryCheck.error}`);
 			} else {
@@ -158,6 +212,7 @@ function assertPinnedWorkspaceDeps(manifest: PackedPackageManifest, versions: Ma
 
 interface PackedPackageManifest {
 	readonly name: string;
+	readonly publishConfig?: { readonly tag?: string };
 	readonly dependencies?: Record<string, string>;
 	readonly optionalDependencies?: Record<string, string>;
 	readonly peerDependencies?: Record<string, string>;

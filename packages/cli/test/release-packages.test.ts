@@ -1,8 +1,12 @@
+// Covers the repo-root scripts/release-packages.ts. It lives under packages/ because
+// CI runs `bun test packages/` and `biome ci packages/`; a test under scripts/ would
+// never run. The fixture copies the real script into a temp dir and shadows only the
+// bun/npm subprocesses, so no test reaches a real registry.
 import { describe, expect, test } from "bun:test";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, delimiter, join } from "node:path";
-import { assertNoPrivateWorkspaceDeps, parseNpmViewResult, RELEASE_ORDER } from "./release-packages";
+import { assertNoPrivateWorkspaceDeps, parseNpmViewResult, RELEASE_ORDER } from "../../../scripts/release-packages";
 
 const RELEASE_PACKAGE_NAMES = new Set(["@gajae-gateway/protocol", "@gajae-gateway/images", "@gajae-gateway/sdk"]);
 const RELEASE_PACKAGE_NAMES_WITH_PRIVATE = new Set([...RELEASE_PACKAGE_NAMES, "@gajae-gateway/home"]);
@@ -121,7 +125,7 @@ interface RecordedCommand {
 // The child process runs a copy of the real release script. Only its bun and
 // npm subprocesses are replaced; packing and reading the tarball use real tar.
 const MOCK_COMMAND = `
-import { appendFileSync, copyFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -142,6 +146,11 @@ if (tool === "bun") {
       console.error("simulated registry failure");
       process.exit(1);
     }
+    const tags = JSON.parse(readFileSync(process.env.TAG_STATE, "utf8"));
+    if (Object.hasOwn(tags, args[1])) {
+      console.log(tags[args[1]]);
+      process.exit(0);
+    }
     if (JSON.parse(process.env.EXISTING_PACKAGES).includes(args[1])) {
       console.log(args[1].slice(args[1].lastIndexOf("@") + 1));
       process.exit(0);
@@ -149,11 +158,23 @@ if (tool === "bun") {
     console.error("404 Not Found");
     process.exit(1);
   }
+  if (args.join(" ") === "config get tag") {
+    if (process.env.CONFIG_ERROR) {
+      console.error("simulated config failure");
+      process.exit(1);
+    }
+    console.log(process.env.CONFIG_TAG);
+    process.exit(0);
+  }
   if (args[0] === "dist-tag" && args[1] === "add") {
     if (args[2] === process.env.DIST_TAG_ERROR) {
       console.error("simulated dist-tag failure");
       process.exit(1);
     }
+    const tags = JSON.parse(readFileSync(process.env.TAG_STATE, "utf8"));
+    const split = args[2].lastIndexOf("@");
+    tags[args[2].slice(0, split) + "@" + args[3]] = args[2].slice(split + 1);
+    writeFileSync(process.env.TAG_STATE, JSON.stringify(tags));
     process.exit(0);
   }
   if (args[0] === "publish") {
@@ -169,7 +190,17 @@ process.exit(1);
 `;
 
 async function withReleaseFixture(
-	options: { existing?: string[]; registryError?: string; distTagError?: string; publishError?: string },
+	options: {
+		existing?: string[];
+		registryError?: string;
+		distTagError?: string;
+		publishError?: string;
+		configTag?: string;
+		configError?: boolean;
+		tags?: Record<string, string>;
+		publishTags?: Record<string, string>;
+		versions?: Record<string, string>;
+	},
 	run: (fixture: {
 		root: string;
 		execute: (...args: string[]) => Promise<{ code: number; output: string; commands: RecordedCommand[] }>;
@@ -180,7 +211,10 @@ async function withReleaseFixture(
 		const bin = join(root, "bin");
 		await mkdir(bin);
 		await mkdir(join(root, "scripts"));
-		await copyFile(new URL("./release-packages.ts", import.meta.url), join(root, "scripts", "release-packages.ts"));
+		await copyFile(
+			new URL("../../../scripts/release-packages.ts", import.meta.url),
+			join(root, "scripts", "release-packages.ts"),
+		);
 		await writeFile(join(root, "mock-command.js"), MOCK_COMMAND);
 		for (const tool of ["bun", "npm"]) {
 			const executable = join(bin, tool);
@@ -190,10 +224,19 @@ async function withReleaseFixture(
 		for (const pkg of RELEASE_FIXTURES) {
 			const dir = join(root, "packages", pkg.directory);
 			await mkdir(dir, { recursive: true });
-			await writeFile(join(dir, "package.json"), JSON.stringify({ name: pkg.name, version: pkg.version }));
+			await writeFile(
+				join(dir, "package.json"),
+				JSON.stringify({
+					name: pkg.name,
+					version: options.versions?.[pkg.name] ?? pkg.version,
+					...(options.publishTags?.[pkg.name] ? { publishConfig: { tag: options.publishTags[pkg.name] } } : {}),
+				}),
+			);
 		}
 		const log = join(root, "commands.jsonl");
 		await writeFile(log, "");
+		const tagState = join(root, "tags.json");
+		await writeFile(tagState, JSON.stringify(options.tags ?? {}));
 		await run({
 			root,
 			execute: async (...args) => {
@@ -209,6 +252,9 @@ async function withReleaseFixture(
 						REGISTRY_ERROR: options.registryError ?? "",
 						DIST_TAG_ERROR: options.distTagError ?? "",
 						PUBLISH_ERROR: options.publishError ?? "",
+						TAG_STATE: tagState,
+						CONFIG_TAG: options.configTag ?? "latest",
+						CONFIG_ERROR: options.configError ? "1" : "",
 					},
 					stdout: "pipe",
 					stderr: "pipe",
@@ -249,6 +295,12 @@ describe("release script subprocess behavior", () => {
 					expected.push({ tool: "bun", args: ["pm", "pack", "--filename", tarball], cwd: pkg.directory });
 					expected.push({ tool: "npm", args: ["view", packageRef(pkg), "version"], cwd: basename(root) });
 					if (existing.includes(packageRef(pkg))) {
+						if (!tag) expected.push({ tool: "npm", args: ["config", "get", "tag"], cwd: pkg.directory });
+						expected.push({
+							tool: "npm",
+							args: ["view", `${pkg.name}@${tag ?? "latest"}`, "version"],
+							cwd: basename(root),
+						});
 						expected.push({
 							tool: "npm",
 							args: ["dist-tag", "add", packageRef(pkg), tag ?? "latest"],
@@ -262,7 +314,13 @@ describe("release script subprocess behavior", () => {
 						});
 					}
 				}
-				expect(result.commands).toEqual(expected);
+				expect(
+					result.commands.map((command) =>
+						command.tool === "npm" && command.args[0] === "view" && command.args[1]?.endsWith(`@${tag ?? "latest"}`)
+							? { ...command, cwd: basename(root) }
+							: command,
+					),
+				).toEqual(expected);
 			});
 		}, 30_000);
 	}
@@ -309,8 +367,12 @@ describe("release script subprocess behavior", () => {
 				["view", packageRef(RELEASE_FIXTURES[0]), "version"],
 				["publish", join(root, "dist-packed", "gajae-gateway-protocol.tgz"), "--access", "public", "--tag", "next"],
 				["view", failed, "version"],
+				["view", `${RELEASE_FIXTURES[1].name}@next`, "version"],
 				["dist-tag", "add", failed, "next"],
 			]);
+			expect(result.output).toMatch(/OIDC|trusted publish/i);
+			expect(result.output).toMatch(/permission|access/i);
+			expect(result.output).toContain(failed);
 			expect(result.commands.some((command) => command.cwd === "sdk")).toBe(false);
 		});
 	}, 30_000);
@@ -329,4 +391,136 @@ describe("release script subprocess behavior", () => {
 			expect(result.commands.some((command) => command.cwd === "sdk")).toBe(false);
 		});
 	}, 30_000);
+
+	test("uses npm's configured tag for resumed packages without forwarding it to fresh publishes", async () => {
+		const existing = [packageRef(RELEASE_FIXTURES[0]), packageRef(RELEASE_FIXTURES[2])];
+		await withReleaseFixture({ existing, configTag: "beta" }, async ({ execute }) => {
+			const result = await execute("--publish");
+			expect(result.code).toBe(0);
+			const npm = result.commands.filter((command) => command.tool === "npm");
+			expect(npm.filter((command) => command.args[0] === "config").map((command) => command.cwd)).toEqual([
+				"protocol",
+				"sdk",
+			]);
+			expect(npm.filter((command) => command.args[0] === "dist-tag").map((command) => command.args)).toEqual(
+				existing.map((ref) => ["dist-tag", "add", ref, "beta"]),
+			);
+			expect(
+				npm.filter((command) => command.args[0] === "publish").every((command) => !command.args.includes("--tag")),
+			).toBe(true);
+		});
+	}, 30_000);
+
+	test("packed publishConfig tag overrides npm config, and an explicit tag overrides both", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		for (const explicit of [false, true]) {
+			await withReleaseFixture(
+				{ existing: [packageRef(pkg)], configTag: "beta", publishTags: { [pkg.name]: "canary" }, configError: true },
+				async ({ execute }) => {
+					const result = await execute("--publish", ...(explicit ? ["--tag", "next"] : []));
+					expect(result.code).toBe(0);
+					const npm = result.commands.filter((command) => command.tool === "npm");
+					expect(npm.some((command) => command.args[0] === "config")).toBe(false);
+					expect(
+						npm.some(
+							(command) => command.args.join(" ") === `view ${pkg.name}@${explicit ? "next" : "canary"} version`,
+						),
+					).toBe(true);
+					expect(
+						npm.some(
+							(command) => command.args.join(" ") === `dist-tag add ${packageRef(pkg)} ${explicit ? "next" : "canary"}`,
+						),
+					).toBe(true);
+				},
+			);
+		}
+	}, 30_000);
+
+	for (const [label, target, shouldWrite] of [
+		["equal", "1.2.3", false],
+		["older", "1.2.2", true],
+		["absent", undefined, true],
+	] as const) {
+		test(`${label} dist-tag ${shouldWrite ? "is updated" : "skips mutation"}`, async () => {
+			const pkg = RELEASE_FIXTURES[0];
+			await withReleaseFixture(
+				{ existing: [packageRef(pkg)], tags: target ? { [`${pkg.name}@next`]: target } : {} },
+				async ({ execute }) => {
+					const result = await execute("--publish", "--tag", "next");
+					expect(result.code).toBe(0);
+					expect(
+						result.commands.filter((command) => command.args[0] === "dist-tag").map((command) => command.args),
+					).toEqual(shouldWrite ? [["dist-tag", "add", packageRef(pkg), "next"]] : []);
+				},
+			);
+		}, 30_000);
+	}
+
+	test("a repeated release observes the tags written by the first release", async () => {
+		await withReleaseFixture({ existing: RELEASE_FIXTURES.map(packageRef) }, async ({ execute }) => {
+			const first = await execute("--publish", "--tag", "next");
+			expect(first.code).toBe(0);
+			expect(first.commands.filter((command) => command.args[0] === "dist-tag")).toHaveLength(4);
+			const second = await execute("--publish", "--tag", "next");
+			expect(second.code).toBe(0);
+			expect(
+				second.commands.slice(first.commands.length).filter((command) => command.args[0] === "dist-tag"),
+			).toHaveLength(0);
+		});
+	}, 30_000);
+
+	test("rejects a newer tag without mutation or publishing subsequent packages", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{ existing: [packageRef(pkg)], tags: { [`${pkg.name}@next`]: "1.3.0" } },
+			async ({ execute }) => {
+				const result = await execute("--publish", "--tag", "next");
+				expect(result.code).not.toBe(0);
+				expect(result.output).toContain("1.3.0");
+				expect(
+					result.commands.some(
+						(command) => command.args[0] === "dist-tag" || command.args[0] === "publish" || command.cwd === "images",
+					),
+				).toBe(false);
+			},
+		);
+	}, 30_000);
+
+	for (const explicit of [false, true]) {
+		test(`prerelease ${explicit ? "explicitly promotes latest" : "rejects implicit latest"}`, async () => {
+			const pkg = RELEASE_FIXTURES[0];
+			const ref = `${pkg.name}@1.2.3-rc.1`;
+			await withReleaseFixture({ existing: [ref], versions: { [pkg.name]: "1.2.3-rc.1" } }, async ({ execute }) => {
+				const result = await execute("--publish", ...(explicit ? ["--tag", "latest"] : []));
+				expect(result.code === 0).toBe(explicit);
+				const mutations = result.commands.filter((command) => command.args[0] === "dist-tag");
+				expect(mutations.map((command) => command.args)).toEqual(explicit ? [["dist-tag", "add", ref, "latest"]] : []);
+				if (!explicit) expect(result.output).toMatch(/prerelease/i);
+			});
+		}, 30_000);
+	}
+
+	for (const failure of ["tag lookup", "config"] as const) {
+		test(`${failure} error fails without tag mutation`, async () => {
+			const pkg = RELEASE_FIXTURES[0];
+			await withReleaseFixture(
+				{
+					existing: [packageRef(pkg)],
+					...(failure === "config" ? { configError: true } : { registryError: `${pkg.name}@next` }),
+				},
+				async ({ execute }) => {
+					const result = await execute("--publish", ...(failure === "tag lookup" ? ["--tag", "next"] : []));
+					expect(result.code).not.toBe(0);
+					expect(result.output).toContain(
+						failure === "config" ? "simulated config failure" : "simulated registry failure",
+					);
+					expect(
+						result.commands.some(
+							(command) => command.args[0] === "dist-tag" || command.args[0] === "publish" || command.cwd === "images",
+						),
+					).toBe(false);
+				},
+			);
+		}, 30_000);
+	}
 });
