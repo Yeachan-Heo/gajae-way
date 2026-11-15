@@ -204,10 +204,30 @@ export class ImageOutbox {
 			const index = entries.findIndex((pending) => pending.messageId === entry.messageId);
 			if (index === -1) entries.push(entry);
 			else entries[index] = entry;
-			await writeEntries(this.#path, entries);
-			this.#entries = entries;
+			// Enforce the tombstone bound on the write path too: a long-lived session
+			// must not grow the journal until the next recovery load.
+			const pruned = pruneTombstones(entries);
+			await writeEntries(this.#path, pruned);
+			this.#entries = pruned;
 			this.#dropped = 0;
-			this.#index?.set(entry.messageId, entry);
+			this.#index = new Map(pruned.map((pending) => [pending.messageId, pending]));
+		});
+	}
+
+	/**
+	 * Drops records rejected by `keep` in one atomic write. Terminal rows are
+	 * removed only after the recovery watermark has passed them, so a replay can
+	 * never turn an intentionally rejected image back into a fresh send.
+	 */
+	async compact(keep: (entry: PendingImage) => boolean): Promise<void> {
+		return this.#serialize(async () => {
+			const entries = await this.#loadEntries();
+			const kept = entries.filter(keep);
+			if (kept.length === entries.length) return;
+			await writeEntries(this.#path, kept);
+			this.#entries = kept;
+			this.#dropped = 0;
+			this.#index = new Map(kept.map((entry) => [entry.messageId, entry]));
 		});
 	}
 

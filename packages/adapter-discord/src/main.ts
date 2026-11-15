@@ -1967,6 +1967,21 @@ export class ReconnectingGateway {
 		);
 	}
 
+	/** Drop terminal rows only after the recovery watermark has passed them. */
+	private async compactTerminalImages(): Promise<void> {
+		const cursors = this.#cursors;
+		if (!cursors) return;
+		try {
+			await this.#imageOutbox.compact((entry) => {
+				if (!entry.terminal) return true;
+				const watermark = cursors.recoveredThrough[entry.channelId] ?? cursors.quarantined[entry.channelId]?.watermark;
+				return watermark === undefined || snowflakeIsAfter(entry.messageId, watermark);
+			});
+		} catch {
+			console.error("Discord image outbox terminal compaction failed; retaining rejected-image rows.");
+		}
+	}
+
 	/** Drop every per-id structure after the intent can never need another attempt. */
 	private cleanupImageState(id: string): void {
 		const timer = this.#imageRetries.get(id);
@@ -2246,8 +2261,15 @@ export class ReconnectingGateway {
 			}
 			await this.ensureCursors();
 			if (!this.#cursors) {
+				// A persisted exact request needs no cursor and no history read. Replay it
+				// (and finish unaudited terminal rows) before the cursor fail-fast, or a
+				// broken cursor store keeps a healthy gateway's image undelivered forever.
+				for (const entry of pendingImages ?? []) {
+					if (entry.completed || (!entry.request && !entry.terminal)) continue;
+					await this.retryPendingImage(entry);
+				}
 				console.error(
-					`Discord recovery refused: cursor store ${this.recoveryCursorPath} is unusable (${this.#cursorFault ?? "unknown error"}); retrying with backoff.`,
+					`Discord recovery refused: cursor store ${this.recoveryCursorPath} is unusable (${this.#cursorFault ?? "unknown error"}); replayed durable image requests, retrying history with backoff.`,
 				);
 				return;
 			}
@@ -2318,6 +2340,7 @@ export class ReconnectingGateway {
 				}
 			}
 			this.persist(retainRecoveryCursors(this.#cursors, this.#recoverableIds));
+			await this.compactTerminalImages();
 			completed = !incomplete;
 		} catch (error) {
 			console.error(

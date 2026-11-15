@@ -465,3 +465,62 @@ test("an intent unacknowledged for 24 hours is dead-lettered instead of wedging 
 		await rm(home, { recursive: true, force: true });
 	}
 }, 12_000);
+
+test("a persisted image request replays even when the recovery cursor is unreadable", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-cursor-read-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "new-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await mkdir(cursorPath);
+		const request = {
+			messageId: id,
+			text: "look\n[image · photo.png]",
+			origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+			engagement: { mentioned: false, group: false, authorId: "human" },
+			images: [image],
+		};
+		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: id, channelId, request, dm: true }]));
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([id]);
+		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
+			{ messageId: id, channelId, completed: true, completedAt: expect.any(Number), dm: true },
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("terminal image rows are compacted only after the watermark passes them", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-compact-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "channel-1";
+	const below = snowflakeFromTimestamp(Date.now() - 120_000);
+	const above = snowflakeFromTimestamp(Date.now() + 60_000);
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 60_000) },
+		});
+		await writeFile(
+			join(home, "image-outbox.json"),
+			JSON.stringify([
+				{ messageId: below, channelId, terminal: true, audited: true },
+				{ messageId: above, channelId, terminal: true, audited: true },
+			]),
+		);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), []);
+		await bounded(adapter.recoverMissedMessages());
+		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
+			{ messageId: above, channelId, terminal: true, audited: true },
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);

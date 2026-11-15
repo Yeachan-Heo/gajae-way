@@ -131,4 +131,19 @@ describe("ImageOutbox", () => {
 		await outbox.put(entry);
 		expect(await new ImageOutbox(join(parent, "outbox.json")).load()).toEqual([entry]);
 	});
+
+	test("a put enforces the tombstone bound without waiting for a recovery load", async () => {
+		const outbox = new ImageOutbox(path);
+		const expired = "123456789012345687";
+		await outbox.put({
+			messageId: expired,
+			channelId: "channel",
+			completed: true,
+			completedAt: Date.now() - 8 * 24 * 60 * 60 * 1000,
+		});
+		const pending: PendingImage = { messageId: "123456789012345688", channelId: "channel" };
+		await outbox.put(pending);
+		expect(await readFile(path, "utf8")).not.toContain(expired);
+		expect(await outbox.load()).toEqual([pending]);
+	});
 });
