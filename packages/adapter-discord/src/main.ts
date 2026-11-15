@@ -1880,7 +1880,10 @@ export class ReconnectingGateway {
 			this.config.threadOnMention,
 			{
 				recoverAmbiguous: async (messageId) => {
-					const existing = await this.discord.channels.fetch(messageId).catch(() => undefined);
+					const attached = (message as { thread?: unknown }).thread;
+					const existing = isRecoveryThread(attached, channelId)
+						? attached
+						: await this.discord.channels.fetch(messageId).catch(() => undefined);
 					if (!isRecoveryThread(existing, channelId) || existing.id !== messageId) return undefined;
 					return {
 						platform: "discord",
@@ -1959,7 +1962,6 @@ export class ReconnectingGateway {
 			messageId: entry.messageId,
 			channelId: entry.channelId,
 			terminal: true,
-			terminalAt: Date.now(),
 			audited: true,
 			...(entry.dm ? { dm: true } : {}),
 		});

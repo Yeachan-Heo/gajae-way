@@ -147,38 +147,26 @@ describe("ImageOutbox", () => {
 		expect(await outbox.load()).toEqual([pending]);
 	});
 
-	test("ages terminal rows after the history rewalk window", async () => {
-		const { snowflakeFromTimestamp } = await import("../src/recovery");
-		const old = String(snowflakeFromTimestamp(Date.now() - 31 * 24 * 60 * 60 * 1000));
-		const recent = String(snowflakeFromTimestamp(Date.now() - 60_000));
-		await writeFile(
-			path,
-			JSON.stringify([
-				{
-					messageId: old,
-					channelId: "channel",
-					terminal: true,
-					terminalAt: Date.now() - 31 * 24 * 60 * 60 * 1000,
-					audited: true,
-				},
-				{ messageId: recent, channelId: "channel", terminal: true, terminalAt: Date.now() - 60_000, audited: true },
-			]),
-		);
-		expect(await new ImageOutbox(path).load()).toEqual([
-			{ messageId: recent, channelId: "channel", terminal: true, terminalAt: expect.any(Number), audited: true },
-		]);
+	test("keeps terminal evidence until the watermark compacts it", async () => {
+		const old = { messageId: "123456789012345681", channelId: "channel", terminal: true, audited: true };
+		const recent = { messageId: "1571558346320773120", channelId: "channel", terminal: true, audited: true };
+		await writeFile(path, JSON.stringify([old, recent]));
+		expect(await new ImageOutbox(path).load()).toEqual([old, recent]);
 	});
 
 	test("refuses a new unresolved intent past the admission bound", async () => {
 		const base = 123456789012345600n;
-		const entries = Array.from({ length: 1_000 }, (_, index) => ({
+		const entries = Array.from({ length: 999 }, (_, index) => ({
 			messageId: String(base + BigInt(index)),
 			channelId: "channel",
 		}));
-		await writeFile(path, JSON.stringify(entries));
+		await writeFile(
+			path,
+			JSON.stringify([...entries, { messageId: String(base + 1_000n), channelId: "channel", terminal: true }]),
+		);
 		const outbox = new ImageOutbox(path);
 		await expect(outbox.put({ messageId: String(base + 2_000n), channelId: "channel" })).rejects.toThrow(
-			"unresolved intents",
+			"unresolved or terminal intents",
 		);
 		// An existing intent and a terminal row are still admitted.
 		await outbox.put({ ...entries[0]!, failureAt: Date.now() });

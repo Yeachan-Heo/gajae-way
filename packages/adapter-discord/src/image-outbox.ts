@@ -6,7 +6,6 @@ export type PendingImage = {
 	readonly channelId: string;
 	readonly request?: Readonly<Record<string, unknown>>;
 	readonly terminal?: boolean;
-	readonly terminalAt?: number;
 	readonly completed?: boolean;
 	readonly completedAt?: number;
 	readonly failureAt?: number;
@@ -19,14 +18,12 @@ const SNOWFLAKE = /^\d{1,20}$/;
 const TOMBSTONE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 /** Bound on retained tombstones even when their snowflakes are recent. */
 const TOMBSTONE_CAP = 1_000;
-/** Terminal evidence is retained long enough to outlive every history rewalk. */
-const TERMINAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
-/** New unresolved intents are refused past this bound; existing intents keep retrying. */
-const MAX_UNRESOLVED_IMAGES = 1_000;
+/** Bound on every non-completed row; new intents are refused past it, never evicted. */
+const MAX_JOURNAL_IMAGES = 1_000;
 
 export class ImageOutboxCapacityError extends Error {
 	constructor() {
-		super(`Image outbox holds ${MAX_UNRESOLVED_IMAGES} unresolved intents`);
+		super(`Image outbox holds ${MAX_JOURNAL_IMAGES} unresolved or terminal intents`);
 		this.name = "ImageOutboxCapacityError";
 	}
 }
@@ -52,7 +49,6 @@ function validateEntry(value: unknown): asserts value is PendingImage {
 		value.channelId === "" ||
 		("request" in value && !isRecord(value.request)) ||
 		("terminal" in value && typeof value.terminal !== "boolean") ||
-		("terminalAt" in value && typeof value.terminalAt !== "number") ||
 		("completed" in value && typeof value.completed !== "boolean") ||
 		("completedAt" in value && typeof value.completedAt !== "number") ||
 		("failureAt" in value && typeof value.failureAt !== "number") ||
@@ -96,8 +92,9 @@ async function readEntries(path: string): Promise<{ entries: PendingImage[]; dro
 
 /**
  * Bounds the journal on every read and write: completed tombstones by completion
- * age and count, terminal evidence by message age (history is never rewalked this
- * far), and unresolved rows only by admission, never by silent eviction.
+ * age and count, and live/terminal rows by admission only. Terminal rows are
+ * removed by watermark compaction in the caller, never by wall clock, because a
+ * lagging watermark could otherwise resurrect a rejected send.
  */
 function pruneEntries(entries: readonly PendingImage[], now = Date.now()): PendingImage[] {
 	const kept: PendingImage[] = [];
@@ -111,9 +108,6 @@ function pruneEntries(entries: readonly PendingImage[], now = Date.now()): Pendi
 		}
 		if (entry.completed) {
 			if (now - at <= TOMBSTONE_RETENTION_MS) completed.push(entry);
-		} else if (entry.terminal) {
-			// Legacy terminal rows have no timestamp; keep them rather than guess.
-			if (entry.terminalAt === undefined || now - entry.terminalAt <= TERMINAL_RETENTION_MS) kept.push(entry);
 		} else {
 			kept.push(entry);
 		}
@@ -231,7 +225,7 @@ export class ImageOutbox {
 				index === -1 &&
 				!entry.completed &&
 				!entry.terminal &&
-				pruned.filter((pending) => !pending.completed && !pending.terminal).length > MAX_UNRESOLVED_IMAGES
+				pruned.filter((pending) => !pending.completed).length >= MAX_JOURNAL_IMAGES
 			)
 				throw new ImageOutboxCapacityError();
 			await writeEntries(this.#path, pruned);

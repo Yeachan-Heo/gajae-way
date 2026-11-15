@@ -264,7 +264,7 @@ test("a deleted image message is dead-lettered instead of retrying forever", asy
 		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
 		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
 		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
-			{ messageId: id, channelId, terminal: true, terminalAt: expect.any(Number), audited: true },
+			{ messageId: id, channelId, terminal: true, audited: true },
 		]);
 	} finally {
 		cleanupTimers();
@@ -299,7 +299,7 @@ test("an unreadable history channel still reaches a terminal image diagnosis", a
 		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
 		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
 		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
-			{ messageId: id, channelId, terminal: true, terminalAt: expect.any(Number), audited: true },
+			{ messageId: id, channelId, terminal: true, audited: true },
 		]);
 		await bounded(adapter.waitForImage({ id } as never, Promise.resolve("unavailable")), 2_000);
 	} finally {
@@ -350,7 +350,7 @@ test("a terminal chat.send rejection is dead-lettered after the bounded attempt 
 		expect(sends).toBe(3);
 		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
 		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
-			{ messageId: id, channelId, terminal: true, terminalAt: expect.any(Number), audited: true, dm: true },
+			{ messageId: id, channelId, terminal: true, audited: true, dm: true },
 		]);
 	} finally {
 		cleanupTimers();
@@ -460,7 +460,7 @@ test("an intent unacknowledged for 24 hours is dead-lettered instead of wedging 
 		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
 		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
 		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
-			{ messageId: id, channelId, terminal: true, terminalAt: expect.any(Number), audited: true, dm: true },
+			{ messageId: id, channelId, terminal: true, audited: true, dm: true },
 		]);
 		await bounded(adapter.waitForImage({ id } as never, Promise.resolve("unavailable")), 2_000);
 	} finally {
@@ -575,7 +575,7 @@ test("a gateway-unavailable image intent records its failure clock and expires",
 		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
 		expect(restarted.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
 		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([
-			{ messageId: id, channelId, terminal: true, terminalAt: expect.any(Number), audited: true, dm: true },
+			{ messageId: id, channelId, terminal: true, audited: true, dm: true },
 		]);
 	} finally {
 		cleanupTimers();
