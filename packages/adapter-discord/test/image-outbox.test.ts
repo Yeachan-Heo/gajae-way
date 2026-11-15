@@ -159,6 +159,26 @@ describe("ImageOutbox", () => {
 		expect(await new ImageOutbox(path).load()).toEqual([old, recent]);
 	});
 
+	test("completed evidence bounds admission when no watermark is available", async () => {
+		const base = 1571558400000000000n;
+		await writeFile(
+			path,
+			JSON.stringify(
+				Array.from({ length: 10_000 }, (_, index) => ({
+					messageId: String(base + BigInt(index)),
+					channelId: "channel",
+					completed: true,
+					completedAt: Date.now(),
+				})),
+			),
+		);
+		const outbox = new ImageOutbox(path);
+		await expect(outbox.put({ messageId: String(base + 20_000n), channelId: "channel" })).rejects.toThrow(
+			"admission bound",
+		);
+		expect((await outbox.load()).filter((entry) => entry.completed)).toHaveLength(10_000);
+	});
+
 	test("refuses a new unresolved intent past the admission bound", async () => {
 		const base = 123456789012345600n;
 		const entries = Array.from({ length: 1_000 }, (_, index) => ({

@@ -20,6 +20,7 @@ const MAX_UNRESOLVED_IMAGES = 1_000;
 /** Terminal evidence is finite without eviction: admission backs off at these bounds. */
 const MAX_TERMINAL_IMAGES_PER_CHANNEL = 500;
 const MAX_TERMINAL_IMAGES = 10_000;
+const MAX_COMPLETED_IMAGES = 10_000;
 
 export class ImageOutboxCapacityError extends Error {
 	constructor() {
@@ -219,11 +220,13 @@ export class ImageOutbox {
 			if (index === -1 && !entry.completed && !entry.terminal) {
 				const unresolved = pruned.filter((pending) => !pending.completed && !pending.terminal);
 				const terminal = pruned.filter((pending) => pending.terminal);
+				const completed = pruned.filter((pending) => pending.completed);
 				if (
 					unresolved.length >= MAX_UNRESOLVED_IMAGES ||
 					terminal.filter((pending) => pending.channelId === entry.channelId).length >=
 						MAX_TERMINAL_IMAGES_PER_CHANNEL ||
-					terminal.length >= MAX_TERMINAL_IMAGES
+					terminal.length >= MAX_TERMINAL_IMAGES ||
+					completed.length >= MAX_COMPLETED_IMAGES
 				)
 					throw new ImageOutboxCapacityError();
 			}

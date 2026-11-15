@@ -1701,8 +1701,15 @@ function isImageIntentExpired(entry: PendingImage, now = Date.now()): boolean {
 }
 
 function isImageReplayBeyondDedupe(entry: PendingImage, now = Date.now()): boolean {
-	if (entry.createdAt === undefined) return false;
-	return now - entry.createdAt >= IMAGE_REPLAY_RETENTION_MS;
+	let createdAt = entry.createdAt;
+	if (createdAt === undefined) {
+		try {
+			createdAt = Number((BigInt(entry.messageId) >> 22n) + 1_420_070_400_000n);
+		} catch {
+			return true;
+		}
+	}
+	return now - createdAt >= IMAGE_REPLAY_RETENTION_MS;
 }
 
 export class ReconnectingGateway {
