@@ -27,9 +27,10 @@ on:
 # reconciled forward from the version list after that write, and the post-write read
 # fails the run if that tag ends up below its channel floor (at least the version this
 # run wrote) after a retried terminal read, or cannot be read at all.
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
+# Serialization lives on the publishing job, not on the workflow: concurrency groups are
+# matched case-insensitively, so a workflow-level group would let a case-variant tag
+# (rejected by `canonical-tag`) queue ahead of a valid pending release and replace it.
+# Gating the queue behind that check means only accepted releases ever contend.
 
 jobs:
   # Runs the same verification the build workflow runs before anything is
@@ -82,6 +83,11 @@ jobs:
   publish-npm:
     name: publish npm packages
     needs: [verify, canonical-tag]
+    # Runs of the same ref publish one at a time; distinct refs never contend, and nothing
+    # reaches this queue before the casing check accepts it.
+    concurrency:
+      group: release-publish-${{ github.ref }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     permissions:
       contents: read

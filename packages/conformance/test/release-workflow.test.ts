@@ -136,17 +136,16 @@ describe("release dist-tag resolution", () => {
 });
 
 describe("release workflow wiring", () => {
-	test("serializes reruns per ref so distinct tagged releases are never dropped", async () => {
+	test("serializes publishing per ref only after the casing gate accepts the release", async () => {
 		const workflow = await releaseWorkflow();
-		// Anchored and workflow-level: a job-level block would shadow the workflow group and
-		// reintroduce the dropped pending run, so the key must sit above `jobs:`.
-		const concurrency = workflow.search(/^concurrency:$/m);
-		const jobs = workflow.search(/^jobs:$/m);
-		expect(concurrency).toBeGreaterThan(-1);
-		expect(jobs).toBeGreaterThan(concurrency);
-		expect(workflow).toMatch(/^ {2}group: release-\$\{\{ github\.ref \}\}$/m);
-		expect(workflow).toContain("cancel-in-progress: false");
-		expect(workflow.match(/^\s*concurrency:/gm) ?? []).toHaveLength(1);
+		// A workflow-level group is entered before `canonical-tag` runs, so a case-variant
+		// tag could replace a valid pending release and then fail the casing check.
+		expect(workflow).not.toMatch(/^concurrency:$/m);
+		const job = workflow.slice(workflow.indexOf("  publish-npm:"));
+		const body = job.slice(0, job.indexOf("\n  build-binaries:"));
+		expect(body).toMatch(
+			/concurrency:\n {6}group: release-publish-\$\{\{ github\.ref \}\}\n {6}cancel-in-progress: false/,
+		);
 	});
 
 	test("publishes with the resolved dist-tag instead of a latest fallback", async () => {
