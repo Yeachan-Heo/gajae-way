@@ -781,11 +781,21 @@ export class ReconnectingGateway implements GatewayClientLike {
 		};
 	}
 
-	async requestPrepared(messageId: string, send: () => Promise<RecoveredSend>): Promise<RecoveredSend> {
+	async requestPrepared(
+		messageId: string,
+		send: () => Promise<RecoveredSend>,
+		retryFailedPreparation = false,
+	): Promise<RecoveredSend> {
 		const pending = this.#pendingPrepared.get(messageId) ?? this.#pendingSends.get(messageId);
 		if (pending) {
-			const shared = await pending;
-			return shared.verdict === "unavailable" ? shared : { verdict: "duplicate" };
+			try {
+				const shared = await pending;
+				return shared.verdict === "unavailable" ? shared : { verdict: "duplicate" };
+			} catch (error) {
+				if (!retryFailedPreparation) throw error;
+				if (this.#pendingPrepared.get(messageId) === pending) this.#pendingPrepared.delete(messageId);
+				return this.requestPrepared(messageId, send);
+			}
 		}
 		if (this.#inbound.has(messageId)) return { verdict: "duplicate" };
 		const attempt = send();
@@ -1197,17 +1207,21 @@ export async function startSlackAdapter(
 				let prepared: Awaited<ReturnType<typeof prepareSlackImages>> | undefined;
 				let sent: RecoveredSend;
 				try {
-					sent = await gateway.requestPrepared(messageId, async () => {
-						prepared = await prepareImages(message.files);
-						return gateway.requestRecovered(
-							messageId,
-							origin,
-							text,
-							engagement,
-							timestamp(message.ts),
-							prepared.images,
-						);
-					});
+					sent = await gateway.requestPrepared(
+						messageId,
+						async () => {
+							prepared = await prepareImages(message.files);
+							return gateway.requestRecovered(
+								messageId,
+								origin,
+								text,
+								engagement,
+								timestamp(message.ts),
+								prepared.images,
+							);
+						},
+						true,
+					);
 				} catch {
 					// Gateway authorization is authoritative and cannot be established locally. Do not
 					// post into a channel whose authorization is unknown, or send text without the image.
