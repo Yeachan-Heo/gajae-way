@@ -357,8 +357,27 @@ test("installPinnedGjcForServices names every candidate when none carries a pin"
 	}
 });
 
-test("servicePinCandidates checks the checkout gateway package before the binDir package", () => {
-	const [checkout, release] = servicePinCandidates("~/bin", { HOME: "/home/op" });
-	expect(checkout).toBe(join(import.meta.dir, "..", "..", "gateway", "package.json"));
+test("servicePinCandidates prefers the target binDir release manifest over the checkout pin", () => {
+	const [release, checkout] = servicePinCandidates("~/bin", { HOME: "/home/op" });
 	expect(release).toBe("/home/op/bin/package.json");
+	expect(checkout).toBe(join(import.meta.dir, "..", "..", "gateway", "package.json"));
+});
+
+test("service repair installs the target release manifest's pin, not a newer checkout pin", async () => {
+	const binDir = await mkdtemp(join(tmpdir(), "gajaeway-service-target-"));
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-service-home-"));
+	try {
+		await writeFile(join(binDir, "package.json"), JSON.stringify({ name: "gajaeway", gjc: { version: "0.19.3" } }));
+		const installed: string[] = [];
+		const version = await installPinnedGjcForServices({
+			home,
+			candidates: servicePinCandidates(binDir, { HOME: "/home/op" }),
+			runner: stubGjcRunner(installed),
+		});
+		expect(version).toBe("0.19.3");
+		expect(installed).toEqual(["0.19.3"]);
+	} finally {
+		await rm(binDir, { recursive: true, force: true });
+		await rm(home, { recursive: true, force: true });
+	}
 });

@@ -448,15 +448,16 @@ async function readRuntime(home: string): Promise<RuntimeConfig | undefined> {
 }
 
 /**
- * Where `services install|repair` finds the GJC pin, mirroring the runtime guard's candidates
- * (`pinnedGjcCandidatePaths` in packages/gateway/src/orchestrator/broker.ts): the checkout's gateway
- * package.json resolved from this module, then the package.json the release updater places beside the binaries.
+ * Where `services install|repair` finds the GJC pin. The target `binDir`'s release manifest is
+ * authoritative: the gateway started from those binaries enforces the pin beside itself, so a
+ * pin from the CLI's own checkout can make it refuse with broker_host_version_mismatch. The
+ * checkout's gateway package.json is only a fallback for a binDir that carries no manifest.
  */
 export function servicePinCandidates(binDir: string, env: NodeJS.ProcessEnv = process.env): readonly string[] {
 	const repoRoot = dirname(dirname(dirname(dirname(__filename))));
 	return [
-		join(repoRoot, "packages", "gateway", "package.json"),
 		join(expandHome(binDir, env.HOME || homedir()), "package.json"),
+		join(repoRoot, "packages", "gateway", "package.json"),
 	];
 }
 
