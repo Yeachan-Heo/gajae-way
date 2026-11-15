@@ -1,6 +1,6 @@
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, userInfo } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { homeLayout } from "@gajae-gateway/home";
 import { parseRuntimeConfig, type RuntimeConfig, RuntimeConfigError } from "@gajae-gateway/protocol";
 import { type GjcInstallRunner, installPinnedGjc } from "./gjc-install";
@@ -476,8 +476,9 @@ export async function installPinnedGjcForServices(options: {
 		version = await readPinnedGjcVersion(options.manifestPath);
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
+		const target = dirname(options.manifestPath);
 		throw new Error(
-			`services requires the release manifest beside the target binaries: ${detail}. Install the release into that directory with 'gajaeway update --bin-dir DIR'`,
+			`services requires the release manifest beside the target binaries: ${detail}. Install the release into ${target} with 'gajaeway update --bin-dir ${target}'`,
 			{ cause: error },
 		);
 	}

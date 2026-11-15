@@ -365,8 +365,8 @@ test("servicePinManifest names the release manifest beside the target binaries",
 });
 
 test("the pin the installer reads is the one the gateway resolves beside its own binary", () => {
-	// The generated definitions run `<binDir>/gajaeway-gateway`, so the installer's manifest and
-	// the runtime's first candidate must name the same file for every serviced install.
+	// The generated definitions run `<binDir>/gajaeway-gateway`; for a regular file there, the
+	// installer's manifest and the runtime's first candidate must name the same file.
 	const binDir = "/opt/gajaeway/bin";
 	expect(servicePinManifest(binDir, { HOME: "/home/op" })).toBe(
 		pinnedGjcCandidatePaths(join(binDir, "gajaeway-gateway"))[0],
