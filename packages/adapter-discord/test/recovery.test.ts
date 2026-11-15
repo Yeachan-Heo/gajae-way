@@ -1178,11 +1178,9 @@ test("recovered image resize notice is sent only for a fresh engaged acknowledge
 			reply: { messageReference: inbound.id, failIfNotExists: false },
 		},
 	]);
-	expect(
-		await gateway.requestRecovered(inbound.id, channelOrigin, "look", { mentioned: true } as never, [
-			{ data: "AQ==", mimeType: "image/jpeg" },
-		]),
-	).toEqual({ verdict: "duplicate" });
+	expect(await gateway.requestRecovered(inbound.id, channelOrigin, "look", { mentioned: true } as never)).toEqual({
+		verdict: "duplicate",
+	});
 	expect(visibleNotices).toHaveLength(1);
 });
 

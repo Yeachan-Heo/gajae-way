@@ -67,6 +67,7 @@ export class DiscordImagePreparationError extends Error {
 	constructor(
 		readonly disposition: "retryable" | "terminal",
 		message = disposition === "terminal" ? "Discord image input rejected." : "Discord image download failed.",
+		readonly refreshSource = false,
 	) {
 		super(message);
 		this.name = "DiscordImagePreparationError";
@@ -134,6 +135,8 @@ async function downloadDiscordImage(url: string, ports: DiscordImagePreparationP
 	} catch (error) {
 		throw new DiscordImagePreparationError(
 			error instanceof PromptImageDownloadError && !error.retryable ? "terminal" : "retryable",
+			undefined,
+			true,
 		);
 	}
 }
