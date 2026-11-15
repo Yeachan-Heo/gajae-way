@@ -20,10 +20,13 @@ const TOMBSTONE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const TOMBSTONE_CAP = 1_000;
 /** New unresolved intents are refused past this bound; existing intents keep retrying. */
 const MAX_UNRESOLVED_IMAGES = 1_000;
+/** Terminal evidence is finite without eviction: admission backs off at these bounds. */
+const MAX_TERMINAL_IMAGES_PER_CHANNEL = 500;
+const MAX_TERMINAL_IMAGES = 10_000;
 
 export class ImageOutboxCapacityError extends Error {
 	constructor() {
-		super(`Image outbox holds ${MAX_UNRESOLVED_IMAGES} unresolved intents`);
+		super("Image outbox admission bound reached");
 		this.name = "ImageOutboxCapacityError";
 	}
 }
@@ -95,7 +98,8 @@ async function readEntries(path: string): Promise<{ entries: PendingImage[]; dro
  * age and count, and unresolved rows by admission. Terminal evidence is removed
  * only by watermark compaction in the caller, never by wall clock, because a
  * lagging watermark could otherwise resurrect a rejected send. Terminal rows do
- * not consume unresolved admission: a rejected send must not deny a new image.
+ * not consume unresolved admission until their per-channel/global evidence bound
+ * is reached; then new admission backs off instead of evicting evidence.
  */
 function pruneEntries(entries: readonly PendingImage[], now = Date.now()): PendingImage[] {
 	const kept: PendingImage[] = [];
@@ -223,13 +227,17 @@ export class ImageOutbox {
 			// Enforce the journal bounds on the write path too: a long-lived session
 			// must not grow until the next recovery load.
 			const pruned = pruneEntries(entries);
-			if (
-				index === -1 &&
-				!entry.completed &&
-				!entry.terminal &&
-				pruned.filter((pending) => !pending.completed && !pending.terminal).length >= MAX_UNRESOLVED_IMAGES
-			)
-				throw new ImageOutboxCapacityError();
+			if (index === -1 && !entry.completed && !entry.terminal) {
+				const unresolved = pruned.filter((pending) => !pending.completed && !pending.terminal);
+				const terminal = pruned.filter((pending) => pending.terminal);
+				if (
+					unresolved.length >= MAX_UNRESOLVED_IMAGES ||
+					terminal.filter((pending) => pending.channelId === entry.channelId).length >=
+						MAX_TERMINAL_IMAGES_PER_CHANNEL ||
+					terminal.length >= MAX_TERMINAL_IMAGES
+				)
+					throw new ImageOutboxCapacityError();
+			}
 			await writeEntries(this.#path, pruned);
 			this.#entries = pruned;
 			this.#dropped = 0;

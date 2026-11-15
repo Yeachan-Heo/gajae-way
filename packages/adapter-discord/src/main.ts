@@ -1755,6 +1755,9 @@ export class ReconnectingGateway {
 		engagement: EngagementContext,
 		unnamed: UnnamedThreads = this.unnamedThreads,
 		turn: Promise<void> = RESOLVED_TURN,
+		recovered = false,
+		ordered = false,
+		retry = false,
 	): Promise<ImageOutcome> {
 		if (turn !== RESOLVED_TURN) {
 			// A live image may prepare while an earlier message in its conversation
@@ -1765,15 +1768,15 @@ export class ReconnectingGateway {
 		return this.ownImage(
 			message.id,
 			discordMessageOrigin(message).conversationId,
-			() => this.processOwnedImage(message, engagement, unnamed, turn),
+			() => this.processOwnedImage(message, engagement, unnamed, turn, recovered, ordered, retry),
 			async () => {
 				try {
 					const pending = await this.#imageOutbox.get(message.id);
-					if (pending) return this.retryPendingImage(pending);
+					if (pending) return this.retryPendingImage(pending, undefined, false, true);
 				} catch {
 					// Retry the original intent when the outbox itself is unavailable.
 				}
-				return this.processImage(message, engagement, unnamed, turn);
+				return this.processImage(message, engagement, unnamed, turn, false, false, true);
 			},
 		);
 	}
@@ -1807,6 +1810,9 @@ export class ReconnectingGateway {
 		engagement: EngagementContext,
 		unnamed: UnnamedThreads,
 		turn: Promise<void> = RESOLVED_TURN,
+		recovered = false,
+		ordered = false,
+		retry = false,
 	): Promise<ImageOutcome> {
 		const sourceOrigin = discordMessageOrigin(message);
 		const channelId = sourceOrigin.conversationId;
@@ -1872,31 +1878,35 @@ export class ReconnectingGateway {
 		// never carry the image again is a terminal intent, not a silent wedge.
 		if (prepared.images.length === 0) return this.terminateImage(entry, "image attachment no longer present");
 		let origin = discordMessageOrigin(message);
-		void nameThreadFromMessage(message, origin, unnamed);
-		origin = await maybeCreateThreadOnMention(
-			message,
-			engagement,
-			origin,
-			this.config.channels?.[origin.conversationId],
-			unnamed,
-			this.config.threadOnMention,
-			{
-				recoverAmbiguous: async (messageId) => {
-					const attached = (message as { thread?: unknown }).thread;
-					const existing = isRecoveryThread(attached, channelId)
-						? attached
-						: await this.discord.channels.fetch(messageId).catch(() => undefined);
-					if (!isRecoveryThread(existing, channelId) || existing.id !== messageId) return undefined;
-					return {
-						platform: "discord",
-						kind: "thread",
-						conversationId: existing.id,
-						parentId: channelId,
-						threadVisibility: "public",
-					};
+		// Recovered input must not cause a Discord-side thread before the gateway's
+		// authoritative admission check. Live input keeps the current behavior.
+		if (!recovered) {
+			void nameThreadFromMessage(message, origin, unnamed);
+			origin = await maybeCreateThreadOnMention(
+				message,
+				engagement,
+				origin,
+				this.config.channels?.[origin.conversationId],
+				unnamed,
+				this.config.threadOnMention,
+				{
+					recoverAmbiguous: async (messageId) => {
+						const attached = (message as { thread?: unknown }).thread;
+						const existing = isRecoveryThread(attached, channelId)
+							? attached
+							: await this.discord.channels.fetch(messageId).catch(() => undefined);
+						if (!isRecoveryThread(existing, channelId) || existing.id !== messageId) return undefined;
+						return {
+							platform: "discord",
+							kind: "thread",
+							conversationId: existing.id,
+							parentId: channelId,
+							threadVisibility: "public",
+						};
+					},
 				},
-			},
-		);
+			);
+		}
 		const body = withTranscript(describeInboundBody(message), await transcribeIfVoice(message, this.config.voice));
 		const receivedAt =
 			typeof message.createdTimestamp === "number" ? new Date(message.createdTimestamp).toISOString() : undefined;
@@ -1911,6 +1921,13 @@ export class ReconnectingGateway {
 		};
 		entry = { ...entry, request, ...(origin.kind === "dm" ? { dm: true } : {}) };
 		await this.#imageOutbox.put(entry);
+		// Source diagnosis and preparation may proceed, but an independently
+		// recovered intent must not cross the history horizon at send time.
+		if ((recovered || retry) && !ordered && this.aheadOfImageHorizon(entry)) {
+			// A live retry may proceed only when no blocked history pass is known;
+			// recovered/offline intents always wait for the sorted history pass.
+			if (!retry || this.#blockedRecoveryChannels.has(entry.channelId)) return this.deferImageFailure(entry);
+		}
 		let notify = false;
 		const result = await this.sendPendingImage(entry, (response) => {
 			notify = response?.engaged === true && response.turnId != null;
@@ -1918,6 +1935,15 @@ export class ReconnectingGateway {
 		if (result === "acked" && notify && prepared.notice)
 			await sendDiscordInboundNotice(message, `Image processing: ${prepared.notice}`);
 		return result;
+	}
+
+	/** The recovery horizon an independently retried image must not cross. */
+	private aheadOfImageHorizon(entry: PendingImage): boolean {
+		const cursors = this.#cursors;
+		if (!cursors) return false;
+		const watermark = cursors.recoveredThrough[entry.channelId] ?? cursors.quarantined[entry.channelId]?.watermark;
+		const horizon = watermark ?? snowflakeFromTimestamp(Date.now() - RECOVERY_BOOTSTRAP_LOOKBACK_MS);
+		return snowflakeIsAfter(entry.messageId, horizon);
 	}
 
 	/** Record a transient failure and enforce the 24h intent deadline on every retry. */
@@ -2186,7 +2212,12 @@ export class ReconnectingGateway {
 		return "acked";
 	}
 
-	private async retryPendingImage(entry: PendingImage, source?: DiscordInboundMessage): Promise<ImageOutcome> {
+	private async retryPendingImage(
+		entry: PendingImage,
+		source?: DiscordInboundMessage,
+		ordered = false,
+		liveRetry = false,
+	): Promise<ImageOutcome> {
 		// A live owner already owns delivery and waits for its ingress turn. Awaiting it
 		// from recovery would deadlock the recovery pass behind an earlier stuck image.
 		if (this.#imageTurnOpen.has(entry.messageId) || this.#imageOwners.has(entry.messageId)) return "unavailable";
@@ -2201,6 +2232,12 @@ export class ReconnectingGateway {
 					return "skip";
 				}
 				if (current.request) {
+					if (
+						!ordered &&
+						this.aheadOfImageHorizon(current) &&
+						(!liveRetry || this.#blockedRecoveryChannels.has(current.channelId))
+					)
+						return this.deferImageFailure(current);
 					if (isReplayableImageRequest(current.request, current.messageId)) {
 						await this.rememberInboundDm(current.request.origin as OriginRef);
 						return this.sendPendingImage(current);
@@ -2238,9 +2275,17 @@ export class ReconnectingGateway {
 				}
 				const engagement = decideInbound(inbound, this.getBotUser(), this.config.channels);
 				if (!engagement) return this.terminateImage(current, "no engagement policy for recovered image");
-				return this.processOwnedImage(inbound, engagement, this.unnamedThreads);
+				return this.processOwnedImage(
+					inbound,
+					engagement,
+					this.unnamedThreads,
+					RESOLVED_TURN,
+					true,
+					ordered,
+					liveRetry,
+				);
 			},
-			() => this.retryPendingImage(entry, source),
+			() => this.retryPendingImage(entry, source, ordered, liveRetry),
 		);
 	}
 
@@ -2545,10 +2590,11 @@ export class ReconnectingGateway {
 					if (selectNativeImageAttachments(message).length > 0 || message.editedTimestamp != null) return "unavailable";
 				}
 				if (pendingImage?.completed) return "skip";
-				if (pendingImage) return this.retryPendingImage(pendingImage, message);
+				if (pendingImage) return this.retryPendingImage(pendingImage, message, true);
 				const engagement = decideInbound(message, botUser, this.config.channels);
 				if (!engagement) return "skip";
-				if (selectNativeImageAttachments(message).length > 0) return this.processImage(message, engagement);
+				if (selectNativeImageAttachments(message).length > 0)
+					return this.processImage(message, engagement, this.unnamedThreads, RESOLVED_TURN, true, true);
 				const text = describeInboundBody(message);
 				if (text === "") return "skip";
 				const origin = discordMessageOrigin(message);

@@ -671,6 +671,86 @@ test("a truncated backfill does not let an above-horizon image overtake history"
 	}
 }, 12_000);
 
+test("a first-time channel uses the bootstrap floor before independent image replay", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-bootstrap-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "dm-bootstrap";
+	const textId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const imageId = snowflakeFromTimestamp(Date.now() - 60_000);
+	const text = dmMessage(textId, channelId);
+	const imageMessage = dmMessage(imageId, channelId, true);
+	const request = {
+		messageId: imageId,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: imageId, channelId, request }]));
+		const channel = {
+			messages: {
+				fetch: async (query: string | { after?: string }) => {
+					if (typeof query === "string") return imageMessage;
+					return !query.after || BigInt(query.after) < BigInt(imageId) ? [imageMessage, text] : [];
+				},
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			textId,
+			imageId,
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a recovered image is admitted without creating a thread first", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-nothread-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "guild-channel";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	let created = 0;
+	const message = {
+		id,
+		content: "<@bot> look",
+		author: { id: "human", username: "human", bot: false },
+		channel: { id: channelId, isDMBased: () => false },
+		guild: { id: "guild" },
+		mentions: { has: () => true },
+		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo.png" }],
+		startThread: async () => {
+			created++;
+			return { id: "created-thread" };
+		},
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		const channel = {
+			messages: { fetch: async (query?: unknown) => (typeof query === "string" ? message : [message]) },
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests, { [channelId]: { engagement: "open" } });
+		await bounded(adapter.recoverMissedMessages());
+		expect(created).toBe(0);
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([id]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
 test("a persisted image request replays even when the recovery cursor is unreadable", async () => {
 	const home = await mkdtemp(join(tmpdir(), "discord-image-order-cursor-read-"));
 	const cleanupTimers = trackTimers();

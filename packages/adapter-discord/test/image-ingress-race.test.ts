@@ -103,7 +103,7 @@ async function fixture(options: { dm?: boolean; watermarkPast?: boolean } = {}) 
 	};
 }
 
-async function assertDelivered(f: Awaited<ReturnType<typeof fixture>>, dm = false) {
+async function assertDelivered(f: Awaited<ReturnType<typeof fixture>>, dm = false, threaded = true) {
 	expect(f.requests).toHaveLength(1);
 	expect(f.requests[0]).toMatchObject({
 		verb: "chat.send",
@@ -111,12 +111,14 @@ async function assertDelivered(f: Awaited<ReturnType<typeof fixture>>, dm = fals
 			messageId: f.id,
 			origin: dm
 				? { platform: "discord", kind: "dm", conversationId: f.channelId, peerId: "human" }
-				: { platform: "discord", kind: "thread", conversationId: "thread-1", parentId: f.channelId },
+				: threaded
+					? { platform: "discord", kind: "thread", conversationId: "thread-1", parentId: f.channelId }
+					: { platform: "discord", kind: "channel", conversationId: f.channelId },
 			images: [image],
 		},
 	});
 	expect(f.counts().preparations).toBe(1);
-	expect(f.counts().threads).toBe(dm ? 0 : 1);
+	expect(f.counts().threads).toBe(dm || !threaded ? 0 : 1);
 	expect(JSON.parse(await readFile(f.outboxPath, "utf8"))).toEqual([
 		{
 			messageId: f.id,
@@ -128,7 +130,7 @@ async function assertDelivered(f: Awaited<ReturnType<typeof fixture>>, dm = fals
 	]);
 }
 
-test("recovery and a concurrent live event share image preparation and thread creation", async () => {
+test("recovery and a concurrent live event share image preparation without a recovery-side thread", async () => {
 	const f = await fixture();
 	try {
 		const recovery = f.gateway.recoverMissedMessages();
@@ -139,9 +141,9 @@ test("recovery and a concurrent live event share image preparation and thread cr
 		f.release();
 		expect(await live).toBe("acked");
 		await recovery;
-		await assertDelivered(f);
+		await assertDelivered(f, false, false);
 		await f.gateway.recoverMissedMessages();
-		await assertDelivered(f);
+		await assertDelivered(f, false, false);
 	} finally {
 		f.release();
 		await rm(f.home, { recursive: true, force: true });

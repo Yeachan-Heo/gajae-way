@@ -166,29 +166,39 @@ describe("ImageOutbox", () => {
 		);
 		const outbox = new ImageOutbox(path);
 		await expect(outbox.put({ messageId: String(base + 2_000n), channelId: "channel" })).rejects.toThrow(
-			"1000 unresolved intents",
+			"admission bound",
 		);
 		// An existing intent and a terminal row are still admitted.
 		await outbox.put({ ...entries[0]!, failureAt: Date.now() });
 		await outbox.put({ messageId: String(base + 2_001n), channelId: "channel", terminal: true, audited: true });
 	});
 
-	test("terminal audit rows do not consume unresolved admission", async () => {
+	test("terminal audit rows are retained and only bind admission at the evidence cap", async () => {
 		const base = 1571558400000000000n;
-		await writeFile(
-			path,
-			JSON.stringify(
-				Array.from({ length: 1_000 }, (_, index) => ({
-					messageId: String(base + BigInt(index)),
-					channelId: "channel",
-					terminal: true,
-					audited: true,
-				})),
-			),
-		);
+		const below = Array.from({ length: 10 }, (_, index) => ({
+			messageId: String(base + BigInt(index)),
+			channelId: "channel",
+			terminal: true,
+			audited: true,
+		}));
+		await writeFile(path, JSON.stringify(below));
 		const outbox = new ImageOutbox(path);
 		const pending = { messageId: String(base + 2_000n), channelId: "channel" };
 		await outbox.put(pending);
 		expect(await outbox.get(pending.messageId)).toEqual(pending);
+
+		const full = Array.from({ length: 500 }, (_, index) => ({
+			messageId: String(base + 10_000n + BigInt(index)),
+			channelId: "channel",
+			terminal: true,
+			audited: true,
+		}));
+		await writeFile(path, JSON.stringify(full));
+		const bounded = new ImageOutbox(path);
+		await expect(bounded.put({ messageId: String(base + 3_000n), channelId: "channel" })).rejects.toThrow(
+			"admission bound",
+		);
+		await expect(bounded.put({ messageId: String(base + 3_001n), channelId: "other" })).resolves.toBeUndefined();
+		expect((await bounded.load()).filter((entry) => entry.terminal)).toHaveLength(500);
 	});
 });
