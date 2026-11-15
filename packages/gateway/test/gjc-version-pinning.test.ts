@@ -1,9 +1,61 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { CliRunner } from "@gajae-gateway/subsession";
-import { pinnedGjcCandidatePaths, preflightGjcRuntime, readPinnedGjcVersion } from "../src/orchestrator/broker";
+import {
+	isCompiledRelease,
+	pinnedGjcCandidatePaths,
+	preflightGjcRuntime,
+	readPinnedGjcVersion,
+} from "../src/orchestrator/broker";
+import { isEmbeddedModuleDir } from "../src/orchestrator/embedded-module";
+
+/** One installed release plus a checkout that still pins a different version. */
+interface PinLayout {
+	readonly root: string;
+	readonly execPath: string;
+	readonly releaseManifest: string;
+	readonly checkoutManifest: string;
+	readonly sourceModulePath: string;
+}
+
+const CHECKOUT_PIN = "8.8.8";
+
+async function pinLayout(): Promise<PinLayout> {
+	const root = await mkdtemp(join(tmpdir(), "gajaeway-gjc-pin-"));
+	const execPath = join(root, "bin", "gajaeway-gateway");
+	await mkdir(dirname(execPath), { recursive: true });
+	await writeFile(execPath, "");
+	const checkoutManifest = join(root, "checkout", "packages", "gateway", "package.json");
+	await mkdir(dirname(checkoutManifest), { recursive: true });
+	await writeFile(checkoutManifest, JSON.stringify({ name: "@gajae-gateway/gateway", gjc: { version: CHECKOUT_PIN } }));
+	return {
+		root,
+		execPath,
+		releaseManifest: join(root, "bin", "package.json"),
+		checkoutManifest,
+		sourceModulePath: join(root, "checkout", "packages", "gateway", "src", "orchestrator", "broker.ts"),
+	};
+}
+
+/** The pin inputs of one delivery mode: a compiled release or a source checkout run. */
+function pinInputs(
+	layout: PinLayout,
+	mode: "compiled" | "source",
+): { readonly compiled: boolean; readonly candidates: readonly string[] } {
+	const modulePath = mode === "compiled" ? "/$bunfs/root/gajaeway-gateway" : layout.sourceModulePath;
+	const compiled = isCompiledRelease(modulePath);
+	return { compiled, candidates: pinnedGjcCandidatePaths(layout.execPath, compiled, modulePath) };
+}
+
+/** Ways the release manifest beside a binary can fail to supply a pin. */
+const BROKEN_RELEASE_MANIFESTS: readonly { readonly state: string; readonly write: (path: string) => Promise<void> }[] =
+	[
+		{ state: "missing", write: async () => {} },
+		{ state: "malformed", write: (path) => writeFile(path, "{ not json") },
+		{ state: "pin-less", write: (path) => writeFile(path, JSON.stringify({ name: "gajaeway" })) },
+	];
 
 describe("GJC version pinning", () => {
 	it("reads pinned gjc version from gateway package.json", () => {
@@ -125,5 +177,66 @@ describe("GJC version pinning", () => {
 		const candidates = pinnedGjcCandidatePaths("/opt/gajaeway/bin/gajaeway-gateway");
 		expect(candidates[0]).toBe("/opt/gajaeway/bin/package.json");
 		expect(candidates[1]).toBe(join(import.meta.dir, "..", "package.json"));
+	});
+
+	it("detects the delivery mode from how the running module is embedded", () => {
+		expect(isCompiledRelease(join(import.meta.dir, "..", "src", "orchestrator", "broker.ts"))).toBe(false);
+		expect(isCompiledRelease("/$bunfs/root/gajaeway-gateway")).toBe(true);
+		expect(isEmbeddedModuleDir("C:\\~BUN\\root")).toBe(true);
+	});
+
+	it("gives a compiled release no checkout candidate", () => {
+		const sourceModule = join(import.meta.dir, "..", "src", "orchestrator", "broker.ts");
+		expect(
+			pinnedGjcCandidatePaths("/opt/gajaeway/bin/gajaeway-gateway", true, "/$bunfs/root/gajaeway-gateway"),
+		).toEqual(["/opt/gajaeway/bin/package.json"]);
+		expect(pinnedGjcCandidatePaths("/opt/gajaeway/bin/gajaeway-gateway", false, sourceModule)).toEqual([
+			"/opt/gajaeway/bin/package.json",
+			join(import.meta.dir, "..", "package.json"),
+		]);
+	});
+
+	for (const broken of BROKEN_RELEASE_MANIFESTS) {
+		it(`fails a compiled release closed when its release manifest is ${broken.state}`, async () => {
+			const layout = await pinLayout();
+			try {
+				await broken.write(layout.releaseManifest);
+				const { compiled, candidates } = pinInputs(layout, "compiled");
+				expect(compiled).toBe(true);
+				expect(candidates).toEqual([layout.releaseManifest]);
+				// The checkout manifest still pins a version, so this only fails if the compiled
+				// release refuses to borrow it.
+				expect(() => readPinnedGjcVersion(candidates, compiled)).toThrow(layout.releaseManifest);
+				expect(() => readPinnedGjcVersion(candidates, compiled)).toThrow(
+					`gajaeway update --bin-dir ${dirname(layout.execPath)}`,
+				);
+			} finally {
+				await rm(layout.root, { recursive: true, force: true });
+			}
+		});
+
+		it(`keeps the checkout fallback for a source run when its release manifest is ${broken.state}`, async () => {
+			const layout = await pinLayout();
+			try {
+				await broken.write(layout.releaseManifest);
+				const { compiled, candidates } = pinInputs(layout, "source");
+				expect(compiled).toBe(false);
+				expect(candidates).toEqual([layout.releaseManifest, layout.checkoutManifest]);
+				expect(readPinnedGjcVersion(candidates, compiled)).toBe(CHECKOUT_PIN);
+			} finally {
+				await rm(layout.root, { recursive: true, force: true });
+			}
+		});
+	}
+
+	it("keeps a valid release manifest authoritative for a compiled release", async () => {
+		const layout = await pinLayout();
+		try {
+			await writeFile(layout.releaseManifest, JSON.stringify({ name: "gajaeway", gjc: { version: "9.9.9" } }));
+			const { compiled, candidates } = pinInputs(layout, "compiled");
+			expect(readPinnedGjcVersion(candidates, compiled)).toBe("9.9.9");
+		} finally {
+			await rm(layout.root, { recursive: true, force: true });
+		}
 	});
 });

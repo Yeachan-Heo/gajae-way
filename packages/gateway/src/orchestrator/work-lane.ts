@@ -61,6 +61,7 @@ import {
 } from "../store/groups/work";
 import type { WriteTx } from "../store/tx";
 import { type BrokerWaitOptions, isBrokerUnavailable, waitForBroker } from "./broker";
+import { isEmbeddedModuleDir } from "./embedded-module";
 import { readFailedTransportCause } from "./failed-turn-evidence";
 import { GIT_COMMAND_TIMEOUT_MS, runGit } from "./git-command";
 import {
@@ -268,11 +269,6 @@ export function getServiceDirectory(): string {
 	} catch {
 		return anchor;
 	}
-}
-
-/** True for the virtual directory a `bun build --compile` binary embeds its modules under. */
-export function isEmbeddedModuleDir(dir: string): boolean {
-	return dir === "/$bunfs/root" || dir.startsWith("/$bunfs/") || /^[A-Z]:[\\/]~BUN[\\/]/i.test(dir);
 }
 
 /** Nearest existing ancestor's realpath with the missing tail re-appended. */
