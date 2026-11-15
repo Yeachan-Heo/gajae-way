@@ -97,7 +97,7 @@ export function readPinnedGjcVersion(
 	if (candidates.length > 0 && isCompiledRelease(modulePath)) {
 		const target = dirname(candidates[0]!);
 		throw new Error(
-			`gjc release pin unavailable: ${tried}. This binary is a compiled release: restore its manifest with 'gajaeway update --bin-dir ${target}'`,
+			`gjc release pin unavailable: ${tried}. This binary is a compiled release: restore its manifest with 'gajaeway update --force --bin-dir ${target}'`,
 		);
 	}
 	throw new Error(`Failed to read pinned GJC version: ${tried}`);

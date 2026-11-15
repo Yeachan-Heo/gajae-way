@@ -478,7 +478,7 @@ export async function installPinnedGjcForServices(options: {
 		const detail = error instanceof Error ? error.message : String(error);
 		const target = dirname(options.manifestPath);
 		throw new Error(
-			`services requires the release manifest beside the target binaries: ${detail}. Install the release into ${target} with 'gajaeway update --bin-dir ${target}'`,
+			`services requires the release manifest beside the target binaries: ${detail}. Install the release into ${target} with 'gajaeway update --force --bin-dir ${target}'`,
 			{ cause: error },
 		);
 	}
