@@ -168,6 +168,15 @@ describe("release workflow wiring", () => {
 		expect(workflow).toMatch(/npm_tag:[\s\S]*?default: ""/);
 	});
 
+	test("rejects a case-variant tag before it can share the ref's concurrency group", async () => {
+		const workflow = await releaseWorkflow();
+		expect(workflow).toMatch(/^ {2}canonical-tag:$/m);
+		expect(workflow).toContain("tr '[:upper:]' '[:lower:]'");
+		expect(workflow).toContain("release tags must be lowercase");
+		// Publishing must be gated by the casing check, not only by the build.
+		expect(workflow).toMatch(/needs: \[verify, canonical-tag\]/);
+	});
+
 	test("mirrors the npm dist-tag in the GitHub release's prerelease flag", async () => {
 		const workflow = await releaseWorkflow();
 		expect(workflow).toMatch(/npm-tag: \$\{\{ steps\.dist-tag\.outputs\.tag \}\}/);

@@ -455,6 +455,17 @@ async function reconcileChannel(name: string, version: string, tag: string, cwd:
 		console.log(`\n${name}@${tag} stays with ${target}; converged forward while ${version} was being released.`);
 		await applyDistTagOnce(name, target, tag, cwd);
 	}
+	// Bounded repair, but never a success claim: if the channel tag is still behind the
+	// floor after the last write, fail. `publish-npm` gates the GitHub release, so staying
+	// silent here would let a stale channel pass for a finished release. The version is
+	// already published, so a rerun resumes and repairs instead of republishing.
+	const floor = await channelTarget(name, version, tag, cwd);
+	const pointer = await readDistTagVersion(name, tag, cwd);
+	if (pointer === undefined || semverOrderOrThrow(pointer, floor, `npm dist-tag ${tag} for ${name}`) < 0) {
+		throw new Error(
+			`dist-tag ${tag} for ${name} is ${pointer ?? "unset"} after ${CONVERGENCE_ATTEMPTS} convergence attempts, below ${floor}; a concurrent release kept moving it`,
+		);
+	}
 }
 
 async function applyDistTag(name: string, version: string, tag: string, cwd: string): Promise<void> {

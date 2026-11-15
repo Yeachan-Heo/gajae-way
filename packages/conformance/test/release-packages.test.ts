@@ -181,7 +181,17 @@ if (tool === "bun") {
     const overrides = JSON.parse(process.env.PUBLISHED_VERSIONS);
     const afterPublish = JSON.parse(process.env.PUBLISHED_VERSIONS_AFTER_PUBLISH);
     const afterWrite = JSON.parse(process.env.PUBLISHED_VERSIONS_AFTER_WRITE);
+    const growth = JSON.parse(process.env.PUBLISHED_VERSIONS_GROWTH);
     const name = args[1];
+    if (existsSync(process.env.WRITTEN_MARKER) && growth[name]) {
+      const counts = existsSync(process.env.GROWTH_STATE)
+        ? JSON.parse(readFileSync(process.env.GROWTH_STATE, "utf8"))
+        : {};
+      counts[name] = (counts[name] ?? 0) + 1;
+      writeFileSync(process.env.GROWTH_STATE, JSON.stringify(counts));
+      console.log(JSON.stringify(growth[name].base.concat(growth[name].grow.slice(0, counts[name]))));
+      process.exit(0);
+    }
     if (existsSync(process.env.WRITTEN_MARKER) && Array.isArray(afterWrite[name])) {
       console.log(JSON.stringify(afterWrite[name]));
       process.exit(0);
@@ -316,6 +326,7 @@ async function withReleaseFixture(
 		publishedVersions?: Record<string, string[]>;
 		publishedVersionsAfterPublish?: Record<string, string[]>;
 		publishedVersionsAfterWrite?: Record<string, string[]>;
+		publishedVersionsGrowth?: Record<string, { base: string[]; grow: string[] }>;
 		versionsError?: string;
 		tagsError?: string;
 		tagsEmpty?: string;
@@ -365,6 +376,7 @@ async function withReleaseFixture(
 		await writeFile(tagState, JSON.stringify(options.tags ?? {}));
 		const publishedMarker = join(root, "published.marker");
 		const writtenMarker = join(root, "written.marker");
+		const growthState = join(root, "growth.json");
 		const staleState = join(root, "stale.json");
 		await writeFile(staleState, JSON.stringify(options.staleVerification ?? {}));
 		await run({
@@ -392,6 +404,8 @@ async function withReleaseFixture(
 						PUBLISHED_MARKER: publishedMarker,
 						PUBLISHED_VERSIONS_AFTER_WRITE: JSON.stringify(options.publishedVersionsAfterWrite ?? {}),
 						WRITTEN_MARKER: writtenMarker,
+						PUBLISHED_VERSIONS_GROWTH: JSON.stringify(options.publishedVersionsGrowth ?? {}),
+						GROWTH_STATE: growthState,
 						VERSIONS_ERROR: options.versionsError ?? "",
 						TAGS_ERROR: options.tagsError ?? "",
 						TAGS_EMPTY: options.tagsEmpty ?? "",
@@ -774,6 +788,29 @@ describe("release script subprocess behavior", () => {
 					["dist-tag", "add", `${pkg.name}@1.3.0`, "latest"],
 				]);
 				expect(result.output).toContain("stays with 1.3.0");
+			},
+		);
+	}, 30_000);
+
+	// Bounded repair is not a success claim: if the channel tag is still below the floor
+	// after the last attempt, the release must fail rather than report a converged tag.
+	test("fails when a channel tag stays below the floor after bounded convergence", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{
+				existing: [packageRef(pkg)],
+				tags: { [`${pkg.name}@latest`]: "1.2.2" },
+				publishedVersions: { [pkg.name]: ["1.2.2", "1.2.3"] },
+				publishedVersionsGrowth: {
+					[pkg.name]: { base: ["1.2.2", "1.2.3"], grow: ["1.3.0", "1.4.0", "1.5.0", "1.6.0"] },
+				},
+			},
+			async ({ execute }) => {
+				const result = await execute("--publish");
+				expect(result.code).not.toBe(0);
+				expect(result.output).toContain("convergence attempts");
+				expect(result.output).toContain("1.6.0");
+				expect(result.commands.some((command) => command.cwd === "images")).toBe(false);
 			},
 		);
 	}, 30_000);

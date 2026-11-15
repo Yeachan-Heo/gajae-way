@@ -60,9 +60,24 @@ jobs:
       - run: bunx tsc --noEmit -p tsconfig.json
       - run: bun test packages/
 
+  canonical-tag:
+    name: require a canonical release tag
+    # Concurrency groups are matched case-insensitively, so a tag differing only in case
+    # (`v1.2.3-RC.1` vs `v1.2.3-rc.1`) would share this ref's serialization group and
+    # could displace a pending release. Reject the variant before anything is published.
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: require lowercase tag
+        run: |
+          if [ "$GITHUB_REF_NAME" != "$(printf '%s' "$GITHUB_REF_NAME" | tr '[:upper:]' '[:lower:]')" ]; then
+            echo "::error::release tags must be lowercase; got $GITHUB_REF_NAME"
+            exit 1
+          fi
+
   publish-npm:
     name: publish npm packages
-    needs: verify
+    needs: [verify, canonical-tag]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
