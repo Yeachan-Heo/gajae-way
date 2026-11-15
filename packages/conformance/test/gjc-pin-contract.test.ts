@@ -24,7 +24,7 @@ test("a compiled release resolves that manifest and nothing else", () => {
 	// now matches it: a release whose manifest cannot supply the pin fails closed instead of
 	// enforcing the build checkout's pin, so the installer's manifest is the whole contract.
 	const binDir = "/opt/gajaeway/bin";
-	expect(pinnedGjcCandidatePaths(join(binDir, "gajaeway-gateway"), true, "/$bunfs/root/gajaeway-gateway")).toEqual([
+	expect(pinnedGjcCandidatePaths(join(binDir, "gajaeway-gateway"), "/$bunfs/root/gajaeway-gateway")).toEqual([
 		servicePinManifest(binDir, { HOME: "/home/op" }),
 	]);
 });

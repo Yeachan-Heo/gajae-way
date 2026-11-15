@@ -26,27 +26,24 @@ export const GJC_ATTACH_ONLY_ENV = "GJC_SDK_BROKER_AUTOSTART";
 /**
  * Candidate locations for the pinned GJC version, in priority order.
  *
- * The manifest beside the running binary is authoritative: it is the release the
- * operator installed and the one `gajaeway services install` reads, so the runtime
- * must not resolve a different pin for the same install. A compiled binary keeps the
- * *build-time* source path in `__filename` and `import.meta.path`, so the checkout
- * candidate resolves on the machine that built it and can pin another version than the
- * release beside the binary; consulting it first made the broker refuse its own release
- * with broker_host_version_mismatch.
+ * The manifest beside the running binary is authoritative: it is the release the operator
+ * installed and the one `gajaeway services install` reads, so the runtime must not resolve a
+ * different pin for the same install.
  *
- * The checkout manifest is a source-run candidate only. `bun` is the executable of a
- * source run and ships no release manifest, so the checkout's own gateway manifest is
- * the pin. A compiled release has no checkout to fall back to — `modulePath` is Bun's
- * virtual root — and a release that lost its own manifest is a broken install, not a
- * second pin source.
+ * The checkout manifest is a source-run candidate only. `bun` is the executable of a source
+ * run and ships no release manifest, so the checkout's own gateway manifest is the pin and
+ * `modulePath` names it on disk. A `bun build --compile` binary reports Bun's virtual root
+ * from `import.meta.path` (its `__filename` still names the build-time source path, which is
+ * why the delivery mode can never be read from `__filename`), so it has no checkout to
+ * consult: the release manifest beside the executable is its only pin source, and a release
+ * that lost that manifest is a broken install that fails closed as one.
  */
 export function pinnedGjcCandidatePaths(
 	execPath: string = process.execPath,
-	compiled: boolean = isCompiledRelease(),
 	modulePath: string = import.meta.path,
 ): readonly string[] {
 	const release = join(dirname(execPath), "package.json");
-	if (compiled) return [release];
+	if (isCompiledRelease(modulePath)) return [release];
 	return [release, join(dirname(dirname(dirname(modulePath))), "package.json")];
 }
 
@@ -63,14 +60,15 @@ export function isCompiledRelease(modulePath: string = import.meta.path): boolea
  * Read the pinned GJC version this build runs against: the first candidate that carries a
  * `gjc.version` wins, so a readable target manifest cannot be overridden by a later fallback.
  *
- * A compiled release fails closed. With no checkout candidate, an executable whose release
- * manifest is missing, unreadable, malformed, or pin-less has no pin of its own, and enforcing
- * another manifest's pin is how the broker comes to refuse its own release. A source run keeps
- * the checkout fallback.
+ * A compiled release fails closed. `modulePath` decides that the candidates come from that
+ * mode, and with no checkout candidate an executable whose release manifest is missing,
+ * unreadable, malformed, or pin-less has no pin of its own — enforcing another manifest's
+ * pin is how the broker comes to refuse its own release. A source run keeps the checkout
+ * fallback.
  */
 export function readPinnedGjcVersion(
 	candidates: readonly string[] = pinnedGjcCandidatePaths(),
-	compiled: boolean = isCompiledRelease(),
+	modulePath: string = import.meta.path,
 ): string {
 	const failures: string[] = [];
 	for (const path of candidates) {
@@ -79,7 +77,9 @@ export function readPinnedGjcVersion(
 			if (typeof version === "string" && version.length > 0) return version;
 			failures.push(`${path} declares no gjc.version`);
 		} catch (error) {
-			// A missing or malformed candidate is not fatal: a later one may carry the pin.
+			// A missing or unusable candidate is not fatal while a later one may carry the pin;
+			// a compiled release has a single candidate, so the loop ends and the throw below
+			// refuses the boot instead of borrowing another manifest's pin.
 			failures.push(
 				(error as NodeJS.ErrnoException | undefined)?.code === "ENOENT"
 					? `${path} is missing`
@@ -88,10 +88,10 @@ export function readPinnedGjcVersion(
 		}
 	}
 	const tried = failures.join("; ");
-	if (compiled && candidates.length > 0) {
+	if (candidates.length > 0 && isCompiledRelease(modulePath)) {
 		const target = dirname(candidates[0]!);
 		throw new Error(
-			`gjc release pin unavailable: ${tried}. This binary is a compiled release, so its pin must come from the manifest beside it: reinstall the release into ${target} with 'gajaeway update --bin-dir ${target}'`,
+			`gjc release pin unavailable: ${tried}. This binary is a compiled release: restore its manifest with 'gajaeway update --bin-dir ${target}'`,
 		);
 	}
 	throw new Error(`Failed to read pinned GJC version: ${tried}`);
