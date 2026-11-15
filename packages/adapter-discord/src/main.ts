@@ -1654,6 +1654,8 @@ export type ImageOutcome = "acked" | "skip" | "unavailable";
 const IMAGE_INTENT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 /** Gateway inbound dedupe retention; a replay older than this is never safe. */
 const IMAGE_REPLAY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+/** Bounded pre-intent admission attempts before releasing ordered ingress. */
+const MAX_IMAGE_ADMISSION_FAILURES = 5;
 const RESOLVED_TURN: Promise<void> = Promise.resolve();
 
 /**
@@ -1725,6 +1727,7 @@ export class ReconnectingGateway {
 	readonly #imageRetryAttempts = new Map<string, number>();
 	readonly #imageSettled = new Map<string, Set<() => void>>();
 	readonly #imageDone = new Set<string>();
+	readonly #imageAdmissionFailures = new Map<string, number>();
 	readonly #imageTurnOpen = new Set<string>();
 	readonly #blockedRecoveryChannels = new Set<string>();
 	readonly unnamedThreads = new UnnamedThreads();
@@ -1844,21 +1847,40 @@ export class ReconnectingGateway {
 	): Promise<ImageOutcome> {
 		const sourceOrigin = discordMessageOrigin(message);
 		const channelId = sourceOrigin.conversationId;
-		let entry = await this.#imageOutbox.get(message.id);
-		if (!entry) {
-			entry = {
-				messageId: message.id,
-				channelId,
-				createdAt: Date.now(),
-				...(sourceOrigin.kind === "dm" ? { dm: true } : {}),
-			};
-			try {
+		let entry: PendingImage | undefined;
+		try {
+			entry = await this.#imageOutbox.get(message.id);
+			if (!entry) {
+				entry = {
+					messageId: message.id,
+					channelId,
+					createdAt: Date.now(),
+					...(sourceOrigin.kind === "dm" ? { dm: true } : {}),
+				};
 				await this.#imageOutbox.put(entry);
-			} catch (error) {
-				if (!(error instanceof ImageOutboxCapacityError)) throw error;
-				await this.rejectImageForCapacity(message.id, channelId);
+				this.#imageAdmissionFailures.delete(message.id);
+			}
+		} catch (error) {
+			if (error instanceof ImageOutboxCapacityError) {
+				this.#imageAdmissionFailures.delete(message.id);
+				await this.rejectImageAdmission(message.id, channelId, "image outbox admission bound reached");
 				return "skip";
 			}
+			const attempts = (this.#imageAdmissionFailures.get(message.id) ?? 0) + 1;
+			if (attempts < MAX_IMAGE_ADMISSION_FAILURES) {
+				this.#imageAdmissionFailures.set(message.id, attempts);
+				console.error(
+					`Discord image outbox admission failed message=${message.id} attempt=${attempts}; retrying without sending.`,
+				);
+				throw error;
+			}
+			this.#imageAdmissionFailures.delete(message.id);
+			await this.rejectImageAdmission(
+				message.id,
+				channelId,
+				`image outbox unavailable after ${attempts} admission attempts`,
+			);
+			return "skip";
 		}
 		// Best-effort: the durable outbox already makes this channel discoverable.
 		// A failing cursor store must not silence the DM's image while text flows.
@@ -2008,7 +2030,7 @@ export class ReconnectingGateway {
 	 * waiter must be released here; otherwise the ordered ingress chain holds every
 	 * later message in the conversation forever.
 	 */
-	private async rejectImageForCapacity(messageId: string, channelId: string): Promise<void> {
+	private async rejectImageAdmission(messageId: string, channelId: string, summary: string): Promise<void> {
 		await this.ensureCursors();
 		if (this.#cursors) {
 			this.deadLetter({
@@ -2017,7 +2039,7 @@ export class ReconnectingGateway {
 				classification: "terminal-message",
 				attempts: 1,
 				at: new Date().toISOString(),
-				summary: "image outbox admission bound reached; no intent was persisted",
+				summary: `${summary}; no intent was persisted`,
 			});
 			this.forgetAttempts(messageId);
 			await this.cursorsFlushed;
@@ -2026,7 +2048,7 @@ export class ReconnectingGateway {
 		if (this.#imageDone.size > 10_000) this.#imageDone.delete(this.#imageDone.values().next().value as string);
 		this.cleanupImageState(messageId);
 		console.error(
-			`Discord image rejected message=${messageId} channel=${channelId}: outbox admission bound reached; dead-lettered without persistence so ingress is released.`,
+			`Discord image rejected message=${messageId} channel=${channelId}: ${summary}; dead-lettered without persistence so ingress is released.`,
 		);
 	}
 

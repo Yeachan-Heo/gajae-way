@@ -869,6 +869,34 @@ test("completed image evidence compacts only below the recovery watermark", asyn
 	}
 }, 12_000);
 
+test("a persistent pre-intent outbox failure releases ingress after bounded attempts", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-unwritable-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "unwritable-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await mkdir(outboxPath);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		for (let attempt = 0; attempt < 4; attempt++)
+			expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("unavailable");
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("skip");
+		expect(requests).toEqual([]);
+		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
+		expect(adapter.deadLetters[0]!.summary).toContain("5 admission attempts");
+		await bounded(adapter.waitForImage(message as never, Promise.resolve("skip")), 2_000);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
 test("a persisted image request replays even when the recovery cursor is unreadable", async () => {
 	const home = await mkdtemp(join(tmpdir(), "discord-image-order-cursor-read-"));
 	const cleanupTimers = trackTimers();
