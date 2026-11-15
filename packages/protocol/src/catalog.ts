@@ -422,7 +422,35 @@ export interface SessionRecallResult {
 	readonly snippets: readonly RecallSnippet[];
 }
 
+/**
+ * One page of `session.list`, oldest `createdAt` first. Paged and filtered on
+ * the gateway because a home accumulates a session row per conversation and
+ * work lane without bound, and the full projection outgrows the 1 MiB frame
+ * (#814): a client-side `--limit` never shrinks the response.
+ */
+export interface SessionListParams {
+	/** 1..SESSION_LIST_MAX_LIMIT; defaults to SESSION_LIST_DEFAULT_LIMIT. */
+	readonly limit?: number;
+	/** Rows to skip; defaults to 0. */
+	readonly offset?: number;
+	/** Only the session with this canonical origin key (`sessions inspect <key>`). */
+	readonly originKey?: string;
+}
+export const SESSION_LIST_DEFAULT_LIMIT = 100;
+export const SESSION_LIST_MAX_LIMIT = 500;
+/** Bootstrap section/diagnostic entries returned per session; the rest is counted, not sent. */
+export const SESSION_LIST_MAX_BOOTSTRAP_ITEMS = 16;
+/**
+ * Serialized bytes of one page's sessions. A page stops early at this budget
+ * (always holding at least one row), so continue from `offset + sessions.length`.
+ */
+export const SESSION_LIST_MAX_RESPONSE_BYTES = 512 * 1024;
+
 export interface SessionListResult {
+	/** Matching session rows in the home, not just this page. */
+	readonly total: number;
+	/** The requested offset; this page may hold fewer than `limit` rows (byte budget). */
+	readonly offset: number;
 	readonly sessions: readonly {
 		readonly origin: OriginRef;
 		readonly createdAt: string;
@@ -797,6 +825,76 @@ export interface WorkStatusResult {
  * applies to the lanes that conversation started; one added outside any
  * conversation (the host operator) applies to every lane.
  */
+/**
+ * Read-only lane progress (#814): the tail of the lane's saved session
+ * transcript, never a prompt or steer. It answers "how is the lane going"
+ * without reaching the lane, so the lane's current turn, its steer queue and
+ * its transcript are left exactly as they were. Changing what a lane does is
+ * `work.steer`; the two never share a verb.
+ */
+export interface WorkProgressParams {
+	readonly name: string;
+	/** 1..WORK_PROGRESS_MAX_LIMIT assistant texts and tool calls each; defaults to WORK_PROGRESS_DEFAULT_LIMIT. */
+	readonly limit?: number;
+}
+export const WORK_PROGRESS_DEFAULT_LIMIT = 5;
+export const WORK_PROGRESS_MAX_LIMIT = 20;
+/** Characters kept per assistant text block after redaction. */
+export const WORK_PROGRESS_TEXT_MAX_CHARS = 600;
+/** Characters kept per tool-call intent (`_i`) after redaction. */
+export const WORK_PROGRESS_INTENT_MAX_CHARS = 160;
+
+export interface WorkProgressToolCall {
+	readonly name: string;
+	/** The call's `_i` intent, redacted and truncated. */
+	readonly intent?: string;
+	readonly at: string | null;
+	/**
+	 * `ok`/`error` from the saved tool result; `running` when no result is saved
+	 * yet and nothing newer happened in the session; `no_result` when the session
+	 * moved on without saving one (an aborted call).
+	 */
+	readonly status: "ok" | "error" | "running" | "no_result";
+}
+
+export interface WorkProgressText {
+	readonly at: string | null;
+	/** Redacted, then cut to WORK_PROGRESS_TEXT_MAX_CHARS. */
+	readonly text: string;
+	readonly truncated: boolean;
+}
+
+export interface WorkProgressResult {
+	readonly name: string;
+	readonly jobId: string;
+	readonly state: string;
+	/** The session whose transcript was read: the bound session, else the last attempt's. */
+	readonly sessionId: string;
+	readonly lastActivityAt: string | null;
+	readonly attempt: WorkStatusResult["attempt"];
+	readonly transcript:
+		| {
+				readonly status: "ok";
+				/** Transcript size when it was read; bytes appended later are not part of this view. */
+				readonly bytes: number;
+				/** Bytes read back from the end; bounded, never the whole file. */
+				readonly scannedBytes: number;
+				/** False when the bounded scan ended before the turn start and every requested item were found. */
+				readonly complete: boolean;
+				/** Rows not shown: malformed, or too large to buffer. */
+				readonly skippedRows: number;
+		  }
+		| { readonly status: "unavailable"; readonly reason: "no_session" | "not_found" | "unreadable" };
+	/** Time of the newest user message (the prompt or a later steer) in the scanned tail. */
+	readonly turnStartedAt: string | null;
+	/** The newest tool call that has no saved result and nothing newer after it. */
+	readonly toolInFlight: WorkProgressToolCall | null;
+	/** Oldest first. */
+	readonly assistantTexts: readonly WorkProgressText[];
+	/** Oldest first. */
+	readonly toolCalls: readonly WorkProgressToolCall[];
+}
+
 export interface WorkDirectiveParams {
 	readonly action: "add" | "list" | "remove";
 	/** The directive text (add). */
@@ -1305,7 +1403,7 @@ export interface VerbCatalogV01 {
 	"delivery.confirm": { params: DeliveryConfirmParams; result: { readonly settled: true } };
 	"delivery.fail": { params: DeliveryFailParams; result: { readonly recorded: true } };
 	"session.recall": { params: SessionRecallParams; result: SessionRecallResult };
-	"session.list": { params: undefined; result: SessionListResult };
+	"session.list": { params: SessionListParams | undefined; result: SessionListResult };
 	"session.modelChoices": { params: SessionModelChoicesParams; result: SessionModelChoicesResult };
 	"memory.audit": { params: undefined; result: MemoryOperationAccepted };
 	"memory.autolink": { params: undefined; result: MemoryOperationAccepted };
@@ -1351,6 +1449,7 @@ export interface VerbCatalogV01 {
 
 	"work.start": { params: WorkStartParams; result: WorkStartResult };
 	"work.status": { params: WorkStatusParams; result: WorkStatusResult };
+	"work.progress": { params: WorkProgressParams; result: WorkProgressResult };
 	"work.steer": { params: WorkSteerParams; result: WorkSteerResult };
 	"work.jobs": { params: WorkJobsParams | undefined; result: WorkJobsResult };
 	"work.retire": { params: WorkRetireParams; result: WorkRetireResult };
@@ -1403,6 +1502,7 @@ export const VERBS_V01 = [
 	"work.run",
 	"work.start",
 	"work.status",
+	"work.progress",
 	"work.steer",
 	"work.jobs",
 	"work.retire",

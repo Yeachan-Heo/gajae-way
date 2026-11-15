@@ -172,7 +172,9 @@ test("a human's thread reply is its own session and the answer stays in that thr
 	await settle();
 	expect(turns).toHaveLength(2);
 	// Two origins, two sessions: the thread does not share the channel's head.
-	const sessions = database.bindings.sessionRows().map((row) => JSON.parse(row.origin_ref_json ?? "{}").conversationId);
+	const sessions = database.bindings
+		.sessionPage({ limit: 500, offset: 0 })
+		.rows.map((row) => JSON.parse(row.origin_ref_json ?? "{}").conversationId);
 	expect(sessions.sort()).toEqual(["C1", "C1:1726543210.000300"]);
 	// Different origins run concurrently, so the two replies may land in either
 	// order. Both live in thread 000300: the channel turn opens it under the

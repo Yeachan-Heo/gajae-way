@@ -1,22 +1,27 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { preparePromptImages } from "@gajae-gateway/images";
 import {
 	type Frame,
 	type GatewayReadinessResult,
+	MAX_FRAME_BYTES,
 	type MemoryOperationStatusResult,
 	OrderedFrameWriter,
 	originKey,
 	type PromptImage,
+	SESSION_LIST_MAX_BOOTSTRAP_ITEMS,
+	SESSION_LIST_MAX_LIMIT,
+	SESSION_LIST_MAX_RESPONSE_BYTES,
 	WORK_JOBS_DEFAULT_LIMIT,
 	WORK_JOBS_MAX_LIMIT,
 } from "@gajae-gateway/protocol";
 import { createLaneJobRecord, MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
 import { ACK_TIMEOUT_MS, DeliveryService } from "../src/delivery/delivery";
+import { SecretGuard } from "../src/guard/secret-guard";
 import { initializeMemory, memoryGit, memoryRoot } from "../src/memory/doctrine";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { ModelNotSelectedError } from "../src/orchestrator/session-port";
@@ -4774,7 +4779,7 @@ test("control tokens never leak: a silence token inside a preamble silences, and
 	expect(messages.map((m: any) => m.text)).toEqual(["This is a real bug report. 알겠고 인정"]);
 	expect(messages[0].replyToMessageId).toBe("1544704223634260038");
 });
-async function workSocketFixture() {
+async function workSocketFixture(options: { secretGuard?: SecretGuard } = {}) {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-async-socket-"));
 	const target = { platform: "discord" as const, kind: "channel" as const, conversationId: "results" };
 	const config: GatewayConfig = {
@@ -4796,6 +4801,7 @@ async function workSocketFixture() {
 		config,
 		database,
 		sessionPort: port,
+		...(options.secretGuard ? { secretGuard: options.secretGuard } : {}),
 		onStop: () => {
 			openAtShutdown = database.work.workAttemptOpen().length;
 			database.close();
@@ -5047,6 +5053,229 @@ for (const verb of ["work.start", "work.run"] as const) {
 		f.client.close();
 	});
 }
+
+test("session.list pages, filters and bounds rows on the gateway so a small --limit fits the frame (#814)", async () => {
+	const f = await workSocketFixture();
+	// 400 conversations whose bootstrap recorded many long diagnostics: unpaged,
+	// this list is ~40 MB and no client-side --limit could make it fit a frame.
+	const diagnostics = Array.from({ length: 60 }, (_, i) => `MEMORY link rejected: ${"x".repeat(400)} ${i}`);
+	f.database.transaction((tx) => {
+		for (let i = 0; i < 400; i++) {
+			const origin = { platform: "discord", kind: "channel", conversationId: `c${String(i).padStart(4, "0")}` };
+			const key = originKey(origin as never);
+			f.database.bindings.incrementTurnCount(tx, key, JSON.stringify(origin));
+			f.database.bindings.markSessionBootstrapped(tx, key, 0, {
+				includedSections: diagnostics,
+				byteCount: 1,
+				truncated: false,
+				diagnostics,
+			});
+		}
+	});
+	const ask = async (id: string, params?: unknown) => {
+		f.client.send({ v: "0.1", type: "request", id, verb: "session.list", ...(params === undefined ? {} : { params }) });
+		await waitFrame(f.client.frames, id);
+		return { frame: f.client.frames.find((frame) => frame.id === id) };
+	};
+	const wireBytes = (id: string) =>
+		Buffer.byteLength(f.client.wireLines.find((line) => JSON.parse(line).id === id) ?? "", "utf8");
+
+	const five = (await ask("five", { limit: 5 })).frame.result;
+	expect(five.total).toBe(400);
+	expect(five.offset).toBe(0);
+	expect(five.sessions.map((session: any) => session.origin.conversationId)).toEqual([
+		"c0000",
+		"c0001",
+		"c0002",
+		"c0003",
+		"c0004",
+	]);
+	expect(five.sessions[0].bootstrap.diagnostics).toHaveLength(SESSION_LIST_MAX_BOOTSTRAP_ITEMS + 1);
+	expect(five.sessions[0].bootstrap.diagnostics.at(-1)).toBe(`(${60 - SESSION_LIST_MAX_BOOTSTRAP_ITEMS} more omitted)`);
+	expect(wireBytes("five")).toBeLessThan(64 * 1024);
+
+	// Every page fits the frame whatever the limit; a full page stops at the byte budget.
+	for (const [id, params] of [
+		["default", undefined],
+		["max", { limit: SESSION_LIST_MAX_LIMIT }],
+	] as const) {
+		const page = (await ask(id, params)).frame.result;
+		expect(page.total).toBe(400);
+		expect(page.sessions.length).toBeGreaterThan(0);
+		expect(wireBytes(id)).toBeLessThanOrEqual(MAX_FRAME_BYTES);
+		expect(Buffer.byteLength(JSON.stringify(page.sessions))).toBeLessThanOrEqual(SESSION_LIST_MAX_RESPONSE_BYTES);
+	}
+	const first = (await ask("first", { limit: SESSION_LIST_MAX_LIMIT })).frame.result;
+	const next = (await ask("next", { limit: 1, offset: first.sessions.length })).frame.result;
+	expect(next.sessions[0].origin.conversationId).toBe(`c${String(first.sessions.length).padStart(4, "0")}`);
+
+	const inspected = (await ask("inspect", { limit: 1, originKey: "discord/channel/c0123" })).frame.result;
+	expect(inspected.total).toBe(1);
+	expect(inspected.sessions.map((session: any) => session.origin.conversationId)).toEqual(["c0123"]);
+	expect((await ask("tail", { limit: 5, offset: 399 })).frame.result.sessions).toHaveLength(1);
+
+	for (const [id, params] of [
+		["zero", { limit: 0 }],
+		["over", { limit: SESSION_LIST_MAX_LIMIT + 1 }],
+		["negative", { offset: -1 }],
+		["key", { originKey: 7 }],
+	] as const) {
+		const { frame } = await ask(id, params);
+		expect(frame.type).toBe("error");
+		expect(frame.error.code).toBe("invalid_params");
+	}
+	f.client.close();
+});
+
+test("work.progress answers from the transcript tail without reaching the lane (#814)", async () => {
+	// The same outbound guard chat uses; a known env value stands in for a host credential.
+	const hostSecret = "Hq4Lm8Np2Rs6Tv0Wx3Yz";
+	const f = await workSocketFixture({
+		secretGuard: new SecretGuard({ files: [], envNames: [], env: { DEPLOY_TOKEN: hostSecret } }, { log: () => {} }),
+	});
+	f.client.send({
+		v: "0.1",
+		type: "request",
+		id: "start",
+		verb: "work.start",
+		params: { name: "a", text: "work", cwd: directory },
+	});
+	await waitFrame(f.client.frames, "start");
+	const receipt = f.client.frames.find((frame) => frame.id === "start").result;
+	expect(receipt.started).toBe(true);
+
+	const progress = async (id: string, params: unknown) => {
+		const began = performance.now();
+		f.client.send({ v: "0.1", type: "request", id, verb: "work.progress", params });
+		await f.client.waitForFrame(id);
+		const elapsed = performance.now() - began;
+		const line = f.client.wireLines.find((candidate) => JSON.parse(candidate).id === id) ?? "";
+		return { frame: JSON.parse(line), bytes: Buffer.byteLength(line), elapsed };
+	};
+	// No transcript saved yet: say so instead of inventing progress.
+	expect((await progress("none", { name: "a" })).frame.result).toMatchObject({
+		name: "a",
+		sessionId: receipt.sessionId,
+		transcript: { status: "unavailable", reason: "not_found" },
+		toolInFlight: null,
+		assistantTexts: [],
+	});
+
+	// The lane's saved transcript, mid tool call, after ~6 MB of earlier turns.
+	const secret = `sk-ant-${"Q7w8E9r0".repeat(6)}`;
+	const at = (ms: number) => new Date(Date.parse("2026-11-15T10:00:00.000Z") + ms).toISOString();
+	let id = 0;
+	const row = (ms: number, role: string, fields: Record<string, unknown>) =>
+		JSON.stringify({
+			type: "message",
+			id: `e${++id}`,
+			parentId: id === 1 ? null : `e${id - 1}`,
+			timestamp: at(ms),
+			message: { role, timestamp: Date.parse(at(ms)), ...fields },
+		});
+	const rows = [
+		JSON.stringify({ type: "session", version: 5, id: receipt.sessionId, cwd: directory, timestamp: at(0) }),
+	];
+	for (let i = 0; i < 60; i++) {
+		rows.push(row(i * 10, "user", { content: [{ type: "text", text: `old turn ${i}` }] }));
+		rows.push(
+			row(i * 10 + 1, "assistant", {
+				content: [
+					{ type: "text", text: `old step ${i}` },
+					{ type: "toolCall", id: `old-${i}`, name: "read", arguments: { path: "x", _i: "Reading" } },
+				],
+			}),
+		);
+		rows.push(
+			row(i * 10 + 2, "toolResult", {
+				toolCallId: `old-${i}`,
+				toolName: "read",
+				isError: false,
+				content: [{ type: "text", text: "z".repeat(100_000) }],
+			}),
+		);
+	}
+	rows.push(row(10_000, "user", { content: [{ type: "text", text: "ship the fix" }] }));
+	rows.push(
+		row(10_001, "assistant", {
+			content: [
+				{ type: "text", text: `Deploying with ${secret} now (token ${hostSecret}).` },
+				{
+					type: "toolCall",
+					id: "live",
+					name: "bash",
+					arguments: { command: "deploy", _i: `Deploying with ${secret}` },
+				},
+			],
+		}),
+	);
+	const bucket = join(directory, "agent", "sessions", "--lane-a--");
+	await mkdir(bucket, { recursive: true });
+	const transcript = join(bucket, `2026-11-15T10-00-00-000Z_${receipt.sessionId}.jsonl`);
+	await writeFile(transcript, `${rows.join("\n")}\n`);
+	const before = { bytes: await readFile(transcript), stat: await stat(transcript) };
+	expect(before.stat.size).toBeGreaterThan(5 * 1024 * 1024);
+	const sends = f.port.sends.length;
+	const steers = f.port.steers.length;
+	const reports = f.database.work.laneReportCounts("a");
+
+	for (let i = 0; i < 5; i++) {
+		const { frame, bytes, elapsed } = await progress(`progress-${i}`, { name: "a", limit: 3 });
+		expect(frame.type).toBe("response");
+		expect(elapsed).toBeLessThan(1000);
+		expect(bytes).toBeLessThan(16 * 1024);
+		expect(JSON.stringify(frame)).not.toContain(secret);
+		expect(JSON.stringify(frame)).not.toContain(hostSecret);
+		expect(frame.result).toMatchObject({
+			name: "a",
+			state: "running",
+			sessionId: receipt.sessionId,
+			attempt: { opRef: receipt.opRef },
+			transcript: { status: "ok", bytes: before.stat.size, complete: true, skippedRows: 0 },
+			turnStartedAt: at(10_000),
+			toolInFlight: {
+				name: "bash",
+				intent: "Deploying with [REDACTED:anthropic_key]",
+				at: at(10_001),
+				status: "running",
+			},
+		});
+		expect(frame.result.assistantTexts).toEqual([
+			{ at: at(581), text: "old step 58", truncated: false },
+			{ at: at(591), text: "old step 59", truncated: false },
+			{
+				at: at(10_001),
+				text: "Deploying with [REDACTED:anthropic_key] now (token [REDACTED:known_secret]).",
+				truncated: false,
+			},
+		]);
+		expect(frame.result.transcript.scannedBytes).toBeLessThan(1024 * 1024);
+		expect(frame.result.toolCalls.map((call: any) => call.status)).toEqual(["ok", "ok", "running"]);
+	}
+
+	// Read-only: the lane got no prompt or steer, its report queue and transcript are untouched,
+	// and its attempt is still the same open one.
+	expect(f.port.sends).toHaveLength(sends);
+	expect(f.port.steers).toHaveLength(steers);
+	expect(f.database.work.laneReportCounts("a")).toEqual(reports);
+	const after = await stat(transcript);
+	expect(await readFile(transcript)).toEqual(before.bytes);
+	expect(after.mtimeMs).toBe(before.stat.mtimeMs);
+	expect(after.size).toBe(before.stat.size);
+	expect(f.database.work.workAttemptGet(receipt.opRef)?.settledAt).toBeNull();
+
+	for (const [errorId, params] of [
+		["bad-limit", { name: "a", limit: 21 }],
+		["bad-field", { name: "a", text: "report progress" }],
+		["unknown", { name: "nope" }],
+	] as const) {
+		const { frame } = await progress(errorId, params);
+		expect(frame.type).toBe("error");
+		expect(frame.error.code).toBe("invalid_params");
+	}
+	expect(f.port.steers).toHaveLength(steers);
+	f.client.close();
+});
 
 test("status reports each connected client's generation and flags an adapter older than the gateway", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-generation-"));

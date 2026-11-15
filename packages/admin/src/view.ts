@@ -471,7 +471,12 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<ConsoleSnapshot
 		status: statusRow(
 			status.value,
 			status.error,
-			sessions.value === null ? null : sessionList.length,
+			// session.list is one gateway page; `total` counts every session in the home.
+			sessions.value === null
+				? null
+				: typeof sessions.value.total === "number"
+					? sessions.value.total
+					: sessionList.length,
 			deps.turns.activeCount,
 			attention,
 			now,

@@ -306,23 +306,13 @@ export class BindingsGroup {
 		);
 	}
 
-	sessionRows(): Array<{
-		origin_ref_json: string | null;
-		created_at: string;
-		last_activity_at: string | null;
-		epoch: number;
-		last_bootstrapped_epoch: number;
-		bootstrap_applied_at: string | null;
-		bootstrap_sections_json: string;
-		bootstrap_byte_count: number;
-		bootstrap_truncated: number;
-		bootstrap_diagnostics_json: string;
-	}> {
-		return this.#db
-			.prepare(
-				"SELECT origin_ref_json, created_at, last_activity_at, epoch, last_bootstrapped_epoch, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions ORDER BY created_at",
-			)
-			.all() as Array<{
+	/**
+	 * One page of session rows, oldest first, plus the matching total. Paged in
+	 * SQL: a home holds a row per conversation and lane, without bound (#814).
+	 */
+	sessionPage(page: { limit: number; offset: number; originKey?: string }): {
+		total: number;
+		rows: Array<{
 			origin_ref_json: string | null;
 			created_at: string;
 			last_activity_at: string | null;
@@ -334,6 +324,29 @@ export class BindingsGroup {
 			bootstrap_truncated: number;
 			bootstrap_diagnostics_json: string;
 		}>;
+	} {
+		const where = page.originKey === undefined ? "" : " WHERE origin_key = ?";
+		const filter = page.originKey === undefined ? [] : [page.originKey];
+		const total = (
+			this.#db.prepare(`SELECT COUNT(*) AS total FROM sessions${where}`).get(...filter) as { total: number }
+		).total;
+		const rows = this.#db
+			.prepare(
+				`SELECT origin_ref_json, created_at, last_activity_at, epoch, last_bootstrapped_epoch, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions${where} ORDER BY created_at, origin_key LIMIT ? OFFSET ?`,
+			)
+			.all(...filter, page.limit, page.offset) as Array<{
+			origin_ref_json: string | null;
+			created_at: string;
+			last_activity_at: string | null;
+			epoch: number;
+			last_bootstrapped_epoch: number;
+			bootstrap_applied_at: string | null;
+			bootstrap_sections_json: string;
+			bootstrap_byte_count: number;
+			bootstrap_truncated: number;
+			bootstrap_diagnostics_json: string;
+		}>;
+		return { total, rows };
 	}
 
 	sessionIdentityRows(): Array<{

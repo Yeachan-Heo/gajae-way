@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { OpsCycleResult, OpsSloResult } from "@gajae-gateway/protocol";
+import type { OpsCycleResult, OpsSloResult, SessionListResult, WorkProgressResult } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 
@@ -749,6 +749,95 @@ describe("list flag validation", () => {
 		});
 });
 
+describe("sessions paging is done by the gateway (#814)", () => {
+	const session = (conversationId: string): SessionListResult["sessions"][number] => ({
+		origin: { platform: "discord", kind: "channel", conversationId },
+		createdAt: "2026-11-15T00:00:00.000Z",
+		lastActivityAt: null,
+		epoch: 0,
+		bootstrap: {
+			epoch: 0,
+			pending: false,
+			appliedAt: null,
+			includedSections: [],
+			byteCount: 10,
+			truncated: false,
+			diagnostics: [],
+		},
+	});
+	async function run(args: string[], result: SessionListResult) {
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const lines: string[] = [];
+		const errors: string[] = [];
+		const client: GajaewayClient = Object.create(GajaewayClient.prototype);
+		client.request = async <T>(verb: string, params?: unknown): Promise<T> => {
+			requests.push({ verb, params });
+			return result as T;
+		};
+		client.close = async () => {};
+		const connect = spyOn(GajaewayClient, "connectSocketWithBackoff").mockResolvedValue(client);
+		const log = spyOn(console, "log").mockImplementation((line) => {
+			lines.push(String(line));
+		});
+		const error = spyOn(console, "error").mockImplementation((line) => {
+			errors.push(String(line));
+		});
+		const previousExit = process.exitCode;
+		try {
+			await main(["--socket", "/test/sessions.sock", "sessions", ...args]);
+			return { requests, lines, errors, connections: connect.mock.calls.length, exitCode: process.exitCode };
+		} finally {
+			connect.mockRestore();
+			log.mockRestore();
+			error.mockRestore();
+			process.exitCode = previousExit ?? 0;
+		}
+	}
+
+	test("sessions list --limit/--offset are sent to the gateway and rows keep their absolute index", async () => {
+		const output = await run(["list", "--limit", "2", "--offset", "5", "--fields", "index,origin"], {
+			total: 9,
+			offset: 5,
+			sessions: [session("c5"), session("c6")],
+		});
+		expect(output.requests).toEqual([{ verb: "session.list", params: { limit: 2, offset: 5 } }]);
+		expect(output.lines).toEqual(["INDEX  ORIGIN", "5      discord/channel/c5", "6      discord/channel/c6"]);
+		expect(output.errors).toEqual(["sessions 6-7 of 9 (next: --offset 7)"]);
+	});
+
+	test("sessions list --json keeps the gateway page envelope verbatim", async () => {
+		const result = { total: 1, offset: 0, sessions: [session("c0")] };
+		const output = await run(["list", "--json", "--limit", "5"], result);
+		expect(output.requests).toEqual([{ verb: "session.list", params: { limit: 5 } }]);
+		expect(output.lines).toEqual([JSON.stringify(result)]);
+		expect(output.errors).toEqual([]);
+	});
+
+	test("sessions list without paging flags asks for the gateway's default page", async () => {
+		const output = await run(["list"], { total: 0, offset: 0, sessions: [] });
+		expect(output.requests).toEqual([{ verb: "session.list", params: undefined }]);
+	});
+
+	test("sessions inspect asks for exactly one row by index or by origin key", async () => {
+		const byIndex = await run(["inspect", "3"], { total: 9, offset: 3, sessions: [session("c3")] });
+		expect(byIndex.requests).toEqual([{ verb: "session.list", params: { limit: 1, offset: 3 } }]);
+		expect(byIndex.lines[0]).toBe("origin: discord/channel/c3");
+		const byKey = await run(["inspect", "work/task/lane"], { total: 1, offset: 0, sessions: [session("c9")] });
+		expect(byKey.requests).toEqual([{ verb: "session.list", params: { limit: 1, originKey: "work/task/lane" } }]);
+		const missing = await run(["inspect", "work/task/none"], { total: 0, offset: 0, sessions: [] });
+		expect(missing.errors.join(" ")).toContain("Unknown session: work/task/none");
+		expect(missing.exitCode).toBe(1);
+	});
+
+	for (const args of [["list", "--limit", "0"], ["list", "--limit", "501"], ["inspect"], ["inspect", "-1"], ["bogus"]])
+		test(`sessions ${args.join(" ")} fails before connecting`, async () => {
+			const output = await run(args, { total: 0, offset: 0, sessions: [] });
+			expect(output.connections).toBe(0);
+			expect(output.requests).toEqual([]);
+			expect(output.exitCode).not.toBe(0);
+		});
+});
+
 describe("monitor update", () => {
 	async function run(commands: string[][]) {
 		const requests: Array<{ verb: string; params: unknown }> = [];
@@ -1328,6 +1417,74 @@ describe("work operator commands", () => {
 		expect(output.lines).toEqual(["steered: client-exact"]);
 		expect(output.closed).toBe(true);
 	});
+
+	const progressResult: WorkProgressResult = {
+		name: "fix",
+		jobId: "job-1",
+		state: "running",
+		sessionId: "session-1",
+		lastActivityAt: "2026-11-15T10:00:05.000Z",
+		attempt: { opRef: "op-1", startedAt: "2026-11-15T10:00:00.000Z" },
+		transcript: { status: "ok", bytes: 9000, scannedBytes: 4000, complete: true, skippedRows: 0 },
+		turnStartedAt: "2026-11-15T10:00:00.000Z",
+		toolInFlight: { name: "bash", intent: "Running tests", at: "2026-11-15T10:00:04.000Z", status: "running" },
+		assistantTexts: [{ at: "2026-11-15T10:00:03.000Z", text: "Parser fixed;\nrunning tests.", truncated: false }],
+		toolCalls: [
+			{ name: "edit", intent: "Fixing parser", at: "2026-11-15T10:00:02.000Z", status: "ok" },
+			{ name: "bash", intent: "Running tests", at: "2026-11-15T10:00:04.000Z", status: "running" },
+		],
+	};
+
+	test("work status --progress is the read-only work.progress verb, never status or steer", async () => {
+		const output = await run(["status", "fix", "--progress", "--limit", "3"], progressResult);
+		expect(output.requests).toEqual([{ verb: "work.progress", params: { name: "fix", limit: 3 } }]);
+		expect(output.lines).toEqual([
+			"lane fix: running session=session-1 attempt=op-1 started=2026-11-15T10:00:00.000Z",
+			"transcript: 9000B, read last 4000B",
+			"tool calls (oldest first):",
+			'  2026-11-15T10:00:02.000Z ok edit "Fixing parser"',
+			'  2026-11-15T10:00:04.000Z running bash "Running tests"',
+			"assistant (oldest first):",
+			"  2026-11-15T10:00:03.000Z Parser fixed; running tests.",
+			"turn started: 2026-11-15T10:00:00.000Z",
+			'now running: bash "Running tests" since 2026-11-15T10:00:04.000Z',
+		]);
+		expect(output.closed).toBe(true);
+		const json = await run(["status", "fix", "--progress", "--json"], progressResult);
+		expect(json.requests).toEqual([{ verb: "work.progress", params: { name: "fix" } }]);
+		expect(json.lines).toEqual([JSON.stringify(progressResult)]);
+	});
+
+	test("work status --progress names an unreadable transcript instead of inventing progress", async () => {
+		const output = await run(["status", "fix", "--progress"], {
+			...progressResult,
+			transcript: { status: "unavailable", reason: "not_found" },
+			turnStartedAt: null,
+			toolInFlight: null,
+			assistantTexts: [],
+			toolCalls: [],
+		});
+		expect(output.lines.slice(1)).toEqual([
+			"transcript: unavailable (not_found)",
+			"turn started: -",
+			"now running: no tool call",
+		]);
+	});
+
+	for (const args of [
+		["status", "fix", "--limit", "3"],
+		["status", "fix", "--progress", "--limit", "0"],
+		["status", "fix", "--progress", "--limit", "21"],
+		["status", "fix", "--progress", "--progress"],
+		["status", "fix", "--progress", "extra"],
+		["steer", "fix", "--progress"],
+	])
+		test(`work ${args.join(" ")} is a usage error before connecting`, async () => {
+			const output = await run(args, progressResult);
+			expect(output.connections).toBe(0);
+			expect(output.requests).toEqual([]);
+			expect(output.errors.join(" ")).toContain("status <name> [--progress [--limit N] [--json]]");
+		});
 
 	test("work steer refusal is not acceptance", async () => {
 		const output = await run(["steer", "fix", "focus"], { steered: false, reason: "steer_refused:sdk_refused" });

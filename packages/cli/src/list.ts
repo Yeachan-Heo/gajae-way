@@ -201,12 +201,21 @@ export function renderList<T>(
 		readonly result: unknown;
 		/** Restore the gateway array-item shape when display rows are wrapped. */
 		readonly serializeRow?: (row: T) => unknown;
+		/**
+		 * Set when the gateway already paged the rows (`session.list`): they are
+		 * shown as-is, indexed from this offset, and `--json` keeps the envelope.
+		 */
+		readonly serverPageOffset?: number;
 	},
 ): string[] {
-	const entries = pageRows(rows, options);
+	const serverPaged = envelope.serverPageOffset !== undefined;
+	const entries = serverPaged
+		? rows.map((row, index) => ({ row, index: (envelope.serverPageOffset as number) + index }))
+		: pageRows(rows, options);
 	const selected = selectColumns(columns, options.fields);
 	if (!options.json) return renderTable(selected, entries);
-	if (!options.fields && options.limit === undefined && options.offset === 0) return [JSON.stringify(envelope.result)];
+	if (!options.fields && (serverPaged || (options.limit === undefined && options.offset === 0)))
+		return [JSON.stringify(envelope.result)];
 	const projected = options.fields
 		? projectRows(selected, entries)
 		: entries.map((entry) => (envelope.serializeRow ? envelope.serializeRow(entry.row) : entry.row));

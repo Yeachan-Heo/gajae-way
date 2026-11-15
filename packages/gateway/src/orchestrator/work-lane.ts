@@ -11,8 +11,11 @@ import {
 	ProtocolError,
 	parseOriginKey,
 	validateOriginRef,
+	WORK_PROGRESS_DEFAULT_LIMIT,
+	WORK_PROGRESS_MAX_LIMIT,
 	type WorkDirective,
 	type WorkDirectiveResult,
+	type WorkProgressResult,
 	type WorkStartResult,
 	type WorkStatusResult,
 	type WorkSteerResult,
@@ -61,7 +64,7 @@ import {
 } from "../store/groups/work";
 import type { WriteTx } from "../store/tx";
 import { type BrokerWaitOptions, isBrokerUnavailable, waitForBroker } from "./broker";
-import { readFailedTransportCause } from "./failed-turn-evidence";
+import { locateSavedTranscript, readFailedTransportCause } from "./failed-turn-evidence";
 import { GIT_COMMAND_TIMEOUT_MS, runGit } from "./git-command";
 import {
 	type LaneForceRetireReason,
@@ -75,6 +78,7 @@ import {
 import { sanitizeDiagnostic } from "./rebind";
 import { isSessionUnavailable, type SessionLiveness, type SessionPort } from "./session-port";
 import { isRelayTransportFailure, type TailHandle } from "./tail-runner";
+import { readTranscriptTail } from "./transcript-tail";
 
 const owners = new WeakSet<Store>();
 /** Consecutive failed reconciliations between authority re-checks through recovery. */
@@ -1279,6 +1283,78 @@ export class WorkLaneManager {
 						},
 					}
 				: {}),
+		};
+	}
+	/**
+	 * Read-only lane progress (#814): durable job state plus the tail of the
+	 * lane's saved session transcript. It is the answer to "how is the lane
+	 * going". Unlike {@link status} it makes no broker call, and unlike
+	 * {@link steer} it never reaches the lane: no prompt, no steer, no activity
+	 * touch, no write of any kind. Every returned string has passed `redact`.
+	 */
+	async progress(params: unknown, redact: (text: string) => string): Promise<WorkProgressResult> {
+		const { name, limit } = parseProgressParams(params);
+		const empty = { turnStartedAt: null, toolInFlight: null, assistantTexts: [], toolCalls: [] } as const;
+		const admission = this.#job(name) ? undefined : this.#admissions.get(name);
+		if (admission)
+			return {
+				name,
+				jobId: laneJobIdentity(name).jobId,
+				state: admission.failedAt === undefined ? "admitting" : "admission_failed",
+				sessionId: "",
+				lastActivityAt: null,
+				attempt: null,
+				transcript: { status: "unavailable", reason: "no_session" },
+				...empty,
+			};
+		const job = this.#job(name, true)!;
+		const key = workSessionKey(name);
+		const attempt = job.attempts.at(-1);
+		// A retired lane has no binding, but its last attempt's transcript still tells how it went.
+		const sessionId = this.#db.bindings.getSessionRecord(key)?.sessionId || attempt?.sessionId || "";
+		const snapshot = {
+			name,
+			jobId: job.jobId,
+			state: job.state,
+			sessionId,
+			lastActivityAt: this.#db.bindings.workLaneRows().find((row) => row.origin_key === key)?.last_activity_at ?? null,
+			attempt: attempt
+				? {
+						opRef: attempt.opRef,
+						startedAt: attempt.startedAt,
+						...(attempt.endedAt ? { endedAt: attempt.endedAt } : {}),
+						...(attempt.endState ? { endState: attempt.endState } : {}),
+					}
+				: null,
+		};
+		if (!sessionId) return { ...snapshot, transcript: { status: "unavailable", reason: "no_session" }, ...empty };
+		// The transcript lives under the broker authority's agent dir, the same one failed-turn evidence reads.
+		const path = await locateSavedTranscript(this.#db.bindings.authority?.canonicalAgentDir, sessionId);
+		if (path === undefined)
+			return { ...snapshot, transcript: { status: "unavailable", reason: "not_found" }, ...empty };
+		let tail: Awaited<ReturnType<typeof readTranscriptTail>>;
+		try {
+			tail = await readTranscriptTail(path, { limit, redact });
+		} catch {
+			return { ...snapshot, transcript: { status: "unavailable", reason: "unreadable" }, ...empty };
+		}
+		// A call without a saved result is only in flight while its attempt is open.
+		const settled = attempt === undefined || attempt.endedAt !== undefined;
+		return {
+			...snapshot,
+			transcript: {
+				status: "ok",
+				bytes: tail.bytes,
+				scannedBytes: tail.scannedBytes,
+				complete: tail.complete,
+				skippedRows: tail.skippedRows,
+			},
+			turnStartedAt: tail.turnStartedAt,
+			toolInFlight: settled ? null : tail.toolInFlight,
+			assistantTexts: tail.assistantTexts,
+			toolCalls: settled
+				? tail.toolCalls.map((call) => (call.status === "running" ? { ...call, status: "no_result" } : call))
+				: tail.toolCalls,
 		};
 	}
 	/**
@@ -3105,6 +3181,15 @@ function parseName(params: unknown): string {
 	const name = (params as { name?: unknown } | null)?.name;
 	if (typeof name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) invalid("name");
 	return name;
+}
+function parseProgressParams(params: unknown): { name: string; limit: number } {
+	if (!params || typeof params !== "object" || Array.isArray(params)) invalid("params");
+	for (const field of Object.keys(params)) if (field !== "name" && field !== "limit") invalid(field);
+	const name = parseName(params);
+	const { limit = WORK_PROGRESS_DEFAULT_LIMIT } = params as { limit?: unknown };
+	if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > WORK_PROGRESS_MAX_LIMIT)
+		invalid("limit");
+	return { name, limit };
 }
 
 function laneReportClaimHash(reportId: string, claimSeq: number): string {

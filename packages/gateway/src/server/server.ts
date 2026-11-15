@@ -44,6 +44,10 @@ import {
 	type RequestFrame,
 	reactionAllowlistDescription,
 	resolveReactionEmoji,
+	SESSION_LIST_DEFAULT_LIMIT,
+	SESSION_LIST_MAX_BOOTSTRAP_ITEMS,
+	SESSION_LIST_MAX_LIMIT,
+	SESSION_LIST_MAX_RESPONSE_BYTES,
 	validateOriginRef,
 	WORK_JOBS_DEFAULT_LIMIT,
 	WORK_JOBS_MAX_LIMIT,
@@ -75,7 +79,7 @@ import {
 	FunctionalReadiness,
 } from "../functional-readiness";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
-import { SECRET_GUARD_SYSTEM_NOTICE, SecretGuard, secretSourcesFromEnv } from "../guard/secret-guard";
+import { redactionLine, SECRET_GUARD_SYSTEM_NOTICE, SecretGuard, secretSourcesFromEnv } from "../guard/secret-guard";
 import { autolinkCorpus } from "../memory/autolink";
 import { MemoryClosureQueue } from "../memory/closure";
 import { DEFAULT_DEBLOAT_BYTE_THRESHOLD } from "../memory/debloat";
@@ -1826,6 +1830,19 @@ async function handleRequest(
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 			return;
 		}
+		case "work.progress": {
+			// Read-only: never routed through work.status's broker query or work.steer.
+			// Transcript text is lane output, so it gets the same redaction as chat.
+			const counts: Record<string, number> = {};
+			const result = await runtime.work.progress(request.params, (text) => {
+				const redaction = runtime.secretGuard.redact(text);
+				for (const [kind, count] of Object.entries(redaction.counts)) counts[kind] = (counts[kind] ?? 0) + count;
+				return redaction.text;
+			});
+			if (Object.keys(counts).length > 0) console.warn(redactionLine("work.progress", counts));
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			return;
+		}
 		case "work.directive": {
 			const result = await runtime.work.directive(request.params);
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
@@ -2032,14 +2049,48 @@ async function handleRequest(
 			});
 			return;
 		case "session.list": {
-			const sessions = options.database.bindings.sessionRows().map((row) => ({
-				origin: row.origin_ref_json ? JSON.parse(row.origin_ref_json) : LOOPBACK_ORIGIN,
-				createdAt: row.created_at,
-				lastActivityAt: row.last_activity_at,
-				epoch: row.epoch,
-				bootstrap: bootstrapProjection(row),
-			}));
-			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { sessions } });
+			// Paged and filtered in SQL before serialization (#814): the unpaged list
+			// outgrew the 1 MiB frame, so even `sessions list --limit 5` failed.
+			const value = request.params ?? {};
+			if (typeof value !== "object" || value === null || Array.isArray(value))
+				throw new ProtocolError("invalid_params", "session.list parameters must be an object");
+			const {
+				limit = SESSION_LIST_DEFAULT_LIMIT,
+				offset = 0,
+				originKey: key,
+			} = value as { limit?: unknown; offset?: unknown; originKey?: unknown };
+			if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > SESSION_LIST_MAX_LIMIT)
+				throw new ProtocolError("invalid_params", `limit must be an integer from 1 to ${SESSION_LIST_MAX_LIMIT}`);
+			if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0)
+				throw new ProtocolError("invalid_params", "offset must be a non-negative integer");
+			if (key !== undefined && (typeof key !== "string" || !key || key.length > 512))
+				throw new ProtocolError("invalid_params", "originKey must be a non-empty string");
+			const page = options.database.bindings.sessionPage({
+				limit,
+				offset,
+				...(key === undefined ? {} : { originKey: key as string }),
+			});
+			const sessions: unknown[] = [];
+			let bytes = 0;
+			for (const row of page.rows) {
+				const session = {
+					origin: row.origin_ref_json ? JSON.parse(row.origin_ref_json) : LOOPBACK_ORIGIN,
+					createdAt: row.created_at,
+					lastActivityAt: row.last_activity_at,
+					epoch: row.epoch,
+					bootstrap: bootstrapProjection(row),
+				};
+				// The frame bound holds for any limit: the page ends early at the byte budget.
+				bytes += Buffer.byteLength(JSON.stringify(session));
+				if (sessions.length > 0 && bytes > SESSION_LIST_MAX_RESPONSE_BYTES) break;
+				sessions.push(session);
+			}
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { total: page.total, offset, sessions },
+			});
 			return;
 		}
 		case "session.modelChoices": {
@@ -4463,9 +4514,10 @@ function bootstrapProjection(row: {
 	const strings = (value: string): readonly string[] => {
 		try {
 			const parsed = JSON.parse(value);
-			return Array.isArray(parsed) && parsed.every((item) => typeof item === "string")
-				? parsed
-				: ["projection_corrupt"];
+			if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === "string")) return ["projection_corrupt"];
+			// One row must stay small whatever a bootstrap recorded: count the rest, do not send it.
+			const kept = parsed.slice(0, SESSION_LIST_MAX_BOOTSTRAP_ITEMS).map((item) => utf8Prefix(item, 256));
+			return parsed.length > kept.length ? [...kept, `(${parsed.length - kept.length} more omitted)`] : kept;
 		} catch {
 			return ["projection_corrupt"];
 		}
