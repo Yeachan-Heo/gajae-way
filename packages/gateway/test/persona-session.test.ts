@@ -3087,10 +3087,13 @@ test("terminal text recovery window survives a gateway restart instead of restar
 		"terminal_ok with pending output was not held",
 	);
 	const missKey = `terminal_text_miss:${first.opRef}`;
-	expect(database!.core.metaGet(missKey)).toBeDefined();
+	const firstMissAt = database!.core.metaGet(missKey);
+	expect(firstMissAt).toBeDefined();
 
-	// Restart before the window expires. The first miss is durable, so the
-	// recovered actor continues the same window instead of starting a new one.
+	// Restart three quarters of the way through the window. The first miss is durable, so
+	// the recovered actor continues the same window; a deadline restarted on boot would
+	// still be held here and would not expire until a full window after the restart.
+	clock.offsetMs = 45_000;
 	await manager!.stop();
 	database!.close();
 	database = await Store.open(join(home, "gateway.db"));
@@ -3117,6 +3120,14 @@ test("terminal text recovery window survives a gateway restart instead of restar
 	expect(database.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
 	expect(terminal).toEqual([]);
 
+	// The restart and a further miss leave the original deadline untouched.
+	await manager.tick(KEY);
+	await eventually(() => port.statusReads.length > 0, "recovered turn did not re-check its status");
+	expect(database.core.metaGet(missKey)).toBe(firstMissAt);
+	expect(database.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
+	expect(terminal).toEqual([]);
+
+	// Past the original deadline, not merely a full window after the restart.
 	clock.offsetMs = MINUTE + 1_000;
 	await manager.tick(KEY);
 	await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "done", "window did not expire");
