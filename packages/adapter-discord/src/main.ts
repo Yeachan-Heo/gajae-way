@@ -2404,7 +2404,12 @@ export class ReconnectingGateway {
 						const watermark =
 							this.#cursors.recoveredThrough[entry.channelId] ?? this.#cursors.quarantined[entry.channelId]?.watermark;
 						if (watermark !== undefined && snowflakeIsAfter(entry.messageId, watermark)) {
-							incomplete = true;
+							// Defer behind history, but keep the same 24h clock: a channel that
+							// never converges must dead-letter instead of re-walking forever.
+							const failed = await this.noteImageFailure(entry);
+							if (isImageIntentExpired(failed))
+								await this.terminateImage(failed, "image intent unresolved for 24 hours");
+							else incomplete = true;
 							continue;
 						}
 					}

@@ -644,7 +644,27 @@ test("a truncated backfill does not let an above-horizon image overtake history"
 		await bounded(adapter.recoverMissedMessages());
 		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
 		const persisted = JSON.parse(await readFile(outboxPath, "utf8"));
-		expect(persisted).toEqual([{ messageId: id, channelId, request }]);
+		expect(persisted).toEqual([{ messageId: id, channelId, request, failureAt: expect.any(Number) }]);
+		await writeFile(
+			outboxPath,
+			JSON.stringify([{ messageId: id, channelId, request, failureAt: Date.now() - 25 * 60 * 60 * 1000 }]),
+		);
+		const expired = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async () => {
+						throw new Error("temporary history truncation");
+					},
+				},
+			}),
+			requests,
+		);
+		await bounded(expired.recoverMissedMessages());
+		expect(expired.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([
+			{ messageId: id, channelId, terminal: true, audited: true },
+		]);
 	} finally {
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });
