@@ -179,7 +179,7 @@ async function readDistTags(name: string, cwd: string): Promise<Record<string, s
 	const result = await npmOutput(["view", name, "dist-tags", "--json"], cwd);
 	if (result.code !== 0) {
 		// A package that was never published has no tags to read.
-		if (result.stderr.includes("404")) return {};
+		if (result.stderr.includes("404")) return Object.create(null);
 		throw new Error(`npm dist-tag lookup failed for ${name}: ${result.stderr || result.stdout}`);
 	}
 	let parsed: unknown;
@@ -270,8 +270,10 @@ async function resolveEffectiveTag(
 //     the pointer is converged forward (or left alone when it is already there).
 //   - the ordering is decided before every write, including the tag npm writes during
 //     `npm publish`, so no tag is moved backwards even for a moment.
-// The remaining window is a version published between the read and the write; the
-// post-write re-read detects that instead of hiding it.
+// The remaining window is a version published between the read and the write. For
+// `latest` the post-write re-read detects that through the version list; a named tag
+// has only its pointer as an ordering source, so a concurrent writer that lands in that
+// window is not seen here and the next release has to repair the pointer.
 async function resumeTag(
 	name: string,
 	version: string,
@@ -357,8 +359,12 @@ async function applyDistTag(name: string, version: string, tag: string, cwd: str
 			readFailure = verified.stderr || verified.stdout || "npm view exited non-zero with no output";
 			continue;
 		}
+		// An exit-0 read with no value is not a confirmation of the write.
+		if (!verified.stdout) {
+			readFailure = "npm view exited 0 with no version";
+			continue;
+		}
 		readFailure = undefined;
-		if (!verified.stdout) continue;
 		if (semverOrderOrThrow(verified.stdout, version, `npm dist-tag ${tag} for ${name}`) >= 0) {
 			if (verified.stdout !== version) {
 				console.log(

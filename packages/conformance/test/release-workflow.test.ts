@@ -124,6 +124,8 @@ describe("release workflow wiring", () => {
 		expect(workflow).toContain('run: bun run release:publish -- --tag "$NPM_DIST_TAG"');
 		// No fallback of any spelling can hide in the resolve step: the tag it prints is
 		// either the dispatch input or the derived value.
+		expect(workflow).toContain("- name: Resolve npm dist-tag");
+		expect(workflow).toContain("tag=$TAG");
 		const resolveStep = workflow.slice(workflow.indexOf("- name: Resolve npm dist-tag"));
 		const resolveBody = resolveStep.slice(0, resolveStep.indexOf("\n      - name:"));
 		expect(resolveBody).not.toContain("latest");

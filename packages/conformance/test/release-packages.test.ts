@@ -187,6 +187,7 @@ if (tool === "bun") {
     process.exit(0);
   }
   if (args[0] === "view" && args[2] === "dist-tags" && args[3] === "--json") {
+    if (args[1] === process.env.TAGS_EMPTY) process.exit(0);
     if (args[1] === process.env.TAGS_ERROR) {
       console.error("simulated tag-map failure");
       process.exit(1);
@@ -301,6 +302,7 @@ async function withReleaseFixture(
 		publishedVersionsAfterPublish?: Record<string, string[]>;
 		versionsError?: string;
 		tagsError?: string;
+		tagsEmpty?: string;
 	},
 	run: (fixture: {
 		root: string;
@@ -369,6 +371,7 @@ async function withReleaseFixture(
 						PUBLISHED_MARKER: publishedMarker,
 						VERSIONS_ERROR: options.versionsError ?? "",
 						TAGS_ERROR: options.tagsError ?? "",
+						TAGS_EMPTY: options.tagsEmpty ?? "",
 					},
 					stdout: "pipe",
 					stderr: "pipe",
@@ -713,9 +716,9 @@ describe("release script subprocess behavior", () => {
 		});
 	}, 30_000);
 
-	// A release that publishes while this run uploads is the documented read-to-write
-	// window: the version is already published under `latest`, and the post-publish read
-	// converges the pointer forward instead of leaving it on the older version.
+	// A release that lands while this run uploads is the documented read-to-write window:
+	// `npm publish` has already written `latest` onto this run's older version when the
+	// newer version shows up in the list, so the post-publish read converges forward.
 	test("converges latest when a newer release publishes during the upload", async () => {
 		const pkg = RELEASE_FIXTURES[0];
 		await withReleaseFixture(
@@ -841,17 +844,28 @@ describe("release script subprocess behavior", () => {
 		});
 	}, 30_000);
 
-	test("publishes a fresh version under the resolved latest tag when it is the highest", async () => {
+	test("passes an explicit latest through to npm publish when this version is the highest", async () => {
 		const pkg = RELEASE_FIXTURES[0];
 		await withReleaseFixture({ publishedVersions: { [pkg.name]: ["1.2.2"] } }, async ({ execute }) => {
 			const result = await execute("--publish", "--tag", "latest");
 			expect(result.code).toBe(0);
-			expect(
-				result.commands.some(
-					(command) =>
-						command.args[0] === "publish" && command.args.includes("--tag") && command.args.includes("latest"),
-				),
-			).toBe(true);
+			const publish = result.commands.filter(
+				(command) => command.args[0] === "publish" && command.cwd === pkg.directory,
+			);
+			expect(publish.map((command) => command.args[command.args.length - 1])).toEqual(["latest"]);
+			expect(result.commands.filter((command) => command.args[0] === "dist-tag")).toEqual([]);
+		});
+	}, 30_000);
+
+	// An exit-0 read with no body is not evidence that no tag exists, so it must not
+	// authorize a write decision.
+	test("fails closed when the tag map comes back empty", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture({ existing: [packageRef(pkg)], tagsEmpty: pkg.name }, async ({ execute }) => {
+			const result = await execute("--publish", "--tag", "next");
+			expect(result.code).not.toBe(0);
+			expect(result.output).toContain("invalid JSON");
+			expect(result.commands.some((command) => command.args[0] === "dist-tag" || command.cwd === "images")).toBe(false);
 		});
 	}, 30_000);
 
