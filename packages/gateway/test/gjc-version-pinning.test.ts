@@ -211,7 +211,7 @@ describe("GJC version pinning", () => {
 				// release refuses to borrow it.
 				expect(() => readPinnedGjcVersion(candidates, modulePath)).toThrow(layout.releaseManifest);
 				expect(() => readPinnedGjcVersion(candidates, modulePath)).toThrow(
-					`gajaeway update --bin-dir ${dirname(layout.execPath)}`,
+					`gajaeway update --force --bin-dir ${dirname(layout.execPath)}`,
 				);
 			} finally {
 				await rm(layout.root, { recursive: true, force: true });

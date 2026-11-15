@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { join } from "node:path";
 import { servicePinManifest } from "../../cli/src/services";
-import { pinnedGjcCandidatePaths } from "../../gateway/src/orchestrator/broker";
+import { isCompiledRelease, pinnedGjcCandidatePaths } from "../../gateway/src/orchestrator/broker";
 
 /**
  * `gajaeway services install|repair` installs the pin from the target release manifest, and
@@ -24,6 +24,8 @@ test("a compiled release resolves that manifest and nothing else", () => {
 	// now matches it: a release whose manifest cannot supply the pin fails closed instead of
 	// enforcing the build checkout's pin, so the installer's manifest is the whole contract.
 	const binDir = "/opt/gajaeway/bin";
+	// The module path a `bun build --compile` binary reports is Bun's virtual root.
+	expect(isCompiledRelease("/$bunfs/root/gajaeway-gateway")).toBe(true);
 	expect(pinnedGjcCandidatePaths(join(binDir, "gajaeway-gateway"), "/$bunfs/root/gajaeway-gateway")).toEqual([
 		servicePinManifest(binDir, { HOME: "/home/op" }),
 	]);
