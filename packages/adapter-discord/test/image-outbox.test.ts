@@ -156,7 +156,7 @@ describe("ImageOutbox", () => {
 
 	test("refuses a new unresolved intent past the admission bound", async () => {
 		const base = 123456789012345600n;
-		const entries = Array.from({ length: 999 }, (_, index) => ({
+		const entries = Array.from({ length: 1_000 }, (_, index) => ({
 			messageId: String(base + BigInt(index)),
 			channelId: "channel",
 		}));
@@ -166,10 +166,29 @@ describe("ImageOutbox", () => {
 		);
 		const outbox = new ImageOutbox(path);
 		await expect(outbox.put({ messageId: String(base + 2_000n), channelId: "channel" })).rejects.toThrow(
-			"unresolved or terminal intents",
+			"1000 unresolved intents",
 		);
 		// An existing intent and a terminal row are still admitted.
 		await outbox.put({ ...entries[0]!, failureAt: Date.now() });
 		await outbox.put({ messageId: String(base + 2_001n), channelId: "channel", terminal: true, audited: true });
+	});
+
+	test("terminal audit rows do not consume unresolved admission", async () => {
+		const base = 1571558400000000000n;
+		await writeFile(
+			path,
+			JSON.stringify(
+				Array.from({ length: 1_000 }, (_, index) => ({
+					messageId: String(base + BigInt(index)),
+					channelId: "channel",
+					terminal: true,
+					audited: true,
+				})),
+			),
+		);
+		const outbox = new ImageOutbox(path);
+		const pending = { messageId: String(base + 2_000n), channelId: "channel" };
+		await outbox.put(pending);
+		expect(await outbox.get(pending.messageId)).toEqual(pending);
 	});
 });

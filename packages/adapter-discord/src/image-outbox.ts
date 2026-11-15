@@ -18,12 +18,12 @@ const SNOWFLAKE = /^\d{1,20}$/;
 const TOMBSTONE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 /** Bound on retained tombstones even when their snowflakes are recent. */
 const TOMBSTONE_CAP = 1_000;
-/** Bound on every non-completed row; new intents are refused past it, never evicted. */
-const MAX_JOURNAL_IMAGES = 1_000;
+/** New unresolved intents are refused past this bound; existing intents keep retrying. */
+const MAX_UNRESOLVED_IMAGES = 1_000;
 
 export class ImageOutboxCapacityError extends Error {
 	constructor() {
-		super(`Image outbox holds ${MAX_JOURNAL_IMAGES} unresolved or terminal intents`);
+		super(`Image outbox holds ${MAX_UNRESOLVED_IMAGES} unresolved intents`);
 		this.name = "ImageOutboxCapacityError";
 	}
 }
@@ -92,9 +92,10 @@ async function readEntries(path: string): Promise<{ entries: PendingImage[]; dro
 
 /**
  * Bounds the journal on every read and write: completed tombstones by completion
- * age and count, and live/terminal rows by admission only. Terminal rows are
- * removed by watermark compaction in the caller, never by wall clock, because a
- * lagging watermark could otherwise resurrect a rejected send.
+ * age and count, and unresolved rows by admission. Terminal evidence is removed
+ * only by watermark compaction in the caller, never by wall clock, because a
+ * lagging watermark could otherwise resurrect a rejected send. Terminal rows do
+ * not consume unresolved admission: a rejected send must not deny a new image.
  */
 function pruneEntries(entries: readonly PendingImage[], now = Date.now()): PendingImage[] {
 	const kept: PendingImage[] = [];
@@ -226,7 +227,7 @@ export class ImageOutbox {
 				index === -1 &&
 				!entry.completed &&
 				!entry.terminal &&
-				pruned.filter((pending) => !pending.completed).length >= MAX_JOURNAL_IMAGES
+				pruned.filter((pending) => !pending.completed && !pending.terminal).length >= MAX_UNRESOLVED_IMAGES
 			)
 				throw new ImageOutboxCapacityError();
 			await writeEntries(this.#path, pruned);

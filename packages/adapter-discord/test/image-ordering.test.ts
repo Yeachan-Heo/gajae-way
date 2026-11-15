@@ -483,8 +483,6 @@ test("an image refused by the admission bound releases the conversation chain", 
 			Array.from({ length: 1_000 }, (_, index) => ({
 				messageId: String(base + BigInt(index)),
 				channelId,
-				terminal: true,
-				audited: true,
 				dm: true,
 			})),
 		),
@@ -504,6 +502,104 @@ test("an image refused by the admission bound releases the conversation chain", 
 		).toBe(false);
 		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
 		await bounded(adapter.waitForImage(message as never, Promise.resolve("skip")), 2_000);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a transient source-fetch failure starts the failure clock and expires", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-source-fail-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "source-fail-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 120_000);
+	await saveRecoveryCursors(cursorPath, {
+		...emptyCursors(),
+		knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+		sequence: 1,
+	});
+	await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, dm: true }]));
+	try {
+		const failing = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async () => {
+						throw new Error("temporary source failure");
+					},
+				},
+			}),
+			[],
+		);
+		await bounded(failing.recoverMissedMessages());
+		const afterFailure = JSON.parse(await readFile(outboxPath, "utf8"));
+		expect(afterFailure[0].failureAt).toEqual(expect.any(Number));
+		expect(afterFailure[0].terminal).toBeUndefined();
+		await writeFile(outboxPath, JSON.stringify([{ ...afterFailure[0], failureAt: Date.now() - 25 * 60 * 60 * 1000 }]));
+		const expired = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async () => {
+						throw new Error("temporary source failure");
+					},
+				},
+			}),
+			[],
+		);
+		await bounded(expired.recoverMissedMessages());
+		expect(expired.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([
+			{ messageId: id, channelId, terminal: true, audited: true, dm: true },
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an in-window pending image stays behind older missed history", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-inwindow-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "dm-inwindow";
+	const watermark = snowflakeFromTimestamp(Date.now() - 180_000);
+	const textId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const imageId = snowflakeFromTimestamp(Date.now() - 60_000);
+	const text = dmMessage(textId, channelId);
+	const imageMessage = dmMessage(imageId, channelId, true);
+	const request = {
+		messageId: imageId,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: watermark },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: imageId, channelId, request }]));
+		const channel = {
+			messages: {
+				fetch: async (query: string | { after?: string }) => {
+					if (typeof query === "string") return imageMessage;
+					return !query.after || BigInt(query.after) < BigInt(imageId) ? [imageMessage, text] : [];
+				},
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			textId,
+			imageId,
+		]);
 	} finally {
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });

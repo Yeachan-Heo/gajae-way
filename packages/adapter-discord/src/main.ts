@@ -1847,17 +1847,17 @@ export class ReconnectingGateway {
 				if (error instanceof DiscordImagePreparationError && error.refreshSource && !refreshed) {
 					try {
 						const channel = await this.discord.channels.fetch(channelId);
-						if (!isRecoverableChannel(channel)) return "unavailable";
+						if (!isRecoverableChannel(channel)) return this.deferImageFailure(entry);
 						const fresh: unknown = await (channel.messages as unknown as { fetch(id: string): Promise<unknown> }).fetch(
 							message.id,
 						);
-						if (!fresh || typeof fresh !== "object" || !("author" in fresh)) return "unavailable";
+						if (!fresh || typeof fresh !== "object" || !("author" in fresh)) return this.deferImageFailure(entry);
 						imageSource = fresh as DiscordInboundMessage;
 						refreshed = true;
 						attempt--;
 						continue;
 					} catch {
-						return "unavailable";
+						return this.deferImageFailure(entry);
 					}
 				}
 				if (error instanceof DiscordImagePreparationError && error.disposition === "terminal") {
@@ -1866,11 +1866,7 @@ export class ReconnectingGateway {
 				if (attempt < RECOVERY_MAX_ATTEMPTS) await this.sleep(RECOVERY_ATTEMPT_BACKOFF_MS * 2 ** (attempt - 1));
 			}
 		}
-		if (!prepared) {
-			entry = await this.noteImageFailure(entry);
-			if (isImageIntentExpired(entry)) return this.terminateImage(entry, "image intent unresolved for 24 hours");
-			return "unavailable";
-		}
+		if (!prepared) return this.deferImageFailure(entry);
 		// A refetched message can have been edited since the intent was recorded.
 		// Never downgrade a pending image to a text-only message; a source that can
 		// never carry the image again is a terminal intent, not a silent wedge.
@@ -1922,6 +1918,13 @@ export class ReconnectingGateway {
 		if (result === "acked" && notify && prepared.notice)
 			await sendDiscordInboundNotice(message, `Image processing: ${prepared.notice}`);
 		return result;
+	}
+
+	/** Record a transient failure and enforce the 24h intent deadline on every retry. */
+	private async deferImageFailure(entry: PendingImage): Promise<ImageOutcome> {
+		const failed = await this.noteImageFailure(entry);
+		if (isImageIntentExpired(failed)) return this.terminateImage(failed, "image intent unresolved for 24 hours");
+		return "unavailable";
 	}
 
 	/** Persist the first unresolved failure so a restart cannot reset the 24h clock. */
@@ -2006,13 +2009,21 @@ export class ReconnectingGateway {
 
 	/** Replay request-bearing and unaudited-terminal rows before any history gate. */
 	private async replayDurableImages(pending: readonly PendingImage[] | undefined): Promise<void> {
+		const cursors = this.#cursors;
 		for (const entry of pending ?? []) {
 			if (entry.completed) continue;
 			if (entry.terminal) {
 				if (!entry.audited) await this.retryPendingImage(entry);
 				continue;
 			}
-			if (entry.request) await this.retryPendingImage(entry);
+			if (!entry.request) continue;
+			// With a known horizon, an intent above it belongs to the upcoming history
+			// window. Sending it here would place it before older missed text; the
+			// sorted history pass delivers both. Without a horizon there is nothing to
+			// merge against, so replay directly.
+			const watermark = cursors?.recoveredThrough[entry.channelId] ?? cursors?.quarantined[entry.channelId]?.watermark;
+			if (watermark !== undefined && snowflakeIsAfter(entry.messageId, watermark)) continue;
+			await this.retryPendingImage(entry);
 		}
 	}
 
@@ -2206,7 +2217,7 @@ export class ReconnectingGateway {
 					} catch (error) {
 						if (isPermanentDiscordUnreadable(error))
 							return this.terminateImage(current, `channel unavailable: ${summarizeRecoveryFailure(error)}`);
-						return "unavailable";
+						return this.deferImageFailure(current);
 					}
 					if (!isRecoverableChannel(channel))
 						return this.terminateImage(current, "destination is no longer a recoverable channel");
@@ -2220,9 +2231,9 @@ export class ReconnectingGateway {
 					} catch (error) {
 						if (isPermanentDiscordUnreadable(error))
 							return this.terminateImage(current, `message unavailable: ${summarizeRecoveryFailure(error)}`);
-						return "unavailable";
+						return this.deferImageFailure(current);
 					}
-					if (!message || typeof message !== "object" || !("author" in message)) return "unavailable";
+					if (!message || typeof message !== "object" || !("author" in message)) return this.deferImageFailure(current);
 					inbound = message as DiscordInboundMessage;
 				}
 				const engagement = decideInbound(inbound, this.getBotUser(), this.config.channels);
