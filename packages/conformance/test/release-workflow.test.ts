@@ -5,6 +5,7 @@
 // packages/ because CI runs `bun test packages/` and `biome ci packages/`.
 import { describe, expect, test } from "bun:test";
 import { resolveReleaseDistTag } from "../../../scripts/release-dist-tag";
+import { RELEASE_ORDER } from "../../../scripts/release-packages";
 
 const WORKFLOW_URL = new URL("../../../.github/workflows/release.yml", import.meta.url);
 
@@ -47,7 +48,16 @@ describe("release dist-tag resolution", () => {
 		]);
 		expect(await derived.exited).toBe(0);
 		expect(stderr).toBe("");
-		expect(stdout.trim()).toBe("latest");
+		// Derive the expectation from the checked-out versions: hardcoding "latest"
+		// would fail on the first prerelease bump, which is the case this protects.
+		const versions: string[] = [];
+		for (const packageDirectory of RELEASE_ORDER) {
+			const manifest = await Bun.file(
+				new URL(`../../../packages/${packageDirectory}/package.json`, import.meta.url),
+			).json();
+			versions.push(manifest.version);
+		}
+		expect(stdout.trim()).toBe(resolveReleaseDistTag("", versions));
 	});
 
 	test("the CLI fails instead of deriving when --requested has no value", async () => {
@@ -69,7 +79,8 @@ describe("release workflow wiring", () => {
 	test("publishes with the resolved dist-tag instead of a latest fallback", async () => {
 		const workflow = await releaseWorkflow();
 		expect(workflow).toContain('bun scripts/release-dist-tag.ts --requested "$NPM_TAG_INPUT"');
-		expect(workflow).toMatch(/run: bun run release:publish -- --tag "\$\{\{ steps\.dist-tag\.outputs\.tag \}\}"/);
+		expect(workflow).toMatch(/NPM_DIST_TAG: \$\{\{ steps\.dist-tag\.outputs\.tag \}\}/);
+		expect(workflow).toContain('run: bun run release:publish -- --tag "$NPM_DIST_TAG"');
 		expect(workflow).not.toContain('if [ -z "$TAG" ]; then TAG="latest"; fi');
 	});
 

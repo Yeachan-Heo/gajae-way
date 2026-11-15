@@ -20,9 +20,10 @@ on:
 # distinct tags never displace each other.
 #
 # Cross-tag ordering of dist-tag writes is enforced by the script, not by GitHub: a
-# resumed release refuses to move `latest` below the highest published stable
-# version, and the post-write read fails the run if another release moved the tag
-# meanwhile.
+# write never moves a tag backwards (a tag a newer release already moved is left
+# alone so its own GitHub release still gets created), `latest` is ordered by the
+# published version list rather than the tag pointer, and the post-write read fails
+# the run if another release moved the tag this run just wrote.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -96,7 +97,9 @@ jobs:
           echo "Publishing with npm dist-tag $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
       - name: Publish protocol, images, sdk, cli (dependency order)
-        run: bun run release:publish -- --tag "${{ steps.dist-tag.outputs.tag }}"
+        env:
+          NPM_DIST_TAG: ${{ steps.dist-tag.outputs.tag }}
+        run: bun run release:publish -- --tag "$NPM_DIST_TAG"
 
   build-binaries:
     name: build-${{ matrix.platform }}-${{ matrix.arch }}

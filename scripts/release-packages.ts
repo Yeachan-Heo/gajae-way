@@ -114,6 +114,9 @@ export async function checkNpmRegistry(
 async function readPublishedVersions(name: string, cwd: string): Promise<string[]> {
 	const result = await npmOutput(["view", name, "versions", "--json"], cwd);
 	if (result.code !== 0) {
+		// A package that has never been published is the normal first-release case, and
+		// npm answers the versions lookup with the same 404 as the metadata check.
+		if (result.stderr.includes("404")) return [];
 		throw new Error(`npm published-version lookup failed for ${name}: ${result.stderr || result.stdout}`);
 	}
 	let parsed: unknown;
@@ -128,13 +131,15 @@ async function readPublishedVersions(name: string, cwd: string): Promise<string[
 	return parsed;
 }
 
-// Guard the `latest` pointer with the registry's published version list. A stale
-// `npm view <name>@latest version` read (1.2.2 while the tag really is 1.3.0) then
-// cannot authorize a backwards write, because 1.3.0 is in the versions list and the
-// write is refused. A version published between this read and the write is the
-// remaining registry-side race; `npm dist-tag add` has no compare-and-set, and the
-// post-write re-read reports that outcome instead of hiding it.
-async function assertLatestStaysAtHighestPublished(name: string, version: string, cwd: string): Promise<void> {
+// `latest` is ordered content, not a pointer: only the highest published stable
+// version may hold it. Reading the version list instead of the tag pointer is what
+// stops an old release rerun from writing a stale pointer backwards. It is still a
+// read before an unconditional `npm dist-tag add` (npm has no compare-and-set), so a
+// version published between the read and the write can still land out of order; the
+// post-write re-read reports that instead of hiding it. The version list and the
+// dist-tag pointer come from the same registry document, so a cache stale for one can
+// be stale for the other; what this removes is trusting the mutable pointer.
+async function latestTarget(name: string, version: string, cwd: string): Promise<string> {
 	const published = await readPublishedVersions(name, cwd);
 	let highest: string | undefined;
 	try {
@@ -142,13 +147,9 @@ async function assertLatestStaysAtHighestPublished(name: string, version: string
 	} catch {
 		throw new Error(`npm published-version list for ${name} contains an unparseable version: ${published.join(", ")}`);
 	}
-	if (highest === undefined) return;
-	if (Bun.semver.order(highest, version) > 0) {
-		throw new Error(
-			`refusing to point ${name}@latest at ${version}: the registry already publishes ${highest}. ` +
-				`The dist-tag pointer can be stale, so only the highest published stable version may move latest.`,
-		);
-	}
+	if (highest === undefined) return version;
+	if (Bun.semver.order(highest, version) > 0) return highest;
+	return version;
 }
 
 async function npmOutput(args: string[], cwd: string): Promise<{ stdout: string; stderr: string; code: number }> {
@@ -166,20 +167,20 @@ async function npmOutput(args: string[], cwd: string): Promise<{ stdout: string;
 // resolved with npm's own precedence (--tag, then the packed publishConfig.tag, then
 // `npm config get tag`, run from the same cwd npm publish uses) and then applied
 // explicitly. release.yml resolves --tag from the release content, so the fallbacks
-// and the prerelease guard only run for interactive releases. The backwards refusal
-// is unconditional: a release that must move a tag backwards needs a manual
-// `npm dist-tag add`.
+// and the prerelease guard only run for interactive releases.
 //
-// `npm dist-tag add` has no conditional form. The tag pointer read below can be stale
-// (npm serves dist-tags from a cache), and authorizing a write from it lets an old
-// release rerun move `latest` backwards after a newer release published. So `latest`
-// is additionally authorized from the published version list, which is ordered
-// content rather than a mutable pointer: `latest` may only be moved by the highest
-// published stable version. Concurrent tagged releases are no longer serialized by a
-// single workflow concurrency group, because that group dropped pending releases; the
-// published-version guard is what keeps two of them from landing out of order. The
-// post-write re-read is detection, not a second lock, and cannot see a writer that
-// lands after it.
+// Publishing immutable content and moving a dist-tag are separate concerns, and only
+// the pointer move is order-sensitive: an already-published version must not fail its
+// release because a newer release holds the tag, or the tagged GitHub release would
+// never be created. Every write is still a read followed by an unconditional
+// `npm dist-tag add` (npm has no compare-and-set), so ordering rests on two rules:
+//   - a tag that already points past this version is left alone, never moved back;
+//   - `latest` is derived from the published version list, not from the tag pointer,
+//     so a stale `latest` read cannot authorize a backwards write. When a newer
+//     stable version is published, the pointer is converged forward (or left alone
+//     when it is already there) and this release continues.
+// The remaining window is a version published between the read and the write; the
+// post-write re-read reports that instead of hiding it.
 async function resumeTag(
 	name: string,
 	version: string,
@@ -215,12 +216,13 @@ async function resumeTag(
 	if (current.code !== 0 && !current.stderr.includes("404")) {
 		throw new Error(`npm dist-tag lookup failed for ${name}@${effectiveTag}: ${current.stderr || current.stdout}`);
 	}
-	if (current.code === 0) {
-		if (!current.stdout) throw new Error(`npm dist-tag lookup returned an empty version for ${name}@${effectiveTag}`);
-		if (current.stdout === version) {
-			console.log(`\n${name}@${version} already has dist-tag ${effectiveTag}.`);
-			return;
-		}
+	if (current.code === 0 && !current.stdout) {
+		throw new Error(`npm dist-tag lookup returned an empty version for ${name}@${effectiveTag}`);
+	}
+	const currentVersion = current.code === 0 ? current.stdout : undefined;
+	if (currentVersion === version) {
+		console.log(`\n${name}@${version} already has dist-tag ${effectiveTag}.`);
+		return;
 	}
 
 	// Only refuse the implicit promotion when it would move the tag: a prerelease that
@@ -228,21 +230,49 @@ async function resumeTag(
 	if (!tag && effectiveTag === "latest" && isPrereleaseVersion(version)) {
 		throw new Error(`refusing to implicitly tag prerelease ${name}@${version} as latest; specify --tag explicitly`);
 	}
-	if (current.code === 0) {
+	if (currentVersion !== undefined) {
 		let order: number;
 		try {
-			order = Bun.semver.order(current.stdout, version);
+			order = Bun.semver.order(currentVersion, version);
 		} catch {
-			throw new Error(`npm dist-tag ${effectiveTag} for ${name} points at an unparseable version: ${current.stdout}`);
+			throw new Error(`npm dist-tag ${effectiveTag} for ${name} points at an unparseable version: ${currentVersion}`);
 		}
 		if (order > 0) {
-			throw new Error(`refusing to move ${name}@${effectiveTag} backwards from ${current.stdout} to ${version}`);
+			// A newer release already moved this tag. Moving it back is never allowed, and
+			// failing would strand this tag's already-published version, because the GitHub
+			// release still has to be created. Leave the pointer alone and finish the release.
+			console.log(
+				`\n${name}@${effectiveTag} already points at ${currentVersion}; leaving it instead of moving it back to ${version}.`,
+			);
+			return;
 		}
 	}
-	if (effectiveTag === "latest") await assertLatestStaysAtHighestPublished(name, version, cwd);
+	if (effectiveTag === "latest") {
+		const target = await latestTarget(name, version, cwd);
+		if (target !== version) {
+			console.log(`\n${name}@latest stays with ${target}; ${version} is published but older.`);
+			if (currentVersion === undefined) {
+				await applyDistTag(name, target, effectiveTag, cwd);
+			} else if (semverOrder(currentVersion, target, effectiveTag, name) < 0) {
+				await applyDistTag(name, target, effectiveTag, cwd);
+			}
+			return;
+		}
+	}
+	await applyDistTag(name, version, effectiveTag, cwd);
+}
 
+function semverOrder(left: string, right: string, tag: string, name: string): number {
 	try {
-		await run(["npm", "dist-tag", "add", `${name}@${version}`, effectiveTag], cwd);
+		return Bun.semver.order(left, right);
+	} catch {
+		throw new Error(`npm dist-tag ${tag} for ${name} points at an unparseable version: ${left}`);
+	}
+}
+
+async function applyDistTag(name: string, version: string, tag: string, cwd: string): Promise<void> {
+	try {
+		await run(["npm", "dist-tag", "add", `${name}@${version}`, tag], cwd);
 	} catch (error) {
 		throw new Error(
 			`npm dist-tag update failed for ${name}@${version}. OIDC requires npm 11.21.0+ (11.x) or 12.2.0+ (12.x) and "Allow npm dist-tag" on this package's trusted publisher.`,
@@ -260,7 +290,7 @@ async function resumeTag(
 	let readFailure: string | undefined;
 	for (let attempt = 0; attempt < 3; attempt++) {
 		if (attempt > 0) await Bun.sleep(1_000);
-		const verified = await npmOutput(["view", `${name}@${effectiveTag}`, "version"], cwd);
+		const verified = await npmOutput(["view", `${name}@${tag}`, "version"], cwd);
 		if (verified.code !== 0) {
 			readFailure = verified.stderr || verified.stdout || "npm view exited non-zero with no output";
 			continue;
@@ -270,10 +300,10 @@ async function resumeTag(
 		observed = verified.stdout || "nothing";
 	}
 	if (readFailure !== undefined) {
-		throw new Error(`npm dist-tag verification failed for ${name}@${effectiveTag}: ${readFailure}`);
+		throw new Error(`npm dist-tag verification failed for ${name}@${tag}: ${readFailure}`);
 	}
 	throw new Error(
-		`dist-tag ${effectiveTag} for ${name} resolves to ${observed} after writing ${version}; a concurrent release moved it`,
+		`dist-tag ${tag} for ${name} resolves to ${observed} after writing ${version}; a concurrent release moved it`,
 	);
 }
 
@@ -310,13 +340,20 @@ async function main(): Promise<void> {
 			} else if (registryCheck.error) {
 				throw new Error(`registry check failed for ${packageName}@${packageVersion}: ${registryCheck.error}`);
 			} else {
-				// A concurrent tagged release can publish a newer version while this one is
-				// starting; publishing an older version with `--tag latest` would then move the
-				// tag backwards. Apply the same published-version ordering as the resume path.
-				if (tag === "latest") await assertLatestStaysAtHighestPublished(packageName, packageVersion, dir);
 				const publishCmd = ["npm", "publish", tarball, "--access", "public"];
 				if (tag) publishCmd.push("--tag", tag);
 				await run(publishCmd, dir);
+				// `npm publish --tag latest` moves the pointer itself, and distinct tagged
+				// releases can now run concurrently, so an older version may reach this point
+				// after a newer stable version was published. Converge the pointer forward
+				// instead of leaving latest on the older version.
+				if (tag === "latest") {
+					const target = await latestTarget(packageName, packageVersion, dir);
+					if (target !== packageVersion) {
+						console.log(`\n${packageName}@latest stays with ${target}; ${packageVersion} was published but is older.`);
+						await applyDistTag(packageName, target, "latest", dir);
+					}
+				}
 			}
 		}
 	}

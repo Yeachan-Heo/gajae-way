@@ -174,6 +174,10 @@ if (tool === "bun") {
     const versions = overrides[name] ?? JSON.parse(process.env.EXISTING_PACKAGES)
       .filter((ref) => ref.startsWith(name + "@"))
       .map((ref) => ref.slice(name.length + 1));
+    if (versions.length === 0) {
+      console.error("404 Not Found");
+      process.exit(1);
+    }
     console.log(JSON.stringify(versions));
     process.exit(0);
   }
@@ -536,28 +540,28 @@ describe("release script subprocess behavior", () => {
 		});
 	}, 30_000);
 
-	test("rejects a newer tag without mutation or publishing subsequent packages", async () => {
+	// A newer release already moved this tag. Moving it back is never allowed, but
+	// failing would strand this tag's published version and skip its GitHub release, so
+	// the run leaves the pointer alone and finishes the remaining packages.
+	test("leaves a tag that a newer release already moved and finishes the release", async () => {
 		const pkg = RELEASE_FIXTURES[0];
 		await withReleaseFixture(
 			{ existing: [packageRef(pkg)], tags: { [`${pkg.name}@next`]: "1.3.0" } },
 			async ({ execute }) => {
 				const result = await execute("--publish", "--tag", "next");
-				expect(result.code).not.toBe(0);
-				expect(result.output).toContain("1.3.0");
-				expect(
-					result.commands.some(
-						(command) => command.args[0] === "dist-tag" || command.args[0] === "publish" || command.cwd === "images",
-					),
-				).toBe(false);
+				expect(result.code).toBe(0);
+				expect(result.output).toContain("leaving it instead of moving it back");
+				expect(result.commands.filter((command) => command.args[0] === "dist-tag")).toEqual([]);
+				expect(result.commands.some((command) => command.cwd === "images")).toBe(true);
 			},
 		);
 	}, 30_000);
 
 	// A rerun of an older release can read a cached dist-tag that still points at the
-	// previous version while a newer release has already published and moved latest.
-	// The published version list is what authorizes the write, so that rerun must fail
-	// instead of moving latest backwards.
-	test("ignores a stale latest read when a newer stable version is published", async () => {
+	// previous version while a newer release has already published 1.3.0. The published
+	// version list orders the write, so the pointer is converged forward and the older
+	// version is never written to latest.
+	test("converges a stale latest read forward to the newest published stable version", async () => {
 		const pkg = RELEASE_FIXTURES[0];
 		await withReleaseFixture(
 			{
@@ -567,17 +571,17 @@ describe("release script subprocess behavior", () => {
 			},
 			async ({ execute }) => {
 				const result = await execute("--publish");
-				expect(result.code).not.toBe(0);
-				expect(result.output).toContain("1.3.0");
-				expect(result.output).toContain("highest published stable version");
-				expect(result.commands.some((command) => command.args[0] === "dist-tag" || command.cwd === "images")).toBe(
-					false,
-				);
+				expect(result.code).toBe(0);
+				expect(result.output).toContain("stays with 1.3.0");
+				expect(
+					result.commands.filter((command) => command.args[0] === "dist-tag").map((command) => command.args),
+				).toEqual([["dist-tag", "add", `${pkg.name}@1.3.0`, "latest"]]);
+				expect(result.commands.some((command) => command.cwd === "images")).toBe(true);
 			},
 		);
 	}, 30_000);
 
-	test("moves latest to the highest published stable version", async () => {
+	test("does not treat a published prerelease as blocking latest", async () => {
 		const pkg = RELEASE_FIXTURES[0];
 		await withReleaseFixture(
 			{
@@ -595,13 +599,29 @@ describe("release script subprocess behavior", () => {
 		);
 	}, 30_000);
 
-	test("refuses to publish an older version as latest", async () => {
+	// Publishing immutable content must not be blocked by the pointer: the version is
+	// published and the older version's run converges latest to the newer release.
+	test("publishes a new older version and converges latest forward", async () => {
 		const pkg = RELEASE_FIXTURES[0];
 		await withReleaseFixture({ publishedVersions: { [pkg.name]: ["1.2.2", "1.3.0"] } }, async ({ execute }) => {
 			const result = await execute("--publish", "--tag", "latest");
-			expect(result.code).not.toBe(0);
-			expect(result.output).toContain("1.3.0");
-			expect(result.commands.some((command) => command.args[0] === "publish" || command.cwd === "images")).toBe(false);
+			expect(result.code).toBe(0);
+			expect(result.output).toContain("stays with 1.3.0");
+			const npm = result.commands.filter((command) => command.tool === "npm");
+			expect(npm.some((command) => command.args[0] === "publish" && command.args.includes("--tag"))).toBe(true);
+			expect(npm.filter((command) => command.args[0] === "dist-tag").map((command) => command.args)).toEqual([
+				["dist-tag", "add", `${pkg.name}@1.3.0`, "latest"],
+			]);
+		});
+	}, 30_000);
+
+	test("treats a 404 version list as a package that has never been published", async () => {
+		await withReleaseFixture({}, async ({ execute }) => {
+			const result = await execute("--publish", "--tag", "latest");
+			expect(result.code).toBe(0);
+			expect(result.output).not.toContain("published-version lookup failed");
+			expect(result.commands.filter((command) => command.args[0] === "publish")).toHaveLength(RELEASE_FIXTURES.length);
+			expect(result.commands.filter((command) => command.args[0] === "dist-tag")).toEqual([]);
 		});
 	}, 30_000);
 
