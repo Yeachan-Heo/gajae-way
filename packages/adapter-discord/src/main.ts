@@ -41,7 +41,7 @@ import {
 	type StatusReactionsMode,
 } from "./config";
 import { GatewayDownAlarm, lastLogLine } from "./down-alert";
-import { ImageOutbox, type PendingImage } from "./image-outbox";
+import { ImageOutbox, ImageOutboxCapacityError, type PendingImage } from "./image-outbox";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
 import { loadDiscordMedia, parseDiscordMedia } from "./outgoing-attachments";
 import {
@@ -1813,7 +1813,13 @@ export class ReconnectingGateway {
 		let entry = await this.#imageOutbox.get(message.id);
 		if (!entry) {
 			entry = { messageId: message.id, channelId, ...(sourceOrigin.kind === "dm" ? { dm: true } : {}) };
-			await this.#imageOutbox.put(entry);
+			try {
+				await this.#imageOutbox.put(entry);
+			} catch (error) {
+				if (!(error instanceof ImageOutboxCapacityError)) throw error;
+				await this.rejectImageForCapacity(message.id, channelId);
+				return "skip";
+			}
 		}
 		// Best-effort: the durable outbox already makes this channel discoverable.
 		// A failing cursor store must not silence the DM's image while text flows.
@@ -1935,6 +1941,34 @@ export class ReconnectingGateway {
 	}
 
 	/**
+	 * Releases a message refused by admission before any intent existed. There is
+	 * no row to make terminal, so the dead letter is the durable diagnosis and the
+	 * waiter must be released here; otherwise the ordered ingress chain holds every
+	 * later message in the conversation forever.
+	 */
+	private async rejectImageForCapacity(messageId: string, channelId: string): Promise<void> {
+		await this.ensureCursors();
+		if (this.#cursors) {
+			this.deadLetter({
+				messageId,
+				conversationId: channelId,
+				classification: "terminal-message",
+				attempts: 1,
+				at: new Date().toISOString(),
+				summary: "image outbox admission bound reached; no intent was persisted",
+			});
+			this.forgetAttempts(messageId);
+			await this.cursorsFlushed;
+		}
+		this.#imageDone.add(messageId);
+		if (this.#imageDone.size > 10_000) this.#imageDone.delete(this.#imageDone.values().next().value as string);
+		this.cleanupImageState(messageId);
+		console.error(
+			`Discord image rejected message=${messageId} channel=${channelId}: outbox admission bound reached; dead-lettered without persistence so ingress is released.`,
+		);
+	}
+
+	/**
 	 * Durably records a rejected image intent, then releases its waiters. The
 	 * dead-letter write is best-effort: the terminal outbox state is what stops the
 	 * resend, so an unusable cursor store must not pin the conversation forever.
@@ -1973,8 +2007,12 @@ export class ReconnectingGateway {
 	/** Replay request-bearing and unaudited-terminal rows before any history gate. */
 	private async replayDurableImages(pending: readonly PendingImage[] | undefined): Promise<void> {
 		for (const entry of pending ?? []) {
-			if (entry.completed || (!entry.request && !entry.terminal)) continue;
-			await this.retryPendingImage(entry);
+			if (entry.completed) continue;
+			if (entry.terminal) {
+				if (!entry.audited) await this.retryPendingImage(entry);
+				continue;
+			}
+			if (entry.request) await this.retryPendingImage(entry);
 		}
 	}
 
@@ -2353,7 +2391,6 @@ export class ReconnectingGateway {
 				}
 			}
 			this.persist(retainRecoveryCursors(this.#cursors, this.#recoverableIds));
-			await this.compactTerminalImages();
 			completed = !incomplete;
 		} catch (error) {
 			console.error(
@@ -2373,6 +2410,10 @@ export class ReconnectingGateway {
 			// A resolved pass means its progress is on disk. Persists stay fire-and-forget
 			// during the pass, then the pass joins the chain before reporting completion.
 			await this.cursorsFlushed;
+			// Compact only below the watermark that is now durable. Otherwise a crash
+			// could restore an older watermark after the terminal evidence is gone,
+			// resurrecting a rejected intent on the next rewalk.
+			if (!this.#cursorSaveFault) await this.compactTerminalImages();
 		}
 	}
 

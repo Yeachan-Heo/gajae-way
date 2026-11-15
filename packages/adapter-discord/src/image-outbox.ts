@@ -161,6 +161,7 @@ export class ImageOutbox {
 		const result = this.#pending.then(operation).catch((error: unknown) => {
 			this.#entries = undefined;
 			this.#index = undefined;
+			if (error instanceof ImageOutboxCapacityError) throw error;
 			// Do not log error messages: callers may have supplied sensitive payloads.
 			const code =
 				typeof error === "object" &&

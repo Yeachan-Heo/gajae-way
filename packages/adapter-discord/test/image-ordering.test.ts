@@ -469,6 +469,47 @@ test("an intent unacknowledged for 24 hours is dead-lettered instead of wedging 
 	}
 }, 12_000);
 
+test("an image refused by the admission bound releases the conversation chain", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-capacity-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	await saveRecoveryCursors(cursorPath, emptyCursors());
+	const channelId = "capacity-dm";
+	const base = 1571558400000000000n;
+	await writeFile(
+		outboxPath,
+		JSON.stringify(
+			Array.from({ length: 1_000 }, (_, index) => ({
+				messageId: String(base + BigInt(index)),
+				channelId,
+				terminal: true,
+				audited: true,
+				dm: true,
+			})),
+		),
+	);
+	try {
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		const id = String(base + 10_000n);
+		const message = dmMessage(id, channelId, true);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("skip");
+		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
+		expect(adapter.deadLetters[0]!.summary).toContain("admission bound");
+		expect(
+			JSON.parse(await readFile(outboxPath, "utf8")).some((entry: { messageId: string }) => entry.messageId === id),
+		).toBe(false);
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		await bounded(adapter.waitForImage(message as never, Promise.resolve("skip")), 2_000);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
 test("a persisted image request replays even when the recovery cursor is unreadable", async () => {
 	const home = await mkdtemp(join(tmpdir(), "discord-image-order-cursor-read-"));
 	const cleanupTimers = trackTimers();
