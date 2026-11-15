@@ -63,12 +63,15 @@ jobs:
   canonical-tag:
     name: require a canonical release tag
     # Concurrency groups are matched case-insensitively, so a tag differing only in case
-    # (`v1.2.3-RC.1` vs `v1.2.3-rc.1`) would share this ref's serialization group and
-    # could displace a pending release. Reject the variant before anything is published.
-    if: github.ref_type == 'tag'
+    # (`v1.2.3-RC.1` vs `v1.2.3-rc.1`) shares this ref's serialization group. The variant
+    # is rejected here so it can never publish into that group. The job itself stays
+    # unconditional: a job-level `if` would make `needs` skip publishing for a branch
+    # dispatch, which is a documented way to release, and the workflow would report
+    # success with nothing published.
     runs-on: ubuntu-24.04
     steps:
       - name: require lowercase tag
+        if: github.ref_type == 'tag'
         run: |
           if [ "$GITHUB_REF_NAME" != "$(printf '%s' "$GITHUB_REF_NAME" | tr '[:upper:]' '[:lower:]')" ]; then
             echo "::error::release tags must be lowercase; got $GITHUB_REF_NAME"

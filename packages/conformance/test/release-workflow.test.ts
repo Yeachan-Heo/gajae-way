@@ -168,12 +168,17 @@ describe("release workflow wiring", () => {
 		expect(workflow).toMatch(/npm_tag:[\s\S]*?default: ""/);
 	});
 
-	test("rejects a case-variant tag before it can share the ref's concurrency group", async () => {
+	test("rejects a case-variant tag without skipping a branch dispatch", async () => {
 		const workflow = await releaseWorkflow();
-		expect(workflow).toMatch(/^ {2}canonical-tag:$/m);
-		expect(workflow).toContain("tr '[:upper:]' '[:lower:]'");
-		expect(workflow).toContain("release tags must be lowercase");
-		// Publishing must be gated by the casing check, not only by the build.
+		const job = workflow.slice(workflow.indexOf("  canonical-tag:"));
+		const body = job.slice(0, job.indexOf("\n  publish-npm:"));
+		// The casing check must be a step condition: a job-level `if` would make `needs`
+		// skip publishing for a branch dispatch, which is a supported way to release.
+		expect(body).not.toMatch(/^ {4}if:/m);
+		expect(body).toContain("if: github.ref_type == 'tag'");
+		expect(body).toContain("tr '[:upper:]' '[:lower:]'");
+		expect(body).toContain("release tags must be lowercase");
+		// Publishing must be gated by the check, not only by the build.
 		expect(workflow).toMatch(/needs: \[verify, canonical-tag\]/);
 	});
 
