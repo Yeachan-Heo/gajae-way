@@ -150,6 +150,14 @@ if (tool === "bun") {
     }
     const tags = JSON.parse(readFileSync(process.env.TAG_STATE, "utf8"));
     if (Object.hasOwn(tags, args[1])) {
+      const stale = JSON.parse(readFileSync(process.env.STALE_STATE, "utf8"));
+      if (Object.hasOwn(stale, args[1])) {
+        const value = stale[args[1]];
+        delete stale[args[1]];
+        writeFileSync(process.env.STALE_STATE, JSON.stringify(stale));
+        console.log(value);
+        process.exit(0);
+      }
       console.log(tags[args[1]]);
       process.exit(0);
     }
@@ -203,6 +211,7 @@ async function withReleaseFixture(
 		publishTags?: Record<string, string>;
 		versions?: Record<string, string>;
 		interleave?: string;
+		staleVerification?: Record<string, string>;
 	},
 	run: (fixture: {
 		root: string;
@@ -243,6 +252,8 @@ async function withReleaseFixture(
 		await writeFile(log, "");
 		const tagState = join(root, "tags.json");
 		await writeFile(tagState, JSON.stringify(options.tags ?? {}));
+		const staleState = join(root, "stale.json");
+		await writeFile(staleState, JSON.stringify(options.staleVerification ?? {}));
 		await run({
 			root,
 			execute: async (...args) => {
@@ -259,6 +270,7 @@ async function withReleaseFixture(
 						DIST_TAG_ERROR: options.distTagError ?? "",
 						PUBLISH_ERROR: options.publishError ?? "",
 						TAG_STATE: tagState,
+						STALE_STATE: staleState,
 						CONFIG_TAG: options.configTag ?? "latest",
 						CONFIG_ERROR: options.configError ? "1" : "",
 						INTERLEAVE_VERSION: options.interleave ?? "",
@@ -529,6 +541,23 @@ describe("release script subprocess behavior", () => {
 			expect(result.output).toContain("1.2.4");
 			expect(result.commands.some((command) => command.cwd === "images" || command.args[0] === "publish")).toBe(false);
 		});
+	}, 30_000);
+
+	test("re-reads a lagging registry instead of calling it a concurrent move", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{ existing: [packageRef(pkg)], staleVerification: { [`${pkg.name}@next`]: "1.2.2" } },
+			async ({ execute }) => {
+				const result = await execute("--publish", "--tag", "next");
+				expect(result.code).toBe(0);
+				expect(result.output).not.toContain("concurrent release");
+				// The retry re-reads; it must never issue a second unconditional write.
+				expect(result.commands.filter((command) => command.args[0] === "dist-tag")).toHaveLength(1);
+				expect(
+					result.commands.filter((command) => command.args[0] === "view" && command.args[1] === `${pkg.name}@next`),
+				).toHaveLength(3);
+			},
+		);
 	}, 30_000);
 
 	test("refuses an option-shaped publishConfig tag instead of passing it to npm", async () => {

@@ -111,14 +111,14 @@ async function npmOutput(args: string[], cwd: string): Promise<{ stdout: string;
 // resolved with npm's own precedence (--tag, then the packed publishConfig.tag, then
 // `npm config get tag`, run from the same cwd npm publish uses) and then applied
 // explicitly. release.yml always passes --tag, so the fallbacks and the prerelease
-// guard only run for interactive releases; `--tag` is also the escape hatch when a
-// tag must deliberately move backwards.
+// guard only run for interactive releases. The backwards refusal is unconditional: a
+// release that must move a tag backwards needs a manual `npm dist-tag add`.
 //
 // `npm dist-tag add` has no conditional form, so the checks below read the tag and
 // then write it: they protect against a tag that was already ahead, not against a
-// writer that lands between the read and the write. Release runs are serialized by
-// release.yml's concurrency group, which is what keeps that window closed for the
-// only writers npm has here.
+// writer that lands between the read and the write. release.yml's concurrency group is
+// what serializes the CI writers; the post-write re-read is detection, not a second
+// lock, and cannot see a writer that lands after it.
 async function resumeTag(
 	name: string,
 	version: string,
@@ -141,10 +141,13 @@ async function resumeTag(
 	// config are package-controlled data: a tag such as "--force" would be consumed by
 	// npm as an option, so the command would mutate a different tag than the one checked
 	// here. Reject the shape rather than pass it as a positional argument.
-	if (!effectiveTag || effectiveTag.startsWith("-") || /\s/.test(effectiveTag)) {
+	if (effectiveTag.startsWith("-")) {
 		throw new Error(
 			`refusing to use dist-tag ${JSON.stringify(effectiveTag)} for ${name}: npm would parse it as an option`,
 		);
+	}
+	if (/\s/.test(effectiveTag)) {
+		throw new Error(`refusing to use dist-tag ${JSON.stringify(effectiveTag)} for ${name}: it contains whitespace`);
 	}
 
 	const current = await npmOutput(["view", `${name}@${effectiveTag}`, "version"], cwd);
@@ -187,14 +190,24 @@ async function resumeTag(
 
 	// The write is the last chance to notice an interleaved release: if a concurrent run
 	// moved the tag after our read, npm accepts our write and ours accepts theirs in
-	// whichever order they land. Re-read so the release fails on a tag that did not end
-	// up where this run put it instead of reporting success.
-	const verified = await npmOutput(["view", `${name}@${effectiveTag}`, "version"], cwd);
-	if (verified.code !== 0 || verified.stdout !== version) {
-		throw new Error(
-			`dist-tag ${effectiveTag} for ${name} resolves to ${verified.stdout || "nothing"} after writing ${version}; a concurrent release moved it`,
-		);
+	// whichever order they land. Re-read until the registry reflects the write, then give
+	// up loudly. Never re-write here: a second unconditional write could win by
+	// repetition and clobber a genuinely newer tag.
+	let observed = "nothing";
+	for (let attempt = 0; attempt < 3; attempt++) {
+		if (attempt > 0) await Bun.sleep(1_000);
+		const verified = await npmOutput(["view", `${name}@${effectiveTag}`, "version"], cwd);
+		if (verified.code !== 0) {
+			throw new Error(
+				`npm dist-tag verification failed for ${name}@${effectiveTag}: ${verified.stderr || verified.stdout}`,
+			);
+		}
+		if (verified.stdout === version) return;
+		observed = verified.stdout || "nothing";
 	}
+	throw new Error(
+		`dist-tag ${effectiveTag} for ${name} resolves to ${observed} after writing ${version}; a concurrent release moved it`,
+	);
 }
 
 async function main(): Promise<void> {

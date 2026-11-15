@@ -13,8 +13,9 @@ on:
 
 # A tag push and a manual dispatch can overlap. `npm dist-tag add` has no
 # conditional form, so two runs could each read a tag, then write it in the
-# wrong order and point it backwards. Serialize release runs instead of
-# dropping either: a queued run keeps its own tag input.
+# wrong order and point it backwards. Serialize them instead: GitHub keeps one
+# running and one pending run per group, and a third supersedes the pending one.
+# A superseded release loses nothing because the script is resumable.
 concurrency:
   group: release
   cancel-in-progress: false
