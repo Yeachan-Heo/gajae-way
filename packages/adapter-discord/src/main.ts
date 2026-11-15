@@ -2324,11 +2324,14 @@ export class ReconnectingGateway {
 					"Discord image outbox unavailable; image recovery is paused while unrelated text recovery continues.",
 				);
 			}
+			// Load the cursor state before replay so an above-horizon intent can wait
+			// for the sorted history pass instead of overtaking older missed text. A
+			// failed load leaves it undefined and still replays every durable intent.
+			await this.ensureCursors();
 			// The durable image consumer is independent of history recovery: an exact
 			// persisted request needs neither the cursor nor a history read, and a live
 			// image was admitted ahead of history in the first place.
 			await this.replayDurableImages(pendingImages);
-			await this.ensureCursors();
 			if (!this.#cursors) {
 				console.error(
 					`Discord recovery refused: cursor store ${this.recoveryCursorPath} is unusable (${this.#cursorFault ?? "unknown error"}); durable image intents were replayed, retrying history with backoff.`,
@@ -2395,6 +2398,16 @@ export class ReconnectingGateway {
 				} else if (entry.terminal) {
 					if (!entry.audited) await this.recordTerminalImage(entry, "image intent was previously rejected");
 				} else if (!entry.completed) {
+					// A request above the horizon waits for a later history pass when its
+					// channel was truncated or held; sending here would overtake older text.
+					if (entry.request && blocked.has(entry.channelId)) {
+						const watermark =
+							this.#cursors.recoveredThrough[entry.channelId] ?? this.#cursors.quarantined[entry.channelId]?.watermark;
+						if (watermark !== undefined && snowflakeIsAfter(entry.messageId, watermark)) {
+							incomplete = true;
+							continue;
+						}
+					}
 					// Attempt directly even when the conversation's history is unreadable:
 					// a permanent message/channel error must reach its terminal diagnosis,
 					// and a persisted request needs no Discord read at all.

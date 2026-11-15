@@ -606,6 +606,51 @@ test("an in-window pending image stays behind older missed history", async () =>
 	}
 }, 12_000);
 
+test("a truncated backfill does not let an above-horizon image overtake history", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-truncated-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "truncated-dm";
+	const watermark = snowflakeFromTimestamp(Date.now() - 180_000);
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const request = {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: watermark },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, request }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async () => {
+						throw new Error("temporary history truncation");
+					},
+				},
+			}),
+			requests,
+		);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		const persisted = JSON.parse(await readFile(outboxPath, "utf8"));
+		expect(persisted).toEqual([{ messageId: id, channelId, request }]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
 test("a persisted image request replays even when the recovery cursor is unreadable", async () => {
 	const home = await mkdtemp(join(tmpdir(), "discord-image-order-cursor-read-"));
 	const cleanupTimers = trackTimers();
