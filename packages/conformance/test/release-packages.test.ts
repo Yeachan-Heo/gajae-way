@@ -213,13 +213,15 @@ if (tool === "bun") {
   if (args[0] === "view" && args[2] === "dist-tags" && args[3] === "--json") {
     const staleTags = JSON.parse(readFileSync(process.env.STALE_TAGS, "utf8"));
     const rule = staleTags[args[1]];
-    if (rule) {
-      const counts = existsSync(process.env.STALE_TAGS_COUNT)
-        ? JSON.parse(readFileSync(process.env.STALE_TAGS_COUNT, "utf8"))
+    if (rule && !rule.fired) {
+      const writes = existsSync(process.env.WRITE_COUNT)
+        ? JSON.parse(readFileSync(process.env.WRITE_COUNT, "utf8"))
         : {};
-      counts[args[1]] = (counts[args[1]] ?? 0) + 1;
-      writeFileSync(process.env.STALE_TAGS_COUNT, JSON.stringify(counts));
-      if (counts[args[1]] === rule.at) {
+      // Fired by write progress, not by a read ordinal, so moving a read cannot silently
+      // retarget this stub.
+      if ((writes[args[1]] ?? 0) >= rule.afterWrites) {
+        rule.fired = true;
+        writeFileSync(process.env.STALE_TAGS, JSON.stringify(staleTags));
         if (rule.payload === "__404__") {
           console.error("404 Not Found");
           process.exit(1);
@@ -296,6 +298,12 @@ if (tool === "bun") {
     const split = args[2].lastIndexOf("@");
     tags[args[2].slice(0, split) + "@" + args[3]] = process.env.INTERLEAVE_VERSION || args[2].slice(split + 1);
     writeFileSync(process.env.TAG_STATE, JSON.stringify(tags));
+    const writes = existsSync(process.env.WRITE_COUNT)
+      ? JSON.parse(readFileSync(process.env.WRITE_COUNT, "utf8"))
+      : {};
+    const written = args[2].slice(0, split);
+    writes[written] = (writes[written] ?? 0) + 1;
+    writeFileSync(process.env.WRITE_COUNT, JSON.stringify(writes));
     writeFileSync(process.env.WRITTEN_MARKER, "1");
     process.exit(0);
   }
@@ -347,7 +355,7 @@ async function withReleaseFixture(
 		versionsError?: string;
 		tagsError?: string;
 		tagsEmpty?: string;
-		staleTags?: Record<string, { at: number; payload: string }>;
+		staleTags?: Record<string, { afterWrites: number; payload: string; fired?: boolean }>;
 	},
 	run: (fixture: {
 		root: string;
@@ -396,7 +404,7 @@ async function withReleaseFixture(
 		const writtenMarker = join(root, "written.marker");
 		const growthState = join(root, "growth.json");
 		const staleTagsState = join(root, "stale-tags.json");
-		const staleTagsCount = join(root, "stale-tags-count.json");
+		const writeCount = join(root, "write-count.json");
 		const staleState = join(root, "stale.json");
 		await writeFile(staleState, JSON.stringify(options.staleVerification ?? {}));
 		await writeFile(staleTagsState, JSON.stringify(options.staleTags ?? {}));
@@ -428,7 +436,7 @@ async function withReleaseFixture(
 						PUBLISHED_VERSIONS_GROWTH: JSON.stringify(options.publishedVersionsGrowth ?? {}),
 						GROWTH_STATE: growthState,
 						STALE_TAGS: staleTagsState,
-						STALE_TAGS_COUNT: staleTagsCount,
+						WRITE_COUNT: writeCount,
 						VERSIONS_ERROR: options.versionsError ?? "",
 						TAGS_ERROR: options.tagsError ?? "",
 						TAGS_EMPTY: options.tagsEmpty ?? "",
@@ -830,7 +838,9 @@ describe("release script subprocess behavior", () => {
 					[pkg.name]: { base: ["1.2.2", "1.2.3"], grow: ["1.3.0", "1.4.0", "1.5.0"] },
 				},
 				// The first terminal read is the fifth tag-map read for this package.
-				staleTags: { [pkg.name]: { at: 5, payload: "__404__" } },
+				// Fires on the first tag-map read once this run has written four tags, which is
+				// the terminal read after three repair writes.
+				staleTags: { [pkg.name]: { afterWrites: 4, payload: "__404__" } },
 			},
 			async ({ execute }) => {
 				const result = await execute("--publish");
