@@ -20,7 +20,7 @@ on:
 # distinct tags never displace each other.
 #
 # Cross-tag ordering of dist-tag writes is enforced by the script, not by GitHub: no
-# write moves a tag below its live pointer or, for `latest`, below the highest
+# write is decided below the tag's live pointer or, for `latest`, below the highest
 # published stable version. A tag a newer release already moved is left alone so its
 # own GitHub release still gets created, an older fresh version is published under a
 # scratch tag instead, and the post-write read fails the run only if the tag ends up

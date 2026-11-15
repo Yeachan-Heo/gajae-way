@@ -172,16 +172,38 @@ function forwardTarget(version: string, candidate: string | undefined, context: 
 	return semverOrderOrThrow(candidate, version, context) > 0 ? candidate : version;
 }
 
-// A tag nobody claimed is a 404, not a failure: npm answers a tag lookup for a version
-// that never held that tag the same way it answers a package that was never published.
-async function readDistTagVersion(name: string, tag: string, cwd: string): Promise<string | undefined> {
-	const current = await npmOutput(["view", `${name}@${tag}`, "version"], cwd);
-	if (current.code !== 0) {
-		if (current.stderr.includes("404")) return undefined;
-		throw new Error(`npm dist-tag lookup failed for ${name}@${tag}: ${current.stderr || current.stdout}`);
+// A tag nobody claimed is simply absent from the tag map, which is why the map is read
+// instead of `npm view <name>@<tag>`: that form makes an unset tag an error whose shape
+// has to be guessed, while a missing entry is unambiguous data.
+async function readDistTags(name: string, cwd: string): Promise<Record<string, string>> {
+	const result = await npmOutput(["view", name, "dist-tags", "--json"], cwd);
+	if (result.code !== 0) {
+		// A package that was never published has no tags to read.
+		if (result.stderr.includes("404")) return {};
+		throw new Error(`npm dist-tag lookup failed for ${name}: ${result.stderr || result.stdout}`);
 	}
-	if (!current.stdout) throw new Error(`npm dist-tag lookup returned an empty version for ${name}@${tag}`);
-	return current.stdout;
+	if (!result.stdout) return {};
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(result.stdout);
+	} catch {
+		throw new Error(`npm dist-tag lookup returned invalid JSON for ${name}: ${result.stdout}`);
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		throw new Error(`npm dist-tag lookup returned unexpected data for ${name}: ${result.stdout}`);
+	}
+	const tags: Record<string, string> = {};
+	for (const [key, value] of Object.entries(parsed)) {
+		if (typeof value !== "string" || value.length === 0) {
+			throw new Error(`npm dist-tag lookup returned unexpected data for ${name}: ${result.stdout}`);
+		}
+		tags[key] = value;
+	}
+	return tags;
+}
+
+async function readDistTagVersion(name: string, tag: string, cwd: string): Promise<string | undefined> {
+	return (await readDistTags(name, cwd))[tag];
 }
 
 function semverOrderOrThrow(left: string, right: string, context: string): number {
@@ -242,10 +264,10 @@ async function resolveEffectiveTag(
 // release because a newer release holds the tag, or the tagged GitHub release would
 // never be created. Every write is still a read followed by an unconditional
 // `npm dist-tag add` (npm has no compare-and-set), so ordering rests on two rules:
-//   - no write moves a tag below its live pointer or, for `latest`, below the highest
-//     published stable version; a tag that already points past this version is left
-//     alone and this release continues. When a newer stable version is published the
-//     pointer is converged forward (or left alone when it is already there).
+//   - no write is decided below the tag's live pointer or, for `latest`, below the
+//     highest published stable version; a tag that already points past this version is
+//     left alone and this release continues. When a newer stable version is published
+//     the pointer is converged forward (or left alone when it is already there).
 //   - the ordering is decided before every write, including the tag npm writes during
 //     `npm publish`, so no tag is moved backwards even for a moment.
 // The remaining window is a version published between the read and the write; the
@@ -274,8 +296,16 @@ async function resumeTag(
 		// A newer release already moved this tag. Moving it back is never allowed, and
 		// failing would strand this tag's already-published version, because the GitHub
 		// release still has to be created. Leave the pointer alone and finish the release.
-		console.log(`\n${name}@${effectiveTag} stays with ${target}; leaving it instead of moving it back to ${version}.`);
-		if (currentVersion !== target) await applyDistTag(name, target, effectiveTag, cwd);
+		if (currentVersion === target) {
+			console.log(
+				`\n${name}@${effectiveTag} stays with ${target}; leaving it instead of moving it back to ${version}.`,
+			);
+			return;
+		}
+		console.log(
+			`\n${name}@${effectiveTag} stays with ${target}; moving it forward from ${currentVersion ?? "no pointer"} instead of back to ${version}.`,
+		);
+		await applyDistTag(name, target, effectiveTag, cwd);
 		return;
 	}
 	if (currentVersion === version) {

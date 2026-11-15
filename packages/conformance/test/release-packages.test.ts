@@ -181,6 +181,28 @@ if (tool === "bun") {
     console.log(JSON.stringify(versions));
     process.exit(0);
   }
+  if (args[0] === "view" && args[2] === "dist-tags" && args[3] === "--json") {
+    if (args[1] === process.env.TAGS_ERROR) {
+      console.error("simulated tag-map failure");
+      process.exit(1);
+    }
+    const state = JSON.parse(readFileSync(process.env.TAG_STATE, "utf8"));
+    const prefix = args[1] + "@";
+    const tags = {};
+    let known = false;
+    for (const [key, value] of Object.entries(state)) {
+      if (key.startsWith(prefix)) {
+        tags[key.slice(prefix.length)] = value;
+        known = true;
+      }
+    }
+    if (!known && !JSON.parse(process.env.EXISTING_PACKAGES).some((ref) => ref.startsWith(prefix))) {
+      console.error("404 Not Found");
+      process.exit(1);
+    }
+    console.log(JSON.stringify(tags));
+    process.exit(0);
+  }
   if (args[0] === "view" && args.length === 3 && args[2] === "version") {
     if (args[1] === process.env.REGISTRY_ERROR) {
       console.error("simulated registry failure");
@@ -244,7 +266,7 @@ if (tool === "bun") {
     // the post-publish reads would see a pointer the real registry already moved.
     const tagIndex = args.indexOf("--tag");
     if (tagIndex !== -1 && args[tagIndex + 1] !== undefined) {
-      const directory = basename(args[1]).replace(/^gajae-gateway-/, "").replace(/.tgz$/, "");
+      const directory = basename(args[1]).replace("gajae-gateway-", "").replace(".tgz", "");
       const packed = JSON.parse(spawnSync("tar", ["-xOzf", args[1], "package/package.json"], { encoding: "utf8" }).stdout);
       const tags = JSON.parse(readFileSync(process.env.TAG_STATE, "utf8"));
       tags["@gajae-gateway/" + directory + "@" + args[tagIndex + 1]] = packed.version;
@@ -272,6 +294,7 @@ async function withReleaseFixture(
 		staleVerification?: Record<string, string>;
 		publishedVersions?: Record<string, string[]>;
 		versionsError?: string;
+		tagsError?: string;
 	},
 	run: (fixture: {
 		root: string;
@@ -336,6 +359,7 @@ async function withReleaseFixture(
 						INTERLEAVE_VERSION: options.interleave ?? "",
 						PUBLISHED_VERSIONS: JSON.stringify(options.publishedVersions ?? {}),
 						VERSIONS_ERROR: options.versionsError ?? "",
+						TAGS_ERROR: options.tagsError ?? "",
 					},
 					stdout: "pipe",
 					stderr: "pipe",
@@ -379,7 +403,7 @@ describe("release script subprocess behavior", () => {
 						if (!tag) expected.push({ tool: "npm", args: ["config", "get", "tag"], cwd: pkg.directory });
 						expected.push({
 							tool: "npm",
-							args: ["view", `${pkg.name}@${tag ?? "latest"}`, "version"],
+							args: ["view", pkg.name, "dist-tags", "--json"],
 							cwd: pkg.directory,
 						});
 						if (tag === undefined) {
@@ -408,7 +432,7 @@ describe("release script subprocess behavior", () => {
 						// list, before deciding which tag `npm publish` must write.
 						expected.push({
 							tool: "npm",
-							args: ["view", `${pkg.name}@${tag ?? "latest"}`, "version"],
+							args: ["view", pkg.name, "dist-tags", "--json"],
 							cwd: pkg.directory,
 						});
 						if (tag === undefined) {
@@ -428,7 +452,7 @@ describe("release script subprocess behavior", () => {
 						// behind.
 						expected.push({
 							tool: "npm",
-							args: ["view", `${pkg.name}@${tag ?? "latest"}`, "version"],
+							args: ["view", pkg.name, "dist-tags", "--json"],
 							cwd: pkg.directory,
 						});
 						if (tag === undefined) {
@@ -471,10 +495,10 @@ describe("release script subprocess behavior", () => {
 			expect(result.commands.filter((command) => command.tool === "npm").map((command) => command.args)).toEqual([
 				["view", packageRef(RELEASE_FIXTURES[0]), "version"],
 				["config", "get", "tag"],
-				["view", `${RELEASE_FIXTURES[0].name}@latest`, "version"],
+				["view", RELEASE_FIXTURES[0].name, "dist-tags", "--json"],
 				["view", RELEASE_FIXTURES[0].name, "versions", "--json"],
 				["publish", join(root, "dist-packed", "gajae-gateway-protocol.tgz"), "--access", "public", "--tag", "latest"],
-				["view", `${RELEASE_FIXTURES[0].name}@latest`, "version"],
+				["view", RELEASE_FIXTURES[0].name, "dist-tags", "--json"],
 				["view", RELEASE_FIXTURES[0].name, "versions", "--json"],
 				["view", failed, "version"],
 			]);
@@ -490,11 +514,11 @@ describe("release script subprocess behavior", () => {
 			expect(result.output).toContain("simulated dist-tag failure");
 			expect(result.commands.filter((command) => command.tool === "npm").map((command) => command.args)).toEqual([
 				["view", packageRef(RELEASE_FIXTURES[0]), "version"],
-				["view", `${RELEASE_FIXTURES[0].name}@next`, "version"],
+				["view", RELEASE_FIXTURES[0].name, "dist-tags", "--json"],
 				["publish", join(root, "dist-packed", "gajae-gateway-protocol.tgz"), "--access", "public", "--tag", "next"],
-				["view", `${RELEASE_FIXTURES[0].name}@next`, "version"],
+				["view", RELEASE_FIXTURES[0].name, "dist-tags", "--json"],
 				["view", failed, "version"],
-				["view", `${RELEASE_FIXTURES[1].name}@next`, "version"],
+				["view", RELEASE_FIXTURES[1].name, "dist-tags", "--json"],
 				["dist-tag", "add", failed, "next"],
 			]);
 			expect(result.output).toMatch(/OIDC|trusted publish/i);
@@ -511,11 +535,11 @@ describe("release script subprocess behavior", () => {
 			expect(result.output).toContain("simulated publish failure");
 			expect(result.commands.filter((command) => command.tool === "npm").map((command) => command.args)).toEqual([
 				["view", packageRef(RELEASE_FIXTURES[0]), "version"],
-				["view", `${RELEASE_FIXTURES[0].name}@next`, "version"],
+				["view", RELEASE_FIXTURES[0].name, "dist-tags", "--json"],
 				["publish", join(root, "dist-packed", "gajae-gateway-protocol.tgz"), "--access", "public", "--tag", "next"],
-				["view", `${RELEASE_FIXTURES[0].name}@next`, "version"],
+				["view", RELEASE_FIXTURES[0].name, "dist-tags", "--json"],
 				["view", packageRef(RELEASE_FIXTURES[1]), "version"],
-				["view", `${RELEASE_FIXTURES[1].name}@next`, "version"],
+				["view", RELEASE_FIXTURES[1].name, "dist-tags", "--json"],
 				["publish", join(root, "dist-packed", "gajae-gateway-images.tgz"), "--access", "public", "--tag", "next"],
 			]);
 			expect(result.commands.some((command) => command.cwd === "sdk")).toBe(false);
@@ -749,6 +773,28 @@ describe("release script subprocess behavior", () => {
 		});
 	}, 30_000);
 
+	// The first stable release after prerelease-only publishes has no `latest` tag to read.
+	// A tag-map read reports that as an absent entry, not as an error that aborts the release.
+	test("publishes the first stable version when only a prerelease tag exists", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{
+				existing: [`${pkg.name}@1.2.3-rc.1`],
+				tags: { [`${pkg.name}@next`]: "1.2.3-rc.1" },
+				publishedVersions: { [pkg.name]: ["1.2.3-rc.1"] },
+			},
+			async ({ execute }) => {
+				const result = await execute("--publish", "--tag", "latest");
+				expect(result.code).toBe(0);
+				const publish = result.commands.filter(
+					(command) => command.args[0] === "publish" && command.cwd === pkg.directory,
+				);
+				expect(publish.map((command) => command.args[command.args.length - 1])).toEqual(["latest"]);
+				expect(result.output).not.toContain("dist-tag lookup failed");
+			},
+		);
+	}, 30_000);
+
 	test("treats a 404 version list as a package that has never been published", async () => {
 		await withReleaseFixture({}, async ({ execute }) => {
 			const result = await execute("--publish", "--tag", "latest");
@@ -850,9 +896,11 @@ describe("release script subprocess behavior", () => {
 				expect(result.output).not.toContain("concurrent release");
 				// The retry re-reads; it must never issue a second unconditional write.
 				expect(result.commands.filter((command) => command.args[0] === "dist-tag")).toHaveLength(1);
+				// The pointer is read as a tag map now, so only the verification re-reads
+				// `pkg@next` itself: the stale value once, then the value this run wrote.
 				expect(
 					result.commands.filter((command) => command.args[0] === "view" && command.args[1] === `${pkg.name}@next`),
-				).toHaveLength(3);
+				).toHaveLength(2);
 			},
 		);
 	}, 30_000);
@@ -892,13 +940,13 @@ describe("release script subprocess behavior", () => {
 			await withReleaseFixture(
 				{
 					existing: [packageRef(pkg)],
-					...(failure === "config" ? { configError: true } : { registryError: `${pkg.name}@next` }),
+					...(failure === "config" ? { configError: true } : { tagsError: pkg.name }),
 				},
 				async ({ execute }) => {
 					const result = await execute("--publish", ...(failure === "tag lookup" ? ["--tag", "next"] : []));
 					expect(result.code).not.toBe(0);
 					expect(result.output).toContain(
-						failure === "config" ? "simulated config failure" : "simulated registry failure",
+						failure === "config" ? "simulated config failure" : "simulated tag-map failure",
 					);
 					expect(
 						result.commands.some(
