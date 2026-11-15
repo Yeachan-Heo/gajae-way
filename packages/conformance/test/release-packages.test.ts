@@ -5,7 +5,7 @@
 // importing outside itself. The fixture copies the real script into a temp dir and
 // shadows only the bun/npm subprocesses, so no test reaches a real registry.
 import { describe, expect, test } from "bun:test";
-import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, delimiter, join } from "node:path";
 import { assertNoPrivateWorkspaceDeps, parseNpmViewResult, RELEASE_ORDER } from "../../../scripts/release-packages";
@@ -208,7 +208,10 @@ async function withReleaseFixture(
 		execute: (...args: string[]) => Promise<{ code: number; output: string; commands: RecordedCommand[] }>;
 	}) => Promise<void>,
 ): Promise<void> {
-	const root = await mkdtemp(join(tmpdir(), "release-packages-test-"));
+	// Bun resolves symlinks in import.meta.url, so the copied script always reports the
+	// canonical temp root. Canonicalize here too, or macOS (/var -> /private/var) compares
+	// the script's realpath output against an unresolved expectation.
+	const root = await realpath(await mkdtemp(join(tmpdir(), "release-packages-test-")));
 	try {
 		const bin = join(root, "bin");
 		await mkdir(bin);
