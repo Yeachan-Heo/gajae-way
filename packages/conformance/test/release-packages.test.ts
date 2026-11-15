@@ -10,7 +10,8 @@ import { tmpdir } from "node:os";
 import { basename, delimiter, join } from "node:path";
 import {
 	assertNoPrivateWorkspaceDeps,
-	highestPublishedStableVersion,
+	highestPublishedVersion,
+	isPrereleaseVersion,
 	parseNpmViewResult,
 	RELEASE_ORDER,
 } from "../../../scripts/release-packages";
@@ -82,19 +83,27 @@ describe("release package workspace dependency guard", () => {
 	});
 });
 
-describe("latest ordering", () => {
+describe("channel ordering", () => {
+	const stable = (version: string) => !isPrereleaseVersion(version);
+	const prerelease = (version: string) => isPrereleaseVersion(version);
+
 	test("selects the highest stable published version by semver order", () => {
-		expect(highestPublishedStableVersion(["1.2.3", "1.10.0", "1.9.9"])).toBe("1.10.0");
+		expect(highestPublishedVersion(["1.2.3", "1.10.0", "1.9.9"], stable)).toBe("1.10.0");
 	});
 
 	test("ignores prereleases and build metadata when selecting latest", () => {
-		expect(highestPublishedStableVersion(["1.2.3", "1.3.0-rc.1", "2.0.0-beta.2"])).toBe("1.2.3");
-		expect(highestPublishedStableVersion(["1.3.0+build.5", "1.2.9"])).toBe("1.3.0+build.5");
+		expect(highestPublishedVersion(["1.2.3", "1.3.0-rc.1", "2.0.0-beta.2"], stable)).toBe("1.2.3");
+		expect(highestPublishedVersion(["1.3.0+build.5", "1.2.9"], stable)).toBe("1.3.0+build.5");
 	});
 
 	test("reports no candidate when only prereleases are published", () => {
-		expect(highestPublishedStableVersion(["1.0.0-rc.1"])).toBeUndefined();
-		expect(highestPublishedStableVersion([])).toBeUndefined();
+		expect(highestPublishedVersion(["1.0.0-rc.1"], stable)).toBeUndefined();
+		expect(highestPublishedVersion([], stable)).toBeUndefined();
+	});
+
+	test("selects the highest prerelease published version for next", () => {
+		expect(highestPublishedVersion(["1.2.3", "1.3.0-rc.1", "1.3.0-rc.10"], prerelease)).toBe("1.3.0-rc.10");
+		expect(highestPublishedVersion(["1.2.3"], prerelease)).toBeUndefined();
 	});
 });
 
@@ -432,13 +441,13 @@ describe("release script subprocess behavior", () => {
 							args: ["view", pkg.name, "dist-tags", "--json"],
 							cwd: pkg.directory,
 						});
-						if (tag === undefined) {
-							expected.push({
-								tool: "npm",
-								args: ["view", pkg.name, "versions", "--json"],
-								cwd: pkg.directory,
-							});
-						}
+						// `latest` and `next` are both channels, so the published version list is the
+						// floor for the write.
+						expected.push({
+							tool: "npm",
+							args: ["view", pkg.name, "versions", "--json"],
+							cwd: pkg.directory,
+						});
 						expected.push({
 							tool: "npm",
 							args: ["dist-tag", "add", packageRef(pkg), tag ?? "latest"],
@@ -449,19 +458,17 @@ describe("release script subprocess behavior", () => {
 							args: ["view", `${pkg.name}@${tag ?? "latest"}`, "version"],
 							cwd: pkg.directory,
 						});
-						if (tag === undefined) {
-							// `latest` is re-derived from the version list after the write.
-							expected.push({
-								tool: "npm",
-								args: ["view", pkg.name, "versions", "--json"],
-								cwd: pkg.directory,
-							});
-							expected.push({
-								tool: "npm",
-								args: ["view", pkg.name, "dist-tags", "--json"],
-								cwd: pkg.directory,
-							});
-						}
+						// A channel tag is re-derived from the version list after the write.
+						expected.push({
+							tool: "npm",
+							args: ["view", pkg.name, "versions", "--json"],
+							cwd: pkg.directory,
+						});
+						expected.push({
+							tool: "npm",
+							args: ["view", pkg.name, "dist-tags", "--json"],
+							cwd: pkg.directory,
+						});
 					} else {
 						// The publish path resolves the tag once and orders it before publishing, so a
 						// fresh package reads npm's configured tag (only when --tag is absent) and, for
@@ -474,33 +481,29 @@ describe("release script subprocess behavior", () => {
 							args: ["view", pkg.name, "dist-tags", "--json"],
 							cwd: pkg.directory,
 						});
-						if (tag === undefined) {
-							expected.push({
-								tool: "npm",
-								args: ["view", pkg.name, "versions", "--json"],
-								cwd: pkg.directory,
-							});
-						}
+						expected.push({
+							tool: "npm",
+							args: ["view", pkg.name, "versions", "--json"],
+							cwd: pkg.directory,
+						});
 						expected.push({
 							tool: "npm",
 							args: ["publish", tarball, "--access", "public", "--tag", tag ?? "latest"],
 							cwd: pkg.directory,
 						});
-						// `npm publish` writes the tag itself; only `latest` is reconciled afterwards, from
-						// the version list, so a release that landed during the upload cannot leave it
-						// behind. A named tag is ordered by its pointer before the publish.
-						if (tag === undefined) {
-							expected.push({
-								tool: "npm",
-								args: ["view", pkg.name, "versions", "--json"],
-								cwd: pkg.directory,
-							});
-							expected.push({
-								tool: "npm",
-								args: ["view", pkg.name, "dist-tags", "--json"],
-								cwd: pkg.directory,
-							});
-						}
+						// `npm publish` writes the tag itself, and a channel tag is reconciled from the
+						// version list afterwards, so a release of the same channel that landed during the
+						// upload cannot leave it behind.
+						expected.push({
+							tool: "npm",
+							args: ["view", pkg.name, "versions", "--json"],
+							cwd: pkg.directory,
+						});
+						expected.push({
+							tool: "npm",
+							args: ["view", pkg.name, "dist-tags", "--json"],
+							cwd: pkg.directory,
+						});
 					}
 				}
 				expect(result.commands).toEqual(expected);
@@ -554,9 +557,13 @@ describe("release script subprocess behavior", () => {
 			expect(result.commands.filter((command) => command.tool === "npm").map((command) => command.args)).toEqual([
 				["view", packageRef(RELEASE_FIXTURES[0]), "version"],
 				["view", RELEASE_FIXTURES[0].name, "dist-tags", "--json"],
+				["view", RELEASE_FIXTURES[0].name, "versions", "--json"],
 				["publish", join(root, "dist-packed", "gajae-gateway-protocol.tgz"), "--access", "public", "--tag", "next"],
+				["view", RELEASE_FIXTURES[0].name, "versions", "--json"],
+				["view", RELEASE_FIXTURES[0].name, "dist-tags", "--json"],
 				["view", failed, "version"],
 				["view", RELEASE_FIXTURES[1].name, "dist-tags", "--json"],
+				["view", RELEASE_FIXTURES[1].name, "versions", "--json"],
 				["dist-tag", "add", failed, "next"],
 			]);
 			expect(result.output).toMatch(/OIDC|trusted publish/i);
@@ -574,9 +581,13 @@ describe("release script subprocess behavior", () => {
 			expect(result.commands.filter((command) => command.tool === "npm").map((command) => command.args)).toEqual([
 				["view", packageRef(RELEASE_FIXTURES[0]), "version"],
 				["view", RELEASE_FIXTURES[0].name, "dist-tags", "--json"],
+				["view", RELEASE_FIXTURES[0].name, "versions", "--json"],
 				["publish", join(root, "dist-packed", "gajae-gateway-protocol.tgz"), "--access", "public", "--tag", "next"],
+				["view", RELEASE_FIXTURES[0].name, "versions", "--json"],
+				["view", RELEASE_FIXTURES[0].name, "dist-tags", "--json"],
 				["view", packageRef(RELEASE_FIXTURES[1]), "version"],
 				["view", RELEASE_FIXTURES[1].name, "dist-tags", "--json"],
+				["view", RELEASE_FIXTURES[1].name, "versions", "--json"],
 				["publish", join(root, "dist-packed", "gajae-gateway-images.tgz"), "--access", "public", "--tag", "next"],
 			]);
 			expect(result.commands.some((command) => command.cwd === "sdk")).toBe(false);
@@ -763,6 +774,99 @@ describe("release script subprocess behavior", () => {
 					["dist-tag", "add", `${pkg.name}@1.3.0`, "latest"],
 				]);
 				expect(result.output).toContain("stays with 1.3.0");
+			},
+		);
+	}, 30_000);
+
+	// `next` is the channel the workflow derives for prereleases, so the same floor
+	// applies: two concurrent prerelease refs must not leave the older one on `next`.
+	test("repairs a next write when a newer prerelease publishes in between", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{
+				existing: [`${pkg.name}@1.3.0-rc.1`],
+				versions: { [pkg.name]: "1.3.0-rc.1" },
+				tags: { [`${pkg.name}@next`]: "1.2.0-rc.9" },
+				publishedVersions: { [pkg.name]: ["1.2.0-rc.9", "1.3.0-rc.1"] },
+				publishedVersionsAfterWrite: { [pkg.name]: ["1.2.0-rc.9", "1.3.0-rc.1", "1.4.0-rc.1"] },
+			},
+			async ({ execute }) => {
+				const result = await execute("--publish", "--tag", "next");
+				expect(result.code).toBe(0);
+				expect(
+					result.commands.filter((command) => command.args[0] === "dist-tag").map((command) => command.args),
+				).toEqual([
+					["dist-tag", "add", `${pkg.name}@1.3.0-rc.1`, "next"],
+					["dist-tag", "add", `${pkg.name}@1.4.0-rc.1`, "next"],
+				]);
+				expect(result.output).toContain("stays with 1.4.0-rc.1");
+			},
+		);
+	}, 30_000);
+
+	// A scratch tag is a plausible operator tag name, so an existing one is never
+	// overwritten or deleted.
+	test("uses a run-unique scratch tag instead of overwriting an operator tag", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{
+				publishedVersions: { [pkg.name]: ["1.2.2", "1.3.0"] },
+				tags: { [`${pkg.name}@gajae-pending-1-2-3`]: "0.9.0" },
+			},
+			async ({ execute }) => {
+				const result = await execute("--publish", "--tag", "latest");
+				expect(result.code).toBe(0);
+				const publish = result.commands.filter(
+					(command) => command.args[0] === "publish" && command.cwd === pkg.directory,
+				);
+				const scratch = publish[0]?.args.at(-1) ?? "";
+				expect(scratch.startsWith("gajae-pending-1-2-3-")).toBe(true);
+				// The operator's tag keeps its own version: it is neither written nor removed.
+				const operatorTag = `${pkg.name}@gajae-pending-1-2-3`;
+				expect(result.commands.some((command) => command.args.includes(operatorTag))).toBe(false);
+				expect(
+					result.commands.filter((command) => command.args[0] === "dist-tag").map((command) => command.args),
+				).toEqual([
+					["dist-tag", "rm", pkg.name, scratch],
+					["dist-tag", "add", `${pkg.name}@1.3.0`, "latest"],
+				]);
+			},
+		);
+	}, 30_000);
+
+	// Interrupted cleanup: a resumed release removes the scratch tag a previous run left
+	// behind, but only while it still points at that version.
+	test("removes a scratch tag left behind by an interrupted run on resume", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{
+				existing: [packageRef(pkg)],
+				tags: { [`${pkg.name}@next`]: "1.2.3", [`${pkg.name}@gajae-pending-1-2-3`]: "1.2.3" },
+			},
+			async ({ execute }) => {
+				const result = await execute("--publish", "--tag", "next");
+				expect(result.code).toBe(0);
+				expect(
+					result.commands.filter((command) => command.args[0] === "dist-tag").map((command) => command.args),
+				).toEqual([["dist-tag", "rm", pkg.name, "gajae-pending-1-2-3"]]);
+			},
+		);
+	}, 30_000);
+
+	test("leaves a scratch tag that no longer points at the resumed version", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{
+				existing: [packageRef(pkg)],
+				tags: { [`${pkg.name}@next`]: "1.2.3", [`${pkg.name}@gajae-pending-1-2-3`]: "1.4.0" },
+			},
+			async ({ execute }) => {
+				const result = await execute("--publish", "--tag", "next");
+				expect(result.code).toBe(0);
+				expect(result.commands.filter((command) => command.args[0] === "dist-tag" && command.args[1] === "rm")).toEqual(
+					[],
+				);
+				expect(result.commands.some((command) => command.args.includes(`${pkg.name}@gajae-pending-1-2-3`))).toBe(false);
 			},
 		);
 	}, 30_000);
