@@ -1867,8 +1867,8 @@ export class ReconnectingGateway {
 				return "skip";
 			}
 			const attempts = (this.#imageAdmissionFailures.get(message.id) ?? 0) + 1;
-			if (attempts < MAX_IMAGE_ADMISSION_FAILURES) {
-				this.#imageAdmissionFailures.set(message.id, attempts);
+			this.#imageAdmissionFailures.set(message.id, attempts);
+			if (attempts < MAX_IMAGE_ADMISSION_FAILURES || recovered || ordered || !this.#imageSettled.has(message.id)) {
 				console.error(
 					`Discord image outbox admission failed message=${message.id} attempt=${attempts}; retrying without sending.`,
 				);
@@ -1882,6 +1882,7 @@ export class ReconnectingGateway {
 			);
 			return "skip";
 		}
+		if (entry) this.#imageAdmissionFailures.delete(message.id);
 		// Best-effort: the durable outbox already makes this channel discoverable.
 		// A failing cursor store must not silence the DM's image while text flows.
 		await this.rememberInboundDm(sourceOrigin);
