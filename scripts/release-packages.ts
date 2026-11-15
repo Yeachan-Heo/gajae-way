@@ -124,7 +124,8 @@ async function main(): Promise<void> {
 			const registryCheck = await checkNpmRegistry(packageName, packageVersion);
 
 			if (registryCheck.alreadyPublished) {
-				console.log(`\n⏭️  ${packageName}@${packageVersion} already published on npm, skipping.`);
+				console.log(`\n${packageName}@${packageVersion} already published on npm; applying dist-tag.`);
+				await run(["npm", "dist-tag", "add", `${packageName}@${packageVersion}`, tag ?? "latest"], dir);
 			} else if (registryCheck.error) {
 				throw new Error(`registry check failed for ${packageName}@${packageVersion}: ${registryCheck.error}`);
 			} else {
