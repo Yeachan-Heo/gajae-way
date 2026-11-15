@@ -24,7 +24,7 @@ on:
 # published stable version. A tag a newer release already moved is left alone so its
 # own GitHub release still gets created, an older fresh version is published under a
 # scratch tag instead, and the post-write read fails the run only if the tag ends up
-# below the version this run wrote.
+# below the version this run wrote or cannot be read at all.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false

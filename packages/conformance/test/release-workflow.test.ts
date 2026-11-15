@@ -106,11 +106,14 @@ describe("release dist-tag resolution", () => {
 describe("release workflow wiring", () => {
 	test("serializes reruns per ref so distinct tagged releases are never dropped", async () => {
 		const workflow = await releaseWorkflow();
-		expect(workflow).toMatch(/group: release-\$\{\{ github\.ref \}\}/);
+		// Anchored and workflow-level: a job-level block would shadow the workflow group and
+		// reintroduce the dropped pending run, so the key must sit above `jobs:`.
+		const concurrency = workflow.search(/^concurrency:$/m);
+		const jobs = workflow.search(/^jobs:$/m);
+		expect(concurrency).toBeGreaterThan(-1);
+		expect(jobs).toBeGreaterThan(concurrency);
+		expect(workflow).toMatch(/^ {2}group: release-\$\{\{ github\.ref \}\}$/m);
 		expect(workflow).toContain("cancel-in-progress: false");
-		// The old global group let a third tag push cancel a pending tagged release.
-		expect(workflow).not.toMatch(/^ {2}group: release$/m);
-		// A job-level group would shadow the workflow-level one and reintroduce the drop.
 		expect(workflow.match(/^\s*concurrency:/gm) ?? []).toHaveLength(1);
 	});
 
@@ -119,7 +122,11 @@ describe("release workflow wiring", () => {
 		expect(workflow).toContain('bun scripts/release-dist-tag.ts --requested "$NPM_TAG_INPUT"');
 		expect(workflow).toMatch(/NPM_DIST_TAG: \$\{\{ steps\.dist-tag\.outputs\.tag \}\}/);
 		expect(workflow).toContain('run: bun run release:publish -- --tag "$NPM_DIST_TAG"');
-		expect(workflow).not.toContain('if [ -z "$TAG" ]; then TAG="latest"; fi');
+		// No fallback of any spelling can hide in the resolve step: the tag it prints is
+		// either the dispatch input or the derived value.
+		const resolveStep = workflow.slice(workflow.indexOf("- name: Resolve npm dist-tag"));
+		const resolveBody = resolveStep.slice(0, resolveStep.indexOf("\n      - name:"));
+		expect(resolveBody).not.toContain("latest");
 	});
 
 	test("does not default a manual dispatch input to latest", async () => {

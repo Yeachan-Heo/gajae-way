@@ -148,7 +148,7 @@ interface RecordedCommand {
 // The child process runs a copy of the real release script. Only its bun and
 // npm subprocesses are replaced; packing and reading the tarball use real tar.
 const MOCK_COMMAND = `
-import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -170,7 +170,12 @@ if (tool === "bun") {
       process.exit(1);
     }
     const overrides = JSON.parse(process.env.PUBLISHED_VERSIONS);
+    const afterPublish = JSON.parse(process.env.PUBLISHED_VERSIONS_AFTER_PUBLISH);
     const name = args[1];
+    if (existsSync(process.env.PUBLISHED_MARKER) && Array.isArray(afterPublish[name])) {
+      console.log(JSON.stringify(afterPublish[name]));
+      process.exit(0);
+    }
     const versions = overrides[name] ?? JSON.parse(process.env.EXISTING_PACKAGES)
       .filter((ref) => ref.startsWith(name + "@"))
       .map((ref) => ref.slice(name.length + 1));
@@ -266,11 +271,11 @@ if (tool === "bun") {
     // the post-publish reads would see a pointer the real registry already moved.
     const tagIndex = args.indexOf("--tag");
     if (tagIndex !== -1 && args[tagIndex + 1] !== undefined) {
-      const directory = basename(args[1]).replace("gajae-gateway-", "").replace(".tgz", "");
       const packed = JSON.parse(spawnSync("tar", ["-xOzf", args[1], "package/package.json"], { encoding: "utf8" }).stdout);
       const tags = JSON.parse(readFileSync(process.env.TAG_STATE, "utf8"));
-      tags["@gajae-gateway/" + directory + "@" + args[tagIndex + 1]] = packed.version;
+      tags[packed.name + "@" + args[tagIndex + 1]] = packed.version;
       writeFileSync(process.env.TAG_STATE, JSON.stringify(tags));
+      writeFileSync(process.env.PUBLISHED_MARKER, "1");
     }
     process.exit(0);
   }
@@ -293,6 +298,7 @@ async function withReleaseFixture(
 		interleave?: string;
 		staleVerification?: Record<string, string>;
 		publishedVersions?: Record<string, string[]>;
+		publishedVersionsAfterPublish?: Record<string, string[]>;
 		versionsError?: string;
 		tagsError?: string;
 	},
@@ -335,6 +341,7 @@ async function withReleaseFixture(
 		await writeFile(log, "");
 		const tagState = join(root, "tags.json");
 		await writeFile(tagState, JSON.stringify(options.tags ?? {}));
+		const publishedMarker = join(root, "published.marker");
 		const staleState = join(root, "stale.json");
 		await writeFile(staleState, JSON.stringify(options.staleVerification ?? {}));
 		await run({
@@ -358,6 +365,8 @@ async function withReleaseFixture(
 						CONFIG_ERROR: options.configError ? "1" : "",
 						INTERLEAVE_VERSION: options.interleave ?? "",
 						PUBLISHED_VERSIONS: JSON.stringify(options.publishedVersions ?? {}),
+						PUBLISHED_VERSIONS_AFTER_PUBLISH: JSON.stringify(options.publishedVersionsAfterPublish ?? {}),
+						PUBLISHED_MARKER: publishedMarker,
 						VERSIONS_ERROR: options.versionsError ?? "",
 						TAGS_ERROR: options.tagsError ?? "",
 					},
@@ -704,6 +713,33 @@ describe("release script subprocess behavior", () => {
 		});
 	}, 30_000);
 
+	// A release that publishes while this run uploads is the documented read-to-write
+	// window: the version is already published under `latest`, and the post-publish read
+	// converges the pointer forward instead of leaving it on the older version.
+	test("converges latest when a newer release publishes during the upload", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{
+				publishedVersions: { [pkg.name]: ["1.2.2"] },
+				publishedVersionsAfterPublish: { [pkg.name]: ["1.2.2", "1.3.0"] },
+			},
+			async ({ execute }) => {
+				const result = await execute("--publish", "--tag", "latest");
+				expect(result.code).toBe(0);
+				const npm = result.commands.filter((command) => command.tool === "npm");
+				expect(
+					npm
+						.filter((command) => command.args[0] === "publish" && command.cwd === pkg.directory)
+						.map((command) => command.args[command.args.length - 1]),
+				).toEqual(["latest"]);
+				expect(npm.filter((command) => command.args[0] === "dist-tag").map((command) => command.args)).toEqual([
+					["dist-tag", "add", `${pkg.name}@1.3.0`, "latest"],
+				]);
+				expect(result.output).toContain("stays with 1.3.0");
+			},
+		);
+	}, 30_000);
+
 	// An explicitly promoted prerelease keeps `latest`; a resumed stable release must not
 	// demote it just because it is the highest published stable version.
 	test("does not demote a latest pointer that holds a newer prerelease", async () => {
@@ -805,7 +841,7 @@ describe("release script subprocess behavior", () => {
 		});
 	}, 30_000);
 
-	test("publishes a fresh version as latest when it is the highest", async () => {
+	test("publishes a fresh version under the resolved latest tag when it is the highest", async () => {
 		const pkg = RELEASE_FIXTURES[0];
 		await withReleaseFixture({ publishedVersions: { [pkg.name]: ["1.2.2"] } }, async ({ execute }) => {
 			const result = await execute("--publish", "--tag", "latest");

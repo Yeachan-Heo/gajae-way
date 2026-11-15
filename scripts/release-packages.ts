@@ -182,7 +182,6 @@ async function readDistTags(name: string, cwd: string): Promise<Record<string, s
 		if (result.stderr.includes("404")) return {};
 		throw new Error(`npm dist-tag lookup failed for ${name}: ${result.stderr || result.stdout}`);
 	}
-	if (!result.stdout) return {};
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(result.stdout);
@@ -192,7 +191,8 @@ async function readDistTags(name: string, cwd: string): Promise<Record<string, s
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
 		throw new Error(`npm dist-tag lookup returned unexpected data for ${name}: ${result.stdout}`);
 	}
-	const tags: Record<string, string> = {};
+	// A null prototype keeps a `__proto__` entry from resolving to Object.prototype.
+	const tags: Record<string, string> = Object.create(null);
 	for (const [key, value] of Object.entries(parsed)) {
 		if (typeof value !== "string" || value.length === 0) {
 			throw new Error(`npm dist-tag lookup returned unexpected data for ${name}: ${result.stdout}`);
