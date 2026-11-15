@@ -244,7 +244,7 @@ if (tool === "bun") {
     // the post-publish reads would see a pointer the real registry already moved.
     const tagIndex = args.indexOf("--tag");
     if (tagIndex !== -1 && args[tagIndex + 1] !== undefined) {
-      const directory = basename(args[1]).replace(/^gajae-gateway-/, "").replace(/\.tgz$/, "");
+      const directory = basename(args[1]).replace(/^gajae-gateway-/, "").replace(/.tgz$/, "");
       const packed = JSON.parse(spawnSync("tar", ["-xOzf", args[1], "package/package.json"], { encoding: "utf8" }).stdout);
       const tags = JSON.parse(readFileSync(process.env.TAG_STATE, "utf8"));
       tags["@gajae-gateway/" + directory + "@" + args[tagIndex + 1]] = packed.version;
@@ -404,16 +404,17 @@ describe("release script subprocess behavior", () => {
 						// fresh package reads npm's configured tag (only when --tag is absent) and, for
 						// `latest`, the published version list.
 						if (!tag) expected.push({ tool: "npm", args: ["config", "get", "tag"], cwd: pkg.directory });
+						// The publish path reads the live pointer, and for `latest` the published version
+						// list, before deciding which tag `npm publish` must write.
+						expected.push({
+							tool: "npm",
+							args: ["view", `${pkg.name}@${tag ?? "latest"}`, "version"],
+							cwd: pkg.directory,
+						});
 						if (tag === undefined) {
 							expected.push({
 								tool: "npm",
 								args: ["view", pkg.name, "versions", "--json"],
-								cwd: pkg.directory,
-							});
-						} else {
-							expected.push({
-								tool: "npm",
-								args: ["view", `${pkg.name}@${tag}`, "version"],
 								cwd: pkg.directory,
 							});
 						}
@@ -470,6 +471,7 @@ describe("release script subprocess behavior", () => {
 			expect(result.commands.filter((command) => command.tool === "npm").map((command) => command.args)).toEqual([
 				["view", packageRef(RELEASE_FIXTURES[0]), "version"],
 				["config", "get", "tag"],
+				["view", `${RELEASE_FIXTURES[0].name}@latest`, "version"],
 				["view", RELEASE_FIXTURES[0].name, "versions", "--json"],
 				["publish", join(root, "dist-packed", "gajae-gateway-protocol.tgz"), "--access", "public", "--tag", "latest"],
 				["view", `${RELEASE_FIXTURES[0].name}@latest`, "version"],
@@ -676,6 +678,45 @@ describe("release script subprocess behavior", () => {
 				["dist-tag", "add", `${pkg.name}@1.3.0`, "latest"],
 			]);
 		});
+	}, 30_000);
+
+	// An explicitly promoted prerelease keeps `latest`; a resumed stable release must not
+	// demote it just because it is the highest published stable version.
+	test("does not demote a latest pointer that holds a newer prerelease", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{
+				existing: [packageRef(pkg)],
+				tags: { [`${pkg.name}@latest`]: "1.3.0-rc.1" },
+				publishedVersions: { [pkg.name]: ["1.2.3", "1.3.0-rc.1"] },
+			},
+			async ({ execute }) => {
+				const result = await execute("--publish");
+				expect(result.code).toBe(0);
+				expect(result.output).toContain("stays with 1.3.0-rc.1");
+				expect(result.commands.filter((command) => command.args[0] === "dist-tag")).toEqual([]);
+				expect(result.commands.some((command) => command.cwd === "images")).toBe(true);
+			},
+		);
+	}, 30_000);
+
+	test("publishes an older version under a scratch tag instead of demoting a newer prerelease", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{ tags: { [`${pkg.name}@latest`]: "1.3.0-rc.1" }, publishedVersions: { [pkg.name]: ["1.2.3", "1.3.0-rc.1"] } },
+			async ({ execute }) => {
+				const result = await execute("--publish", "--tag", "latest");
+				expect(result.code).toBe(0);
+				expect(result.output).toContain("stays with 1.3.0-rc.1");
+				const publish = result.commands.filter(
+					(command) => command.args[0] === "publish" && command.cwd === pkg.directory,
+				);
+				expect(publish.map((command) => command.args[command.args.length - 1])).toEqual(["gajae-pending-1-2-3"]);
+				expect(
+					result.commands.filter((command) => command.args[0] === "dist-tag").map((command) => command.args),
+				).toEqual([["dist-tag", "rm", pkg.name, "gajae-pending-1-2-3"]]);
+			},
+		);
 	}, 30_000);
 
 	// A pointer equal to the resumed version does not prove it is still the newest one.
