@@ -15,6 +15,7 @@
  *   bun scripts/release-dist-tag.ts --requested latest    # honor an explicit input
  */
 
+import { fileURLToPath } from "node:url";
 import { isPrereleaseVersion, RELEASE_ORDER } from "./release-packages";
 
 export function resolveReleaseDistTag(requested: string | undefined, versions: readonly string[]): string {
@@ -57,7 +58,9 @@ async function main(): Promise<void> {
 			process.exit(2);
 		}
 	}
-	const root = new URL("..", import.meta.url).pathname;
+	// A checkout path may contain characters the URL form escapes, so decode it before
+	// using it as a filesystem path.
+	const root = fileURLToPath(new URL("..", import.meta.url));
 	console.log(resolveReleaseDistTag(requested, await readReleaseVersions(root)));
 }
 

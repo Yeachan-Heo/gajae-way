@@ -20,6 +20,7 @@
 
 import { mkdir, readdir } from "node:fs/promises";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const RELEASE_ORDER = ["protocol", "images", "sdk", "cli"] as const;
 
@@ -270,10 +271,12 @@ async function resolveEffectiveTag(
 //     the pointer is converged forward (or left alone when it is already there).
 //   - the ordering is decided before every write, including the tag npm writes during
 //     `npm publish`, so no tag is moved backwards even for a moment.
-// The remaining window is a version published between the read and the write. For
-// `latest` the post-write re-read detects that through the version list; a named tag
-// has only its pointer as an ordering source, so a concurrent writer that lands in that
-// window is not seen here and the next release has to repair the pointer.
+// The remaining window is a version published between the read and the write. `latest`
+// closes it in the same run: applyDistTag re-derives the tag from the version list after
+// writing and converges forward, so a stale write repairs itself instead of waiting for
+// the next release. A named tag has only its pointer as an ordering source, so a
+// concurrent writer that lands in that window is not seen and the next release has to
+// repair the pointer.
 async function resumeTag(
 	name: string,
 	version: string,
@@ -331,7 +334,7 @@ async function removeDistTag(name: string, tag: string, cwd: string): Promise<vo
 	}
 }
 
-async function applyDistTag(name: string, version: string, tag: string, cwd: string): Promise<void> {
+async function applyDistTagOnce(name: string, version: string, tag: string, cwd: string): Promise<void> {
 	try {
 		await run(["npm", "dist-tag", "add", `${name}@${version}`, tag], cwd);
 	} catch (error) {
@@ -383,9 +386,34 @@ async function applyDistTag(name: string, version: string, tag: string, cwd: str
 	);
 }
 
+// `npm dist-tag add` is unconditional, so the value a run writes can be stale by the
+// time it lands: a resumed release that read the published version list before a newer
+// release published would otherwise leave `latest` on its own older version, and its
+// post-write check would pass because the pointer matches what it wrote. `latest` is
+// therefore re-derived from the version list after writing and converged forward in the
+// same run; each pass re-reads, so a release that lands during the repair is picked up
+// too. A named tag has no equivalent source and is only ordered by its pointer.
+const LATEST_CONVERGENCE_ATTEMPTS = 3;
+
+async function reconcileLatest(name: string, version: string, cwd: string): Promise<void> {
+	for (let attempt = 0; attempt < LATEST_CONVERGENCE_ATTEMPTS; attempt++) {
+		const target = await latestTarget(name, version, cwd);
+		const pointer = await readDistTagVersion(name, "latest", cwd);
+		if (pointer !== undefined && semverOrderOrThrow(pointer, target, `npm dist-tag latest for ${name}`) >= 0) return;
+		console.log(`\n${name}@latest stays with ${target}; converged forward while ${version} was being released.`);
+		await applyDistTagOnce(name, target, "latest", cwd);
+	}
+}
+
+async function applyDistTag(name: string, version: string, tag: string, cwd: string): Promise<void> {
+	await applyDistTagOnce(name, version, tag, cwd);
+	if (tag === "latest") await reconcileLatest(name, version, cwd);
+}
+
 async function main(): Promise<void> {
 	const { publish, tag } = parseArgs(process.argv.slice(2));
-	const root = new URL("..", import.meta.url).pathname;
+	// Decode the URL form so a checkout path with spaces or `#` still resolves.
+	const root = fileURLToPath(new URL("..", import.meta.url));
 	const packedDir = `${root}dist-packed`;
 	await mkdir(packedDir, { recursive: true });
 
@@ -439,16 +467,10 @@ async function main(): Promise<void> {
 					);
 					await removeDistTag(packageName, publishTag, dir);
 				}
-				// `npm publish` may have left the pointer on this version while a newer release
-				// landed during the upload, and a scratch publish leaves the pointer untouched.
-				// Re-read after publishing and converge on the same forward-only rule the resume
-				// path uses, so neither case can end behind the newest release.
-				const observed = await readDistTagVersion(packageName, effectiveTag, dir);
-				const converged = await tagTarget(packageName, packageVersion, effectiveTag, observed, dir);
-				if (observed !== converged) {
-					console.log(`\n${packageName}@${effectiveTag} stays with ${converged} after publishing ${packageVersion}.`);
-					await applyDistTag(packageName, converged, effectiveTag, dir);
-				}
+				// `npm publish` writes `latest` itself, so the post-write reconciliation is what
+				// catches a release that landed during the upload; a scratch publish leaves the
+				// pointer untouched and reconciles from the same version list.
+				if (effectiveTag === "latest") await reconcileLatest(packageName, packageVersion, dir);
 			}
 		}
 	}

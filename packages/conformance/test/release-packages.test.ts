@@ -171,7 +171,12 @@ if (tool === "bun") {
     }
     const overrides = JSON.parse(process.env.PUBLISHED_VERSIONS);
     const afterPublish = JSON.parse(process.env.PUBLISHED_VERSIONS_AFTER_PUBLISH);
+    const afterWrite = JSON.parse(process.env.PUBLISHED_VERSIONS_AFTER_WRITE);
     const name = args[1];
+    if (existsSync(process.env.WRITTEN_MARKER) && Array.isArray(afterWrite[name])) {
+      console.log(JSON.stringify(afterWrite[name]));
+      process.exit(0);
+    }
     if (existsSync(process.env.PUBLISHED_MARKER) && Array.isArray(afterPublish[name])) {
       console.log(JSON.stringify(afterPublish[name]));
       process.exit(0);
@@ -255,6 +260,7 @@ if (tool === "bun") {
     const split = args[2].lastIndexOf("@");
     tags[args[2].slice(0, split) + "@" + args[3]] = process.env.INTERLEAVE_VERSION || args[2].slice(split + 1);
     writeFileSync(process.env.TAG_STATE, JSON.stringify(tags));
+    writeFileSync(process.env.WRITTEN_MARKER, "1");
     process.exit(0);
   }
   if (args[0] === "dist-tag" && args[1] === "rm") {
@@ -300,6 +306,7 @@ async function withReleaseFixture(
 		staleVerification?: Record<string, string>;
 		publishedVersions?: Record<string, string[]>;
 		publishedVersionsAfterPublish?: Record<string, string[]>;
+		publishedVersionsAfterWrite?: Record<string, string[]>;
 		versionsError?: string;
 		tagsError?: string;
 		tagsEmpty?: string;
@@ -344,6 +351,7 @@ async function withReleaseFixture(
 		const tagState = join(root, "tags.json");
 		await writeFile(tagState, JSON.stringify(options.tags ?? {}));
 		const publishedMarker = join(root, "published.marker");
+		const writtenMarker = join(root, "written.marker");
 		const staleState = join(root, "stale.json");
 		await writeFile(staleState, JSON.stringify(options.staleVerification ?? {}));
 		await run({
@@ -369,6 +377,8 @@ async function withReleaseFixture(
 						PUBLISHED_VERSIONS: JSON.stringify(options.publishedVersions ?? {}),
 						PUBLISHED_VERSIONS_AFTER_PUBLISH: JSON.stringify(options.publishedVersionsAfterPublish ?? {}),
 						PUBLISHED_MARKER: publishedMarker,
+						PUBLISHED_VERSIONS_AFTER_WRITE: JSON.stringify(options.publishedVersionsAfterWrite ?? {}),
+						WRITTEN_MARKER: writtenMarker,
 						VERSIONS_ERROR: options.versionsError ?? "",
 						TAGS_ERROR: options.tagsError ?? "",
 						TAGS_EMPTY: options.tagsEmpty ?? "",
@@ -435,6 +445,19 @@ describe("release script subprocess behavior", () => {
 							args: ["view", `${pkg.name}@${tag ?? "latest"}`, "version"],
 							cwd: pkg.directory,
 						});
+						if (tag === undefined) {
+							// `latest` is re-derived from the version list after the write.
+							expected.push({
+								tool: "npm",
+								args: ["view", pkg.name, "versions", "--json"],
+								cwd: pkg.directory,
+							});
+							expected.push({
+								tool: "npm",
+								args: ["view", pkg.name, "dist-tags", "--json"],
+								cwd: pkg.directory,
+							});
+						}
 					} else {
 						// The publish path resolves the tag once and orders it before publishing, so a
 						// fresh package reads npm's configured tag (only when --tag is absent) and, for
@@ -459,18 +482,18 @@ describe("release script subprocess behavior", () => {
 							args: ["publish", tarball, "--access", "public", "--tag", tag ?? "latest"],
 							cwd: pkg.directory,
 						});
-						// Publishing re-reads the pointer afterwards, and `latest` also re-reads the
-						// version list, so a release that landed during the upload cannot leave the tag
-						// behind.
-						expected.push({
-							tool: "npm",
-							args: ["view", pkg.name, "dist-tags", "--json"],
-							cwd: pkg.directory,
-						});
+						// `npm publish` writes the tag itself; only `latest` is reconciled afterwards, from
+						// the version list, so a release that landed during the upload cannot leave it
+						// behind. A named tag is ordered by its pointer before the publish.
 						if (tag === undefined) {
 							expected.push({
 								tool: "npm",
 								args: ["view", pkg.name, "versions", "--json"],
+								cwd: pkg.directory,
+							});
+							expected.push({
+								tool: "npm",
+								args: ["view", pkg.name, "dist-tags", "--json"],
 								cwd: pkg.directory,
 							});
 						}
@@ -510,8 +533,8 @@ describe("release script subprocess behavior", () => {
 				["view", RELEASE_FIXTURES[0].name, "dist-tags", "--json"],
 				["view", RELEASE_FIXTURES[0].name, "versions", "--json"],
 				["publish", join(root, "dist-packed", "gajae-gateway-protocol.tgz"), "--access", "public", "--tag", "latest"],
-				["view", RELEASE_FIXTURES[0].name, "dist-tags", "--json"],
 				["view", RELEASE_FIXTURES[0].name, "versions", "--json"],
+				["view", RELEASE_FIXTURES[0].name, "dist-tags", "--json"],
 				["view", failed, "version"],
 			]);
 			expect(result.commands.some((command) => command.cwd === "sdk")).toBe(false);
@@ -528,7 +551,6 @@ describe("release script subprocess behavior", () => {
 				["view", packageRef(RELEASE_FIXTURES[0]), "version"],
 				["view", RELEASE_FIXTURES[0].name, "dist-tags", "--json"],
 				["publish", join(root, "dist-packed", "gajae-gateway-protocol.tgz"), "--access", "public", "--tag", "next"],
-				["view", RELEASE_FIXTURES[0].name, "dist-tags", "--json"],
 				["view", failed, "version"],
 				["view", RELEASE_FIXTURES[1].name, "dist-tags", "--json"],
 				["dist-tag", "add", failed, "next"],
@@ -549,7 +571,6 @@ describe("release script subprocess behavior", () => {
 				["view", packageRef(RELEASE_FIXTURES[0]), "version"],
 				["view", RELEASE_FIXTURES[0].name, "dist-tags", "--json"],
 				["publish", join(root, "dist-packed", "gajae-gateway-protocol.tgz"), "--access", "public", "--tag", "next"],
-				["view", RELEASE_FIXTURES[0].name, "dist-tags", "--json"],
 				["view", packageRef(RELEASE_FIXTURES[1]), "version"],
 				["view", RELEASE_FIXTURES[1].name, "dist-tags", "--json"],
 				["publish", join(root, "dist-packed", "gajae-gateway-images.tgz"), "--access", "public", "--tag", "next"],
@@ -714,6 +735,32 @@ describe("release script subprocess behavior", () => {
 				["dist-tag", "add", `${pkg.name}@1.3.0`, "latest"],
 			]);
 		});
+	}, 30_000);
+
+	// A resumed release can read the version list before a newer release publishes and
+	// then write its own older version. The post-write reconciliation re-derives `latest`
+	// from the list, so the stale write is repaired by the same run.
+	test("repairs a resumed latest write when a newer release publishes in between", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{
+				existing: [packageRef(pkg)],
+				tags: { [`${pkg.name}@latest`]: "1.2.2" },
+				publishedVersions: { [pkg.name]: ["1.2.2", "1.2.3"] },
+				publishedVersionsAfterWrite: { [pkg.name]: ["1.2.2", "1.2.3", "1.3.0"] },
+			},
+			async ({ execute }) => {
+				const result = await execute("--publish");
+				expect(result.code).toBe(0);
+				expect(
+					result.commands.filter((command) => command.args[0] === "dist-tag").map((command) => command.args),
+				).toEqual([
+					["dist-tag", "add", packageRef(pkg), "latest"],
+					["dist-tag", "add", `${pkg.name}@1.3.0`, "latest"],
+				]);
+				expect(result.output).toContain("stays with 1.3.0");
+			},
+		);
 	}, 30_000);
 
 	// A release that lands while this run uploads is the documented read-to-write window:
