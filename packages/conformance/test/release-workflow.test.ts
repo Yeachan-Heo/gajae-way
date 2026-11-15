@@ -140,7 +140,10 @@ describe("release workflow wiring", () => {
 		const workflow = await releaseWorkflow();
 		// A workflow-level group is entered before `canonical-tag` runs, so a case-variant
 		// tag could replace a valid pending release and then fail the casing check.
-		expect(workflow).not.toMatch(/^concurrency:$/m);
+		expect(workflow).not.toMatch(/^concurrency:/m);
+		// One block only, and the scalar form counts too: a workflow-level `concurrency:`
+		// declaration is the cheapest way to reintroduce the queue collision.
+		expect(workflow.match(/^\s*concurrency:/gm) ?? []).toHaveLength(1);
 		const job = workflow.slice(workflow.indexOf("  publish-npm:"));
 		const body = job.slice(0, job.indexOf("\n  build-binaries:"));
 		expect(body).toMatch(
