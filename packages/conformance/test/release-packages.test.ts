@@ -229,10 +229,26 @@ if (tool === "bun") {
     writeFileSync(process.env.TAG_STATE, JSON.stringify(tags));
     process.exit(0);
   }
+  if (args[0] === "dist-tag" && args[1] === "rm") {
+    const tags = JSON.parse(readFileSync(process.env.TAG_STATE, "utf8"));
+    delete tags[args[2] + "@" + args[3]];
+    writeFileSync(process.env.TAG_STATE, JSON.stringify(tags));
+    process.exit(0);
+  }
   if (args[0] === "publish") {
     if (process.env.PUBLISH_ERROR && args[1].endsWith(process.env.PUBLISH_ERROR)) {
       console.error("simulated publish failure");
       process.exit(1);
+    }
+    // Real npm publish writes the dist-tag it was given, so the fixture must too or
+    // the post-publish reads would see a pointer the real registry already moved.
+    const tagIndex = args.indexOf("--tag");
+    if (tagIndex !== -1 && args[tagIndex + 1] !== undefined) {
+      const directory = basename(args[1]).replace(/^gajae-gateway-/, "").replace(/\.tgz$/, "");
+      const packed = JSON.parse(spawnSync("tar", ["-xOzf", args[1], "package/package.json"], { encoding: "utf8" }).stdout);
+      const tags = JSON.parse(readFileSync(process.env.TAG_STATE, "utf8"));
+      tags["@gajae-gateway/" + directory + "@" + args[tagIndex + 1]] = packed.version;
+      writeFileSync(process.env.TAG_STATE, JSON.stringify(tags));
     }
     process.exit(0);
   }
@@ -384,11 +400,43 @@ describe("release script subprocess behavior", () => {
 							cwd: pkg.directory,
 						});
 					} else {
+						// The publish path resolves the tag once and orders it before publishing, so a
+						// fresh package reads npm's configured tag (only when --tag is absent) and, for
+						// `latest`, the published version list.
+						if (!tag) expected.push({ tool: "npm", args: ["config", "get", "tag"], cwd: pkg.directory });
+						if (tag === undefined) {
+							expected.push({
+								tool: "npm",
+								args: ["view", pkg.name, "versions", "--json"],
+								cwd: pkg.directory,
+							});
+						} else {
+							expected.push({
+								tool: "npm",
+								args: ["view", `${pkg.name}@${tag}`, "version"],
+								cwd: pkg.directory,
+							});
+						}
 						expected.push({
 							tool: "npm",
-							args: ["publish", tarball, "--access", "public", ...(tag ? ["--tag", tag] : [])],
+							args: ["publish", tarball, "--access", "public", "--tag", tag ?? "latest"],
 							cwd: pkg.directory,
 						});
+						// Publishing re-reads the pointer afterwards, and `latest` also re-reads the
+						// version list, so a release that landed during the upload cannot leave the tag
+						// behind.
+						expected.push({
+							tool: "npm",
+							args: ["view", `${pkg.name}@${tag ?? "latest"}`, "version"],
+							cwd: pkg.directory,
+						});
+						if (tag === undefined) {
+							expected.push({
+								tool: "npm",
+								args: ["view", pkg.name, "versions", "--json"],
+								cwd: pkg.directory,
+							});
+						}
 					}
 				}
 				expect(result.commands).toEqual(expected);
@@ -421,7 +469,11 @@ describe("release script subprocess behavior", () => {
 			expect(result.output).toContain("simulated registry failure");
 			expect(result.commands.filter((command) => command.tool === "npm").map((command) => command.args)).toEqual([
 				["view", packageRef(RELEASE_FIXTURES[0]), "version"],
-				["publish", join(root, "dist-packed", "gajae-gateway-protocol.tgz"), "--access", "public"],
+				["config", "get", "tag"],
+				["view", RELEASE_FIXTURES[0].name, "versions", "--json"],
+				["publish", join(root, "dist-packed", "gajae-gateway-protocol.tgz"), "--access", "public", "--tag", "latest"],
+				["view", `${RELEASE_FIXTURES[0].name}@latest`, "version"],
+				["view", RELEASE_FIXTURES[0].name, "versions", "--json"],
 				["view", failed, "version"],
 			]);
 			expect(result.commands.some((command) => command.cwd === "sdk")).toBe(false);
@@ -436,7 +488,9 @@ describe("release script subprocess behavior", () => {
 			expect(result.output).toContain("simulated dist-tag failure");
 			expect(result.commands.filter((command) => command.tool === "npm").map((command) => command.args)).toEqual([
 				["view", packageRef(RELEASE_FIXTURES[0]), "version"],
+				["view", `${RELEASE_FIXTURES[0].name}@next`, "version"],
 				["publish", join(root, "dist-packed", "gajae-gateway-protocol.tgz"), "--access", "public", "--tag", "next"],
+				["view", `${RELEASE_FIXTURES[0].name}@next`, "version"],
 				["view", failed, "version"],
 				["view", `${RELEASE_FIXTURES[1].name}@next`, "version"],
 				["dist-tag", "add", failed, "next"],
@@ -455,53 +509,60 @@ describe("release script subprocess behavior", () => {
 			expect(result.output).toContain("simulated publish failure");
 			expect(result.commands.filter((command) => command.tool === "npm").map((command) => command.args)).toEqual([
 				["view", packageRef(RELEASE_FIXTURES[0]), "version"],
+				["view", `${RELEASE_FIXTURES[0].name}@next`, "version"],
 				["publish", join(root, "dist-packed", "gajae-gateway-protocol.tgz"), "--access", "public", "--tag", "next"],
+				["view", `${RELEASE_FIXTURES[0].name}@next`, "version"],
 				["view", packageRef(RELEASE_FIXTURES[1]), "version"],
+				["view", `${RELEASE_FIXTURES[1].name}@next`, "version"],
 				["publish", join(root, "dist-packed", "gajae-gateway-images.tgz"), "--access", "public", "--tag", "next"],
 			]);
 			expect(result.commands.some((command) => command.cwd === "sdk")).toBe(false);
 		});
 	}, 30_000);
 
-	test("uses npm's configured tag for resumed packages without forwarding it to fresh publishes", async () => {
+	test("forwards npm's configured tag to fresh publishes and resumes alike", async () => {
 		const existing = [packageRef(RELEASE_FIXTURES[0]), packageRef(RELEASE_FIXTURES[2])];
 		await withReleaseFixture({ existing, configTag: "beta" }, async ({ execute }) => {
 			const result = await execute("--publish");
 			expect(result.code).toBe(0);
 			const npm = result.commands.filter((command) => command.tool === "npm");
-			expect(npm.filter((command) => command.args[0] === "config").map((command) => command.cwd)).toEqual([
-				"protocol",
-				"sdk",
-			]);
+			// Every package resolves the same configured tag, because the publish path shares
+			// the resume path's precedence instead of letting npm pick an untracked default.
+			expect(new Set(npm.filter((command) => command.args[0] === "config").map((command) => command.cwd))).toEqual(
+				new Set(RELEASE_FIXTURES.map((pkg) => pkg.directory)),
+			);
 			expect(npm.filter((command) => command.args[0] === "dist-tag").map((command) => command.args)).toEqual(
 				existing.map((ref) => ["dist-tag", "add", ref, "beta"]),
 			);
 			expect(
-				npm.filter((command) => command.args[0] === "publish").every((command) => !command.args.includes("--tag")),
+				npm
+					.filter((command) => command.args[0] === "publish")
+					.every((command) => command.args[command.args.length - 1] === "beta"),
 			).toBe(true);
 		});
 	}, 30_000);
 
 	test("packed publishConfig tag overrides npm config, and an explicit tag overrides both", async () => {
 		const pkg = RELEASE_FIXTURES[0];
+		const existing = RELEASE_FIXTURES.map(packageRef);
 		for (const explicit of [false, true]) {
 			await withReleaseFixture(
-				{ existing: [packageRef(pkg)], configTag: "beta", publishTags: { [pkg.name]: "canary" }, configError: true },
+				{ existing, configTag: "beta", publishTags: { [pkg.name]: "canary" } },
 				async ({ execute }) => {
 					const result = await execute("--publish", ...(explicit ? ["--tag", "next"] : []));
 					expect(result.code).toBe(0);
 					const npm = result.commands.filter((command) => command.tool === "npm");
-					expect(npm.some((command) => command.args[0] === "config")).toBe(false);
-					expect(
-						npm.some(
-							(command) => command.args.join(" ") === `view ${pkg.name}@${explicit ? "next" : "canary"} version`,
-						),
-					).toBe(true);
-					expect(
-						npm.some(
-							(command) => command.args.join(" ") === `dist-tag add ${packageRef(pkg)} ${explicit ? "next" : "canary"}`,
-						),
-					).toBe(true);
+					// An explicit --tag skips npm config altogether, and the packed publishConfig tag
+					// wins over it for the package that declares one.
+					if (explicit) {
+						expect(npm.some((command) => command.args[0] === "config")).toBe(false);
+					} else {
+						expect(npm.some((command) => command.cwd === pkg.directory && command.args[0] === "config")).toBe(false);
+						expect(npm.some((command) => command.cwd !== pkg.directory && command.args[0] === "config")).toBe(true);
+					}
+					expect(npm.filter((command) => command.args[0] === "dist-tag").map((command) => command.args[3])).toEqual(
+						explicit ? ["next", "next", "next", "next"] : ["canary", "beta", "beta", "beta"],
+					);
 				},
 			);
 		}
@@ -599,19 +660,51 @@ describe("release script subprocess behavior", () => {
 		);
 	}, 30_000);
 
-	// Publishing immutable content must not be blocked by the pointer: the version is
-	// published and the older version's run converges latest to the newer release.
-	test("publishes a new older version and converges latest forward", async () => {
+	// Publishing immutable content must not be blocked by the pointer: the older version is
+	// still published, under a scratch tag, so `latest` never moves backwards at all.
+	test("publishes an older version under a scratch tag and converges latest forward", async () => {
 		const pkg = RELEASE_FIXTURES[0];
 		await withReleaseFixture({ publishedVersions: { [pkg.name]: ["1.2.2", "1.3.0"] } }, async ({ execute }) => {
 			const result = await execute("--publish", "--tag", "latest");
 			expect(result.code).toBe(0);
 			expect(result.output).toContain("stays with 1.3.0");
 			const npm = result.commands.filter((command) => command.tool === "npm");
-			expect(npm.some((command) => command.args[0] === "publish" && command.args.includes("--tag"))).toBe(true);
+			const publish = npm.filter((command) => command.args[0] === "publish" && command.cwd === pkg.directory);
+			expect(publish.map((command) => command.args[command.args.length - 1])).toEqual(["gajae-pending-1-2-3"]);
 			expect(npm.filter((command) => command.args[0] === "dist-tag").map((command) => command.args)).toEqual([
+				["dist-tag", "rm", pkg.name, "gajae-pending-1-2-3"],
 				["dist-tag", "add", `${pkg.name}@1.3.0`, "latest"],
 			]);
+		});
+	}, 30_000);
+
+	// A pointer equal to the resumed version does not prove it is still the newest one.
+	test("converges a latest pointer that already sits on the resumed version", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{
+				existing: [packageRef(pkg)],
+				tags: { [`${pkg.name}@latest`]: "1.2.3" },
+				publishedVersions: { [pkg.name]: ["1.2.3", "1.3.0"] },
+			},
+			async ({ execute }) => {
+				const result = await execute("--publish");
+				expect(result.code).toBe(0);
+				expect(result.output).toContain("stays with 1.3.0");
+				expect(
+					result.commands.filter((command) => command.args[0] === "dist-tag").map((command) => command.args),
+				).toEqual([["dist-tag", "add", `${pkg.name}@1.3.0`, "latest"]]);
+			},
+		);
+	}, 30_000);
+
+	test("refuses to publish a prerelease without an explicit tag instead of letting npm default to latest", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture({ versions: { [pkg.name]: "1.2.3-rc.1" } }, async ({ execute }) => {
+			const result = await execute("--publish");
+			expect(result.code).not.toBe(0);
+			expect(result.output).toMatch(/prerelease .* as latest/);
+			expect(result.commands.some((command) => command.args[0] === "publish")).toBe(false);
 		});
 	}, 30_000);
 
@@ -682,13 +775,26 @@ describe("release script subprocess behavior", () => {
 		);
 	}, 30_000);
 
-	test("fails when a concurrent release moved the tag this run just wrote", async () => {
+	// A concurrent release winning forward is the enforced ordering, so it must not fail
+	// this run and strand the packages and GitHub release still to come.
+	test("keeps a tag a concurrent release moved forward instead of failing the release", async () => {
 		const pkg = RELEASE_FIXTURES[0];
 		await withReleaseFixture({ existing: [packageRef(pkg)], interleave: "1.2.4" }, async ({ execute }) => {
 			const result = await execute("--publish", "--tag", "next");
+			expect(result.code).toBe(0);
+			expect(result.output).toContain("moved forward to 1.2.4");
+			expect(result.commands.some((command) => command.cwd === "images")).toBe(true);
+			// Detection only: never a second unconditional write.
+			expect(result.commands.filter((command) => command.args[0] === "dist-tag")).toHaveLength(1);
+		});
+	}, 30_000);
+
+	test("fails when a concurrent release moved the tag this run just wrote backwards", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture({ existing: [packageRef(pkg)], interleave: "1.2.2" }, async ({ execute }) => {
+			const result = await execute("--publish", "--tag", "next");
 			expect(result.code).not.toBe(0);
-			expect(result.output).toContain("concurrent release");
-			expect(result.output).toContain("1.2.4");
+			expect(result.output).toContain("moved it backwards");
 			expect(result.commands.some((command) => command.cwd === "images" || command.args[0] === "publish")).toBe(false);
 		});
 	}, 30_000);

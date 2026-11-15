@@ -21,9 +21,10 @@ on:
 #
 # Cross-tag ordering of dist-tag writes is enforced by the script, not by GitHub: a
 # write never moves a tag backwards (a tag a newer release already moved is left
-# alone so its own GitHub release still gets created), `latest` is ordered by the
-# published version list rather than the tag pointer, and the post-write read fails
-# the run if another release moved the tag this run just wrote.
+# alone so its own GitHub release still gets created, and an older fresh version is
+# published under a scratch tag instead), `latest` is ordered by the published
+# version list rather than the tag pointer, and the post-write read fails the run
+# only if the tag ends up below the version this run wrote.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -65,6 +66,8 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    outputs:
+      npm-tag: ${{ steps.dist-tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -154,5 +157,6 @@ jobs:
           generate_release_notes: true
           draft: false
           # A tag push matches `v*.*.*` including prerelease tags, so the GitHub
-          # release has to mirror the prerelease status npm used.
-          prerelease: ${{ github.ref_type == 'tag' && contains(github.ref_name, '-') }}
+          # release mirrors the npm dist-tag this run published with instead of
+          # guessing from the tag name: one source of truth for both registries.
+          prerelease: ${{ needs.publish-npm.outputs.npm-tag != 'latest' }}

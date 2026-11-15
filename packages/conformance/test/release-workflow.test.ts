@@ -4,6 +4,9 @@
 // resolution rules and the workflow lines that must use them. They live under
 // packages/ because CI runs `bun test packages/` and `biome ci packages/`.
 import { describe, expect, test } from "bun:test";
+import { copyFile, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { resolveReleaseDistTag } from "../../../scripts/release-dist-tag";
 import { RELEASE_ORDER } from "../../../scripts/release-packages";
 
@@ -65,6 +68,39 @@ describe("release dist-tag resolution", () => {
 		const result = Bun.spawn([process.execPath, script.pathname, "--requested"], { stdout: "pipe", stderr: "pipe" });
 		expect(await result.exited).toBe(2);
 	});
+
+	// The test above compares the CLI against the same function that feeds it, so it would
+	// still pass with a hardcoded `latest`. This one runs the real CLI against prerelease
+	// manifests, which is the regression that used to promote a prerelease on a rerun.
+	test("the CLI derives next from prerelease package manifests", async () => {
+		const root = await realpath(await mkdtemp(join(tmpdir(), "release-dist-tag-test-")));
+		try {
+			await mkdir(join(root, "scripts"));
+			for (const file of ["release-dist-tag.ts", "release-packages.ts"]) {
+				await copyFile(new URL(`../../../scripts/${file}`, import.meta.url), join(root, "scripts", file));
+			}
+			for (const directory of RELEASE_ORDER) {
+				await mkdir(join(root, "packages", directory), { recursive: true });
+				await writeFile(
+					join(root, "packages", directory, "package.json"),
+					JSON.stringify({ name: `@fixture/${directory}`, version: "1.2.3-rc.1" }),
+				);
+			}
+			const derived = Bun.spawn([process.execPath, join(root, "scripts", "release-dist-tag.ts"), "--requested", ""], {
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr] = await Promise.all([
+				new Response(derived.stdout).text(),
+				new Response(derived.stderr).text(),
+			]);
+			expect(await derived.exited).toBe(0);
+			expect(stderr).toBe("");
+			expect(stdout.trim()).toBe("next");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("release workflow wiring", () => {
@@ -74,6 +110,8 @@ describe("release workflow wiring", () => {
 		expect(workflow).toContain("cancel-in-progress: false");
 		// The old global group let a third tag push cancel a pending tagged release.
 		expect(workflow).not.toMatch(/^ {2}group: release$/m);
+		// A job-level group would shadow the workflow-level one and reintroduce the drop.
+		expect(workflow.match(/^\s*concurrency:/gm) ?? []).toHaveLength(1);
 	});
 
 	test("publishes with the resolved dist-tag instead of a latest fallback", async () => {
@@ -89,8 +127,12 @@ describe("release workflow wiring", () => {
 		expect(workflow).toMatch(/npm_tag:[\s\S]*?default: ""/);
 	});
 
-	test("marks a prerelease tag's GitHub release as a prerelease", async () => {
+	test("mirrors the npm dist-tag in the GitHub release's prerelease flag", async () => {
 		const workflow = await releaseWorkflow();
-		expect(workflow).toMatch(/prerelease: \$\{\{ github\.ref_type == 'tag' && contains\(github\.ref_name, '-'\) \}\}/);
+		expect(workflow).toMatch(/npm-tag: \$\{\{ steps\.dist-tag\.outputs\.tag \}\}/);
+		expect(workflow).toMatch(/prerelease: \$\{\{ needs\.publish-npm\.outputs\.npm-tag != 'latest' \}\}/);
+		// The tag name is not the source of truth: `v*.*.*` also matches prerelease tags
+		// whose checked-out versions are stable, and the npm tag is what this run published.
+		expect(workflow).not.toContain("contains(github.ref_name, '-')");
 	});
 });
