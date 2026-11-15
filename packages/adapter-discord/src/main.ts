@@ -1338,6 +1338,10 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		const receivedAt =
 			typeof message.createdTimestamp === "number" ? new Date(message.createdTimestamp).toISOString() : undefined;
 		if (selectNativeImageAttachments(message).length > 0) {
+			// Discord can redeliver the same message while its first delivery is
+			// still settling. Reserving another ordered turn would queue that turn
+			// behind the waiter it is supposed to release.
+			if (gateway.imageInFlight(message.id)) return;
 			let start!: () => void;
 			const turn = new Promise<void>((resolve) => {
 				start = resolve;
@@ -1747,6 +1751,16 @@ export class ReconnectingGateway {
 		this.#attempt = 0;
 		void this.downAlarm?.up();
 		void this.#flushEdits();
+	}
+
+	/** True while a live/recovered image event already owns or awaits this message. */
+	imageInFlight(messageId: string): boolean {
+		return (
+			this.#imageOwners.has(messageId) ||
+			this.#imageDone.has(messageId) ||
+			this.#imageTurnOpen.has(messageId) ||
+			this.#imageSettled.has(messageId)
+		);
 	}
 
 	/** Owns an image from durable intent through acknowledgement, across live and history. */

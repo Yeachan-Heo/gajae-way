@@ -751,6 +751,54 @@ test("a recovered image is admitted without creating a thread first", async () =
 	}
 }, 12_000);
 
+test("a duplicate live image event is coalesced while its first send is settling", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-duplicate-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "duplicate-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	const requests: Array<{ verb: string; params: any }> = [];
+	let sends = 0;
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			requests,
+			{},
+			async (verb) => {
+				if (verb !== "chat.send") return { engaged: false, turnId: null };
+				sends++;
+				if (sends === 1) throw new Error("temporary send failure");
+				return { engaged: false, turnId: null };
+			},
+		);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		const first = adapter.processImage(message as never, engagement!);
+		const waiter = adapter.waitForImage(message as never, first);
+		expect(await bounded(first)).toBe("unavailable");
+		adapter.adoptClient({
+			request: async (verb: string, params: unknown) => {
+				requests.push({ verb, params });
+				sends++;
+				return { engaged: false, turnId: null };
+			},
+		} as never);
+		expect(adapter.imageInFlight(id)).toBe(true);
+		expect(["unavailable", "acked"]).toContain(await adapter.processImage(message as never, engagement!));
+		await bounded(waiter);
+		expect(sends).toBe(2);
+		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
+			{ messageId: id, channelId, completed: true, completedAt: expect.any(Number), dm: true },
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
 test("a persisted image request replays even when the recovery cursor is unreadable", async () => {
 	const home = await mkdtemp(join(tmpdir(), "discord-image-order-cursor-read-"));
 	const cleanupTimers = trackTimers();
