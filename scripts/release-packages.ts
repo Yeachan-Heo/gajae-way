@@ -35,9 +35,9 @@ export function isPrereleaseVersion(version: string): boolean {
 // version list, which is what keeps a concurrent release of the same channel from being
 // left behind; an operator-chosen tag has no channel and is ordered by its pointer only.
 // The floor spans release lines: a `next` pointer follows the highest published
-// prerelease, so a prerelease line published under another tag still moves it. A tag
-// moved by hand survives only until the next release of that channel, which converges it
-// back to the floor.
+// prerelease, so a prerelease line published under another tag still moves it. A channel
+// tag moved by hand below the floor is converged back up at the next release of that
+// channel; a hand move above the floor is kept, because no write goes backwards.
 // A Map, not an object literal: `tag` is maintainer-supplied and an object would answer
 // for `constructor`, `toString`, or `__proto__`.
 const CHANNEL_FLOORS = new Map<string, (version: string) => boolean>([
@@ -312,6 +312,9 @@ async function resumeTag(
 	// Any such tag is safe to delete only while it still points at this version.
 	const orphanBase = scratchTagBase(version);
 	for (const [orphan, orphanVersion] of Object.entries(tags)) {
+		// Never reclaim the tag this run is releasing: an operator may keep a tag in the
+		// reserved namespace, and the snapshot above is not re-read after a deletion.
+		if (orphan === effectiveTag) continue;
 		if (orphanVersion !== version) continue;
 		if (orphan !== orphanBase && !orphan.startsWith(`${orphanBase}-`)) continue;
 		await removeDistTag(name, orphan, version, cwd);

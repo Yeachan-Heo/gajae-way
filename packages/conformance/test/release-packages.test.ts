@@ -852,6 +852,20 @@ describe("release script subprocess behavior", () => {
 		});
 	}, 30_000);
 
+	test("never reclaims the tag this run is releasing, even in the reserved namespace", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		const operatorTag = "gajae-pending-1-2-3";
+		await withReleaseFixture(
+			{ existing: [packageRef(pkg)], tags: { [`${pkg.name}@${operatorTag}`]: "1.2.3" } },
+			async ({ execute }) => {
+				const result = await execute("--publish", "--tag", operatorTag);
+				expect(result.code).toBe(0);
+				expect(result.output).toContain("already has dist-tag");
+				expect(result.commands.filter((command) => command.args[0] === "dist-tag")).toEqual([]);
+			},
+		);
+	}, 30_000);
+
 	test("reclaims a run-unique scratch tag left behind by an interrupted run", async () => {
 		const pkg = RELEASE_FIXTURES[0];
 		await withReleaseFixture(
