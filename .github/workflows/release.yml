@@ -11,6 +11,14 @@ on:
         required: false
         default: "latest"
 
+# A tag push and a manual dispatch can overlap. `npm dist-tag add` has no
+# conditional form, so two runs could each read a tag, then write it in the
+# wrong order and point it backwards. Serialize release runs instead of
+# dropping either: a queued run keeps its own tag input.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   # Runs the same verification the build workflow runs before anything is
   # published or released, so a red test/build never reaches the registry

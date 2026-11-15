@@ -113,6 +113,12 @@ async function npmOutput(args: string[], cwd: string): Promise<{ stdout: string;
 // explicitly. release.yml always passes --tag, so the fallbacks and the prerelease
 // guard only run for interactive releases; `--tag` is also the escape hatch when a
 // tag must deliberately move backwards.
+//
+// `npm dist-tag add` has no conditional form, so the checks below read the tag and
+// then write it: they protect against a tag that was already ahead, not against a
+// writer that lands between the read and the write. Release runs are serialized by
+// release.yml's concurrency group, which is what keeps that window closed for the
+// only writers npm has here.
 async function resumeTag(
 	name: string,
 	version: string,
@@ -130,6 +136,15 @@ async function resumeTag(
 			throw new Error(`npm config get tag returned no tag for ${name}; pass --tag explicitly`);
 		}
 		effectiveTag = result.stdout;
+	}
+	// parseArgs rejects an option-shaped --tag, but publishConfig.tag and npm's own
+	// config are package-controlled data: a tag such as "--force" would be consumed by
+	// npm as an option, so the command would mutate a different tag than the one checked
+	// here. Reject the shape rather than pass it as a positional argument.
+	if (!effectiveTag || effectiveTag.startsWith("-") || /\s/.test(effectiveTag)) {
+		throw new Error(
+			`refusing to use dist-tag ${JSON.stringify(effectiveTag)} for ${name}: npm would parse it as an option`,
+		);
 	}
 
 	const current = await npmOutput(["view", `${name}@${effectiveTag}`, "version"], cwd);
@@ -167,6 +182,17 @@ async function resumeTag(
 		throw new Error(
 			`npm dist-tag update failed for ${name}@${version}. OIDC requires npm 11.21.0+ (11.x) or 12.2.0+ (12.x) and "Allow npm dist-tag" on this package's trusted publisher.`,
 			{ cause: error },
+		);
+	}
+
+	// The write is the last chance to notice an interleaved release: if a concurrent run
+	// moved the tag after our read, npm accepts our write and ours accepts theirs in
+	// whichever order they land. Re-read so the release fails on a tag that did not end
+	// up where this run put it instead of reporting success.
+	const verified = await npmOutput(["view", `${name}@${effectiveTag}`, "version"], cwd);
+	if (verified.code !== 0 || verified.stdout !== version) {
+		throw new Error(
+			`dist-tag ${effectiveTag} for ${name} resolves to ${verified.stdout || "nothing"} after writing ${version}; a concurrent release moved it`,
 		);
 	}
 }

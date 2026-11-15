@@ -175,7 +175,7 @@ if (tool === "bun") {
     }
     const tags = JSON.parse(readFileSync(process.env.TAG_STATE, "utf8"));
     const split = args[2].lastIndexOf("@");
-    tags[args[2].slice(0, split) + "@" + args[3]] = args[2].slice(split + 1);
+    tags[args[2].slice(0, split) + "@" + args[3]] = process.env.INTERLEAVE_VERSION || args[2].slice(split + 1);
     writeFileSync(process.env.TAG_STATE, JSON.stringify(tags));
     process.exit(0);
   }
@@ -202,6 +202,7 @@ async function withReleaseFixture(
 		tags?: Record<string, string>;
 		publishTags?: Record<string, string>;
 		versions?: Record<string, string>;
+		interleave?: string;
 	},
 	run: (fixture: {
 		root: string;
@@ -260,6 +261,7 @@ async function withReleaseFixture(
 						TAG_STATE: tagState,
 						CONFIG_TAG: options.configTag ?? "latest",
 						CONFIG_ERROR: options.configError ? "1" : "",
+						INTERLEAVE_VERSION: options.interleave ?? "",
 					},
 					stdout: "pipe",
 					stderr: "pipe",
@@ -309,6 +311,11 @@ describe("release script subprocess behavior", () => {
 						expected.push({
 							tool: "npm",
 							args: ["dist-tag", "add", packageRef(pkg), tag ?? "latest"],
+							cwd: pkg.directory,
+						});
+						expected.push({
+							tool: "npm",
+							args: ["view", `${pkg.name}@${tag ?? "latest"}`, "version"],
 							cwd: pkg.directory,
 						});
 					} else {
@@ -509,6 +516,32 @@ describe("release script subprocess behavior", () => {
 				expect(result.code).toBe(0);
 				expect(result.output).toContain("already has dist-tag latest");
 				expect(result.commands.filter((command) => command.args[0] === "dist-tag")).toEqual([]);
+			},
+		);
+	}, 30_000);
+
+	test("fails when a concurrent release moved the tag this run just wrote", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture({ existing: [packageRef(pkg)], interleave: "1.2.4" }, async ({ execute }) => {
+			const result = await execute("--publish", "--tag", "next");
+			expect(result.code).not.toBe(0);
+			expect(result.output).toContain("concurrent release");
+			expect(result.output).toContain("1.2.4");
+			expect(result.commands.some((command) => command.cwd === "images" || command.args[0] === "publish")).toBe(false);
+		});
+	}, 30_000);
+
+	test("refuses an option-shaped publishConfig tag instead of passing it to npm", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{ existing: [packageRef(pkg)], publishTags: { [pkg.name]: "--force" } },
+			async ({ execute }) => {
+				const result = await execute("--publish");
+				expect(result.code).not.toBe(0);
+				expect(result.output).toContain("would parse it as an option");
+				expect(result.commands.some((command) => command.args[0] === "dist-tag" || command.cwd === "images")).toBe(
+					false,
+				);
 			},
 		);
 	}, 30_000);
