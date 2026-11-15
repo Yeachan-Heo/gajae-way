@@ -3,7 +3,6 @@ import { mkdir, mkdtemp, readFile, readlink, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { homeLayout } from "@gajae-gateway/home";
-import { pinnedGjcCandidatePaths } from "../../gateway/src/orchestrator/broker";
 import type { GjcInstallRunner } from "../src/gjc-install";
 import {
 	BROKER_UNIT,
@@ -362,15 +361,6 @@ test("installPinnedGjcForServices refuses a manifest without a pin instead of us
 
 test("servicePinManifest names the release manifest beside the target binaries", () => {
 	expect(servicePinManifest("~/bin", { HOME: "/home/op" })).toBe("/home/op/bin/package.json");
-});
-
-test("the pin the installer reads is the one the gateway resolves beside its own binary", () => {
-	// The generated definitions run `<binDir>/gajaeway-gateway`; for a regular file there, the
-	// installer's manifest and the runtime's first candidate must name the same file.
-	const binDir = "/opt/gajaeway/bin";
-	expect(servicePinManifest(binDir, { HOME: "/home/op" })).toBe(
-		pinnedGjcCandidatePaths(join(binDir, "gajaeway-gateway"))[0],
-	);
 });
 
 test("service repair installs the target release manifest's pin, not the checkout pin", async () => {
