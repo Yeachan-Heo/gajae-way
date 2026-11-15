@@ -1862,12 +1862,20 @@ export class ReconnectingGateway {
 			}
 		} catch (error) {
 			if (error instanceof ImageOutboxCapacityError) {
+				if (recovered || ordered || !this.#imageSettled.has(message.id)) {
+					console.error(
+						`Discord image outbox admission bound reached message=${message.id}; holding recovery progress.`,
+					);
+					throw error;
+				}
 				this.#imageAdmissionFailures.delete(message.id);
 				await this.rejectImageAdmission(message.id, channelId, "image outbox admission bound reached");
 				return "skip";
 			}
 			const attempts = (this.#imageAdmissionFailures.get(message.id) ?? 0) + 1;
 			this.#imageAdmissionFailures.set(message.id, attempts);
+			if (this.#imageAdmissionFailures.size > 10_000)
+				this.#imageAdmissionFailures.delete(this.#imageAdmissionFailures.keys().next().value as string);
 			if (attempts < MAX_IMAGE_ADMISSION_FAILURES || recovered || ordered || !this.#imageSettled.has(message.id)) {
 				console.error(
 					`Discord image outbox admission failed message=${message.id} attempt=${attempts}; retrying without sending.`,
@@ -2132,6 +2140,7 @@ export class ReconnectingGateway {
 
 	/** Drop every per-id structure after the intent can never need another attempt. */
 	private cleanupImageState(id: string): void {
+		this.#imageAdmissionFailures.delete(id);
 		const timer = this.#imageRetries.get(id);
 		if (timer) clearTimeout(timer);
 		this.#imageRetries.delete(id);

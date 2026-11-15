@@ -494,14 +494,16 @@ test("an image refused by the admission bound releases the conversation chain", 
 		const message = dmMessage(id, channelId, true);
 		const engagement = decideInbound(message as never, bot, {});
 		expect(engagement).toBeDefined();
-		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("skip");
+		const first = adapter.processImage(message as never, engagement!);
+		const waiter = adapter.waitForImage(message as never, first);
+		expect(await bounded(first)).toBe("skip");
+		await bounded(waiter);
 		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
 		expect(adapter.deadLetters[0]!.summary).toContain("admission bound");
 		expect(
 			JSON.parse(await readFile(outboxPath, "utf8")).some((entry: { messageId: string }) => entry.messageId === id),
 		).toBe(false);
 		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
-		await bounded(adapter.waitForImage(message as never, Promise.resolve("skip")), 2_000);
 	} finally {
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });
@@ -894,6 +896,66 @@ test("a persistent pre-intent outbox failure releases ingress after bounded atte
 		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
 		expect(adapter.deadLetters[0]!.summary).toContain("5 admission attempts");
 		await bounded(waiter, 2_000);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("recovered admission failures never take the live terminal release", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-recovered-admission-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "recovered-dm";
+	const base = 1571558400000000000n;
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(
+			outboxPath,
+			JSON.stringify(
+				Array.from({ length: 1_000 }, (_, index) => ({
+					messageId: String(base + BigInt(index)),
+					channelId,
+				})),
+			),
+		);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		const id = String(base + 10_000n);
+		const message = dmMessage(id, channelId, true);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		expect(await bounded(adapter.processImage(message as never, engagement!, undefined, undefined, true))).toBe(
+			"unavailable",
+		);
+		expect(adapter.deadLetters).toEqual([]);
+		expect(requests).toEqual([]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("recovered pre-intent outbox failures hold progress without dead-lettering", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-recovered-io-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "recovered-io-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await mkdir(outboxPath);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), []);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		for (let attempt = 0; attempt < 5; attempt++)
+			expect(await bounded(adapter.processImage(message as never, engagement!, undefined, undefined, true))).toBe(
+				"unavailable",
+			);
+		expect(adapter.deadLetters).toEqual([]);
 	} finally {
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });
