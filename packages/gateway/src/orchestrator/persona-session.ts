@@ -167,6 +167,14 @@ function relayUnavailableTrackerKey(opRef: string): string {
 	return `relay_unavailable:${opRef}`;
 }
 
+/**
+ * First miss of a terminal operation's result text. Durable so the bounded
+ * recovery window still expires after a gateway restart instead of restarting.
+ */
+function terminalTextMissKey(opRef: string): string {
+	return `terminal_text_miss:${opRef}`;
+}
+
 const ESCALATION_NOTICE_PREFIX = "escalation-notice:";
 
 /**
@@ -300,6 +308,7 @@ function completeInboundTurn(
 	if (changed === 1) store.core.metaDelete(escalatedHoldKey(opRef));
 	// Clean up relay unavailability tracker when turn completes (#766)
 	if (changed === 1) store.core.metaDelete(relayUnavailableTrackerKey(opRef));
+	if (changed === 1) store.core.metaDelete(terminalTextMissKey(opRef));
 	return changed;
 }
 
@@ -4437,8 +4446,17 @@ class OriginActor {
 				}
 				if (text === undefined) {
 					const now = this.#manager.now();
+					// The window is a limit on how long the turn may hold, not on how long
+					// this process may live: recover the first miss from durable state so a
+					// restart cannot restart the budget and leave the turn pending forever.
+					const firstMissKey = terminalTextMissKey(bound.turn.opRef);
+					const recordedFirstMiss = Number.parseInt(this.#manager.database.core.metaGet(firstMissKey) ?? "", 10);
+					const durableFirstMiss =
+						Number.isSafeInteger(recordedFirstMiss) && recordedFirstMiss > 0 ? recordedFirstMiss : undefined;
+					bound.terminalTextFirstMissAtMs ??= durableFirstMiss ?? now;
+					if (durableFirstMiss === undefined)
+						this.#manager.database.core.metaSet(firstMissKey, bound.terminalTextFirstMissAtMs.toString());
 					bound.terminalTextMisses += 1;
-					bound.terminalTextFirstMissAtMs ??= now;
 					const exhausted =
 						bound.terminalTextMisses >= TERMINAL_TEXT_RECOVERY_MAX_ATTEMPTS ||
 						now - bound.terminalTextFirstMissAtMs >= TERMINAL_TEXT_RECOVERY_WINDOW_MS;
