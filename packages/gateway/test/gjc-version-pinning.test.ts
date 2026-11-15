@@ -93,7 +93,25 @@ describe("GJC version pinning", () => {
 		try {
 			const beside = join(directory, "package.json");
 			await writeFile(beside, JSON.stringify({ name: "@gajae-gateway/gateway", gjc: { version: "9.9.9" } }));
-			expect(readPinnedGjcVersion([join(directory, "absent", "package.json"), beside])).toBe("9.9.9");
+			expect(readPinnedGjcVersion([beside, join(directory, "absent", "package.json")])).toBe("9.9.9");
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps the release beside the binary authoritative when the checkout manifest is readable too", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-gjc-pin-"));
+		try {
+			const beside = join(directory, "package.json");
+			await writeFile(beside, JSON.stringify({ name: "gajaeway", gjc: { version: "9.9.9" } }));
+			const candidates = pinnedGjcCandidatePaths(join(directory, "gajaeway-gateway"));
+			// Both manifests are readable and disagree: the checkout candidate still pins the
+			// version this repository builds against. The release beside the binary must win, or
+			// the broker refuses its own install with broker_host_version_mismatch.
+			const checkout = join(import.meta.dir, "..", "package.json");
+			expect(candidates.at(-1)).toBe(checkout);
+			expect(readPinnedGjcVersion([checkout])).not.toBe("9.9.9");
+			expect(readPinnedGjcVersion(candidates)).toBe("9.9.9");
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}
@@ -103,7 +121,9 @@ describe("GJC version pinning", () => {
 		expect(() => readPinnedGjcVersion(["/nonexistent/package.json"])).toThrow("/nonexistent/package.json");
 	});
 
-	it("offers the running binary's own directory as a pin location", () => {
-		expect(pinnedGjcCandidatePaths("/opt/gajaeway/bin/gajaeway-gateway")).toContain("/opt/gajaeway/bin/package.json");
+	it("offers the running binary's own directory as the first pin location", () => {
+		const candidates = pinnedGjcCandidatePaths("/opt/gajaeway/bin/gajaeway-gateway");
+		expect(candidates[0]).toBe("/opt/gajaeway/bin/package.json");
+		expect(candidates[1]).toBe(join(import.meta.dir, "..", "package.json"));
 	});
 });

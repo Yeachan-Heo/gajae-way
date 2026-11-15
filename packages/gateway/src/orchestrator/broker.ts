@@ -25,17 +25,24 @@ export const GJC_ATTACH_ONLY_ENV = "GJC_SDK_BROKER_AUTOSTART";
 /**
  * Candidate locations for the pinned GJC version, in priority order.
  *
- * A compiled binary keeps the *build-time* source path in `__filename`, so the
- * checkout candidate only resolves on the machine that built it. An installed
- * binary carries the pin beside itself instead; without that second candidate a
- * binary shipped to another host exits at boot naming a path from the build
- * machine, which no operator can act on (found deploying dev to jip-gajae).
+ * The manifest beside the running binary is authoritative: it is the release the
+ * operator installed and the one `gajaeway services install` reads, so the runtime
+ * must not resolve a different pin for the same install. A compiled binary keeps
+ * the *build-time* source path in `__filename`, so the checkout candidate resolves
+ * on the machine that built it and can pin another version than the release beside
+ * the binary; consulting it first made the broker refuse its own release with
+ * broker_host_version_mismatch. The checkout manifest stays only as the documented
+ * fallback for a source run, where no manifest sits beside the executable.
  */
 export function pinnedGjcCandidatePaths(execPath: string = process.execPath): readonly string[] {
-	return [join(dirname(dirname(dirname(__filename))), "package.json"), join(dirname(execPath), "package.json")];
+	return [join(dirname(execPath), "package.json"), join(dirname(dirname(dirname(__filename))), "package.json")];
 }
 
-/** Read the pinned GJC version this build runs against, or throw naming every candidate tried. */
+/**
+ * Read the pinned GJC version this build runs against: the first candidate that carries a
+ * `gjc.version` wins, so a readable target manifest cannot be overridden by a later fallback.
+ * Throws naming every candidate tried when none carries the pin.
+ */
 export function readPinnedGjcVersion(candidates: readonly string[] = pinnedGjcCandidatePaths()): string {
 	for (const path of candidates) {
 		try {
