@@ -37,9 +37,10 @@ export const GJC_ATTACH_ONLY_ENV = "GJC_SDK_BROKER_AUTOSTART";
  * the *build-time* source path in `__filename`, so the checkout candidate resolves
  * on the machine that built it and can pin another version than the release beside
  * the binary; consulting it first made the broker refuse its own release with
- * broker_host_version_mismatch. The checkout manifest stays only as the documented
- * fallback for an executable with no usable pin beside it (absent, unreadable, or
- * without `gjc.version`), which is a source run.
+ * broker_host_version_mismatch. The checkout manifest is only a fallback for an
+ * executable with no usable pin beside it (absent, unparseable, or without
+ * `gjc.version`): a source run always lands there, and a release host that lost its
+ * manifest is a broken install, not a second pin source.
  */
 export function pinnedGjcCandidatePaths(execPath: string = process.execPath): readonly string[] {
 	return [join(dirname(execPath), "package.json"), join(dirname(dirname(dirname(__filename))), "package.json")];

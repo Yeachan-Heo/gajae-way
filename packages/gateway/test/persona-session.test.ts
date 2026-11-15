@@ -3093,7 +3093,6 @@ test("terminal text recovery window survives a gateway restart instead of restar
 	// Restart three quarters of the way through the window. The first miss is durable, so
 	// the recovered actor continues the same window; a deadline restarted on boot would
 	// still be held here and would not expire until a full window after the restart.
-	const readsBeforeRestart = port.statusReads.length;
 	clock.offsetMs = 45_000;
 	await manager!.stop();
 	database!.close();
@@ -3121,9 +3120,11 @@ test("terminal text recovery window survives a gateway restart instead of restar
 	expect(database.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
 	expect(terminal).toEqual([]);
 
-	// The restart and a further miss leave the original deadline untouched.
+	// Recovery reads the status itself, so the baseline is taken after it: the tick below
+	// must re-check on its own, and the restart and that miss leave the deadline untouched.
+	const readsAfterRecover = port.statusReads.length;
 	await manager.tick(KEY);
-	await eventually(() => port.statusReads.length > readsBeforeRestart, "recovered turn did not re-check its status");
+	await eventually(() => port.statusReads.length > readsAfterRecover, "recovered turn did not re-check its status");
 	expect(database.core.metaGet(missKey)).toBe(firstMissAt);
 	expect(database.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
 	expect(terminal).toEqual([]);

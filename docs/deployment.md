@@ -87,7 +87,7 @@ The updater stages the platform release, backs up replaced binaries, reads the s
 
 With `--no-restart`, stale service definitions for missing binaries are left alone so a healthy running process is not stopped during the staged update. The later `gajaeway ops restart-stack` stops and removes those stale services before restarting the installed stack.
 
-A source checkout upgrades through `git`, `bun run build`, and `gajaeway services repair --bin-dir dist` (the build writes `dist/package.json` beside the binaries); when running under Bun, pass `--bin-dir DIR` to update. The release update requires Bun to install the pinned GJC package.
+A source checkout upgrades through `git`, `bun run build`, and `gajaeway services repair --bin-dir "$PWD/dist"` (the build writes `dist/package.json` beside the binaries); when running under Bun, pass `--bin-dir DIR` to update. The release update requires Bun to install the pinned GJC package.
 
 ### Gateway and adapter rollout for `chat.images`
 
