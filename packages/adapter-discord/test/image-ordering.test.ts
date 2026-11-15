@@ -962,6 +962,43 @@ test("recovered pre-intent outbox failures hold progress without dead-lettering"
 	}
 }, 12_000);
 
+test("a history join inherits a capacity hold from the live owner", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-join-capacity-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "join-capacity-dm";
+	const base = 1571558400000000000n;
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(
+			outboxPath,
+			JSON.stringify(
+				Array.from({ length: 1_000 }, (_, index) => ({
+					messageId: String(base + BigInt(index)),
+					channelId,
+				})),
+			),
+		);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		const id = String(base + 10_000n);
+		const message = dmMessage(id, channelId, true);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		const live = adapter.processImage(message as never, engagement!);
+		const waiter = adapter.waitForImage(message as never, live);
+		const history = adapter.processImage(message as never, engagement!, undefined, undefined, true);
+		expect(await bounded(live)).toBe("skip");
+		expect(await bounded(history)).toBe("unavailable");
+		await bounded(waiter);
+		expect(requests).toEqual([]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
 test("a persisted image request replays even when the recovery cursor is unreadable", async () => {
 	const home = await mkdtemp(join(tmpdir(), "discord-image-order-cursor-read-"));
 	const cleanupTimers = trackTimers();

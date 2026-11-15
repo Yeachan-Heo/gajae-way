@@ -1727,6 +1727,7 @@ export class ReconnectingGateway {
 	readonly #imageRetryAttempts = new Map<string, number>();
 	readonly #imageSettled = new Map<string, Set<() => void>>();
 	readonly #imageDone = new Set<string>();
+	readonly #imageUnsent = new Set<string>();
 	readonly #imageAdmissionFailures = new Map<string, number>();
 	readonly #imageTurnOpen = new Set<string>();
 	readonly #blockedRecoveryChannels = new Set<string>();
@@ -1790,6 +1791,15 @@ export class ReconnectingGateway {
 		ordered = false,
 		retry = false,
 	): Promise<ImageOutcome> {
+		const existing = this.#imageOwners.get(message.id);
+		if (existing) {
+			if (!recovered && !ordered) return existing;
+			return existing.then((outcome) =>
+				outcome === "skip" && this.#imageUnsent.has(message.id) ? "unavailable" : outcome,
+			);
+		}
+		if (this.#imageUnsent.has(message.id) && !recovered && !ordered) return Promise.resolve("skip");
+		if (!this.#imageUnsent.has(message.id) && this.#imageDone.has(message.id)) return Promise.resolve("skip");
 		if (turn !== RESOLVED_TURN) {
 			// A live image may prepare while an earlier message in its conversation
 			// still holds the ingress slot; only delivery waits for the turn.
@@ -1859,6 +1869,7 @@ export class ReconnectingGateway {
 				};
 				await this.#imageOutbox.put(entry);
 				this.#imageAdmissionFailures.delete(message.id);
+				this.#imageUnsent.delete(message.id);
 			}
 		} catch (error) {
 			if (error instanceof ImageOutboxCapacityError) {
@@ -1890,7 +1901,10 @@ export class ReconnectingGateway {
 			);
 			return "skip";
 		}
-		if (entry) this.#imageAdmissionFailures.delete(message.id);
+		if (entry) {
+			this.#imageAdmissionFailures.delete(message.id);
+			this.#imageUnsent.delete(message.id);
+		}
 		// Best-effort: the durable outbox already makes this channel discoverable.
 		// A failing cursor store must not silence the DM's image while text flows.
 		await this.rememberInboundDm(sourceOrigin);
@@ -2055,6 +2069,8 @@ export class ReconnectingGateway {
 		}
 		this.#imageDone.add(messageId);
 		if (this.#imageDone.size > 10_000) this.#imageDone.delete(this.#imageDone.values().next().value as string);
+		this.#imageUnsent.add(messageId);
+		if (this.#imageUnsent.size > 10_000) this.#imageUnsent.delete(this.#imageUnsent.values().next().value as string);
 		this.cleanupImageState(messageId);
 		console.error(
 			`Discord image rejected message=${messageId} channel=${channelId}: ${summary}; dead-lettered without persistence so ingress is released.`,
