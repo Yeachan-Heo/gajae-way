@@ -69,11 +69,43 @@ describe("release dist-tag resolution", () => {
 		expect(await result.exited).toBe(2);
 	});
 
+	test("reads manifests from a checkout path with spaces and a hash", async () => {
+		const root = await realpath(await mkdtemp(join(tmpdir(), "release dist-tag stable #")));
+		try {
+			await mkdir(join(root, "scripts"));
+			for (const file of ["release-dist-tag.ts", "release-packages.ts"]) {
+				await copyFile(new URL(`../../../scripts/${file}`, import.meta.url), join(root, "scripts", file));
+			}
+			for (const directory of RELEASE_ORDER) {
+				await mkdir(join(root, "packages", directory), { recursive: true });
+				await writeFile(
+					join(root, "packages", directory, "package.json"),
+					JSON.stringify({ name: `@fixture/${directory}`, version: "1.2.3" }),
+				);
+			}
+			const derived = Bun.spawn([process.execPath, join(root, "scripts", "release-dist-tag.ts"), "--requested", ""], {
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr] = await Promise.all([
+				new Response(derived.stdout).text(),
+				new Response(derived.stderr).text(),
+			]);
+			expect(await derived.exited).toBe(0);
+			expect(stderr).toBe("");
+			expect(stdout.trim()).toBe("latest");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	}, 30_000);
+
 	// The test above compares the CLI against the same function that feeds it, so it would
 	// still pass with a hardcoded `latest`. This one runs the real CLI against prerelease
 	// manifests, which is the regression that used to promote a prerelease on a rerun.
 	test("the CLI derives next from prerelease package manifests", async () => {
-		const root = await realpath(await mkdtemp(join(tmpdir(), "release-dist-tag-test-")));
+		// Space and `#` force URL percent-encoding, so this fails if the resolver uses the
+		// URL pathname instead of `fileURLToPath`.
+		const root = await realpath(await mkdtemp(join(tmpdir(), "release dist-tag #")));
 		try {
 			await mkdir(join(root, "scripts"));
 			for (const file of ["release-dist-tag.ts", "release-packages.ts"]) {

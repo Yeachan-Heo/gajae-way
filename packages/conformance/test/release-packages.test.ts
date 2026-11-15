@@ -319,7 +319,11 @@ async function withReleaseFixture(
 	// Bun resolves symlinks in import.meta.url, so the copied script always reports the
 	// canonical temp root. Canonicalize here too, or macOS (/var -> /private/var) compares
 	// the script's realpath output against an unresolved expectation.
-	const root = await realpath(await mkdtemp(join(tmpdir(), "release-packages-test-")));
+	//
+	// The prefix contains a space and `#` on purpose: `new URL("..", import.meta.url)`
+	// percent-encodes both, so every test in this file fails if the script uses the URL
+	// pathname instead of decoding it with `fileURLToPath`.
+	const root = await realpath(await mkdtemp(join(tmpdir(), "release packages #")));
 	try {
 		const bin = join(root, "bin");
 		await mkdir(bin);
