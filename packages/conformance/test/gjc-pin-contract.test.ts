@@ -18,3 +18,13 @@ test("the installer reads the pin the broker resolves beside its binary", () => 
 		pinnedGjcCandidatePaths(join(binDir, "gajaeway-gateway"))[0],
 	);
 });
+
+test("a compiled release resolves that manifest and nothing else", () => {
+	// The installer has always had exactly one pin source for a target. The compiled runtime
+	// now matches it: a release whose manifest cannot supply the pin fails closed instead of
+	// enforcing the build checkout's pin, so the installer's manifest is the whole contract.
+	const binDir = "/opt/gajaeway/bin";
+	expect(pinnedGjcCandidatePaths(join(binDir, "gajaeway-gateway"), true, "/$bunfs/root/gajaeway-gateway")).toEqual([
+		servicePinManifest(binDir, { HOME: "/home/op" }),
+	]);
+});
