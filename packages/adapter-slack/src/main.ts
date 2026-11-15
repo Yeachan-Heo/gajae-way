@@ -781,6 +781,13 @@ export class ReconnectingGateway implements GatewayClientLike {
 		};
 	}
 
+	/**
+	 * Inbound send whose image preparation is covered by the duplicate check.
+	 * Preparation shares the adapter's per-minute image budget, so paying for it
+	 * for an id that is already acknowledged (or in flight) starves genuinely new
+	 * images behind work whose only outcome can be "duplicate". The dedupe must
+	 * therefore happen before `send` runs, never inside it.
+	 */
 	async requestPrepared(
 		messageId: string,
 		send: () => Promise<RecoveredSend>,
@@ -1349,7 +1356,10 @@ export async function startSlackAdapter(
 			};
 			let prepared: Awaited<ReturnType<typeof prepareSlackImages>> | undefined;
 			let sent: RecoveredSend;
-			// A stale backfill is recorded for context but must not open a new turn.
+			// A stale backfill (old, and the bot already posted after it in that
+			// conversation) is recorded so the persona's context is complete, but it
+			// never opens a turn: answering it now would re-answer something the room
+			// watched get answered hours ago (live, 2026-09-17).
 			try {
 				sent = await gateway.requestPrepared(messageId, async () => {
 					prepared = await prepareImages(message.files);

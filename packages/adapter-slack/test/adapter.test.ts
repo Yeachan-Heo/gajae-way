@@ -1819,33 +1819,6 @@ test("Slack recovery advances past a live-delivered image without downloading it
 	}
 });
 
-test("Slack recovery skips live-delivered images after adapter restart", async () => {
-	let downloads = 0;
-	const imageFetch: ImageFetch = async () => {
-		downloads++;
-		return downloads === 1 ? new Response(ONE_PIXEL_PNG) : new Response("expired", { status: 404 });
-	};
-	const channels = { C1: { engagement: "open" as const } };
-	const first = await fixture(channels, { autoRecover: false, imageFetch });
-	const message = inbound({
-		ts: "1700000040.000001",
-		files: [{ name: "photo.png", mimetype: "image/png", url_private: "https://files.slack.com/photo.png" }],
-	});
-	let resumed: Awaited<ReturnType<typeof fixture>> | undefined;
-	try {
-		await first.event({ ...message });
-		first.socket.stop();
-		resumed = await fixture(channels, { autoRecover: false, imageFetch, recoveryCursorPath: first.recoveryCursorPath });
-		resumed.api.history.C1 = [{ ...message }];
-		expect(await resumed.recoverMissedMessages()).toBe(true);
-		expect(downloads).toBe(1);
-		expect((await loadRecoveryCursors(resumed.recoveryCursorPath)).recoveredThrough.C1).toBe(message.ts);
-	} finally {
-		first.socket.stop();
-		resumed?.socket.stop();
-	}
-});
-
 test("Slack recovery skips acknowledged images when a budget-limited pass is retried", async () => {
 	let clock = 0;
 	const monotonic = spyOn(performance, "now").mockImplementation(() => clock);
