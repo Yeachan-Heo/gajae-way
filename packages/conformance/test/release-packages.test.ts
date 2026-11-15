@@ -8,7 +8,12 @@ import { describe, expect, test } from "bun:test";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, delimiter, join } from "node:path";
-import { assertNoPrivateWorkspaceDeps, parseNpmViewResult, RELEASE_ORDER } from "../../../scripts/release-packages";
+import {
+	assertNoPrivateWorkspaceDeps,
+	highestPublishedStableVersion,
+	parseNpmViewResult,
+	RELEASE_ORDER,
+} from "../../../scripts/release-packages";
 
 const RELEASE_PACKAGE_NAMES = new Set(["@gajae-gateway/protocol", "@gajae-gateway/images", "@gajae-gateway/sdk"]);
 const RELEASE_PACKAGE_NAMES_WITH_PRIVATE = new Set([...RELEASE_PACKAGE_NAMES, "@gajae-gateway/home"]);
@@ -74,6 +79,22 @@ describe("release package workspace dependency guard", () => {
 		expect(() => assertNoPrivateWorkspaceDeps(manifest, WORKSPACE_PACKAGES, RELEASE_PACKAGE_NAMES)).toThrow(
 			"not in the release map",
 		);
+	});
+});
+
+describe("latest ordering", () => {
+	test("selects the highest stable published version by semver order", () => {
+		expect(highestPublishedStableVersion(["1.2.3", "1.10.0", "1.9.9"])).toBe("1.10.0");
+	});
+
+	test("ignores prereleases and build metadata when selecting latest", () => {
+		expect(highestPublishedStableVersion(["1.2.3", "1.3.0-rc.1", "2.0.0-beta.2"])).toBe("1.2.3");
+		expect(highestPublishedStableVersion(["1.3.0+build.5", "1.2.9"])).toBe("1.3.0+build.5");
+	});
+
+	test("reports no candidate when only prereleases are published", () => {
+		expect(highestPublishedStableVersion(["1.0.0-rc.1"])).toBeUndefined();
+		expect(highestPublishedStableVersion([])).toBeUndefined();
 	});
 });
 
@@ -143,6 +164,19 @@ if (tool === "bun") {
     process.exit(result.status ?? 1);
   }
 } else if (tool === "npm") {
+  if (args[0] === "view" && args[2] === "versions" && args[3] === "--json") {
+    if (args[1] === process.env.VERSIONS_ERROR) {
+      console.error("simulated version-list failure");
+      process.exit(1);
+    }
+    const overrides = JSON.parse(process.env.PUBLISHED_VERSIONS);
+    const name = args[1];
+    const versions = overrides[name] ?? JSON.parse(process.env.EXISTING_PACKAGES)
+      .filter((ref) => ref.startsWith(name + "@"))
+      .map((ref) => ref.slice(name.length + 1));
+    console.log(JSON.stringify(versions));
+    process.exit(0);
+  }
   if (args[0] === "view" && args.length === 3 && args[2] === "version") {
     if (args[1] === process.env.REGISTRY_ERROR) {
       console.error("simulated registry failure");
@@ -216,6 +250,8 @@ async function withReleaseFixture(
 		versions?: Record<string, string>;
 		interleave?: string;
 		staleVerification?: Record<string, string>;
+		publishedVersions?: Record<string, string[]>;
+		versionsError?: string;
 	},
 	run: (fixture: {
 		root: string;
@@ -278,6 +314,8 @@ async function withReleaseFixture(
 						CONFIG_TAG: options.configTag ?? "latest",
 						CONFIG_ERROR: options.configError ? "1" : "",
 						INTERLEAVE_VERSION: options.interleave ?? "",
+						PUBLISHED_VERSIONS: JSON.stringify(options.publishedVersions ?? {}),
+						VERSIONS_ERROR: options.versionsError ?? "",
 					},
 					stdout: "pipe",
 					stderr: "pipe",
@@ -324,6 +362,13 @@ describe("release script subprocess behavior", () => {
 							args: ["view", `${pkg.name}@${tag ?? "latest"}`, "version"],
 							cwd: pkg.directory,
 						});
+						if (tag === undefined) {
+							expected.push({
+								tool: "npm",
+								args: ["view", pkg.name, "versions", "--json"],
+								cwd: pkg.directory,
+							});
+						}
 						expected.push({
 							tool: "npm",
 							args: ["dist-tag", "add", packageRef(pkg), tag ?? "latest"],
@@ -504,6 +549,87 @@ describe("release script subprocess behavior", () => {
 						(command) => command.args[0] === "dist-tag" || command.args[0] === "publish" || command.cwd === "images",
 					),
 				).toBe(false);
+			},
+		);
+	}, 30_000);
+
+	// A rerun of an older release can read a cached dist-tag that still points at the
+	// previous version while a newer release has already published and moved latest.
+	// The published version list is what authorizes the write, so that rerun must fail
+	// instead of moving latest backwards.
+	test("ignores a stale latest read when a newer stable version is published", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{
+				existing: [packageRef(pkg)],
+				tags: { [`${pkg.name}@latest`]: "1.2.2" },
+				publishedVersions: { [pkg.name]: ["1.2.2", "1.2.3", "1.3.0"] },
+			},
+			async ({ execute }) => {
+				const result = await execute("--publish");
+				expect(result.code).not.toBe(0);
+				expect(result.output).toContain("1.3.0");
+				expect(result.output).toContain("highest published stable version");
+				expect(result.commands.some((command) => command.args[0] === "dist-tag" || command.cwd === "images")).toBe(
+					false,
+				);
+			},
+		);
+	}, 30_000);
+
+	test("moves latest to the highest published stable version", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{
+				existing: [packageRef(pkg)],
+				tags: { [`${pkg.name}@latest`]: "1.2.2" },
+				publishedVersions: { [pkg.name]: ["1.2.2", "1.3.0-rc.1"] },
+			},
+			async ({ execute }) => {
+				const result = await execute("--publish");
+				expect(result.code).toBe(0);
+				expect(
+					result.commands.filter((command) => command.args[0] === "dist-tag").map((command) => command.args),
+				).toEqual([["dist-tag", "add", packageRef(pkg), "latest"]]);
+			},
+		);
+	}, 30_000);
+
+	test("refuses to publish an older version as latest", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture({ publishedVersions: { [pkg.name]: ["1.2.2", "1.3.0"] } }, async ({ execute }) => {
+			const result = await execute("--publish", "--tag", "latest");
+			expect(result.code).not.toBe(0);
+			expect(result.output).toContain("1.3.0");
+			expect(result.commands.some((command) => command.args[0] === "publish" || command.cwd === "images")).toBe(false);
+		});
+	}, 30_000);
+
+	test("publishes a fresh version as latest when it is the highest", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture({ publishedVersions: { [pkg.name]: ["1.2.2"] } }, async ({ execute }) => {
+			const result = await execute("--publish", "--tag", "latest");
+			expect(result.code).toBe(0);
+			expect(
+				result.commands.some(
+					(command) =>
+						command.args[0] === "publish" && command.args.includes("--tag") && command.args.includes("latest"),
+				),
+			).toBe(true);
+		});
+	}, 30_000);
+
+	test("fails closed when the published version list cannot be read", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{ existing: [packageRef(pkg)], tags: { [`${pkg.name}@latest`]: "1.2.2" }, versionsError: pkg.name },
+			async ({ execute }) => {
+				const result = await execute("--publish");
+				expect(result.code).not.toBe(0);
+				expect(result.output).toContain("simulated version-list failure");
+				expect(result.commands.some((command) => command.args[0] === "dist-tag" || command.cwd === "images")).toBe(
+					false,
+				);
 			},
 		);
 	}, 30_000);

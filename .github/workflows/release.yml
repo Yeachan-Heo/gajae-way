@@ -7,17 +7,24 @@ on:
   workflow_dispatch:
     inputs:
       npm_tag:
-        description: "npm dist-tag for the package publish (e.g. latest, next)"
+        description: "npm dist-tag for the package publish (e.g. latest, next); empty derives next for a prerelease release and latest otherwise"
         required: false
-        default: "latest"
+        default: ""
 
-# A tag push and a manual dispatch can overlap. `npm dist-tag add` has no
-# conditional form, so two runs could each read a tag, then write it in the
-# wrong order and point it backwards. Serialize them instead: GitHub keeps one
-# running and one pending run per group, and a third supersedes the pending one.
-# A superseded release loses nothing because the script is resumable.
+# Every tagged release has to run: a tag push publishes that version's packages and
+# creates its GitHub release, and a run that never starts does neither. GitHub keeps
+# only one running and one pending run per concurrency group and drops the older
+# pending one, so a single shared group let two later tags cancel an earlier pending
+# tag's release. Key the group by ref instead: reruns of the same tag still serialize
+# (the script resumes an already-published version instead of republishing), while
+# distinct tags never displace each other.
+#
+# Cross-tag ordering of dist-tag writes is enforced by the script, not by GitHub: a
+# resumed release refuses to move `latest` below the highest published stable
+# version, and the post-write read fails the run if another release moved the tag
+# meanwhile.
 concurrency:
-  group: release
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -71,14 +78,25 @@ jobs:
           node-version: 24
       - run: npm install -g npm@latest
       - run: bun install --frozen-lockfile
-      # Publishes @gajae-gateway/protocol, @gajae-gateway/sdk, and @gajae-gateway/cli in
-      # dependency order via scripts/release-packages.ts --publish. The
-      # script never touches the registry unless --publish is explicit.
-      - name: Publish protocol, sdk, cli (dependency order)
+      # Publishes @gajae-gateway/protocol, @gajae-gateway/images, @gajae-gateway/sdk, and
+      # @gajae-gateway/cli in dependency order via scripts/release-packages.ts --publish.
+      # The script never touches the registry unless --publish is explicit.
+      #
+      # The dist-tag comes from scripts/release-dist-tag.ts, not from a `latest`
+      # fallback: tag-triggered runs match `v*.*.*`, which includes prerelease tags
+      # such as v1.2.3-rc.1, and the script treats an explicit --tag as opt-in. The
+      # derivation sends a prerelease release to `next` so rerunning its tag cannot
+      # promote it to latest.
+      - name: Resolve npm dist-tag
+        id: dist-tag
+        env:
+          NPM_TAG_INPUT: ${{ github.event.inputs.npm_tag }}
         run: |
-          TAG="${{ github.event.inputs.npm_tag }}"
-          if [ -z "$TAG" ]; then TAG="latest"; fi
-          bun run release:publish -- --tag "$TAG"
+          TAG="$(bun scripts/release-dist-tag.ts --requested "$NPM_TAG_INPUT")"
+          echo "Publishing with npm dist-tag $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - name: Publish protocol, images, sdk, cli (dependency order)
+        run: bun run release:publish -- --tag "${{ steps.dist-tag.outputs.tag }}"
 
   build-binaries:
     name: build-${{ matrix.platform }}-${{ matrix.arch }}
@@ -132,4 +150,6 @@ jobs:
           files: release/*.tar.gz
           generate_release_notes: true
           draft: false
-          prerelease: false
+          # A tag push matches `v*.*.*` including prerelease tags, so the GitHub
+          # release has to mirror the prerelease status npm used.
+          prerelease: ${{ github.ref_type == 'tag' && contains(github.ref_name, '-') }}
