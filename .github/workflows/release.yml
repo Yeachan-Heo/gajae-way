@@ -160,6 +160,10 @@ jobs:
   github-release:
     name: create GitHub release
     needs: [publish-npm, build-binaries]
+    # A GitHub release needs a tag ref. Nothing `needs` this job, so skipping it on a
+    # branch dispatch cannot propagate and the manual path still publishes and finishes
+    # green.
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     permissions:
       contents: write

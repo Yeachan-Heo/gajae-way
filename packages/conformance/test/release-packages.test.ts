@@ -211,6 +211,23 @@ if (tool === "bun") {
     process.exit(0);
   }
   if (args[0] === "view" && args[2] === "dist-tags" && args[3] === "--json") {
+    const staleTags = JSON.parse(readFileSync(process.env.STALE_TAGS, "utf8"));
+    const rule = staleTags[args[1]];
+    if (rule) {
+      const counts = existsSync(process.env.STALE_TAGS_COUNT)
+        ? JSON.parse(readFileSync(process.env.STALE_TAGS_COUNT, "utf8"))
+        : {};
+      counts[args[1]] = (counts[args[1]] ?? 0) + 1;
+      writeFileSync(process.env.STALE_TAGS_COUNT, JSON.stringify(counts));
+      if (counts[args[1]] === rule.at) {
+        if (rule.payload === "__404__") {
+          console.error("404 Not Found");
+          process.exit(1);
+        }
+        console.log(rule.payload);
+        process.exit(0);
+      }
+    }
     if (args[1] === process.env.TAGS_EMPTY) process.exit(0);
     if (args[1] === process.env.TAGS_ERROR) {
       console.error("simulated tag-map failure");
@@ -330,6 +347,7 @@ async function withReleaseFixture(
 		versionsError?: string;
 		tagsError?: string;
 		tagsEmpty?: string;
+		staleTags?: Record<string, { at: number; payload: string }>;
 	},
 	run: (fixture: {
 		root: string;
@@ -377,8 +395,11 @@ async function withReleaseFixture(
 		const publishedMarker = join(root, "published.marker");
 		const writtenMarker = join(root, "written.marker");
 		const growthState = join(root, "growth.json");
+		const staleTagsState = join(root, "stale-tags.json");
+		const staleTagsCount = join(root, "stale-tags-count.json");
 		const staleState = join(root, "stale.json");
 		await writeFile(staleState, JSON.stringify(options.staleVerification ?? {}));
+		await writeFile(staleTagsState, JSON.stringify(options.staleTags ?? {}));
 		await run({
 			root,
 			execute: async (...args) => {
@@ -406,6 +427,8 @@ async function withReleaseFixture(
 						WRITTEN_MARKER: writtenMarker,
 						PUBLISHED_VERSIONS_GROWTH: JSON.stringify(options.publishedVersionsGrowth ?? {}),
 						GROWTH_STATE: growthState,
+						STALE_TAGS: staleTagsState,
+						STALE_TAGS_COUNT: staleTagsCount,
 						VERSIONS_ERROR: options.versionsError ?? "",
 						TAGS_ERROR: options.tagsError ?? "",
 						TAGS_EMPTY: options.tagsEmpty ?? "",
@@ -788,6 +811,32 @@ describe("release script subprocess behavior", () => {
 					["dist-tag", "add", `${pkg.name}@1.3.0`, "latest"],
 				]);
 				expect(result.output).toContain("stays with 1.3.0");
+			},
+		);
+	}, 30_000);
+
+	// The terminal read is retried: a tag map that has not caught up is not evidence that
+	// the channel is still behind, so the retry must be able to reach a converged state.
+	test("retries a lagging tag-map read before failing a converged channel", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{
+				existing: [packageRef(pkg)],
+				tags: { [`${pkg.name}@latest`]: "1.2.2" },
+				publishedVersions: { [pkg.name]: ["1.2.2", "1.2.3"] },
+				// The floor advances for exactly the three attempts, then stops, so the last
+				// write already reached it; the first terminal read 404s and the retry succeeds.
+				publishedVersionsGrowth: {
+					[pkg.name]: { base: ["1.2.2", "1.2.3"], grow: ["1.3.0", "1.4.0", "1.5.0"] },
+				},
+				// The first terminal read is the fifth tag-map read for this package.
+				staleTags: { [pkg.name]: { at: 5, payload: "__404__" } },
+			},
+			async ({ execute }) => {
+				const result = await execute("--publish");
+				expect(result.code).toBe(0);
+				expect(result.output).not.toContain("could not be read");
+				expect(result.commands.some((command) => command.cwd === "images")).toBe(true);
 			},
 		);
 	}, 30_000);

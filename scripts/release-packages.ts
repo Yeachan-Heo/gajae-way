@@ -463,7 +463,8 @@ async function reconcileChannel(name: string, version: string, tag: string, cwd:
 	// The terminal read is retried once and its failure is reported separately: a metadata
 	// read that has not caught up is not evidence that a concurrent release moved the tag,
 	// and blaming a concurrent writer for a lagging read would be a false diagnosis.
-	let failure: string | undefined;
+	let belowFloor: string | undefined;
+	let readFailure: string | undefined;
 	for (let attempt = 0; attempt < 2; attempt++) {
 		if (attempt > 0) await Bun.sleep(1_000);
 		let floor: string;
@@ -472,17 +473,19 @@ async function reconcileChannel(name: string, version: string, tag: string, cwd:
 			floor = await channelTarget(name, version, tag, cwd);
 			pointer = await readDistTagVersion(name, tag, cwd);
 		} catch (error) {
-			failure = `dist-tag ${tag} for ${name} could not be read after ${CONVERGENCE_ATTEMPTS} convergence attempts: ${error instanceof Error ? error.message : String(error)}`;
+			readFailure = `dist-tag ${tag} for ${name} could not be read after ${CONVERGENCE_ATTEMPTS} convergence attempts: ${error instanceof Error ? error.message : String(error)}`;
 			continue;
 		}
 		if (pointer === undefined) {
-			failure = `dist-tag ${tag} for ${name} could not be read after ${CONVERGENCE_ATTEMPTS} convergence attempts`;
+			readFailure = `dist-tag ${tag} for ${name} could not be read after ${CONVERGENCE_ATTEMPTS} convergence attempts`;
 			continue;
 		}
 		if (semverOrderOrThrow(pointer, floor, `npm dist-tag ${tag} for ${name}`) >= 0) return;
-		failure = `dist-tag ${tag} for ${name} is ${pointer} after ${CONVERGENCE_ATTEMPTS} convergence attempts, below ${floor}; a concurrent release kept moving it`;
+		// Keep the concrete evidence: a later read failure must not replace it.
+		belowFloor = `dist-tag ${tag} for ${name} is ${pointer} after ${CONVERGENCE_ATTEMPTS} convergence attempts, below ${floor}; a concurrent release kept moving it`;
+		readFailure = undefined;
 	}
-	throw new Error(failure ?? `dist-tag ${tag} for ${name} did not converge`);
+	throw new Error(belowFloor ?? readFailure ?? `dist-tag ${tag} for ${name} did not converge`);
 }
 
 async function applyDistTag(name: string, version: string, tag: string, cwd: string): Promise<void> {

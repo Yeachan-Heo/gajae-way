@@ -182,6 +182,14 @@ describe("release workflow wiring", () => {
 		expect(workflow).toMatch(/needs: \[verify, canonical-tag\]/);
 	});
 
+	test("creates the GitHub release only for a tag ref", async () => {
+		const workflow = await releaseWorkflow();
+		const job = workflow.slice(workflow.indexOf("  github-release:"));
+		// Nothing needs this job, so skipping it on a branch dispatch does not propagate and
+		// the manual dispatch still publishes and finishes green.
+		expect(job).toMatch(/^ {4}if: github\.ref_type == 'tag'$/m);
+	});
+
 	test("mirrors the npm dist-tag in the GitHub release's prerelease flag", async () => {
 		const workflow = await releaseWorkflow();
 		expect(workflow).toMatch(/npm-tag: \$\{\{ steps\.dist-tag\.outputs\.tag \}\}/);
