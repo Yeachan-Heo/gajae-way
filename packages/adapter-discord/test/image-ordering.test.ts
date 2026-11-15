@@ -884,13 +884,16 @@ test("a persistent pre-intent outbox failure releases ingress after bounded atte
 		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
 		const engagement = decideInbound(message as never, bot, {});
 		expect(engagement).toBeDefined();
-		for (let attempt = 0; attempt < 4; attempt++)
+		const first = adapter.processImage(message as never, engagement!);
+		const waiter = adapter.waitForImage(message as never, first);
+		expect(await bounded(first)).toBe("unavailable");
+		for (let attempt = 0; attempt < 3; attempt++)
 			expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("unavailable");
 		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("skip");
 		expect(requests).toEqual([]);
 		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
 		expect(adapter.deadLetters[0]!.summary).toContain("5 admission attempts");
-		await bounded(adapter.waitForImage(message as never, Promise.resolve("skip")), 2_000);
+		await bounded(waiter, 2_000);
 	} finally {
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });
