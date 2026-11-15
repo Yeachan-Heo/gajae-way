@@ -799,6 +799,76 @@ test("a duplicate live image event is coalesced while its first send is settling
 	}
 }, 12_000);
 
+test("a request older than gateway dedupe retention is not replayed", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-dedupe-age-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "old-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 31 * 24 * 60 * 60 * 1000);
+	const request = {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([{ messageId: id, channelId, request, createdAt: Date.now() - 31 * 24 * 60 * 60 * 1000 }]),
+		);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
+		expect(adapter.deadLetters[0]!.summary).toContain("dedupe retention");
+		// The bootstrap watermark passed this id, so the terminal evidence compacted safely.
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("completed image evidence compacts only below the recovery watermark", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-completed-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "completed-dm";
+	const watermark = snowflakeFromTimestamp(Date.now() - 60_000);
+	const below = snowflakeFromTimestamp(Date.now() - 120_000);
+	const above = snowflakeFromTimestamp(Date.now() + 60_000);
+	const row = (messageId: string, completedAt: number) => ({ messageId, channelId, completed: true, completedAt });
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: watermark },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([row(below, Date.now() - 8 * 24 * 60 * 60 * 1000), row(above, Date.now())]),
+		);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), []);
+		await bounded(adapter.recoverMissedMessages());
+		expect(
+			JSON.parse(await readFile(outboxPath, "utf8")).map((entry: { messageId: string }) => entry.messageId),
+		).toEqual([above]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
 test("a persisted image request replays even when the recovery cursor is unreadable", async () => {
 	const home = await mkdtemp(join(tmpdir(), "discord-image-order-cursor-read-"));
 	const cleanupTimers = trackTimers();
@@ -833,12 +903,12 @@ test("terminal image rows are compacted only after the watermark passes them", a
 	const cleanupTimers = trackTimers();
 	const cursorPath = join(home, "recovery-cursor.json");
 	const channelId = "channel-1";
-	const below = snowflakeFromTimestamp(Date.now() - 120_000);
+	const below = snowflakeFromTimestamp(Date.now() - 8 * 24 * 60 * 60 * 1000);
 	const above = snowflakeFromTimestamp(Date.now() + 60_000);
 	try {
 		await saveRecoveryCursors(cursorPath, {
 			...emptyCursors(),
-			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 60_000) },
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 7 * 24 * 60 * 60 * 1000) },
 		});
 		await writeFile(
 			join(home, "image-outbox.json"),

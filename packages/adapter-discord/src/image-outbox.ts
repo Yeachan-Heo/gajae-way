@@ -8,16 +8,13 @@ export type PendingImage = {
 	readonly terminal?: boolean;
 	readonly completed?: boolean;
 	readonly completedAt?: number;
+	readonly createdAt?: number;
 	readonly failureAt?: number;
 	readonly audited?: boolean;
 	readonly dm?: boolean;
 };
 
 const SNOWFLAKE = /^\d{1,20}$/;
-/** A completed tombstone only has to outlive the message's own recovery window. */
-const TOMBSTONE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
-/** Bound on retained tombstones even when their snowflakes are recent. */
-const TOMBSTONE_CAP = 1_000;
 /** New unresolved intents are refused past this bound; existing intents keep retrying. */
 const MAX_UNRESOLVED_IMAGES = 1_000;
 /** Terminal evidence is finite without eviction: admission backs off at these bounds. */
@@ -54,6 +51,7 @@ function validateEntry(value: unknown): asserts value is PendingImage {
 		("terminal" in value && typeof value.terminal !== "boolean") ||
 		("completed" in value && typeof value.completed !== "boolean") ||
 		("completedAt" in value && typeof value.completedAt !== "number") ||
+		("createdAt" in value && typeof value.createdAt !== "number") ||
 		("failureAt" in value && typeof value.failureAt !== "number") ||
 		("audited" in value && typeof value.audited !== "boolean") ||
 		("dm" in value && typeof value.dm !== "boolean") ||
@@ -94,31 +92,22 @@ async function readEntries(path: string): Promise<{ entries: PendingImage[]; dro
 }
 
 /**
- * Bounds the journal on every read and write: completed tombstones by completion
- * age and count, and unresolved rows by admission. Terminal evidence is removed
- * only by watermark compaction in the caller, never by wall clock, because a
- * lagging watermark could otherwise resurrect a rejected send. Terminal rows do
- * not consume unresolved admission until their per-channel/global evidence bound
- * is reached; then new admission backs off instead of evicting evidence.
+ * Keeps every readable row; time-based eviction is unsafe because a lagging
+ * watermark could resurrect a rejected or already-delivered send. Completed and
+ * terminal evidence is removed by watermark compaction in the caller, and
+ * unresolved rows alone use admission backoff.
  */
-function pruneEntries(entries: readonly PendingImage[], now = Date.now()): PendingImage[] {
+function pruneEntries(entries: readonly PendingImage[]): PendingImage[] {
 	const kept: PendingImage[] = [];
-	const completed: PendingImage[] = [];
 	for (const entry of entries) {
-		let at: number;
 		try {
-			at = entry.completed ? (entry.completedAt ?? snowflakeTime(entry.messageId)) : snowflakeTime(entry.messageId);
+			snowflakeTime(entry.messageId);
+			kept.push(entry);
 		} catch {
 			continue;
 		}
-		if (entry.completed) {
-			if (now - at <= TOMBSTONE_RETENTION_MS) completed.push(entry);
-		} else {
-			kept.push(entry);
-		}
 	}
-	completed.sort((a, b) => (BigInt(b.messageId) > BigInt(a.messageId) ? 1 : -1));
-	return [...kept, ...completed.slice(0, TOMBSTONE_CAP)];
+	return kept;
 }
 
 async function writeEntries(path: string, entries: readonly PendingImage[]): Promise<void> {

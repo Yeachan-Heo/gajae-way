@@ -1652,6 +1652,8 @@ export type ImageOutcome = "acked" | "skip" | "unavailable";
  * an ingress chain and a recovery watermark wedged forever.
  */
 const IMAGE_INTENT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+/** Gateway inbound dedupe retention; a replay older than this is never safe. */
+const IMAGE_REPLAY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const RESOLVED_TURN: Promise<void> = Promise.resolve();
 
 /**
@@ -1696,6 +1698,11 @@ function isReplayableImageRequest(request: Readonly<Record<string, unknown>>, me
 
 function isImageIntentExpired(entry: PendingImage, now = Date.now()): boolean {
 	return entry.failureAt !== undefined && now - entry.failureAt >= IMAGE_INTENT_MAX_AGE_MS;
+}
+
+function isImageReplayBeyondDedupe(entry: PendingImage, now = Date.now()): boolean {
+	if (entry.createdAt === undefined) return false;
+	return now - entry.createdAt >= IMAGE_REPLAY_RETENTION_MS;
 }
 
 export class ReconnectingGateway {
@@ -1832,7 +1839,12 @@ export class ReconnectingGateway {
 		const channelId = sourceOrigin.conversationId;
 		let entry = await this.#imageOutbox.get(message.id);
 		if (!entry) {
-			entry = { messageId: message.id, channelId, ...(sourceOrigin.kind === "dm" ? { dm: true } : {}) };
+			entry = {
+				messageId: message.id,
+				channelId,
+				createdAt: Date.now(),
+				...(sourceOrigin.kind === "dm" ? { dm: true } : {}),
+			};
 			try {
 				await this.#imageOutbox.put(entry);
 			} catch (error) {
@@ -2073,9 +2085,15 @@ export class ReconnectingGateway {
 		if (!cursors) return;
 		try {
 			await this.#imageOutbox.compact((entry) => {
-				if (!entry.terminal) return true;
+				if (!entry.completed && !entry.terminal) return true;
 				const watermark = cursors.recoveredThrough[entry.channelId] ?? cursors.quarantined[entry.channelId]?.watermark;
-				return watermark === undefined || snowflakeIsAfter(entry.messageId, watermark);
+				if (watermark === undefined || snowflakeIsAfter(entry.messageId, watermark)) return true;
+				// Keep a short post-watermark grace so an in-flight settlement still
+				// observes the evidence before it is compacted below the watermark.
+				const age = Date.now() - (entry.completedAt ?? 0);
+				if (entry.completed) return age < 7 * 24 * 60 * 60 * 1000;
+				const timestamp = Number((BigInt(entry.messageId) >> 22n) + 1_420_070_400_000n);
+				return Date.now() - timestamp < 7 * 24 * 60 * 60 * 1000;
 			});
 		} catch {
 			console.error("Discord image outbox terminal compaction failed; retaining rejected-image rows.");
@@ -2152,6 +2170,9 @@ export class ReconnectingGateway {
 		const request = entry.request;
 		if (!request || !isReplayableImageRequest(request, entry.messageId))
 			return this.terminateImage(entry, "persisted image request is invalid");
+		if (isImageReplayBeyondDedupe(entry)) {
+			return this.terminateImage(entry, "image replay exceeds gateway dedupe retention");
+		}
 		if (isImageIntentExpired(entry)) return this.terminateImage(entry, "image intent unresolved for 24 hours");
 		const verdict = await this.#inbound.join(entry.messageId, async () => {
 			const client = this.#client;

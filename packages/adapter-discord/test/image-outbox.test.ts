@@ -85,7 +85,7 @@ describe("ImageOutbox", () => {
 		expect(await new ImageOutbox(path).load()).toEqual([valid]);
 	});
 
-	test("prunes expired completion tombstones but retains pending and recent ones", async () => {
+	test("retains completion tombstones until the watermark compacts them", async () => {
 		const now = Date.now();
 		const expired = "123456789012345685";
 		const recent = "123456789012345686";
@@ -99,7 +99,13 @@ describe("ImageOutbox", () => {
 			]),
 		);
 		const loaded = await new ImageOutbox(path).load();
-		expect(loaded).toHaveLength(2);
+		expect(loaded).toHaveLength(3);
+		expect(loaded).toContainEqual({
+			messageId: expired,
+			channelId: "channel",
+			completed: true,
+			completedAt: now - 8 * 24 * 60 * 60 * 1000,
+		});
 		expect(loaded).toContainEqual({
 			messageId: recent,
 			channelId: "channel",
@@ -107,7 +113,6 @@ describe("ImageOutbox", () => {
 			completedAt: now - 60_000,
 		});
 		expect(loaded).toContainEqual(pending);
-		expect(await readFile(path, "utf8")).not.toContain(expired);
 	});
 
 	test("fails closed for malformed JSON and invalid state", async () => {
@@ -132,19 +137,19 @@ describe("ImageOutbox", () => {
 		expect(await new ImageOutbox(join(parent, "outbox.json")).load()).toEqual([entry]);
 	});
 
-	test("a put enforces the tombstone bound without waiting for a recovery load", async () => {
+	test("a put retains completion evidence until the watermark compacts it", async () => {
 		const outbox = new ImageOutbox(path);
-		const expired = "123456789012345687";
-		await outbox.put({
-			messageId: expired,
+		const completed = "123456789012345687";
+		const entry = {
+			messageId: completed,
 			channelId: "channel",
 			completed: true,
 			completedAt: Date.now() - 8 * 24 * 60 * 60 * 1000,
-		});
+		};
+		await outbox.put(entry);
 		const pending: PendingImage = { messageId: "123456789012345688", channelId: "channel" };
 		await outbox.put(pending);
-		expect(await readFile(path, "utf8")).not.toContain(expired);
-		expect(await outbox.load()).toEqual([pending]);
+		expect(await outbox.load()).toEqual([entry, pending]);
 	});
 
 	test("keeps terminal evidence until the watermark compacts it", async () => {

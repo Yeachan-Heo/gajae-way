@@ -92,7 +92,13 @@ test("a first-time DM image intent survives restart before preparation", async (
 		expect(await first.processImage(message, engagement!)).toBe("unavailable");
 		expect(sends).toEqual([]);
 		expect(await outbox(home)).toEqual([
-			{ messageId: message.id, channelId: "new-dm", dm: true, failureAt: expect.any(Number) },
+			{
+				messageId: message.id,
+				channelId: "new-dm",
+				dm: true,
+				createdAt: expect.any(Number),
+				failureAt: expect.any(Number),
+			},
 		]);
 		expect((await loadRecoveryCursors(cursorPath)).knownDms["new-dm"]).toBeDefined();
 
