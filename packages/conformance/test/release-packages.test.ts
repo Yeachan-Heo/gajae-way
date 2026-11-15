@@ -155,6 +155,10 @@ if (tool === "bun") {
         const value = stale[args[1]];
         delete stale[args[1]];
         writeFileSync(process.env.STALE_STATE, JSON.stringify(stale));
+        if (value === "__404__") {
+          console.error("404 Not Found");
+          process.exit(1);
+        }
         console.log(value);
         process.exit(0);
       }
@@ -556,6 +560,20 @@ describe("release script subprocess behavior", () => {
 				expect(
 					result.commands.filter((command) => command.args[0] === "view" && command.args[1] === `${pkg.name}@next`),
 				).toHaveLength(3);
+			},
+		);
+	}, 30_000);
+
+	test("retries a transient not-found read after the tag write", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{ existing: [packageRef(pkg)], staleVerification: { [`${pkg.name}@next`]: "__404__" } },
+			async ({ execute }) => {
+				const result = await execute("--publish", "--tag", "next");
+				expect(result.code).toBe(0);
+				expect(result.output).not.toContain("verification failed");
+				// Retried reads must never turn into a second write.
+				expect(result.commands.filter((command) => command.args[0] === "dist-tag")).toHaveLength(1);
 			},
 		);
 	}, 30_000);

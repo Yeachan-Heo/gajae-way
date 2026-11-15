@@ -192,18 +192,23 @@ async function resumeTag(
 	// moved the tag after our read, npm accepts our write and ours accepts theirs in
 	// whichever order they land. Re-read until the registry reflects the write, then give
 	// up loudly. Never re-write here: a second unconditional write could win by
-	// repetition and clobber a genuinely newer tag.
+	// repetition and clobber a genuinely newer tag. A read that fails outright is retried
+	// the same way: a tag written a moment ago can still 404 while metadata catches up.
 	let observed = "nothing";
+	let readFailure: string | undefined;
 	for (let attempt = 0; attempt < 3; attempt++) {
 		if (attempt > 0) await Bun.sleep(1_000);
 		const verified = await npmOutput(["view", `${name}@${effectiveTag}`, "version"], cwd);
 		if (verified.code !== 0) {
-			throw new Error(
-				`npm dist-tag verification failed for ${name}@${effectiveTag}: ${verified.stderr || verified.stdout}`,
-			);
+			readFailure = verified.stderr || verified.stdout || "npm view exited non-zero with no output";
+			continue;
 		}
 		if (verified.stdout === version) return;
+		readFailure = undefined;
 		observed = verified.stdout || "nothing";
+	}
+	if (readFailure !== undefined) {
+		throw new Error(`npm dist-tag verification failed for ${name}@${effectiveTag}: ${readFailure}`);
 	}
 	throw new Error(
 		`dist-tag ${effectiveTag} for ${name} resolves to ${observed} after writing ${version}; a concurrent release moved it`,
