@@ -834,6 +834,46 @@ describe("release script subprocess behavior", () => {
 		);
 	}, 30_000);
 
+	// `tag` is maintainer-supplied, so the channel lookup must not answer for an
+	// Object.prototype key; such a tag is an ordinary pointer-ordered tag.
+	test("treats an Object.prototype tag name as a plain tag", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture({ tags: { [`${pkg.name}@constructor`]: "0.9.0" } }, async ({ execute }) => {
+			const result = await execute("--publish", "--tag", "constructor");
+			expect(result.code).toBe(0);
+			// No channel floor exists for this tag, so no version list is read for it.
+			expect(result.commands.some((command) => command.args[0] === "view" && command.args[2] === "versions")).toBe(
+				false,
+			);
+			const publish = result.commands.filter(
+				(command) => command.args[0] === "publish" && command.cwd === pkg.directory,
+			);
+			expect(publish.map((command) => command.args.at(-1))).toEqual(["constructor"]);
+		});
+	}, 30_000);
+
+	test("reclaims a run-unique scratch tag left behind by an interrupted run", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{
+				existing: [packageRef(pkg)],
+				tags: {
+					[`${pkg.name}@next`]: "1.2.3",
+					[`${pkg.name}@gajae-pending-1-2-3-abcd1234`]: "1.2.3",
+					[`${pkg.name}@gajae-pending-1-2-3-beef5678`]: "1.4.0",
+				},
+			},
+			async ({ execute }) => {
+				const result = await execute("--publish", "--tag", "next");
+				expect(result.code).toBe(0);
+				// Only the scratch tag that still carries this version is removed.
+				expect(
+					result.commands.filter((command) => command.args[0] === "dist-tag").map((command) => command.args),
+				).toEqual([["dist-tag", "rm", pkg.name, "gajae-pending-1-2-3-abcd1234"]]);
+			},
+		);
+	}, 30_000);
+
 	// Interrupted cleanup: a resumed release removes the scratch tag a previous run left
 	// behind, but only while it still points at that version.
 	test("removes a scratch tag left behind by an interrupted run on resume", async () => {

@@ -34,10 +34,16 @@ export function isPrereleaseVersion(version: string): boolean {
 // stable release and `next` for a prerelease. Each channel has a floor in the published
 // version list, which is what keeps a concurrent release of the same channel from being
 // left behind; an operator-chosen tag has no channel and is ordered by its pointer only.
-const CHANNEL_FLOORS: Record<string, (version: string) => boolean> = {
-	latest: (version) => !isPrereleaseVersion(version),
-	next: (version) => isPrereleaseVersion(version),
-};
+// The floor spans release lines: a `next` pointer follows the highest published
+// prerelease, so a prerelease line published under another tag still moves it. A tag
+// moved by hand survives only until the next release of that channel, which converges it
+// back to the floor.
+// A Map, not an object literal: `tag` is maintainer-supplied and an object would answer
+// for `constructor`, `toString`, or `__proto__`.
+const CHANNEL_FLOORS = new Map<string, (version: string) => boolean>([
+	["latest", (version) => !isPrereleaseVersion(version)],
+	["next", (version) => isPrereleaseVersion(version)],
+]);
 
 export function highestPublishedVersion(
 	versions: readonly string[],
@@ -144,16 +150,16 @@ async function readPublishedVersions(name: string, cwd: string): Promise<string[
 	return parsed;
 }
 
-// `latest` is ordered content whose floor is the highest published stable version, not
-// the mutable pointer: reading the version list is what stops an old release rerun from
-// writing a stale pointer backwards. It is still a read before an unconditional
+// A channel tag is ordered content whose floor is the highest published version in that
+// channel, not the mutable pointer: reading the version list is what stops an old release
+// rerun from writing a stale pointer backwards. It is still a read before an unconditional
 // `npm dist-tag add` (npm has no compare-and-set), so a version published between the
 // read and the write can still land out of order; the post-write re-read detects that
 // instead of hiding it. The version list and the dist-tag pointer come from the same
 // registry document, so a cache stale for one can be stale for the other; what this
 // removes is authorizing a write from the pointer alone.
 async function channelTarget(name: string, version: string, tag: string, cwd: string): Promise<string> {
-	const channel = CHANNEL_FLOORS[tag];
+	const channel = CHANNEL_FLOORS.get(tag);
 	if (channel === undefined) return version;
 	const published = await readPublishedVersions(name, cwd);
 	let highest: string | undefined;
@@ -167,7 +173,7 @@ async function channelTarget(name: string, version: string, tag: string, cwd: st
 }
 
 // The version this tag may end up on: a candidate that already points past this version
-// wins, because a tag never moves backwards. `latest` takes its candidate from the
+// wins, because a tag never moves backwards. A channel tag takes its candidate from the
 // published version list; every tag also takes the live pointer as a candidate, so a
 // pointer an operator or an earlier run placed ahead is never overwritten downward.
 async function tagTarget(
@@ -302,9 +308,14 @@ async function resumeTag(
 	const tags = await readDistTags(name, cwd);
 	const currentVersion = tags[effectiveTag];
 	// A previous run can have published this version under a scratch tag and died before
-	// removing it. That tag is safe to delete only while it still points at this version.
-	const orphan = scratchTagBase(version);
-	if (tags[orphan] === version) await removeDistTag(name, orphan, version, cwd);
+	// removing it, including the run-unique form taken when the derived name was occupied.
+	// Any such tag is safe to delete only while it still points at this version.
+	const orphanBase = scratchTagBase(version);
+	for (const [orphan, orphanVersion] of Object.entries(tags)) {
+		if (orphanVersion !== version) continue;
+		if (orphan !== orphanBase && !orphan.startsWith(`${orphanBase}-`)) continue;
+		await removeDistTag(name, orphan, version, cwd);
+	}
 
 	// Only refuse the implicit promotion when it would move the tag: a prerelease that
 	// already converged is a no-op, not an error.
@@ -358,7 +369,11 @@ async function removeDistTag(name: string, tag: string, version: string, cwd: st
 	// Only a tag this run still sees its own version on is ours to delete.
 	const current = await readDistTagVersion(name, tag, cwd);
 	if (current !== version) {
-		if (current !== undefined) console.log(`\nwarning: leaving ${name}@${tag} at ${current}; it is not this release.`);
+		console.log(
+			current === undefined
+				? `\nwarning: could not see ${name}@${tag} after publishing ${version}; leaving it in place.`
+				: `\nwarning: leaving ${name}@${tag} at ${current}; it is not this release.`,
+		);
 		return;
 	}
 	const result = await npmOutput(["dist-tag", "rm", name, tag], cwd);
@@ -421,11 +436,12 @@ async function applyDistTagOnce(name: string, version: string, tag: string, cwd:
 
 // `npm dist-tag add` is unconditional, so the value a run writes can be stale by the
 // time it lands: a resumed release that read the published version list before a newer
-// release published would otherwise leave `latest` on its own older version, and its
-// post-write check would pass because the pointer matches what it wrote. `latest` is
-// therefore re-derived from the version list after writing and converged forward in the
-// same run; each pass re-reads, so a release that lands during the repair is picked up
-// too. A named tag has no equivalent source and is only ordered by its pointer.
+// release published would otherwise leave the channel tag on its own older version, and
+// its post-write check would pass because the pointer matches what it wrote. A channel
+// tag is therefore re-derived from the version list after writing and converged forward
+// in the same run; each pass re-reads, so a release that lands during the repair is
+// picked up too. A tag with no channel floor has no equivalent source and is only
+// ordered by its pointer.
 const CONVERGENCE_ATTEMPTS = 3;
 
 async function reconcileChannel(name: string, version: string, tag: string, cwd: string): Promise<void> {
@@ -440,7 +456,7 @@ async function reconcileChannel(name: string, version: string, tag: string, cwd:
 
 async function applyDistTag(name: string, version: string, tag: string, cwd: string): Promise<void> {
 	await applyDistTagOnce(name, version, tag, cwd);
-	if (CHANNEL_FLOORS[tag] !== undefined) await reconcileChannel(name, version, tag, cwd);
+	if (CHANNEL_FLOORS.has(tag)) await reconcileChannel(name, version, tag, cwd);
 }
 
 async function main(): Promise<void> {
@@ -503,7 +519,7 @@ async function main(): Promise<void> {
 				// `npm publish` writes the tag itself, so the post-write reconciliation is what
 				// catches a release of the same channel that landed during the upload; a scratch
 				// publish leaves the pointer untouched and reconciles from the same version list.
-				if (CHANNEL_FLOORS[effectiveTag] !== undefined) {
+				if (CHANNEL_FLOORS.has(effectiveTag)) {
 					await reconcileChannel(packageName, packageVersion, effectiveTag, dir);
 				}
 			}
