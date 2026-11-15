@@ -76,6 +76,7 @@ function gateway(
 	channels: Record<string, { engagement: string }> = {},
 	requestImpl?: (verb: string, params: unknown) => Promise<unknown>,
 	prepareImpl?: () => Promise<{ images: Array<{ data: string; mimeType: "image/jpeg" }>; notice: string }>,
+	withClient = true,
 ) {
 	return new ReconnectingGateway(
 		"unused-socket",
@@ -85,12 +86,14 @@ function gateway(
 		undefined,
 		cursorPath,
 		() => bot,
-		{
-			request: async (verb: string, params: unknown) => {
-				requests.push({ verb, params });
-				return requestImpl ? requestImpl(verb, params) : { engaged: false, turnId: null };
-			},
-		} as never,
+		withClient
+			? ({
+					request: async (verb: string, params: unknown) => {
+						requests.push({ verb, params });
+						return requestImpl ? requestImpl(verb, params) : { engaged: false, turnId: null };
+					},
+				} as never)
+			: undefined,
 		async () => {},
 		undefined,
 		undefined,
@@ -261,7 +264,7 @@ test("a deleted image message is dead-lettered instead of retrying forever", asy
 		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
 		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
 		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
-			{ messageId: id, channelId, terminal: true, audited: true },
+			{ messageId: id, channelId, terminal: true, terminalAt: expect.any(Number), audited: true },
 		]);
 	} finally {
 		cleanupTimers();
@@ -296,7 +299,7 @@ test("an unreadable history channel still reaches a terminal image diagnosis", a
 		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
 		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
 		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
-			{ messageId: id, channelId, terminal: true, audited: true },
+			{ messageId: id, channelId, terminal: true, terminalAt: expect.any(Number), audited: true },
 		]);
 		await bounded(adapter.waitForImage({ id } as never, Promise.resolve("unavailable")), 2_000);
 	} finally {
@@ -347,7 +350,7 @@ test("a terminal chat.send rejection is dead-lettered after the bounded attempt 
 		expect(sends).toBe(3);
 		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
 		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
-			{ messageId: id, channelId, terminal: true, audited: true, dm: true },
+			{ messageId: id, channelId, terminal: true, terminalAt: expect.any(Number), audited: true, dm: true },
 		]);
 	} finally {
 		cleanupTimers();
@@ -457,7 +460,7 @@ test("an intent unacknowledged for 24 hours is dead-lettered instead of wedging 
 		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
 		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
 		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
-			{ messageId: id, channelId, terminal: true, audited: true, dm: true },
+			{ messageId: id, channelId, terminal: true, terminalAt: expect.any(Number), audited: true, dm: true },
 		]);
 		await bounded(adapter.waitForImage({ id } as never, Promise.resolve("unavailable")), 2_000);
 	} finally {
@@ -518,6 +521,61 @@ test("terminal image rows are compacted only after the watermark passes them", a
 		await bounded(adapter.recoverMissedMessages());
 		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
 			{ messageId: above, channelId, terminal: true, audited: true },
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a gateway-unavailable image intent records its failure clock and expires", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-noclient-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "new-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		const request = {
+			messageId: id,
+			text: "look\n[image · photo.png]",
+			origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+			engagement: { mentioned: false, group: false, authorId: "human" },
+			images: [image],
+		};
+		const outboxPath = join(home, "image-outbox.json");
+		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, request, dm: true }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			requests,
+			{},
+			undefined,
+			undefined,
+			false,
+		);
+		const message = dmMessage(id, channelId, true);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("unavailable");
+		const afterFailure = JSON.parse(await readFile(outboxPath, "utf8"));
+		expect(afterFailure[0].failureAt).toEqual(expect.any(Number));
+		await writeFile(outboxPath, JSON.stringify([{ ...afterFailure[0], failureAt: Date.now() - 25 * 60 * 60 * 1000 }]));
+		const restarted = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			requests,
+			{},
+			undefined,
+			undefined,
+			false,
+		);
+		expect(await bounded(restarted.processImage(message as never, engagement!))).toBe("skip");
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(restarted.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([
+			{ messageId: id, channelId, terminal: true, terminalAt: expect.any(Number), audited: true, dm: true },
 		]);
 	} finally {
 		cleanupTimers();

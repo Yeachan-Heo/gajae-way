@@ -6,6 +6,7 @@ export type PendingImage = {
 	readonly channelId: string;
 	readonly request?: Readonly<Record<string, unknown>>;
 	readonly terminal?: boolean;
+	readonly terminalAt?: number;
 	readonly completed?: boolean;
 	readonly completedAt?: number;
 	readonly failureAt?: number;
@@ -18,6 +19,17 @@ const SNOWFLAKE = /^\d{1,20}$/;
 const TOMBSTONE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 /** Bound on retained tombstones even when their snowflakes are recent. */
 const TOMBSTONE_CAP = 1_000;
+/** Terminal evidence is retained long enough to outlive every history rewalk. */
+const TERMINAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+/** New unresolved intents are refused past this bound; existing intents keep retrying. */
+const MAX_UNRESOLVED_IMAGES = 1_000;
+
+export class ImageOutboxCapacityError extends Error {
+	constructor() {
+		super(`Image outbox holds ${MAX_UNRESOLVED_IMAGES} unresolved intents`);
+		this.name = "ImageOutboxCapacityError";
+	}
+}
 const DISCORD_EPOCH_MS = 1_420_070_400_000n;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -40,6 +52,7 @@ function validateEntry(value: unknown): asserts value is PendingImage {
 		value.channelId === "" ||
 		("request" in value && !isRecord(value.request)) ||
 		("terminal" in value && typeof value.terminal !== "boolean") ||
+		("terminalAt" in value && typeof value.terminalAt !== "number") ||
 		("completed" in value && typeof value.completed !== "boolean") ||
 		("completedAt" in value && typeof value.completedAt !== "number") ||
 		("failureAt" in value && typeof value.failureAt !== "number") ||
@@ -81,22 +94,29 @@ async function readEntries(path: string): Promise<{ entries: PendingImage[]; dro
 	return { entries, dropped };
 }
 
-/** Completed intents are tombstone-only: bound them by age and by count. */
-function pruneTombstones(entries: readonly PendingImage[], now = Date.now()): PendingImage[] {
+/**
+ * Bounds the journal on every read and write: completed tombstones by completion
+ * age and count, terminal evidence by message age (history is never rewalked this
+ * far), and unresolved rows only by admission, never by silent eviction.
+ */
+function pruneEntries(entries: readonly PendingImage[], now = Date.now()): PendingImage[] {
 	const kept: PendingImage[] = [];
 	const completed: PendingImage[] = [];
 	for (const entry of entries) {
-		if (!entry.completed) {
-			kept.push(entry);
-			continue;
-		}
 		let at: number;
 		try {
-			at = entry.completedAt ?? snowflakeTime(entry.messageId);
+			at = entry.completed ? (entry.completedAt ?? snowflakeTime(entry.messageId)) : snowflakeTime(entry.messageId);
 		} catch {
 			continue;
 		}
-		if (now - at <= TOMBSTONE_RETENTION_MS) completed.push(entry);
+		if (entry.completed) {
+			if (now - at <= TOMBSTONE_RETENTION_MS) completed.push(entry);
+		} else if (entry.terminal) {
+			// Legacy terminal rows have no timestamp; keep them rather than guess.
+			if (entry.terminalAt === undefined || now - entry.terminalAt <= TERMINAL_RETENTION_MS) kept.push(entry);
+		} else {
+			kept.push(entry);
+		}
 	}
 	completed.sort((a, b) => (BigInt(b.messageId) > BigInt(a.messageId) ? 1 : -1));
 	return [...kept, ...completed.slice(0, TOMBSTONE_CAP)];
@@ -169,7 +189,7 @@ export class ImageOutbox {
 	async load(): Promise<readonly PendingImage[]> {
 		return this.#serialize(async () => {
 			const entries = await this.#loadEntries();
-			const pruned = pruneTombstones(entries);
+			const pruned = pruneEntries(entries);
 			if (this.#dropped > 0 || pruned.length !== entries.length) {
 				await writeEntries(this.#path, pruned);
 				this.#entries = pruned;
@@ -204,9 +224,16 @@ export class ImageOutbox {
 			const index = entries.findIndex((pending) => pending.messageId === entry.messageId);
 			if (index === -1) entries.push(entry);
 			else entries[index] = entry;
-			// Enforce the tombstone bound on the write path too: a long-lived session
-			// must not grow the journal until the next recovery load.
-			const pruned = pruneTombstones(entries);
+			// Enforce the journal bounds on the write path too: a long-lived session
+			// must not grow until the next recovery load.
+			const pruned = pruneEntries(entries);
+			if (
+				index === -1 &&
+				!entry.completed &&
+				!entry.terminal &&
+				pruned.filter((pending) => !pending.completed && !pending.terminal).length > MAX_UNRESOLVED_IMAGES
+			)
+				throw new ImageOutboxCapacityError();
 			await writeEntries(this.#path, pruned);
 			this.#entries = pruned;
 			this.#dropped = 0;

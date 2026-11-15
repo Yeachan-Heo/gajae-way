@@ -1959,12 +1959,21 @@ export class ReconnectingGateway {
 			messageId: entry.messageId,
 			channelId: entry.channelId,
 			terminal: true,
+			terminalAt: Date.now(),
 			audited: true,
 			...(entry.dm ? { dm: true } : {}),
 		});
 		console.error(
 			`Discord image intent rejected message=${entry.messageId} channel=${entry.channelId} (${summary}); dead-lettered without chat.send.`,
 		);
+	}
+
+	/** Replay request-bearing and unaudited-terminal rows before any history gate. */
+	private async replayDurableImages(pending: readonly PendingImage[] | undefined): Promise<void> {
+		for (const entry of pending ?? []) {
+			if (entry.completed || (!entry.request && !entry.terminal)) continue;
+			await this.retryPendingImage(entry);
+		}
 	}
 
 	/** Drop terminal rows only after the recovery watermark has passed them. */
@@ -2056,6 +2065,11 @@ export class ReconnectingGateway {
 		const verdict = await this.#inbound.join(entry.messageId, async () => {
 			const client = this.#client;
 			if (!client) {
+				entry = await this.noteImageFailure(entry);
+				if (isImageIntentExpired(entry)) {
+					await this.terminateImage(entry, "image intent unresolved for 24 hours");
+					return "unavailable";
+				}
 				this.scheduleReconnect();
 				console.error(
 					`Discord image chat.send deferred message=${entry.messageId} channel=${entry.channelId}: gateway link unavailable.`,
@@ -2259,17 +2273,14 @@ export class ReconnectingGateway {
 					"Discord image outbox unavailable; image recovery is paused while unrelated text recovery continues.",
 				);
 			}
+			// The durable image consumer is independent of history recovery: an exact
+			// persisted request needs neither the cursor nor a history read, and a live
+			// image was admitted ahead of history in the first place.
+			await this.replayDurableImages(pendingImages);
 			await this.ensureCursors();
 			if (!this.#cursors) {
-				// A persisted exact request needs no cursor and no history read. Replay it
-				// (and finish unaudited terminal rows) before the cursor fail-fast, or a
-				// broken cursor store keeps a healthy gateway's image undelivered forever.
-				for (const entry of pendingImages ?? []) {
-					if (entry.completed || (!entry.request && !entry.terminal)) continue;
-					await this.retryPendingImage(entry);
-				}
 				console.error(
-					`Discord recovery refused: cursor store ${this.recoveryCursorPath} is unusable (${this.#cursorFault ?? "unknown error"}); replayed durable image requests, retrying history with backoff.`,
+					`Discord recovery refused: cursor store ${this.recoveryCursorPath} is unusable (${this.#cursorFault ?? "unknown error"}); durable image intents were replayed, retrying history with backoff.`,
 				);
 				return;
 			}
