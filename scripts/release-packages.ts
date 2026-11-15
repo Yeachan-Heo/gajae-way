@@ -106,6 +106,13 @@ async function npmOutput(args: string[], cwd: string): Promise<{ stdout: string;
 	return { stdout: stdout.trim(), stderr: stderr.trim(), code };
 }
 
+// A resumed release must converge on the same dist-tags a clean run would have
+// written, because the skip in main() also skipped `npm publish --tag`. The tag is
+// resolved with npm's own precedence (--tag, then the packed publishConfig.tag, then
+// `npm config get tag`, run from the same cwd npm publish uses) and then applied
+// explicitly. release.yml always passes --tag, so the fallbacks and the prerelease
+// guard only run for interactive releases; `--tag` is also the escape hatch when a
+// tag must deliberately move backwards.
 async function resumeTag(
 	name: string,
 	version: string,
@@ -116,13 +123,13 @@ async function resumeTag(
 	let effectiveTag = tag ?? manifest.publishConfig?.tag;
 	if (!effectiveTag) {
 		const result = await npmOutput(["config", "get", "tag"], cwd);
-		if (result.code !== 0 || !result.stdout) {
+		if (result.code !== 0) {
 			throw new Error(`npm tag configuration failed for ${name}: ${result.stderr || result.stdout}`);
 		}
+		if (!result.stdout) {
+			throw new Error(`npm config get tag returned no tag for ${name}; pass --tag explicitly`);
+		}
 		effectiveTag = result.stdout;
-	}
-	if (!tag && effectiveTag === "latest" && version.split("+")[0]?.includes("-")) {
-		throw new Error(`refusing to implicitly tag prerelease ${name}@${version} as latest; specify --tag explicitly`);
 	}
 
 	const current = await npmOutput(["view", `${name}@${effectiveTag}`, "version"], cwd);
@@ -135,7 +142,21 @@ async function resumeTag(
 			console.log(`\n${name}@${version} already has dist-tag ${effectiveTag}.`);
 			return;
 		}
-		if (Bun.semver.order(current.stdout, version) > 0) {
+	}
+
+	// Only refuse the implicit promotion when it would move the tag: a prerelease that
+	// already converged took the no-op return above and is not an error.
+	if (!tag && effectiveTag === "latest" && version.split("+")[0]?.includes("-")) {
+		throw new Error(`refusing to implicitly tag prerelease ${name}@${version} as latest; specify --tag explicitly`);
+	}
+	if (current.code === 0) {
+		let order: number;
+		try {
+			order = Bun.semver.order(current.stdout, version);
+		} catch {
+			throw new Error(`npm dist-tag ${effectiveTag} for ${name} points at an unparseable version: ${current.stdout}`);
+		}
+		if (order > 0) {
 			throw new Error(`refusing to move ${name}@${effectiveTag} backwards from ${current.stdout} to ${version}`);
 		}
 	}

@@ -1,7 +1,9 @@
 // Covers the repo-root scripts/release-packages.ts. It lives under packages/ because
 // CI runs `bun test packages/` and `biome ci packages/`; a test under scripts/ would
-// never run. The fixture copies the real script into a temp dir and shadows only the
-// bun/npm subprocesses, so no test reaches a real registry.
+// never run. It lives in packages/conformance (the repo-wide gate package) rather than
+// in a consumer package because sdk-boundary-dogfood forbids a consumer package from
+// importing outside itself. The fixture copies the real script into a temp dir and
+// shadows only the bun/npm subprocesses, so no test reaches a real registry.
 import { describe, expect, test } from "bun:test";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -299,7 +301,7 @@ describe("release script subprocess behavior", () => {
 						expected.push({
 							tool: "npm",
 							args: ["view", `${pkg.name}@${tag ?? "latest"}`, "version"],
-							cwd: basename(root),
+							cwd: pkg.directory,
 						});
 						expected.push({
 							tool: "npm",
@@ -314,13 +316,7 @@ describe("release script subprocess behavior", () => {
 						});
 					}
 				}
-				expect(
-					result.commands.map((command) =>
-						command.tool === "npm" && command.args[0] === "view" && command.args[1]?.endsWith(`@${tag ?? "latest"}`)
-							? { ...command, cwd: basename(root) }
-							: command,
-					),
-				).toEqual(expected);
+				expect(result.commands).toEqual(expected);
 			});
 		}, 30_000);
 	}
@@ -371,7 +367,7 @@ describe("release script subprocess behavior", () => {
 				["dist-tag", "add", failed, "next"],
 			]);
 			expect(result.output).toMatch(/OIDC|trusted publish/i);
-			expect(result.output).toMatch(/permission|access/i);
+			expect(result.output).toContain("Allow npm dist-tag");
 			expect(result.output).toContain(failed);
 			expect(result.commands.some((command) => command.cwd === "sdk")).toBe(false);
 		});
@@ -499,6 +495,20 @@ describe("release script subprocess behavior", () => {
 			});
 		}, 30_000);
 	}
+
+	test("a prerelease that already holds latest is a no-op, not a refusal", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		const ref = `${pkg.name}@1.2.3-rc.1`;
+		await withReleaseFixture(
+			{ existing: [ref], versions: { [pkg.name]: "1.2.3-rc.1" }, tags: { [`${pkg.name}@latest`]: "1.2.3-rc.1" } },
+			async ({ execute }) => {
+				const result = await execute("--publish");
+				expect(result.code).toBe(0);
+				expect(result.output).toContain("already has dist-tag latest");
+				expect(result.commands.filter((command) => command.args[0] === "dist-tag")).toEqual([]);
+			},
+		);
+	}, 30_000);
 
 	for (const failure of ["tag lookup", "config"] as const) {
 		test(`${failure} error fails without tag mutation`, async () => {
