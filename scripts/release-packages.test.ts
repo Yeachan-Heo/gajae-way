@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { assertNoPrivateWorkspaceDeps, RELEASE_ORDER } from "./release-packages";
+import { assertNoPrivateWorkspaceDeps, RELEASE_ORDER, parseNpmViewResult } from "./release-packages";
 
 const RELEASE_PACKAGE_NAMES = new Set(["@gajae-gateway/protocol", "@gajae-gateway/images", "@gajae-gateway/sdk"]);
 const RELEASE_PACKAGE_NAMES_WITH_PRIVATE = new Set([...RELEASE_PACKAGE_NAMES, "@gajae-gateway/home"]);
@@ -65,5 +65,39 @@ describe("release package workspace dependency guard", () => {
 		expect(() => assertNoPrivateWorkspaceDeps(manifest, WORKSPACE_PACKAGES, RELEASE_PACKAGE_NAMES)).toThrow(
 			"not in the release map",
 		);
+	});
+});
+
+describe("npm registry checks", () => {
+	test("parseNpmViewResult detects already published version", () => {
+		const result = parseNpmViewResult("0.5.0\n", "", 0, "0.5.0");
+		expect(result).toEqual({ alreadyPublished: true });
+	});
+
+	test("parseNpmViewResult handles version not found (404)", () => {
+		const result = parseNpmViewResult("", "404 Not Found", 1, "0.5.0");
+		expect(result).toEqual({ alreadyPublished: false });
+	});
+
+	test("parseNpmViewResult reports other registry errors", () => {
+		const result = parseNpmViewResult("", "ENEEDAUTH: no trusted publisher exists", 1, "0.5.0");
+		expect(result).toEqual({
+			alreadyPublished: false,
+			error: "ENEEDAUTH: no trusted publisher exists",
+		});
+	});
+
+	test("parseNpmViewResult reports unexpected version from npm", () => {
+		const result = parseNpmViewResult("0.4.0\n", "", 0, "0.5.0");
+		expect(result.alreadyPublished).toBe(false);
+		expect(result.error).toContain("unexpected version");
+	});
+
+	test("parseNpmViewResult reports error when both stdout and stderr are present", () => {
+		const result = parseNpmViewResult("some output", "E_TIMEOUT", 1, "0.5.0");
+		expect(result).toEqual({
+			alreadyPublished: false,
+			error: "E_TIMEOUT",
+		});
 	});
 });

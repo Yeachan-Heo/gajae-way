@@ -1584,6 +1584,8 @@ test("model refusals notify once without consuming the pending message's eventua
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open",
+		// `/model` is owner-only; p1 is the owner recovering from the refusal.
+		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "model-refusal", peerId: "p1" } },
 	};
 	const database = await Store.open(config.dbPath);
 	const port = new ScriptedSessionPort({

@@ -104,6 +104,14 @@ const PROMPT_TOO_LARGE_CODE = "prompt_too_large";
 
 class SendTurnNoLongerBoundError extends Error {}
 
+/** The pre-send compaction may still be running on the host; the send must wait for evidence it is over. */
+class CompactionUnresolvedError extends Error {
+	constructor(code: string | undefined) {
+		super(`compaction may still be running${code ? ` (${code})` : ""}`);
+		this.name = "CompactionUnresolvedError";
+	}
+}
+
 function localPreflightRejectionKey(opRef: string): string {
 	return `${LOCAL_PREFLIGHT_REJECTION_PREFIX}${opRef}`;
 }
@@ -147,6 +155,22 @@ function providerTransportRetryAttempt(
 		10,
 	);
 	return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+/** `work`'s result, or undefined when it is still running at `deadlineMs` (epoch ms). */
+async function beforeDeadline<T>(work: Promise<T>, deadlineMs: number): Promise<T | undefined> {
+	if (!Number.isFinite(deadlineMs)) return await work;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			work,
+			new Promise<undefined>((resolve) => {
+				timer = setTimeout(() => resolve(undefined), Math.max(0, deadlineMs - Date.now()));
+			}),
+		]);
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+	}
 }
 
 /** An escalated hold (#686) whose late answer is still wanted; restored on adoption after a restart. */
@@ -205,6 +229,11 @@ function parseDeadHostMark(value: string | undefined): DeadHostMark | undefined 
 	} catch {
 		return undefined;
 	}
+}
+
+/** Session of an origin whose last pre-send compaction may still be running. */
+function unresolvedCompactionKey(originKey: string): string {
+	return `compaction-unresolved:${originKey}`;
 }
 
 /** Track relay unavailable events for a turn to detect unresponsive relays even on live hosts (#766). */
@@ -1179,7 +1208,9 @@ export class PersonaSessionManager {
 		for (;;) {
 			if (this.#stopped || this.#restartDrainId !== restartId) return "stopped";
 			const actors = [...this.#actors.values()];
-			const checks = Promise.all(actors.map((actor) => actor.enqueue(async () => actor.hasUnsettledTurns())));
+			const checks = Promise.all(
+				actors.map((actor) => actor.enqueue(async () => await actor.hasUnsettledTurns(deadline))),
+			);
 			let timer: ReturnType<typeof setTimeout> | undefined;
 			const timedOut = Symbol("restart drain timed out");
 			let unsettled: (boolean | undefined)[] | typeof timedOut;
@@ -1410,6 +1441,8 @@ type BoundTurn = PersonaTurnIdentity & {
 	 * delivered and its terminal completes the turn like a current one.
 	 */
 	answerWanted: boolean;
+	/** Only blocked restart probes are shared across the drain loop's short polling interval. */
+	restartDrainVerdict?: { checkedAtMs: number; blocked: true };
 	/**
 	 * The relay that owned this turn is gone (died mid-turn, or the turn was
 	 * adopted after a restart): its content will never arrive on a stream, so
@@ -1433,6 +1466,12 @@ type BoundTurn = PersonaTurnIdentity & {
 	stallHostTerminated?: boolean;
 	/** SIGTERM was accepted, but the host process has not yet been confirmed exited. */
 	stallHostTerminating?: boolean;
+	/**
+	 * The transcript showed, before the stall cutoff stopped the host, that the
+	 * reply the owned relay delivered ended with stopReason "stop" (#768). A
+	 * stopped host answers no transcript read, so closure cannot probe it later.
+	 */
+	stallReplyConcluded?: boolean;
 	/** Original authority captured before signalling; never refreshed into a new broker's proof. */
 	stallExitOwner?: NonNullable<ReturnType<typeof stalledExitOwner>>;
 	/** A stalled retired hold already attempted its one allowed host termination. */
@@ -1639,8 +1678,60 @@ class OriginActor {
 		return this.#state;
 	}
 
-	hasUnsettledTurns(): boolean {
-		return this.#state !== "idle" || this.#current !== undefined || this.#retired.size > 0;
+	/**
+	 * Restart-drain check. `deadlineMs` (epoch ms) is the drain's own deadline: a
+	 * host probe still running then counts as blocked and releases this actor's
+	 * queue, so a hung status read or inspect cannot hold up the origin after
+	 * the drain has given up.
+	 */
+	async hasUnsettledTurns(deadlineMs = Number.POSITIVE_INFINITY): Promise<boolean> {
+		if (this.#state !== "idle" || this.#current !== undefined) return true;
+		for (const bound of this.#retired.values()) {
+			// Only a detached escalated hold whose operation is not reported active and
+			// whose host process is proven exited by OS `ps` can be skipped: recovery
+			// readopts it from the durable marker and pending trigger, and no producer
+			// can be lost. Registry liveness alone is not process-exit evidence.
+			if (
+				bound.answerWanted !== true ||
+				bound.detached !== true ||
+				this.#manager.database.core.metaGet(escalatedHoldKey(bound.turn.opRef)) === undefined
+			) {
+				bound.restartDrainVerdict = undefined;
+				return true;
+			}
+			// Only a blocked verdict is cached. An exemption is re-proven on every
+			// drain poll, because it lets the restart go ahead while this turn's
+			// producer would be lost if the host were in fact still running.
+			const verdict = bound.restartDrainVerdict;
+			if (verdict && this.#manager.now() - verdict.checkedAtMs < STATUS_RECHECK_MIN_MS) return true;
+			const blocked = await beforeDeadline(this.#restartDrainProbe(bound), deadlineMs);
+			if (blocked === undefined) return true;
+			if (this.#stopped || this.#manager.stopped) return true;
+			bound.restartDrainVerdict = blocked ? { checkedAtMs: this.#manager.now(), blocked: true } : undefined;
+			if (blocked) return true;
+		}
+		return false;
+	}
+
+	/** True unless the held operation is reported settled and its host process is proven exited. */
+	async #restartDrainProbe(bound: BoundTurn): Promise<boolean> {
+		try {
+			const report = await this.#statusForRecovery(bound.sessionId, bound.turn.opRef);
+			if (this.#stopped || this.#manager.stopped) return true;
+			const port = this.#manager.port;
+			// A report for another (or no) operation says nothing about this one, as in recovery.
+			if (
+				report.operationRef !== bound.turn.opRef ||
+				report.status.status === "accepted" ||
+				report.status.status === "in_flight" ||
+				port.hostExited === undefined
+			)
+				return true;
+			return (await port.hostExited({ sessionId: bound.sessionId, repo: this.#manager.repo })) !== true;
+		} catch {
+			// Unreadable host evidence keeps the producer fence.
+			return true;
+		}
 	}
 
 	enqueue<T>(work: () => Promise<T>): Promise<T | undefined> {
@@ -3944,6 +4035,13 @@ class OriginActor {
 			this.#clearStallReconciliation(bound);
 			return false;
 		}
+		// Read the stopReason proof while the host can still serve the transcript.
+		bound.stallReplyConcluded =
+			bound.lastAssistantText !== undefined && (await this.#lastAssistantIsAnswering(bound)) === true;
+		if (!canTerminate()) {
+			this.#clearStallReconciliation(bound);
+			return false;
+		}
 		const authorizeTermination = async () => {
 			if (!canTerminate()) return false;
 			try {
@@ -4753,8 +4851,23 @@ class OriginActor {
 	 * send, so no prompt ever lands on a session gjc would compact first. A
 	 * compaction that fails or is unavailable is logged and the send goes ahead:
 	 * gjc's own compaction and the wedged-submission reset stay the fallback.
+	 *
+	 * A compaction that may still be running (gjc's request timed out, or no gjc
+	 * answer was read) never lets the send through: a prompt sent now queues
+	 * behind it on the session's ordered controls and times out as an ambiguous
+	 * send. The turn goes back to pending, and each retry needs evidence that
+	 * the run is over: a readable context below the line (it landed), or the
+	 * host's answer to a second `compaction.run` sent on the relay, which gjc's
+	 * ordered dispatcher runs only after the first. An unreadable context, a
+	 * refusal before dispatch and a missing reply are not evidence.
 	 */
 	async #prepareContext(sessionId: string, epoch: number, opRef: string, tail: TailHandle): Promise<PreparedContext> {
+		// Durable, so a restarted gateway keeps holding until the run is proven over.
+		const unresolvedKey = unresolvedCompactionKey(this.originKey);
+		const unresolvedOn = this.#manager.database.core.metaGet(unresolvedKey);
+		// A run left unresolved on another session says nothing about this one.
+		if (unresolvedOn !== undefined && unresolvedOn !== sessionId) this.#manager.database.core.metaDelete(unresolvedKey);
+		const unresolved = unresolvedOn === sessionId;
 		let usage: SessionContextUsage | undefined;
 		try {
 			usage = await this.#manager.port.contextUsage?.({ sessionId, repo: this.#manager.repo, relay: tail });
@@ -4763,19 +4876,46 @@ class OriginActor {
 			this.#manager.log(
 				`persona_context_unreadable origin=${this.originKey} session=${sessionId} detail=${safeDiagnostic(error)}`,
 			);
-			return { compacted: false };
+			if (!unresolved) return { compacted: false };
 		}
-		if (!usage || usage.tokens < PERSONA_COMPACTION_TOKENS) return { ...(usage ? { usage } : {}), compacted: false };
+		const belowLine = usage !== undefined && usage.tokens < PERSONA_COMPACTION_TOKENS;
+		if (unresolved && belowLine) {
+			// The earlier run landed: the context is compacted and the persona goes back in.
+			this.#manager.database.core.metaDelete(unresolvedKey);
+			this.#manager.log(
+				`persona_compaction_resolved origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage!.tokens} evidence=context_below_line`,
+			);
+			return { compacted: true };
+		}
+		if (!unresolved && (usage === undefined || belowLine)) return { ...(usage ? { usage } : {}), compacted: false };
+		// Written ahead of the run: a gateway that stops while it is in flight must
+		// come back holding, since the host keeps compacting regardless.
+		if (!unresolved) this.#manager.database.core.metaSet(unresolvedKey, sessionId);
 		const startedAt = this.#manager.now();
-		const { status } = await this.#manager.port.runCompaction({
+		const { status, code, outcomeUnknown, answered } = await this.#manager.port.runCompaction({
 			sessionId,
 			repo: this.#manager.repo,
 			originKey: this.originKey,
+			relay: tail,
 		});
 		this.#manager.log(
-			`persona_compaction origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage.tokens} status=${status} elapsedMs=${this.#manager.now() - startedAt}`,
+			`persona_compaction origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage?.tokens ?? "unknown"} status=${status}${code ? ` code=${code}` : ""}${outcomeUnknown ? " outcome=unknown" : ""}${unresolved ? " after=unresolved" : ""} elapsedMs=${this.#manager.now() - startedAt}`,
 		);
-		return status === "succeeded" ? { compacted: true } : { usage, compacted: false };
+		// Behind an unresolved run, only the host dispatcher's answer to this run
+		// proves the earlier one is over (gjc orders them): a refusal before
+		// dispatch or a reply that never came does not. The hold lasts until such
+		// an answer, a readable context below the line, the host's death or /new.
+		// A receipt is the host's answer on either path, and a host without
+		// compaction.run cannot have one running.
+		const settled = answered === true || status === "succeeded" || status === "skipped" || status === "unavailable";
+		if (outcomeUnknown || (unresolved && !settled)) throw new CompactionUnresolvedError(code);
+		// Answered, or a first run that never reached the host (refused before
+		// dispatch, frame never written): nothing is left compacting.
+		this.#manager.database.core.metaDelete(unresolvedKey);
+		// The earlier run may have compacted even if this one failed ("already
+		// compacted"): resolve it as compacted so the persona goes back in.
+		if (unresolved || status === "succeeded") return { compacted: true };
+		return { ...(usage ? { usage } : {}), compacted: false };
 	}
 
 	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {
@@ -4897,21 +5037,14 @@ class OriginActor {
 			const message =
 				"the session running this turn produced no terminal event before the stall deadline; the request was not resent";
 			try {
-				// Check if the turn delivered a reply that properly concluded (stopReason "stop").
-				// If it did, don't post the failure notice, as the user has their answer.
-				let forceFailureNotice = true;
-				if (bound.lastAssistantText !== undefined) {
-					const isAnswering = await this.#lastAssistantIsAnswering(bound);
-					// isAnswering === true: last message has stopReason "stop" → no notice needed
-					// isAnswering === false: last message has different stopReason → keep notice
-					// isAnswering === undefined: read failed → keep notice (fail safe)
-					if (isAnswering === true) {
-						forceFailureNotice = false;
-						this.#manager.log(
-							`stall_turn_answered_properly origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} last_stop_reason=stop`,
-						);
-					}
-				}
+				// A delivered reply that properly concluded (stopReason "stop", probed
+				// before the host was stopped) already answered the user: no notice.
+				// An unreadable or non-"stop" transcript keeps the notice (fail safe).
+				const forceFailureNotice = bound.stallReplyConcluded !== true;
+				if (!forceFailureNotice)
+					this.#manager.log(
+						`stall_turn_answered_properly origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} last_stop_reason=stop`,
+					);
 				await bound.lifecycle.onFailure?.({
 					...bound,
 					error: new GjcRuntimeError(`session_unavailable: ${message}`, { code: "session_unavailable", message }),

@@ -1365,7 +1365,8 @@ test("slash commands /new and /reset map to gateway session resets with the invo
 		id: "itx-1",
 		user: { id: "owner-1", username: "bellman" },
 		channel: { id: "channel-9", type: 0 },
-		reply: async (options: { content: string }) => {
+		deferReply: async () => {},
+		editReply: async (options: { content: string }) => {
 			replied = options.content;
 		},
 	};
@@ -1413,6 +1414,10 @@ test("/model subcommands map to the gateway's /model text verbs, not to a sessio
 				reply: async (options: { content: string }) => {
 					replies.push(options.content);
 				},
+				deferReply: async () => {},
+				editReply: async (options: { content: string }) => {
+					replies.push(options.content);
+				},
 			} as never,
 			gateway as never,
 			{ error: () => {} },
@@ -1432,6 +1437,7 @@ test("/model autocomplete filters gateway choices and fails soft to an empty lis
 	const interaction = (focused: string) => ({
 		isAutocomplete: () => true,
 		commandName: "model",
+		user: { id: "owner-1" },
 		options: { getFocused: () => focused },
 		respond: async (choices: Array<{ name: string; value: string }>) => {
 			responded.push(choices);
@@ -1460,6 +1466,7 @@ test("/model autocomplete narrows provider models by typed text and drops choice
 	const interaction = (focused: string) => ({
 		isAutocomplete: () => true,
 		commandName: "model",
+		user: { id: "owner-1" },
 		options: { getFocused: () => focused },
 		respond: async (choices: Array<{ name: string; value: string }>) => {
 			responded.push(choices);
@@ -1490,7 +1497,8 @@ test("a declined slash command answers not-authorized instead of claiming a rese
 			id: "itx-2",
 			user: { id: "intruder", username: "mallory" },
 			channel: { id: "channel-9", type: 0 },
-			reply: async (options: { content: string }) => {
+			deferReply: async () => {},
+			editReply: async (options: { content: string }) => {
 				replied = options.content;
 			},
 		} as never,
@@ -1498,6 +1506,113 @@ test("a declined slash command answers not-authorized instead of claiming a rese
 		{ error: () => {} },
 	);
 	expect(replied).toContain("not authorized");
+});
+
+test("/model acknowledges within Discord's deadline: the reply is deferred before the gateway answers (#796)", async () => {
+	const events: string[] = [];
+	let release: (() => void) | undefined;
+	const gateway = {
+		requestInbound: async () => {
+			events.push("gateway");
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return { engaged: true };
+		},
+	};
+	const deferred: unknown[] = [];
+	const edits: string[] = [];
+	const done = handleSlashCommand(
+		{
+			isChatInputCommand: () => true,
+			commandName: "model",
+			id: "itx-slow",
+			user: { id: "owner-1", username: "bellman" },
+			channel: { id: "channel-9", type: 0 },
+			options: { getSubcommand: () => "set", getString: () => "frontier-heavy" },
+			reply: async () => {
+				events.push("reply");
+			},
+			deferReply: async (options: unknown) => {
+				events.push("defer");
+				deferred.push(options);
+			},
+			editReply: async (options: { content: string }) => {
+				events.push("edit");
+				edits.push(options.content);
+			},
+		} as never,
+		gateway as never,
+		{ error: () => {} },
+	);
+	await Bun.sleep(1);
+	// Acknowledged (ephemerally) while the gateway is still working.
+	expect(events).toEqual(["defer", "gateway"]);
+	expect(deferred).toEqual([{ flags: 64 }]);
+	release?.();
+	await done;
+	expect(events).toEqual(["defer", "gateway", "edit"]);
+	expect(edits).toEqual(["🦞 model command accepted"]);
+});
+
+test("a non-owner /model set gets an ephemeral owner-only refusal, and a failed round trip never leaves the ack hanging (#796)", async () => {
+	const edits: string[] = [];
+	const interaction = (gateway: unknown, id: string) =>
+		handleSlashCommand(
+			{
+				isChatInputCommand: () => true,
+				commandName: "model",
+				id,
+				user: { id: "member-1", username: "mallory" },
+				channel: { id: "channel-9", type: 0 },
+				options: { getSubcommand: () => "set", getString: () => "frontier-heavy" },
+				reply: async () => {
+					throw new Error("a deferred interaction must be edited, not replied to");
+				},
+				deferReply: async () => {},
+				editReply: async (options: { content: string }) => {
+					edits.push(options.content);
+				},
+			} as never,
+			gateway as never,
+			{ error: () => {} },
+		);
+	await interaction({ requestInbound: async () => ({ engaged: false }) }, "itx-member");
+	await interaction(
+		{
+			requestInbound: async () => {
+				throw new Error("gateway link not connected");
+			},
+		},
+		"itx-down",
+	);
+	expect(edits).toEqual(["not authorized: /model is owner-only", "/model failed; try again"]);
+});
+
+test("/model autocomplete asks for the invoking user's choices and offers nothing without one (#796)", async () => {
+	const asked: string[] = [];
+	const responded: Array<Array<{ name: string; value: string }>> = [];
+	// The gateway answers per author: preset names only for the owner.
+	const gateway = {
+		modelChoices: async (authorId: string) => {
+			asked.push(authorId);
+			return authorId === "owner-1" ? ["frontier-heavy"] : [];
+		},
+	};
+	const interaction = (user: { id: string } | undefined) => ({
+		isAutocomplete: () => true,
+		commandName: "model",
+		...(user ? { user } : {}),
+		options: { getFocused: () => "" },
+		respond: async (choices: Array<{ name: string; value: string }>) => {
+			responded.push(choices);
+		},
+	});
+	await handleModelAutocomplete(interaction({ id: "member-1" }) as never, gateway);
+	await handleModelAutocomplete(interaction(undefined) as never, gateway);
+	await handleModelAutocomplete(interaction({ id: "owner-1" }) as never, gateway);
+	expect(asked).toEqual(["member-1", "owner-1"]);
+	expect(responded).toEqual([[], [], [{ name: "frontier-heavy", value: "frontier-heavy" }]]);
 });
 
 test("presence is shown for every engaged turn: DMs, mentions, and un-mentioned group/thread follow-ups", async () => {

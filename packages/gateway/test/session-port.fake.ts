@@ -14,7 +14,7 @@ import type {
 	SessionActivity,
 	SessionBindInput,
 	SessionBinding,
-	SessionCompactionStatus,
+	SessionCompactionResult,
 	SessionLiveness,
 	SessionPort,
 	SessionRequestInput,
@@ -150,6 +150,7 @@ export class ScriptedSessionPort implements SessionPort {
 	readonly statusReads: Array<{ sessionId: string; repo: string; opRef: string; relayUsed: boolean }> = [];
 	readonly #sessions = new Map<string, string>();
 	readonly #sessionStates = new Map<string, BrokerSession>();
+	readonly #exitedHosts = new Set<string>();
 	readonly #resumeFailures = new Map<string, Error>();
 	readonly #operations = new Map<string, Operation>();
 	readonly #transcripts = new Map<string, string[]>();
@@ -303,6 +304,16 @@ export class ScriptedSessionPort implements SessionPort {
 			...(activity ? { activity } : {}),
 			...(hostIncarnation ? { hostIncarnation } : {}),
 		};
+	}
+
+	async hostExited(input: { sessionId: string; repo: string }): Promise<boolean> {
+		return this.#exitedHosts.has(input.sessionId);
+	}
+
+	/** Explicit process-exit evidence, independent of broker liveness. */
+	setHostExited(sessionId: string, exited: boolean): void {
+		if (exited) this.#exitedHosts.add(sessionId);
+		else this.#exitedHosts.delete(sessionId);
 	}
 
 	async resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding> {
@@ -578,7 +589,7 @@ export class ScriptedSessionPort implements SessionPort {
 		sessionId: string;
 		repo: string;
 		originKey: string;
-	}): Promise<{ readonly status: SessionCompactionStatus }> {
+	}): Promise<SessionCompactionResult> {
 		return { status: "unavailable" };
 	}
 
@@ -829,7 +840,10 @@ export class ScriptedSessionPort implements SessionPort {
 	}
 
 	/** Patches a bound session's state, or seeds one the port never bound (a session left on disk by an earlier runtime). */
-	setSessionState(sessionId: string, patch: Partial<Pick<BrokerSession, "repo" | "live" | "deleted">>): void {
+	setSessionState(
+		sessionId: string,
+		patch: Partial<Pick<BrokerSession, "repo" | "live" | "deleted" | "activityState">>,
+	): void {
 		const current = this.#sessionStates.get(sessionId) ?? { sessionId, repo: "", live: false, deleted: false };
 		this.#sessionStates.set(sessionId, { ...current, ...patch });
 	}

@@ -310,6 +310,7 @@ const WORK_REASON_CODES = new Set([
 	"stopped_incomplete",
 	"sdk_failed",
 	"send_rejected",
+	"send_undelivered",
 	"terminal_missing_receipt",
 	"terminal_uncertain",
 	"session_dead",
@@ -317,6 +318,7 @@ const WORK_REASON_CODES = new Set([
 	"host_lost",
 	"recovery_indeterminate",
 	"output_unavailable",
+	"operator_abandoned",
 ]);
 
 export function workAssert(condition: unknown, assertion = "work attempt payload validation"): asserts condition {

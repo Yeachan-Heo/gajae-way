@@ -4,9 +4,12 @@ import type { CliResult, CliRunner } from "@gajae-gateway/subsession";
 import {
 	type BrokerDiscovery,
 	type BrokerLivenessVerdict,
+	BrokerStartupFailureTracker,
 	judgeBrokerLiveness,
 	type PidAliveProbe,
 	readBrokerDiscovery,
+	readBrokerStartupExitRecordSync,
+	validateStartupExitRecord,
 } from "./broker-liveness";
 import { isVerifiedGjcVersion, MIN_GJC_VERSION, VERIFIED_GJC_THROUGH } from "./gjc-contract";
 import { extractRuntimeError, sanitizeDiagnostic } from "./rebind";
@@ -15,10 +18,13 @@ export {
 	BROKER_HEARTBEAT_TTL_MS,
 	type BrokerDiscovery,
 	type BrokerLivenessVerdict,
+	BrokerStartupFailureTracker,
 	describeBindHold,
 	judgeBrokerLiveness,
 	type PidAliveProbe,
 	readBrokerDiscovery,
+	readBrokerStartupExitRecordSync,
+	validateStartupExitRecord,
 } from "./broker-liveness";
 export const GJC_ATTACH_ONLY_ENV = "GJC_SDK_BROKER_AUTOSTART";
 
@@ -120,6 +126,11 @@ export interface GlobalGjcClientOptions {
 	readonly onLiveOutageExceeded?: (detail: string) => void;
 	/** Broker-unavailable refusals are counted by the gateway SLO journal. */
 	readonly onUnavailable?: (at: number) => void;
+}
+/** One broker startup wedge: K distinct startup-exit records sharing a reason (#800). */
+export interface BrokerStartupWedge {
+	readonly reason: string;
+	readonly blockingPath?: string;
 }
 export type GlobalGjcClientDependencies = Omit<GlobalGjcClientOptions, "cwd">;
 
@@ -456,6 +467,9 @@ export class GlobalGjcClient {
 	/** Observation times of incarnation changes after the first; bounded by the churn window. */
 	#respawns: number[] = [];
 	#churnAlerted = false;
+	/** Tracks consecutive broker startup failures with the same reason. */
+	#startupFailureTracker = new BrokerStartupFailureTracker();
+	#onStartupWedge: ((wedge: BrokerStartupWedge) => void) | undefined;
 
 	constructor(options: GlobalGjcClientOptions) {
 		this.#options = options;
@@ -522,9 +536,15 @@ export class GlobalGjcClient {
 	judgeLiveness(): Promise<BrokerLivenessVerdict> {
 		return judgeBrokerLiveness(this.discoveryPath, this.#options.isPidAlive ?? defaultPidAlive);
 	}
+
 	onGeneration(listener: BrokerGenerationListener): () => void {
 		this.#listeners.add(listener);
 		return () => this.#listeners.delete(listener);
+	}
+
+	/** The runtime installs the owner alert after the client exists, like onGeneration. */
+	setOnStartupWedgeAlert(listener: (wedge: BrokerStartupWedge) => void): void {
+		this.#onStartupWedge = listener;
 	}
 	async preflight(): Promise<void> {
 		const result = await preflightGjcRuntime(
@@ -748,6 +768,8 @@ export class GlobalGjcClient {
 					}
 				}
 			}
+			// Reset startup failure tracker when broker is confirmed live
+			this.#startupFailureTracker.reset();
 			return true;
 		} catch (error) {
 			if (epoch === this.#epoch && !this.#stopped) {
@@ -823,6 +845,21 @@ export class GlobalGjcClient {
 					this.#outageSince = undefined;
 					this.#liveOutageSince = undefined;
 				} else if (epoch === this.#epoch && !this.#stopped) {
+					// Check for startup-exit record and track failures
+					const startupRecord = readBrokerStartupExitRecordSync(this.agentDir);
+					const validatedRecord = startupRecord ? validateStartupExitRecord(startupRecord) : undefined;
+					if (validatedRecord) {
+						const shouldAlert = this.#startupFailureTracker.recordFailure(validatedRecord, now);
+						if (shouldAlert) {
+							const recordCount = this.#startupFailureTracker.recentRecordCount();
+							const logLine = `broker_startup_wedge reason=${validatedRecord.reason}${validatedRecord.blockingLockPath ? ` blockingLockPath=${validatedRecord.blockingLockPath}` : ""} records=${recordCount}`;
+							this.#log(logLine);
+							this.#onStartupWedge?.({
+								reason: validatedRecord.reason,
+								blockingPath: validatedRecord.blockingLockPath,
+							});
+						}
+					}
 					this.#log(
 						new GjcCliUnavailableError(
 							`global broker unavailable; observing without repair: ${this.#unavailableReason}`,
