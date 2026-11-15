@@ -64,7 +64,7 @@ On macOS, `bun run build` finishes with `scripts/sign-dist.sh`, which re-signs e
 
 Each adapter binary runs in the foreground. Discord and Slack `--help` and `--version` return without connecting. Every adapter acquires its own non-blocking home lease (`adapter-discord`, `adapter-slack`, or `adapter-telegram`) and refuses a second owner for the same `$GAJAEWAY_HOME`; no PID file decides ownership.
 
-The release gateway does not use an arbitrary executable found on `PATH`. It reads the exact GJC version from the package manifest beside the installed binaries (the build-time checkout's manifest only when nothing was installed beside them), and the current pin is `0.20.0`. When installing a release or running `gajaeway update --force`, the updater installs that version under `$GAJAEWAY_HOME/gjc/<version>/bin/gjc`, verifies its reported version, and atomically flips `$GAJAEWAY_HOME/gjc/current` to it. The previous version is retained for rollback. The binaries need no source checkout or Bun to run; installing/updating the pinned GJC package uses Bun on the update host.
+The release gateway does not use an arbitrary executable found on `PATH`. It reads the exact GJC version from the package manifest beside the installed binaries (the build-time checkout's manifest only as the fallback for an executable with no usable pin beside it), and the current pin is `0.20.0`. When installing a release or running `gajaeway update --force`, the updater installs that version under `$GAJAEWAY_HOME/gjc/<version>/bin/gjc`, verifies its reported version, and atomically flips `$GAJAEWAY_HOME/gjc/current` to it. The previous version is retained for rollback. The binaries need no source checkout or Bun to run; installing/updating the pinned GJC package uses Bun on the update host.
 
 The gateway's error contract is verified through GJC 0.20.x. Client preflight admits the package pin or newer, but this is not production runtime selection: the broker host requires exact equality with the package pin before spawning. A newer unverified minor raises `gjc_unverified_version`. Updating a host-global `gjc` does not upgrade the private runtime or an already-running broker. GJC 0.20.0 keeps a supervised foreground broker alive when idle; only detached autostart brokers reap themselves when abandoned. The gateway continues to use the public foreground command and owns shutdown through its service manager.
 
@@ -87,7 +87,7 @@ The updater stages the platform release, backs up replaced binaries, reads the s
 
 With `--no-restart`, stale service definitions for missing binaries are left alone so a healthy running process is not stopped during the staged update. The later `gajaeway ops restart-stack` stops and removes those stale services before restarting the installed stack.
 
-A source checkout upgrades through `git`, `bun run build`, and `gajaeway services repair`; when running under Bun, pass `--bin-dir DIR` to update. The release update requires Bun to install the pinned GJC package.
+A source checkout upgrades through `git`, `bun run build`, and `gajaeway services repair --bin-dir dist` (the build writes `dist/package.json` beside the binaries); when running under Bun, pass `--bin-dir DIR` to update. The release update requires Bun to install the pinned GJC package.
 
 ### Gateway and adapter rollout for `chat.images`
 

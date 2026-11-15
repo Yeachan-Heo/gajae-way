@@ -449,11 +449,12 @@ async function readRuntime(home: string): Promise<RuntimeConfig | undefined> {
 
 /**
  * The release manifest beside the binaries `services install|repair` targets. It is the only pin
- * source: the gateway started from those binaries enforces the pin from that same manifest, so no
- * other file can describe this target. The CLI checkout's own gateway manifest is deliberately not
- * a candidate — an arbitrary `--bin-dir` is not demonstrably this checkout, and installing the
- * checkout pin for it is how a release broker came to refuse its own install with
- * broker_host_version_mismatch.
+ * source for a target that supplies a pin: the gateway started from those binaries enforces the
+ * pin from that same manifest, so no other file describes this target. The CLI checkout's own
+ * gateway manifest is deliberately not a candidate — an arbitrary `--bin-dir` is not demonstrably
+ * this checkout, and installing the checkout pin for it is how a release broker came to refuse its
+ * own install with broker_host_version_mismatch. The launchd/systemd definitions run
+ * `<binDir>/gajaeway-gateway`, so this is the manifest the runtime resolves for it.
  */
 export function servicePinManifest(binDir: string, env: NodeJS.ProcessEnv = process.env): string {
 	return join(expandHome(binDir, env.HOME || homedir()), "package.json");
@@ -461,16 +462,25 @@ export function servicePinManifest(binDir: string, env: NodeJS.ProcessEnv = proc
 
 /**
  * Install the pin `manifestPath` declares into the private prefix and return its version.
- * A manifest that is missing, malformed, or pin-less fails the install: a target that cannot
- * supply its own pin is not served by another manifest's pin, and an install failure propagates
- * instead of being retried elsewhere.
+ * A manifest that is missing, malformed, or pin-less fails the install with the release-directory
+ * remedy: a target that cannot supply its own pin is not served by another manifest's pin, and an
+ * install failure propagates instead of being retried elsewhere.
  */
 export async function installPinnedGjcForServices(options: {
 	readonly home: string;
 	readonly manifestPath: string;
 	readonly runner?: GjcInstallRunner;
 }): Promise<string> {
-	const version = await readPinnedGjcVersion(options.manifestPath);
+	let version: string;
+	try {
+		version = await readPinnedGjcVersion(options.manifestPath);
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		throw new Error(
+			`services requires the release manifest beside the target binaries: ${detail}. Install the release into that directory with 'gajaeway update --bin-dir DIR'`,
+			{ cause: error },
+		);
+	}
 	await installPinnedGjc({
 		home: options.home,
 		version,
