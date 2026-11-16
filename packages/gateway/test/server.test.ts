@@ -55,6 +55,8 @@ async function connect(socketPath: string): Promise<{
 	frames: any[];
 	wireLines: string[];
 	waitForFrame(id: string): Promise<void>;
+	/** Resolves once the gateway side has closed the connection. */
+	closed: Promise<void>;
 	close(): void;
 }> {
 	const frames: any[] = [];
@@ -62,11 +64,15 @@ async function connect(socketPath: string): Promise<{
 	const frameWaiters = new Map<string, Array<() => void>>();
 	let buffered = Buffer.alloc(0);
 	let writer: OrderedFrameWriter | undefined;
+	const { promise: closed, resolve: markClosed } = Promise.withResolvers<void>();
 	const socket = await Bun.connect({
 		unix: socketPath,
 		socket: {
 			drain() {
 				writer?.drain();
+			},
+			close() {
+				markClosed();
 			},
 			data(_socket, data) {
 				buffered = Buffer.concat([buffered, Buffer.from(data)]);
@@ -105,6 +111,7 @@ async function connect(socketPath: string): Promise<{
 		frames,
 		wireLines,
 		waitForFrame,
+		closed,
 		close: () => writer!.close(),
 	};
 }
@@ -546,6 +553,41 @@ test("a connected adapter receives a failed delivery again on the periodic sweep
 	expect(
 		client.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.deliveryId === deliveryId),
 	).toHaveLength(2);
+	client.close();
+});
+
+test("delivery destination: delivery.fail logs the adapter's exact stage reason with the ledger code and state", async () => {
+	const { client, database } = await startDeliveryServer();
+	const origin = { platform: "discord", kind: "dm", conversationId: "exact-failure", peerId: "owner" } as const;
+	const delivery = new DeliveryService(database);
+	expect(delivery.prepare("turn-exact", origin, "reply", undefined, "exact-failed")).toBeDefined();
+	expect(delivery.prepare("turn-partial", origin, "reply", undefined, "partial-failed")).toBeDefined();
+	const errors: string[] = [];
+	const original = console.error;
+	console.error = (line: string) => void errors.push(String(line));
+	try {
+		for (const [id, reason, ambiguous] of [
+			["exact-failed", "thread_missing: Unknown Channel", false],
+			["partial-failed", "partial_send: Missing Permissions", true],
+		] as const) {
+			client.send({
+				v: "0.1",
+				type: "request",
+				id: `fail-${id}`,
+				verb: "delivery.fail",
+				params: { deliveryId: id, reason, ambiguous },
+			});
+			await waitFrame(client.frames, `fail-${id}`);
+		}
+	} finally {
+		console.error = original;
+	}
+	expect(errors).toContain(
+		"delivery_failed deliveryId=exact-failed code=not_found state=pending reason=thread_missing:_Unknown_Channel",
+	);
+	expect(errors).toContain(
+		"delivery_failed deliveryId=partial-failed code=forbidden state=failed_ambiguous reason=partial_send:_Missing_Permissions",
+	);
 	client.close();
 });
 
@@ -3241,6 +3283,11 @@ test("owner /restart takes over a stack supervisor that exceeds its wait deadlin
 		)
 			await Bun.sleep(5);
 		expect(client.frames.some((frame) => frame.type === "event" && frame.event === "gateway.stopping")).toBe(true);
+		// gateway.stopping is the final frame: the gateway closes every connection as soon
+		// as it flushes, so the stale supervisor's recheck races that close. Whether the
+		// gateway still reads it (refused) or closes first (never read) depends on Bun's
+		// socket close timing (1.4.0 answers it, 1.4.4 has already closed); either way the
+		// stale supervisor must not regain the drain.
 		client.send({
 			v: "0.1",
 			type: "request",
@@ -3248,10 +3295,10 @@ test("owner /restart takes over a stack supervisor that exceeds its wait deadlin
 			verb: "gateway.restart.prepare",
 			params: { restartId: "stalled-stack-supervisor", waitMs: 1_000 },
 		});
-		await client.waitForFrame("stale-stack-recheck");
-		expect(client.frames.find((frame) => frame.id === "stale-stack-recheck")?.error?.code).toBe(
-			"gateway_shutting_down",
-		);
+		await Promise.race([client.waitForFrame("stale-stack-recheck"), client.closed]);
+		const recheck = client.frames.find((frame) => frame.id === "stale-stack-recheck");
+		const fence = recheck === undefined ? "closed_before_read" : (recheck.error?.code ?? "granted");
+		expect(["closed_before_read", "gateway_shutting_down"]).toContain(fence);
 		for (let attempt = 0; attempt < 500 && exitCode === undefined; attempt++) await Bun.sleep(5);
 		expect(exitCode).toBe(75);
 	} finally {
@@ -4947,7 +4994,9 @@ test("stdio stop detaches work.run before runtime request drain in an actual chi
 		startStdioServer({ config, database, sessionPort: port, onStop: () => { database.close(); process.exit(0); } });
 	`;
 	const child = Bun.spawn([process.execPath, "-e", code], {
-		cwd: process.cwd(),
+		// The child imports by repo-relative path, so pin its cwd to the repo root
+		// rather than inheriting wherever `bun test` was launched from.
+		cwd: join(import.meta.dir, "../../.."),
 		env: { ...process.env, WORK_TEST_HOME: directory },
 		stdin: "pipe",
 		stdout: "pipe",

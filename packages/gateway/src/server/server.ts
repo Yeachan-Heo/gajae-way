@@ -1772,6 +1772,11 @@ async function handleRequest(
 			if (failOutcome === "transitioned") {
 				const failedRow = runtime.delivery.get(params.deliveryId);
 				const code = failedRow?.lastError ?? "other";
+				// The adapter's exact reason (stage prefix and platform message) is kept in the
+				// log; the ledger stores only its allowlisted code.
+				console.error(
+					`delivery_failed deliveryId=${params.deliveryId} code=${code} state=${failedRow?.state ?? "unknown"} reason=${safeDiagnosticField(params.reason)}`,
+				);
 				runtime.readiness.recordFailure({
 					category: "delivery",
 					code,

@@ -1916,6 +1916,60 @@ test("force retirement preserves a recorded terminal outcome in lane history", a
 	expect(attempt?.errorCode).toBeUndefined();
 });
 
+test("force retirement of a never-read output records a pending receipt for the parent", async () => {
+	const f = await fixture({ ownerTarget: () => origin });
+	f.port.fetchWorkerOutput = async () => ({ status: "absent", code: "output_pending" });
+	const result = await started(f, "a", origin);
+	f.port.setSessionState(result.sessionId, { live: false });
+	expect(f.db.work.workAttemptGet(result.opRef)?.output).toMatchObject({ disposition: "pending" });
+
+	expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: true });
+	const runtime = f.db.work.workAttemptGet(result.opRef)!;
+	expect(runtime).toMatchObject({ decision: "fallback", output: { disposition: "unavailable" } });
+	const report = f.notices.at(-1);
+	expect(report?.turnId).toBe(result.opRef);
+	expect(report?.text).toContain("final_response_pending");
+	expect(report?.text).toContain(result.opRef);
+});
+
+test("force retirement of a nested child leaves a pending lane report for its parent", async () => {
+	const f = await fixture({ allowNested: () => true });
+	f.port.fetchWorkerOutput = async () => ({ status: "absent", code: "output_pending" });
+	f.setOwnerTarget(origin);
+	const parent = await f.manager.start({ name: "parent", text: "parent work", cwd: f.directory });
+	if (!parent.started) throw new Error("parent did not start");
+	const child = await f.manager.start({
+		name: "child",
+		text: "child work",
+		cwd: f.directory,
+		callerSessionId: parent.sessionId,
+	});
+	if (!child.started) throw new Error("child did not start");
+	f.port.setSessionState(child.sessionId, { live: false });
+	expect(await f.lanes.forceRetire("child")).toMatchObject({ retired: true });
+	const runtime = f.db.work.workAttemptGet(child.opRef)!;
+	expect(runtime).toMatchObject({ decision: "reported", output: { disposition: "unavailable" } });
+	const report = f.db.work.laneReportsByParent("parent")[0]!;
+	expect(report).toMatchObject({ child_op_ref: child.opRef });
+	expect(report.body).toContain("final_response_pending");
+	expect(report.body).toContain(child.opRef);
+});
+
+test("report text marks an unread output as pending instead of unavailable", () => {
+	const pending = reportText(
+		"a",
+		"attempt_ended",
+		"session_dead",
+		"gw-op",
+		{ disposition: "unavailable", reads: 0, nextReadAt: null, excerpt: null, proof: null, knownSilence: null },
+		undefined,
+		undefined,
+		true,
+	);
+	expect(pending).toContain("final_response_pending opRef=gw-op");
+	expect(pending).not.toContain("output_unavailable");
+});
+
 test("force-retiring a disowned lane records a session_disowned terminal", async () => {
 	const f = await fixture();
 	const result = await started(f);
