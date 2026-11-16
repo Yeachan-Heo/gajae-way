@@ -4,6 +4,7 @@ import { appendFile, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
+import { GjcCommandQueueTimeoutError } from "../src/orchestrator/broker";
 import { isDefinitiveSteerRejection } from "../src/orchestrator/persona-session";
 import {
 	BrokerSessionPort,
@@ -12,7 +13,13 @@ import {
 	SessionBusyStalledError,
 	SessionRequestTimeoutError,
 } from "../src/orchestrator/session-port";
-import { type TailHandle, TailRunner } from "../src/orchestrator/tail-runner";
+import {
+	RelayClosedError,
+	RelayRequestTimeoutError,
+	type RelayResponse,
+	type TailHandle,
+	TailRunner,
+} from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, Store } from "../src/store";
 import {
 	attachTestBrokerOwnership,
@@ -2349,4 +2356,140 @@ test("runCompaction waits minutes for gjc to finish compacting and maps its rece
 	expect(await port.runCompaction(target)).toEqual({ status: "skipped" });
 	reply = { ok: true, result: {} };
 	expect(await port.runCompaction(target)).toEqual({ status: "failed" });
+});
+
+test("runCompaction gives gjc's own request the compaction budget and reports a run that may still be compacting", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database!, join(home, "agent"));
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "compact", epoch: 0 });
+	const calls: { args: string[]; timeoutMs: number | undefined }[] = [];
+	// gjc's public command-error envelope; `timeout` is what its session router
+	// returns when the host has not replied within the request budget.
+	const commandError = (code: string, outcomeCertainty: string) =>
+		JSON.stringify({
+			schema: "gjc.command-error",
+			version: 1,
+			ok: false,
+			command: ["sdk", "session", "raw", "control"],
+			error: { code, category: code, message: "failure", retryability: "unknown", outcomeCertainty, references: [] },
+			complete: true,
+		});
+	let respond: () => Promise<{ exitCode: number; stdout: string; stderr: string }> = async () => ({
+		exitCode: 0,
+		stdout: JSON.stringify({ ok: true, result: { started: true } }),
+		stderr: "",
+	});
+	const run: CliRunner = async (args, options) => {
+		calls.push({ args: [...args], timeoutMs: options?.timeoutMs });
+		return await respond();
+	};
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: run,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	const target = { sessionId: "sdk-1", repo, originKey: "compact" };
+
+	expect(await port.runCompaction(target)).toEqual({ status: "succeeded" });
+	// Without --timeout-ms gjc's session request gives up after 40 s while the host keeps compacting.
+	const args = calls[0]!.args;
+	const flag = args.indexOf("--timeout-ms");
+	expect(flag).toBeGreaterThan(args.indexOf("compaction.run"));
+	const requestBudgetMs = Number(args[flag + 1]);
+	// One five-minute deadline end to end: the process bound (CLI slot wait included)
+	// is the whole budget, and gjc's request ends a little earlier so its reply is read.
+	expect(calls[0]!.timeoutMs).toBe(300_000);
+	expect(requestBudgetMs).toBeGreaterThan(40_000);
+	expect(requestBudgetMs).toBeLessThan(calls[0]!.timeoutMs!);
+
+	// gjc's request timeout settles only the client; the host may still be compacting.
+	respond = async () => ({ exitCode: 1, stdout: commandError("timeout", "unknown"), stderr: "" });
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "timeout", outcomeUnknown: true });
+	respond = async () => ({ exitCode: 1, stdout: commandError("uncertain_after_send", "unknown"), stderr: "" });
+	expect(await port.runCompaction(target)).toEqual({
+		status: "failed",
+		code: "uncertain_after_send",
+		outcomeUnknown: true,
+	});
+	// So may a run whose process was cut off or never printed gjc's envelope.
+	respond = async () => {
+		throw new Error("request timed out after 300000ms");
+	};
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", outcomeUnknown: true });
+	respond = async () => ({ exitCode: 1, stdout: "", stderr: "killed" });
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", outcomeUnknown: true });
+
+	// Other structured CLI failures stay plain failures with their code, but never `answered`:
+	// operation_failed covers both a finished compaction failure and a lost reply.
+	respond = async () => ({ exitCode: 1, stdout: commandError("operation_failed", "unknown"), stderr: "" });
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "operation_failed" });
+	// A run that never got a CLI slot never reached gjc.
+	respond = async () => {
+		throw new GjcCommandQueueTimeoutError(300_000);
+	};
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "queue_timeout" });
+
+	respond = async () => ({ exitCode: 1, stdout: commandError("unsupported_operation", "not-applied"), stderr: "" });
+	expect(await port.runCompaction(target)).toEqual({ status: "unavailable", code: "unsupported_operation" });
+});
+
+test("runCompaction on the relay reports whether the host's ordered dispatcher answered", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database!, join(home, "agent"));
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "compact", epoch: 0 });
+	const cliCalls: string[][] = [];
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: async (args) => {
+			cliCalls.push([...args]);
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { started: true } }), stderr: "" };
+		},
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	const controls: { operation: string; timeoutMs: number | undefined }[] = [];
+	let reply: () => Promise<RelayResponse> = async () => ({ ok: true, result: { started: true } });
+	const relay = {
+		control: async (operation: string, _input: Record<string, unknown>, options?: { timeoutMs?: number }) => {
+			controls.push({ operation, timeoutMs: options?.timeoutMs });
+			return await reply();
+		},
+	} as unknown as TailHandle;
+	const target = { sessionId: "sdk-1", repo, originKey: "compact", relay };
+
+	expect(await port.runCompaction(target)).toEqual({ status: "succeeded", answered: true });
+	// Straight to the host on the relay, under the whole five-minute budget; no CLI slot.
+	expect(controls).toEqual([{ operation: "compaction.run", timeoutMs: 300_000 }]);
+	expect(cliCalls).toEqual([]);
+
+	// The dispatcher's own failure for this run (e.g. already compacted) is an answer.
+	reply = async () => ({ ok: false, error: { code: "internal", message: "Control operation failed." } });
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "internal", answered: true });
+	// Refused before ordered dispatch: the run never started and proves nothing about earlier ones.
+	for (const code of ["session_quiescing", "not_activated", "operation_not_session_owned"]) {
+		reply = async () => ({ ok: false, error: { code, message: "refused" } });
+		expect(await port.runCompaction(target)).toEqual({ status: "failed", code });
+	}
+	reply = async () => ({ ok: false, error: { code: "unknown_operation", message: "unknown" } });
+	expect(await port.runCompaction(target)).toEqual({ status: "unavailable", code: "unknown_operation" });
+
+	// No reply: the host may still be compacting.
+	reply = async () => {
+		throw new RelayRequestTimeoutError("sdk-1", "gw-1", 300_000);
+	};
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", outcomeUnknown: true });
+	reply = async () => {
+		throw new RelayClosedError("sdk-1", "stream ended", true);
+	};
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", outcomeUnknown: true });
+	// A frame never written never reached the host.
+	reply = async () => {
+		throw new RelayClosedError("sdk-1", "relay not open", false);
+	};
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "relay_unwritten" });
 });

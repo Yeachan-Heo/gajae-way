@@ -37,6 +37,8 @@ export interface StdioTransport {
 
 export interface GajaewayClientOptions {
 	requestTimeoutMs?: number;
+	/** Refuse gateways that cannot preserve these required input semantics. */
+	requiredCapabilities?: readonly string[];
 	/** Identifies this process in `gateway.status` generation diagnostics. */
 	clientName?: string;
 	/** Cancels an in-progress socket connection or negotiation. */
@@ -249,12 +251,14 @@ export class GajaewayClient {
 	#negotiated?: Promise<void>;
 	#requestTimeoutMs: number;
 	#clientName: string;
+	readonly #requiredCapabilities: readonly string[];
 	#id = 0;
 
 	private constructor(transport?: Transport, options?: GajaewayClientOptions) {
 		this.#transport = transport;
 		this.#requestTimeoutMs = options?.requestTimeoutMs ?? 30_000;
 		this.#clientName = options?.clientName ?? "@gajae-gateway/sdk";
+		this.#requiredCapabilities = [...(options?.requiredCapabilities ?? [])];
 	}
 
 	on(event: string, handler: EventHandler): () => void {
@@ -380,6 +384,7 @@ export class GajaewayClient {
 					type: "hello",
 					payload: {
 						supportedVersions: [PROFILE_VERSION],
+						requiredCapabilities: this.#requiredCapabilities,
 						clientInfo: { name: this.#clientName, startedAt: processStartedAt() },
 					},
 				})

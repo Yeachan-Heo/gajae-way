@@ -1,9 +1,16 @@
 import { expect, test } from "bun:test";
+import type { ImageFetch } from "@gajae-gateway/images";
+import { downloadPromptImage, ImagePreparationBudget } from "@gajae-gateway/images";
 import {
 	collectAttachments,
+	createDiscordImagePreparer,
+	DISCORD_IMAGE_ALLOWED_HOSTS,
 	describeAttachment,
 	describeInboundBody,
 	isVoiceMessageAttachment,
+	prepareDiscordImages,
+	selectImageAttachments,
+	selectNativeImageAttachments,
 } from "../src/attachments";
 
 const VOICE = {
@@ -46,6 +53,264 @@ test("attachment kind comes from the mime type so the persona need not parse it"
 	);
 	expect(describeAttachment({ name: "report.pdf", contentType: "application/pdf" })).toBe("[file · report.pdf]");
 	expect(describeAttachment({ name: "notes.txt" })).toBe("[file · notes.txt]");
+});
+
+test("image descriptions identify the native attachment without exposing its signed CDN URL", () => {
+	const url = "https://cdn.discordapp.com/attachments/1/2/photo.png?ex=secret-signature";
+	expect(describeAttachment({ name: "photo.png", contentType: "image/png", url })).toBe("[image · photo.png]");
+	expect(describeAttachment({ name: "archive.bin", contentType: "application/octet-stream", url })).toContain(url);
+});
+
+test("native image sources are limited to PNG/JPEG, with filename inference only when MIME is missing", () => {
+	const message = {
+		attachments: [
+			{ name: "photo.data", contentType: " IMAGE/JPEG ", url: "https://cdn.discordapp.com/photo" },
+			{ name: "inferred.jpeg", url: "https://cdn.discordapp.com/inferred" },
+			{ name: "native.png", contentType: "image/png", url: "https://cdn.discordapp.com/native" },
+			{ name: "animated.gif", contentType: "image/gif", url: "https://cdn.discordapp.com/gif" },
+			{ name: "preview.webp", contentType: "image/webp", url: "https://cdn.discordapp.com/webp" },
+			{ name: "looks-like-image.png", contentType: "application/octet-stream", url: "https://cdn.discordapp.com/file" },
+			{ name: "clip.mp4", contentType: "video/mp4", url: "https://cdn.discordapp.com/video" },
+		],
+	};
+	expect(selectNativeImageAttachments(message)).toEqual([
+		message.attachments[0],
+		message.attachments[1],
+		message.attachments[2],
+	]);
+	expect(selectImageAttachments(message)).toEqual(message.attachments.slice(0, 5));
+});
+
+test("unsupported images retain their URLs and captions beside ordinary attachments", async () => {
+	const message = {
+		content: "Please look at these",
+		attachments: [
+			{
+				name: "animation.gif",
+				contentType: "image/gif",
+				url: "https://cdn.discordapp.com/animation.gif?sig=gif-secret",
+			},
+			{
+				name: "preview.webp",
+				contentType: "image/webp",
+				url: "https://cdn.discordapp.com/preview.webp?sig=webp-secret",
+			},
+			{
+				name: "notes.txt",
+				contentType: "text/plain",
+				url: "https://cdn.discordapp.com/notes.txt?sig=file-secret",
+			},
+		],
+	};
+	let downloads = 0;
+	expect(describeInboundBody(message)).toBe(
+		[
+			"Please look at these",
+			"[image · animation.gif · https://cdn.discordapp.com/animation.gif?sig=gif-secret]",
+			"[image · preview.webp · https://cdn.discordapp.com/preview.webp?sig=webp-secret]",
+			"[file · notes.txt · https://cdn.discordapp.com/notes.txt?sig=file-secret]",
+		].join("\n"),
+	);
+	expect(
+		await prepareDiscordImages(message, {
+			download: async () => {
+				downloads++;
+				return Uint8Array.of(1);
+			},
+			prepare: async () => ({ images: [], notice: "" }),
+		}),
+	).toEqual({ images: [], notice: "" });
+	expect(downloads).toBe(0);
+});
+
+test("Discord image downloads preserve signed URLs and pass only the approved hosts to the helper", async () => {
+	const cdnUrl = "https://cdn.discordapp.com/attachments/1/2/photo.png?ex=abc&is=def&hm=signed";
+	const mediaUrl = "https://media.discordapp.net/attachments/1/2/preview.png?width=640&signature=signed";
+	const downloads: Array<{ url: string; allowedHosts: readonly string[] }> = [];
+	let preparedSources: readonly Uint8Array[] = [];
+	const result = await prepareDiscordImages(
+		{
+			attachments: [
+				{ name: "photo.png", contentType: "image/png", url: cdnUrl },
+				{ name: "preview.png", contentType: "image/png", url: mediaUrl },
+			],
+		},
+		{
+			download: async (url, options) => {
+				downloads.push({ url, allowedHosts: options.allowedHosts });
+				return Uint8Array.of(downloads.length);
+			},
+			prepare: async (sources) => {
+				preparedSources = sources;
+				return { images: [{ data: "AQ==", mimeType: "image/jpeg" }], notice: "resized" };
+			},
+		},
+	);
+	expect(downloads).toEqual([
+		{ url: cdnUrl, allowedHosts: DISCORD_IMAGE_ALLOWED_HOSTS },
+		{ url: mediaUrl, allowedHosts: DISCORD_IMAGE_ALLOWED_HOSTS },
+	]);
+	expect(preparedSources).toEqual([Uint8Array.of(1), Uint8Array.of(2)]);
+	expect(result).toEqual({ images: [{ data: "AQ==", mimeType: "image/jpeg" }], notice: "resized" });
+});
+
+test("arbitrary image hosts are rejected before reaching the download helper", async () => {
+	let fetchCount = 0;
+	const fetchImage: ImageFetch = async () => {
+		fetchCount++;
+		return new Response(new Uint8Array([1]));
+	};
+	await expect(
+		prepareDiscordImages(
+			{
+				attachments: [
+					{
+						name: "photo.png",
+						contentType: "image/png",
+						url: "https://attacker.example/photo.png?secret=query",
+					},
+				],
+			},
+			{
+				download: downloadPromptImage,
+				prepare: async () => ({ images: [], notice: "" }),
+				fetch: fetchImage,
+			},
+		),
+	).rejects.toMatchObject({ disposition: "terminal" });
+	expect(fetchCount).toBe(0);
+});
+
+test("permanent HTTP image failures are terminal while server failures stay retryable", async () => {
+	const message = {
+		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo" }],
+	};
+	const prepare = async () => ({ images: [], notice: "" });
+	const unavailable: ImageFetch = async () => new Response("unavailable", { status: 503 });
+	const expired: ImageFetch = async () => new Response("expired", { status: 403 });
+	await expect(
+		prepareDiscordImages(message, {
+			download: downloadPromptImage,
+			prepare,
+			fetch: unavailable,
+		}),
+	).rejects.toMatchObject({ disposition: "retryable" });
+	await expect(
+		prepareDiscordImages(message, {
+			download: downloadPromptImage,
+			prepare,
+			fetch: expired,
+		}),
+	).rejects.toMatchObject({ disposition: "terminal" });
+});
+
+test("more than four images are rejected before any download", async () => {
+	let downloadCount = 0;
+	await expect(
+		prepareDiscordImages(
+			{
+				attachments: Array.from({ length: 5 }, (_, index) => ({
+					name: `${index}.png`,
+					contentType: "image/png",
+					url: `https://cdn.discordapp.com/${index}`,
+				})),
+			},
+			{
+				download: async () => {
+					downloadCount++;
+					return Uint8Array.of(1);
+				},
+				prepare: async () => ({ images: [], notice: "" }),
+			},
+		),
+	).rejects.toThrow("at most 4 images");
+	expect(downloadCount).toBe(0);
+});
+
+test("the shared budget bounds native preparations and holds a failed job until sibling downloads settle", async () => {
+	const prepareImages = createDiscordImagePreparer(new ImagePreparationBudget());
+	let releaseSibling!: (bytes: Uint8Array) => void;
+	let releaseOther!: (bytes: Uint8Array) => void;
+	const sibling = new Promise<Uint8Array>((resolve) => {
+		releaseSibling = resolve;
+	});
+	const other = new Promise<Uint8Array>((resolve) => {
+		releaseOther = resolve;
+	});
+	const downloads: string[] = [];
+	let prepared = 0;
+	const ports = {
+		download: async (url: string) => {
+			downloads.push(url);
+			if (url.endsWith("/failed")) throw new Error("download failure");
+			if (url.endsWith("/sibling")) return sibling;
+			if (url.endsWith("/other")) return other;
+			return Uint8Array.of(1);
+		},
+		prepare: async () => {
+			prepared++;
+			return { images: [], notice: "" };
+		},
+	};
+	const message = (...paths: string[]) => ({
+		attachments: paths.map((path) => ({ contentType: "image/png", url: `https://cdn.discordapp.com/${path}` })),
+	});
+	const failed = prepareImages(message("failed", "sibling"), ports).then(
+		() => undefined,
+		(error: unknown) => error,
+	);
+	const pending = prepareImages(message("other"), ports);
+	await expect(prepareImages(message("blocked"), ports)).rejects.toThrow();
+	expect(downloads).toEqual([
+		"https://cdn.discordapp.com/failed",
+		"https://cdn.discordapp.com/sibling",
+		"https://cdn.discordapp.com/other",
+	]);
+	await expect(prepareImages({}, ports)).resolves.toEqual({ images: [], notice: "" });
+	await expect(
+		prepareImages({ attachments: [{ contentType: "image/gif", url: "https://cdn.discordapp.com/gif" }] }, ports),
+	).resolves.toEqual({ images: [], notice: "" });
+	await Promise.resolve();
+	await expect(prepareImages(message("still-blocked"), ports)).rejects.toThrow();
+	expect(downloads).toHaveLength(3);
+	releaseSibling(Uint8Array.of(2));
+	expect(await failed).toMatchObject({ disposition: "retryable" });
+	await expect(prepareImages(message("accepted"), ports)).resolves.toEqual({ images: [], notice: "" });
+	releaseOther(Uint8Array.of(3));
+	await pending;
+	expect(prepared).toBe(2);
+});
+
+test("native decoding retains its budget slot until preparation finishes", async () => {
+	const prepareImages = createDiscordImagePreparer(new ImagePreparationBudget());
+	let release!: () => void;
+	let decoding!: () => void;
+	const pendingDecode = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const decodeStarted = new Promise<void>((resolve) => {
+		decoding = resolve;
+	});
+	let downloads = 0;
+	const ports = {
+		download: async () => {
+			downloads++;
+			return Uint8Array.of(1);
+		},
+		prepare: async () => {
+			decoding();
+			await pendingDecode;
+			return { images: [], notice: "" };
+		},
+	};
+	const message = { attachments: [{ contentType: "image/jpeg", url: "https://cdn.discordapp.com/photo" }] };
+	const first = prepareImages(message, ports);
+	const second = prepareImages(message, ports);
+	await decodeStarted;
+	await expect(prepareImages(message, ports)).rejects.toThrow();
+	expect(downloads).toBe(2);
+	release();
+	await Promise.all([first, second]);
 });
 
 test("an attachment-only message produces a body instead of the empty string that was dropped", () => {

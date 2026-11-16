@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { acquireLease } from "@gajae-gateway/home";
 import { loadConfig } from "../src/config";
 import { runCensus } from "../src/ops/census";
-import { Store } from "../src/store";
+import { LATEST_SCHEMA_VERSION, Store } from "../src/store";
 
 const homes: string[] = [];
 
@@ -53,7 +53,7 @@ test("census is a read-only v38 view and reports quarantined invalid work by cut
 	const f = await fixture();
 	const before = await readFile(f.path);
 	const report = await runCensus(f.config);
-	expect(report.schemaVersion).toBe(39);
+	expect(report.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 	expect(report.authority).toEqual({
 		canonicalAgentDir: join(f.home, "agent"),
 		identity: `gjc:${join(f.home, "agent")}`,
@@ -118,7 +118,7 @@ test("main wires the census verb to the offline command", async () => {
 	]);
 	expect(stderr).toBe("");
 	expect(exitCode).toBe(0);
-	expect(stdout).toContain('"schemaVersion": 39');
+	expect(stdout).toContain(`"schemaVersion": ${LATEST_SCHEMA_VERSION}`);
 });
 
 test("census refuses a restore journal before opening the database and releases its lease", async () => {

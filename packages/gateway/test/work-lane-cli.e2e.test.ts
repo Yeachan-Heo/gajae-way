@@ -177,8 +177,13 @@ test("killing only the CLI waiter leaves its run observable and notification-fre
 	expect(f.calls("resume")).toHaveLength(0);
 }, 40_000);
 
-test("a caller timeout during bind can precede admission and a same-name start queues behind it", async () => {
+test("a disconnected caller sees in-memory admission and a same-name start is held", async () => {
 	const f = await fixture();
+	const unknown = await cli(f, ["status", "never-admitted"]);
+	expect(unknown.code).toBe(1);
+	expect(unknown.stdout).toBe("");
+	expect(unknown.stderr).toContain("unknown work lane");
+	expect(unknown.stderr).toContain("Do not blindly retry, even with the same name");
 	const gate = f.armBindGate();
 	const first = launch(f, ["start", "delayed", "--cwd", f.home, "first private prompt"]);
 	const arrival = await f.bindGateArrival(gate);
@@ -188,26 +193,31 @@ test("a caller timeout during bind can precede admission and a same-name start q
 	expect(timedOut.stdout).toBe("");
 	expect(timedOut.code).not.toBe(0);
 
-	const unknown = await cli(f, ["status", "delayed"]);
-	expect(unknown.code).toBe(1);
-	expect(unknown.stdout).toBe("");
-	expect(unknown.stderr).toContain("unknown work lane");
-	expect(unknown.stderr).toContain("Do not blindly retry, even with the same name");
+	const admitting = await status(f, "delayed");
+	expect(admitting).toMatchObject({
+		state: "admitting",
+		attempt: null,
+		op: null,
+		admission: { startedAt: expect.any(String) },
+	});
 	expect(f.snapshot().jobs).toHaveLength(0);
 	expect(f.snapshot().runtimes).toHaveLength(0);
 	expect(f.calls("bind")).toHaveLength(0);
 	expect(f.calls("send")).toHaveLength(0);
 
-	const second = launch(f, ["start", "delayed", "--cwd", f.home, "second private prompt"]);
-	expect((await f.bindGateContender(gate)).originKey).toBe(arrival.originKey);
-	expect(second.done()).toBe(false);
+	const refused = await cli(f, ["start", "delayed", "--cwd", f.home, "second private prompt"]);
+	expect(refused.code).toBe(1);
+	expect(refused.stdout).toContain("HELD: the lane start is still being admitted");
+	expect(refused.stdout).toContain("state: admitting");
+	expect(refused.stderr).toBe("");
 	expect(f.calls("bind")).toHaveLength(0);
 	expect(f.calls("send")).toHaveLength(0);
 	f.releaseBindGate();
-	const refused = await second.result;
-	expect(refused.code).toBe(1);
-	expect(refused.stdout).toBe("");
-	expect(refused.stderr).toContain("attempt already open; use work.steer or wait");
+	await eventually(
+		() => f.calls("send"),
+		(calls) => calls.length === 1,
+		"disconnected start acceptance",
+	);
 	const pending = await status(f, "delayed");
 	expect(pending.attempt.endedAt).toBeUndefined();
 	expect(pending.op.status).toBe("in_flight");
@@ -260,17 +270,12 @@ test("SDK request timeout does not cancel a gated start over the real socket", a
 		expect(error).toBeInstanceOf(ProtocolError);
 		expect(error).toMatchObject({ code: "verb_failed", message: "request timed out after 1000ms" });
 
-		const unknown = await client.request<WorkStatusResult>("work.status", { name: "sdk-timeout" }).then(
-			(result) => ({ result }),
-			(error: unknown) => ({ error }),
-		);
-		expect(unknown).toHaveProperty("error");
-		const statusError = "error" in unknown ? unknown.error : undefined;
-		expect(statusError).toBeInstanceOf(ProtocolError);
-		expect(statusError).toMatchObject({
-			code: "invalid_params",
-			message: "unknown work lane",
-			detail: { reasonCode: "unknown_work_lane", name: "sdk-timeout" },
+		const admitting = await client.request<WorkStatusResult>("work.status", { name: "sdk-timeout" });
+		expect(admitting).toMatchObject({
+			state: "admitting",
+			attempt: null,
+			op: null,
+			admission: { startedAt: expect.any(String) },
 		});
 		expect(f.snapshot().jobs).toHaveLength(0);
 		expect(f.calls("send")).toHaveLength(0);

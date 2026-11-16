@@ -115,3 +115,65 @@ test("a failed event is still recovered, as before", async () => {
 	await propagator.reconcile();
 	expect(stage(db, eventId)).toBe("failed");
 });
+
+test("a mid-batch fence failure never leaves a coalesced authoring pointer half-retired", async () => {
+	// A crash between per-row fence transactions used to retire the shared
+	// authoring pointer for only part of a coalesced batch. Recovery then reads a
+	// pointer that no longer covers the batch, rejects it, and re-authors events
+	// whose work already ran. The fence and the whole batch's pointer retirement
+	// must commit (or roll back) together.
+	const fenceHome = await mkdtemp(join(tmpdir(), "gajaeway-monitor-fence-"));
+	const db = await Store.open(join(fenceHome, "gateway.db"));
+	const propagatorRef: { current?: MonitorPropagator } = {};
+	try {
+		const registry = new MonitorRegistry(db);
+		const monitor = registry.add({
+			name: "fence-batch",
+			trigger: { kind: "cron", schedule: "30 6 * * *" },
+			eventTypes: ["memory.canonicalize"],
+			burstPolicy: "coalesce",
+			enabled: true,
+		});
+		const submitted: string[] = [];
+		const port = sessionPortFromScript({
+			bind: async () => ({ sessionId: "s" }),
+			respond: async () => JSON.stringify(submitted.map((eventId) => ({ eventId, note: "done" }))),
+		});
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry,
+			sessionPort: port,
+			memory: new MemoryClosureQueue(db, fenceHome),
+			delivery: new DeliveryService(db),
+			emit: () => {},
+		});
+		propagatorRef.current = propagator;
+
+		const original = db.monitors.eventFencedUpdate.bind(db.monitors);
+		let fenceCalls = 0;
+		db.monitors.eventFencedUpdate = (tx, eventId, leaseId, stage, batchId, nowMs) => {
+			if (stage === "dispatched") {
+				fenceCalls += 1;
+				if (fenceCalls === 2) throw new Error("injected crash between per-row fences");
+			}
+			return original(tx, eventId, leaseId, stage, batchId, nowMs);
+		};
+
+		submitted.push(propagator.submit(monitor.monitorId, "memory.canonicalize", { at: 1 }));
+		submitted.push(propagator.submit(monitor.monitorId, "memory.canonicalize", { at: 2 }));
+		for (let attempt = 0; attempt < 200 && fenceCalls < 2; attempt++) await Bun.sleep(10);
+		expect(fenceCalls).toBe(2);
+		await propagator.drain();
+
+		const pointers = submitted.map((eventId) => db.core.metaGet(`monitor_authoring_turn:${eventId}`));
+		expect(pointers.every((pointer) => pointer !== undefined)).toBe(true);
+		expect(new Set(pointers).size).toBe(1);
+		const rows = db.monitors.eventsByIds(submitted);
+		expect(rows).toHaveLength(2);
+		expect(new Set(rows.map((row) => row.batch_id)).size).toBe(1);
+	} finally {
+		await propagatorRef.current?.drain().catch(() => {});
+		db.close();
+		await rm(fenceHome, { recursive: true, force: true });
+	}
+});

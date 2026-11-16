@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { Store } from "../src/store";
+import { LATEST_SCHEMA_VERSION, Store } from "../src/store";
 import { sessionPortFromScript } from "./session-port.fake";
 
 const responseFor = (prompt: string) =>
@@ -61,7 +61,7 @@ test("monitors inherit gateway model/tier by default and may override both per m
 		]);
 		expect(registry.get(inherited.monitorId)).toMatchObject({ model: undefined, serviceTier: undefined });
 		expect(registry.get(overridden.monitorId)).toMatchObject({ model: "z-ai/glm-5.3", serviceTier: "none" });
-		expect(database.schemaVersion).toBe(39);
+		expect(database.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 		database.close();
 	} finally {
 		await rm(home, { recursive: true, force: true });

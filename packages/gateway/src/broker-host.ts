@@ -63,6 +63,8 @@ export async function runBrokerHost(config: GatewayConfig): Promise<number> {
 			...brokerEnv,
 		};
 		const version = await versionOf(exe, env, config.home);
+		// The release beside the running binary owns the pin (see pinnedGjcCandidatePaths), so
+		// the host and `gajaeway services install` resolve the same version for this install.
 		const pinned = readPinnedGjcVersion();
 		if (version !== pinned)
 			throw new Error(`broker_host_version_mismatch running=${version ?? "unknown"} required=${pinned}`);
