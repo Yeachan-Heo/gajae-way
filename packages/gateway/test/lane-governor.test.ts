@@ -13,7 +13,7 @@ import {
 	parseLaneJobRecord,
 } from "@gajae-gateway/subsession";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
-import { inSweep, SweepLimiter } from "../src/orchestrator/sweep-limiter";
+import { currentSweep, inSweep, SweepLimiter } from "../src/orchestrator/sweep-limiter";
 import { BrokerAuthorityError, Store } from "../src/store";
 import type { WorkAttemptSettlement, WorkAttemptTerminalEvidence } from "../src/store/groups/work";
 import { ScriptedSessionPort } from "./session-port.fake";
@@ -938,8 +938,9 @@ test("retireAllDead from a sweep probes in sweep scope but retires as ordinary w
 	const result = await sweep.run(async () => await governor.retireAllDead());
 
 	expect(result.names).toEqual(["dead"]);
-	// The nominating probes are sweep reads; forceRetire's own probe and close are not.
-	expect(scopes).toContain("liveness:sess-dead:true");
+	// Both nomination and the locked recheck use sweep scope; only close escapes it.
+	expect(scopes.filter((entry) => entry === "liveness:sess-dead:true")).toHaveLength(2);
+	expect(scopes).not.toContain("liveness:sess-dead:false");
 	expect(scopes).toContain("liveness:sess-live:true");
 	expect(scopes).toContain("close:sess-dead:false");
 	expect(scopes.filter((entry) => entry.startsWith("close:")).every((entry) => entry.endsWith(":false"))).toBe(true);
@@ -950,6 +951,68 @@ test("retireAllDead from a sweep probes in sweep scope but retires as ordinary w
 	await governor.retireAllDead();
 	expect(scopes.length).toBeGreaterThan(0);
 	expect(scopes.every((entry) => entry.endsWith(":false"))).toBe(true);
+});
+
+test("forced retirement waits for its lane lock outside the slot and bounds rechecks after close failure", async () => {
+	database = await Store.open(":memory:");
+	bind("dead", NOW - 120_000, "sess-dead");
+	const entered = Promise.withResolvers<void>();
+	const allowLock = Promise.withResolvers<void>();
+	const held = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const recheckWaiting = Promise.withResolvers<void>();
+	const scopes: string[] = [];
+	let reads = 0;
+	class ProbePort extends ScriptedSessionPort {
+		override async runExclusive<T>(key: string, work: () => Promise<T>): Promise<T> {
+			scopes.push(`lock:${inSweep()}`);
+			entered.resolve();
+			await allowLock.promise;
+			return await super.runExclusive(key, work);
+		}
+		override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
+			const current = currentSweep();
+			scopes.push(`liveness:${inSweep()}`);
+			if (scopes.filter((entry) => entry.startsWith("liveness:")).length === 2) recheckWaiting.resolve();
+			const probe = async () => {
+				reads++;
+				return await super.liveness(input);
+			};
+			return current ? await current.read(probe) : await probe();
+		}
+		override async close(): Promise<void> {
+			scopes.push(`close:${inSweep()}`);
+			throw new Error("injected close failure");
+		}
+	}
+	const port = new ProbePort();
+	port.setSessionState("sess-dead", { live: false });
+	const sweep = new SweepLimiter();
+	const governor = new LaneGovernor({ database, sessionPort: port, now: () => NOW, log: () => {} });
+	const retiring = sweep.run(async () => await governor.retireAllDead());
+	let competing: Promise<void> | undefined;
+	try {
+		await entered.promise;
+		competing = sweep.run(
+			async () =>
+				await sweep.read(async () => {
+					held.resolve();
+					await release.promise;
+				}),
+		);
+		await held.promise;
+		allowLock.resolve();
+		await recheckWaiting.promise;
+		expect(reads).toBe(1);
+		release.resolve();
+		expect((await retiring).names).toEqual(["dead"]);
+		expect(scopes).toEqual(["liveness:true", "lock:false", "liveness:true", "close:false", "liveness:true"]);
+	} finally {
+		allowLock.resolve();
+		release.resolve();
+		await competing;
+		await retiring;
+	}
 });
 
 test("a sweep-nominated retirement probes as sweep reads; an operator retirement does not", async () => {

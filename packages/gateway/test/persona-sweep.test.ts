@@ -248,6 +248,36 @@ test("overlapping recovery calls join one sweep", async () => {
 	await third;
 });
 
+test("one recovery failure does not suppress admission of another origin's pending steer", async () => {
+	const port = new CountingReadPort();
+	const [running] = await restartWithRunningTurns(port, 1);
+	await manager!.recover();
+	const failing = sweepOrigin(99);
+	enqueueAt(running!, "pending-steer", "steer while running");
+	enqueueAt(failing, "pending-failure", "binding fails");
+	const bindTurn = database!.inbox.bindTurn.bind(database!.inbox);
+	database!.inbox.bindTurn = (tx, input) => {
+		if (input.originKey === failing.key) throw new Error("injected inbox bind failure");
+		return bindTurn(tx, input);
+	};
+	await expect(manager!.recover()).rejects.toThrow("injected inbox bind failure");
+	expect(port.steers.some((steer) => steer.text.includes("steer while running"))).toBe(true);
+	expect(database!.inbox.pendingOrigins()).toContain(failing.key);
+});
+
+test("automatic reset retains sweep scope only for retired-host reads", async () => {
+	const port = new CountingReadPort();
+	const [origin] = await restartWithRunningTurns(port, 1);
+	await manager!.recover();
+	port.complete(port.sends[0]!.opRef, "done");
+	await manager!.tick(origin!.key);
+	await eventually(() => manager!.state(origin!.key) === "idle", "turn did not settle");
+	port.resetCounts();
+	await manager!.sweepLimiter.run(async () => await manager!.reset(origin!.key, JSON.stringify(origin!.ref)));
+	expect(port.scopes).toContain(`jobs:${port.sends[0]!.sessionId}:sweep`);
+	expect(port.scopes).toContain(`inspect:${port.sends[0]!.sessionId}:sweep`);
+});
+
 test("a message for an origin the sweep has not reached is admitted without waiting for the sweep", async () => {
 	const port = new CountingReadPort();
 	const origins = await restartWithRunningTurns(port, 4);

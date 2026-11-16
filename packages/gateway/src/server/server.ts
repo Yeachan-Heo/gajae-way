@@ -1220,7 +1220,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				.recover()
 				.then(async () => {
 					await personaSessions.sweepIdleHosts();
-					await sweepIdleSessions(runtime, options.database);
+					await sweep.run(async () => await sweepIdleSessions(runtime, options.database));
 				})
 				.catch((error: unknown) => console.error(`persona recovery sweep failed: ${diagnostic(error)}`)),
 		console.info,

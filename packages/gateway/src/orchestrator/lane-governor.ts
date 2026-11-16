@@ -8,7 +8,7 @@ import type { Store } from "../store";
 import { runGit } from "./git-command";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionPort } from "./session-port";
-import { inSweep, SweepLimiter, sweepControl } from "./sweep-limiter";
+import { currentSweep, inSweep, SweepLimiter, sweepControl } from "./sweep-limiter";
 
 export const WORK_LANE_PREFIX = "work/task/";
 
@@ -389,8 +389,12 @@ export class LaneGovernor {
 	 * the epoch with reason operator_force.
 	 */
 	forceRetire(name: string): Promise<LaneRetireOutcome> {
-		// Retirement is a control operation: from a sweep it runs as ordinary work.
-		if (inSweep()) return sweepControl(() => this.forceRetire(name));
+		const sweep = currentSweep();
+		if (sweep) return sweepControl(() => this.#forceRetireOutsideSweep(name, sweep));
+		return this.#forceRetireOutsideSweep(name);
+	}
+
+	#forceRetireOutsideSweep(name: string, sweep?: SweepLimiter): Promise<LaneRetireOutcome> {
 		if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 			return Promise.resolve({
 				retired: false,
@@ -404,7 +408,7 @@ export class LaneGovernor {
 				await this.#recoveryGate?.();
 				if (this.#stopped)
 					return { retired: false as const, sessionKey: workSessionKey(name), reason: "gateway is stopping" };
-				return await this.#forceRetire(name);
+				return await this.#forceRetire(name, sweep);
 			} catch (error) {
 				const detail = sanitizeDiagnostic(diagnostic(error));
 				this.#log(`lane_force_retire_failed name=${name} reason=${detail}`);
@@ -419,7 +423,7 @@ export class LaneGovernor {
 		return task;
 	}
 
-	#forceRetire(name: string): Promise<LaneRetireOutcome> {
+	#forceRetire(name: string, sweep?: SweepLimiter): Promise<LaneRetireOutcome> {
 		const sessionKey = workSessionKey(name);
 		if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 			return Promise.resolve({ retired: false, sessionKey, reason: "broker_authority_quarantined" });
@@ -427,185 +431,189 @@ export class LaneGovernor {
 		// We will only close if liveness proves the session is dead/disowned.
 		const preflight = this.activeLanes().find((candidate) => candidate.name === name);
 		if (!preflight) return Promise.resolve({ retired: false, sessionKey, reason: "no bound lane for that name" });
-		return this.#port.runExclusive(sessionKey, async () => {
-			if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
-				return { retired: false, sessionKey, reason: "broker_authority_quarantined" };
-			if (this.#stopped) return { retired: false, sessionKey, reason: "gateway is stopping" };
-			const lane = this.activeLanes().find((candidate) => candidate.name === name);
-			if (!lane) return { retired: false, sessionKey, reason: "no bound lane for that name" };
-			const job = this.#job(name);
-			const record = job === "corrupt" ? undefined : job;
-			let repo = record?.lane.worktreePath;
-			if (!repo) {
-				repo = this.#database.bindings.workLaneRepoBySessionId(lane.sessionId);
-			}
-			if (!repo) {
-				if (this.#database.bindings.isBrokerMode()) {
-					this.#log(`lane_retire_failed name=${name} session=${lane.sessionId} reason=orphan_no_repo_found`);
-					return { retired: false, sessionKey, reason: "orphan lane: no job record and no owned binding repo" };
-				}
-				repo = process.cwd();
-			}
-			// For force retire, we must have broker liveness proof that the session is dead or disowned,
-			// OR the session must be live but idle with an open attempt (operator abandonment).
-			const liveness = await this.#safeLiveness(lane.sessionId, repo);
-			const isIdleEnough = lane.idleMs >= this.idleRetireMs;
-			const isOpenAttempt = lane.attemptOpen;
+		return this.#port.runExclusive(sessionKey, () =>
+			sweep ? sweep.run(() => this.#forceRetireLocked(name, sessionKey)) : this.#forceRetireLocked(name, sessionKey),
+		);
+	}
 
-			// For abandonment, we need broker evidence:
-			// 1. Session activity state is idle
-			// 2. Op status from broker is unknown with receiptState unknown (not in_flight, not accepted)
-			// 3. No background jobs (async tasks, bash) still running in the session host
-			const lastAttempt = record?.attempts.at(-1);
-			let canRetireAsAbandonment = false;
-			let brokerActivityIdle = false;
-			let opStatusUnknown = false;
-			let runningJobsEmpty = true;
-			if (liveness.live === true && !liveness.disowned && isIdleEnough && isOpenAttempt && lastAttempt) {
-				// Check broker activity state
+	async #forceRetireLocked(name: string, sessionKey: string): Promise<LaneRetireOutcome> {
+		if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
+			return { retired: false, sessionKey, reason: "broker_authority_quarantined" };
+		if (this.#stopped) return { retired: false, sessionKey, reason: "gateway is stopping" };
+		const lane = this.activeLanes().find((candidate) => candidate.name === name);
+		if (!lane) return { retired: false, sessionKey, reason: "no bound lane for that name" };
+		const job = this.#job(name);
+		const record = job === "corrupt" ? undefined : job;
+		let repo = record?.lane.worktreePath;
+		if (!repo) {
+			repo = this.#database.bindings.workLaneRepoBySessionId(lane.sessionId);
+		}
+		if (!repo) {
+			if (this.#database.bindings.isBrokerMode()) {
+				this.#log(`lane_retire_failed name=${name} session=${lane.sessionId} reason=orphan_no_repo_found`);
+				return { retired: false, sessionKey, reason: "orphan lane: no job record and no owned binding repo" };
+			}
+			repo = process.cwd();
+		}
+		// For force retire, we must have broker liveness proof that the session is dead or disowned,
+		// OR the session must be live but idle with an open attempt (operator abandonment).
+		const liveness = await this.#safeLiveness(lane.sessionId, repo);
+		const isIdleEnough = lane.idleMs >= this.idleRetireMs;
+		const isOpenAttempt = lane.attemptOpen;
+
+		// For abandonment, we need broker evidence:
+		// 1. Session activity state is idle
+		// 2. Op status from broker is unknown with receiptState unknown (not in_flight, not accepted)
+		// 3. No background jobs (async tasks, bash) still running in the session host
+		const lastAttempt = record?.attempts.at(-1);
+		let canRetireAsAbandonment = false;
+		let brokerActivityIdle = false;
+		let opStatusUnknown = false;
+		let runningJobsEmpty = true;
+		if (liveness.live === true && !liveness.disowned && isIdleEnough && isOpenAttempt && lastAttempt) {
+			// Check broker activity state
+			try {
+				const brokerSession = await this.#port.inspect({ sessionId: lane.sessionId, repo });
+				if (brokerSession) {
+					brokerActivityIdle = brokerSession.activityState === "idle";
+				}
+			} catch (error) {
+				const detail = sanitizeDiagnostic(diagnostic(error));
+				this.#log(`lane_broker_inspect_failed name=${name} session=${lane.sessionId} reason=${detail}`);
+				// Conservative: cannot confirm idle, refuse abandonment
+				brokerActivityIdle = false;
+			}
+
+			// Check op status from broker
+			try {
+				const status = await this.#port.status({
+					sessionId: lane.sessionId,
+					repo,
+					opRef: lastAttempt.opRef,
+				});
+				const promptStatus = status.status.status;
+				const receiptState = status.status.receiptState;
+				// Unknown status with unknown receipt = safe to abandon
+				opStatusUnknown = promptStatus === "unknown" && (receiptState === undefined || receiptState === "unknown");
+			} catch (error) {
+				const detail = sanitizeDiagnostic(diagnostic(error));
+				this.#log(`lane_status_check_failed name=${name} opRef=${lastAttempt.opRef} reason=${detail}`);
+				// Conservative: cannot confirm status unknown, refuse abandonment
+				opStatusUnknown = false;
+			}
+
+			// Check for running background jobs (async tasks, bash) that would be terminated by close
+			if (brokerActivityIdle && opStatusUnknown && this.#port.runningJobs) {
 				try {
-					const brokerSession = await this.#port.inspect({ sessionId: lane.sessionId, repo });
-					if (brokerSession) {
-						brokerActivityIdle = brokerSession.activityState === "idle";
+					const jobs = await this.#port.runningJobs({ sessionId: lane.sessionId, repo });
+					runningJobsEmpty = jobs.length === 0;
+					if (!runningJobsEmpty) {
+						this.#log(
+							`lane_abandonment_refused name=${name} session=${lane.sessionId} reason=running_jobs count=${jobs.length}`,
+						);
 					}
 				} catch (error) {
 					const detail = sanitizeDiagnostic(diagnostic(error));
-					this.#log(`lane_broker_inspect_failed name=${name} session=${lane.sessionId} reason=${detail}`);
-					// Conservative: cannot confirm idle, refuse abandonment
-					brokerActivityIdle = false;
+					this.#log(`lane_running_jobs_check_failed name=${name} session=${lane.sessionId} reason=${detail}`);
+					// Conservative: cannot confirm jobs are empty, refuse abandonment
+					runningJobsEmpty = false;
 				}
+			}
 
-				// Check op status from broker
-				try {
-					const status = await this.#port.status({
-						sessionId: lane.sessionId,
-						repo,
-						opRef: lastAttempt.opRef,
-					});
-					const promptStatus = status.status.status;
-					const receiptState = status.status.receiptState;
-					// Unknown status with unknown receipt = safe to abandon
-					opStatusUnknown = promptStatus === "unknown" && (receiptState === undefined || receiptState === "unknown");
-				} catch (error) {
-					const detail = sanitizeDiagnostic(diagnostic(error));
-					this.#log(`lane_status_check_failed name=${name} opRef=${lastAttempt.opRef} reason=${detail}`);
-					// Conservative: cannot confirm status unknown, refuse abandonment
-					opStatusUnknown = false;
-				}
+			// Allow abandonment only if all broker conditions and job status are met
+			canRetireAsAbandonment = brokerActivityIdle && opStatusUnknown && runningJobsEmpty;
+		}
 
-				// Check for running background jobs (async tasks, bash) that would be terminated by close
-				if (brokerActivityIdle && opStatusUnknown && this.#port.runningJobs) {
+		// Allow retiring if:
+		// 1. Session is dead/disowned (normal case), OR
+		// 2. Session is live but idle with broker confirmation (operator abandonment), OR
+		// 3. Session is live but idle with an attempt already settled as operator_abandoned (may be retrying close after transient failure)
+		//    But only if there are no running jobs to protect independent background work.
+		const sessionIsDeadOrDisowned = liveness.live === false || liveness.disowned;
+		// For retry-after-transient-close-failure, only allow if the attempt was settled as operator_abandoned,
+		// not for other end reasons like session_dead or session_disowned from a reaped wait or other failure.
+		// Do not require isIdleEnough for retry: settlement's activity update has made the lane appear newly active.
+		// Instead, revalidate current liveness and running jobs; the abandonment intent is persisted in the terminal reason.
+		let isAlreadySettledAbandon = false;
+		let retryRunningJobsEmpty = true;
+		if (lastAttempt && lastAttempt.endedAt && liveness.live === true && !liveness.disowned) {
+			// Check if the attempt was settled with operator_abandoned reason
+			const runtime = this.#database.work.workAttemptGet(lastAttempt.opRef);
+			if (runtime && runtime.terminal?.reasonCode === "operator_abandoned") {
+				// Before allowing retry, verify no new running jobs have started since settlement
+				if (this.#port.runningJobs) {
 					try {
 						const jobs = await this.#port.runningJobs({ sessionId: lane.sessionId, repo });
-						runningJobsEmpty = jobs.length === 0;
-						if (!runningJobsEmpty) {
+						retryRunningJobsEmpty = jobs.length === 0;
+						if (!retryRunningJobsEmpty) {
 							this.#log(
-								`lane_abandonment_refused name=${name} session=${lane.sessionId} reason=running_jobs count=${jobs.length}`,
+								`lane_retry_abandon_refused name=${name} session=${lane.sessionId} reason=running_jobs count=${jobs.length}`,
 							);
 						}
 					} catch (error) {
 						const detail = sanitizeDiagnostic(diagnostic(error));
-						this.#log(`lane_running_jobs_check_failed name=${name} session=${lane.sessionId} reason=${detail}`);
-						// Conservative: cannot confirm jobs are empty, refuse abandonment
-						runningJobsEmpty = false;
+						this.#log(`lane_retry_running_jobs_check_failed name=${name} session=${lane.sessionId} reason=${detail}`);
+						// Conservative: cannot confirm jobs are empty, refuse retry
+						retryRunningJobsEmpty = false;
 					}
 				}
+				isAlreadySettledAbandon = retryRunningJobsEmpty;
+			}
+		}
 
-				// Allow abandonment only if all broker conditions and job status are met
-				canRetireAsAbandonment = brokerActivityIdle && opStatusUnknown && runningJobsEmpty;
-			}
+		if (!sessionIsDeadOrDisowned && !canRetireAsAbandonment && !isAlreadySettledAbandon) {
+			this.#log(`lane_force_retire_rejected name=${name} session=${lane.sessionId} reason=session_still_live`);
+			return {
+				retired: false,
+				sessionKey,
+				reason: "session is still live; cannot force retire",
+			};
+		}
 
-			// Allow retiring if:
-			// 1. Session is dead/disowned (normal case), OR
-			// 2. Session is live but idle with broker confirmation (operator abandonment), OR
-			// 3. Session is live but idle with an attempt already settled as operator_abandoned (may be retrying close after transient failure)
-			//    But only if there are no running jobs to protect independent background work.
-			const sessionIsDeadOrDisowned = liveness.live === false || liveness.disowned;
-			// For retry-after-transient-close-failure, only allow if the attempt was settled as operator_abandoned,
-			// not for other end reasons like session_dead or session_disowned from a reaped wait or other failure.
-			// Do not require isIdleEnough for retry: settlement's activity update has made the lane appear newly active.
-			// Instead, revalidate current liveness and running jobs; the abandonment intent is persisted in the terminal reason.
-			let isAlreadySettledAbandon = false;
-			let retryRunningJobsEmpty = true;
-			if (lastAttempt && lastAttempt.endedAt && liveness.live === true && !liveness.disowned) {
-				// Check if the attempt was settled with operator_abandoned reason
-				const runtime = this.#database.work.workAttemptGet(lastAttempt.opRef);
-				if (runtime && runtime.terminal?.reasonCode === "operator_abandoned") {
-					// Before allowing retry, verify no new running jobs have started since settlement
-					if (this.#port.runningJobs) {
-						try {
-							const jobs = await this.#port.runningJobs({ sessionId: lane.sessionId, repo });
-							retryRunningJobsEmpty = jobs.length === 0;
-							if (!retryRunningJobsEmpty) {
-								this.#log(
-									`lane_retry_abandon_refused name=${name} session=${lane.sessionId} reason=running_jobs count=${jobs.length}`,
-								);
-							}
-						} catch (error) {
-							const detail = sanitizeDiagnostic(diagnostic(error));
-							this.#log(`lane_retry_running_jobs_check_failed name=${name} session=${lane.sessionId} reason=${detail}`);
-							// Conservative: cannot confirm jobs are empty, refuse retry
-							retryRunningJobsEmpty = false;
-						}
-					}
-					isAlreadySettledAbandon = retryRunningJobsEmpty;
-				}
+		// Session is confirmed dead, disowned, or idle+open (operator abandonment).
+		// The attempt owner closes the history and runtime row together before we retire the binding.
+		// A completed attempt may also own an unresolved checks cycle that must end
+		// when its lane is force-retired.
+		if (lastAttempt && (!lastAttempt.endedAt || record?.state === "awaiting_checks")) {
+			let settleReason: LaneForceRetireReason;
+			if (canRetireAsAbandonment) {
+				// Operator force-retired an idle open attempt (broker status unknown)
+				settleReason = "operator_abandoned";
+			} else if (liveness.disowned) {
+				settleReason = "session_disowned";
+			} else {
+				settleReason = "session_dead";
 			}
-
-			if (!sessionIsDeadOrDisowned && !canRetireAsAbandonment && !isAlreadySettledAbandon) {
-				this.#log(`lane_force_retire_rejected name=${name} session=${lane.sessionId} reason=session_still_live`);
-				return {
-					retired: false,
-					sessionKey,
-					reason: "session is still live; cannot force retire",
-				};
+			const endedAt = new Date(this.#now()).toISOString();
+			if (!this.#forceRetireSettlement?.(name, lastAttempt.opRef, settleReason, endedAt)) {
+				const detail = "work attempt could not be settled";
+				this.#log(`lane_force_retire_failed name=${name} opRef=${lastAttempt.opRef} reason=${detail}`);
+				return { retired: false, sessionKey, reason: detail };
 			}
-
-			// Session is confirmed dead, disowned, or idle+open (operator abandonment).
-			// The attempt owner closes the history and runtime row together before we retire the binding.
-			// A completed attempt may also own an unresolved checks cycle that must end
-			// when its lane is force-retired.
-			if (lastAttempt && (!lastAttempt.endedAt || record?.state === "awaiting_checks")) {
-				let settleReason: LaneForceRetireReason;
-				if (canRetireAsAbandonment) {
-					// Operator force-retired an idle open attempt (broker status unknown)
-					settleReason = "operator_abandoned";
-				} else if (liveness.disowned) {
-					settleReason = "session_disowned";
-				} else {
-					settleReason = "session_dead";
-				}
-				const endedAt = new Date(this.#now()).toISOString();
-				if (!this.#forceRetireSettlement?.(name, lastAttempt.opRef, settleReason, endedAt)) {
-					const detail = "work attempt could not be settled";
-					this.#log(`lane_force_retire_failed name=${name} opRef=${lastAttempt.opRef} reason=${detail}`);
-					return { retired: false, sessionKey, reason: detail };
-				}
+		}
+		// Forced retirement is unattended; preserve the durable worktree and
+		// branch so its commits and the stored worktree path remain resumable.
+		// Close the session and rebind the epoch.
+		let closed = false;
+		try {
+			await sweepControl(async () => await this.#port.close({ sessionId: lane.sessionId, repo }));
+			closed = true;
+		} catch (error) {
+			const detail = sanitizeDiagnostic(diagnostic(error));
+			this.#log(`lane_close_failed name=${name} session=${lane.sessionId} detail=${detail} action=force_close`);
+			// On close failure, do a fresh liveness check before proceeding with rotateEpoch.
+			// Only proceed if we can confirm the host is dead/disowned; otherwise preserve the binding.
+			const closeFailureLiveness = await this.#safeLiveness(lane.sessionId, repo);
+			if (closeFailureLiveness.live !== false && !closeFailureLiveness.disowned) {
+				// Host may still be live or liveness is unknown; must not rotate epoch without confirmation it is dead/disowned.
+				return { retired: false, sessionKey, reason: `session close failed: ${detail}` };
 			}
-			// Forced retirement is unattended; preserve the durable worktree and
-			// branch so its commits and the stored worktree path remain resumable.
-			// Close the session and rebind the epoch.
-			let closed = false;
-			try {
-				await this.#port.close({ sessionId: lane.sessionId, repo });
-				closed = true;
-			} catch (error) {
-				const detail = sanitizeDiagnostic(diagnostic(error));
-				this.#log(`lane_close_failed name=${name} session=${lane.sessionId} detail=${detail} action=force_close`);
-				// On close failure, do a fresh liveness check before proceeding with rotateEpoch.
-				// Only proceed if we can confirm the host is dead/disowned; otherwise preserve the binding.
-				const closeFailureLiveness = await this.#safeLiveness(lane.sessionId, repo);
-				if (closeFailureLiveness.live !== false && !closeFailureLiveness.disowned) {
-					// Host may still be live or liveness is unknown; must not rotate epoch without confirmation it is dead/disowned.
-					return { retired: false, sessionKey, reason: `session close failed: ${detail}` };
-				}
-				// For dead/disowned sessions confirmed by fresh liveness check, proceed with rotation.
-			}
-			this.#database.transaction((tx) => this.#database.bindings.rotateEpoch(tx, sessionKey));
-			const logReason = canRetireAsAbandonment ? "operator_abandoned" : "operator_force";
-			this.#log(`lane_retired name=${name} session=${lane.sessionId} reason=${logReason} closed=${closed}`);
-			return { retired: true, sessionKey, sessionId: lane.sessionId, closed, forced: true };
-		});
+			// For dead/disowned sessions confirmed by fresh liveness check, proceed with rotation.
+		}
+		this.#database.transaction((tx) => this.#database.bindings.rotateEpoch(tx, sessionKey));
+		const logReason = canRetireAsAbandonment ? "operator_abandoned" : "operator_force";
+		this.#log(`lane_retired name=${name} session=${lane.sessionId} reason=${logReason} closed=${closed}`);
+		return { retired: true, sessionKey, sessionId: lane.sessionId, closed, forced: true };
 	}
 
 	/**

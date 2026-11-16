@@ -47,6 +47,7 @@ import {
 	type TerminateHostOutcome,
 } from "./session-port";
 import {
+	currentSweep,
 	outsideSweep,
 	SWEEP_MAILBOX_WAIT_MS,
 	SWEEP_UNIT_SLOW_MS,
@@ -950,7 +951,10 @@ export class PersonaSessionManager {
 			started.push(finished);
 		}
 		try {
-			return await Promise.all(started);
+			const results = await Promise.allSettled(started);
+			const failure = results.find((result) => result.status === "rejected");
+			if (failure?.status === "rejected") throw failure.reason;
+			return results.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []));
 		} finally {
 			if (actors.length > 0)
 				this.#log(
@@ -1142,7 +1146,10 @@ export class PersonaSessionManager {
 	 */
 	reset(originKey: string, originRefJson: string, floorAt = new Date(this.#now()).toISOString()): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
-		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).reset(originRefJson, floorAt));
+		const sweep = currentSweep();
+		return this.#actor(originKey).enqueue(
+			async () => await this.#actor(originKey).reset(originRefJson, floorAt, sweep),
+		);
 	}
 
 	/**
@@ -1188,19 +1195,18 @@ export class PersonaSessionManager {
 				)
 				.map((row) => row.origin_key),
 		]);
-		const recovered = await this.#sweepActors(
+		await this.#sweepActors(
 			"recover",
 			[...origins].map((originKey) => this.#actor(originKey)),
 			async (actor) => {
 				await actor.recover();
 				await actor.reconcile();
 				await actor.recoverObserver();
+				// Admission is ordinary mailbox work and must proceed even if another origin fails.
+				await sweepControl(async () => await actor.admit());
 			},
 		);
-		// Pending rows outside a turn (released before the restart, or arrived
-		// while down) are dispatched now, outside the sweep slot; nothing is expired.
-		// A deferred origin is admitted by its next inbound message or the next sweep.
-		await Promise.all(recovered.map((actor) => actor.enqueue(async () => await actor.admit())));
+		// Deferred origins are admitted by their next inbound message or the next sweep.
 	}
 
 	/** Tail gaps and broker replacements reconcile status; tail is never terminal authority. */
@@ -1880,7 +1886,7 @@ class OriginActor {
 		for (const retired of [...this.#retired.values()]) await this.#reconcileBound(retired);
 	}
 
-	async reset(originRefJson: string, floorAt: string): Promise<void> {
+	async reset(originRefJson: string, floorAt: string, sweep?: SweepLimiter): Promise<void> {
 		await this.#closeObserver("reset");
 		const previous = this.#current;
 		// The binding being rotated away from. Read before bumpEpoch clears it: if
@@ -1926,7 +1932,11 @@ class OriginActor {
 		// With a retired turn still pending, its reconcile ends the host once the
 		// answer is settled; #terminateRetiredSession sees it in #retired and waits.
 		// With nothing in flight, this is the only place that will ever do it.
-		if (previousSessionId) await this.#terminateRetiredSession(previousSessionId, "reset");
+		if (previousSessionId) {
+			const terminate = async () => await this.#terminateRetiredSession(previousSessionId, "reset");
+			if (sweep) await sweep.run(terminate);
+			else await terminate();
+		}
 		await this.#dispatchNext();
 	}
 

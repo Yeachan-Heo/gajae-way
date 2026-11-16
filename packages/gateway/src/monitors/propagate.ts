@@ -2470,7 +2470,9 @@ export class MonitorPropagator {
 			for (const probe of ["turnRunning", "queueEmpty", "runningJobs"] as const) {
 				if (probe === "queueEmpty" && !this.#sessionPort.queueEmpty) continue;
 				try {
-					const result = await this.#sessionPort[probe]?.({ sessionId, repo: this.#repo });
+					const result = await this.#sweep.run(
+						async () => await this.#sessionPort[probe]?.({ sessionId, repo: this.#repo }),
+					);
 					const busy =
 						probe === "turnRunning"
 							? result === true
