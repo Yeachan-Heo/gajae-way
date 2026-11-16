@@ -2007,7 +2007,6 @@ export class ReconnectingGateway {
 		const admittedIdentity = entry.sourceIdentity ?? imageSourceIdentity(message);
 		const admittedText = entry.sourceText ?? (typeof message.content === "string" ? message.content : "");
 		if (
-			!entry.request &&
 			entry.sourceIdentity !== undefined &&
 			(admittedIdentity !== imageSourceIdentity(message) ||
 				admittedText !== (typeof message.content === "string" ? message.content : ""))
@@ -2082,6 +2081,15 @@ export class ReconnectingGateway {
 		// Never downgrade a pending image to a text-only message; a source that can
 		// never carry the image again is a terminal intent, not a silent wedge.
 		if (prepared.images.length === 0) return this.terminateImage(entry, "image attachment no longer present");
+		// A delete or edit can invalidate the row while images were preparing. Re-read
+		// the authoritative row before persisting a request or creating a destination;
+		// the stale local entry must not resurrect a terminally invalidated intent.
+		const latest = await this.#imageOutbox.get(message.id).catch(() => undefined);
+		if (latest?.completed) return "skip";
+		if (latest?.terminal) {
+			if (!latest.audited) await this.recordTerminalImage(latest, "image intent was previously rejected");
+			return "skip";
+		}
 		// Identity from the Discord message id is stable across a restart; every live
 		// intent's destination (channel or thread) is persisted with it, so a retry
 		// answers where the first attempt already did. A history-discovered intent
@@ -2415,6 +2423,11 @@ export class ReconnectingGateway {
 		if (isImageIntentExpired(entry)) return this.terminateImage(entry, "image intent unresolved for 24 hours");
 		let declined = false;
 		const verdict = await this.#inbound.join(entry.messageId, async () => {
+			// A delete/edit can invalidate the row while preparation, thread creation, or
+			// this gate's wait is pending. Re-read the authoritative row before dispatch so
+			// a stale owner never sends content whose source was removed or replaced.
+			const latest = await this.#imageOutbox.get(entry.messageId).catch(() => undefined);
+			if (latest?.terminal || latest?.completed) return "unavailable";
 			const client = this.#client;
 			if (!client) {
 				entry = await this.noteImageFailure(entry);
@@ -2473,6 +2486,7 @@ export class ReconnectingGateway {
 			// The gate cannot carry "skip"; report it from the durable outcome so the
 			// owner does not arm a retry for an already dead-lettered intent.
 			const latest = await this.#imageOutbox.get(entry.messageId).catch(() => undefined);
+			if (latest?.completed) return "skip";
 			return latest?.terminal && latest.audited ? "skip" : "unavailable";
 		}
 		// Keep only a completion tombstone. Before this durable write, a crash
@@ -2518,42 +2532,33 @@ export class ReconnectingGateway {
 						(!liveRetry || this.#blockedRecoveryChannels.has(current.channelId))
 					)
 						return this.deferImageFailure(current);
-					if (isReplayableImageRequest(current.request, current.messageId)) {
-						// A restored row is already a durable target: registering it here would
-						// give it the newest retention slot and evict a live DM at the cap.
-						if (!current.restored) await this.rememberInboundDm(current.request.origin as OriginRef);
-						return this.sendPendingImage(current);
-					}
-					return this.terminateImage(current, "persisted image request is invalid");
+					if (!isReplayableImageRequest(current.request, current.messageId))
+						return this.terminateImage(current, "persisted image request is invalid");
+					// A request can outlive its source: the adapter may persist it, crash before
+					// the first send, and stay offline while the message is deleted or edited.
+					// The live delete/edit handlers cannot see that event, so re-read the source
+					// before the first replay. Only definitive not-found or changed bytes are
+					// terminal; transient reads keep retrying.
+					const revalidated = await this.revalidateImageReplay(current, source);
+					if (!revalidated.ok)
+						return revalidated.terminal
+							? this.terminateImage(current, revalidated.summary)
+							: this.deferImageFailure(current);
+					// A restored row is already a durable target: registering it here would
+					// give it the newest retention slot and evict a live DM at the cap.
+					if (!current.restored) await this.rememberInboundDm(current.request.origin as OriginRef);
+					return this.sendPendingImage(current);
 				}
 				// Recovery usually holds the message that produced the intent, so use it
 				// instead of spending another API call on a fetch that may not be allowed.
 				let inbound = source?.id === current.messageId ? source : undefined;
 				if (!inbound) {
-					let channel: unknown;
-					try {
-						channel = await this.discord.channels.fetch(current.channelId);
-					} catch (error) {
-						if (isPermanentDiscordUnreadable(error))
-							return this.terminateImage(current, `channel unavailable: ${summarizeRecoveryFailure(error)}`);
-						return this.deferImageFailure(current);
-					}
-					if (!isRecoverableChannel(channel))
-						return this.terminateImage(current, "destination is no longer a recoverable channel");
-					let message: unknown;
-					try {
-						message = await (
-							channel.messages as unknown as {
-								fetch(id: string): Promise<unknown>;
-							}
-						).fetch(current.messageId);
-					} catch (error) {
-						if (isPermanentDiscordUnreadable(error))
-							return this.terminateImage(current, `message unavailable: ${summarizeRecoveryFailure(error)}`);
-						return this.deferImageFailure(current);
-					}
-					if (!message || typeof message !== "object" || !("author" in message)) return this.deferImageFailure(current);
-					inbound = message as DiscordInboundMessage;
+					const fetched = await this.fetchImageSource(current.channelId, current.messageId);
+					if (!("message" in fetched))
+						return fetched.outcome === "gone"
+							? this.terminateImage(current, fetched.summary)
+							: this.deferImageFailure(current);
+					inbound = fetched.message;
 				}
 				const engagement = decideInbound(inbound, this.getBotUser(), this.config.channels);
 				if (!engagement) return this.terminateImage(current, "no engagement policy for recovered image");
@@ -2569,6 +2574,67 @@ export class ReconnectingGateway {
 			},
 			() => this.retryPendingImage(entry, source, ordered, liveRetry),
 		);
+	}
+
+	/** Fetch the Discord message a persisted image intent was built from. */
+	private async fetchImageSource(
+		channelId: string,
+		messageId: string,
+	): Promise<
+		{ readonly message: DiscordInboundMessage } | { readonly outcome: "gone" | "unavailable"; readonly summary: string }
+	> {
+		let channel: unknown;
+		try {
+			channel = await this.discord.channels.fetch(channelId);
+		} catch (error) {
+			if (isPermanentDiscordUnreadable(error))
+				return { outcome: "gone", summary: `channel unavailable: ${summarizeRecoveryFailure(error)}` };
+			return { outcome: "unavailable", summary: "channel fetch failed" };
+		}
+		if (!isRecoverableChannel(channel))
+			return { outcome: "gone", summary: "destination is no longer a recoverable channel" };
+		let message: unknown;
+		try {
+			message = await (
+				channel.messages as unknown as {
+					fetch(id: string): Promise<unknown>;
+				}
+			).fetch(messageId);
+		} catch (error) {
+			if (isPermanentDiscordUnreadable(error))
+				return { outcome: "gone", summary: `message unavailable: ${summarizeRecoveryFailure(error)}` };
+			return { outcome: "unavailable", summary: "message fetch failed" };
+		}
+		if (!message || typeof message !== "object" || !("author" in message))
+			return { outcome: "unavailable", summary: "message fetch returned no message" };
+		return { message: message as DiscordInboundMessage };
+	}
+
+	/**
+	 * Revalidate a persisted exact request against its Discord source. A request can
+	 * outlive its message (deleted while offline) or point at replaced attachment
+	 * bytes (edited while offline); neither event can invalidate the row while the
+	 * adapter is disconnected.
+	 */
+	private async revalidateImageReplay(
+		current: PendingImage,
+		source?: DiscordInboundMessage,
+	): Promise<{ readonly ok: true } | { readonly ok: false; readonly terminal: boolean; readonly summary: string }> {
+		let inbound = source?.id === current.messageId ? source : undefined;
+		if (!inbound) {
+			const fetched = await this.fetchImageSource(current.channelId, current.messageId);
+			if (!("message" in fetched)) return { ok: false, terminal: fetched.outcome === "gone", summary: fetched.summary };
+			inbound = fetched.message;
+		}
+		if (current.sourceIdentity !== undefined && imageSourceIdentity(inbound) !== current.sourceIdentity)
+			return { ok: false, terminal: true, summary: "image source changed after the message was edited" };
+		if (
+			current.sourceText !== undefined &&
+			typeof inbound.content === "string" &&
+			inbound.content !== current.sourceText
+		)
+			return { ok: false, terminal: true, summary: "image source changed after the message was edited" };
+		return { ok: true };
 	}
 
 	async connect(): Promise<void> {

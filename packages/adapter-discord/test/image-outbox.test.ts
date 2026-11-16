@@ -79,6 +79,34 @@ describe("ImageOutbox", () => {
 		expect(await new ImageOutbox(path).load()).toEqual([entry]);
 	});
 
+	test("a stale write cannot replace terminal or completed evidence", async () => {
+		const outbox = new ImageOutbox(path);
+		const terminal: PendingImage = {
+			messageId: "123456789012345682",
+			channelId: "channel",
+			terminal: true,
+			audited: true,
+		};
+		await outbox.put(terminal);
+		await outbox.put({ messageId: terminal.messageId, channelId: "channel", request: { image: "stale" } });
+		expect(await outbox.get(terminal.messageId)).toMatchObject({ terminal: true, audited: true });
+		expect((await outbox.get(terminal.messageId))?.request).toBeUndefined();
+
+		const completed: PendingImage = {
+			messageId: "123456789012345683",
+			channelId: "channel",
+			completed: true,
+			completedAt: 1,
+		};
+		await outbox.put(completed);
+		await outbox.put({ messageId: completed.messageId, channelId: "channel", failureAt: 2 });
+		expect(await outbox.get(completed.messageId)).toMatchObject({ completed: true, completedAt: 1 });
+
+		// Forward evidence still lands: a terminal row can become a completion tombstone.
+		await outbox.put({ ...terminal, terminal: false, completed: true, completedAt: 3 });
+		expect(await outbox.get(terminal.messageId)).toMatchObject({ completed: true, terminal: false });
+	});
+
 	test("drops one corrupt record but keeps readable intents", async () => {
 		const valid: PendingImage = { messageId: "123456789012345683", channelId: "channel" };
 		await writeFile(path, JSON.stringify([valid, { messageId: "not-a-snowflake", channelId: "channel" }]));

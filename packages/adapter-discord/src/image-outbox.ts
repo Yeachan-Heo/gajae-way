@@ -272,6 +272,17 @@ export class ImageOutbox {
 			validateEntry(entry);
 			const entries = [...(await this.#loadEntries())];
 			const index = entries.findIndex((pending) => pending.messageId === entry.messageId);
+			const existing = index === -1 ? undefined : entries[index];
+			// Final evidence is monotonic: a stale owner that prepared before a delete/edit
+			// or before acknowledgement must never turn a terminal or completed row back
+			// into a fresh send. Forward evidence writes (terminal -> completed) still land.
+			if (
+				existing &&
+				(existing.terminal === true || existing.completed === true) &&
+				!entry.terminal &&
+				!entry.completed
+			)
+				return;
 			if (index === -1) entries.push(entry);
 			else entries[index] = entry;
 			// Enforce the journal bounds on the write path too: a long-lived session
