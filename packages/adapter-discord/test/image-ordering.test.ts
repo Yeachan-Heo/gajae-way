@@ -1472,3 +1472,123 @@ test("incomplete thread discovery never reclaims completed evidence", async () =
 		await rm(home, { recursive: true, force: true });
 	}
 }, 12_000);
+
+test("a restore keeps the newest completed DM tombstones when one slot is free", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-restore-recency-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const recent = new Date(Date.now() - 60_000).toISOString();
+	const knownDms = Object.fromEntries(
+		Array.from({ length: 99 }, (_, index) => [`dm-${index}`, { lastSeenAt: recent, seq: index + 1 }]),
+	);
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { other: snowflakeFromTimestamp(Date.now() - 60_000) },
+			knownDms,
+			sequence: 99,
+			gatewayDbIdentity: "0:0",
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{
+					messageId: snowflakeFromTimestamp(Date.now() - 24 * 60 * 60 * 1000),
+					channelId: "dm-a",
+					dm: true,
+					completed: true,
+					completedAt: Date.now() - 24 * 60 * 60 * 1000,
+				},
+				{
+					messageId: snowflakeFromTimestamp(Date.now() - 48 * 60 * 60 * 1000),
+					channelId: "dm-b",
+					dm: true,
+					completed: true,
+					completedAt: Date.now() - 48 * 60 * 60 * 1000,
+				},
+			]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			[],
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "new-db" } } : { engaged: false, turnId: null },
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		const cursors = await loadRecoveryCursors(cursorPath);
+		expect(Object.keys(cursors.knownDms)).toHaveLength(100);
+		expect(cursors.knownDms["dm-0"]).toBeDefined();
+		// The newer completion holds the only free slot; the older one is behind it.
+		expect(cursors.knownDms["dm-a"]).toBeDefined();
+		expect(cursors.knownDms["dm-b"]).toBeUndefined();
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("persistent partial thread discovery stops driving retries but never reclaims", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-partial-bounded-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const parent = {
+		messages: { fetch: async () => [] },
+		threads: {
+			fetchActive: async () => {
+				throw new Error("temporary thread discovery failure");
+			},
+			fetchArchived: async () => ({ threads: [], hasMore: false }),
+		},
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { "channel-1": snowflakeFromTimestamp(Date.now() - 60_000) },
+			gatewayDbIdentity: "0:0",
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{
+					messageId: snowflakeFromTimestamp(Date.now() - 60_000),
+					channelId: "orphan-thread",
+					completed: true,
+					completedAt: Date.now(),
+				},
+			]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => parent,
+			[],
+			{ "channel-1": { engagement: "open" } },
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "0:0" } } : { engaged: false, turnId: null },
+		);
+		const warnings: string[] = [];
+		const originalWarn = console.warn;
+		console.warn = (...args: unknown[]) => {
+			warnings.push(args.map(String).join(" "));
+		};
+		try {
+			// A retry timer from an earlier pass may add a pass of its own; four awaited
+			// passes guarantee the bounded attempt count is reached either way.
+			for (let pass = 0; pass < 4; pass++) {
+				await bounded(adapter.recoverMissedMessages());
+				await adapter.cursorsFlushed;
+			}
+		} finally {
+			console.warn = originalWarn;
+		}
+		expect(warnings.some((line) => line.includes("quarantined partial thread discovery"))).toBe(true);
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toHaveLength(1);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);

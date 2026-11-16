@@ -1754,6 +1754,8 @@ export class ReconnectingGateway {
 	#retryTimer: ReturnType<typeof setTimeout> | undefined;
 	#retryAttempt = 0;
 	readonly #unreadableRecoveryTargets = new Map<string, number>();
+	/** Consecutive passes where a configured parent's thread enumeration was partial. */
+	readonly #partialDiscovery = new Map<string, number>();
 	#recoverableIds = new Set<string>();
 
 	constructor(
@@ -2203,6 +2205,9 @@ export class ReconnectingGateway {
 			...Object.keys(cursors?.knownDms ?? {}),
 			...Object.keys(cursors?.recoveredThrough ?? {}),
 			...Object.keys(cursors?.quarantined ?? {}),
+			// Rendered unreadable on this or an earlier pass: keep its evidence until the
+			// channel is readable again. Retain-only, so it cannot hide a live target.
+			...this.#unreadableRecoveryTargets.keys(),
 		]);
 		try {
 			const drop = new Set(
@@ -2531,6 +2536,10 @@ export class ReconnectingGateway {
 		// A pass counts as complete only when every non-quarantined target finished cleanly.
 		// Permission-dead targets are still probed on reconnect, but stop driving a 60s error loop.
 		let completed = false;
+		// Reclamation needs a pass that read every target; retry scheduling only needs
+		// the history read to finish, so a persistently undiscoverable parent cannot
+		// drive a full pass every 60s forever.
+		let reclaimSafe = true;
 		const blocked = new Set<string>();
 		try {
 			let pendingImages: readonly PendingImage[] | undefined;
@@ -2589,7 +2598,6 @@ export class ReconnectingGateway {
 			const seen = new Set<string>();
 			this.#recoverableIds = new Set(queue);
 			let incomplete = pendingImages === undefined;
-			let discoveryComplete = true;
 			for (let index = 0; index < queue.length; index++) {
 				const conversationId = queue[index] as string;
 				if (seen.has(conversationId)) continue;
@@ -2600,7 +2608,11 @@ export class ReconnectingGateway {
 						incomplete = true;
 						blocked.add(conversationId);
 					}
-					if (!result.discoveryComplete) discoveryComplete = false;
+					if (result.discoveryComplete) this.#partialDiscovery.delete(conversationId);
+					else {
+						reclaimSafe = false;
+						if (this.notePartialDiscovery(conversationId)) incomplete = true;
+					}
 					if (this.#unreadableRecoveryTargets.has(conversationId)) blocked.add(conversationId);
 					for (const threadId of result.threadIds) {
 						if (seen.has(threadId)) continue;
@@ -2650,7 +2662,7 @@ export class ReconnectingGateway {
 				}
 			}
 			this.persist(retainRecoveryCursors(this.#cursors, this.#recoverableIds));
-			completed = !incomplete && discoveryComplete;
+			completed = !incomplete;
 		} catch (error) {
 			console.error(
 				`Discord recovery pass failed: ${error instanceof Error ? error.message : String(error)}; retrying with backoff.`,
@@ -2676,7 +2688,9 @@ export class ReconnectingGateway {
 				await this.compactTerminalImages();
 				// Only a pass that read every target can decide a channel is unreachable:
 				// a failed thread discovery would otherwise hide live targets for good.
-				if (completed) await this.reclaimUnreachableCompletedImages();
+				// `completed` also excludes a thrown or incomplete pass; durable reachability
+				// is the safety property and these gates are extra caution.
+				if (completed && reclaimSafe) await this.reclaimUnreachableCompletedImages();
 			}
 		}
 	}
@@ -2930,6 +2944,22 @@ export class ReconnectingGateway {
 		return false;
 	}
 
+	/**
+	 * Bounds partial thread discovery the same way an unreadable channel is bounded: it
+	 * stays an incomplete pass (and so keeps reclamation off) while attempts are below the
+	 * bound, then stops driving the 60s retry loop. Re-enumeration resumes on reconnect.
+	 */
+	private notePartialDiscovery(conversationId: string): boolean {
+		const attempts = (this.#partialDiscovery.get(conversationId) ?? 0) + 1;
+		this.#partialDiscovery.set(conversationId, attempts);
+		if (attempts < RECOVERY_UNREADABLE_QUARANTINE_ATTEMPTS) return true;
+		if (attempts === RECOVERY_UNREADABLE_QUARANTINE_ATTEMPTS)
+			console.warn(
+				`Discord recovery quarantined partial thread discovery for ${conversationId} after ${attempts} attempts; history recovery continues and completed image reclamation stays disabled for this process until discovery succeeds.`,
+			);
+		return false;
+	}
+
 	private clearUnreadableRecoveryTarget(conversationId: string): void {
 		const attempts = this.#unreadableRecoveryTargets.get(conversationId);
 		if (attempts === undefined) return;
@@ -3113,14 +3143,16 @@ export class ReconnectingGateway {
 			};
 			const now = Date.now();
 			const cutoff = now - RECOVERY_KNOWN_DM_TTL_MS;
-			// Rebind oldest-first below every existing live slot: a completed DM that only
-			// needs a history target must never displace a genuinely recent live DM when
-			// the bounded set is full. Expired tombstones cannot be rewound into the floor.
+			// Rebind below every existing live slot: a completed DM that only needs a history
+			// target must never displace a genuinely recent live DM when the bounded set is
+			// full. `pruneKnownDms` keeps the highest seq, so newest-first ordering is what
+			// preserves the newest completions; lastSeenAt keeps their real observation time
+			// so TTL expires from the DM's own recency, not from the restore.
 			const known = { ...next.knownDms };
 			let seq = Math.min(...Object.values(known).map((entry) => entry.seq), next.sequence + 1);
 			for (const { channelId, at } of completedDms
 				.filter((entry) => entry.at >= cutoff && known[entry.channelId] === undefined)
-				.sort((a, b) => a.at - b.at)) {
+				.sort((a, b) => b.at - a.at)) {
 				known[channelId] = { lastSeenAt: new Date(Math.min(at, now)).toISOString(), seq: --seq };
 			}
 			next = { ...next, knownDms: pruneKnownDms({ ...next, knownDms: known }, now).knownDms };
