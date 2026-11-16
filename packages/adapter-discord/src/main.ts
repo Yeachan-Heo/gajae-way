@@ -1,5 +1,5 @@
 import { basename, dirname, join } from "node:path";
-import { acquireLease, exitOnLeaseHeld, homeLayout, type Lease, LeaseHeldError } from "@gajae-gateway/home";
+import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import { ImagePreparationBudget } from "@gajae-gateway/images";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import {
@@ -3221,8 +3221,12 @@ export class ReconnectingGateway {
 				void client.request<{ database?: { identity?: string } }>("gateway.status").then(
 					(result) => {
 						const identity = result?.database?.identity;
-						if (identity !== undefined && this.#cursors?.gatewayDbIdentity === undefined) {
-							this.persist({ ...this.#cursors!, gatewayDbIdentity: identity });
+						if (
+							identity !== undefined &&
+							this.#cursors !== undefined &&
+							this.#cursors.gatewayDbIdentity === undefined
+						) {
+							this.persist({ ...this.#cursors, gatewayDbIdentity: identity });
 						} else if (identity !== undefined && identity !== this.#cursors?.gatewayDbIdentity) {
 							void this.reconcileGatewayRestore();
 						}
