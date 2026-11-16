@@ -1,6 +1,6 @@
 import { stat } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
+import { acquireLease, exitOnLeaseHeld, homeLayout, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import { ImagePreparationBudget } from "@gajae-gateway/images";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import {
@@ -2103,7 +2103,7 @@ export class ReconnectingGateway {
 			messageId: entry.messageId,
 			channelId: entry.channelId,
 			terminal: true,
-			audited: true,
+			audited: !this.#cursorSaveFault,
 			...(entry.dm ? { dm: true } : {}),
 		});
 		console.error(
@@ -2913,8 +2913,10 @@ export class ReconnectingGateway {
 	}
 
 	private async gatewayDbIdentity(): Promise<string | undefined> {
+		const home = process.env.GAJAEWAY_HOME ?? join(process.env.HOME ?? "~", ".gajaeway");
+		const path = this.config.gatewayDbPath ?? homeLayout(home).db;
 		try {
-			const info = await stat(join(dirname(this.socketPath), "gateway.db"));
+			const info = await stat(path);
 			return `${info.dev}:${info.ino}`;
 		} catch {
 			return undefined;

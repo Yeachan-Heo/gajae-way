@@ -98,7 +98,7 @@ export interface RecoveryCursorState {
 	readonly deadLetterDigest: Readonly<Record<string, RecoveryDeadLetterDigest>>;
 	/** Monotonic allocator for the `seq` fields above. */
 	readonly sequence: number;
-	/** Inode of gateway.db seen at the last cursor write; detects operator restore. */
+	/** Inode of the gateway database seen at the last cursor write; detects operator restore. */
 	readonly gatewayDbIdentity?: string;
 }
 

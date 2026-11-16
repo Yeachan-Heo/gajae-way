@@ -1012,7 +1012,13 @@ test("a replaced gateway database invalidates completion tombstones", async () =
 	const id = snowflakeFromTimestamp(Date.now() - 60_000);
 	try {
 		await writeFile(join(home, "gateway.db"), "");
-		await saveRecoveryCursors(cursorPath, { ...emptyCursors(), gatewayDbIdentity: "0:0" });
+		const previousHome = process.env.GAJAEWAY_HOME;
+		process.env.GAJAEWAY_HOME = home;
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 60_000) },
+			gatewayDbIdentity: "0:0",
+		});
 		await writeFile(
 			outboxPath,
 			JSON.stringify([{ messageId: id, channelId, completed: true, completedAt: Date.now() }]),
@@ -1028,7 +1034,13 @@ test("a replaced gateway database invalidates completion tombstones", async () =
 			join(home, "gateway.sock"),
 		);
 		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
 		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([]);
+		const cursors = await loadRecoveryCursors(cursorPath);
+		expect(cursors.gatewayDbIdentity).toBeDefined();
+		expect(cursors.gatewayDbIdentity).not.toBe("0:0");
+		process.env.GAJAEWAY_HOME = previousHome;
+		if (previousHome === undefined) delete process.env.GAJAEWAY_HOME;
 	} finally {
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });

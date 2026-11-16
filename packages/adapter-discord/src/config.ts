@@ -85,6 +85,8 @@ export interface GatewayDownAlertConfig {
 export interface DiscordAdapterConfig {
 	readonly tokenFile: string;
 	readonly gatewaySocket?: string;
+	/** Gateway database path for restore identity; defaults to the home layout. */
+	readonly gatewayDbPath?: string;
 	readonly intents?: readonly number[];
 	readonly channels?: Readonly<Record<string, DiscordChannelPolicy>>;
 	/** Absolute or config-relative directories permitted for outbound MEDIA files. Omitted disables file uploads. */
@@ -145,6 +147,9 @@ export async function loadDiscordAdapterConfig(
 	if (raw.gatewaySocket !== undefined && typeof raw.gatewaySocket !== "string") {
 		throw new DiscordAdapterStartupError("Discord adapter gatewaySocket must be a string when set.");
 	}
+	if (raw.gatewayDbPath !== undefined && (typeof raw.gatewayDbPath !== "string" || raw.gatewayDbPath.trim() === "")) {
+		throw new DiscordAdapterStartupError("Discord adapter gatewayDbPath must be a non-empty string when set.");
+	}
 	if (
 		raw.intents !== undefined &&
 		(!Array.isArray(raw.intents) || raw.intents.some((intent) => !Number.isInteger(intent)))
@@ -194,6 +199,13 @@ export async function loadDiscordAdapterConfig(
 	const voice = await loadVoiceConfig(raw.voice, configPath);
 	return {
 		...raw,
+		...(typeof raw.gatewayDbPath === "string"
+			? {
+					gatewayDbPath: isAbsolute(raw.gatewayDbPath)
+						? raw.gatewayDbPath
+						: resolve(dirname(configPath), raw.gatewayDbPath),
+				}
+			: {}),
 		tokenFile,
 		token,
 		configPath,
