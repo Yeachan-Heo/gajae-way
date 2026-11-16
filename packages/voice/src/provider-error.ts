@@ -1,5 +1,8 @@
 /**
- * Shared error boundary for ElevenLabs HTTP responses.
+ * Shared error boundary for speech-provider HTTP responses: ElevenLabs
+ * (`{detail: {...}}` or top-level fields) and OpenAI-compatible endpoints
+ * (`{error: {...}}`). The OpenAI envelope is read only as a fallback after the
+ * ElevenLabs fields, so an ElevenLabs body classifies exactly as before.
  *
  * Provider bodies are untrusted input. Only documented error fields are inspected,
  * and only a flattened, bounded, redacted diagnostic reaches logs.
@@ -56,11 +59,12 @@ async function readProviderFields(response: Response): Promise<ProviderFields> {
 	}
 	if (!isRecord(payload)) return {};
 	const detail = isRecord(payload.detail) ? payload.detail : undefined;
+	const error = isRecord(payload.error) ? payload.error : undefined;
 	return {
-		code: firstText(detail?.code, payload.code),
-		status: firstText(detail?.status, payload.status),
-		type: firstText(detail?.type, payload.type),
-		message: firstText(detail?.message, payload.message),
+		code: firstText(detail?.code, payload.code, error?.code),
+		status: firstText(detail?.status, payload.status, error?.status),
+		type: firstText(detail?.type, payload.type, error?.type),
+		message: firstText(detail?.message, payload.message, error?.message),
 	};
 }
 

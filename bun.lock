@@ -19,6 +19,7 @@
         "@gajae-gateway/log": "workspace:*",
         "@gajae-gateway/protocol": "workspace:*",
         "@gajae-gateway/sdk": "workspace:*",
+        "@gajae-gateway/voice": "workspace:*",
         "discord.js": "^14.25.1",
       },
     },
@@ -31,6 +32,7 @@
         "@gajae-gateway/log": "workspace:*",
         "@gajae-gateway/protocol": "workspace:*",
         "@gajae-gateway/sdk": "workspace:*",
+        "@gajae-gateway/voice": "workspace:*",
       },
     },
     "packages/adapter-telegram": {
@@ -119,6 +121,10 @@
       "name": "@gajae-gateway/subsession",
       "version": "0.1.0",
     },
+    "packages/voice": {
+      "name": "@gajae-gateway/voice",
+      "version": "0.1.0",
+    },
   },
   "packages": {
     "@biomejs/biome": ["@biomejs/biome@2.5.2", "", { "optionalDependencies": { "@biomejs/cli-darwin-arm64": "2.5.2", "@biomejs/cli-darwin-x64": "2.5.2", "@biomejs/cli-linux-arm64": "2.5.2", "@biomejs/cli-linux-arm64-musl": "2.5.2", "@biomejs/cli-linux-x64": "2.5.2", "@biomejs/cli-linux-x64-musl": "2.5.2", "@biomejs/cli-win32-arm64": "2.5.2", "@biomejs/cli-win32-x64": "2.5.2" }, "bin": { "biome": "bin/biome" } }, "sha512-VQ3RCqr7JmDIX+w6stWYl+g/3bYofN3q2wDBHUKKc/c7i5QWrFKFBZYCYPWTE6agsUPMIZZe6/CMmVUfUAhkKA=="],
@@ -178,6 +184,8 @@
     "@gajae-gateway/sdk": ["@gajae-gateway/sdk@workspace:packages/sdk"],
 
     "@gajae-gateway/subsession": ["@gajae-gateway/subsession@workspace:packages/subsession"],
+
+    "@gajae-gateway/voice": ["@gajae-gateway/voice@workspace:packages/voice"],
 
     "@jimp/core": ["@jimp/core@1.6.1", "", { "dependencies": { "@jimp/file-ops": "1.6.1", "@jimp/types": "1.6.1", "@jimp/utils": "1.6.1", "await-to-js": "^3.0.0", "exif-parser": "^0.1.12", "file-type": "^21.3.3", "mime": "3" } }, "sha512-+BoKC5G6hkrSy501zcJ2EpfnllP+avPevcBfRcZe/CW+EwEfY6X1EZ8QWyT7NpDIvEEJb1fdJnMMfUnFkxmw9A=="],
 

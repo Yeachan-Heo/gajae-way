@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
+import { speakable } from "@gajae-gateway/voice";
 import { discordSpeechPorts } from "../src/main";
-import { clampSpeed, MAX_SPEED, MIN_SPEED, oggOpusDuration, speakable, synthesizeVoice } from "../src/speech";
+import { clampSpeed, MAX_SPEED, MIN_SPEED, oggOpusDuration, synthesizeVoice } from "../src/speech";
 
 const KEY = { apiKey: "test-key" };
 

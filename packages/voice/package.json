@@ -1,0 +1,13 @@
+{
+	"name": "@gajae-gateway/voice",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Provider-neutral voice-message rules shared by chat adapters: transcript rendering, speakable text, provider error classification.",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"scripts": {
+		"test": "bun test"
+	}
+}

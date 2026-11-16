@@ -494,6 +494,35 @@ Presence is a reaction gradient on the message the persona is answering, not a p
 
 After every socket connect and gateway reconnect the adapter backfills missed messages from `conversations.history`, keyed by `channel:ts`, so the gateway's durable dedupe makes overlap with live traffic safe. Coverage is bounded on purpose: only channels listed in `adapter-slack.json` `channels`, the 100 most recently active DMs seen live within 30 days, and threads the persona replied in during the last 7 days are revisited; a channel with no watermark is backfilled 24 hours deep, and an oversized gap drains across passes in bounded slices. Channels the bot cannot read are quarantined after three consecutive failures and probed again on the next connect. A message the gateway refuses three times for its own content is dead-lettered into `adapters/slack/recovery-cursor.json` (with a per-channel digest) rather than pinning the channel; a gateway outage never discards anything.
 
+### Slack voice messages
+
+An optional `voice` section in `adapter-slack.json` turns on voice in and out. Without it nothing changes: an audio clip arrives as its `[audio · …]` line and replies stay text. With it, the first audio clip of a message (a Slack recorder clip, `subtype: "slack_audio"`, or any `audio/*` upload) is rendered as `[voice message · 4.3s · id F… · size · url]`, downloaded from `url_private_download` with the bot token (Slack file hosts only, at most 25 MB), transcribed, and the transcript is appended on the next line — the same convention as the Discord adapter. The message is also flagged as a voice turn, so the final reply carries `voiceText`; after the text is posted and confirmed, the adapter synthesizes it and uploads `voice-reply.wav` into the same thread. Endpoints are OpenAI-compatible (`/audio/transcriptions` with `response_format=json`, `/audio/speech` with `response_format=wav`) and nothing about the provider is defaulted:
+
+```json
+{
+  "voice": {
+    "endpoint": "https://apis.opengateway.ai/v1/audio/transcriptions",
+    "model": "sionic-ai/qwen3-asr-1.7b",
+    "language": "ko",
+    "apiKeyFile": "secrets/og-gajae-key",
+    "timeoutMs": 20000,
+    "speechEndpoint": "https://apis.opengateway.ai/v1/audio/speech",
+    "speechModel": "sionic-ai/qwen3-tts-1.7b",
+    "voice": "sohee",
+    "voices": { "U0123456789": "ryan", "C0123456789": "vivian" },
+    "speechTimeoutMs": 30000
+  }
+}
+```
+
+- `endpoint` and `model` are required; `language` pins the transcription language (omit to let the model detect it). Slack's `webm` and `m4a` clips are sent as-is: OpenGateway's ASR accepts both (verified 2026-11-16), so no transcoding or ffmpeg is needed.
+- The key comes from exactly one of `apiKeyFile` (relative to the config directory) or `apiKeyEnv` (an environment variable name). Errors name the file or variable, never the value.
+- `speechEndpoint`, `speechModel` and `voice` turn on spoken replies and must be set together; omit all three for transcription only. `maxSpokenChars` optionally caps the spoken text (default: the whole reply, with urls and code removed).
+- `voices` optionally overrides the voice per Slack user id (`U…`/`W…`) or conversation id (`C…`/`D…`/`G…`). The speaker of the voice turn wins over the conversation, which wins over `voice`. Values are checked at startup against the voices `sionic-ai/qwen3-tts-1.7b` accepts — `aiden dylan eric ono_anna ryan serena sohee uncle_fu vivian` — and an invalid key or value is logged as a warning and ignored, so that speaker gets the default voice.
+- Any other malformed field is a startup error. At runtime everything fails open: a failed download or a timeout forwards the clip line alone, a provider rejection appends `[transcription unavailable · <code>]`, and a synthesis or upload failure is logged while the text reply stays delivered.
+- Scopes: `files:read` downloads clips and `files:write` uploads the spoken reply; both are already in the scope list above.
+- Only live messages are transcribed. A clip backfilled by recovery arrives as its voice-message line without a transcript, and a reply redelivered after a gateway restart is text only.
+
 ## Reloading configuration without a restart
 
 A running gateway re-reads `config.json` on `SIGHUP` (`kill -HUP <pid>`) or on the `gateway.reloadConfig` verb; both run the same implementation, so the console and the signal behave identically.

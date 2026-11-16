@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
+import { readTranscript, renderTranscript, withTranscript } from "@gajae-gateway/voice";
 import { firstVoiceMessage } from "../src/attachments";
 import { OrderedIngress, transcribeIfVoice } from "../src/main";
-import { readTranscript, renderTranscript, transcribeVoiceMessage, withTranscript } from "../src/voice";
+import { transcribeVoiceMessage } from "../src/voice";
 
 const KEY = { apiKey: "test-key" };
 const URL = "https://cdn.discordapp.com/attachments/1/2/voice-message.ogg?ex=abc";
