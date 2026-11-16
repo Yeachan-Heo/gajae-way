@@ -130,7 +130,7 @@ test("monitor.update RPC returns the stable ID and monitor.inspect reads the cha
 		});
 		const listed = await request("list", "monitor.list", {});
 		expect(listed).toMatchObject({
-			result: { monitors: [{ monitorId: monitor.monitorId, contextRollTokens: 100_000 }] },
+			result: { monitors: [{ monitorId: monitor.monitorId, contextRollTokens: 100_000 }], invalid: [] },
 		});
 		const cleared = await request("clear-budget", "monitor.update", {
 			monitorId: monitor.monitorId,
