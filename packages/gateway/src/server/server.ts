@@ -367,6 +367,10 @@ async function applyConfigReload(
 	runtime.config = result.config;
 	runtime.personaSessions.setStallTimeoutMs(result.config.stallTimeoutMs);
 	runtime.personaSessions.setHostLimits(result.config.sessions);
+	if (result.changed.includes("model") && result.config.model) {
+		runtime.personaSessions.setSessionModel(result.config.model);
+		runtime.monitors.setDefaultModel(result.config.model);
+	}
 	options.broker?.setMaxPoolSize(result.config.sessions?.maxLiveHosts ?? DEFAULT_SESSIONS_MAX_LIVE_HOSTS);
 	console.info(
 		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,

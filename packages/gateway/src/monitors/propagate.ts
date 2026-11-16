@@ -324,7 +324,7 @@ export class MonitorPropagator {
 	/** Per-origin serialization lives in SessionPort, shared with all SDK callers. */
 	readonly #repo: string;
 	readonly #memoryDebloat: { readonly root: string; readonly thresholdBytes: number } | undefined;
-	readonly #model: GjcModelSelection | undefined;
+	#model: GjcModelSelection | undefined;
 	readonly #serviceTier: GjcServiceTier | undefined;
 	readonly #appliedModels = new Map<string, string>();
 	readonly #appliedServiceTiers = new Map<string, GjcServiceTier>();
@@ -427,6 +427,11 @@ export class MonitorPropagator {
 			options.protocolFailureRollThreshold ?? MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD;
 		this.#repo = options.repo ?? process.cwd();
 		this.#memoryDebloat = options.memoryDebloat;
+	}
+
+	/** Future monitor turns inherit the latest gateway default unless explicitly overridden. */
+	setDefaultModel(model: GjcModelSelection): void {
+		this.#model = model;
 	}
 
 	/**
