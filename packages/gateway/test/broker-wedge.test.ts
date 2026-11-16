@@ -222,7 +222,7 @@ test("a successful bind resets the durable poisoned-create rotation counter", as
 				exitCode: 0,
 				stdout: JSON.stringify({
 					ok: true,
-					result: { session: { sessionId: "recovered", live, deleted: false, locator: { repo: REPO } } },
+					result: { session: { sessionId: "recovered", live, deleted: false, locator: { cwd: REPO } } },
 				}),
 				stderr: "",
 			};

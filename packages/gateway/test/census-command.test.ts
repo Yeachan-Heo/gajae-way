@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { acquireLease } from "@gajae-gateway/home";
 import { loadConfig } from "../src/config";
 import { runCensus } from "../src/ops/census";
-import { Store } from "../src/store";
+import { LATEST_SCHEMA_VERSION, Store } from "../src/store";
 
 const homes: string[] = [];
 
@@ -53,7 +53,7 @@ test("census is a read-only v38 view and reports quarantined invalid work by cut
 	const f = await fixture();
 	const before = await readFile(f.path);
 	const report = await runCensus(f.config);
-	expect(report.schemaVersion).toBe(38);
+	expect(report.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 	expect(report.authority).toEqual({
 		canonicalAgentDir: join(f.home, "agent"),
 		identity: `gjc:${join(f.home, "agent")}`,
@@ -65,6 +65,32 @@ test("census is a read-only v38 view and reports quarantined invalid work by cut
 	expect(report.openQuarantined["cutover-census"]).toMatchObject({ invalid: 1 });
 	expect(report.authorityCounts.inspectionError).toContain("lane job state is corrupt");
 	expect(await readFile(f.path)).toEqual(before);
+});
+
+test("census reports the work_journal row count and its on-disk byte size", async () => {
+	const f = await fixture();
+	const raw = new Database(f.path, { readonly: true });
+	const { rows, jsonBytes } = raw
+		.query("SELECT COUNT(*) AS rows, COALESCE(SUM(LENGTH(CAST(row_json AS BLOB))), 0) AS jsonBytes FROM work_journal")
+		.get() as { rows: number; jsonBytes: number };
+	const { pageSize } = raw.query("SELECT page_size AS pageSize FROM pragma_page_size()").get() as { pageSize: number };
+	// SQLite builds without SQLITE_ENABLE_DBSTAT_VTAB take the documented estimate instead of page sizes.
+	let hasDbstat = true;
+	try {
+		raw.query("SELECT 1 FROM dbstat LIMIT 1").get();
+	} catch {
+		hasDbstat = false;
+	}
+	raw.close();
+	expect(rows).toBeGreaterThan(0);
+	const report = await runCensus(f.config);
+	expect(report.journalRowCount).toBe(rows);
+	if (hasDbstat) {
+		expect(report.journalByteSize).toBeGreaterThanOrEqual(jsonBytes);
+		expect(report.journalByteSize % pageSize).toBe(0);
+	} else {
+		expect(report.journalByteSize).toBe(jsonBytes + rows * 80);
+	}
 });
 
 test("census refuses while a daemon holds the gateway lease", async () => {
@@ -92,7 +118,7 @@ test("main wires the census verb to the offline command", async () => {
 	]);
 	expect(stderr).toBe("");
 	expect(exitCode).toBe(0);
-	expect(stdout).toContain('"schemaVersion": 38');
+	expect(stdout).toContain(`"schemaVersion": ${LATEST_SCHEMA_VERSION}`);
 });
 
 test("census refuses a restore journal before opening the database and releases its lease", async () => {
@@ -103,4 +129,23 @@ test("census refuses a restore journal before opening the database and releases 
 	expect(await readFile(f.path)).toEqual(before);
 	const lease = await acquireLease(f.home, "gateway");
 	await lease.release();
+});
+
+test("census handles pre-v36 database without work_journal table", async () => {
+	const f = await fixture();
+	const raw = new Database(f.path);
+	try {
+		// Remove v36 migration to simulate pre-v36 database
+		raw.exec("DROP TABLE work_journal");
+		raw.exec("DELETE FROM schema_migrations WHERE version >= 36");
+		raw.close();
+		// Census should still work and report null/0 for journal metrics
+		const report = await runCensus(f.config);
+		expect(report.journalRowCount).toBe(0);
+		expect(report.journalByteSize).toBe(0);
+	} finally {
+		try {
+			raw.close();
+		} catch {}
+	}
 });

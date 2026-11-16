@@ -25,7 +25,7 @@ export type CliRunner = (
 
 export type BrokerSession = {
 	readonly sessionId: string;
-	/** `locator.repo`: the workspace the session was launched in. */
+	/** `locator.cwd`: the workspace the session was launched in. */
 	readonly repo: string;
 	readonly stateRoot?: string;
 	readonly pid?: number;
@@ -38,16 +38,27 @@ export type BrokerSession = {
 export class GjcCliError extends Error {
 	readonly exitCode: number;
 	readonly stderr: string;
+	/** Fixed public classifiers only; never retain the runtime's diagnostic prose. */
+	readonly diagnostics: readonly string[];
 
 	/** The `error` payload from an `ok: false` envelope, when there was one. */
 	readonly details: unknown;
 
-	constructor(message: string, exitCode: number, stderr: string, details: unknown = undefined) {
+	constructor(
+		message: string,
+		exitCode: number,
+		stderr: string,
+		details: unknown = undefined,
+		diagnostics: readonly string[] = [],
+	) {
 		super(message);
 		this.name = "GjcCliError";
 		this.exitCode = exitCode;
 		this.stderr = stderr;
 		this.details = details;
+		this.diagnostics = diagnostics.includes("lifecycle_legacy_history_ambiguous")
+			? ["lifecycle_legacy_history_ambiguous"]
+			: [];
 	}
 }
 
@@ -70,13 +81,23 @@ export function parseEnvelope<T>(result: CliResult, command: string): T {
 	if (typeof body !== "object" || body === null) {
 		throw new GjcCliError(`gjc sdk ${command} envelope is not an object`, 0, result.stdout.slice(0, 400));
 	}
-	const envelope = body as { ok?: unknown; result?: unknown; error?: unknown };
+	const envelope = body as { ok?: unknown; result?: unknown; error?: unknown; diagnostics?: unknown };
 	if (envelope.ok !== true) {
+		const diagnostics = Array.isArray(envelope.diagnostics)
+			? envelope.diagnostics.flatMap((item: unknown) =>
+					item !== null &&
+					typeof item === "object" &&
+					(item as { code?: unknown }).code === "lifecycle_legacy_history_ambiguous"
+						? ["lifecycle_legacy_history_ambiguous"]
+						: [],
+				)
+			: [];
 		throw new GjcCliError(
 			`gjc sdk ${command} reported failure: ${JSON.stringify(envelope.error ?? null)}`,
 			0,
 			"",
 			envelope.error,
+			diagnostics,
 		);
 	}
 	return envelope.result as T;
@@ -84,7 +105,7 @@ export function parseEnvelope<T>(result: CliResult, command: string): T {
 
 type RawSession = {
 	sessionId?: unknown;
-	locator?: { repo?: unknown; stateRoot?: unknown };
+	locator?: { cwd?: unknown; stateRoot?: unknown };
 	pid?: unknown;
 	live?: unknown;
 	deleted?: unknown;
@@ -96,12 +117,12 @@ function normalizeSession(raw: RawSession): BrokerSession | undefined {
 	if (typeof raw.sessionId !== "string" || raw.sessionId.length === 0) {
 		return undefined;
 	}
-	if (typeof raw.locator?.repo !== "string") {
+	if (typeof raw.locator?.cwd !== "string") {
 		return undefined;
 	}
 	return {
 		sessionId: raw.sessionId,
-		repo: raw.locator.repo,
+		repo: raw.locator.cwd,
 		...(typeof raw.locator.stateRoot === "string" ? { stateRoot: raw.locator.stateRoot } : {}),
 		...(typeof raw.pid === "number" ? { pid: raw.pid } : {}),
 		live: raw.live === true,
@@ -132,7 +153,9 @@ export function sessionArgs(options: ControllerOptions, leaf: readonly string[])
 }
 
 export async function listSessions(options: ControllerOptions): Promise<readonly BrokerSession[]> {
-	const result = await options.run(sessionArgs(options, ["list", "--repo", options.repo]));
+	// Default `repo` scope requires Git and spans its worktrees. A controller owns
+	// one exact workspace, including a non-Git directory: request `cwd` explicitly.
+	const result = await options.run(sessionArgs(options, ["list", "--scope", "cwd", "--repo", options.repo]));
 	const payload = parseEnvelope<{ sessions?: readonly RawSession[] }>(result, "session list");
 	return (payload.sessions ?? [])
 		.map(normalizeSession)

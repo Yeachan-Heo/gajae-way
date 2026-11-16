@@ -1,6 +1,20 @@
 import type { Dirent } from "node:fs";
-import { appendFile, mkdir, readdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import {
+	appendFile,
+	mkdir,
+	mkdtemp,
+	readdir,
+	readFile,
+	realpath,
+	rename,
+	rm,
+	stat,
+	unlink,
+	writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, normalize, relative } from "node:path";
+import { GIT_COMMAND_TIMEOUT_MS } from "../orchestrator/git-command";
 import {
 	type AxisDescriptor,
 	type AxisRegistry,
@@ -58,8 +72,23 @@ export class CorpusWriter {
 	}
 }
 
-export function memoryGit(root: string, args: readonly string[]): Promise<string> {
-	return memoryGitUnserialized(root, args);
+/**
+ * Deadline for one memory git command. Memory git is local work on the corpus
+ * (init, add, commit, log, rev-parse), the same class of command as the work
+ * lane's local git, so it gets the same budget (#615): far above what a healthy
+ * command takes on a large corpus, yet a hook, filter or helper that never
+ * returns can no longer hold the memory FIFO, and every intent behind it, forever.
+ */
+export const MEMORY_GIT_TIMEOUT_MS = GIT_COMMAND_TIMEOUT_MS;
+/** How long a killed shell gets to be reaped before the call gives up waiting on Bun's exit report. */
+const MEMORY_GIT_REAP_GRACE_MS = 1_000;
+
+export function memoryGit(
+	root: string,
+	args: readonly string[],
+	timeoutMs: number = MEMORY_GIT_TIMEOUT_MS,
+): Promise<string> {
+	return memoryGitUnserialized(root, args, timeoutMs);
 }
 
 export class MemoryGitLockedError extends Error {
@@ -74,25 +103,124 @@ export class MemoryGitLockedError extends Error {
 	}
 }
 
-async function memoryGitUnserialized(root: string, args: readonly string[]): Promise<string> {
-	// posix_spawn can transiently fail with ENOENT/EAGAIN on a busy host even
-	// though git exists (observed under parallel test load); one bounded retry
-	// keeps a durable closure from failing on a scheduler hiccup.
-	for (let attempt = 0; ; attempt++) {
+/**
+ * A memory git command that outlived {@link MEMORY_GIT_TIMEOUT_MS}; its process
+ * group was killed. Transient like an index lock: the intent stays open for a
+ * later attempt rather than being quarantined.
+ */
+export class MemoryGitTimeoutError extends Error {
+	readonly command: string;
+	readonly timeoutMs: number;
+
+	constructor(args: readonly string[], timeoutMs: number) {
+		super(
+			`memory git ${args[0]} timed out after ${timeoutMs}ms (argv: ${formatArgv(args)}); its process group was killed`,
+		);
+		this.name = "MemoryGitTimeoutError";
+		this.command = args[0] ?? "git";
+		this.timeoutMs = timeoutMs;
+	}
+}
+
+/**
+ * Runs git with its output in files and its exit status in a third file, written
+ * (via rename, so it is complete when it appears) by the shell that ran git.
+ *
+ * Under Bun 1.4.0 a child's completion was seen never to reach the event loop: a
+ * gateway e2e teardown hung in the memory drain behind a `git init` that had
+ * exited (a zombie nobody reaped, `exitCode` still null, `exited` never settling),
+ * and in other runs behind an output pipe whose end-of-file never arrived after
+ * git exited 0. Either one wedged the memory FIFO, and with it every later intent
+ * and gateway shutdown, for good. So completion is the exit file appearing, polled
+ * alongside `exited`, and no result waits on a pipe: a helper that inherits git's
+ * output cannot hold it open past git's exit either. A git that never exits at all
+ * is bounded by the deadline: the shell leads its own process group, and the whole
+ * group is SIGKILLed when the deadline passes.
+ */
+const MEMORY_GIT_SCRIPT =
+	'out=$1 err=$2 status=$3; shift 3; git "$@" >"$out" 2>"$err"; code=$?; printf %s "$code" >"$status.tmp" && /bin/mv "$status.tmp" "$status"; exit "$code"';
+const MEMORY_GIT_POLL_MIN_MS = 5;
+const MEMORY_GIT_POLL_MAX_MS = 100;
+
+/**
+ * Process groups of memory git commands still in flight. Running detached takes git
+ * out of the gateway's own process group, so a supervisor that cleans up by group
+ * (launchd) no longer reaches it, and the deadline timer dies with the process. A
+ * gateway that exits mid-command (its shutdown deadline, or a normal return) kills
+ * them itself, so no stuck git outlives it and writes the corpus under the next boot.
+ */
+const liveMemoryGitGroups = new Set<number>();
+process.on("exit", () => {
+	for (const group of liveMemoryGitGroups) killGroup(group);
+});
+
+async function memoryGitUnserialized(root: string, args: readonly string[], timeoutMs: number): Promise<string> {
+	const deadline = performance.now() + timeoutMs;
+	const scratch = await mkdtemp(join(tmpdir(), "gajaeway-memory-git-"));
+	let group: number | undefined;
+	try {
+		const stdoutPath = join(scratch, "stdout");
+		const stderrPath = join(scratch, "stderr");
+		const statusPath = join(scratch, "status");
+		// posix_spawn can transiently fail with ENOENT/EAGAIN on a busy host even
+		// though the executable exists (observed under parallel test load); one
+		// bounded retry of spawning the shell keeps a durable closure from failing on
+		// a scheduler hiccup. git's own exit status is never retried: it may have done work.
 		let child: ReturnType<typeof Bun.spawn>;
-		try {
-			child = Bun.spawn(["git", ...args], { cwd: root, env: gitEnv(), stdout: "pipe", stderr: "pipe" });
-		} catch (error) {
-			if (attempt === 0) {
+		for (let attempt = 0; ; attempt++) {
+			try {
+				child = Bun.spawn(["/bin/sh", "-c", MEMORY_GIT_SCRIPT, "sh", stdoutPath, stderrPath, statusPath, ...args], {
+					cwd: root,
+					env: gitEnv(),
+					stdin: "ignore",
+					stdout: "ignore",
+					stderr: "ignore",
+					detached: true,
+				});
+				group = child.pid;
+				liveMemoryGitGroups.add(group);
+				break;
+			} catch (error) {
+				if (attempt > 0) throw error;
 				await Bun.sleep(50);
-				continue;
 			}
+		}
+		let stopped = false;
+		// Kill git with every hook, filter and helper it started, and give the shell a
+		// bounded moment to be reaped (Bun may never report it).
+		const stop = async (): Promise<void> => {
+			stopped = true;
+			killGroup(child.pid);
+			await Promise.race([child.exited, Bun.sleep(MEMORY_GIT_REAP_GRACE_MS)]);
+			child.unref();
+		};
+		let code: number | undefined;
+		try {
+			const status = await memoryGitStatus(child, statusPath, deadline);
+			if (status === undefined) {
+				await stop();
+				// git may have finished between the last poll and the kill; its recorded status is then the truth.
+				code = await readStatus(statusPath);
+				if (code === undefined) throw new MemoryGitTimeoutError(args, timeoutMs);
+			} else {
+				code = status.code;
+				// The shell died without git's status, so git and its helpers may still be running in the group.
+				if (!status.recorded) killGroup(child.pid);
+			}
+		} catch (error) {
+			// A status that cannot be read says nothing about whether git is done: a git
+			// still running must not outlive this call and write the corpus under a later intent.
+			if (!stopped) await stop();
 			throw error;
 		}
-		const [stdout, stderr, code] = await Promise.all([
-			new Response(child.stdout as ReadableStream).text(),
-			new Response(child.stderr as ReadableStream).text(),
-			child.exited,
+		// Nothing of this command is left to kill at exit; the shell may be reaped and its pid reused.
+		liveMemoryGitGroups.delete(child.pid);
+		// Once the status is known nothing here waits on the shell again; a child whose
+		// exit Bun never reports must not keep the event loop alive either.
+		child.unref();
+		const [stdout, stderr] = await Promise.all([
+			readIfPresent(stdoutPath).then((text) => text ?? ""),
+			readIfPresent(stderrPath).then((text) => text ?? ""),
 		]);
 		if (code === 0) return stdout.trim();
 		const lockPath = join(root, ".git", "index.lock");
@@ -106,6 +234,77 @@ async function memoryGitUnserialized(root: string, args: readonly string[]): Pro
 			throw new MemoryGitLockedError(lockPath, ageMs);
 		}
 		throw new Error(gitFailureMessage(args, code, stdout, stderr));
+	} finally {
+		if (group !== undefined) liveMemoryGitGroups.delete(group);
+		// A scratch dir that cannot be removed is a leak to report, never a reason to replace git's result.
+		await rm(scratch, { recursive: true, force: true }).catch((error: unknown) => {
+			console.warn(
+				`memory git scratch dir ${scratch} not removed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		});
+	}
+}
+
+/**
+ * A file the shell may never have created (killed first) reads as absent; any other
+ * read failure is raised, never mistaken for empty output (an empty `log --grep`
+ * means "no such commit" to the closure, which would then commit twice).
+ */
+async function readIfPresent(path: string): Promise<string | undefined> {
+	try {
+		return await readFile(path, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
+async function readStatus(statusPath: string): Promise<number | undefined> {
+	const text = await readIfPresent(statusPath);
+	if (text === undefined) return undefined;
+	// Written whole via rename, so anything but an exit code is a broken invariant.
+	if (!/^\d+$/.test(text)) throw new Error(`memory git status file is malformed: ${JSON.stringify(text)}`);
+	return Number(text);
+}
+
+/**
+ * SIGKILLs the process group a memory git shell leads. Only the group is signalled,
+ * never the bare pid: the shell may already be reaped and its pid reused, while a
+ * group id stays reserved as long as any member lives.
+ */
+function killGroup(group: number): void {
+	try {
+		process.kill(-group, "SIGKILL");
+	} catch {
+		// No member left.
+	}
+}
+
+/**
+ * git's exit status: the status file once it appears, else the shell's own exit if
+ * that is seen first, else `undefined` once `deadline` (a `performance.now()` time) passes.
+ * `recorded` says whether git itself recorded it: only that proves git finished.
+ */
+async function memoryGitStatus(
+	child: ReturnType<typeof Bun.spawn>,
+	statusPath: string,
+	deadline: number,
+): Promise<{ readonly code: number; readonly recorded: boolean } | undefined> {
+	let exited: number | undefined;
+	void child.exited.then((code) => {
+		exited = code;
+	});
+	for (let delay = MEMORY_GIT_POLL_MIN_MS; ; delay = Math.min(delay * 2, MEMORY_GIT_POLL_MAX_MS)) {
+		const status = await readStatus(statusPath);
+		if (status !== undefined) return { code: status, recorded: true };
+		// The shell ended without recording git's status (killed before it could).
+		if (exited !== undefined) {
+			const late = await readStatus(statusPath);
+			return late === undefined ? { code: exited, recorded: false } : { code: late, recorded: true };
+		}
+		const remaining = deadline - performance.now();
+		if (remaining <= 0) return undefined;
+		await Promise.race([child.exited, Bun.sleep(Math.min(delay, remaining))]);
 	}
 }
 
@@ -117,11 +316,45 @@ async function memoryGitUnserialized(root: string, args: readonly string[]): Pro
  * detached worktree.
  */
 function gitFailureMessage(args: readonly string[], code: number, stdout: string, stderr: string): string {
-	const argv = ["git", ...args]
-		.map((arg) => (/^[\w./=:@-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, "'\\''")}'`))
-		.join(" ");
 	const reason = [stderr.trim(), stdout.trim()].filter(Boolean).join(" | ") || "(no output)";
-	return `memory git ${args[0]} failed (exit ${code}, argv: ${argv}): ${reason}`;
+	return `memory git ${args[0]} failed (exit ${code}, argv: ${formatArgv(args)}): ${reason}`;
+}
+
+function formatArgv(args: readonly string[]): string {
+	return ["git", ...args].map((arg) => (/^[\w./=:@-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, "'\\''")}'`)).join(" ");
+}
+
+/**
+ * Whether `root/.git` holds what git needs to recognize a repository. A bare `.git`
+ * directory is not enough: a `git init` killed at its deadline leaves one behind,
+ * and every later command in it fails as "not a git repository".
+ *
+ * A gitfile (linked worktree, separate git dir) is never re-initialized, which would
+ * rewrite settings such as core.filemode; git itself must accept what it points at,
+ * or this throws: init cannot repair it, and initialization fails before recovery
+ * can quarantine an intent over it.
+ */
+async function repositoryComplete(root: string): Promise<boolean> {
+	const dotGit = join(root, ".git");
+	let isGitfile: boolean;
+	try {
+		isGitfile = (await stat(dotGit)).isFile();
+	} catch {
+		return false;
+	}
+	if (isGitfile) {
+		await memoryGit(root, ["rev-parse", "--git-dir"]);
+		return true;
+	}
+	const checks = await Promise.all(
+		["HEAD", "objects", "refs"].map((entry) =>
+			stat(join(dotGit, entry)).then(
+				() => true,
+				() => false,
+			),
+		),
+	);
+	return checks.every(Boolean);
 }
 
 /**
@@ -146,18 +379,18 @@ async function initializeCorpus(root: string): Promise<string> {
 		for (const partition of axis.partitions)
 			await mkdir(join(root, axis.root, partition), { recursive: true, mode: 0o700 });
 	}
-	try {
-		await stat(join(root, ".git"));
-	} catch {
+	if (!(await repositoryComplete(root))) {
+		// Also repairs a `.git` a killed `git init` left half-written: re-running init on an
+		// existing repository only adds what is missing and never touches history.
 		try {
 			await memoryGit(root, ["init"]);
 		} catch (error) {
 			// Another *process* can initialize the same corpus in the window between
 			// the check and the call. A repository that exists by now is the outcome
-			// we wanted; anything else is a real failure.
-			await stat(join(root, ".git")).catch(() => {
-				throw error;
-			});
+			// we wanted; anything else is a real failure. A timed-out init is our own
+			// git, killed part-way, so whatever it left is never taken as a repository.
+			// A gitfile that fails validation here keeps init's own error as the diagnostic.
+			if (error instanceof MemoryGitTimeoutError || !(await repositoryComplete(root).catch(() => false))) throw error;
 		}
 	}
 	// Whether the map covers the current axis set is a question about state, not

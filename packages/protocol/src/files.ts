@@ -29,7 +29,11 @@ export interface FileReply {
 	readonly body: string;
 }
 
-/** Upper bound per file; Slack accepts far more, but a chat reply is not a file transfer service. */
+/**
+ * Upper bound per file; Slack accepts far more, but a chat reply is not a file
+ * transfer service. Telegram's Bot API takes documents up to 50 MB, so a file
+ * between 50 MB and this cap is refused there as a definitive delivery failure.
+ */
 export const OUTBOUND_FILE_MAX_BYTES = 50 * 1024 * 1024;
 /** At most this many files per turn; extra directives are refused with a notice. */
 export const OUTBOUND_FILES_PER_TURN_CAP = 5;
@@ -37,7 +41,7 @@ export const OUTBOUND_FILES_PER_TURN_CAP = 5;
 const MEDIA_PREFIX = "MEDIA:";
 
 /** Platforms whose adapter uploads `file` deliveries; others would only see the text fallback. */
-const FILE_PLATFORMS: ReadonlySet<OriginPlatform> = new Set(["slack"]);
+const FILE_PLATFORMS: ReadonlySet<OriginPlatform> = new Set(["slack", "telegram"]);
 
 export function platformSupportsFiles(platform: OriginPlatform): boolean {
 	return FILE_PLATFORMS.has(platform);

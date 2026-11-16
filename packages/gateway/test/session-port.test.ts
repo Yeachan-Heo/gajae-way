@@ -1,17 +1,25 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
+import { GjcCommandQueueTimeoutError } from "../src/orchestrator/broker";
 import { isDefinitiveSteerRejection } from "../src/orchestrator/persona-session";
 import {
 	BrokerSessionPort,
 	MAX_POISONED_CREATE_ROTATIONS,
 	ModelNotSelectedError,
+	SessionBusyStalledError,
 	SessionRequestTimeoutError,
 } from "../src/orchestrator/session-port";
-import { type TailHandle, TailRunner } from "../src/orchestrator/tail-runner";
+import {
+	RelayClosedError,
+	RelayRequestTimeoutError,
+	type RelayResponse,
+	type TailHandle,
+	TailRunner,
+} from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, Store } from "../src/store";
 import {
 	attachTestBrokerOwnership,
@@ -138,7 +146,7 @@ test("an unknown startup model fails without poisoning create keys and can be co
 				stdout: JSON.stringify({
 					ok: true,
 					result: {
-						session: { sessionId: args.at(-1), live: true, deleted: false, locator: { repo: "/tmp/workspace" } },
+						session: { sessionId: args.at(-1), live: true, deleted: false, locator: { cwd: "/tmp/workspace" } },
 					},
 				}),
 				stderr: "",
@@ -445,7 +453,15 @@ test("AC-K rendered SDK prompt is notice + blank line + task; broker SessionPort
 				result: { commandId: "cmd-1", turnId: "turn-1", accepted: true, clientRef: request.input.clientRef },
 			};
 		if (request.operation === "turn.result")
-			return { ok: true, result: { kind: "prompt", status: "terminal_ok", clientRef: request.input.clientRef } };
+			return {
+				ok: true,
+				result: {
+					kind: "prompt",
+					status: "terminal_ok",
+					clientRef: request.input.clientRef,
+					outcome: { kind: "stopped", reason: "end_turn", provenance: "agent_end" },
+				},
+			};
 		if (request.operation === "session.last_assistant")
 			return { ok: true, page: { items: ["finished body"], complete: true } };
 		return { ok: false, error: { code: "unsupported_operation" } };
@@ -1834,6 +1850,214 @@ test("send surfaces `busy` once the bounded wait is exhausted, never having sent
 	expect(sends).toBe(4);
 });
 
+async function busyHostFixture(originKey: string) {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const agentDir = join(home, "agent");
+	const authority = initializeTestBrokerAuthority(database, agentDir);
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database, authority, { sessionId: "sdk-1", repo, originKey, epoch: 0 });
+	const bucket = join(agentDir, "sessions", "bucket");
+	await mkdir(bucket, { recursive: true });
+	const transcript = join(bucket, "2026-10-26T00-00-00_sdk-1.jsonl");
+	await writeFile(transcript, '{"type":"session"}\n');
+	return { repo, transcript, authority };
+}
+
+/** `session inspect` for a host that reports `active` with an activity stamp that never moves. */
+const wedgedInspect: CliRunner = async (args) => {
+	if (args.join(" ") !== "sdk session inspect sdk-1") throw new Error(`unexpected command ${args.join(" ")}`);
+	return {
+		exitCode: 0,
+		stdout: JSON.stringify({ ok: true, result: { session: { live: true, activity: { state: "active", at: 1_000 } } } }),
+		stderr: "",
+	};
+};
+
+test("a busy host whose activity stamp and transcript never move is reported stalled, never having sent (#687)", async () => {
+	const { repo, authority } = await busyHostFixture("busy-stalled");
+	let clock = 0;
+	let sends = 0;
+	const relay = scriptedRelay(() => {
+		sends++;
+		return { ok: false, error: { code: "busy", message: "busy" } };
+	});
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: wedgedInspect,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			clock += ms;
+		},
+	});
+	const error = await port
+		.send({ sessionId: "sdk-1", repo, text: "hi", opRef: "gw-p-stall1", busyStallMs: 60_000 })
+		.catch((caught: unknown) => caught);
+	expect(error).toBeInstanceOf(SessionBusyStalledError);
+	expect((error as SessionBusyStalledError).silentMs).toBe(60_000);
+	expect((error as SessionBusyStalledError).evidence).toContain("activity=active@1000");
+	// The busy refusal is durable: the prompt was provably never accepted.
+	expect(port.promptRefusal({ sessionId: "sdk-1", repo, opRef: "gw-p-stall1" })).toBe("busy");
+	// Sampled at 0s, 30s and 60s; it gave up at 60s, long before the 10-minute busy deadline.
+	expect(clock).toBe(60_000);
+	expect(sends).toBe(31);
+});
+
+test("a busy host whose transcript keeps growing is waited out, not reported stalled (#687)", async () => {
+	const { repo, transcript, authority } = await busyHostFixture("busy-progress");
+	let clock = 0;
+	let sends = 0;
+	const relay = scriptedRelay(() => {
+		sends++;
+		if (sends < 100) return { ok: false, error: { code: "busy", message: "busy" } };
+		return { ok: true, result: { commandId: "c", turnId: "t", accepted: true } };
+	});
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: wedgedInspect,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			clock += ms;
+			// The running turn keeps writing its transcript.
+			await appendFile(transcript, `{"type":"message","n":${clock}}\n`);
+		},
+	});
+	const receipt = await port.send({
+		sessionId: "sdk-1",
+		repo,
+		text: "hi",
+		opRef: "gw-p-progress1",
+		busyStallMs: 60_000,
+	});
+	expect(receipt.operationRef).toBe("gw-p-progress1");
+	// 99 busy refusals spanned 198s, more than three stall windows, without a stall.
+	expect(clock).toBe(198_000);
+});
+
+async function busyRefusalOutcome(
+	options: { readonly cli: CliRunner; readonly writeTranscript: boolean; readonly busyStallMs: number },
+	opRef: string,
+): Promise<{ readonly error: unknown; readonly clock: number }> {
+	const { repo, transcript, authority } = await busyHostFixture(opRef);
+	if (!options.writeTranscript) await rm(transcript);
+	let clock = 0;
+	const relay = scriptedRelay(() => ({ ok: false, error: { code: "busy", message: "busy" } }));
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: options.cli,
+		tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			clock += ms;
+		},
+	});
+	const error = await port
+		.send({ sessionId: "sdk-1", repo, text: "hi", opRef, busyStallMs: options.busyStallMs })
+		.catch((caught: unknown) => caught);
+	return { error, clock };
+}
+
+test("an unreadable inspect beside a static transcript is not stall evidence (#687)", async () => {
+	const failingInspect: CliRunner = async () => {
+		throw new Error("inspect timed out");
+	};
+	const { error, clock } = await busyRefusalOutcome(
+		{ cli: failingInspect, writeTranscript: true, busyStallMs: 60_000 },
+		"gw-p-partial1",
+	);
+	expect(error).not.toBeInstanceOf(SessionBusyStalledError);
+	expect(String(error)).toMatch(/busy/);
+	// The wait ran to its deadline (stall bound + one sample), never concluding a stall.
+	expect(clock).toBeGreaterThanOrEqual(90_000);
+});
+
+test("a static activity stamp without a readable transcript is not stall evidence (#687)", async () => {
+	const { error } = await busyRefusalOutcome(
+		{ cli: wedgedInspect, writeTranscript: false, busyStallMs: 60_000 },
+		"gw-p-partial2",
+	);
+	expect(error).not.toBeInstanceOf(SessionBusyStalledError);
+	expect(String(error)).toMatch(/busy/);
+});
+
+test("a stall bound longer than the default busy wait is still reached, not requeued at ten minutes (#687)", async () => {
+	const { error, clock } = await busyRefusalOutcome(
+		{ cli: wedgedInspect, writeTranscript: true, busyStallMs: 15 * 60_000 },
+		"gw-p-long-stall",
+	);
+	expect(error).toBeInstanceOf(SessionBusyStalledError);
+	expect((error as SessionBusyStalledError).silentMs).toBe(15 * 60_000);
+	expect(clock).toBe(15 * 60_000);
+});
+
+for (const when of ["before", "flush", "after"] as const) {
+	test(`a busy retry whose relay dies ${when === "flush" ? "flushing" : `${when} writing`} the prompt ${when === "before" ? "keeps the busy refusal" : "stays ambiguous"} (#689)`, async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+		database = await Store.open(join(home, "gateway.db"));
+		const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+		const repo = join(home, "workspace");
+		await createOwnedSessionFixture(database, authority, {
+			sessionId: "sdk-1",
+			repo,
+			originKey: `busy-${when}`,
+			epoch: 0,
+		});
+		let prompts = 0;
+		let relay!: ReturnType<typeof scriptedRelay>;
+		relay = scriptedRelay((request) => {
+			if (request.operation !== "turn.prompt") throw new Error(`unexpected request ${request.operation}`);
+			prompts++;
+			if (prompts === 1) return { ok: false, error: { code: "busy", message: "busy" } };
+			// The frame reached the host, which then died before answering.
+			relay.streams.at(-1)?.close();
+			return new Promise<never>(() => {});
+		});
+		const port = new BrokerSessionPort({
+			database,
+			authority,
+			cli: async () => {
+				throw new Error("unexpected command");
+			},
+			tailRunner: new TailRunner({ stream: relay.spawn, repo }),
+			sleep: async () => {
+				const stream = relay.streams.at(-1);
+				if (when === "before") stream?.close();
+				if (when === "flush" && stream) {
+					// Production writes to the pipe and then flushes; a flush failure
+					// follows a frame that may already be on its way to the host.
+					const write = stream.write.bind(stream);
+					stream.write = (line: string) => {
+						write(line);
+						if (line.includes('"turn.prompt"')) throw new Error("EPIPE: broken pipe on flush");
+					};
+				}
+			},
+		});
+		const opRef = `gw-p-busy-${when}`;
+		await expect(port.send({ sessionId: "sdk-1", repo, text: "hi", opRef })).rejects.toThrow(/closed/);
+		const intent = database.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify(["sdk-1", opRef]));
+		if (when === "before") {
+			expect(prompts).toBe(1);
+			expect(port.promptRefusal({ sessionId: "sdk-1", repo, opRef })).toBe("busy");
+		} else if (when === "flush") {
+			expect(
+				relay.streams.flatMap((stream) => stream.written).filter((frame) => frame.operation === "turn.prompt"),
+			).toHaveLength(2);
+			expect(intent?.state).toBe("pending");
+			expect(port.promptRefusal({ sessionId: "sdk-1", repo, opRef })).toBeUndefined();
+		} else {
+			expect(prompts).toBe(2);
+			expect(intent?.state).toBe("pending");
+			expect(port.promptRefusal({ sessionId: "sdk-1", repo, opRef })).toBeUndefined();
+		}
+	});
+}
+
 test("request keeps observing an accepted op on the CLI when its relay tears mid-turn, never abandoning it", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await Store.open(join(home, "gateway.db"));
@@ -1852,7 +2076,11 @@ test("request keeps observing an accepted op on the CLI when its relay tears mid
 					ok: true,
 					result: {
 						operationRef: "gw-torn-1",
-						status: { status: cliReports < 2 ? "in_flight" : "terminal_ok", clientRef: "gw-torn-1" },
+						status: {
+							status: cliReports < 2 ? "in_flight" : "terminal_ok",
+							clientRef: "gw-torn-1",
+							...(cliReports >= 2 ? { outcome: { kind: "stopped", reason: "end_turn", provenance: "agent_end" } } : {}),
+						},
 						summary: { completed: cliReports >= 2 },
 					},
 				}),
@@ -1923,6 +2151,7 @@ for (const progressing of [true, false]) {
 					kind: "prompt",
 					status: polls >= 6 ? "terminal_ok" : "in_flight",
 					clientRef: request.input.clientRef,
+					...(polls >= 6 ? { outcome: { kind: "stopped", reason: "end_turn", provenance: "agent_end" } } : {}),
 				},
 			};
 		});
@@ -2127,4 +2356,140 @@ test("runCompaction waits minutes for gjc to finish compacting and maps its rece
 	expect(await port.runCompaction(target)).toEqual({ status: "skipped" });
 	reply = { ok: true, result: {} };
 	expect(await port.runCompaction(target)).toEqual({ status: "failed" });
+});
+
+test("runCompaction gives gjc's own request the compaction budget and reports a run that may still be compacting", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database!, join(home, "agent"));
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "compact", epoch: 0 });
+	const calls: { args: string[]; timeoutMs: number | undefined }[] = [];
+	// gjc's public command-error envelope; `timeout` is what its session router
+	// returns when the host has not replied within the request budget.
+	const commandError = (code: string, outcomeCertainty: string) =>
+		JSON.stringify({
+			schema: "gjc.command-error",
+			version: 1,
+			ok: false,
+			command: ["sdk", "session", "raw", "control"],
+			error: { code, category: code, message: "failure", retryability: "unknown", outcomeCertainty, references: [] },
+			complete: true,
+		});
+	let respond: () => Promise<{ exitCode: number; stdout: string; stderr: string }> = async () => ({
+		exitCode: 0,
+		stdout: JSON.stringify({ ok: true, result: { started: true } }),
+		stderr: "",
+	});
+	const run: CliRunner = async (args, options) => {
+		calls.push({ args: [...args], timeoutMs: options?.timeoutMs });
+		return await respond();
+	};
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: run,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	const target = { sessionId: "sdk-1", repo, originKey: "compact" };
+
+	expect(await port.runCompaction(target)).toEqual({ status: "succeeded" });
+	// Without --timeout-ms gjc's session request gives up after 40 s while the host keeps compacting.
+	const args = calls[0]!.args;
+	const flag = args.indexOf("--timeout-ms");
+	expect(flag).toBeGreaterThan(args.indexOf("compaction.run"));
+	const requestBudgetMs = Number(args[flag + 1]);
+	// One five-minute deadline end to end: the process bound (CLI slot wait included)
+	// is the whole budget, and gjc's request ends a little earlier so its reply is read.
+	expect(calls[0]!.timeoutMs).toBe(300_000);
+	expect(requestBudgetMs).toBeGreaterThan(40_000);
+	expect(requestBudgetMs).toBeLessThan(calls[0]!.timeoutMs!);
+
+	// gjc's request timeout settles only the client; the host may still be compacting.
+	respond = async () => ({ exitCode: 1, stdout: commandError("timeout", "unknown"), stderr: "" });
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "timeout", outcomeUnknown: true });
+	respond = async () => ({ exitCode: 1, stdout: commandError("uncertain_after_send", "unknown"), stderr: "" });
+	expect(await port.runCompaction(target)).toEqual({
+		status: "failed",
+		code: "uncertain_after_send",
+		outcomeUnknown: true,
+	});
+	// So may a run whose process was cut off or never printed gjc's envelope.
+	respond = async () => {
+		throw new Error("request timed out after 300000ms");
+	};
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", outcomeUnknown: true });
+	respond = async () => ({ exitCode: 1, stdout: "", stderr: "killed" });
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", outcomeUnknown: true });
+
+	// Other structured CLI failures stay plain failures with their code, but never `answered`:
+	// operation_failed covers both a finished compaction failure and a lost reply.
+	respond = async () => ({ exitCode: 1, stdout: commandError("operation_failed", "unknown"), stderr: "" });
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "operation_failed" });
+	// A run that never got a CLI slot never reached gjc.
+	respond = async () => {
+		throw new GjcCommandQueueTimeoutError(300_000);
+	};
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "queue_timeout" });
+
+	respond = async () => ({ exitCode: 1, stdout: commandError("unsupported_operation", "not-applied"), stderr: "" });
+	expect(await port.runCompaction(target)).toEqual({ status: "unavailable", code: "unsupported_operation" });
+});
+
+test("runCompaction on the relay reports whether the host's ordered dispatcher answered", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database!, join(home, "agent"));
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "compact", epoch: 0 });
+	const cliCalls: string[][] = [];
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: async (args) => {
+			cliCalls.push([...args]);
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { started: true } }), stderr: "" };
+		},
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	const controls: { operation: string; timeoutMs: number | undefined }[] = [];
+	let reply: () => Promise<RelayResponse> = async () => ({ ok: true, result: { started: true } });
+	const relay = {
+		control: async (operation: string, _input: Record<string, unknown>, options?: { timeoutMs?: number }) => {
+			controls.push({ operation, timeoutMs: options?.timeoutMs });
+			return await reply();
+		},
+	} as unknown as TailHandle;
+	const target = { sessionId: "sdk-1", repo, originKey: "compact", relay };
+
+	expect(await port.runCompaction(target)).toEqual({ status: "succeeded", answered: true });
+	// Straight to the host on the relay, under the whole five-minute budget; no CLI slot.
+	expect(controls).toEqual([{ operation: "compaction.run", timeoutMs: 300_000 }]);
+	expect(cliCalls).toEqual([]);
+
+	// The dispatcher's own failure for this run (e.g. already compacted) is an answer.
+	reply = async () => ({ ok: false, error: { code: "internal", message: "Control operation failed." } });
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "internal", answered: true });
+	// Refused before ordered dispatch: the run never started and proves nothing about earlier ones.
+	for (const code of ["session_quiescing", "not_activated", "operation_not_session_owned"]) {
+		reply = async () => ({ ok: false, error: { code, message: "refused" } });
+		expect(await port.runCompaction(target)).toEqual({ status: "failed", code });
+	}
+	reply = async () => ({ ok: false, error: { code: "unknown_operation", message: "unknown" } });
+	expect(await port.runCompaction(target)).toEqual({ status: "unavailable", code: "unknown_operation" });
+
+	// No reply: the host may still be compacting.
+	reply = async () => {
+		throw new RelayRequestTimeoutError("sdk-1", "gw-1", 300_000);
+	};
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", outcomeUnknown: true });
+	reply = async () => {
+		throw new RelayClosedError("sdk-1", "stream ended", true);
+	};
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", outcomeUnknown: true });
+	// A frame never written never reached the host.
+	reply = async () => {
+		throw new RelayClosedError("sdk-1", "relay not open", false);
+	};
+	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "relay_unwritten" });
 });

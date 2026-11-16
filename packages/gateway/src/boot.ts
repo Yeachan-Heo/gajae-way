@@ -2,7 +2,7 @@ import { chmod, mkdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { acquireLease, homeLayout, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 
-import { type ConfigOverrides, loadConfig } from "./config";
+import { type ConfigOverrides, DEFAULT_SESSIONS_MAX_LIVE_HOSTS, loadConfig } from "./config";
 import { DeliveryService } from "./delivery/delivery";
 import { seedDefaultMonitors } from "./monitors/defaults";
 import { MonitorRegistry } from "./monitors/registry";
@@ -131,6 +131,9 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 			cwd: personaWorkspace,
 			agentDir: config.gjc.agentDir,
 			pinnedVersion,
+			// The effective host cap (persona default when unset), so the CLI pool
+			// is never smaller than the session hosts it serves.
+			maxPoolSize: config.sessions?.maxLiveHosts ?? DEFAULT_SESSIONS_MAX_LIVE_HOSTS,
 			onUnavailable: (at) => {
 				sloRecorder?.note("broker_unavailable", at);
 				options.broker?.onUnavailable?.(at);
@@ -153,9 +156,9 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 			await waitForBroker("preflight", () => client.preflight(), options.brokerWait);
 			const persona = new PersonaLoader(config.home);
 			await persona.ensureWorkspace();
-			// Generic product default: memory maintenance crons exist on every fresh
-			// deployment (seeded once; operator removals are never resurrected).
-			seedDefaultMonitors(new MonitorRegistry(database), database);
+			// Opt-out skips seeding before the runtime starts, without consuming seed
+			// flags or changing existing monitors. Unset preserves the seed-once default.
+			if (config.memory?.seedDefaultMonitors !== false) seedDefaultMonitors(new MonitorRegistry(database), database);
 			const ledger = new DeliveryService(database);
 			const pruned = ledger.prune(7 * 24 * 60 * 60 * 1000);
 			const pending = ledger.listUndelivered(24 * 60 * 60 * 1000).length;

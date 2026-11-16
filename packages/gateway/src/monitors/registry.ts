@@ -6,6 +6,7 @@ import {
 	type MonitorSpec,
 	type MonitorUpdateParams,
 	OriginRefError,
+	parseOriginKey,
 	type TriggerSpec,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
@@ -28,6 +29,7 @@ const MONITOR_UPDATE_FIELDS = new Set([
 	"instruction",
 	"model",
 	"serviceTier",
+	"contextRollTokens",
 	"reportTo",
 	"enabled",
 	"procedureFiles",
@@ -74,6 +76,7 @@ export class MonitorRegistry {
 				instruction: instruction ?? null,
 				modelJson: record.model ? JSON.stringify(record.model) : null,
 				serviceTier: record.serviceTier ?? null,
+				contextRollTokens: record.contextRollTokens ?? null,
 				procedureFilesJson: procedureFiles ? JSON.stringify(procedureFiles) : null,
 			});
 			if (record.reportTo)
@@ -134,7 +137,10 @@ export class MonitorRegistry {
 					? patch.procedureFiles.map((file) => file.trim())
 					: undefined
 				: current.procedureFiles;
-			const updated: MonitorRecord = { ...current, ...patch, trigger, instruction, procedureFiles };
+			const contextRollTokens = Object.hasOwn(patch, "contextRollTokens")
+				? (patch.contextRollTokens ?? undefined)
+				: current.contextRollTokens;
+			const updated: MonitorRecord = { ...current, ...patch, trigger, instruction, procedureFiles, contextRollTokens };
 			if (typeof updated.enabled !== "boolean") throw new Error("monitor enabled must be a boolean");
 			validateSpec(updated);
 			const persisted = this.#database.monitors.update(tx, {
@@ -148,6 +154,7 @@ export class MonitorRegistry {
 				instruction: instruction ?? null,
 				modelJson: updated.model ? JSON.stringify(updated.model) : null,
 				serviceTier: updated.serviceTier ?? null,
+				contextRollTokens: updated.contextRollTokens ?? null,
 				procedureFilesJson: procedureFiles ? JSON.stringify(procedureFiles) : null,
 			});
 			if (!persisted) return undefined;
@@ -171,6 +178,18 @@ export class MonitorRegistry {
 			const deleted = this.#database.monitors.delete(tx, monitorId);
 			this.#database.core.metaDelete(monitorCronMetaKey(monitorId));
 			this.#database.core.metaDelete(monitorReportToMetaKey(monitorId));
+			// Roll intents expire with the monitor; retired hosts remain owned until safely closed.
+			for (const prefix of ["monitor_context_budget_arm:", "monitor_roll_handoff:"]) {
+				for (const key of this.#database.core.metaKeysInRange(prefix, `${prefix}\uffff`)) {
+					try {
+						const originKey = key.slice(prefix.length);
+						const origin = parseOriginKey(originKey);
+						if (origin.platform === "monitor" && origin.parentId === monitorId) this.#database.core.metaDelete(key);
+					} catch {
+						// Malformed keys cannot identify a monitor origin.
+					}
+				}
+			}
 			if (!deleted) return false;
 			for (const event of this.#database.monitors.eventsAwaitingDispatch(monitorId)) {
 				this.#database.monitors.eventTerminalFail(
@@ -231,6 +250,7 @@ function rowToRecord(row: ReturnType<Store["monitors"]["rows"]>[number], reportT
 		instruction: row.instruction ?? undefined,
 		model: row.model_json ? JSON.parse(row.model_json) : undefined,
 		serviceTier: (row.service_tier as MonitorRecord["serviceTier"]) ?? undefined,
+		contextRollTokens: row.context_roll_tokens ?? undefined,
 		procedureFiles: row.procedure_files_json ? JSON.parse(row.procedure_files_json) : undefined,
 		reportTo: reportToJson ? JSON.parse(reportToJson) : undefined,
 		createdAt: row.created_at,
@@ -288,6 +308,11 @@ export function validateSpec(spec: MonitorSpec): void {
 	}
 	if (spec.serviceTier !== undefined && !SERVICE_TIERS.has(spec.serviceTier))
 		throw new Error("monitor serviceTier is invalid");
+	if (
+		spec.contextRollTokens !== undefined &&
+		(!Number.isInteger(spec.contextRollTokens) || spec.contextRollTokens < 10_000 || spec.contextRollTokens > 2_000_000)
+	)
+		throw new Error("monitor contextRollTokens is invalid");
 	if (spec.instruction !== undefined) {
 		if (typeof spec.instruction !== "string") throw new Error("monitor instruction must be a string");
 		if (spec.instruction.length > MONITOR_INSTRUCTION_MAX_LENGTH)

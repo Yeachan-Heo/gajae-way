@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { describePanelResponse, type SlackBlockAction } from "../src/interactions";
+import { askUserPanelBlocks } from "../src/panels";
 import { SlackSocketMode, type SocketModeHandlers, type WebSocketLike } from "../src/socket";
 
 class FakeSocket implements WebSocketLike {
@@ -193,6 +195,122 @@ test("Slack retries deduplicate both envelope and event IDs but dispatch unseen 
 		await flush();
 		expect(socket.sent).toHaveLength(4);
 		expect(f.events).toEqual([{ text: "a" }, { text: "new" }]);
+	} finally {
+		f.mode.stop();
+	}
+});
+
+test("interactive block_actions are acknowledged after handoff and duplicate envelopes dispatch once", async () => {
+	const f = fixture();
+	const origin = { platform: "slack", kind: "thread", conversationId: "C1:123.456", parentId: "C1" } as const;
+	const blocks = askUserPanelBlocks({
+		turnId: "turn",
+		origin,
+		role: "assistant",
+		text: "Choose",
+		final: true,
+		askUserPanel: {
+			panelId: "question_001",
+			question: "Choose",
+			expiresAt: new Date(Date.now() + 60_000).toISOString(),
+			options: [{ id: "option_a", label: "A" }],
+		},
+	});
+	const button = (blocks.find((block) => block.type === "actions")?.elements as unknown[])[0];
+	const payload = {
+		type: "block_actions",
+		user: { id: "U1", name: "User" },
+		channel: { id: "C1" },
+		message: { type: "message", ts: "123.457", thread_ts: "123.456" },
+		actions: [button],
+	};
+	try {
+		await f.boot();
+		const socket = f.sockets[0] as FakeSocket;
+		socket.message({ envelope_id: "interactive-1", type: "interactive", payload });
+		socket.message({ envelope_id: "interactive-1", type: "interactive", payload, retry_attempt: 1 });
+		socket.message({ envelope_id: "interactive-1", type: "interactive", payload });
+		await flush();
+		socket.message({ envelope_id: "interactive-2", type: "interactive", payload: { type: "view_submission" } });
+		await flush();
+		expect(f.order).toEqual(["event", "ack", "ack", "ack", "ack"]);
+		expect(socket.sent.map((item) => JSON.parse(item))).toEqual([
+			{ envelope_id: "interactive-1" },
+			{ envelope_id: "interactive-1" },
+			{ envelope_id: "interactive-1" },
+			{ envelope_id: "interactive-2" },
+		]);
+		expect(f.events).toEqual([payload]);
+		expect(describePanelResponse(f.events[0] as SlackBlockAction)).toMatchObject({
+			origin,
+			panelId: "question_001",
+			selectedOptionId: "option_a",
+		});
+	} finally {
+		f.mode.stop();
+	}
+});
+
+test("Slack block-action ACK waits for a successful handoff shared by concurrent retries", async () => {
+	let release!: () => void;
+	const accepted = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let calls = 0;
+	const f = fixture({
+		async onEvent() {
+			calls++;
+			await accepted;
+		},
+	});
+	try {
+		await f.boot();
+		const socket = f.sockets[0] as FakeSocket;
+		const frame = { envelope_id: "action", type: "interactive", payload: { type: "block_actions" } };
+		socket.message(frame);
+		socket.message({ ...frame, retry_attempt: 1 });
+		await flush();
+		expect(calls).toBe(1);
+		expect(socket.sent).toEqual([]);
+		release();
+		await flush();
+		expect(socket.sent.map((data) => JSON.parse(data))).toEqual([{ envelope_id: "action" }, { envelope_id: "action" }]);
+		socket.message({ ...frame, retry_attempt: 2 });
+		await flush();
+		expect(calls).toBe(1);
+		expect(socket.sent).toHaveLength(3);
+	} finally {
+		release();
+		f.mode.stop();
+	}
+});
+
+test("Slack retries failed block-action handoffs instead of acknowledging or deduplicating them", async () => {
+	let calls = 0;
+	let available = false;
+	const f = fixture({
+		async onEvent() {
+			calls++;
+			if (!available) throw new Error("gateway reconnecting");
+		},
+	});
+	try {
+		await f.boot();
+		const socket = f.sockets[0] as FakeSocket;
+		const frame = { envelope_id: "action", type: "interactive", payload: { type: "block_actions" } };
+		socket.message(frame);
+		await flush();
+		expect(calls).toBe(1);
+		expect(socket.sent).toEqual([]);
+		available = true;
+		socket.message({ ...frame, retry_attempt: 1 });
+		await flush();
+		expect(calls).toBe(2);
+		expect(socket.sent).toEqual([JSON.stringify({ envelope_id: "action" })]);
+		socket.message({ ...frame, retry_attempt: 2 });
+		await flush();
+		expect(calls).toBe(2);
+		expect(socket.sent).toHaveLength(2);
 	} finally {
 		f.mode.stop();
 	}
@@ -420,6 +538,135 @@ test("Slack pongs and frames keep a quiet socket alive", async () => {
 		f.elapse(14 * 60_000);
 		expect(socket.closed).toHaveLength(0);
 		expect(f.mode.connected).toBe(true);
+	} finally {
+		f.mode.stop();
+	}
+});
+
+test("#710: a connections.open that never answers is abandoned and the reconnect loop opens a fresh socket", async () => {
+	const timers: { work: () => void; ms: number; cleared: boolean }[] = [];
+	const delays: number[] = [];
+	const sleepers: (() => void)[] = [];
+	const logs: string[] = [];
+	const sockets: FakeSocket[] = [];
+	let opens = 0;
+	const mode = new SlackSocketMode(
+		// The first request hangs forever, as one stuck on a dead keep-alive connection does.
+		() => (++opens === 1 ? new Promise<{ url: string }>(() => {}) : Promise.resolve({ url: "wss://slack.test" })),
+		{ onEvent() {}, onSlashCommand() {} },
+		{
+			factory: () => {
+				const socket = new FakeSocket([]);
+				sockets.push(socket);
+				return socket;
+			},
+			sleep: (ms) => {
+				delays.push(ms);
+				return new Promise((resolve) => sleepers.push(resolve));
+			},
+			random: () => 1,
+			log: { log: (line) => logs.push(String(line)), error: (line) => logs.push(String(line)) },
+			openTimeoutMs: 30_000,
+			setTimeout: (work, ms) => {
+				const timer = { work, ms, cleared: false };
+				timers.push(timer);
+				return timer;
+			},
+			clearTimeout: (timer) => {
+				(timer as { cleared: boolean }).cleared = true;
+			},
+		},
+	);
+	try {
+		const start = mode.start();
+		await flush();
+		expect(opens).toBe(1);
+		expect(timers.map((timer) => timer.ms)).toEqual([30_000]);
+		timers[0]!.work();
+		await flush();
+		await start;
+		expect(logs).toContain("Slack socket connection failed: connections.open timed out after 30000ms");
+		expect(delays).toEqual([500]);
+		sleepers.shift()?.();
+		await flush();
+		expect(opens).toBe(2);
+		expect(sockets).toHaveLength(1);
+		// An answered request clears its own bound.
+		expect(timers).toHaveLength(2);
+		expect(timers[1]!.cleared).toBe(true);
+		sockets[0]!.open();
+		sockets[0]!.message({ type: "hello" });
+		expect(mode.connected).toBe(true);
+	} finally {
+		mode.stop();
+	}
+});
+
+test("#710: a socket kept busy by pings but never greeted with hello is replaced after the liveness window", async () => {
+	const f = livenessFixture();
+	try {
+		await f.boot();
+		const socket = f.sockets[0] as HalfOpenSocket;
+		expect(f.mode.connected).toBe(false);
+		// Slack pings every few seconds, so the plain quiet check never fires.
+		for (let minute = 0; minute < 14; minute++) {
+			f.elapse(60_000);
+			socket.listeners.get("ping")?.({});
+		}
+		expect(f.disconnects).toEqual([]);
+		f.elapse(60_000);
+		expect(f.disconnects).toEqual(["Slack socket never connected"]);
+		expect(f.logs.some((line) => line.startsWith("Slack socket never connected: no hello after 900s"))).toBe(true);
+		await flush();
+		expect(f.delays).toEqual([500]);
+	} finally {
+		f.mode.stop();
+	}
+});
+
+test("#710: slash_commands envelopes never count as Events API delivery", async () => {
+	const f = livenessFixture();
+	try {
+		await f.boot();
+		const socket = f.sockets[0] as HalfOpenSocket;
+		socket.message({ type: "hello" });
+		socket.message({
+			envelope_id: "s1",
+			type: "slash_commands",
+			payload: { command: "/status", text: "", user_id: "U1", channel_id: "C1" },
+		});
+		await flush();
+		expect(f.mode.lastEnvelopeAt).toBeUndefined();
+	} finally {
+		f.mode.stop();
+	}
+});
+
+test("#710: the socket reports when it said hello and when the last envelope arrived, and restart reconnects", async () => {
+	const f = livenessFixture();
+	try {
+		await f.boot();
+		const socket = f.sockets[0] as HalfOpenSocket;
+		expect(f.mode.connectedSince).toBeUndefined();
+		expect(f.mode.lastEnvelopeAt).toBeUndefined();
+		socket.message({ type: "hello" });
+		expect(f.mode.connectedSince).toBe(1_000_000);
+		f.elapse(5_000);
+		socket.message(envelope("e1"));
+		await flush();
+		expect(f.mode.lastEnvelopeAt).toBe(1_005_000);
+		f.mode.restart("Slack events possibly disabled");
+		expect(f.disconnects).toEqual(["Slack events possibly disabled"]);
+		expect(f.mode.connected).toBe(false);
+		expect(f.mode.connectedSince).toBeUndefined();
+		await flush();
+		expect(f.delays).toEqual([500]);
+		f.sleepers.shift()?.();
+		await flush();
+		f.sockets[1]?.open();
+		f.sockets[1]?.message({ type: "hello" });
+		expect(f.mode.connections).toBe(2);
+		expect(f.mode.connectedSince).toBe(1_005_000);
 	} finally {
 		f.mode.stop();
 	}

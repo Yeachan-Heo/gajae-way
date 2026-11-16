@@ -33,6 +33,8 @@ export interface CensusReport {
 			}
 		>
 	>;
+	readonly journalRowCount: number;
+	readonly journalByteSize: number;
 }
 
 function addCutoverCount(
@@ -109,6 +111,9 @@ export async function runCensus(config: GatewayConfig): Promise<CensusReport> {
 			const leaseOwners = Object.fromEntries(
 				await Promise.all(LEASE_NAMES.map(async (name) => [name, await readLeaseOwner(config.home, name)] as const)),
 			);
+			// Measure work_journal row count and byte size
+			const { rowCount: journalRowCount, byteSize: journalByteSize } = database.journal.measure();
+
 			const report: CensusReport = {
 				schemaVersion: database.schemaVersion,
 				authority: authorityCounts.authority,
@@ -119,6 +124,8 @@ export async function runCensus(config: GatewayConfig): Promise<CensusReport> {
 				openQuarantined: Object.fromEntries(
 					[...quarantineCounts.entries()].sort(([left], [right]) => left.localeCompare(right)),
 				),
+				journalRowCount,
+				journalByteSize,
 			};
 			console.log(JSON.stringify(report, null, 2));
 			return report;

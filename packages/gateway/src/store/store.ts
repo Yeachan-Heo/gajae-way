@@ -12,6 +12,9 @@ import type { WriteTx } from "./tx";
 
 export const HISTORY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export const CONFIRMED_DELIVERY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+// Non-latest attempt_updated rows are never read by replay (only latest snapshot per key is used).
+// Superseded rows can be deleted aggressively without affecting recovery.
+export const ATTEMPT_UPDATE_RETENTION_MS = 60 * 60 * 1000; // 1 hour
 
 export interface RetentionSweepResult {
 	readonly deleted: Readonly<Record<string, number>>;
@@ -160,7 +163,15 @@ export class Store {
 			note("monitor_slots", monitors.slots);
 			note("deliveries", this.outbox.sweep(tx, cutoffs));
 			note("lane_reports", this.work.sweep(tx, cutoffs));
-			note("work_journal", this.journal.sweep(tx, cutoffs));
+			let journalDeleted = this.journal.sweep(tx, cutoffs);
+			const remainingBudget = batch - journalDeleted;
+			if (remainingBudget > 0) {
+				journalDeleted += this.journal.sweepAttemptUpdated(tx, {
+					updateCutoff: new Date(now.getTime() - ATTEMPT_UPDATE_RETENTION_MS).toISOString(),
+					batch: remainingBudget,
+				});
+			}
+			note("work_journal", journalDeleted);
 			return { deleted, more };
 		});
 	}

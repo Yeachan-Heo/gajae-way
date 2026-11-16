@@ -89,6 +89,7 @@ export {
 	contaminationFreeze,
 	decideRecovery,
 	detectContamination,
+	type HoldKind,
 	type LaneLifecycle,
 	type RecoveryAction,
 	type RecoveryDecision,

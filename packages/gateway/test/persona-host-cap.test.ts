@@ -341,7 +341,7 @@ test("a stalled-turn cutoff frees one host slot once when its failure notice ret
 		);
 		expect(h.manager.admissionHold(origin("b").key)).toBeUndefined();
 		expect(h.sent("c1")).toBeUndefined();
-		expect(terminationCalls).toBe(2);
+		expect(terminationCalls).toBe(1);
 		expect(h.port.closes.map((close) => close.sessionId)).toContain(sessionA);
 		expect(h.manager.liveHostCount()).toBe(1);
 	} finally {

@@ -39,6 +39,7 @@ export interface WebSocketLike {
 }
 
 export interface SocketModeHandlers {
+	/** For block actions, resolve after acceptance or definitive rejection; throw for an uncertain handoff. */
 	onEvent(event: Record<string, unknown>, envelope: SlackEnvelope): void | Promise<void>;
 	onSlashCommand(command: SlackSlashCommand, envelope: SlackEnvelope): void | Promise<void>;
 	onConnected?(): void;
@@ -59,6 +60,10 @@ export interface SocketModeOptions {
 	readonly now?: () => number;
 	readonly setInterval?: (work: () => void, ms: number) => unknown;
 	readonly clearInterval?: (timer: unknown) => void;
+	/** Bound on `apps.connections.open`; a hung call must not stall the reconnect loop. */
+	readonly openTimeoutMs?: number;
+	readonly setTimeout?: (work: () => void, ms: number) => unknown;
+	readonly clearTimeout?: (timer: unknown) => void;
 }
 
 /**
@@ -71,6 +76,13 @@ export interface SocketModeOptions {
 export const DEFAULT_SOCKET_LIVENESS_TIMEOUT_MS = 15 * 60_000;
 export const MIN_SOCKET_LIVENESS_TIMEOUT_MS = 30_000;
 const LIVENESS_CHECK_MAX_MS = 60_000;
+/**
+ * `apps.connections.open` answers in well under a second. Without a bound, one
+ * request hung on a dead keep-alive connection after a network drop parked the
+ * reconnect loop forever: no socket, so no liveness watchdog, and no retry
+ * (#710: "closed unexpectedly", then 18 hours of nothing).
+ */
+export const DEFAULT_SOCKET_OPEN_TIMEOUT_MS = 30_000;
 
 export class SlackSocketMode {
 	private ready?: Promise<void>;
@@ -80,7 +92,10 @@ export class SlackSocketMode {
 	private failures = 0;
 	private isConnected = false;
 	private opened = 0;
+	private connectedAt: number | undefined;
+	private lastEventAt: number | undefined;
 	private readonly seen = new Map<string, string | undefined>();
+	private readonly pendingActions = new Map<string, Promise<void>>();
 	private retryTimer?: ReturnType<typeof setTimeout>;
 	private readonly factory: (url: string) => WebSocketLike;
 	private readonly sleep: (ms: number) => Promise<void>;
@@ -90,9 +105,12 @@ export class SlackSocketMode {
 	private readonly now: () => number;
 	private readonly setInterval: (work: () => void, ms: number) => unknown;
 	private readonly clearInterval: (timer: unknown) => void;
+	private readonly openTimeoutMs: number;
+	private readonly setTimer: (work: () => void, ms: number) => unknown;
+	private readonly clearTimer: (timer: unknown) => void;
 
 	constructor(
-		private readonly openConnection: () => Promise<{ readonly url: string }>,
+		private readonly openConnection: (signal?: AbortSignal) => Promise<{ readonly url: string }>,
 		private readonly handlers: SocketModeHandlers,
 		options: SocketModeOptions = {},
 	) {
@@ -111,6 +129,9 @@ export class SlackSocketMode {
 		this.now = options.now ?? Date.now;
 		this.setInterval = options.setInterval ?? ((work, ms) => setInterval(work, ms));
 		this.clearInterval = options.clearInterval ?? ((timer) => clearInterval(timer as ReturnType<typeof setInterval>));
+		this.openTimeoutMs = options.openTimeoutMs ?? DEFAULT_SOCKET_OPEN_TIMEOUT_MS;
+		this.setTimer = options.setTimeout ?? ((work, ms) => setTimeout(work, ms));
+		this.clearTimer = options.clearTimeout ?? ((timer) => clearTimeout(timer as ReturnType<typeof setTimeout>));
 	}
 
 	get connected(): boolean {
@@ -118,6 +139,19 @@ export class SlackSocketMode {
 	}
 	get connections(): number {
 		return this.opened;
+	}
+	/** When the current connection said hello; undefined while disconnected. */
+	get connectedSince(): number | undefined {
+		return this.isConnected ? this.connectedAt : undefined;
+	}
+	/** When the last events_api envelope arrived (pings, hello, and slash_commands excluded; the deaf-socket detector uses this to track message delivery). */
+	get lastEnvelopeAt(): number | undefined {
+		return this.lastEventAt;
+	}
+
+	/** Replace the current connection through the ordinary reconnect path. */
+	restart(reason: string): void {
+		this.retire?.(reason);
 	}
 
 	start(): Promise<void> {
@@ -147,14 +181,26 @@ export class SlackSocketMode {
 	private async run(generation: number, ready: () => void, cancelled: Promise<void>): Promise<void> {
 		while (generation === this.generation) {
 			try {
-				const connection = await Promise.race([this.openConnection(), cancelled]);
+				let openTimer: unknown;
+				const openAbort = new AbortController();
+				const connection = await Promise.race([
+					this.openConnection(openAbort.signal),
+					cancelled,
+					new Promise<never>((_, reject) => {
+						openTimer = this.setTimer(() => {
+							openAbort.abort();
+							reject(new SocketOpenTimeoutError(this.openTimeoutMs));
+						}, this.openTimeoutMs);
+					}),
+				]).finally(() => this.clearTimer(openTimer));
 				if (!connection || generation !== this.generation) break;
 				const socket = this.factory(connection.url);
 				await Promise.race([
 					new Promise<void>((resolve) => {
 						let retired = false;
 						let opened = false;
-						let lastActivityAt = this.now();
+						const createdAt = this.now();
+						let lastActivityAt = createdAt;
 						let probed = false;
 						const touch = () => {
 							lastActivityAt = this.now();
@@ -162,6 +208,15 @@ export class SlackSocketMode {
 						};
 						const watchdog = this.setInterval(
 							() => {
+								// Pings can keep a socket that never said hello "active"; it still delivers nothing.
+								const unannounced = this.now() - createdAt;
+								if (!this.isConnected && unannounced >= this.livenessTimeoutMs) {
+									this.log.log(
+										`Slack socket never connected: no hello after ${Math.round(unannounced / 1000)}s; forcing reconnect.`,
+									);
+									retire("Slack socket never connected");
+									return;
+								}
 								const quiet = this.now() - lastActivityAt;
 								if (quiet >= this.livenessTimeoutMs) {
 									this.log.log(
@@ -223,8 +278,10 @@ export class SlackSocketMode {
 					}),
 					cancelled,
 				]);
-			} catch {
-				this.log.error("Slack socket connection failed");
+			} catch (error) {
+				this.log.error(
+					`Slack socket connection failed${error instanceof SocketOpenTimeoutError ? `: ${error.message}` : ""}`,
+				);
 			}
 			if (generation !== this.generation) break;
 			const delay = Math.min(30_000, 500 * 2 ** Math.min(this.failures++, 6)) * (0.5 + this.random() * 0.5);
@@ -247,6 +304,12 @@ export class SlackSocketMode {
 		ready();
 	}
 
+	private rememberEnvelope(id: string, eventId?: string): void {
+		this.seen.delete(id);
+		this.seen.set(id, eventId);
+		while (this.seen.size > 1024) this.seen.delete(this.seen.keys().next().value as string);
+	}
+
 	private async receive(socket: WebSocketLike, data: unknown, retire: (reason: string) => void): Promise<void> {
 		let frame: Record<string, unknown>;
 		try {
@@ -258,12 +321,19 @@ export class SlackSocketMode {
 			return;
 		}
 		try {
-			// Slack retries unacknowledged envelopes; ACK must precede any application work.
-			if (typeof frame.envelope_id === "string") socket.send(JSON.stringify({ envelope_id: frame.envelope_id }));
+			const payload = isObject(frame.payload) ? frame.payload : undefined;
+			const actionPayload = frame.type === "interactive" && payload?.type === "block_actions" ? payload : undefined;
+			const acknowledge = () => {
+				if (typeof frame.envelope_id === "string") socket.send(JSON.stringify({ envelope_id: frame.envelope_id }));
+			};
+			// Ordinary events are recovered from history; panel actions must reach the gateway first.
+			if (!actionPayload) acknowledge();
 			if (frame.type === "hello") {
 				this.failures = 0;
 				if (!this.isConnected) {
 					this.isConnected = true;
+					this.connectedAt = this.now();
+					this.lastEventAt = undefined;
 					this.handlers.onConnected?.();
 				}
 				return;
@@ -276,7 +346,28 @@ export class SlackSocketMode {
 				this.log.log("Slack socket ignored a non-envelope frame");
 				return;
 			}
-			const payload = isObject(frame.payload) ? frame.payload : undefined;
+			const envelope = frame as unknown as SlackEnvelope;
+			if (actionPayload) {
+				const id = frame.envelope_id;
+				if (this.seen.has(id)) {
+					this.rememberEnvelope(id);
+					acknowledge();
+					return;
+				}
+				let handoff = this.pendingActions.get(id);
+				if (!handoff) {
+					handoff = Promise.resolve().then(() => this.handlers.onEvent(actionPayload, envelope));
+					this.pendingActions.set(id, handoff);
+				}
+				try {
+					await handoff;
+					this.rememberEnvelope(id);
+					acknowledge();
+				} finally {
+					if (this.pendingActions.get(id) === handoff) this.pendingActions.delete(id);
+				}
+				return;
+			}
 			const eventId =
 				frame.type === "events_api" && typeof payload?.event_id === "string" ? payload.event_id : undefined;
 			let duplicate = this.seen.has(frame.envelope_id);
@@ -290,12 +381,10 @@ export class SlackSocketMode {
 					break;
 				}
 			}
-			this.seen.delete(frame.envelope_id);
-			this.seen.set(frame.envelope_id, eventId);
-			while (this.seen.size > 1024) this.seen.delete(this.seen.keys().next().value as string);
-			if (typeof frame.retry_attempt === "number" && frame.retry_attempt > 0 && duplicate) return;
-			const envelope = frame as unknown as SlackEnvelope;
+			this.rememberEnvelope(frame.envelope_id, eventId);
+			if (duplicate) return;
 			if (frame.type === "events_api" && isObject(payload?.event)) {
+				this.lastEventAt = this.now();
 				await this.handlers.onEvent(payload.event, envelope);
 			} else if (frame.type === "slash_commands" && payload) {
 				await this.handlers.onSlashCommand(payload as unknown as SlackSlashCommand, envelope);
@@ -305,6 +394,13 @@ export class SlackSocketMode {
 		} catch {
 			this.log.error("Slack socket envelope handling failed");
 		}
+	}
+}
+
+class SocketOpenTimeoutError extends Error {
+	constructor(ms: number) {
+		super(`connections.open timed out after ${ms}ms`);
+		this.name = "SocketOpenTimeoutError";
 	}
 }
 

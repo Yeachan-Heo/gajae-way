@@ -113,13 +113,17 @@ export class LiveReplyTracker {
 	}
 
 	/**
-	 * The turn settled — terminal delivery or final progress tick. No further
-	 * edit is attempted, but the entry stays so a replayed part can still be
-	 * answered (re-confirmed when applied, posted when not) until TTL eviction.
+	 * Seal after already queued edits. Later deliveries run after the seal, while
+	 * applied replays can still be re-confirmed until TTL eviction.
 	 */
-	close(turnId: string): void {
+	close(turnId: string): Promise<void> {
 		const entry = this.#entries.get(turnId);
-		if (entry) entry.open = false;
+		if (!entry) return Promise.resolve();
+		const closed = entry.chain.then(() => {
+			entry.open = false;
+		});
+		entry.chain = closed;
+		return closed;
 	}
 
 	/** True while the turn has an open live message; tests and diagnostics. */
@@ -143,6 +147,15 @@ export class LiveReplyTracker {
 			// The reservation must not pin the turn to untracked mode: dropping
 			// it lets the ledger's retry of this part open a fresh live message.
 			this.#abandon(input.turnId, entry);
+			// Even a definite refusal of a later chunk leaves earlier chunks visible.
+			// Preserve the cause but report the overall delivery as ambiguous.
+			if (tail)
+				throw new Error(
+					`Slack live reply partially posted: ${error instanceof Error ? error.message : String(error)}`,
+					{
+						cause: error,
+					},
+				);
 			throw error;
 		}
 		if (!tail) {
