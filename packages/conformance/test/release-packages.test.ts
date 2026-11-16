@@ -190,6 +190,26 @@ import { spawnSync } from "node:child_process";
 
 const [tool, ...args] = process.argv.slice(2);
 appendFileSync(process.env.COMMAND_LOG, JSON.stringify({ tool, args, cwd: basename(process.cwd()) }) + "\\n");
+
+// A concurrent release moving the tag this run is releasing: it fires on the configured
+// tag-map read or just before a tag mutation, so the fixture also models an older script
+// with no fresh read for it to fire on.
+function applyTagAdvance(name) {
+  const advance = JSON.parse(process.env.TAG_ADVANCES)[name];
+  if (!advance) return;
+  const fired = existsSync(process.env.TAG_ADVANCE_STATE)
+    ? JSON.parse(readFileSync(process.env.TAG_ADVANCE_STATE, "utf8"))
+    : {};
+  if (fired[name]) return;
+  const tags = JSON.parse(readFileSync(process.env.TAG_STATE, "utf8"));
+  tags[name + "@" + advance.tag] = advance.version;
+  for (const [created, createdVersion] of Object.entries(advance.createTags ?? {})) {
+    tags[name + "@" + created] = createdVersion;
+  }
+  writeFileSync(process.env.TAG_STATE, JSON.stringify(tags));
+  fired[name] = true;
+  writeFileSync(process.env.TAG_ADVANCE_STATE, JSON.stringify(fired));
+}
 if (tool === "bun") {
   if (args.join(" ") === "run build") process.exit(0);
   if (args[0] === "pm" && args[1] === "pack" && args[2] === "--filename" && args.length === 4) {
@@ -262,6 +282,17 @@ if (tool === "bun") {
       console.error("simulated tag-map failure");
       process.exit(1);
     }
+    const advance = JSON.parse(process.env.TAG_ADVANCES)[args[1]];
+    if (advance) {
+      const reads = existsSync(process.env.TAG_READ_COUNT)
+        ? JSON.parse(readFileSync(process.env.TAG_READ_COUNT, "utf8"))
+        : {};
+      reads[args[1]] = (reads[args[1]] ?? 0) + 1;
+      writeFileSync(process.env.TAG_READ_COUNT, JSON.stringify(reads));
+      // Fired by read ordinal: the concurrent release moves the tag after this run has
+      // observed it, which is the interleaving the write must not overwrite downward.
+      if (reads[args[1]] === advance.afterReads) applyTagAdvance(args[1]);
+    }
     const state = JSON.parse(readFileSync(process.env.TAG_STATE, "utf8"));
     const prefix = args[1] + "@";
     const tags = {};
@@ -321,8 +352,9 @@ if (tool === "bun") {
       console.error("simulated dist-tag failure");
       process.exit(1);
     }
-    const tags = JSON.parse(readFileSync(process.env.TAG_STATE, "utf8"));
     const split = args[2].lastIndexOf("@");
+    applyTagAdvance(args[2].slice(0, split));
+    const tags = JSON.parse(readFileSync(process.env.TAG_STATE, "utf8"));
     tags[args[2].slice(0, split) + "@" + args[3]] = process.env.INTERLEAVE_VERSION || args[2].slice(split + 1);
     writeFileSync(process.env.TAG_STATE, JSON.stringify(tags));
     const writes = existsSync(process.env.WRITE_COUNT)
@@ -350,6 +382,7 @@ if (tool === "bun") {
     const tagIndex = args.indexOf("--tag");
     if (tagIndex !== -1 && args[tagIndex + 1] !== undefined) {
       const packed = JSON.parse(spawnSync("tar", ["-xOzf", args[1], "package/package.json"], { encoding: "utf8" }).stdout);
+      applyTagAdvance(packed.name);
       const tags = JSON.parse(readFileSync(process.env.TAG_STATE, "utf8"));
       tags[packed.name + "@" + args[tagIndex + 1]] = packed.version;
       writeFileSync(process.env.TAG_STATE, JSON.stringify(tags));
@@ -375,6 +408,10 @@ async function withReleaseFixture(
 		versions?: Record<string, string>;
 		interleave?: string;
 		staleVerification?: Record<string, string>;
+		tagAdvances?: Record<
+			string,
+			{ tag: string; version: string; afterReads: number; createTags?: Record<string, string> }
+		>;
 		publishedVersions?: Record<string, string[]>;
 		publishedVersionsAfterPublish?: Record<string, string[]>;
 		publishedVersionsAfterWrite?: Record<string, string[]>;
@@ -432,6 +469,8 @@ async function withReleaseFixture(
 		const growthState = join(root, "growth.json");
 		const staleTagsState = join(root, "stale-tags.json");
 		const writeCount = join(root, "write-count.json");
+		const tagReadCount = join(root, "tag-read-count.json");
+		const tagAdvanceState = join(root, "tag-advance-state.json");
 		const staleState = join(root, "stale.json");
 		await writeFile(staleState, JSON.stringify(options.staleVerification ?? {}));
 		await writeFile(staleTagsState, JSON.stringify(options.staleTags ?? {}));
@@ -455,6 +494,9 @@ async function withReleaseFixture(
 						CONFIG_TAG: options.configTag ?? "latest",
 						CONFIG_ERROR: options.configError ? "1" : "",
 						INTERLEAVE_VERSION: options.interleave ?? "",
+						TAG_ADVANCES: JSON.stringify(options.tagAdvances ?? {}),
+						TAG_ADVANCE_STATE: tagAdvanceState,
+						TAG_READ_COUNT: tagReadCount,
 						PUBLISHED_VERSIONS: JSON.stringify(options.publishedVersions ?? {}),
 						PUBLISHED_VERSIONS_AFTER_PUBLISH: JSON.stringify(options.publishedVersionsAfterPublish ?? {}),
 						PUBLISHED_MARKER: publishedMarker,
@@ -1266,6 +1308,88 @@ describe("release script subprocess behavior", () => {
 			expect(result.output).toContain("moved it backwards");
 			expect(result.commands.some((command) => command.cwd === "images" || command.args[0] === "publish")).toBe(false);
 		});
+	}, 30_000);
+
+	// A resume reads the tag, a newer release moves it forward, and then the older run
+	// writes: npm has no compare-and-set, so the write must be authorized by a read taken
+	// immediately before it. A custom tag has no published-version floor to repair this
+	// afterwards, so the tag must stay on the newer version and the older run must say so.
+	test("never moves a resumed custom tag back below a release that advanced it", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{
+				existing: [packageRef(pkg)],
+				tags: { [`${pkg.name}@beta`]: "1.2.2" },
+				tagAdvances: { [pkg.name]: { tag: "beta", version: "1.2.4", afterReads: 2 } },
+			},
+			async ({ root, execute }) => {
+				const result = await execute("--publish", "--tag", "beta");
+				expect(result.code).toBe(0);
+				expect(result.output).toContain("stays with 1.2.4; leaving it instead of moving it back to 1.2.3");
+				expect(
+					result.commands.filter((command) => command.args[0] === "dist-tag").map((command) => command.args),
+				).toEqual([]);
+				const tags = JSON.parse(await readFile(join(root, "tags.json"), "utf8"));
+				expect(tags[`${pkg.name}@beta`]).toBe("1.2.4");
+			},
+		);
+	}, 30_000);
+
+	// The same interleaving on the fresh-publish path: `npm publish --tag` writes the
+	// pointer unconditionally, so an advanced custom tag must divert this version to a
+	// scratch tag instead of moving the pointer back.
+	test("never publishes a fresh version under a custom tag a release already advanced", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{
+				tags: { [`${pkg.name}@beta`]: "1.2.2" },
+				tagAdvances: { [pkg.name]: { tag: "beta", version: "1.2.4", afterReads: 2 } },
+			},
+			async ({ root, execute }) => {
+				const result = await execute("--publish", "--tag", "beta");
+				expect(result.code).toBe(0);
+				const publish = result.commands.filter(
+					(command) => command.args[0] === "publish" && command.cwd === pkg.directory,
+				);
+				expect(publish.map((command) => command.args[command.args.length - 1])).toEqual(["gajae-pending-1-2-3"]);
+				expect(result.output).toContain("stays with 1.2.4");
+				const tags = JSON.parse(await readFile(join(root, "tags.json"), "utf8"));
+				expect(tags[`${pkg.name}@beta`]).toBe("1.2.4");
+				expect(tags[`${pkg.name}@gajae-pending-1-2-3`]).toBeUndefined();
+			},
+		);
+	}, 30_000);
+
+	// The ordering re-read is one observation, not two: an operator tag named like the base
+	// scratch tag that appears before that read must select a suffixed scratch name, and the
+	// publish cleanup must not remove the operator's pointer.
+	test("selects a free scratch name from the tag map it re-read before publishing", async () => {
+		const pkg = RELEASE_FIXTURES[0];
+		await withReleaseFixture(
+			{
+				tags: { [`${pkg.name}@beta`]: "1.2.4" },
+				tagAdvances: {
+					[pkg.name]: {
+						tag: "beta",
+						version: "1.2.4",
+						afterReads: 2,
+						createTags: { "gajae-pending-1-2-3": "1.5.0" },
+					},
+				},
+			},
+			async ({ root, execute }) => {
+				const result = await execute("--publish", "--tag", "beta");
+				expect(result.code).toBe(0);
+				const publish = result.commands.filter(
+					(command) => command.args[0] === "publish" && command.cwd === pkg.directory,
+				);
+				const scratch = publish[0]?.args.at(-1) ?? "";
+				expect(scratch.startsWith("gajae-pending-1-2-3-")).toBe(true);
+				const tags = JSON.parse(await readFile(join(root, "tags.json"), "utf8"));
+				expect(tags[`${pkg.name}@beta`]).toBe("1.2.4");
+				expect(tags[`${pkg.name}@gajae-pending-1-2-3`]).toBe("1.5.0");
+			},
+		);
 	}, 30_000);
 
 	test("re-reads a lagging registry instead of calling it a concurrent move", async () => {

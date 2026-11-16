@@ -295,8 +295,11 @@ async function resolveEffectiveTag(
 // tag closes it in the same run: applyDistTag re-derives the tag from the version list
 // after writing and converges forward, so a stale write repairs itself instead of
 // waiting for the next release. A tag with no channel floor has only its pointer as an
-// ordering source, so a concurrent writer that lands in that window is not seen and the
-// next release has to repair the pointer.
+// ordering source, so every write to it is authorized by a read taken immediately before
+// the write: a release that already moved the tag wins and this run never moves it back,
+// and that outcome is printed instead of silently skipped. A release still landing
+// between that final read and the write is invisible without a compare-and-set, so the
+// next release has to repair that pointer.
 async function resumeTag(
 	name: string,
 	version: string,
@@ -507,9 +510,29 @@ async function reconcileChannel(name: string, version: string, tag: string, cwd:
 	throw new Error(belowFloor ?? readFailure ?? `dist-tag ${tag} for ${name} did not converge`);
 }
 
-async function applyDistTag(name: string, version: string, tag: string, cwd: string): Promise<void> {
+// A tag with no channel floor has no published-version list to repair it afterwards, so
+// its write is authorized by a fresh observation taken immediately before it. npm has no
+// compare-and-set, but this closes the window between the snapshot read that decided the
+// target and the write: a release that moved the tag in between must win, and this run
+// must never move it back. The release continues because failing would strand this tag's
+// already-published version and skip the GitHub release still to be created; the outcome
+// is printed instead of silently skipped.
+async function applyCustomDistTag(name: string, version: string, tag: string, cwd: string): Promise<void> {
+	const current = await readDistTagVersion(name, tag, cwd);
+	if (current !== undefined && semverOrderOrThrow(current, version, `npm dist-tag ${tag} for ${name}`) > 0) {
+		console.log(`\n${name}@${tag} stays with ${current}; leaving it instead of moving it back to ${version}.`);
+		return;
+	}
 	await applyDistTagOnce(name, version, tag, cwd);
-	if (CHANNEL_FLOORS.has(tag)) await reconcileChannel(name, version, tag, cwd);
+}
+
+async function applyDistTag(name: string, version: string, tag: string, cwd: string): Promise<void> {
+	if (!CHANNEL_FLOORS.has(tag)) {
+		await applyCustomDistTag(name, version, tag, cwd);
+		return;
+	}
+	await applyDistTagOnce(name, version, tag, cwd);
+	await reconcileChannel(name, version, tag, cwd);
 }
 
 async function main(): Promise<void> {
@@ -560,8 +583,24 @@ async function main(): Promise<void> {
 				// a scratch tag instead, and the pointer is never moved backwards, not even for the
 				// moment between publish and repair.
 				const tags = await readDistTags(packageName, dir);
-				const target = await tagTarget(packageName, packageVersion, effectiveTag, tags[effectiveTag], dir);
-				const publishTag = target === packageVersion ? effectiveTag : scratchTag(packageVersion, tags);
+				let target = await tagTarget(packageName, packageVersion, effectiveTag, tags[effectiveTag], dir);
+				let availableTags = tags;
+				// A custom tag has no published-version floor and no post-publish reconcile, so it is
+				// re-observed immediately before `npm publish` writes it: a newer release that moved it
+				// after the snapshot read above must win, and this version goes under a scratch tag
+				// instead of moving the pointer back. The fresh map also selects the scratch name, so an
+				// operator tag created since the snapshot is never taken for a free scratch name. A
+				// channel tag is covered by the version-list read inside tagTarget and by the
+				// post-publish reconciliation.
+				if (!CHANNEL_FLOORS.has(effectiveTag)) {
+					availableTags = await readDistTags(packageName, dir);
+					target = forwardTarget(
+						target,
+						availableTags[effectiveTag],
+						`npm dist-tag ${effectiveTag} for ${packageName}`,
+					);
+				}
+				const publishTag = target === packageVersion ? effectiveTag : scratchTag(packageVersion, availableTags);
 				await run(["npm", "publish", tarball, "--access", "public", "--tag", publishTag], dir);
 				if (publishTag !== effectiveTag) {
 					console.log(

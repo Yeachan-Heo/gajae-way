@@ -31,7 +31,9 @@ on:
 #
 # Cross-tag ordering of dist-tag writes is enforced by the script, not by GitHub: no
 # write is decided below the tag's live pointer or, for the channel tags `latest` and
-# `next`, below the highest published version in that channel. A tag a newer release already moved is left alone so its
+# `next`, below the highest published version in that channel. An explicit tag is
+# re-read immediately before its write, so a release that already moved it is left on the
+# newer version instead of being moved back. A tag a newer release already moved is left alone so its
 # own GitHub release still gets created, an older fresh version is published under a
 # scratch tag whose name is checked against the tag map read first, the channel tag a run
 # writes is
