@@ -171,9 +171,41 @@ test("rows larger than the row bound are skipped and counted without hiding thei
 	expect(tail.skippedRows).toBe(1);
 	expect(tail.assistantTexts.map((item) => item.text)).toEqual(["Read it."]);
 	expect(tail.toolCalls).toEqual([
-		{ name: "read", intent: "Reading a huge file", at: new Date(start + 1000).toISOString(), status: "no_result" },
+		{ name: "read", intent: "Reading a huge file", at: new Date(start + 1000).toISOString(), status: "unknown" },
 	]);
 	expect(tail.turnStartedAt).toBe(new Date(start).toISOString());
+});
+
+test("skipped rows only make earlier unmatched calls unknown, not known results or newer calls", async () => {
+	await writeFile(
+		path,
+		lines([
+			user(0, "go"),
+			assistant(1000, call("missing", "read")),
+			result(2000, "missing", false, "x".repeat(600_000)),
+			assistant(3000, call("known", "bash")),
+			result(4000, "known"),
+			assistant(5000, call("live", "bash")),
+		]),
+	);
+	const tail = await readTranscriptTail(path, { limit: 5, redact: noRedact, maxRowBytes: 100_000 });
+	expect(tail.toolCalls.map((item) => item.status)).toEqual(["unknown", "ok", "running"]);
+	expect(tail.toolInFlight?.status).toBe("running");
+});
+
+test("out-of-range numeric timestamps do not abort scanning neighboring rows", async () => {
+	const invalid = assistant(1000, text("invalid time"));
+	invalid.timestamp = 8.64e15 + 1;
+	(invalid.message as Row).timestamp = 8.64e15 + 1;
+	const fallback = assistant(2000, text("fallback time"));
+	fallback.timestamp = 8.64e15 + 1;
+	await writeFile(path, lines([user(0, "go"), invalid, fallback, assistant(3000, text("valid time"))]));
+	const tail = await readTranscriptTail(path, { limit: 5, redact: noRedact });
+	expect(tail.assistantTexts.map(({ text, at }) => [text, at])).toEqual([
+		["invalid time", null],
+		["fallback time", new Date(start + 2000).toISOString()],
+		["valid time", new Date(start + 3000).toISOString()],
+	]);
 });
 
 test("malformed rows are skipped and counted", async () => {

@@ -605,9 +605,13 @@ function parseWorkProgressArgs(args: readonly string[], usage: string): { limit?
 
 /** One line per item; the current state comes last so a tail-truncated shell still shows it. */
 export function renderWorkProgress(result: WorkProgressResult): string[] {
-	const oneLine = (text: string) => text.replace(/\s+/g, " ").trim();
+	const oneLine = (text: string) =>
+		text
+			.replace(/\s+/g, " ")
+			.replace(/[\p{Cc}\p{Cf}]/gu, (char) => `\\u{${(char.codePointAt(0) ?? char.charCodeAt(0)).toString(16)}}`)
+			.trim();
 	const call = (tool: WorkProgressResult["toolCalls"][number]) =>
-		`${tool.name}${tool.intent ? ` ${JSON.stringify(oneLine(tool.intent))}` : ""}`;
+		`${oneLine(tool.name)}${tool.intent ? ` ${JSON.stringify(oneLine(tool.intent))}` : ""}`;
 	const attempt = result.attempt
 		? ` attempt=${result.attempt.opRef} started=${result.attempt.startedAt}${result.attempt.endedAt ? ` ended=${result.attempt.endedAt} end=${result.attempt.endState ?? "-"}` : ""}`
 		: "";
@@ -630,7 +634,9 @@ export function renderWorkProgress(result: WorkProgressResult): string[] {
 	lines.push(
 		result.toolInFlight
 			? `now running: ${call(result.toolInFlight)} since ${result.toolInFlight.at ?? "-"}`
-			: "now running: no tool call",
+			: result.toolCalls.some((tool) => tool.status === "unknown")
+				? "now running: unknown (skipped transcript rows)"
+				: "now running: no tool call",
 	);
 	return lines;
 }
@@ -814,6 +820,15 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				const client = await connectGatewaySocket(parsed.socket);
 				try {
 					const result = await client.request<SessionListResult>("session.list", params);
+					if (
+						!Number.isSafeInteger(result.total) ||
+						!Number.isSafeInteger(result.offset) ||
+						result.offset !== (params?.offset ?? 0) ||
+						!Array.isArray(result.sessions)
+					)
+						throw new Error(
+							"Gateway does not support session paging; restart the gateway before listing or inspecting sessions",
+						);
 					if (command === "list") {
 						for (const line of renderList(
 							SESSION_COLUMNS,
@@ -831,6 +846,11 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 							);
 					} else {
 						const session = result.sessions[0];
+						if (
+							result.sessions.length > 1 ||
+							(params?.originKey && session && originKey(session.origin) !== params.originKey)
+						)
+							throw new Error("Gateway did not honor the session inspection filter; restart the gateway");
 						if (!session) throw new Error(`Unknown session: ${selector}`);
 						console.log(`origin: ${originKey(session.origin)}`);
 						console.log(`epoch: ${session.epoch}`);

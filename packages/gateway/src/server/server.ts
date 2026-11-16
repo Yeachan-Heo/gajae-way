@@ -2068,7 +2068,7 @@ async function handleRequest(
 				throw new ProtocolError("invalid_params", `limit must be an integer from 1 to ${SESSION_LIST_MAX_LIMIT}`);
 			if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0)
 				throw new ProtocolError("invalid_params", "offset must be a non-negative integer");
-			if (key !== undefined && (typeof key !== "string" || !key || key.length > 512))
+			if (key !== undefined && (typeof key !== "string" || !key))
 				throw new ProtocolError("invalid_params", "originKey must be a non-empty string");
 			const page = options.database.bindings.sessionPage({
 				limit,

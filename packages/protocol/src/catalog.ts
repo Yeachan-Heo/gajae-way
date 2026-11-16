@@ -852,9 +852,10 @@ export interface WorkProgressToolCall {
 	/**
 	 * `ok`/`error` from the saved tool result; `running` when no result is saved
 	 * yet and nothing newer happened in the session; `no_result` when the session
-	 * moved on without saving one (an aborted call).
+	 * moved on without saving one (an aborted call); `unknown` when a skipped
+	 * newer row may have contained the result.
 	 */
-	readonly status: "ok" | "error" | "running" | "no_result";
+	readonly status: "ok" | "error" | "running" | "no_result" | "unknown";
 }
 
 export interface WorkProgressText {

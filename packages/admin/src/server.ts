@@ -13,7 +13,7 @@
  * a live socket and prevents this package from reaching into gateway internals.
  */
 
-import type { ChatMessagePayload, ChatProgressPayload } from "@gajae-gateway/protocol";
+import { type ChatMessagePayload, type ChatProgressPayload, SESSION_LIST_MAX_LIMIT } from "@gajae-gateway/protocol";
 import { type AuditLog, memoryAuditLog } from "./audit";
 import { formatClockSeconds } from "./format";
 import { type GateOptions, MutationGate, type MutationOperation } from "./gate";
@@ -53,7 +53,6 @@ export type AdminApp = {
 
 const READ_ROUTES: Record<string, string> = {
 	"/api/status": "gateway.status",
-	"/api/sessions": "session.list",
 	"/api/jobs": "work.jobs",
 	"/api/monitors": "monitor.list",
 };
@@ -265,6 +264,31 @@ export function createAdminApp(options: AdminServerOptions): AdminApp {
 			}
 		}
 
+		if (url.pathname === "/api/sessions") {
+			if (method !== "GET") return json({ ok: false, error: "read routes accept GET only" }, 405);
+			const limitText = url.searchParams.get("limit");
+			const offsetText = url.searchParams.get("offset");
+			const limit = limitText === null ? undefined : Number(limitText);
+			const offset = offsetText === null ? undefined : Number(offsetText);
+			if (
+				(limit !== undefined &&
+					(!/^\d+$/.test(limitText ?? "") ||
+						!Number.isSafeInteger(limit) ||
+						limit < 1 ||
+						limit > SESSION_LIST_MAX_LIMIT)) ||
+				(offset !== undefined && (!/^\d+$/.test(offsetText ?? "") || !Number.isSafeInteger(offset)))
+			)
+				return json({ ok: false, error: "invalid session pagination" }, 400);
+			try {
+				const params =
+					limit === undefined && offset === undefined
+						? undefined
+						: { ...(limit === undefined ? {} : { limit }), ...(offset === undefined ? {} : { offset }) };
+				return json({ ok: true, result: await request("session.list", params) });
+			} catch (error) {
+				return json({ ok: false, error: message(error) }, 502);
+			}
+		}
 		const verb = READ_ROUTES[url.pathname];
 		if (verb) {
 			if (method !== "GET") return json({ ok: false, error: "read routes accept GET only" }, 405);

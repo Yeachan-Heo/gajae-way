@@ -12,6 +12,7 @@ gajaeway memory audit
 ```
 
 `sessions list` is paged by the gateway; follow its `next: --offset` hint instead of raising `--limit`. `work status <name> --progress` shows what a lane is doing from its transcript without reaching it; use `work steer` only to change what the lane does.
+A tool status of `unknown` means a skipped transcript row may have contained its result; do not infer that the call is still running or aborted.
 
 Use supported read-only projections: `gajaeway ops cycle|deliveries|integrity` while the gateway is online, and `gajaeway-gateway census` while it is stopped. Do not inspect the database file directly.
 

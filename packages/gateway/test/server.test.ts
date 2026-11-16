@@ -5176,6 +5176,32 @@ test("session.list pages, filters and bounds rows on the gateway so a small --li
 	f.client.close();
 });
 
+test("session.list accepts a protocol-valid canonical origin key longer than 512 characters", async () => {
+	const f = await workSocketFixture();
+	const origin = {
+		platform: "discord",
+		kind: "thread",
+		conversationId: "c".repeat(256),
+		parentId: "p".repeat(256),
+	} as const;
+	const key = originKey(origin);
+	expect(key.length).toBeGreaterThan(512);
+	f.database.transaction((tx) => f.database.bindings.incrementTurnCount(tx, key, JSON.stringify(origin)));
+	f.client.send({
+		v: "0.1",
+		type: "request",
+		id: "long-key",
+		verb: "session.list",
+		params: { limit: 1, originKey: key },
+	});
+	await waitFrame(f.client.frames, "long-key");
+	const frame = f.client.frames.find((item) => item.id === "long-key");
+	expect(frame.type).toBe("response");
+	expect(frame.result.total).toBe(1);
+	expect(frame.result.sessions[0].origin).toEqual(origin);
+	f.client.close();
+});
+
 test("work.progress answers from the transcript tail without reaching the lane (#814)", async () => {
 	// The same outbound guard chat uses; a known env value stands in for a host credential.
 	const hostSecret = "Hq4Lm8Np2Rs6Tv0Wx3Yz";

@@ -911,11 +911,31 @@ describe("sessions paging is done by the gateway (#814)", () => {
 		const byIndex = await run(["inspect", "3"], { total: 9, offset: 3, sessions: [session("c3")] });
 		expect(byIndex.requests).toEqual([{ verb: "session.list", params: { limit: 1, offset: 3 } }]);
 		expect(byIndex.lines[0]).toBe("origin: discord/channel/c3");
-		const byKey = await run(["inspect", "work/task/lane"], { total: 1, offset: 0, sessions: [session("c9")] });
-		expect(byKey.requests).toEqual([{ verb: "session.list", params: { limit: 1, originKey: "work/task/lane" } }]);
+		const byKey = await run(["inspect", "discord/channel/c9"], { total: 1, offset: 0, sessions: [session("c9")] });
+		expect(byKey.requests).toEqual([{ verb: "session.list", params: { limit: 1, originKey: "discord/channel/c9" } }]);
 		const missing = await run(["inspect", "work/task/none"], { total: 0, offset: 0, sessions: [] });
 		expect(missing.errors.join(" ")).toContain("Unknown session: work/task/none");
 		expect(missing.exitCode).toBe(1);
+	});
+
+	test("inspection fails closed when the gateway ignores paging or the origin filter", async () => {
+		const legacy = { sessions: [session("first"), session("second")] } as unknown as SessionListResult;
+		for (const selector of ["1", "discord/channel/second"]) {
+			const output = await run(["inspect", selector], legacy);
+			expect(output.lines).toEqual([]);
+			expect(output.errors.join(" ")).toContain("does not support session paging");
+			expect(output.exitCode).toBe(1);
+		}
+		const wrongKey = await run(["inspect", "discord/channel/second"], {
+			total: 1,
+			offset: 0,
+			sessions: [session("first")],
+		});
+		expect(wrongKey.lines).toEqual([]);
+		expect(wrongKey.errors.join(" ")).toContain("did not honor the session inspection filter");
+		const wrongOffset = await run(["inspect", "1"], { total: 2, offset: 0, sessions: [session("first")] });
+		expect(wrongOffset.lines).toEqual([]);
+		expect(wrongOffset.errors.join(" ")).toContain("does not support session paging");
 	});
 
 	for (const args of [["list", "--limit", "0"], ["list", "--limit", "501"], ["inspect"], ["inspect", "-1"], ["bogus"]])
@@ -1542,6 +1562,23 @@ describe("work operator commands", () => {
 		const json = await run(["status", "fix", "--progress", "--json"], progressResult);
 		expect(json.requests).toEqual([{ verb: "work.progress", params: { name: "fix" } }]);
 		expect(json.lines).toEqual([JSON.stringify(progressResult)]);
+	});
+
+	test("human progress escapes transcript terminal controls while JSON retains encoded data", async () => {
+		const malicious = {
+			...progressResult,
+			toolInFlight: null,
+			toolCalls: [{ name: "bad\x1b[2J", intent: "intent\x9b31m", at: null, status: "unknown" as const }],
+			assistantTexts: [{ at: null, text: "start\x1b]0;spoof\x07\u202eend", truncated: false }],
+		};
+		const output = await run(["status", "fix", "--progress"], malicious);
+		const rendered = output.lines.join("\n");
+		for (const code of [0x1b, 0x07, 0x9b, 0x202e]) expect(rendered).not.toContain(String.fromCodePoint(code));
+		expect(rendered).toContain("bad\\u{1b}[2J");
+		expect(rendered).toContain("start\\u{1b}]0;spoof\\u{7}\\u{202e}end");
+		expect(rendered).toContain("now running: unknown (skipped transcript rows)");
+		const json = await run(["status", "fix", "--progress", "--json"], malicious);
+		expect(JSON.parse(json.lines[0] ?? "")).toEqual(malicious);
 	});
 
 	test("work status --progress names an unreadable transcript instead of inventing progress", async () => {

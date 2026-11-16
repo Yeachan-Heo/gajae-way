@@ -55,7 +55,7 @@ function record(value: unknown): Row | undefined {
 
 function iso(value: unknown): string | null {
 	const time = typeof value === "number" ? value : typeof value === "string" ? Date.parse(value) : Number.NaN;
-	return Number.isFinite(time) && time >= 0 ? new Date(time).toISOString() : null;
+	return Number.isFinite(time) && time >= 0 && time <= 8.64e15 ? new Date(time).toISOString() : null;
 }
 
 /** Redacts first, then cuts, so a cut can never expose part of a secret the full text would hide. */
@@ -170,7 +170,16 @@ export async function readTranscriptTail(path: string, options: TranscriptTailOp
 					if (block?.type === "toolCall" && typeof block.name === "string") {
 						const id = typeof block.id === "string" ? block.id : "";
 						const saved = results.get(id);
-						const status = saved === undefined ? (newerMessage ? "no_result" : "running") : saved ? "error" : "ok";
+						const status =
+							saved === undefined
+								? skippedRows > 0
+									? "unknown"
+									: newerMessage
+										? "no_result"
+										: "running"
+								: saved
+									? "error"
+									: "ok";
 						const intent = record(block.arguments)?._i;
 						const call: WorkProgressToolCall = {
 							name: bounded(block.name, TOOL_NAME_MAX_CHARS, redact).text,

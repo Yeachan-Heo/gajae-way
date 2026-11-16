@@ -50,6 +50,17 @@ describe("read surface", () => {
 		expect(instance.calls).toEqual([{ method, params: undefined }]);
 	});
 
+	test("session route forwards continuation and validates paging before reaching the gateway", async () => {
+		const instance = app();
+		const response = await instance.fetch("/api/sessions?limit=7&offset=12");
+		expect(response.status).toBe(200);
+		expect(instance.calls).toEqual([{ method: "session.list", params: { limit: 7, offset: 12 } }]);
+		for (const query of ["limit=0", "limit=501", "offset=-1", "offset=1.5", "limit=", "offset=9007199254740992"]) {
+			expect((await instance.fetch(`/api/sessions?${query}`)).status).toBe(400);
+		}
+		expect(instance.calls).toHaveLength(1);
+	});
+
 	test("there is no route onto gateway.core: it is a capability, not a verb", async () => {
 		const instance = app();
 		expect((await instance.fetch("/api/core")).status).toBe(404);

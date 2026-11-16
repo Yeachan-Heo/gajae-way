@@ -203,6 +203,60 @@ describe("panels", () => {
 });
 
 describe("session rows", () => {
+	test("follows short byte-limited session pages to expose later sessions", async () => {
+		const backend = stub();
+		const rows = Array.from({ length: 5 }, (_, index) => ({
+			...SESSIONS.sessions[0],
+			origin: { platform: "discord", kind: "channel", conversationId: `c${index}` },
+		}));
+		const offsets: number[] = [];
+		const state = await buildSnapshot({
+			request: async (method, params) => {
+				if (method !== "session.list") return backend.request(method, params);
+				const { offset } = params as { offset: number };
+				offsets.push(offset);
+				return { total: rows.length, offset, sessions: rows.slice(offset, offset + 2) };
+			},
+			turns: new TurnTracker(() => FIXED_NOW.getTime()),
+			now: () => FIXED_NOW,
+		});
+		expect(offsets).toEqual([0, 2, 4]);
+		expect(state.sessions.state).toBe("ready");
+		expect(state.sessions.rows.map((row) => row.key)).toEqual(
+			rows.map((row) => `discord/channel/${row.origin.conversationId}`),
+		);
+		expect(state.status.fields.sessions).toBe("5 sessions");
+	});
+
+	test("labels a bounded or failed pagination snapshot as partial", async () => {
+		const backend = stub();
+		for (const fail of [false, true]) {
+			const offsets: number[] = [];
+			const state = await buildSnapshot({
+				request: async (method, params) => {
+					if (method !== "session.list") return backend.request(method, params);
+					const { offset, limit } = params as { offset: number; limit: number };
+					offsets.push(offset);
+					if (fail && offset > 0) throw new Error("page unavailable");
+					return {
+						total: 1100,
+						offset,
+						sessions: Array.from({ length: Math.min(limit, 1100 - offset) }, (_, index) => ({
+							...SESSIONS.sessions[0],
+							origin: { platform: "discord", kind: "channel", conversationId: `c${offset + index}` },
+						})),
+					};
+				},
+				turns: new TurnTracker(() => FIXED_NOW.getTime()),
+				now: () => FIXED_NOW,
+			});
+			expect(state.sessions.state).toBe("partial");
+			expect(state.sessions.rows).toHaveLength(fail ? 500 : 1000);
+			expect(state.sessions.note).toContain(fail ? "page unavailable" : "snapshot row limit");
+			expect(state.sessions.note).toContain(fail ? "showing 500 of 1100" : "showing 1000 of 1100");
+			expect(offsets).toEqual([0, 500]);
+		}
+	});
 	test("origins are humanised structurally, never dumped verbatim", async () => {
 		const state = await snapshot();
 		expect(state.sessions.rows[0]?.fields.title).toBe("discord channel · 1493…5762");
