@@ -12,7 +12,7 @@ import {
 	type ProtocolFailureReason,
 	parseOriginKey,
 } from "@gajae-gateway/protocol";
-import { envelopeErrorCode, GjcCliError, type StatusReport } from "@gajae-gateway/subsession";
+import { envelopeErrorCode, GjcCliError, projectOpState, type StatusReport } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
@@ -908,6 +908,11 @@ export class MonitorPropagator {
 		const state = report.status?.status;
 		if (state === "failed" && !turn.sizeRolled) return { kind: "terminal", raw };
 		if (state === "accepted" || state === "in_flight") return { kind: "hold", reason: "running" };
+		// A terminal transition that did not complete the turn (refusal, max_tokens,
+		// cancellation, missing/unknown receipt) has no result to recover: keep the
+		// pointer and leave the event held for operator judgement.
+		if (state === "terminal_ok" && !completedAuthoringTurn(report.status))
+			return { kind: "hold", reason: "unresolved" };
 		if (state !== "terminal_ok" && !(state === "failed" && turn.sizeRolled)) {
 			// Durable no-send failures (busy-refused, submission-wedged, host-unavailable)
 			// are explicit evidence the operation was never sent. Forget the pointer and recover.
@@ -983,14 +988,22 @@ export class MonitorPropagator {
 	 * unreadable operation's pointer is dropped: there is nothing left to recover.
 	 */
 	async #recoverUnresolvedTurns(): Promise<void> {
-		const visited = new Set<string>();
-		for (const candidate of this.#database.monitors.eventsGivenUp(AUTHORING_TURN_UNRESOLVED)) {
-			if (this.#closing) return;
-			if (visited.has(candidate.event_id)) continue;
+		if (this.#closing) return;
+		const cursor = this.#database.core.metaGet(AUTHORING_RECOVERY_CURSOR) ?? "";
+		const candidates = this.#database.monitors.eventsGivenUp(AUTHORING_TURN_UNRESOLVED, cursor);
+		if (!candidates.length) {
+			// Nothing left after the cursor: wrap so the next sweep starts over instead
+			// of abandoning candidates that were running when they were last probed.
+			if (cursor !== "") this.#database.core.metaSet(AUTHORING_RECOVERY_CURSOR, "");
+			return;
+		}
+		for (const candidate of candidates) {
+			// Advance before probing. One saved operation per sweep bounds what unrelated
+			// open work waits behind, and a slow or unreadable read never pins the scan.
+			this.#database.core.metaSet(AUTHORING_RECOVERY_CURSOR, candidate.event_id);
 			const raw = this.#database.core.metaGet(authoringTurnKey(candidate.event_id));
 			const turn = raw === undefined ? undefined : parseAuthoringTurnPointer(raw);
 			if (!raw || !turn?.eventIds.includes(candidate.event_id)) continue;
-			for (const eventId of turn.eventIds) visited.add(eventId);
 			const members = this.#database.monitors.eventsByIds([...turn.eventIds]);
 			const reopenable = (rows: readonly MonitorEventDbRow[]) =>
 				rows.length === turn.eventIds.length &&
@@ -1021,7 +1034,7 @@ export class MonitorPropagator {
 				if (!turn.sizeRolled) this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, turn.eventIds, raw));
 				continue;
 			}
-			if (state !== "terminal_ok") continue;
+			if (state !== "terminal_ok" || !completedAuthoringTurn(report.status)) continue;
 			const output = await this.#readAuthoringResult(turn, members, report);
 			if (output.status === "unavailable" && (!turn.sizeRolled || output.definitiveLoss)) {
 				this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, turn.eventIds, raw));
@@ -2005,6 +2018,10 @@ export class MonitorPropagator {
 			report = await readStatus();
 		}
 		if (report.status.status !== "terminal_ok") throw new SessionTerminalError(report);
+		// The turn ended, but not necessarily successfully: a refusal, max_tokens stop,
+		// cancellation, or a missing/unknown receipt carries no completed authoring
+		// result. Hold the saved operation instead of delivering its partial body.
+		if (!completedAuthoringTurn(report.status)) throw new AuthoringResultUnavailableError("output_pending");
 		const output = await this.#readAuthoringResult(turn, rows, report);
 		if (output.status === "proven") return output.text;
 		if (output.status === "unavailable" && (!turn.sizeRolled || output.definitiveLoss))
@@ -2848,6 +2865,16 @@ export class MonitorPropagator {
 }
 
 /**
+ * A terminal transition that actually completed the turn. A refusal, max_tokens
+ * stop, cancellation, or missing/unknown receipt is terminal for the operation
+ * but produced no completed authoring result, and must never be delivered as
+ * one. Shared by every recovery path that harvests a saved operation.
+ */
+function completedAuthoringTurn(status: StatusReport["status"]): boolean {
+	return status.status === "terminal_ok" && projectOpState(status) === "completed";
+}
+
+/**
  * Verify that a failure is a durable no-send failure belonging to the specified operation (#742).
  * Checks both the code AND that the operation reference matches (sessionId + opRef).
  */
@@ -3034,6 +3061,12 @@ export function parseAuthoredArray(response: string): unknown {
 
 /** Failure code of an exhausted event given up on an unresolvable authoring turn (#702). */
 const AUTHORING_TURN_UNRESOLVED = "authoring_turn_unresolved";
+/**
+ * Restart-fair scan position for historical late-result recovery. One saved
+ * operation is probed per sweep, so the scan advances a durable cursor instead
+ * of holding every later candidate behind the first slow status read.
+ */
+const AUTHORING_RECOVERY_CURSOR = "monitor_authoring_recovery_cursor";
 
 /** Durable pointer from an event to the authoring turn its last dispatch started (#187). */
 function authoringTurnKey(eventId: string): string {
