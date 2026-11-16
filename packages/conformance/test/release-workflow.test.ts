@@ -163,11 +163,11 @@ describe("release workflow wiring", () => {
 	test("documents which dist-tag writers the workflow serializes", async () => {
 		const readme = await Bun.file(new URL("../../../README.md", import.meta.url)).text();
 		const publishing = readme.split("### Publishing packages")[1]?.split("### CI/CD")[0] ?? "";
-		// The narrowed guarantee: runs requesting one explicit dist-tag share a group, so
-		// writers of that tag serialize even across refs.
-		expect(publishing).toContain(
-			"What the workflow does serialize is every writer of one explicitly requested dist-tag",
-		);
+		// The narrowed guarantee: branch dispatches requesting the same explicit dist-tag
+		// share a group, so writers of that tag serialize even across refs. A tag-ref
+		// dispatch and a tag push are not in that group and are stated separately below.
+		expect(publishing).toContain("The workflow serializes one class of writers itself");
+		expect(publishing).toContain("every branch dispatch that requests the same `npm_tag`");
 		expect(publishing).toContain("cannot interleave a read and a write on that tag");
 		// Serializing costs GitHub's single pending slot, and the README has to say so
 		// instead of implying every requested release is eventually published.
@@ -297,12 +297,14 @@ describe("release workflow wiring", () => {
 			};
 			const rejected = [
 				" next ",
+				"   ",
 				"\tnext",
 				"\u00a0next",
 				"\ufeffnext",
 				"next\u3000",
 				"next\n",
 				"canary\ntag=next",
+				"canary\r\ntag=next",
 				"canary tag",
 				"canary\ttag",
 				"-next",

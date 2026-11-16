@@ -289,8 +289,8 @@ async function resolveEffectiveTag(
 //     `next`), below the highest published version in that channel; a tag that already
 //     points past this version is left alone and this release continues, and an older
 //     version of the channel is converged forward instead of being written back.
-//   - the ordering is decided before every write, including the tag npm writes during
-//     `npm publish`, so no tag is moved backwards even for a moment.
+//   - this run decides ordering before every write, including the tag npm writes during
+//     `npm publish`, so it never writes a version below what it last observed.
 // The remaining window is a version published between the read and the write. A channel
 // tag closes it in the same run: applyDistTag re-derives the tag from the version list
 // after writing and converges forward, so a stale write repairs itself instead of
@@ -580,8 +580,8 @@ async function main(): Promise<void> {
 				}
 				// `npm publish` always writes a tag, so the ordering has to be decided before it
 				// runs: when a newer release already owns this tag, the version is published under
-				// a scratch tag instead, and the pointer is never moved backwards, not even for the
-				// moment between publish and repair.
+				// a scratch tag instead, so this run never writes the pointer below what it last
+				// observed; the window between that read and the write is the documented residual.
 				const tags = await readDistTags(packageName, dir);
 				let target = await tagTarget(packageName, packageVersion, effectiveTag, tags[effectiveTag], dir);
 				let availableTags = tags;
