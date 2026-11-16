@@ -136,6 +136,13 @@ describe("release dist-tag resolution", () => {
 });
 
 describe("release workflow wiring", () => {
+	test("documents the limits of cross-ref npm dist-tag reconciliation", async () => {
+		const readme = await Bun.file(new URL("../../../README.md", import.meta.url)).text();
+		const publishing = readme.split("### Publishing packages")[1]?.split("### CI/CD")[0] ?? "";
+		expect(publishing).toContain("Concurrent releases from different refs can temporarily move a tag backwards");
+		expect(publishing).toContain("an interrupted or failed reconciliation may leave it stale until a successful retry");
+		expect(publishing).not.toContain("so no tag moves backwards even for the moment");
+	});
 	test("serializes publishing per ref only after the casing gate accepts the release", async () => {
 		const workflow = await releaseWorkflow();
 		// A workflow-level group is entered before `canonical-tag` runs, so a case-variant
