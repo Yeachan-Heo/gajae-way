@@ -714,6 +714,21 @@ export function isPermanentDiscordUnreadable(error: unknown): boolean {
 }
 
 /**
+ * A Discord response that proves the target no longer exists, as opposed to a
+ * permission problem the operator can repair. Replay verification terminalizes
+ * only these; access failures keep the intent retryable.
+ */
+export function isDefinitiveDiscordNotFound(error: unknown): boolean {
+	const candidate = error as { readonly code?: unknown; readonly status?: unknown; readonly httpStatus?: unknown };
+	return (
+		candidate?.code === 10_003 ||
+		candidate?.code === 10_008 ||
+		candidate?.status === 404 ||
+		candidate?.httpStatus === 404
+	);
+}
+
+/**
  * Replays the bounded gap after `cursor` in ascending id order, delivering each message and
  * advancing only past finished ones. Stops early on an unavailable delivery or when discard
  * candidates pile up (uniform failure); reports `truncated` when `maxPages` full pages were

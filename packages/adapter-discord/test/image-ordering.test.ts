@@ -1099,6 +1099,54 @@ test("a transient source read during replay defers instead of dead-lettering", a
 	}
 }, 12_000);
 
+test("a permission-only source read during replay defers instead of dead-lettering", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-source-permission-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "permission-source-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const request = {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 30_000) },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, dm: true, request }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async (query: string) => {
+						if (typeof query !== "string" || query !== id) return [];
+						throw Object.assign(new Error("Missing Access"), { code: 50_001, status: 403 });
+					},
+				},
+			}),
+			requests,
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(adapter.deadLetters).toEqual([]);
+		const persisted = JSON.parse(await readFile(outboxPath, "utf8"))[0];
+		expect(persisted.terminal).toBeUndefined();
+		expect(persisted.failureAt).toBeNumber();
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
 test("a persisted request whose source attachment was replaced is not replayed", async () => {
 	const home = await mkdtemp(join(tmpdir(), "discord-image-order-source-replaced-"));
 	const cleanupTimers = trackTimers();

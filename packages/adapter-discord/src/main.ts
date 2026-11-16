@@ -58,6 +58,7 @@ import {
 	classifyRecoveryFailure,
 	clearAttempt,
 	recoveryCursorPath as defaultRecoveryCursorPath,
+	isDefinitiveDiscordNotFound,
 	isPermanentDiscordUnreadable,
 	loadRecoveryCursors,
 	pruneKnownDms,
@@ -2580,15 +2581,18 @@ export class ReconnectingGateway {
 	private async fetchImageSource(
 		channelId: string,
 		messageId: string,
+		definitivelyGoneOnly = false,
 	): Promise<
 		{ readonly message: DiscordInboundMessage } | { readonly outcome: "gone" | "unavailable"; readonly summary: string }
 	> {
+		// Replay verification must not treat an operator-fixable permission failure as
+		// a deleted source: those keep retrying until the intent deadline.
+		const isGone = definitivelyGoneOnly ? isDefinitiveDiscordNotFound : isPermanentDiscordUnreadable;
 		let channel: unknown;
 		try {
 			channel = await this.discord.channels.fetch(channelId);
 		} catch (error) {
-			if (isPermanentDiscordUnreadable(error))
-				return { outcome: "gone", summary: `channel unavailable: ${summarizeRecoveryFailure(error)}` };
+			if (isGone(error)) return { outcome: "gone", summary: `channel unavailable: ${summarizeRecoveryFailure(error)}` };
 			return { outcome: "unavailable", summary: "channel fetch failed" };
 		}
 		if (!isRecoverableChannel(channel))
@@ -2601,8 +2605,7 @@ export class ReconnectingGateway {
 				}
 			).fetch(messageId);
 		} catch (error) {
-			if (isPermanentDiscordUnreadable(error))
-				return { outcome: "gone", summary: `message unavailable: ${summarizeRecoveryFailure(error)}` };
+			if (isGone(error)) return { outcome: "gone", summary: `message unavailable: ${summarizeRecoveryFailure(error)}` };
 			return { outcome: "unavailable", summary: "message fetch failed" };
 		}
 		if (!message || typeof message !== "object" || !("author" in message))
@@ -2622,7 +2625,7 @@ export class ReconnectingGateway {
 	): Promise<{ readonly ok: true } | { readonly ok: false; readonly terminal: boolean; readonly summary: string }> {
 		let inbound = source?.id === current.messageId ? source : undefined;
 		if (!inbound) {
-			const fetched = await this.fetchImageSource(current.channelId, current.messageId);
+			const fetched = await this.fetchImageSource(current.channelId, current.messageId, true);
 			if (!("message" in fetched)) return { ok: false, terminal: fetched.outcome === "gone", summary: fetched.summary };
 			inbound = fetched.message;
 		}
@@ -2844,8 +2847,9 @@ export class ReconnectingGateway {
 						}
 					}
 					// Attempt directly even when the conversation's history is unreadable:
-					// a permanent message/channel error must reach its terminal diagnosis,
-					// and a persisted request needs no Discord read at all.
+					// a permanent message/channel error must reach its terminal diagnosis, and a
+					// persisted request re-reads only its own source each attempt so a deleted or
+					// replaced attachment is detected without a full history walk.
 					if ((await this.retryPendingImage(entry)) === "unavailable") incomplete = true;
 				}
 			}
