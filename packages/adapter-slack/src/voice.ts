@@ -30,24 +30,6 @@ const SLACK_FILE_REDIRECT_HOSTS = ["files.slack.com", "files-edge.slack.com"] as
 /** Turn ids remembered for picking the speaker's voice; bounded like every other adapter memory. */
 const MAX_REMEMBERED_SPEAKERS = 1_000;
 
-/**
- * The voices `sionic-ai/qwen3-tts-1.7b` on OpenGateway accepts, measured
- * 2026-11-16: anything else is a 400 `Invalid voice`. Per-speaker overrides are
- * checked against this list at load, so a typo costs that override rather than
- * every reply it would have applied to.
- */
-export const OPENGATEWAY_TTS_VOICES: ReadonlySet<string> = new Set([
-	"aiden",
-	"dylan",
-	"eric",
-	"ono_anna",
-	"ryan",
-	"serena",
-	"sohee",
-	"uncle_fu",
-	"vivian",
-]);
-
 export interface SlackTranscriptionConfig {
 	readonly endpoint: string;
 	readonly model: string;
@@ -133,7 +115,7 @@ export async function transcribeSlackVoiceClip(
 		const form = new FormData();
 		form.set("model", config.model);
 		if (config.language) form.set("language", config.language);
-		// `json`, not `verbose_json`: OpenGateway answers verbose_json with a 400.
+		// `json` is the portable shape: a `text` field, no provider-specific extras.
 		form.set("response_format", "json");
 		form.set("file", new Blob([audio.bytes], { type: mimetype }), clipFileName(file, mimetype));
 		return await withTimeout(timeoutMs, async (signal) => {

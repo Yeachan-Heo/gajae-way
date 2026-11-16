@@ -30,15 +30,15 @@ const CLIP: SlackFileLike = {
 	url_private: "https://files.slack.com/files-pri/T1-F0CLIP0001/audio_message.webm",
 	url_private_download: "https://files.slack.com/files-pri/T1-F0CLIP0001/download/audio_message.webm",
 };
-const STT = "https://stt.test/v1/audio/transcriptions";
-const TTS = "https://stt.test/v1/audio/speech";
-const TRANSCRIPTION = { endpoint: STT, model: "sionic-ai/qwen3-asr-1.7b", language: "ko", apiKey: "og-test-key" };
+const STT = "https://stt.example.test/v1/audio/transcriptions";
+const TTS = "https://tts.example.test/v1/audio/speech";
+const TRANSCRIPTION = { endpoint: STT, model: "example-stt", language: "ko", apiKey: "speech-test-key" };
 const SPEECH: SlackSpeechConfig = {
 	endpoint: TTS,
-	model: "sionic-ai/qwen3-tts-1.7b",
-	voice: "sohee",
+	model: "example-tts",
+	voice: "voice-a",
 	voices: {},
-	apiKey: "og-test-key",
+	apiKey: "speech-test-key",
 };
 const WAV = Uint8Array.from([...Buffer.from("RIFF"), ...new Uint8Array(60)]);
 const AUDIO = Uint8Array.from([0x1a, 0x45, 0xdf, 0xa3, 1, 2, 3, 4]);
@@ -102,9 +102,9 @@ test("transcription downloads with the bot token and posts an OpenAI-compatible 
 	expect(new Headers(calls[0]?.init?.headers).get("authorization")).toBe("Bearer xoxb-bot");
 	expect(calls[0]?.init?.redirect).toBe("manual");
 	const post = calls[1]?.init;
-	expect(new Headers(post?.headers).get("authorization")).toBe("Bearer og-test-key");
+	expect(new Headers(post?.headers).get("authorization")).toBe("Bearer speech-test-key");
 	const form = post?.body as FormData;
-	expect(form.get("model")).toBe("sionic-ai/qwen3-asr-1.7b");
+	expect(form.get("model")).toBe("example-stt");
 	expect(form.get("language")).toBe("ko");
 	expect(form.get("response_format")).toBe("json");
 	const file = form.get("file") as File;
@@ -176,11 +176,13 @@ test("a redirect to another Slack file host is followed without the bot token", 
 // ---- voice selection ------------------------------------------------------------------
 
 test("voice selection prefers the speaker, then the conversation, then the default", () => {
-	const speech = { ...SPEECH, voices: { U1: "ryan", C1: "vivian", D9: "aiden" } };
-	expect(selectVoice(speech, "U1", "C1")).toBe("ryan");
-	expect(selectVoice(speech, "U2", "C1")).toBe("vivian");
-	expect(selectVoice(speech, undefined, "D9")).toBe("aiden");
-	expect(selectVoice(speech, "U2", "C2")).toBe("sohee");
+	const speech = { ...SPEECH, voices: { U1: "voice-b", C1: "voice-c", D9: "voice-b" } };
+	expect(selectVoice(speech, "U1", "C1")).toBe("voice-b");
+	expect(selectVoice(speech, "U2", "C1")).toBe("voice-c");
+	expect(selectVoice(speech, undefined, "D9")).toBe("voice-b");
+	expect(selectVoice(speech, "U2", "C2")).toBe("voice-a");
+	// Any provider voice name works, not just a built-in set.
+	expect(selectVoice({ ...speech, voices: { U3: "Provider/Voice_C" } }, "U3", "C2")).toBe("Provider/Voice_C");
 });
 
 // ---- outbound delivery ----------------------------------------------------------------
@@ -278,9 +280,9 @@ test("a voiceText delivery posts the text, confirms, then uploads the WAV into t
 	expect(gateway.requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "d1" } }]);
 	expect(api.uploads[0]?.bytes).toEqual(WAV);
 	expect(JSON.parse(String(tts.calls[0]?.init?.body))).toEqual({
-		model: "sionic-ai/qwen3-tts-1.7b",
+		model: "example-tts",
 		input: "세 시 회의입니다.",
-		voice: "sohee",
+		voice: "voice-a",
 		response_format: "wav",
 	});
 });
@@ -342,13 +344,16 @@ test("a delivery without voiceText never synthesizes", async () => {
 
 test("the remembered speaker's voice wins over the conversation's; an unknown turn uses the conversation's", async () => {
 	const tts = speechRecorder();
-	const replies = new SlackVoiceReplies({ ...SPEECH, voices: { U1: "ryan", C1: "vivian" } }, { fetch: tts.fetcher });
+	const replies = new SlackVoiceReplies(
+		{ ...SPEECH, voices: { U1: "voice-b", C1: "voice-c" } },
+		{ fetch: tts.fetcher },
+	);
 	replies.rememberSpeaker("turn-1", "U1");
 	const api = new Api();
 	await replies.reply(api, { turnId: "turn-1", voiceText: "a" }, "C1", undefined);
 	await replies.reply(api, { turnId: "turn-2", voiceText: "b" }, "C1", undefined);
 	await replies.reply(api, { turnId: "turn-3", voiceText: "c" }, "C2", undefined);
-	expect(tts.calls.map((call) => JSON.parse(String(call.init?.body)).voice)).toEqual(["ryan", "vivian", "sohee"]);
+	expect(tts.calls.map((call) => JSON.parse(String(call.init?.body)).voice)).toEqual(["voice-b", "voice-c", "voice-a"]);
 });
 
 // ---- end to end through the adapter ---------------------------------------------------
@@ -466,7 +471,7 @@ test("the voice turn's speaker picks the reply voice end to end", async () => {
 		if (url === STT) return Response.json({ text: "안녕" });
 		return new Response(WAV);
 	});
-	const f = await adapter({ transcription: TRANSCRIPTION, speech: { ...SPEECH, voices: { U1: "eric" } } }, fetcher);
+	const f = await adapter({ transcription: TRANSCRIPTION, speech: { ...SPEECH, voices: { U1: "voice-c" } } }, fetcher);
 	try {
 		await f.started.handleEvent(clipMessage);
 		await f.started.ingress.drain();
@@ -481,7 +486,7 @@ test("the voice turn's speaker picks the reply voice end to end", async () => {
 		for (let i = 0; i < 20 && f.api.uploads.length === 0; i++) await Bun.sleep(5);
 		expect(f.api.uploads.map((upload) => upload.name)).toEqual(["voice-reply.wav"]);
 		const tts = calls.find((call) => call.url === TTS);
-		expect(JSON.parse(String(tts?.init?.body)).voice).toBe("eric");
+		expect(JSON.parse(String(tts?.init?.body)).voice).toBe("voice-c");
 	} finally {
 		f.stop();
 	}
@@ -512,7 +517,7 @@ async function configFixture(body: (home: string, save: (voice: unknown) => Prom
 	try {
 		await writeFile(join(home, "bot"), "xoxb-secret");
 		await writeFile(join(home, "app"), "xapp-secret");
-		await writeFile(join(home, "og-key"), " og-secret-value \n");
+		await writeFile(join(home, "speech-key"), " speech-secret-value \n");
 		await body(home, (voice) =>
 			writeFile(
 				join(home, "adapter-slack.json"),
@@ -526,12 +531,12 @@ async function configFixture(body: (home: string, save: (voice: unknown) => Prom
 
 const VOICE_SECTION = {
 	endpoint: STT,
-	model: "sionic-ai/qwen3-asr-1.7b",
+	model: "example-stt",
 	language: "ko",
-	apiKeyFile: "og-key",
+	apiKeyFile: "speech-key",
 	speechEndpoint: TTS,
-	speechModel: "sionic-ai/qwen3-tts-1.7b",
-	voice: "sohee",
+	speechModel: "example-tts",
+	voice: "voice-a",
 };
 
 test("an absent voice section loads no voice config", async () => {
@@ -546,38 +551,41 @@ test("a voice section loads transcription and speech with the key from a file or
 		await save(VOICE_SECTION);
 		const fromFile = await loadSlackAdapterConfig({ GAJAEWAY_HOME: home });
 		expect(fromFile.voice).toEqual({
-			transcription: { endpoint: STT, model: "sionic-ai/qwen3-asr-1.7b", language: "ko", apiKey: "og-secret-value" },
+			transcription: { endpoint: STT, model: "example-stt", language: "ko", apiKey: "speech-secret-value" },
 			speech: {
 				endpoint: TTS,
-				model: "sionic-ai/qwen3-tts-1.7b",
-				voice: "sohee",
+				model: "example-tts",
+				voice: "voice-a",
 				voices: {},
-				apiKey: "og-secret-value",
+				apiKey: "speech-secret-value",
 			},
 		});
 		expect(fromFile).not.toHaveProperty("voice.apiKeyFile");
 		const { apiKeyFile: _file, speechEndpoint: _a, speechModel: _b, voice: _c, ...sttOnly } = VOICE_SECTION;
-		await save({ ...sttOnly, apiKeyEnv: "OG_TEST_KEY" });
-		const fromEnv = await loadSlackAdapterConfig({ GAJAEWAY_HOME: home, OG_TEST_KEY: "env-secret" });
+		await save({ ...sttOnly, apiKeyEnv: "SPEECH_API_KEY" });
+		const fromEnv = await loadSlackAdapterConfig({ GAJAEWAY_HOME: home, SPEECH_API_KEY: "env-secret" });
 		expect(fromEnv.voice?.transcription.apiKey).toBe("env-secret");
 		expect(fromEnv.voice?.speech).toBeUndefined();
 	});
 });
 
-test("voices overrides keep valid user and conversation entries and drop bad ones with a warning", async () => {
+test("voices overrides accept any provider voice name and drop bad keys, blank and non-string values", async () => {
 	await configFixture(async (home, save) => {
 		await save({
 			...VOICE_SECTION,
-			voices: { U1: "ryan", C1: "vivian", D1: "ono_anna", U2: "Ryan", C2: "alloy", U3: 7, alice: "eric" },
+			voices: { U1: "voice-b", C1: "voice-c", D1: "Provider/Voice_C", U2: "  ", U3: 7, alice: "voice-b" },
 		});
 		const warnings: string[] = [];
 		const config = await loadSlackAdapterConfig({ GAJAEWAY_HOME: home }, (line) => warnings.push(line));
-		expect(config.voice?.speech?.voices).toEqual({ U1: "ryan", C1: "vivian", D1: "ono_anna" });
-		expect(warnings).toHaveLength(4);
-		expect(warnings.join("\n")).toContain("voice.voices.C2");
-		expect(warnings.join("\n")).not.toContain("og-secret-value");
+		// Whatever the provider calls its voices is kept as written.
+		expect(config.voice?.speech?.voices).toEqual({ U1: "voice-b", C1: "voice-c", D1: "Provider/Voice_C" });
+		expect(warnings).toHaveLength(3);
+		expect(warnings.join("\n")).toContain("voice.voices.U2");
+		expect(warnings.join("\n")).toContain("voice.voices.U3");
+		expect(warnings.join("\n")).toContain('voice.voices key "alice"');
+		expect(warnings.join("\n")).not.toContain("speech-secret-value");
 		// A dropped override falls back to the default voice.
-		expect(selectVoice(config.voice?.speech as SlackSpeechConfig, "U2", "C2")).toBe("sohee");
+		expect(selectVoice(config.voice?.speech as SlackSpeechConfig, "U2", "C2")).toBe("voice-a");
 	});
 });
 
@@ -593,14 +601,14 @@ test("a present but broken voice section is a startup error that never discloses
 			[{ ...noKey, apiKeyEnv: "MISSING_KEY" }, "MISSING_KEY is unset"],
 			[{ ...VOICE_SECTION, apiKeyFile: "missing" }, "Check voice.apiKeyFile"],
 			[{ ...VOICE_SECTION, timeoutMs: 0 }, "positive integer"],
-			[{ ...VOICE_SECTION, voices: ["ryan"] }, "voices must be an object"],
+			[{ ...VOICE_SECTION, voices: ["voice-a"] }, "voices must be an object"],
 		];
 		for (const [voice, message] of broken) {
 			await save(voice);
 			const error = await loadSlackAdapterConfig({ GAJAEWAY_HOME: home }).catch((caught: unknown) => caught);
 			expect(error).toBeInstanceOf(SlackAdapterStartupError);
 			expect((error as Error).message).toContain(message);
-			expect((error as Error).message).not.toContain("og-secret-value");
+			expect((error as Error).message).not.toContain("speech-secret-value");
 		}
 	});
 });

@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { type ChannelEngagementPolicy, ENGAGEMENT_AUDIENCES, ENGAGEMENT_MODES } from "@gajae-gateway/protocol";
 import { MIN_SOCKET_LIVENESS_TIMEOUT_MS } from "./socket";
-import { type LoadedSlackVoiceConfig, OPENGATEWAY_TTS_VOICES } from "./voice";
+import type { LoadedSlackVoiceConfig } from "./voice";
 
 export interface SlackAdapterConfig {
 	readonly botTokenFile: string;
@@ -187,13 +187,13 @@ async function loadVoiceConfig(
 			warn(`Slack adapter voice.voices key ${JSON.stringify(key)} is not a Slack user or conversation id; ignored.`);
 			continue;
 		}
-		if (typeof value !== "string" || !OPENGATEWAY_TTS_VOICES.has(value)) {
+		if (typeof value !== "string" || value.trim() === "") {
 			warn(
-				`Slack adapter voice.voices.${key} ${JSON.stringify(value)} is not one of ${[...OPENGATEWAY_TTS_VOICES].join(", ")}; the default voice is used.`,
+				`Slack adapter voice.voices.${key} ${JSON.stringify(value)} is not a non-empty voice name; the default voice is used.`,
 			);
 			continue;
 		}
-		voices[key] = value;
+		voices[key] = value.trim();
 	}
 	return {
 		transcription,
