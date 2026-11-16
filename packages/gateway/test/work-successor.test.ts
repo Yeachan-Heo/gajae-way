@@ -412,6 +412,85 @@ test("rootless child report survives a held parent's end evidence until late rec
 	}
 });
 
+test("a child report drained after the parent's hold lands is retained instead of steered", async () => {
+	const f = await fixture(8, undefined, { allowNested: true });
+	const parent = await f.manager.start({ name: "steady", text: "steady parent work", repo: f.repo, base: f.base });
+	if (!parent.started) throw new Error("unexpected hold");
+	await until(() => f.db.work.workAttemptGet(parent.opRef)?.sendPhase === "accepted");
+	const child = async (name: string) => {
+		const started = await f.manager.start({
+			name,
+			text: `${name} work`,
+			cwd: f.dir,
+			callerSessionId: parent.sessionId,
+		});
+		if (!started.started) throw new Error(`${name} held`);
+		return started;
+	};
+	const firstChild = await child("first-child");
+	const secondChild = await child("second-child");
+	// One drain snapshot must carry both reports, so the second admission reuses the first's job read.
+	let steers = 0;
+	let steered!: () => void;
+	let release!: () => void;
+	const steering = new Promise<void>((resolve) => {
+		steered = resolve;
+	});
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const steer = f.port.steer.bind(f.port);
+	f.port.steer = async (input) => {
+		if (input.sessionId !== parent.sessionId) return steer(input);
+		steers++;
+		if (steers === 1) {
+			steered();
+			await gate;
+		}
+		return steer(input);
+	};
+	await f.port.runExclusive(workSessionKey("steady"), async () => {
+		f.port.complete(firstChild.opRef, "first child result");
+		f.port.complete(secondChild.opRef, "second child result");
+		await until(() => f.db.work.laneReportsByParent("steady").length === 2);
+	});
+	await steering;
+	// The parent's observer holds the lane outside this session lock while the first steer is out.
+	const startedAt = Date.parse(f.db.work.workAttemptGet(parent.opRef)!.startedAt);
+	const live = f.port.status;
+	f.port.status = async (input) =>
+		input.opRef !== parent.opRef
+			? live(input)
+			: {
+					operationRef: parent.opRef,
+					status: {
+						status: "failed",
+						clientRef: parent.opRef,
+						commandId: "command-parent",
+						turnId: "turn-parent",
+						startedAt,
+						terminalAt: startedAt + 1,
+						receiptState: "missing",
+						error: { code: "prompt_deadline_exceeded" },
+					},
+					summaryCompleted: true,
+				};
+	try {
+		await until(() => f.job("steady").state === "awaiting_operator");
+		// The hold is durable without any proof that the native execution ended.
+		const parked = f.db.work.workAttemptGet(parent.opRef)!;
+		expect(parked.terminal).toBeNull();
+		expect(parked.turnEndObservedAt).toBeUndefined();
+	} finally {
+		release();
+	}
+	await f.port.runExclusive(workSessionKey("steady"), async () => {});
+	expect(steers).toBe(1);
+	expect(f.db.work.laneReportsByParent("steady").find((row) => row.child_op_ref === secondChild.opRef)).toMatchObject({
+		state: "pending",
+	});
+});
+
 for (const initialMode of ["start", "run"] as const) {
 	test(`nested successor authorization follows the caller's captured owner across ${initialMode}/run and lane reuse`, async () => {
 		const f = await fixture(8, undefined, { allowNested: true });

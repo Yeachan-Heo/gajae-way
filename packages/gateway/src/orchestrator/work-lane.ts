@@ -2717,15 +2717,18 @@ export class WorkLaneManager {
 			if (this.#stopped) return;
 			let job: LaneJobRecord | undefined;
 			let unavailable = this.#db.bindings.isQuarantined("work", laneJobIdentity(parentName).jobId);
-			if (!unavailable) {
-				try {
-					job = this.#job(parentName, true);
-				} catch {
-					unavailable = true;
-				}
-			}
 			for (let row of this.#db.work.laneReportsByParent(parentName)) {
 				if (this.#stopped) return;
+				// The observer holds a lane outside this session lock, so an awaited steer above may
+				// have parked the parent. Re-read the durable job before admitting the next report.
+				if (!unavailable) {
+					try {
+						job = this.#job(parentName, true);
+					} catch {
+						unavailable = true;
+						job = undefined;
+					}
+				}
 				if (["consumed", "fallback", "undeliverable"].includes(row.state)) continue;
 				if (unavailable || !job) {
 					await this.#resolveUnavailableLaneReport(row);
@@ -2904,7 +2907,29 @@ export class WorkLaneManager {
 			this.#logLaneReportTransition(row, "claimed", "held", "parent_quarantined_ambiguous");
 	}
 
+	/** A steer may only land on a parent whose durable lane and attempt are still live. */
+	#steerAdmissible(parentName: string, runtime: WorkAttemptRuntime): boolean {
+		let job: LaneJobRecord | undefined;
+		try {
+			job = this.#job(parentName, true);
+		} catch {
+			return false;
+		}
+		if (!job) return false;
+		if (
+			job.state === "awaiting_operator" ||
+			job.state === "awaiting_checks" ||
+			job.state === "stalled" ||
+			job.state === "done" ||
+			job.state === "aborted"
+		)
+			return false;
+		const fresh = this.#attemptByOpRef(runtime.opRef);
+		return Boolean(fresh && !fresh.terminal && fresh.turnEndObservedAt === undefined && this.#binding(fresh));
+	}
+
 	async #claimAndSteerLaneReport(row: LaneReportRow, job: LaneJobRecord, runtime: WorkAttemptRuntime): Promise<void> {
+		if (!this.#steerAdmissible(row.parent_name, runtime)) return;
 		const claimSeq = row.claim_seq + 1;
 		const clientRef = laneSteerClientRef(row.report_id, claimSeq);
 		const claimed = this.#reportMutation((tx) =>
@@ -2922,6 +2947,8 @@ export class WorkLaneManager {
 				this.#logLaneReportTransition(row, row.state, "held", "steer_acceptance_uncertain");
 			return;
 		}
+		// Retain an uncertain steer instead of delivering it into a held or reconciling parent.
+		if (!this.#steerAdmissible(row.parent_name, runtime)) return;
 		await this.#sendLaneSteer(row, job, runtime);
 	}
 
