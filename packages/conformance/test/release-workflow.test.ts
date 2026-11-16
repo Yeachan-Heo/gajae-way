@@ -169,6 +169,9 @@ describe("release workflow wiring", () => {
 			"What the workflow does serialize is every writer of one explicitly requested dist-tag",
 		);
 		expect(publishing).toContain("cannot interleave a read and a write on that tag");
+		// Serializing costs GitHub's single pending slot, and the README has to say so
+		// instead of implying every requested release is eventually published.
+		expect(publishing).toContain("a third same-tag dispatch replaces the older pending one");
 		// The residual has to stay documented: a derived channel tag is not in that group,
 		// so the README must not promise cross-ref non-regression for every write.
 		expect(publishing).toContain("Serialization therefore covers requested tags, not the channel tag");
