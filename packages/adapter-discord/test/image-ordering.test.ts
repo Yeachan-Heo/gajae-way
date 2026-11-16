@@ -1552,6 +1552,63 @@ test("completed DM tombstones are rebound into recovery targets before invalidat
 	}
 });
 
+test("a restore rediscovers an in-window completed DM evicted from knownDms", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-restore-evicted-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "evicted-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 8 * 24 * 60 * 60 * 1000);
+	const message = dmMessage(id, channelId, true);
+	const requests: Array<{ verb: string; params: any }> = [];
+	const fetched: string[] = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { other: snowflakeFromTimestamp(Date.now() - 60_000) },
+			knownDms: Object.fromEntries(
+				Array.from({ length: 100 }, (_, index) => [
+					`known-${index}`,
+					{ lastSeenAt: new Date().toISOString(), seq: index + 1 },
+				]),
+			),
+			sequence: 100,
+			gatewayDbIdentity: "0:0",
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{
+					messageId: id,
+					channelId,
+					dm: true,
+					completed: true,
+					completedAt: Date.now() - 8 * 24 * 60 * 60 * 1000,
+				},
+			]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async (requested: string) => {
+				fetched.push(requested);
+				return { messages: { fetch: async () => (requested === channelId ? [message] : []) } };
+			},
+			requests,
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "new-db" } } : { engaged: false, turnId: null },
+			async () => ({ images: [image], notice: "" }),
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		expect(fetched).toContain(channelId);
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([id]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
 test("completed rows outside every recovery target are reclaimed", async () => {
 	const home = await mkdtemp(join(tmpdir(), "discord-image-order-reclaim-"));
 	const cleanupTimers = trackTimers();

@@ -3273,6 +3273,17 @@ export class ReconnectingGateway {
 					]),
 				),
 			};
+			// A restored completion is also a discovery target: give its DM the replay
+			// floor when it has no in-window watermark so history scans the full restore
+			// horizon instead of the 24h bootstrap window.
+			for (const dm of completedDms) {
+				const existing = next.recoveredThrough[dm.channelId];
+				if (existing === undefined || snowflakeIsAfter(existing, floor))
+					next = {
+						...next,
+						recoveredThrough: { ...next.recoveredThrough, [dm.channelId]: floor },
+					};
+			}
 			const now = Date.now();
 			const cutoff = now - RECOVERY_KNOWN_DM_TTL_MS;
 			// Rebind below every existing live slot: a completed DM that only needs a history
