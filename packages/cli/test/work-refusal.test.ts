@@ -1,8 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ProtocolError } from "@gajae-gateway/protocol";
+import { GajaewayClient } from "@gajae-gateway/sdk";
+import { main } from "../src/main";
 
 // Exercise protocol serialization, real SDK decoding, and the CLI process catch.
 async function runRefusal(command: string, detail: unknown, message = "work send rejected", code = "verb_failed") {
@@ -72,6 +74,7 @@ const safeCauses = [
 	"no_active_turn",
 	"client_ref_conflict",
 	"session_not_found",
+	"sdk_refused",
 ];
 
 describe("work refusal CLI protocol boundary", () => {
@@ -94,17 +97,8 @@ describe("work refusal CLI protocol boundary", () => {
 			});
 		}
 	}
-	for (const cause of [
-		undefined,
-		"sdk_refused",
-		"SECRET",
-		"busy\nSECRET",
-		{ code: "busy", message: "SECRET" },
-		["busy"],
-		null,
-		1,
-	]) {
-		test(`omits absent, redacted or malformed cause ${JSON.stringify(cause)}`, async () => {
+	for (const cause of [undefined, "SECRET", "busy\nSECRET", { code: "busy", message: "SECRET" }, ["busy"], null, 1]) {
+		test(`omits absent, unrecognized or malformed cause ${JSON.stringify(cause)}`, async () => {
 			const result = await runRefusal("run", { reasonCode: "send_rejected", cause, message: "SECRET" });
 			expect(result.stderr).toBe("work send rejected\n");
 			expect(result.exitCode).toBe(1);
@@ -120,6 +114,52 @@ describe("work refusal CLI protocol boundary", () => {
 			expect(result.stderr).toBe("work send rejected\n");
 		});
 	}
+	test("renders and redacts refusal errors from a separately loaded protocol package", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-nested-protocol-"));
+		const copy = join(directory, "errors.ts");
+		await Bun.write(copy, Bun.file(join(import.meta.dir, "../../protocol/src/errors.ts")));
+		const { ProtocolError: NestedProtocolError } = await import(copy);
+		const client: GajaewayClient = Object.create(GajaewayClient.prototype);
+		let failure: Error = new Error("unset");
+		client.request = async () => {
+			throw failure;
+		};
+		client.close = async () => {};
+		const connect = spyOn(GajaewayClient, "connectSocketWithBackoff").mockResolvedValue(client);
+		const errors: string[] = [];
+		const logged = spyOn(console, "error").mockImplementation((line) => errors.push(String(line)));
+		const previousExit = process.exitCode;
+		try {
+			for (const command of ["run", "start"]) {
+				for (const [cause, expected] of [
+					["busy", " cause=busy"],
+					["sdk_refused", " cause=sdk_refused"],
+					["SECRET", ""],
+				]) {
+					failure = new NestedProtocolError("verb_failed", "SECRET remote message", {
+						reasonCode: "send_rejected",
+						cause,
+						diagnostic: "SECRET detail",
+					});
+					expect(failure).not.toBeInstanceOf(ProtocolError);
+					await main(["--socket", "/unused", "work", command, "fix", "task"]);
+					expect(errors.pop()).toBe(`work send rejected${expected}`);
+					expect(process.exitCode).toBe(1);
+				}
+			}
+			failure = new NestedProtocolError("invalid_params", "unrelated error", {
+				reasonCode: "send_rejected",
+				cause: "busy",
+			});
+			await main(["--socket", "/unused", "work", "run", "fix", "task"]);
+			expect(errors.pop()).toBe("unrelated error");
+		} finally {
+			connect.mockRestore();
+			logged.mockRestore();
+			process.exitCode = previousExit ?? 0;
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
 	test("does not reinterpret other verbs or error codes", async () => {
 		for (const [command, code] of [
 			["status", "verb_failed"],

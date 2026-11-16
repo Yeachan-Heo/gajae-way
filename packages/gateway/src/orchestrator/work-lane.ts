@@ -5,11 +5,13 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import {
 	type ChatMessagePayload,
 	isSilentOutput,
+	isWorkRefusalCause,
 	type OriginRef,
 	originKey,
 	type PromptStatusBody,
 	ProtocolError,
 	parseOriginKey,
+	WORK_REFUSAL_CODES as refusalCodes,
 	validateOriginRef,
 	type WorkDirective,
 	type WorkDirectiveResult,
@@ -42,7 +44,6 @@ import { buildDeliveryPayload } from "../delivery/delivery";
 import { BrokerAuthorityError, type Store } from "../store";
 import {
 	type LaneReportRow,
-	WORK_REFUSAL_CODES as refusalCodes,
 	resolveLaneReportOrigin,
 	terminalEvidence,
 	unresolvedTerminalReceipt,
@@ -3446,10 +3447,7 @@ export function reportText(
 		endState === "completed" && checksVerified ? "completed" : endState === "failed" ? "failed" : "attempt_ended";
 	const lead = reason === "end_turn" ? "" : `${reason}: `;
 	const head = `[lane ${name}] ${label}: ${lead}`;
-	const safeRefusalCode =
-		reason === "send_rejected" && refusalCode && (refusalCodes.has(refusalCode) || refusalCode === "sdk_refused")
-			? refusalCode
-			: undefined;
+	const safeRefusalCode = reason === "send_rejected" && isWorkRefusalCause(refusalCode) ? refusalCode : undefined;
 	let body =
 		output.disposition === "unavailable"
 			? pendingOutput

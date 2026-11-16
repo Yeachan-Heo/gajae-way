@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
 	type ChatMessagePayload,
 	isSilentOutput,
+	isWorkRefusalCause,
 	type OriginRef,
 	originKey,
 	validateOriginRef,
@@ -300,16 +301,6 @@ export function workAccepted(runtime: WorkAttemptRuntime): boolean {
 	return runtime.sendPhase === "accepted" || runtime.output.proof !== null || runtime.output.knownSilence !== null;
 }
 
-export const WORK_REFUSAL_CODES: ReadonlySet<string> = new Set([
-	"busy",
-	"steer_refused",
-	"invalid_params",
-	"not_running",
-	"no_active_turn",
-	"client_ref_conflict",
-	"session_not_found",
-]);
-
 const WORK_REASON_CODES = new Set([
 	"end_turn",
 	"prompt_deadline_exceeded",
@@ -400,7 +391,7 @@ export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: strin
 		workAssert(WORK_REASON_CODES.has(terminal.reasonCode));
 		if (terminal.refusalCode !== undefined) {
 			workAssert(terminal.kind === "local" && terminal.reasonCode === "send_rejected" && terminal.status === undefined);
-			workAssert(WORK_REFUSAL_CODES.has(terminal.refusalCode) || terminal.refusalCode === "sdk_refused");
+			workAssert(isWorkRefusalCause(terminal.refusalCode));
 		}
 		if (terminal.kind === "broker") workAssert(terminal.status !== undefined);
 		if (terminal.status !== undefined) {
