@@ -337,6 +337,31 @@ test("a different origin's unresolved create does not prevent disposition", asyn
 	expect((await f.governor.retire("a", "operator")).retired).toBe(true);
 });
 
+test("a superseded-epoch create intent still fences disposition", async () => {
+	const f = await fixture();
+	const scope = JSON.stringify([f.sessionKey, 0]);
+	f.database.transaction((tx) => {
+		f.database.bindings.beginBrokerOperation(tx, f.authority, {
+			operation: "session.create",
+			scope,
+			operationRef: "gw-superseded-create",
+			requestJson: "{}",
+		});
+		f.database.bindings.completeBrokerOperation(tx, f.authority, "session.create", scope, "gw-superseded-create", "{}");
+		f.database.bindings.rotateEpoch(tx, f.sessionKey);
+		f.database.bindings.pruneBrokerOperations(tx, {
+			completedBefore: "9999-01-01T00:00:00.000Z",
+			pendingBefore: "9999-01-01T00:00:00.000Z",
+		});
+	});
+	expect(f.database.bindings.getSessionRecord(f.sessionKey)?.epoch).toBeGreaterThan(0);
+	expect(f.database.bindings.brokerOperation(f.authority, "session.create", scope)?.state).toBe("complete");
+	expect(await f.governor.retire("a", "operator")).toMatchObject({
+		retired: false,
+		reason: "historical job has an unresolved session create",
+	});
+});
+
 test("pruning retains unreconciled completed creates that fence disposition", async () => {
 	const f = await fixture();
 	const scope = JSON.stringify([f.sessionKey, 0]);
