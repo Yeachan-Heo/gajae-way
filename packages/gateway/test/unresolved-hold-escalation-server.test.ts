@@ -448,7 +448,7 @@ test("an escalation notice's receipt is confirmed only for a confirmed row, miss
 	}
 });
 
-test("outbox retention keeps a confirmed escalation notice while its hold is linked, then prunes it", async () => {
+test("outbox retention keeps a confirmed escalation notice while its hold is linked, prunes it after, and never keeps an expired one", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-escalation-retention-"));
 	const db = await Store.open(join(home, "gateway.db"));
 	try {
@@ -473,6 +473,33 @@ test("outbox retention keeps a confirmed escalation notice while its hold is lin
 		db.core.metaDelete(`escalation-notice-delivery:${linked}`);
 		db.transaction((tx) => db.outbox.prune(tx, 7 * 86_400_000, later));
 		expect(db.outbox.get(linked)).toBeUndefined();
+
+		// A linked notice that expired (adapter offline past the outbox TTL) is no proof the user was
+		// told: the link does not keep it, so the history sweep makes it missing and recovery reissues it.
+		const expiredLinked = deterministicBindHoldDeliveryId(originKey, "m-expired-linked", UNRESOLVED_HOLD_ESCALATED);
+		db.transaction((tx) =>
+			db.outbox.create(
+				tx,
+				{ deliveryId: expiredLinked, turnId: "t", originKey, payloadJson: "{}" },
+				Date.now() - 2 * 86_400_000,
+			),
+		);
+		db.core.metaSet(`escalation-notice-delivery:${expiredLinked}`, "gw-p-held-2");
+		db.transaction((tx) => db.outbox.expireStale(tx, 86_400_000));
+		expect(db.outbox.get(expiredLinked)?.state).toBe("expired");
+		const trigger = {
+			message_id: "m-expired-linked",
+			origin_ref_json: JSON.stringify({
+				platform: "discord",
+				kind: "dm",
+				conversationId: "escalation",
+				peerId: "owner",
+			}),
+		};
+		expect(escalationNoticeReceiptInLedger(db, originKey, trigger)).toBe("unconfirmed");
+		db.transaction((tx) => db.outbox.sweep(tx, { deliveryCutoff: cutoff, historyCutoff: cutoff, batch: 100 }));
+		expect(db.outbox.get(expiredLinked)).toBeUndefined();
+		expect(escalationNoticeReceiptInLedger(db, originKey, trigger)).toBe("missing");
 	} finally {
 		db.close();
 	}

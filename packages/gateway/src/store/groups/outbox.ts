@@ -13,7 +13,9 @@ import {
  * A delivery that is not the escalation notice of a still-open hold. The persona
  * layer links such a notice with an `escalation-notice-delivery:<deliveryId>`
  * meta key and deletes it when the hold completes; until then the confirmed row
- * is the proof that the user was told, so retention keeps it.
+ * is the proof that the user was told, so retention keeps it. Only a confirmed
+ * row is proof: an expired linked notice is swept like any other, so that it
+ * becomes missing and recovery can reissue it once.
  */
 const UNLINKED_ESCALATION_NOTICE =
 	"NOT EXISTS (SELECT 1 FROM meta m WHERE m.key = 'escalation-notice-delivery:' || deliveries.delivery_id)";
@@ -409,7 +411,7 @@ export class OutboxGroup {
 	sweep(tx: WriteTx, cutoffs: { deliveryCutoff: string; historyCutoff: string; batch: number }): number {
 		const ids = this.#db
 			.prepare(
-				`SELECT delivery_id FROM deliveries WHERE ((state = 'confirmed' AND updated_at < ?) OR (state = 'expired' AND updated_at < ?)) AND ${UNLINKED_ESCALATION_NOTICE} ORDER BY rowid LIMIT ?`,
+				`SELECT delivery_id FROM deliveries WHERE ((state = 'confirmed' AND updated_at < ? AND ${UNLINKED_ESCALATION_NOTICE}) OR (state = 'expired' AND updated_at < ?)) ORDER BY rowid LIMIT ?`,
 			)
 			.all(cutoffs.deliveryCutoff, cutoffs.historyCutoff, cutoffs.batch) as Array<{ delivery_id: string }>;
 		return this.#delete(tx, ids);

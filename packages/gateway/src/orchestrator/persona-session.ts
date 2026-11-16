@@ -20,12 +20,10 @@ import {
 	DEFAULT_SESSIONS_BUSY_STALL_MS,
 	DEFAULT_SESSIONS_IDLE_RETIRE_MS,
 	DEFAULT_SESSIONS_MAX_LIVE_HOSTS,
-	DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MODE,
 	DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS,
 	DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
 	type GjcModelSelection,
 	type GjcServiceTier,
-	type RetiredHoldAbandonMode,
 	type SessionHostConfig,
 } from "../config";
 import { BrokerAuthorityError, type Store } from "../store";
@@ -860,7 +858,6 @@ export interface PersonaSessionManagerOptions {
 	readonly unresolvedHoldMs?: number;
 	/** Escalated retired hold on a host not live this long is closed; default DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS. */
 	readonly retiredHoldAbandonMs?: number;
-	readonly retiredHoldAbandonMode?: RetiredHoldAbandonMode;
 	/**
 	 * Whether the origin confirmed the escalation notice posted for this trigger.
 	 * A retired hold is abandoned only after it did. Unset means there is no
@@ -935,7 +932,6 @@ export class PersonaSessionManager {
 	#busyStallMs: number;
 	#unresolvedHoldMs: number;
 	#retiredHoldAbandonMs: number;
-	#retiredHoldAbandonMode: RetiredHoldAbandonMode;
 	#draining = false;
 	#restartDrainId: string | undefined;
 	#stopped = false;
@@ -982,7 +978,6 @@ export class PersonaSessionManager {
 			DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS,
 			"retiredHoldAbandonMs",
 		);
-		this.#retiredHoldAbandonMode = options.retiredHoldAbandonMode ?? DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MODE;
 		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
 		this.#onSloEvent = options.onSloEvent;
 		this.#onBindFailure = options.onBindFailure;
@@ -1069,7 +1064,6 @@ export class PersonaSessionManager {
 			DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS,
 			"retiredHoldAbandonMs",
 		);
-		this.#retiredHoldAbandonMode = config?.retiredHoldAbandonMode ?? DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MODE;
 	}
 
 	get busyStallMs(): number {
@@ -1082,10 +1076,6 @@ export class PersonaSessionManager {
 
 	get retiredHoldAbandonMs(): number {
 		return this.#retiredHoldAbandonMs;
-	}
-
-	get retiredHoldAbandonMode(): RetiredHoldAbandonMode {
-		return this.#retiredHoldAbandonMode;
 	}
 
 	get maxLiveHosts(): number {
@@ -4587,7 +4577,7 @@ class OriginActor {
 				await this.#dispatchNext();
 				return;
 			}
-			if (await this.#abandonDeadRetiredHold(bound)) return;
+			if (await this.#parkDeadRetiredHold(bound)) return;
 			this.#logRecoveryHoldOnce(bound.turn, "status_unavailable", `detail=${safeDiagnostic(error)}`);
 			// A turn no relay will announce the end of must not wait for the 60 s
 			// sweep after one unreadable status: keep rechecking at the bounded cadence.
@@ -4623,7 +4613,7 @@ class OriginActor {
 				return;
 			}
 			// Only an unknown op is eligible: an in-flight one may still be mutating the workspace (#772).
-			if (report.status.status === "unknown" && (await this.#abandonDeadRetiredHold(bound))) return;
+			if (report.status.status === "unknown" && (await this.#parkDeadRetiredHold(bound))) return;
 			const reason =
 				report.status.status === "unknown" ? "operation_state_unknown" : "relay_unavailable_holds_in_flight";
 			this.#logRecoveryHoldOnce(bound.turn, reason, `sweeps=${count}`);
@@ -5252,7 +5242,7 @@ class OriginActor {
 	 * - no status other than unknown in between (cleared by the caller).
 	 * Liveness is read only when the window opens and when it closes.
 	 */
-	async #abandonDeadRetiredHold(bound: BoundTurn): Promise<boolean> {
+	async #parkDeadRetiredHold(bound: BoundTurn): Promise<boolean> {
 		if (!bound.retired || !bound.answerWanted) return false;
 		const database = this.#manager.database;
 		const opRef = bound.turn.opRef;
@@ -5317,9 +5307,9 @@ class OriginActor {
 			return true;
 		}
 		// Broker non-liveness is not producer exit: a detached host process can
-		// still be running the op (`session_not_live_but_process_live`). Close only
-		// on the port's identity-correlated process probe; absent or inconclusive
-		// evidence keeps the hold tracked, and the window, for the next sweep.
+		// still be running the op (`session_not_live_but_process_live`). Park only
+		// on the port's process probe; absent or inconclusive evidence keeps the
+		// hold swept every minute, and the window, for the next sweep.
 		if (!(await this.#producerExited(bound))) {
 			if (!this.#producerPresentLogged.has(opRef)) {
 				this.#producerPresentLogged.add(opRef);
@@ -5331,32 +5321,20 @@ class OriginActor {
 			return false;
 		}
 		this.#producerPresentLogged.delete(opRef);
-		if (this.#manager.retiredHoldAbandonMode === "park") {
-			// Conservative default: nothing is forgotten. The hold, its retired tail
-			// and its late answer stay exactly as #718 left them; only the per-sweep
-			// status spawn becomes hourly. Any evidence unparks it.
-			const parkedKey = retiredHoldParkedKey(opRef);
-			if (database.core.metaGet(parkedKey) === undefined) {
-				database.core.metaSet(parkedKey, JSON.stringify({ at: now, probedAt: now } satisfies ParkedMark));
-				this.#manager.log(
-					`retired_hold_parked origin=${this.originKey} epoch=${bound.epoch} opRef=${opRef} session=${bound.sessionId} notLiveMs=${now - mark.at} host=${host.hostIncarnation} probeEveryMs=${RETIRED_HOLD_PARKED_PROBE_MS} reason=host_not_live`,
-					"warn",
-				);
-			}
-			return false;
+		// Nothing is forgotten: the hold, its retired tail and its late answer stay
+		// exactly as #718 left them; only the per-sweep status spawn becomes hourly.
+		// Any readable evidence unparks it. Closing on this evidence is deliberately
+		// not offered: an absent host PID is not an identity-correlated proof that
+		// every producer of the op has exited.
+		const parkedKey = retiredHoldParkedKey(opRef);
+		if (database.core.metaGet(parkedKey) === undefined) {
+			database.core.metaSet(parkedKey, JSON.stringify({ at: now, probedAt: now } satisfies ParkedMark));
+			this.#manager.log(
+				`retired_hold_parked origin=${this.originKey} epoch=${bound.epoch} opRef=${opRef} session=${bound.sessionId} notLiveMs=${now - mark.at} host=${host.hostIncarnation} probeEveryMs=${RETIRED_HOLD_PARKED_PROBE_MS} reason=host_not_live`,
+				"warn",
+			);
 		}
-		bound.tail?.setTurnRunning(false);
-		this.#flushStaleOutput(bound, "session_gone");
-		await bound.tail?.close();
-		const completed = database.transaction((tx) => completeInboundTurn(database, tx, opRef, "turn_failed"));
-		for (const held of database.inbox.steersHeld(opRef)) await this.#abandonHeldSteer(held, opRef, bound);
-		this.#manager.log(
-			`retired_hold_abandoned origin=${this.originKey} epoch=${bound.epoch} opRef=${opRef} session=${bound.sessionId} notLiveMs=${now - mark.at} host=${host.hostIncarnation} reason=host_not_live`,
-			"warn",
-		);
-		if (completed === 1) await this.#notifySettled(bound);
-		await this.#forgetClosed(bound);
-		return true;
+		return false;
 	}
 
 	/** Keeps the notice row of an open hold past retention; a settled trigger's retried notice is not linked (its proof is no longer needed). */

@@ -78,9 +78,6 @@ export const DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS = 24 * 60 * 60_000;
  * `retiredHoldAbandonMs`: `park` keeps the hold and its late answer but probes
  * it hourly instead of every sweep; `close` completes it as a failed turn.
  */
-export type RetiredHoldAbandonMode = "park" | "close";
-export const DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MODE: RetiredHoldAbandonMode = "park";
-const SESSIONS_RETIRED_HOLD_ABANDON_MODES: readonly RetiredHoldAbandonMode[] = ["park", "close"];
 const SESSIONS_RETIRED_HOLD_ABANDON_MIN_MS = 60 * 60_000;
 const SESSIONS_RETIRED_HOLD_ABANDON_MAX_MS = 30 * 24 * 60 * 60_000;
 
@@ -95,8 +92,6 @@ export interface SessionHostConfig {
 	readonly unresolvedHoldMs?: number;
 	/** An escalated retired hold whose host stays not live this long is parked or closed; default DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS. */
 	readonly retiredHoldAbandonMs?: number;
-	/** Park (default) or close such a hold; see RetiredHoldAbandonMode. */
-	readonly retiredHoldAbandonMode?: RetiredHoldAbandonMode;
 }
 export type GjcServiceTier =
 	| "none"
@@ -654,7 +649,6 @@ function parseSessions(value: unknown): SessionHostConfig {
 		"busyStallMs",
 		"unresolvedHoldMs",
 		"retiredHoldAbandonMs",
-		"retiredHoldAbandonMode",
 	];
 	if (Object.keys(input).some((key) => !keys.includes(key)))
 		throw new ConfigError("config_invalid", `sessions may only contain ${keys.join(", ")}`);
@@ -709,14 +703,6 @@ function parseSessions(value: unknown): SessionHostConfig {
 			"config_invalid",
 			`sessions.retiredHoldAbandonMs must be an integer between ${SESSIONS_RETIRED_HOLD_ABANDON_MIN_MS} and ${SESSIONS_RETIRED_HOLD_ABANDON_MAX_MS}`,
 		);
-	if (
-		input.retiredHoldAbandonMode !== undefined &&
-		!SESSIONS_RETIRED_HOLD_ABANDON_MODES.includes(input.retiredHoldAbandonMode as RetiredHoldAbandonMode)
-	)
-		throw new ConfigError(
-			"config_invalid",
-			`sessions.retiredHoldAbandonMode must be one of ${SESSIONS_RETIRED_HOLD_ABANDON_MODES.join(", ")}`,
-		);
 	return {
 		...(input.maxLiveHosts === undefined ? {} : { maxLiveHosts: input.maxLiveHosts as number }),
 		...(input.idleRetireMs === undefined ? {} : { idleRetireMs: input.idleRetireMs as number }),
@@ -724,9 +710,6 @@ function parseSessions(value: unknown): SessionHostConfig {
 		...(input.busyStallMs === undefined ? {} : { busyStallMs: input.busyStallMs as number }),
 		...(input.unresolvedHoldMs === undefined ? {} : { unresolvedHoldMs: input.unresolvedHoldMs as number }),
 		...(input.retiredHoldAbandonMs === undefined ? {} : { retiredHoldAbandonMs: input.retiredHoldAbandonMs as number }),
-		...(input.retiredHoldAbandonMode === undefined
-			? {}
-			: { retiredHoldAbandonMode: input.retiredHoldAbandonMode as RetiredHoldAbandonMode }),
 	};
 }
 
