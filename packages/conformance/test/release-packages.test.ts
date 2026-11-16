@@ -14,6 +14,7 @@ import {
 	isPrereleaseVersion,
 	parseNpmViewResult,
 	RELEASE_ORDER,
+	scratchTag,
 } from "../../../scripts/release-packages";
 
 const RELEASE_PACKAGE_NAMES = new Set(["@gajae-gateway/protocol", "@gajae-gateway/images", "@gajae-gateway/sdk"]);
@@ -104,6 +105,32 @@ describe("channel ordering", () => {
 	test("selects the highest prerelease published version for next", () => {
 		expect(highestPublishedVersion(["1.2.3", "1.3.0-rc.1", "1.3.0-rc.10"], prerelease)).toBe("1.3.0-rc.10");
 		expect(highestPublishedVersion(["1.2.3"], prerelease)).toBeUndefined();
+	});
+});
+
+describe("scratch dist-tag selection", () => {
+	test("uses the version-derived name when it is free", () => {
+		expect(scratchTag("1.2.3", {})).toBe("gajae-pending-1-2-3");
+	});
+
+	// The random suffix is not evidence the generated name is free: an operator tag that
+	// happens to match the candidate would be moved by `npm publish --tag` and then
+	// removed by the cleanup. The candidate is checked against the map read from npm.
+	test("checks a generated suffix against the observed tag map", () => {
+		const tags = {
+			"gajae-pending-1-2-3": "0.9.0",
+			"gajae-pending-1-2-3-aaaa0001": "0.9.1",
+		};
+		const suffixes = ["aaaa0001", "aaaa0002"];
+		expect(scratchTag("1.2.3", tags, () => suffixes.shift()!)).toBe("gajae-pending-1-2-3-aaaa0002");
+	});
+
+	test("fails instead of publishing to a scratch tag it cannot prove free", () => {
+		const tags = {
+			"gajae-pending-1-2-3": "0.9.0",
+			"gajae-pending-1-2-3-aaaa0001": "0.9.1",
+		};
+		expect(() => scratchTag("1.2.3", tags, () => "aaaa0001")).toThrow("could not find an unused scratch dist-tag");
 	});
 });
 

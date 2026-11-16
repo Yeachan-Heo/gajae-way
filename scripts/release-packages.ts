@@ -357,15 +357,34 @@ async function resumeTag(
 // derived from the version so an interrupted run can find it again, but never at the
 // cost of an existing tag: if that name is already taken, a run-unique suffix is used
 // instead and the run only ever removes a scratch tag it can still see its own version
-// on.
+// on. Both the derived name and every generated candidate are checked against the tag
+// map read before publishing.
 function scratchTagBase(version: string): string {
 	return `gajae-pending-${version.replace(/[^0-9A-Za-z-]/g, "-")}`;
 }
 
-function scratchTag(version: string, tags: Readonly<Record<string, string>>): string {
+// The suffix makes a contested name unique to this run, but it is not evidence that the
+// generated name is free: the tag map read before publishing is. A candidate that is
+// already taken would be moved by `npm publish --tag` and then removed by the cleanup,
+// so every candidate is checked against the map and a repeated random draw is retried.
+// Failing after a bounded number of draws is safer than publishing to a tag this run
+// cannot prove it owns; a collision is already improbable, so the bound only guards the
+// generator itself.
+const SCRATCH_TAG_ATTEMPTS = 8;
+
+export function scratchTag(
+	version: string,
+	tags: Readonly<Record<string, string>>,
+	mintSuffix: () => string = () => crypto.randomUUID().slice(0, 8),
+): string {
 	const base = scratchTagBase(version);
-	if (tags[base] === undefined) return base;
-	return `${base}-${crypto.randomUUID().slice(0, 8)}`;
+	const isFree = (candidate: string) => tags[candidate] === undefined;
+	if (isFree(base)) return base;
+	for (let attempt = 0; attempt < SCRATCH_TAG_ATTEMPTS; attempt++) {
+		const candidate = `${base}-${mintSuffix()}`;
+		if (isFree(candidate)) return candidate;
+	}
+	throw new Error(`could not find an unused scratch dist-tag for ${version}`);
 }
 
 async function removeDistTag(name: string, tag: string, version: string, cwd: string): Promise<void> {

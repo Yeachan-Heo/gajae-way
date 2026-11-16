@@ -16,6 +16,11 @@ async function releaseWorkflow(): Promise<string> {
 	return Bun.file(WORKFLOW_URL).text();
 }
 
+function publishJob(workflow: string): string {
+	const job = workflow.slice(workflow.indexOf("  publish-npm:"));
+	return job.slice(0, job.indexOf("\n  build-binaries:"));
+}
+
 describe("release dist-tag resolution", () => {
 	test("derives latest for a stable release", () => {
 		expect(resolveReleaseDistTag("", ["1.2.3", "1.2.3", "1.2.3"])).toBe("latest");
@@ -139,11 +144,13 @@ describe("release workflow wiring", () => {
 	test("documents the limits of cross-ref npm dist-tag reconciliation", async () => {
 		const readme = await Bun.file(new URL("../../../README.md", import.meta.url)).text();
 		const publishing = readme.split("### Publishing packages")[1]?.split("### CI/CD")[0] ?? "";
-		expect(publishing).toContain("Concurrent releases from different refs can temporarily move a tag backwards");
+		expect(publishing).toContain(
+			"Concurrent releases — from different refs, or concurrent manual dispatches of one branch — can temporarily move a tag backwards",
+		);
 		expect(publishing).toContain("an interrupted or failed reconciliation may leave it stale until a successful retry");
 		expect(publishing).not.toContain("so no tag moves backwards even for the moment");
 	});
-	test("serializes publishing per ref only after the casing gate accepts the release", async () => {
+	test("serializes reruns of one immutable tag after the casing gate accepts it", async () => {
 		const workflow = await releaseWorkflow();
 		// A workflow-level group is entered before `canonical-tag` runs, so a case-variant
 		// tag could replace a valid pending release and then fail the casing check.
@@ -151,11 +158,30 @@ describe("release workflow wiring", () => {
 		// One block only, and the scalar form counts too: a workflow-level `concurrency:`
 		// declaration is the cheapest way to reintroduce the queue collision.
 		expect(workflow.match(/^\s*concurrency:/gm) ?? []).toHaveLength(1);
-		const job = workflow.slice(workflow.indexOf("  publish-npm:"));
-		const body = job.slice(0, job.indexOf("\n  build-binaries:"));
-		expect(body).toMatch(
-			/concurrency:\n {6}group: release-publish-\$\{\{ github\.ref \}\}\n {6}cancel-in-progress: false/,
+		expect(publishJob(workflow)).toMatch(
+			/concurrency:\n {6}group: release-publish-\$\{\{ github\.ref_type == 'tag' && github\.ref \|\| github\.run_id \}\}\n {6}cancel-in-progress: false/,
 		);
+	});
+
+	// GitHub keeps one pending run per group and drops the older pending one. A group keyed
+	// only by `github.ref` would therefore let a second manual dispatch from a branch
+	// replace a distinct pending branch release, whose publish job would never run.
+	test("never coalesces distinct manual branch dispatches", async () => {
+		const workflow = await releaseWorkflow();
+		const group = /^ {6}group: (.+)$/m.exec(publishJob(workflow))?.[1] ?? "";
+		// Tag reruns still share the tag's group and serialize.
+		expect(group).toContain("github.ref_type == 'tag'");
+		// A branch dispatch falls back to a per-run key, so it has no second pending slot
+		// that a later dispatch could displace.
+		expect(group).toContain("github.run_id");
+		expect(group).not.toBe("release-publish-${{ github.ref }}");
+	});
+
+	test("documents that branch dispatches are not queued behind each other", async () => {
+		const readme = await Bun.file(new URL("../../../README.md", import.meta.url)).text();
+		const publishing = readme.split("### Publishing packages")[1]?.split("### CI/CD")[0] ?? "";
+		expect(publishing).toContain("Manual dispatches on a branch each run as their own release");
+		expect(publishing).toContain("so a group keyed by branch would silently skip a distinct requested release");
 	});
 
 	test("publishes with the resolved dist-tag instead of a latest fallback", async () => {

@@ -15,15 +15,26 @@ on:
 # creates its GitHub release, and a run that never starts does neither. GitHub keeps
 # only one running and one pending run per concurrency group and drops the older
 # pending one, so a single shared group let two later tags cancel an earlier pending
-# tag's release. Key the group by ref instead: reruns of the same tag still serialize
+# tag's release. Key tagged runs by ref instead: reruns of the same tag still serialize
 # (the script resumes an already-published version instead of republishing), while
 # distinct tags never displace each other.
+#
+# A manual `workflow_dispatch` on a branch is a supported release request too, and it
+# shares `github.ref` with every other dispatch from that branch. A group keyed by the
+# branch would reproduce the same loss for manual releases: the second dispatch becomes
+# pending while one is active, and a third replaces that pending run, so a distinct
+# requested release never starts. Branch dispatches are keyed by run instead and never
+# coalesce; only their npm dist-tag writes are ordered, forward-only, by the script. A
+# concurrent dispatch that publishes the same version can fail its `npm publish`, which a
+# rerun resumes and converges. A dispatch run from a tag ref still shares that tag's
+# queue, so it serializes against tag pushes of the same tag.
 #
 # Cross-tag ordering of dist-tag writes is enforced by the script, not by GitHub: no
 # write is decided below the tag's live pointer or, for the channel tags `latest` and
 # `next`, below the highest published version in that channel. A tag a newer release already moved is left alone so its
 # own GitHub release still gets created, an older fresh version is published under a
-# scratch tag that never overwrites an existing tag, the channel tag a run writes is
+# scratch tag whose name is checked against the tag map read first, the channel tag a run
+# writes is
 # reconciled forward from the version list after that write, and the post-write read
 # fails the run if that tag ends up below its channel floor (at least the version this
 # run wrote) after a retried terminal read, or cannot be read at all.
@@ -83,10 +94,13 @@ jobs:
   publish-npm:
     name: publish npm packages
     needs: [verify, canonical-tag]
-    # Runs of the same ref publish one at a time; distinct refs never contend, and nothing
-    # reaches this queue before the casing check accepts it.
+    # Reruns of one immutable tag share a group so they publish one at a time; distinct
+    # tags never contend, and nothing reaches this queue before the casing check accepts
+    # it. A branch dispatch instead gets its own group: GitHub keeps only one pending run
+    # per group, so a branch-keyed group would let a newer dispatch replace an earlier
+    # pending release and skip its publish job entirely.
     concurrency:
-      group: release-publish-${{ github.ref }}
+      group: release-publish-${{ github.ref_type == 'tag' && github.ref || github.run_id }}
       cancel-in-progress: false
     runs-on: ubuntu-24.04
     permissions:
