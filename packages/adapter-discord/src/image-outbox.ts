@@ -164,8 +164,13 @@ async function writeEntries(path: string, entries: readonly PendingImage[]): Pro
 	} finally {
 		await unlink(temporary).catch(() => {});
 	}
+	await syncOutboxDirectory(directory);
+}
+
+/** Fsync the renamed directory entry; only unsupported directory syncs may degrade. */
+export async function syncOutboxDirectory(directory: string, openFile: typeof open = open): Promise<void> {
 	try {
-		const parent = await open(directory, "r");
+		const parent = await openFile(directory, "r");
 		try {
 			await parent.sync();
 		} finally {

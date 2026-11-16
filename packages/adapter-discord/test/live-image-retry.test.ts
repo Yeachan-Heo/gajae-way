@@ -26,6 +26,7 @@ test("a transient image download failure retries a live new DM without reconnect
 		onChatMessage: () => () => {},
 		onChatProgress: () => () => {},
 		request: async (verb: string, params: unknown) => {
+			if (verb === "gateway.status") return { database: { identity: "test-db" } };
 			sends.push({ verb, params });
 			return { engaged: false, turnId: null };
 		},

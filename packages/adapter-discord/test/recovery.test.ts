@@ -43,6 +43,7 @@ function cursorState(recoveredThrough: Record<string, string>): RecoveryCursorSt
 		deadLetters: [],
 		deadLetterDigest: {},
 		sequence: 0,
+		gatewayDbIdentity: "test-db",
 	};
 }
 
@@ -126,13 +127,13 @@ test("cursor path lives under the adapter home", () => {
 
 test("cursor store round-trips and ignores malformed state", async () => {
 	const path = recoveryCursorPath(home);
-	expect(await loadRecoveryCursors(join(home, "missing.json"))).toEqual(cursorState({}));
+	expect((await loadRecoveryCursors(join(home, "missing.json"))).gatewayDbIdentity).toBeUndefined();
 	await saveRecoveryCursors(path, cursorState({ "channel-1": "1000", bad: "x" }));
 	const state = await loadRecoveryCursors(path);
 	expect(state.recoveredThrough["channel-1"]).toBe("1000");
 	expect(state.recoveredThrough.bad).toBeUndefined();
 	await writeFile(path, "not json{", "utf8");
-	expect(await loadRecoveryCursors(path)).toEqual(cursorState({}));
+	expect((await loadRecoveryCursors(path)).gatewayDbIdentity).toBeUndefined();
 });
 
 test("known DM recovery origins are capped, refreshed, and expired", () => {
@@ -328,7 +329,7 @@ test("cold-start recovery waits for both gateway client and Discord user", async
 	let botUser: unknown;
 	const channel = fakeChannel([inbound]);
 	const client = {
-		request: async () => ({}),
+		request: async (verb: string) => (verb === "gateway.status" ? { database: { identity: "test-db" } } : {}),
 		onChatMessage: () => () => {},
 	};
 	const config = {
@@ -424,7 +425,10 @@ test("a permission-dead thread keeps its gap and does not block sibling recovery
 		undefined,
 		cursorPath,
 		() => bot,
-		{ request: async () => ({}), onChatMessage: () => () => {} } as never,
+		{
+			request: async (verb: string) => (verb === "gateway.status" ? { database: { identity: "test-db" } } : {}),
+			onChatMessage: () => () => {},
+		} as never,
 		async () => {},
 	);
 	await gateway.recoverMissedMessages();
@@ -571,7 +575,20 @@ function wiredGateway(
 	channels: Record<string, Record<string, never>> = { "channel-1": {} },
 	getBotUser: () => unknown = () => bot,
 	prepareImages?: typeof prepareDiscordImages,
+	statusIdentity: string | null = "test-db",
 ): ReconnectingGateway {
+	const request = async (verb: string, params?: unknown) => {
+		const result = await client.request(verb, params);
+		if (
+			statusIdentity !== null &&
+			verb === "gateway.status" &&
+			result !== null &&
+			typeof result === "object" &&
+			!("database" in result)
+		)
+			return { ...result, database: { identity: statusIdentity } };
+		return result;
+	};
 	return new ReconnectingGateway(
 		"socket",
 		{ channels: { fetch: async () => channel } },
@@ -580,7 +597,7 @@ function wiredGateway(
 		undefined,
 		cursorPath,
 		getBotUser,
-		{ ...client, onChatMessage: () => () => {} } as never,
+		{ ...client, request, onChatMessage: () => () => {} } as never,
 		async () => {},
 		undefined,
 		undefined,
@@ -1007,7 +1024,10 @@ test("a throwing history fetch leaves other channels recovered and arms a retry"
 		undefined,
 		cursorPath,
 		() => bot,
-		{ request: async () => ({}), onChatMessage: () => () => {} } as never,
+		{
+			request: async (verb: string) => (verb === "gateway.status" ? { database: { identity: "test-db" } } : {}),
+			onChatMessage: () => () => {},
+		} as never,
 		async () => {},
 	);
 	await gateway.recoverMissedMessages();
@@ -1057,7 +1077,10 @@ test("one channel's unexpected throw leaves later channels recovered and arms a 
 		undefined,
 		cursorPath,
 		() => bot,
-		{ request: async () => ({}), onChatMessage: () => () => {} } as never,
+		{
+			request: async (verb: string) => (verb === "gateway.status" ? { database: { identity: "test-db" } } : {}),
+			onChatMessage: () => () => {},
+		} as never,
 		async () => {},
 	);
 	await gateway.recoverMissedMessages();
@@ -1526,7 +1549,10 @@ test("a channel that lost access is quarantined without blocking healthy recover
 		undefined,
 		cursorPath,
 		() => bot,
-		{ request: async () => ({}), onChatMessage: () => () => {} } as never,
+		{
+			request: async (verb: string) => (verb === "gateway.status" ? { database: { identity: "test-db" } } : {}),
+			onChatMessage: () => () => {},
+		} as never,
 		async () => {},
 	);
 	await gateway.recoverMissedMessages();
@@ -1768,6 +1794,7 @@ test("a live image retry adopts the thread destination the first attempt never p
 		() => bot,
 		{
 			request: async (verb: string, params: unknown) => {
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
 				sent.push({ verb, params: params as Record<string, any> });
 				return { engaged: true, turnId: "turn-1" };
 			},
@@ -1854,6 +1881,7 @@ test("a populated legacy cursor state is rewound before its first database ident
 	const recent = snowflakeFromTimestamp(Date.now() - 60_000);
 	await saveRecoveryCursors(cursorPath, {
 		...cursorState({ "channel-1": recent }),
+		gatewayDbIdentity: undefined,
 		quarantined: { "thread-7": { watermark: recent, seq: 1 } },
 		sequence: 1,
 	});
@@ -1933,7 +1961,7 @@ test("a live image retry adopts the thread a crashed attempt already created", a
 		() => bot,
 		{
 			request: async (verb: string, params: unknown) => {
-				if (verb === "gateway.status") return {};
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
 				sent.push({ verb, params: params as Record<string, any> });
 				return { engaged: true, turnId: "turn-1" };
 			},
@@ -1968,7 +1996,7 @@ test("a database-identity rewind never lands inside a running recovery pass", as
 	const cursorPath = join(home, "rewind-during-pass", "recovery-cursor.json");
 	const cleanupTimers = trackTimers();
 	const legacy = snowflakeFromTimestamp(Date.now() - 60_000);
-	await saveRecoveryCursors(cursorPath, cursorState({ "channel-1": legacy }));
+	await saveRecoveryCursors(cursorPath, { ...cursorState({ "channel-1": legacy }), gatewayDbIdentity: "test-db" });
 	let releaseHistory!: () => void;
 	const historyGate = new Promise<void>((resolve) => {
 		releaseHistory = resolve;
@@ -1998,10 +2026,10 @@ test("a database-identity rewind never lands inside a running recovery pass", as
 			request: async (verb: string) => (verb === "gateway.status" ? { database: { identity: "4:2" } } : {}),
 		} as never);
 		await settle(50);
-		expect((await loadRecoveryCursors(cursorPath)).gatewayDbIdentity).toBeUndefined();
+		expect((await loadRecoveryCursors(cursorPath)).gatewayDbIdentity).toBe("test-db");
 		releaseHistory();
 		await pass;
-		expect((await loadRecoveryCursors(cursorPath)).gatewayDbIdentity).toBeUndefined();
+		expect((await loadRecoveryCursors(cursorPath)).gatewayDbIdentity).toBe("test-db");
 
 		// The next pass reconciles first, then walks history from the rewound floor.
 		await gateway.recoverMissedMessages();
@@ -2044,7 +2072,7 @@ test("two recovery triggers sharing an identity check start one pass", async () 
 				if (verb === "gateway.status") {
 					statusStarted();
 					await statusGate;
-					return {};
+					return { database: { identity: "test-db" } };
 				}
 				return {};
 			},

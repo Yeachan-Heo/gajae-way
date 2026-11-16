@@ -69,7 +69,7 @@ test("a first-time DM image intent survives restart before preparation", async (
 	const sends: Array<{ verb: string; params: unknown }> = [];
 	const request = async (verb: string, params: unknown) => {
 		// Identity polling is additive infrastructure, not a send.
-		if (verb === "gateway.status") return {};
+		if (verb === "gateway.status") return { database: { identity: "test-db" } };
 		sends.push({ verb, params });
 		return { engaged: false, turnId: null };
 	};
@@ -165,7 +165,7 @@ test("an ambiguous gateway ACK replays the exact persisted image request after r
 			fetchChannel,
 			async (verb, params) => {
 				// Identity polling is additive infrastructure, not a send.
-				if (verb === "gateway.status") return {};
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
 				sends.push({ verb, params });
 				throw new Error("connection lost after gateway accepted request");
 			},
@@ -194,7 +194,7 @@ test("an ambiguous gateway ACK replays the exact persisted image request after r
 			cursorPath,
 			fetchChannel,
 			async (verb, params) => {
-				if (verb === "gateway.status") return {};
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
 				sends.push({ verb, params });
 				return { engaged: false, turnId: null };
 			},

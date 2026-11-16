@@ -3,7 +3,7 @@ import { Buffer } from "node:buffer";
 import { mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ImageOutbox, type PendingImage } from "../src/image-outbox";
+import { ImageOutbox, type PendingImage, syncOutboxDirectory } from "../src/image-outbox";
 
 describe("ImageOutbox", () => {
 	let directory: string;
@@ -250,4 +250,25 @@ describe("ImageOutbox", () => {
 		await expect(bounded.put({ messageId: String(base + 3_001n), channelId: "other" })).resolves.toBeUndefined();
 		expect((await bounded.load()).filter((entry) => entry.terminal)).toHaveLength(500);
 	});
+});
+
+test("a directory fsync EIO fails admission while an unsupported sync degrades", async () => {
+	const eio = Object.assign(new Error("EIO: i/o error, fsync"), { code: "EIO" });
+	const failing = async () =>
+		({
+			sync: async () => {
+				throw eio;
+			},
+			close: async () => {},
+		}) as never;
+	await expect(syncOutboxDirectory("/tmp", failing as never)).rejects.toThrow("EIO");
+
+	const unsupported = async () =>
+		({
+			sync: async () => {
+				throw Object.assign(new Error("EINVAL: invalid argument"), { code: "EINVAL" });
+			},
+			close: async () => {},
+		}) as never;
+	await expect(syncOutboxDirectory("/tmp", unsupported as never)).resolves.toBeUndefined();
 });

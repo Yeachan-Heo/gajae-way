@@ -83,6 +83,7 @@ test("recovery does not send a text fallback when the shared image budget reject
 			request: async (verb: string, params: unknown) => {
 				// Identity polling is additive infrastructure, not image delivery.
 				if (verb !== "gateway.status") requests.push({ verb, params });
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
 				return { engaged: false };
 			},
 			onChatMessage: () => () => {},

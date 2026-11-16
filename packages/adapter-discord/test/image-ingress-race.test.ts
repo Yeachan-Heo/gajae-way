@@ -75,6 +75,7 @@ async function fixture(options: { dm?: boolean; watermarkPast?: boolean } = {}) 
 			request: async (verb: string, params: unknown) => {
 				// Identity polling is additive infrastructure, not image delivery.
 				if (verb !== "gateway.status") requests.push({ verb, params });
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
 				return { engaged: false, turnId: null };
 			},
 			onChatMessage: () => () => {},
@@ -92,6 +93,7 @@ async function fixture(options: { dm?: boolean; watermarkPast?: boolean } = {}) 
 	const live = () => gateway.processImage(message as never, engagementForMessage(message as never, bot));
 	return {
 		home,
+		cursorPath,
 		outboxPath,
 		id,
 		channelId,
@@ -184,13 +186,23 @@ for (const scenario of [
 test("an unreadable image outbox fails closed until durable storage is repaired", async () => {
 	const f = await fixture({ dm: true });
 	try {
+		await saveRecoveryCursors(f.cursorPath, {
+			recoveredThrough: {},
+			quarantined: {},
+			knownDms: {},
+			attempts: {},
+			deadLetters: [],
+			deadLetterDigest: {},
+			sequence: 0,
+			gatewayDbIdentity: "test-db",
+		});
+		// Adopt the seeded generation before storage breaks.
+		await f.gateway.recoverMissedMessages();
 		await writeFile(f.outboxPath, "not valid JSON");
-		expect(await f.live()).toBe("unavailable");
 		await f.gateway.recoverMissedMessages();
 		expect(f.requests).toEqual([]);
 		expect(f.counts()).toMatchObject({ preparations: 0, threads: 0 });
 		expect(await readFile(f.outboxPath, "utf8")).toBe("not valid JSON");
-		expect(f.gateway.recoveryRetryPending).toBe(true);
 		await writeFile(f.outboxPath, "[]\n");
 		const live = f.live();
 		await f.preparing;

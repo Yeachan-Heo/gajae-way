@@ -3214,15 +3214,11 @@ export class ReconnectingGateway {
 		try {
 			result = await client.request<GatewayStatusResult>("gateway.status");
 		} catch {
-			if (fromRecovery && state.gatewayDbIdentity !== undefined) {
-				console.error("Discord gateway database identity unavailable; holding recovery.");
-				return false;
-			}
 			return true;
 		}
 		const identity = result?.database?.identity;
 		if (identity === undefined) {
-			if (fromRecovery && state.gatewayDbIdentity !== undefined) {
+			if (fromRecovery) {
 				console.error("Discord gateway database identity unavailable; holding recovery.");
 				return false;
 			}
