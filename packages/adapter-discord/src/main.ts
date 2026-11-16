@@ -1770,6 +1770,7 @@ export class ReconnectingGateway {
 		this.#attempt = 0;
 		void this.downAlarm?.up();
 		void this.#flushEdits();
+		void this.ensureCursors().then(() => this.reconcileGatewayRestore());
 	}
 
 	/** True while a live/recovered image event already owns or awaits this message. */
@@ -2462,6 +2463,7 @@ export class ReconnectingGateway {
 			// for the sorted history pass instead of overtaking older missed text. A
 			// failed load leaves it undefined and still replays every durable intent.
 			await this.ensureCursors();
+			await this.reconcileGatewayRestore();
 			// The durable image consumer is independent of history recovery: an exact
 			// persisted request needs neither the cursor nor a history read, and a live
 			// image was admitted ahead of history in the first place.
@@ -2869,39 +2871,9 @@ export class ReconnectingGateway {
 
 	private ensureCursors(): Promise<void> {
 		this.#cursorLoads ??= loadRecoveryCursors(this.recoveryCursorPath)
-			.then(async (state) => {
+			.then((state) => {
 				this.#cursors = state;
 				this.#cursorFault = undefined;
-				const identity = await this.gatewayDbIdentity();
-				let next = state;
-				if (identity !== undefined && state.gatewayDbIdentity !== undefined && identity !== state.gatewayDbIdentity) {
-					await this.#imageOutbox.invalidateCompleted();
-					const floor = snowflakeFromTimestamp(Date.now() - IMAGE_REPLAY_RETENTION_MS);
-					next = {
-						...state,
-						recoveredThrough: Object.fromEntries(
-							Object.entries(state.recoveredThrough).map(([id, watermark]) => [
-								id,
-								snowflakeIsAfter(watermark, floor) ? floor : watermark,
-							]),
-						),
-						quarantined: Object.fromEntries(
-							Object.entries(state.quarantined).map(([id, entry]) => [
-								id,
-								{
-									...entry,
-									watermark: snowflakeIsAfter(entry.watermark, floor) ? floor : entry.watermark,
-								},
-							]),
-						),
-					};
-					console.error(
-						"Discord gateway database was replaced; rewound recovery watermarks and invalidated completion tombstones.",
-					);
-				}
-				this.#cursors = next;
-				if (identity !== undefined && identity !== state.gatewayDbIdentity)
-					this.persist({ ...next, gatewayDbIdentity: identity });
 			})
 			.catch((error: unknown) => {
 				// Observable and retryable: drop the memoized load so the next recovery pass
@@ -2931,6 +2903,40 @@ export class ReconnectingGateway {
 				this.#recoverableIds,
 			),
 		);
+	}
+
+	private async reconcileGatewayRestore(): Promise<void> {
+		const state = this.#cursors;
+		if (!state) return;
+		const identity = await this.gatewayDbIdentity();
+		if (identity === undefined || identity === state.gatewayDbIdentity) return;
+		let next = state;
+		if (state.gatewayDbIdentity !== undefined) {
+			await this.#imageOutbox.invalidateCompleted();
+			const floor = snowflakeFromTimestamp(Date.now() - IMAGE_REPLAY_RETENTION_MS);
+			next = {
+				...state,
+				recoveredThrough: Object.fromEntries(
+					Object.entries(state.recoveredThrough).map(([id, watermark]) => [
+						id,
+						snowflakeIsAfter(watermark, floor) ? floor : watermark,
+					]),
+				),
+				quarantined: Object.fromEntries(
+					Object.entries(state.quarantined).map(([id, entry]) => [
+						id,
+						{
+							...entry,
+							watermark: snowflakeIsAfter(entry.watermark, floor) ? floor : entry.watermark,
+						},
+					]),
+				),
+			};
+			console.error(
+				"Discord gateway database was replaced; rewound recovery watermarks and invalidated image completion tombstones.",
+			);
+		}
+		this.persist({ ...next, gatewayDbIdentity: identity });
 	}
 
 	private async gatewayDbIdentity(): Promise<string | undefined> {
