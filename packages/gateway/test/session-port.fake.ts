@@ -14,7 +14,7 @@ import type {
 	SessionActivity,
 	SessionBindInput,
 	SessionBinding,
-	SessionCompactionStatus,
+	SessionCompactionResult,
 	SessionLiveness,
 	SessionPort,
 	SessionRequestInput,
@@ -150,6 +150,7 @@ export class ScriptedSessionPort implements SessionPort {
 	readonly statusReads: Array<{ sessionId: string; repo: string; opRef: string; relayUsed: boolean }> = [];
 	readonly #sessions = new Map<string, string>();
 	readonly #sessionStates = new Map<string, BrokerSession>();
+	readonly #exitedHosts = new Set<string>();
 	readonly #resumeFailures = new Map<string, Error>();
 	readonly #operations = new Map<string, Operation>();
 	readonly #transcripts = new Map<string, string[]>();
@@ -292,6 +293,16 @@ export class ScriptedSessionPort implements SessionPort {
 		return { live: state.live, disowned: false, ...(activity ? { activity } : {}) };
 	}
 
+	async hostExited(input: { sessionId: string; repo: string }): Promise<boolean> {
+		return this.#exitedHosts.has(input.sessionId);
+	}
+
+	/** Explicit process-exit evidence, independent of broker liveness. */
+	setHostExited(sessionId: string, exited: boolean): void {
+		if (exited) this.#exitedHosts.add(sessionId);
+		else this.#exitedHosts.delete(sessionId);
+	}
+
 	async resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding> {
 		this.resumes.push(input);
 		const failure = this.#resumeFailures.get(input.sessionId);
@@ -305,6 +316,7 @@ export class ScriptedSessionPort implements SessionPort {
 
 	async send(input: SessionSendInput): Promise<SendReceipt> {
 		this.sendAttempts.push(input);
+		input.beforeWrite?.();
 		if (this.#operations.has(input.opRef))
 			throw new OpRefRejectedError(input.opRef, "client_ref_conflict", { code: "client_ref_conflict" });
 		this.sends.push(input);
@@ -513,12 +525,12 @@ export class ScriptedSessionPort implements SessionPort {
 		);
 	}
 
-	readonly #assistantRows = new Map<string, Array<{ text: string; at: number }>>();
+	readonly #assistantRows = new Map<string, Array<{ text: string; at: number; stopReason?: string }>>();
 
 	/** Scripts a transcript assistant row; a session with scripted rows answers fetchAssistantSince from them only. */
-	appendAssistant(sessionId: string, text: string, at: number = Date.now()): void {
+	appendAssistant(sessionId: string, text: string, at: number = Date.now(), stopReason?: string): void {
 		const rows = this.#assistantRows.get(sessionId) ?? [];
-		rows.push({ text, at });
+		rows.push({ text, at, stopReason });
 		this.#assistantRows.set(sessionId, rows);
 	}
 
@@ -529,7 +541,7 @@ export class ScriptedSessionPort implements SessionPort {
 			const eligible = rows.filter((row) => row.at + 2_000 >= input.notBeforeMs);
 			const chosen =
 				(input.preferSpoken ? eligible.filter((row) => !isSilentReply(row.text)).at(-1) : undefined) ?? eligible.at(-1);
-			return chosen ? { text: chosen.text, pages: 1, complete: true } : undefined;
+			return chosen ? { text: chosen.text, pages: 1, complete: true, stopReason: chosen.stopReason } : undefined;
 		}
 		const operation = [...this.#operations.values()]
 			.reverse()
@@ -555,11 +567,16 @@ export class ScriptedSessionPort implements SessionPort {
 		return handle;
 	}
 
+	/** Test-only accessor to get tail handles for a session. */
+	getTailHandles(sessionId: string): ReadonlySet<ScriptedTailHandle> {
+		return this.#tails.get(sessionId) ?? new Set();
+	}
+
 	async runCompaction(_input: {
 		sessionId: string;
 		repo: string;
 		originKey: string;
-	}): Promise<{ readonly status: SessionCompactionStatus }> {
+	}): Promise<SessionCompactionResult> {
 		return { status: "unavailable" };
 	}
 
@@ -810,7 +827,10 @@ export class ScriptedSessionPort implements SessionPort {
 	}
 
 	/** Patches a bound session's state, or seeds one the port never bound (a session left on disk by an earlier runtime). */
-	setSessionState(sessionId: string, patch: Partial<Pick<BrokerSession, "repo" | "live" | "deleted">>): void {
+	setSessionState(
+		sessionId: string,
+		patch: Partial<Pick<BrokerSession, "repo" | "live" | "deleted" | "activityState">>,
+	): void {
 		const current = this.#sessionStates.get(sessionId) ?? { sessionId, repo: "", live: false, deleted: false };
 		this.#sessionStates.set(sessionId, { ...current, ...patch });
 	}
@@ -838,6 +858,7 @@ export class ScriptedSessionPort implements SessionPort {
 
 	seedAcceptedSend(input: SessionSendInput, state: Operation["state"] = "in_flight", text = ""): void {
 		this.sendAttempts.push(input);
+		input.beforeWrite?.();
 		this.sends.push(input);
 		const now = Date.now();
 		this.#operations.set(input.opRef, {

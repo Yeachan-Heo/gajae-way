@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 /**
  * Root-level release workflow for the npm-publishable packages
- * (@gajae-gateway/protocol, @gajae-gateway/sdk, @gajae-gateway/cli), in dependency order.
+ * (@gajae-gateway/protocol, @gajae-gateway/images, @gajae-gateway/sdk,
+ * @gajae-gateway/cli), in dependency order.
  *
  * Usage:
  *   bun scripts/release-packages.ts            # build + `bun pm pack` dry run (default, safe)
@@ -19,7 +20,7 @@
 import { mkdir, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
-const RELEASE_ORDER = ["protocol", "sdk", "cli"] as const;
+export const RELEASE_ORDER = ["protocol", "images", "sdk", "cli"] as const;
 
 function parseArgs(argv: string[]): { publish: boolean; tag?: string } {
 	let publish = false;
@@ -56,6 +57,44 @@ async function run(cmd: string[], cwd: string): Promise<void> {
 	if (code !== 0) throw new Error(`command failed (exit ${code}): ${cmd.join(" ")} in ${cwd}`);
 }
 
+export function parseNpmViewResult(
+	stdout: string,
+	stderr: string,
+	code: number,
+	expectedVersion: string,
+): { alreadyPublished: boolean; error?: string } {
+	if (code === 0) {
+		const result = stdout.trim();
+		if (result === expectedVersion) {
+			return { alreadyPublished: true };
+		}
+		return { alreadyPublished: false, error: `npm view returned unexpected version: ${result}` };
+	}
+
+	// Check if the error is a 404 (not found) - this is expected for new packages
+	if (stderr.includes("404")) {
+		return { alreadyPublished: false };
+	}
+
+	// Any other error should fail
+	return { alreadyPublished: false, error: stderr.trim() || stdout.trim() };
+}
+
+export async function checkNpmRegistry(
+	name: string,
+	version: string,
+): Promise<{ alreadyPublished: boolean; error?: string }> {
+	const proc = Bun.spawn(["npm", "view", `${name}@${version}`, "version"], {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const stdout = await new Response(proc.stdout).text();
+	const stderr = await new Response(proc.stderr).text();
+	const code = await proc.exited;
+
+	return parseNpmViewResult(stdout, stderr, code, version);
+}
+
 async function main(): Promise<void> {
 	const { publish, tag } = parseArgs(process.argv.slice(2));
 	const root = new URL("..", import.meta.url).pathname;
@@ -80,9 +119,19 @@ async function main(): Promise<void> {
 		assertNoPrivateWorkspaceDeps(packedManifest, workspacePackages, releasePackageNames);
 
 		if (publish) {
-			const publishCmd = ["npm", "publish", tarball, "--access", "public"];
-			if (tag) publishCmd.push("--tag", tag);
-			await run(publishCmd, dir);
+			const packageName = packedManifest.name;
+			const packageVersion = versions.get(packageName)!;
+			const registryCheck = await checkNpmRegistry(packageName, packageVersion);
+
+			if (registryCheck.alreadyPublished) {
+				console.log(`\n⏭️  ${packageName}@${packageVersion} already published on npm, skipping.`);
+			} else if (registryCheck.error) {
+				throw new Error(`registry check failed for ${packageName}@${packageVersion}: ${registryCheck.error}`);
+			} else {
+				const publishCmd = ["npm", "publish", tarball, "--access", "public"];
+				if (tag) publishCmd.push("--tag", tag);
+				await run(publishCmd, dir);
+			}
 		}
 	}
 

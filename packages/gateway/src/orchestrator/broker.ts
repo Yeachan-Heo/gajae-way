@@ -4,10 +4,14 @@ import type { CliResult, CliRunner } from "@gajae-gateway/subsession";
 import {
 	type BrokerDiscovery,
 	type BrokerLivenessVerdict,
+	BrokerStartupFailureTracker,
 	judgeBrokerLiveness,
 	type PidAliveProbe,
 	readBrokerDiscovery,
+	readBrokerStartupExitRecordSync,
+	validateStartupExitRecord,
 } from "./broker-liveness";
+import { isEmbeddedModuleDir } from "./embedded-module";
 import { isVerifiedGjcVersion, MIN_GJC_VERSION, VERIFIED_GJC_THROUGH } from "./gjc-contract";
 import { extractRuntimeError, sanitizeDiagnostic } from "./rebind";
 
@@ -15,37 +19,88 @@ export {
 	BROKER_HEARTBEAT_TTL_MS,
 	type BrokerDiscovery,
 	type BrokerLivenessVerdict,
+	BrokerStartupFailureTracker,
 	describeBindHold,
 	judgeBrokerLiveness,
 	type PidAliveProbe,
 	readBrokerDiscovery,
+	readBrokerStartupExitRecordSync,
+	validateStartupExitRecord,
 } from "./broker-liveness";
 export const GJC_ATTACH_ONLY_ENV = "GJC_SDK_BROKER_AUTOSTART";
 
 /**
  * Candidate locations for the pinned GJC version, in priority order.
  *
- * A compiled binary keeps the *build-time* source path in `__filename`, so the
- * checkout candidate only resolves on the machine that built it. An installed
- * binary carries the pin beside itself instead; without that second candidate a
- * binary shipped to another host exits at boot naming a path from the build
- * machine, which no operator can act on (found deploying dev to jip-gajae).
+ * The manifest beside the running binary is authoritative: it is the release the operator
+ * installed and the one `gajaeway services install` reads, so the runtime must not resolve a
+ * different pin for the same install.
+ *
+ * The checkout manifest is a source-run candidate only. `bun` is the executable of a source
+ * run and ships no release manifest, so the checkout's own gateway manifest is the pin and
+ * `modulePath` names it on disk. A `bun build --compile` binary reports Bun's virtual root
+ * from `import.meta.path` (its `__filename` still names the build-time source path, which is
+ * why the delivery mode can never be read from `__filename`), so it has no checkout to
+ * consult: the release manifest beside the executable is its only pin source, and a release
+ * that lost that manifest is a broken install that fails closed as one.
  */
-export function pinnedGjcCandidatePaths(execPath: string = process.execPath): readonly string[] {
-	return [join(dirname(dirname(dirname(__filename))), "package.json"), join(dirname(execPath), "package.json")];
+export function pinnedGjcCandidatePaths(
+	execPath: string = process.execPath,
+	modulePath: string = import.meta.path,
+): readonly string[] {
+	const release = join(dirname(execPath), "package.json");
+	if (isCompiledRelease(modulePath)) return [release];
+	return [release, join(dirname(dirname(dirname(modulePath))), "package.json")];
 }
 
-/** Read the pinned GJC version this build runs against, or throw naming every candidate tried. */
-export function readPinnedGjcVersion(candidates: readonly string[] = pinnedGjcCandidatePaths()): string {
+/**
+ * True when this process is a `bun build --compile` release rather than a source checkout
+ * run: a compiled binary embeds its modules under Bun's virtual root, a source run executes
+ * them from disk.
+ */
+export function isCompiledRelease(modulePath: string = import.meta.path): boolean {
+	return isEmbeddedModuleDir(dirname(modulePath));
+}
+
+/**
+ * Read the pinned GJC version this build runs against: the first candidate that carries a
+ * `gjc.version` wins, so a readable target manifest cannot be overridden by a later fallback.
+ *
+ * A compiled release fails closed. `modulePath` decides that the candidates come from that
+ * mode, and with no checkout candidate an executable whose release manifest is missing,
+ * unreadable, malformed, or pin-less has no pin of its own — enforcing another manifest's
+ * pin is how the broker comes to refuse its own release. A source run keeps the checkout
+ * fallback.
+ */
+export function readPinnedGjcVersion(
+	candidates: readonly string[] = pinnedGjcCandidatePaths(),
+	modulePath: string = import.meta.path,
+): string {
+	const failures: string[] = [];
 	for (const path of candidates) {
 		try {
 			const version = (JSON.parse(readFileSync(path, "utf-8")) as { gjc?: { version?: unknown } }).gjc?.version;
 			if (typeof version === "string" && version.length > 0) return version;
-		} catch {
-			// A missing or malformed candidate is not fatal: a later one may carry the pin.
+			failures.push(`${path} declares no gjc.version`);
+		} catch (error) {
+			// A missing or unusable candidate is not fatal while a later one may carry the pin;
+			// a compiled release has a single candidate, so the loop ends and the throw below
+			// refuses the boot instead of borrowing another manifest's pin.
+			failures.push(
+				(error as NodeJS.ErrnoException | undefined)?.code === "ENOENT"
+					? `${path} is missing`
+					: `${path} is unreadable or malformed`,
+			);
 		}
 	}
-	throw new Error(`Failed to read pinned GJC version from any of ${candidates.join(", ")}`);
+	const tried = failures.join("; ");
+	if (candidates.length > 0 && isCompiledRelease(modulePath)) {
+		const target = dirname(candidates[0]!);
+		throw new Error(
+			`gjc release pin unavailable: ${tried}. This binary is a compiled release: restore its manifest with 'gajaeway update --force --bin-dir ${target}'`,
+		);
+	}
+	throw new Error(`Failed to read pinned GJC version: ${tried}`);
 }
 export const HEALTH_PROBE_SESSION_ID = "00000000-0000-4000-8000-000000000000";
 const COMMAND_TIMEOUT_MS = 30_000;
@@ -120,6 +175,11 @@ export interface GlobalGjcClientOptions {
 	readonly onLiveOutageExceeded?: (detail: string) => void;
 	/** Broker-unavailable refusals are counted by the gateway SLO journal. */
 	readonly onUnavailable?: (at: number) => void;
+}
+/** One broker startup wedge: K distinct startup-exit records sharing a reason (#800). */
+export interface BrokerStartupWedge {
+	readonly reason: string;
+	readonly blockingPath?: string;
 }
 export type GlobalGjcClientDependencies = Omit<GlobalGjcClientOptions, "cwd">;
 
@@ -482,6 +542,9 @@ export class GlobalGjcClient {
 	/** Observation times of incarnation changes after the first; bounded by the churn window. */
 	#respawns: number[] = [];
 	#churnAlerted = false;
+	/** Tracks consecutive broker startup failures with the same reason. */
+	#startupFailureTracker = new BrokerStartupFailureTracker();
+	#onStartupWedge: ((wedge: BrokerStartupWedge) => void) | undefined;
 
 	constructor(options: GlobalGjcClientOptions) {
 		this.#options = options;
@@ -548,9 +611,15 @@ export class GlobalGjcClient {
 	judgeLiveness(): Promise<BrokerLivenessVerdict> {
 		return judgeBrokerLiveness(this.discoveryPath, this.#options.isPidAlive ?? defaultPidAlive);
 	}
+
 	onGeneration(listener: BrokerGenerationListener): () => void {
 		this.#listeners.add(listener);
 		return () => this.#listeners.delete(listener);
+	}
+
+	/** The runtime installs the owner alert after the client exists, like onGeneration. */
+	setOnStartupWedgeAlert(listener: (wedge: BrokerStartupWedge) => void): void {
+		this.#onStartupWedge = listener;
 	}
 	async preflight(): Promise<void> {
 		const result = await preflightGjcRuntime(
@@ -774,6 +843,8 @@ export class GlobalGjcClient {
 					}
 				}
 			}
+			// Reset startup failure tracker when broker is confirmed live
+			this.#startupFailureTracker.reset();
 			return true;
 		} catch (error) {
 			if (epoch === this.#epoch && !this.#stopped) {
@@ -857,6 +928,21 @@ export class GlobalGjcClient {
 					this.#outageSince = undefined;
 					this.#liveOutageSince = undefined;
 				} else if (epoch === this.#epoch && !this.#stopped) {
+					// Check for startup-exit record and track failures
+					const startupRecord = readBrokerStartupExitRecordSync(this.agentDir);
+					const validatedRecord = startupRecord ? validateStartupExitRecord(startupRecord) : undefined;
+					if (validatedRecord) {
+						const shouldAlert = this.#startupFailureTracker.recordFailure(validatedRecord, now);
+						if (shouldAlert) {
+							const recordCount = this.#startupFailureTracker.recentRecordCount();
+							const logLine = `broker_startup_wedge reason=${validatedRecord.reason}${validatedRecord.blockingLockPath ? ` blockingLockPath=${validatedRecord.blockingLockPath}` : ""} records=${recordCount}`;
+							this.#log(logLine);
+							this.#onStartupWedge?.({
+								reason: validatedRecord.reason,
+								blockingPath: validatedRecord.blockingLockPath,
+							});
+						}
+					}
 					this.#log(
 						new GjcCliUnavailableError(
 							`global broker unavailable; observing without repair: ${this.#unavailableReason}`,

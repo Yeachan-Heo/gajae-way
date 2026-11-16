@@ -29,6 +29,19 @@ export type RecoveryAction =
 	/** Freeze mutations and wait for a human. */
 	| "operator_hold";
 
+/** Structured hold kind for escalation decisions. */
+export type HoldKind =
+	| "ambiguous_authority"
+	| "locator_mismatch"
+	| "duplicate_owner"
+	| "operation_uncertain"
+	| "side_effects_unverified"
+	| "ownership_changed"
+	| "session_deleted"
+	| "session_not_live_but_op_active"
+	| "saved_authority_invalid"
+	| "resume_impossible";
+
 export type RecoveryInput = {
 	readonly session: {
 		readonly live: boolean;
@@ -61,6 +74,7 @@ export type RecoveryDecision = {
 	readonly action: RecoveryAction;
 	readonly freezeMutations: boolean;
 	readonly reason: string;
+	readonly holdKind?: HoldKind;
 };
 
 const UNCERTAIN_STATES = new Set<SupervisorOpState>(["terminal_uncertain", "terminal_missing_receipt"]);
@@ -76,16 +90,19 @@ export function decideRecovery(input: RecoveryInput): RecoveryDecision {
 	const { session, operation, lane } = input;
 
 	if (session.ambiguous === true) {
-		return hold("broker authority is ambiguous");
+		return hold("broker authority is ambiguous", "ambiguous_authority");
 	}
 	if (!session.locatorMatches) {
-		return hold("session locator does not match the lane worktree");
+		return hold("session locator does not match the lane worktree", "locator_mismatch");
 	}
 	if (session.duplicateOwner === true) {
-		return hold("another live session owns this worktree");
+		return hold("another live session owns this worktree", "duplicate_owner");
 	}
 	if (operation.status === "unknown" || UNCERTAIN_STATES.has(operation.supervisorState)) {
-		return hold(`operation state ${operation.supervisorState} is not decidable; do not resend, resume or recreate`);
+		return hold(
+			`operation state ${operation.supervisorState} is not decidable; do not resend, resume or recreate`,
+			"operation_uncertain",
+		);
 	}
 
 	const sessionUsable = session.live && !session.deleted;
@@ -101,10 +118,13 @@ export function decideRecovery(input: RecoveryInput): RecoveryDecision {
 
 	if (sessionUsable && operationTerminal) {
 		if (!lane.sideEffectsVerified) {
-			return hold("the previous operation's repository side effects have not been re-examined");
+			return hold(
+				"the previous operation's repository side effects have not been re-examined",
+				"side_effects_unverified",
+			);
 		}
 		if (!lane.ownershipUnchanged) {
-			return hold("lane ownership changed since the operation was accepted");
+			return hold("lane ownership changed since the operation was accepted", "ownership_changed");
 		}
 		if (input.workComplete === true) {
 			return {
@@ -122,15 +142,19 @@ export function decideRecovery(input: RecoveryInput): RecoveryDecision {
 
 	// Session is not usable from here on.
 	if (session.deleted) {
-		return hold("session is deleted; resume is not available and recreation needs operator sign-off");
+		return hold(
+			"session is deleted; resume is not available and recreation needs operator sign-off",
+			"session_deleted",
+		);
 	}
 	if (!operationTerminal) {
 		return hold(
 			"inconsistent snapshot: session is not live while the operation still reads active; re-read inspect -> status -> inspect",
+			"session_not_live_but_op_active",
 		);
 	}
 	if (!lane.sideEffectsVerified) {
-		return hold("cannot recover a stopped session before its side effects are known");
+		return hold("cannot recover a stopped session before its side effects are known", "side_effects_unverified");
 	}
 	if (lane.resumeImpossible !== true && session.savedAuthorityValid === true) {
 		return {
@@ -146,11 +170,11 @@ export function decideRecovery(input: RecoveryInput): RecoveryDecision {
 			reason: "resume is impossible and the prior operation is terminal: retire predecessor, recreate successor",
 		};
 	}
-	return hold("saved authority could not be validated for resume");
+	return hold("saved authority could not be validated for resume", "saved_authority_invalid");
 }
 
-function hold(reason: string): RecoveryDecision {
-	return { action: "operator_hold", freezeMutations: true, reason };
+function hold(reason: string, holdKind?: HoldKind): RecoveryDecision {
+	return { action: "operator_hold", freezeMutations: true, reason, holdKind };
 }
 
 export type ContaminationClass = "authority" | "scope" | "operation";

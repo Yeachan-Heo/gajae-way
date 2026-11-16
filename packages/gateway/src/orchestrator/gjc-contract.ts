@@ -23,7 +23,7 @@ export const MIN_GJC_VERSION = "0.18.9";
  * still runs, but `ops cycle` gates on `gjc_unverified_version` until the
  * contract test passes on it and this constant is raised.
  */
-export const VERIFIED_GJC_THROUGH = "0.19";
+export const VERIFIED_GJC_THROUGH = "0.20";
 
 function versionParts(version: string): [number, number, number] | undefined {
 	const match = /(\d+)\.(\d+)\.(\d+)/.exec(version);

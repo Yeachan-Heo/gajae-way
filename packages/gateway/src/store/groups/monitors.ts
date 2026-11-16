@@ -37,6 +37,8 @@ export interface MonitorFailureRow {
 	readonly protocol_reason: ProtocolFailureReason | null;
 	readonly response_byte_length: number | null;
 	readonly response_entry_count: number | null;
+	readonly session_id: string | null;
+	readonly op_ref: string | null;
 }
 
 export interface RecentMonitorFailureRow {
@@ -523,7 +525,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		detail: string,
 		now = Date.now(),
 		terminal = false,
-		options?: MonitorFailureOptions,
+		options?: MonitorFailureOptions & { sessionId?: string; opRef?: string },
 	): boolean {
 		this.#core.assertNotQuarantined("monitor", eventId);
 		const changes = this.#db
@@ -925,7 +927,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		return (
 			(this.#db
 				.prepare(
-					"SELECT event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 1",
+					"SELECT event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count, session_id, op_ref FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 1",
 				)
 				.get(eventId) as MonitorFailureRow | null) ?? undefined
 		);
@@ -944,7 +946,13 @@ ORDER BY monitor_failures.rowid DESC LIMIT ?`,
 			.all(limit) as RecentMonitorFailureRow[];
 	}
 
-	failureRecord(tx: WriteTx, eventId: string, code: string, detail: string, options?: MonitorFailureOptions): void {
+	failureRecord(
+		tx: WriteTx,
+		eventId: string,
+		code: string,
+		detail: string,
+		options?: MonitorFailureOptions & { sessionId?: string; opRef?: string },
+	): void {
 		const protocolFailure = options?.protocolFailure;
 		if (protocolFailure) {
 			if (!(PROTOCOL_FAILURE_REASONS as readonly string[]).includes(protocolFailure.reason))
@@ -962,7 +970,7 @@ ORDER BY monitor_failures.rowid DESC LIMIT ?`,
 		const failedAt = new Date().toISOString();
 		this.#db
 			.prepare(
-				"INSERT INTO monitor_failures (event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+				"INSERT INTO monitor_failures (event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count, session_id, op_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 			)
 			.run(
 				tx,
@@ -973,6 +981,8 @@ ORDER BY monitor_failures.rowid DESC LIMIT ?`,
 				protocolFailure?.reason ?? null,
 				protocolFailure?.responseByteLength ?? null,
 				protocolFailure?.responseEntryCount ?? null,
+				options?.sessionId ?? null,
+				options?.opRef ?? null,
 			);
 		this.#db
 			.prepare(

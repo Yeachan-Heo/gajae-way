@@ -79,7 +79,7 @@ test("migration 40 preserves existing monitors with unset context roll tokens an
 		initial.close();
 		const legacy = new Database(path);
 		legacy.exec(
-			"ALTER TABLE monitors DROP COLUMN context_roll_tokens; DELETE FROM schema_migrations WHERE version = 40",
+			"ALTER TABLE monitors DROP COLUMN context_roll_tokens; DELETE FROM schema_migrations WHERE version >= 40",
 		);
 		legacy.close();
 
@@ -111,7 +111,7 @@ test("migration 40 is idempotent when context roll tokens already exist", async 
 		});
 		initial.close();
 		const partial = new Database(path);
-		partial.exec("DELETE FROM schema_migrations WHERE version = 40");
+		partial.exec("DELETE FROM schema_migrations WHERE version >= 40");
 		partial.close();
 		const upgraded = await Store.open(path);
 		expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);

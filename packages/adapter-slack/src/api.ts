@@ -236,7 +236,7 @@ export class SlackWebApi {
 			// A 429, or a 200 whose body says `ratelimited`, both mean "slow down".
 			// Honour Retry-After (seconds), bounded, then give up as ambiguous. Never a
 			// definitive refusal: Slack did not judge the payload.
-			const limited = response.status === 429 || (await bodySaysRateLimited(response));
+			const limited = response.status === 429 || (response.ok && (await bodySaysRateLimited(response)));
 			if (!limited) break;
 			const header = Number(response.headers.get("retry-after"));
 			retryAfterMs = Math.min(
@@ -251,11 +251,8 @@ export class SlackWebApi {
 			if (!response.ok) throw new SlackApiError(response.status, `http_${response.status}`);
 			return undefined as T;
 		}
-		// Delivery ambiguity is decided by the error class: a SlackApiError is Slack
-		// saying no, everything else is "we do not know". An unreadable or truncated
-		// body is the second kind - Slack may well have accepted the write - so it
-		// must NOT become a SlackApiError, or the ledger would record a definitive
-		// non-delivery for a message the room can already see.
+		// An unreadable or truncated body cannot prove Slack rejected the write.
+		// Structured errors retain their status and code for ambiguity classification.
 		let body: unknown;
 		try {
 			body = await response.json();
@@ -431,9 +428,14 @@ export class SlackWebApi {
 	}
 }
 
-/** Transport failure cannot prove whether Slack accepted the write before disconnecting. */
+/** Server failures and transport failures cannot prove whether Slack accepted the write. */
 export function deliveryFailureIsAmbiguous(error: unknown): boolean {
-	return !(error instanceof SlackApiError);
+	return (
+		!(error instanceof SlackApiError) ||
+		(error.status >= 500 && error.status < 600) ||
+		error.code === "internal_error" ||
+		error.code === "fatal_error"
+	);
 }
 
 function historyPage(body: HistoryResponse): SlackHistoryPage {
