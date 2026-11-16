@@ -235,7 +235,7 @@ Broker mutations are journaled in `broker_operations`, intent first. `session.cr
 
 ### Functional readiness
 
-`gateway.status` reports process liveness separately from functional readiness. Readiness degrades after three consecutive failures in the same category (`session_create`, `turn`, `delivery`, or `monitor_delivery`) within a rolling five-minute window. A successful operation in that category clears its failure streak; old evidence expires. The payload includes a bounded failure code, sanitized detail, timestamp, and origin; `gajaeway status` prints the payload as JSON.
+`gateway.status` reports process liveness separately from functional readiness. For `session_create`, `turn`, `delivery`, and `monitor_delivery`, readiness degrades after three consecutive failures in the same category within a rolling five-minute window. `monitor_bind` degrades when one monitor origin reaches three consecutive first-attempt bind failures, even if retries succeed; its latest degradation observation expires after five minutes. A first-attempt bind and configuration success clears that origin's bind streak, and bind readiness clears once all degraded origins recover. Success in another category clears only that category. The payload includes a bounded failure code, sanitized detail, timestamp, and origin; `gajaeway status` prints the payload as JSON.
 
 ## Engagement and safety floors
 

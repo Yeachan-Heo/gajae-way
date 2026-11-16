@@ -485,6 +485,20 @@ test("session.create diagnostics are sanitized before failures reach callers", a
 	expect((failure as GjcCliError).details).toMatchObject({ code: "invalid_params" });
 });
 
+test("a local CLI queue timeout keeps its type through the session port sanitizer (#748)", async () => {
+	const run: CliRunner = async (args) => {
+		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
+		throw new GjcCommandQueueTimeoutError(30000, 4, 16, 16, "session.create");
+	};
+	const { port, repo } = await brokerPortFixture(run);
+	const failure = await port
+		.bind({ originKey: "discord/dm/queue-timeout-bind", epoch: 0, repo })
+		.catch((error: unknown) => error);
+
+	expect(failure).toBeInstanceOf(GjcCommandQueueTimeoutError);
+	expect((failure as GjcCommandQueueTimeoutError).timeoutMs).toBe(30000);
+});
+
 test("a binding recorded under a symlinked workspace stays owned when the runtime asks with the resolved path", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-symlink-repo-"));
 	database = await Store.open(join(home, "gateway.db"));

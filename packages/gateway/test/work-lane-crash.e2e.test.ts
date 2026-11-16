@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DeliveryService } from "../src/delivery/delivery";
 import { Store } from "../src/store";
-import { type Barrier, eventually, noticeOrigin, WorkFixture, writeFixtureJson } from "./fixtures/work-lane-server";
+import { type Barrier, eventually, WorkFixture, writeFixtureJson } from "./fixtures/work-lane-server";
 
 const fixtures: WorkFixture[] = [];
 afterEach(async () => {
@@ -255,7 +255,6 @@ for (const point of [
 for (const point of ["settle-before", "settle-report", "settle-commit"] as const) {
 	test(`persona parent crash at ${point}: one durable inbound report and one persona send`, async () => {
 		const f = await fixture();
-		const rootKey = "discord/channel/fixture";
 		const rootSessionId = await f.seedPersonaSession();
 		const priorPersonaSends = f.calls("send").filter((call) => call.input.sessionId === rootSessionId).length;
 		const { client, receipt } = await start(f, "persona-child", rootSessionId);
