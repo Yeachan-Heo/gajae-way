@@ -5,14 +5,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	DEFAULT_SESSIONS_BUSY_STALL_MS,
+	DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MODE,
 	DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS,
 	DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
+	type RetiredHoldAbandonMode,
 } from "../src/config";
 import {
 	type EscalationNoticeReceipt,
 	type PersonaBindHoldInput,
 	PersonaSessionManager,
 	personaTurnOpRef,
+	RETIRED_HOLD_PARKED_PROBE_MS,
 	UNRESOLVED_HOLD_ESCALATED,
 } from "../src/orchestrator/persona-session";
 import { RelayClosedError } from "../src/orchestrator/tail-runner";
@@ -96,6 +99,7 @@ async function heldOrigin(
 		clock?: VirtualClock;
 		retiredHoldAbandonMs?: number;
 		noticeReceipt?: () => EscalationNoticeReceipt;
+		abandonMode?: RetiredHoldAbandonMode;
 		/** Process-exit evidence for the held session's host (default: none). */
 		hostExited?: boolean;
 	},
@@ -148,6 +152,7 @@ async function heldOrigin(
 			unresolvedHoldMs: 10 * MINUTE,
 			...(options.retiredHoldAbandonMs ? { retiredHoldAbandonMs: options.retiredHoldAbandonMs } : {}),
 			...(options.noticeReceipt ? { escalationNoticeReceipt: options.noticeReceipt } : {}),
+			...(options.abandonMode ? { retiredHoldAbandonMode: options.abandonMode } : {}),
 			...(options.clock ? options.clock.managerOptions() : {}),
 			log: (line: string) => logs.push(line),
 			onBindHold: (input) => {
@@ -1020,6 +1025,7 @@ test("an escalated hold whose host stays not live past retiredHoldAbandonMs is c
 		live: false,
 		hostExited: true,
 		clock,
+		abandonMode: "close",
 		retiredHoldAbandonMs: 120 * MINUTE,
 	});
 	try {
@@ -1094,6 +1100,7 @@ test("an escalated hold whose host is seen live again restarts the abandonment w
 		live: false,
 		hostExited: true,
 		clock,
+		abandonMode: "close",
 		retiredHoldAbandonMs: 60 * MINUTE,
 	});
 	try {
@@ -1141,6 +1148,7 @@ test("unanswerable liveness at the end of the abandonment window neither closes 
 		live: false,
 		hostExited: true,
 		clock,
+		abandonMode: "close",
 		retiredHoldAbandonMs: 60 * MINUTE,
 	});
 	try {
@@ -1185,6 +1193,7 @@ test("an in-flight status read during the abandonment window restarts it, also w
 		live: false,
 		hostExited: true,
 		clock,
+		abandonMode: "close",
 		retiredHoldAbandonMs: 60 * MINUTE,
 	});
 	try {
@@ -1238,6 +1247,7 @@ test("a disowned session id is not proof its host exited: the hold stays open pa
 		live: false,
 		hostExited: true,
 		clock,
+		abandonMode: "close",
 		retiredHoldAbandonMs: 60 * MINUTE,
 	});
 	try {
@@ -1293,6 +1303,7 @@ test("a hold whose escalation notice the origin never confirmed is not abandoned
 		live: false,
 		hostExited: true,
 		clock,
+		abandonMode: "close",
 		retiredHoldAbandonMs: 60 * MINUTE,
 		noticeReceipt: () => {
 			asks++;
@@ -1328,6 +1339,7 @@ test("a host that revived and died again inside the window is a new incarnation 
 		live: false,
 		hostExited: true,
 		clock,
+		abandonMode: "close",
 		retiredHoldAbandonMs: 60 * MINUTE,
 	});
 	try {
@@ -1358,6 +1370,7 @@ test("an activity stamp that moved inside the window restarts it, even on the sa
 		live: false,
 		hostExited: true,
 		clock,
+		abandonMode: "close",
 		retiredHoldAbandonMs: 60 * MINUTE,
 	});
 	try {
@@ -1383,6 +1396,7 @@ test("a not-live read without a host identity never abandons the hold", async ()
 		live: false,
 		hostExited: true,
 		clock,
+		abandonMode: "close",
 		retiredHoldAbandonMs: 60 * MINUTE,
 	});
 	try {
@@ -1408,6 +1422,7 @@ test("a not-live read without an activity stamp never opens or closes the window
 		live: false,
 		hostExited: true,
 		clock,
+		abandonMode: "close",
 		retiredHoldAbandonMs: 60 * MINUTE,
 	});
 	try {
@@ -1480,6 +1495,7 @@ test("a dead hold whose host process is still present is never abandoned: broker
 		live: false,
 		hostExited: false,
 		clock,
+		abandonMode: "close",
 		retiredHoldAbandonMs: 60 * MINUTE,
 	});
 	try {
@@ -1512,6 +1528,7 @@ test("a hold whose notice row was pruned is re-noticed once under the same deliv
 		live: false,
 		hostExited: true,
 		clock,
+		abandonMode: "close",
 		retiredHoldAbandonMs: 60 * MINUTE,
 		noticeReceipt: () => receipt,
 	});
@@ -1554,6 +1571,7 @@ test("a crash while scheduling a replacement escalation notice leaves a retryabl
 		live: false,
 		hostExited: true,
 		clock,
+		abandonMode: "close",
 		retiredHoldAbandonMs: 60 * MINUTE,
 		noticeReceipt: () => receipt,
 	});
@@ -1594,14 +1612,99 @@ test("a crash while scheduling a replacement escalation notice leaves a retryabl
 	}
 });
 
+test("by default a dead hold is parked, not closed: still tracked, probed hourly, unparked by evidence, cadence durable across a restart", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-parked", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: true,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		let statusReads = 0;
+		let inFlight = false;
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			statusReads++;
+			if (inFlight)
+				return { operationRef: input.opRef, status: { status: "in_flight" as const }, summaryCompleted: false };
+			throw endpointStale();
+		};
+		// The same evidence a close needs, but the default disposition keeps everything #718 kept.
+		await sweepMinutes(clock, f.manager, f.originKey, 61);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBe("1");
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeDefined();
+		const parked = f.logs.filter((line) => line.startsWith("retired_hold_parked ") && line.includes(f.heldOpRef));
+		expect(parked).toHaveLength(1);
+		expect(parked[0]).toContain("reason=host_not_live");
+		expect(parked[0]).toContain(`probeEveryMs=${RETIRED_HOLD_PARKED_PROBE_MS}`);
+		expect(f.logs.filter((line) => line.startsWith("retired_hold_abandoned "))).toHaveLength(0);
+		expect(f.notices).toHaveLength(1);
+		// Parked: three more hours cost three status reads, not 180.
+		const atPark = statusReads;
+		await sweepMinutes(clock, f.manager, f.originKey, 180);
+		expect(statusReads - atPark).toBeGreaterThanOrEqual(2);
+		expect(statusReads - atPark).toBeLessThanOrEqual(3);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+
+		// The probe stamp is durable: a restart does not resume per-sweep reads.
+		await f.manager.stop();
+		const restarted = f.startManager();
+		try {
+			await restarted.recover();
+			const atRestart = statusReads;
+			for (let minute = 0; minute < 30; minute++) {
+				await clock.advance(MINUTE);
+				await restarted.reconcile(f.originKey);
+			}
+			expect(statusReads - atRestart).toBeLessThanOrEqual(1);
+			expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeDefined();
+
+			// Readable evidence at the next hourly probe unparks the hold, and it is swept every minute again.
+			inFlight = true;
+			const beforeEvidence = statusReads;
+			for (let minute = 0; minute < 61 && statusReads === beforeEvidence; minute++) {
+				await clock.advance(MINUTE);
+				await restarted.reconcile(f.originKey);
+			}
+			expect(statusReads).toBe(beforeEvidence + 1);
+			expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeUndefined();
+			expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeUndefined();
+			expect(
+				f.logs.filter((line) => line.startsWith("retired_hold_unparked ") && line.includes(f.heldOpRef)),
+			).toHaveLength(1);
+			const afterUnpark = statusReads;
+			for (let minute = 0; minute < 5; minute++) {
+				await clock.advance(MINUTE);
+				await restarted.reconcile(f.originKey);
+			}
+			expect(statusReads - afterUnpark).toBe(5);
+			expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		} finally {
+			await restarted.stop();
+		}
+	} finally {
+		await f.manager.stop();
+	}
+});
+
 test("a reloaded sessions.retiredHoldAbandonMs applies to the live manager", async () => {
 	const f = await heldOrigin("dead-hold-reload", { heldForMs: 11 * MINUTE, live: false });
 	try {
 		expect(f.manager.retiredHoldAbandonMs).toBe(DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS);
-		f.manager.setHostLimits({ retiredHoldAbandonMs: 2 * 60 * MINUTE });
+		expect(f.manager.retiredHoldAbandonMode).toBe(DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MODE);
+		expect(f.manager.retiredHoldAbandonMode).toBe("park");
+		f.manager.setHostLimits({ retiredHoldAbandonMs: 2 * 60 * MINUTE, retiredHoldAbandonMode: "close" });
 		expect(f.manager.retiredHoldAbandonMs).toBe(2 * 60 * MINUTE);
+		expect(f.manager.retiredHoldAbandonMode).toBe("close");
 		f.manager.setHostLimits(undefined);
 		expect(f.manager.retiredHoldAbandonMs).toBe(DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS);
+		expect(f.manager.retiredHoldAbandonMode).toBe("park");
 	} finally {
 		await f.manager.stop();
 	}
@@ -1614,6 +1717,7 @@ test("an escalated hold whose status reads in_flight is never abandoned, even wi
 		live: false,
 		hostExited: true,
 		clock,
+		abandonMode: "close",
 		retiredHoldAbandonMs: 60 * MINUTE,
 	});
 	try {

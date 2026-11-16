@@ -279,6 +279,15 @@ test("sessions host limits parse, omit absent fields, and reload live", async ()
 		expect(() => parseConfigFile({ schemaVersion: 1, sessions: { retiredHoldAbandonMs } })).toThrow(
 			"sessions.retiredHoldAbandonMs must be an integer",
 		);
+	// Dead retired hold disposition: park (the default when unset) or close.
+	for (const retiredHoldAbandonMode of ["park", "close"] as const)
+		expect(parseConfigFile({ schemaVersion: 1, sessions: { retiredHoldAbandonMode } }).sessions).toEqual({
+			retiredHoldAbandonMode,
+		});
+	for (const retiredHoldAbandonMode of ["drop", "", 1, true])
+		expect(() => parseConfigFile({ schemaVersion: 1, sessions: { retiredHoldAbandonMode } })).toThrow(
+			"sessions.retiredHoldAbandonMode must be one of park, close",
+		);
 	const path = await home();
 	await Bun.write(
 		join(path, "config.json"),

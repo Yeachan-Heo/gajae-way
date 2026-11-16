@@ -20,10 +20,12 @@ import {
 	DEFAULT_SESSIONS_BUSY_STALL_MS,
 	DEFAULT_SESSIONS_IDLE_RETIRE_MS,
 	DEFAULT_SESSIONS_MAX_LIVE_HOSTS,
+	DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MODE,
 	DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS,
 	DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
 	type GjcModelSelection,
 	type GjcServiceTier,
+	type RetiredHoldAbandonMode,
 	type SessionHostConfig,
 } from "../config";
 import { BrokerAuthorityError, type Store } from "../store";
@@ -265,6 +267,32 @@ export function linkOpenEscalatedHoldNotices(store: Store): number {
 	return linked;
 }
 
+/**
+ * A dead retired hold that is parked: still tracked, its late answer still
+ * wanted, but probed once per {@link RETIRED_HOLD_PARKED_PROBE_MS} instead of
+ * every sweep. Cleared by any evidence that clears the dead-since mark.
+ */
+function retiredHoldParkedKey(opRef: string): string {
+	return `retired-hold-parked:${opRef}`;
+}
+
+interface ParkedMark {
+	readonly at: number;
+	readonly probedAt: number;
+}
+
+function parseParkedMark(value: string | undefined): ParkedMark | undefined {
+	if (value === undefined) return undefined;
+	try {
+		const mark = JSON.parse(value) as Partial<ParkedMark>;
+		if (typeof mark.at !== "number" || !Number.isFinite(mark.at)) return undefined;
+		if (typeof mark.probedAt !== "number" || !Number.isFinite(mark.probedAt)) return undefined;
+		return { at: mark.at, probedAt: mark.probedAt };
+	} catch {
+		return undefined;
+	}
+}
+
 /** The not-live host a dead retired hold's abandonment window opened on. */
 interface DeadHostMark {
 	readonly at: number;
@@ -438,6 +466,7 @@ function completeInboundTurn(
 	// Clean up relay unavailability tracker when turn completes (#766)
 	if (changed === 1) store.core.metaDelete(relayUnavailableTrackerKey(opRef));
 	if (changed === 1) store.core.metaDelete(retiredHoldDeadSinceKey(opRef));
+	if (changed === 1) store.core.metaDelete(retiredHoldParkedKey(opRef));
 	if (changed === 1) store.core.metaDelete(escalationNoticeConfirmedKey(opRef));
 	if (changed === 1) store.core.metaDelete(escalationNoticeReissuedKey(opRef));
 	if (changed === 1 && trigger)
@@ -714,6 +743,8 @@ export interface PersonaBindHoldInput {
 
 /** Bind-hold reason for a turn whose unresolved hold was escalated to a retired hold (#686). */
 export const UNRESOLVED_HOLD_ESCALATED = "unresolved_hold_escalated";
+/** How often a parked dead retired hold is still probed for a late terminal, instead of every sweep. */
+export const RETIRED_HOLD_PARKED_PROBE_MS = 60 * 60_000;
 const UNRESOLVED_HOLD_NOTICE =
 	"[turn held] I could not confirm whether my answer to an earlier message finished, so I will not run it again. Newer messages continue in a fresh session; if that earlier answer still arrives, it will be posted here.";
 
@@ -829,6 +860,7 @@ export interface PersonaSessionManagerOptions {
 	readonly unresolvedHoldMs?: number;
 	/** Escalated retired hold on a host not live this long is closed; default DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS. */
 	readonly retiredHoldAbandonMs?: number;
+	readonly retiredHoldAbandonMode?: RetiredHoldAbandonMode;
 	/**
 	 * Whether the origin confirmed the escalation notice posted for this trigger.
 	 * A retired hold is abandoned only after it did. Unset means there is no
@@ -903,6 +935,7 @@ export class PersonaSessionManager {
 	#busyStallMs: number;
 	#unresolvedHoldMs: number;
 	#retiredHoldAbandonMs: number;
+	#retiredHoldAbandonMode: RetiredHoldAbandonMode;
 	#draining = false;
 	#restartDrainId: string | undefined;
 	#stopped = false;
@@ -949,6 +982,7 @@ export class PersonaSessionManager {
 			DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS,
 			"retiredHoldAbandonMs",
 		);
+		this.#retiredHoldAbandonMode = options.retiredHoldAbandonMode ?? DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MODE;
 		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
 		this.#onSloEvent = options.onSloEvent;
 		this.#onBindFailure = options.onBindFailure;
@@ -1035,6 +1069,7 @@ export class PersonaSessionManager {
 			DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS,
 			"retiredHoldAbandonMs",
 		);
+		this.#retiredHoldAbandonMode = config?.retiredHoldAbandonMode ?? DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MODE;
 	}
 
 	get busyStallMs(): number {
@@ -1047,6 +1082,10 @@ export class PersonaSessionManager {
 
 	get retiredHoldAbandonMs(): number {
 		return this.#retiredHoldAbandonMs;
+	}
+
+	get retiredHoldAbandonMode(): RetiredHoldAbandonMode {
+		return this.#retiredHoldAbandonMode;
 	}
 
 	get maxLiveHosts(): number {
@@ -4529,6 +4568,9 @@ class OriginActor {
 			epoch: bound.epoch,
 			repo: this.#manager.repo,
 		});
+		// A parked dead hold is probed once an hour, not once a sweep: its late
+		// terminal is still wanted, its status spawn every minute is not.
+		if (knownReport === undefined && !this.#parkedProbeDue(bound)) return;
 		let report: StatusReport;
 		try {
 			report = knownReport ?? (await this.#statusOf(bound));
@@ -5289,6 +5331,20 @@ class OriginActor {
 			return false;
 		}
 		this.#producerPresentLogged.delete(opRef);
+		if (this.#manager.retiredHoldAbandonMode === "park") {
+			// Conservative default: nothing is forgotten. The hold, its retired tail
+			// and its late answer stay exactly as #718 left them; only the per-sweep
+			// status spawn becomes hourly. Any evidence unparks it.
+			const parkedKey = retiredHoldParkedKey(opRef);
+			if (database.core.metaGet(parkedKey) === undefined) {
+				database.core.metaSet(parkedKey, JSON.stringify({ at: now, probedAt: now } satisfies ParkedMark));
+				this.#manager.log(
+					`retired_hold_parked origin=${this.originKey} epoch=${bound.epoch} opRef=${opRef} session=${bound.sessionId} notLiveMs=${now - mark.at} host=${host.hostIncarnation} probeEveryMs=${RETIRED_HOLD_PARKED_PROBE_MS} reason=host_not_live`,
+					"warn",
+				);
+			}
+			return false;
+		}
 		bound.tail?.setTurnRunning(false);
 		this.#flushStaleOutput(bound, "session_gone");
 		await bound.tail?.close();
@@ -5344,8 +5400,31 @@ class OriginActor {
 	}
 
 	#clearRetiredHoldDeadSince(opRef: string): void {
+		const database = this.#manager.database;
 		const key = retiredHoldDeadSinceKey(opRef);
-		if (this.#manager.database.core.metaGet(key) !== undefined) this.#manager.database.core.metaDelete(key);
+		if (database.core.metaGet(key) !== undefined) database.core.metaDelete(key);
+		const parkedKey = retiredHoldParkedKey(opRef);
+		if (database.core.metaGet(parkedKey) !== undefined) {
+			// Readable evidence, or a live host: the hold is swept every minute again.
+			database.core.metaDelete(parkedKey);
+			this.#manager.log(`retired_hold_unparked origin=${this.originKey} opRef=${opRef} reason=evidence`, "warn");
+		}
+	}
+
+	/**
+	 * Whether this sweep may read the op's status: always for an unparked hold;
+	 * for a parked one, once per {@link RETIRED_HOLD_PARKED_PROBE_MS}, stamping
+	 * the probe so a restart does not reset the cadence.
+	 */
+	#parkedProbeDue(bound: BoundTurn): boolean {
+		const database = this.#manager.database;
+		const key = retiredHoldParkedKey(bound.turn.opRef);
+		const parked = parseParkedMark(database.core.metaGet(key));
+		if (!parked) return true;
+		const now = this.#manager.now();
+		if (now - parked.probedAt < RETIRED_HOLD_PARKED_PROBE_MS) return false;
+		database.core.metaSet(key, JSON.stringify({ at: parked.at, probedAt: now } satisfies ParkedMark));
+		return true;
 	}
 
 	/** Drops actor tracking for a turn that is already closed durably, then serves anything queued behind it. */
