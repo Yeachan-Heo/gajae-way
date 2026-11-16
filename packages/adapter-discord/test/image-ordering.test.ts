@@ -1187,7 +1187,16 @@ test("a failed cursor checkpoint preserves completed DM evidence until restore c
 		await rm(cursorTemp, { recursive: true });
 		const restarted = gateway(
 			cursorPath,
-			async () => ({ messages: { fetch: async () => [] } }),
+			async () => ({
+				messages: {
+					fetch: async (query: string | { after?: string }) =>
+						typeof query === "string"
+							? dmMessage(id, "lost-dm", true)
+							: !query.after || BigInt(query.after) < BigInt(id)
+								? [dmMessage(id, "lost-dm", true)]
+								: [],
+				},
+			}),
 			requests,
 			{},
 			async (verb) =>
@@ -1195,12 +1204,55 @@ test("a failed cursor checkpoint preserves completed DM evidence until restore c
 		);
 		await bounded(restarted.recoverMissedMessages());
 		expect((await loadRecoveryCursors(cursorPath)).knownDms["lost-dm"]).toBeDefined();
-		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([]);
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([id]);
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toMatchObject([
+			{ messageId: id, dm: true, completed: true },
+		]);
 	} finally {
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+test("restore preserves and visits DM targets beyond the known-DM cap", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-restore-dm-overflow-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const now = Date.now();
+	const rows = Array.from({ length: 101 }, (_, index) => ({
+		messageId: snowflakeFromTimestamp(now - 60_000 + index),
+		channelId: `dm-${index}`,
+		dm: true,
+		completed: true,
+		completedAt: now,
+	}));
+	const fetched = new Set<string>();
+	try {
+		await saveRecoveryCursors(cursorPath, { ...emptyCursors(), gatewayDbIdentity: "old-db" });
+		await writeFile(outboxPath, JSON.stringify(rows));
+		const adapter = gateway(
+			cursorPath,
+			async (id) => {
+				fetched.add(id);
+				throw new Error("temporarily unavailable");
+			},
+			[],
+			{},
+			async (verb) => (verb === "gateway.status" ? { database: { identity: "new-db" } } : {}),
+		);
+		await bounded(adapter.recoverMissedMessages(), 30_000);
+		const cursors = await loadRecoveryCursors(cursorPath);
+		expect(Object.keys(cursors.knownDms)).toHaveLength(100);
+		expect(fetched.size).toBe(101);
+		const pending = JSON.parse(await readFile(outboxPath, "utf8")) as Array<{ channelId: string; completed?: boolean }>;
+		expect(new Set(pending.map((entry) => entry.channelId))).toEqual(new Set(rows.map((entry) => entry.channelId)));
+		expect(pending.every((entry) => !entry.completed)).toBe(true);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 35_000);
 
 test("audited terminal rows in unconfigured channels get a recovery watermark and are reclaimed", async () => {
 	const home = await mkdtemp(join(tmpdir(), "discord-image-terminal-orphan-"));

@@ -2558,6 +2558,9 @@ export class ReconnectingGateway {
 			// failed load leaves it undefined and still replays every durable intent.
 			await this.ensureCursors();
 			if (!(await this.reconcileGatewayRestore())) return;
+			// Restore reconciliation may replace completed DMs with durable replay
+			// intents, including DMs exceeding the bounded known-DM cursor set.
+			if (pendingImages) pendingImages = await this.#imageOutbox.load();
 			// The durable image consumer is independent of history recovery: an exact
 			// persisted request needs neither the cursor nor a history read, and a live
 			// image was admitted ahead of history in the first place.
