@@ -2942,7 +2942,6 @@ export class ReconnectingGateway {
 			}
 		}
 		if (identity === undefined) {
-			this.#legacyCursor = false;
 			return;
 		}
 		if (identity === state.gatewayDbIdentity) {
@@ -2951,6 +2950,7 @@ export class ReconnectingGateway {
 		}
 		let next = state;
 		if (state.gatewayDbIdentity !== undefined || legacyState) {
+			this.#imageDone.clear();
 			await this.#imageOutbox.invalidateCompleted();
 			const latest = this.#cursors ?? state;
 			const floor = snowflakeFromTimestamp(Date.now() - IMAGE_REPLAY_RETENTION_MS);
