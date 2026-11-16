@@ -1547,6 +1547,9 @@ export interface SlashInteractionLike {
 	} | null;
 	readonly channel?: DiscordMessageOriginShape["channel"] | null;
 	reply(options: { content: string; ephemeral?: boolean }): Promise<unknown>;
+	/** Acknowledge inside Discord's 3 s window; the verdict follows through editReply. */
+	deferReply(options: { ephemeral?: boolean }): Promise<unknown>;
+	editReply(options: { content: string }): Promise<unknown>;
 }
 
 /** Same precedence as messages, for a slash command's invoking user. */
@@ -1565,6 +1568,7 @@ export async function handleSlashCommand(
 	const command = interaction.commandName;
 	if (command !== "new" && command !== "reset" && command !== "model") return;
 	if (!interaction.channel || !interaction.user) return;
+	let deferred = false;
 	try {
 		let text = `/${command}`;
 		if (command === "model") {
@@ -1582,6 +1586,13 @@ export async function handleSlashCommand(
 		}
 		const origin = discordMessageOrigin({ author: { id: interaction.user.id }, channel: interaction.channel });
 		const interactionServerTag = resolveServerTag(interaction.user);
+		// Discord invalidates an interaction three seconds after it arrives, while a
+		// gateway turn routinely takes longer (the chat.send verb alone allows 30 s).
+		// Acknowledge first and deliver the verdict through editReply; replying only
+		// after the round trip is what produced "Unknown interaction" and left the
+		// command unanswered (JJO-2444).
+		await interaction.deferReply({ ephemeral: true });
+		deferred = true;
 		const result = await gateway.requestInbound(`slash-${interaction.id}`, origin, text, {
 			mentioned: true,
 			group: origin.kind !== "dm",
@@ -1595,13 +1606,31 @@ export async function handleSlashCommand(
 		// Honest ack: the gateway allowlist may decline the command (non-owner in a
 		// group surface) — never claim a reset that did not happen. `/model` never
 		// resets the session; the gateway posts the resulting selection itself.
-		await interaction.reply(
-			result?.engaged
-				? { content: command === "model" ? "🦞 model command accepted" : "🦞 session reset", ephemeral: true }
-				: { content: "not authorized for session commands here", ephemeral: true },
-		);
+		// An unconfirmed round trip (`undefined`) is not a refusal: the command may
+		// already have been applied, so say so instead of reporting not-authorized.
+		await interaction.editReply({
+			content:
+				result === undefined
+					? "the gateway did not confirm this command; it may already have applied. Check `/model` before retrying."
+					: result.engaged
+						? command === "model"
+							? "🦞 model command accepted"
+							: "🦞 session reset"
+						: "not authorized for session commands here",
+		});
 	} catch (error) {
 		log.error(`Discord slash command failed: ${error instanceof Error ? error.message : String(error)}`);
+		if (deferred) {
+			// A deferred interaction must still be resolved, or the invoker sits on
+			// "thinking…" until the token expires.
+			try {
+				await interaction.editReply({
+					content: "the command failed before the gateway confirmed it; it may already have applied.",
+				});
+			} catch {
+				// The interaction token is gone; the log line above is the record.
+			}
+		}
 	}
 }
 
