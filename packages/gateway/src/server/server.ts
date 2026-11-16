@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { readFile, unlink } from "node:fs/promises";
+import { readFile, stat, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { validatePromptImages } from "@gajae-gateway/images";
 import {
@@ -1411,6 +1411,15 @@ function createRuntime(options: GatewayServerOptions): Runtime {
  * delivery.fail the events stay `authored` (distinguishable, operator-visible)
  * while the ledger row itself records failed/ambiguous.
  */
+async function databaseIdentity(path: string): Promise<string | undefined> {
+	try {
+		const info = await stat(path);
+		return `${info.dev}:${info.ino}`;
+	} catch {
+		return undefined;
+	}
+}
+
 function settleMonitorBatch(database: Store, deliveryId: string, stage: MonitorEventStage): void {
 	const delivery = database.outbox.get(deliveryId);
 	if (!delivery) return;
@@ -1568,6 +1577,7 @@ async function handleRequest(
 					pid: process.pid,
 					startedAt: gatewayStartedAt,
 					schemaVersion: options.database.schemaVersion,
+					database: { identity: await databaseIdentity(options.config.dbPath) },
 					readiness: (() => {
 						const drainId = runtime.personaSessions.restartDrainId;
 						if (drainId !== undefined) {

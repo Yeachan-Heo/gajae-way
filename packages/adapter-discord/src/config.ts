@@ -194,13 +194,6 @@ export async function loadDiscordAdapterConfig(
 	const voice = await loadVoiceConfig(raw.voice, configPath);
 	return {
 		...raw,
-		...(typeof raw.gatewayDbPath === "string"
-			? {
-					gatewayDbPath: isAbsolute(raw.gatewayDbPath)
-						? raw.gatewayDbPath
-						: resolve(dirname(configPath), raw.gatewayDbPath),
-				}
-			: {}),
 		tokenFile,
 		token,
 		configPath,

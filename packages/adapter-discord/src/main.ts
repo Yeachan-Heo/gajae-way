@@ -1,4 +1,3 @@
-import { stat } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { acquireLease, exitOnLeaseHeld, homeLayout, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import { ImagePreparationBudget } from "@gajae-gateway/images";
@@ -2907,23 +2906,31 @@ export class ReconnectingGateway {
 
 	private async reconcileGatewayRestore(): Promise<void> {
 		const state = this.#cursors;
-		if (!state) return;
-		const identity = await this.gatewayDbIdentity();
+		const client = this.#client;
+		if (!state || !client || state.gatewayDbIdentity === undefined) return;
+		let result: { database?: { identity?: string } } | undefined;
+		try {
+			result = await client.request<{ database?: { identity?: string } }>("gateway.status");
+		} catch {
+			return;
+		}
+		const identity = result?.database?.identity;
 		if (identity === undefined || identity === state.gatewayDbIdentity) return;
 		let next = state;
 		if (state.gatewayDbIdentity !== undefined) {
 			await this.#imageOutbox.invalidateCompleted();
+			const latest = this.#cursors ?? state;
 			const floor = snowflakeFromTimestamp(Date.now() - IMAGE_REPLAY_RETENTION_MS);
 			next = {
-				...state,
+				...latest,
 				recoveredThrough: Object.fromEntries(
-					Object.entries(state.recoveredThrough).map(([id, watermark]) => [
+					Object.entries(latest.recoveredThrough).map(([id, watermark]) => [
 						id,
 						snowflakeIsAfter(watermark, floor) ? floor : watermark,
 					]),
 				),
 				quarantined: Object.fromEntries(
-					Object.entries(state.quarantined).map(([id, entry]) => [
+					Object.entries(latest.quarantined).map(([id, entry]) => [
 						id,
 						{
 							...entry,
@@ -2937,15 +2944,6 @@ export class ReconnectingGateway {
 			);
 		}
 		this.persist({ ...next, gatewayDbIdentity: identity });
-	}
-
-	private async gatewayDbIdentity(): Promise<string | undefined> {
-		try {
-			const info = await stat(this.socketPath);
-			return `${info.dev}:${info.ino}`;
-		} catch {
-			return undefined;
-		}
 	}
 
 	/** Serialized, fire-and-forget cursor-store write; a failed persist only widens the gap. */
@@ -3220,8 +3218,16 @@ export class ReconnectingGateway {
 		setTimeout(
 			() => {
 				if (this.#client !== client) return;
-				void client.request("gateway.status").then(
-					() => this.monitor(client, 0),
+				void client.request<{ database?: { identity?: string } }>("gateway.status").then(
+					(result) => {
+						const identity = result?.database?.identity;
+						if (identity !== undefined && this.#cursors?.gatewayDbIdentity === undefined) {
+							this.persist({ ...this.#cursors!, gatewayDbIdentity: identity });
+						} else if (identity !== undefined && identity !== this.#cursors?.gatewayDbIdentity) {
+							void this.reconcileGatewayRestore();
+						}
+						this.monitor(client, 0);
+					},
 					() => {
 						const next = monitorFailureDecision(strikes);
 						if (next.action === "reconnect") this.scheduleReconnect();

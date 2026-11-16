@@ -1011,7 +1011,6 @@ test("a replaced gateway database invalidates completion tombstones", async () =
 	const channelId = "restore-dm";
 	const id = snowflakeFromTimestamp(Date.now() - 60_000);
 	try {
-		await writeFile(join(home, "gateway.sock"), "");
 		await saveRecoveryCursors(cursorPath, {
 			...emptyCursors(),
 			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 60_000) },
@@ -1026,10 +1025,8 @@ test("a replaced gateway database invalidates completion tombstones", async () =
 			async () => ({ messages: { fetch: async () => [] } }),
 			[],
 			{},
-			undefined,
-			undefined,
-			true,
-			join(home, "gateway.sock"),
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "new-db" } } : { engaged: false, turnId: null },
 		);
 		await bounded(adapter.recoverMissedMessages());
 		await adapter.cursorsFlushed;
