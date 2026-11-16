@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeliveryService } from "../src/delivery/delivery";
@@ -124,8 +124,9 @@ test("GjcCommandQueueTimeoutError passes through sanitizer and classifies as ses
 			bind: async (_input: SessionBindInput) => {
 				bindAttempts++;
 				// Local CLI pool queue timeout (preserved through sanitizer)
-				const error = new GjcCommandQueueTimeoutError(30000, 4, 16, 16, "session.create");
-				throw error;
+				const error = new GjcCommandQueueTimeoutError(30000, 4, 16, 16, "session.create", 35000);
+				// The production sanitizer may reconstruct the error as a plain Error.
+				throw bindAttempts === 2 ? new Error(error.message) : error;
 			},
 			runExclusive: async (_, fn) => fn(),
 		};
@@ -165,6 +166,7 @@ test("GjcCommandQueueTimeoutError passes through sanitizer and classifies as ses
 		for (const eventId of eventIds) {
 			const failure = database.monitors.failure(eventId);
 			expect(failure?.code).toBe("session_bind_failed");
+			expect(failure?.detail).toContain('"queueWaitMs":35000');
 		}
 
 		// Verify degraded readiness signal was recorded after 3rd failure
@@ -286,6 +288,7 @@ test("first-bind degradation survives successful retries until a first-attempt s
 			});
 			readiness.recordSuccess("delivery");
 			readiness.recordSuccess("monitor_delivery");
+			expect(readiness.snapshot().ready).toBe(i < 2);
 		}
 
 		expect(bindAttempts).toBe(10);
@@ -446,6 +449,69 @@ test("queue timeout error includes pool occupancy in error message (#748)", asyn
 	const unavailable = new GjcCliUnavailableError("request timed out after 30000ms", "session.create");
 	expect(unavailable.message).toContain("operation=session.create");
 	expect(unavailable.operation).toBe("session.create");
+});
+
+test("first-attempt bind recovery clears degradation before payload preparation fails (#748)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-bind-payload-"));
+	try {
+		const database = await Store.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "bind-payload-failure",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["memory.debloat"],
+			burstPolicy: "serialize",
+		});
+		const brokenRoot = join(home, "cyclic-memory-root");
+		await symlink(brokenRoot, brokenRoot);
+		let failBind = true;
+		const readiness = new FunctionalReadiness();
+		const port: Partial<SessionPort> = {
+			bind: async (input) => {
+				if (failBind) throw new GjcCliUnavailableError("request timed out");
+				return {
+					sessionId: "s",
+					epoch: input.epoch,
+					originKey: input.originKey,
+					repo: input.repo,
+					startupModelApplied: false,
+				};
+			},
+			runExclusive: async (_, fn) => fn(),
+		};
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: port as SessionPort,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			memoryDebloat: { root: brokenRoot, thresholdBytes: 10 },
+			onReadinessFailure: (failure) =>
+				readiness.recordFailure({
+					category: failure.code === "monitor_bind_degraded" ? "monitor_bind" : "monitor_delivery",
+					code: failure.code,
+					detail: failure.detail,
+					origin: failure.originKey,
+					at: failure.at,
+				}),
+			onFirstAttemptBindSuccess: () => readiness.recordSuccess("monitor_bind"),
+		});
+		for (let i = 0; i < 3; i++) await pipeline.submitAwaitable(monitor.monitorId, "memory.debloat", {});
+		expect(readiness.snapshot().failure?.category).toBe("monitor_bind");
+		failBind = false;
+		const id = await pipeline.submitAwaitable(monitor.monitorId, "memory.debloat", {});
+		expect(database.monitors.eventGet(id)?.stage).toBe("failed");
+		expect(database.monitors.failure(id)?.code).not.toBe("session_bind_failed");
+		expect(
+			pipeline.sessionSafetyState(`monitor/eventtype/memory.debloat/parent=${monitor.monitorId}`)
+				.firstAttemptBindFailures,
+		).toBe(0);
+		expect(readiness.snapshot().failure?.category).not.toBe("monitor_bind");
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
 });
 
 test("monitor_bind readiness clears only when ALL degraded origins succeed on first attempt (#748)", async () => {

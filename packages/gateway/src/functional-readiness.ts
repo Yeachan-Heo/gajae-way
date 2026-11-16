@@ -34,7 +34,11 @@ export class FunctionalReadiness {
 			detail: bounded(input.detail, 200),
 			at: new Date(atMs).toISOString(),
 			...(input.origin ? { origin: bounded(input.origin, 160) } : {}),
-			consecutiveFailures: Math.min(active.length + 1, FUNCTIONAL_READINESS_FAILURE_THRESHOLD),
+			// Monitor bind observations are emitted only after the per-origin streak reaches the threshold.
+			consecutiveFailures:
+				input.category === "monitor_bind"
+					? FUNCTIONAL_READINESS_FAILURE_THRESHOLD
+					: Math.min(active.length + 1, FUNCTIONAL_READINESS_FAILURE_THRESHOLD),
 		};
 		active.push({ atMs, failure });
 		if (active.length > FUNCTIONAL_READINESS_FAILURE_THRESHOLD) active.shift();
@@ -51,8 +55,8 @@ export class FunctionalReadiness {
 			const active = observations.filter(
 				(observation) => nowMs >= observation.atMs && nowMs - observation.atMs < FUNCTIONAL_READINESS_WINDOW_MS,
 			);
-			if (active.length < FUNCTIONAL_READINESS_FAILURE_THRESHOLD) continue;
 			const current = active.at(-1);
+			if (category !== "monitor_bind" && active.length < FUNCTIONAL_READINESS_FAILURE_THRESHOLD) continue;
 			if (current && (!latest || current.atMs > latest.atMs)) latest = current;
 			if (active.length !== observations.length) this.#failures.set(category, active);
 		}
@@ -72,7 +76,10 @@ export class FunctionalReadiness {
 			state: "degraded",
 			windowMs: FUNCTIONAL_READINESS_WINDOW_MS,
 			failureThreshold: FUNCTIONAL_READINESS_FAILURE_THRESHOLD,
-			reason: `${failure.category}: ${failure.code} (${FUNCTIONAL_READINESS_FAILURE_THRESHOLD} consecutive failures within 5m)`,
+			reason:
+				failure.category === "monitor_bind"
+					? `${failure.category}: ${failure.code} (${FUNCTIONAL_READINESS_FAILURE_THRESHOLD} consecutive first-attempt bind failures; latest within 5m)`
+					: `${failure.category}: ${failure.code} (${FUNCTIONAL_READINESS_FAILURE_THRESHOLD} consecutive failures within 5m)`,
 			failure,
 		};
 	}

@@ -221,13 +221,13 @@ export function isBrokerUnavailable(error: unknown): boolean {
 	return error instanceof Error && /^gjc sdk request failed: broker_unavailable(?:\s|\(|$)/.test(error.message);
 }
 
-/**
- * Local CLI pool queue timeout: the pool stayed full for the whole call budget.
- * This error class is preserved through sanitization so it can be properly
- * classified as session_bind_failed during bind/configure phases (#748).
- */
+/** Local pool congestion is not broker unavailability, including after error sanitization. */
 export function isCliQueueTimeout(error: unknown): boolean {
-	return error instanceof GjcCommandQueueTimeoutError;
+	return (
+		error instanceof GjcCommandQueueTimeoutError ||
+		(error instanceof Error &&
+			/^gjc command queue timed out after \d+ms \(local CLI pool saturated\)/.test(error.message))
+	);
 }
 
 export interface BrokerWaitOptions {
@@ -482,9 +482,11 @@ export class GjcCommandQueueTimeoutError extends Error {
 		readonly poolOccupancy?: number,
 		readonly poolSize?: number,
 		operation?: string,
+		readonly queueWaitMs?: number,
 	) {
 		const details = [
 			...(operation ? [`operation=${operation}`] : []),
+			...(queueWaitMs !== undefined ? [`queueWaitMs=${queueWaitMs}`] : []),
 			...(queueLength !== undefined && poolOccupancy !== undefined && poolSize !== undefined
 				? [`queue=${queueLength} occupancy=${poolOccupancy}/${poolSize}`]
 				: []),
@@ -1031,6 +1033,7 @@ export class GlobalGjcClient {
 					this.#inflight,
 					this.#maxPoolSize,
 					operation,
+					queueWaitMs,
 				);
 		}
 		this.#assertAgentDirIdentity(true);

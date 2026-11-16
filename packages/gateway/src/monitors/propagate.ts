@@ -17,7 +17,7 @@ import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
 import { oversizedMemoryFiles } from "../memory/debloat";
-import { GjcCommandQueueTimeoutError, isBrokerUnavailable, isCliQueueTimeout } from "../orchestrator/broker";
+import { isBrokerUnavailable, isCliQueueTimeout } from "../orchestrator/broker";
 import { sanitizeDiagnostic, sanitizeDiagnosticDetail } from "../orchestrator/rebind";
 import {
 	isSessionBusy,
@@ -1273,7 +1273,6 @@ export class MonitorPropagator {
 		let dispatchPhase = "bind";
 		let dispatchOperation: string | undefined;
 		let dispatchOperationArgs: Record<string, unknown> | undefined;
-		let firstAttemptBindSucceeded = false;
 		// Registered before the per-origin queue: an event still waiting for its
 		// turn is just as interrupted by a shutdown as one mid-request.
 		for (const row of claimed)
@@ -1365,7 +1364,6 @@ export class MonitorPropagator {
 						repo: this.#repo,
 						...(effectiveModel ? { model: effectiveModel } : {}),
 					});
-					firstAttemptBindSucceeded = !replayedBatch;
 					sessionId = binding.sessionId;
 					boundSessionId = sessionId;
 					boundSessionEpoch = binding.epoch;
@@ -1390,6 +1388,12 @@ export class MonitorPropagator {
 						};
 						await this.#sessionPort.setServiceTier({ sessionId, repo: this.#repo, tier: effectiveServiceTier });
 						this.#appliedServiceTiers.set(sessionId, effectiveServiceTier);
+					}
+					// Binding and configuration have recovered even if procedure or payload preparation fails.
+					if (!replayedBatch) {
+						this.#safetyState(sessionOriginKey).firstAttemptBindFailures = 0;
+						this.#degradedBindOrigins.delete(sessionOriginKey);
+						if (this.#degradedBindOrigins.size === 0) this.#recordFirstAttemptBindSuccess(sessionOriginKey);
 					}
 				}
 				boundSessionId = sessionId;
@@ -1595,13 +1599,6 @@ export class MonitorPropagator {
 						this.#database.core.metaSet(authoringTurnKey(row.event_id), pendingTurn);
 					}
 				});
-				// Bind and configure succeeded on the first attempt: binding has recovered,
-				// whatever the authoring turn does next (#748).
-				if (firstAttemptBindSucceeded) {
-					this.#safetyState(sessionOriginKey).firstAttemptBindFailures = 0;
-					this.#degradedBindOrigins.delete(sessionOriginKey);
-					if (this.#degradedBindOrigins.size === 0) this.#recordFirstAttemptBindSuccess(sessionOriginKey);
-				}
 				dispatchPhase = "request";
 				dispatchOperation = "request";
 				dispatchOperationArgs = {
@@ -3244,11 +3241,7 @@ function cliFailureDiagnostic(error: unknown): {
 			: message.match(/\boperation=([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*)\b/)?.[1];
 	const cliSubcommand = message.match(/\bcliSubcommand="([a-z][a-z0-9_]*(?: [a-z][a-z0-9_]*)?)"/)?.[1];
 	const occupancy = message.match(/\boccupancy=(\d+)(?:\/(\d+))?/);
-	const queueWaitMs =
-		numberValue(fields.queueWaitMs) ??
-		(error instanceof GjcCommandQueueTimeoutError
-			? numberValue(error.timeoutMs)
-			: numberFromMessage(/\bqueueWaitMs=(\d+)\b/));
+	const queueWaitMs = numberValue(fields.queueWaitMs) ?? numberFromMessage(/\bqueueWaitMs=(\d+)\b/);
 	const queueLength = numberValue(fields.queueLength) ?? numberFromMessage(/\bqueue=(\d+)\b/);
 	const poolOccupancy = numberValue(fields.poolOccupancy) ?? numberValue(occupancy?.[1]);
 	const poolSize = numberValue(fields.poolSize) ?? numberValue(occupancy?.[2]);

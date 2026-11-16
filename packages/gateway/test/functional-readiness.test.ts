@@ -49,7 +49,8 @@ test("a success resets only its own failure streak", () => {
 
 test("monitor bind degradation survives delivery success until a first-attempt bind succeeds", () => {
 	const readiness = new FunctionalReadiness();
-	for (let i = 0; i < 3; i++) fail(readiness, "monitor_bind", START + i, "monitor_bind_degraded");
+	// This category receives an already-thresholded per-origin observation.
+	fail(readiness, "monitor_bind", START, "monitor_bind_degraded");
 
 	readiness.recordSuccess("delivery");
 	readiness.recordSuccess("monitor_delivery");
