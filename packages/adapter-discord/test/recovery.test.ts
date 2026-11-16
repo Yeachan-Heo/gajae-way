@@ -403,13 +403,19 @@ test("an active thread gap is recovered once through its configured parent", asy
 test("a rejected identity probe holds recovery instead of advancing a stale cursor", async () => {
 	const cursorPath = join(home, "identity-probe-failure", "recovery-cursor.json");
 	const missed = message(snowflakeFromTimestamp(Date.now() - 60_000));
-	const sent: string[] = [];
+	const channel = fakeChannel([missed]);
+	const afterProbe: string[] = [];
+	let probes = 0;
 	await saveRecoveryCursors(cursorPath, cursorState({}));
 	const gateway = wiredGateway(
-		fakeChannel([missed]),
+		channel,
 		{
 			request: async (verb: string) => {
-				if (verb === "gateway.status") throw new Error("status unavailable");
+				if (verb === "gateway.status") {
+					probes++;
+					throw new Error("status unavailable");
+				}
+				afterProbe.push(verb);
 				return {};
 			},
 		},
@@ -422,7 +428,10 @@ test("a rejected identity probe holds recovery instead of advancing a stale curs
 	const cleanupTimers = trackTimers();
 	try {
 		await gateway.recoverMissedMessages();
-		expect(sent).toEqual([]);
+		// A rejected probe must abort before the pass reads history or sends anything.
+		expect(probes).toBe(1);
+		expect(afterProbe).toEqual([]);
+		expect(channel.fetches).toEqual([]);
 		expect((await loadRecoveryCursors(cursorPath)).recoveredThrough["channel-1"]).toBeUndefined();
 		expect(gateway.recoveryRetryPending).toBe(true);
 	} finally {
