@@ -28,6 +28,7 @@ import type { PromptImage } from "@gajae-gateway/protocol";
 const MAX_RENDERED_ATTACHMENTS = 10;
 
 export type AttachmentLike = {
+	readonly id?: string | null;
 	readonly name?: string | null;
 	readonly contentType?: string | null;
 	readonly size?: number | null;
@@ -88,7 +89,11 @@ export function selectImageAttachments(message: AttachmentCarrier): AttachmentLi
 /** Stable identity for the image bytes a message currently points at. */
 export function imageSourceIdentity(message: AttachmentCarrier): string {
 	return selectNativeImageAttachments(message)
-		.map((attachment) => `${attachment.url ?? ""}\u0000${attachment.name ?? ""}\u0000${attachment.size ?? ""}`)
+		.map((attachment) => {
+			const stable =
+				attachment.id ?? `${attachment.name ?? ""}\u0000${attachment.size ?? ""}\u0000${attachment.contentType ?? ""}`;
+			return stable;
+		})
 		.join("\u0001");
 }
 
