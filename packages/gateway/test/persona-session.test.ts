@@ -2962,19 +2962,14 @@ async function caseB(port: WedgedSessionPort) {
 	return fixture;
 }
 
-test("case B: terminal_ok with pending output holds despite spoken and silent transcript rows, then uses exact output", async () => {
+test("case B: terminal_ok with pending output uses a late exact output inside the recovery window", async () => {
 	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
 	const { clock, logs, terminal, failures, first } = await caseB(port);
 	port.appendAssistant(first.sessionId, "the real answer");
-	port.appendAssistant(first.sessionId, "[SILENT]");
 
-	clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS - MINUTE;
+	clock.offsetMs = 30_000;
 	await manager!.tick(KEY);
 	expect(logs.some((line) => line.startsWith("wedged_turn_released"))).toBe(false);
-	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
-
-	clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
-	await manager!.tick(KEY);
 	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
 		state: "pending",
 		turn_state: "accepted",
@@ -2983,7 +2978,7 @@ test("case B: terminal_ok with pending output holds despite spoken and silent tr
 	});
 	expect(terminal).toEqual([]);
 	expect(failures).toEqual([]);
-	// A healthy host is not killed and the binding is kept.
+	// A healthy host is not killed and the binding is kept while the receipt may still arrive.
 	expect(port.closes).toHaveLength(0);
 	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	expect(logs.some((line) => line.startsWith("accepted_turn_closed"))).toBe(false);
@@ -2995,19 +2990,16 @@ test("case B: terminal_ok with pending output holds despite spoken and silent tr
 	expect(port.sends).toHaveLength(1);
 });
 
-test("case B with only [SILENT] in the transcript remains held without a silent receipt", async () => {
+test("case B with only [SILENT] in the transcript never substitutes it for the missing receipt", async () => {
 	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
 	const { clock, logs, terminal, failures, first } = await caseB(port);
 	port.appendAssistant(first.sessionId, "[SILENT]");
 	clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
 	await manager!.tick(KEY);
-	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
-		state: "pending",
-		turn_state: "accepted",
-		turn_op_ref: first.opRef,
-		bound_session_id: first.sessionId,
-	});
-	expect(terminal).toEqual([]);
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+	expect(terminal).toHaveLength(1);
+	expect(terminal[0]).toContain("[turn completed]");
+	expect(terminal[0]).not.toContain("[SILENT]");
 	expect(failures).toEqual([]);
 	expect(logs.some((line) => line.startsWith("accepted_turn_closed"))).toBe(false);
 	expect(port.closes).toHaveLength(0);
@@ -3028,34 +3020,42 @@ test("an unrelated confirmed delivery cannot settle a terminal operation with pe
 	});
 	clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
 	await manager!.tick(KEY);
-	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
-		state: "pending",
-		turn_state: "accepted",
-		turn_op_ref: first.opRef,
-		bound_session_id: first.sessionId,
-	});
-	expect(terminal).toEqual([]);
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+	expect(terminal).toHaveLength(1);
+	expect(terminal[0]).toContain("[turn completed]");
+	expect(terminal[0]).not.toContain("already posted");
 	expect(recorded).toEqual([]);
 	expect(failures).toEqual([]);
 	expect(logs.some((line) => line.startsWith("accepted_turn_closed"))).toBe(false);
 });
 
-test("case B with no transcript remains held instead of inferring output failure from elapsed time", async () => {
+test("case B with no transcript settles with one notice after the recovery window", async () => {
 	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
 	const { clock, logs, terminal, failures, first } = await caseB(port);
 	clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
 	await manager!.tick(KEY);
-	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
-		state: "pending",
-		turn_state: "accepted",
-		turn_op_ref: first.opRef,
-		bound_session_id: first.sessionId,
-	});
-	expect(terminal).toEqual([]);
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+	expect(terminal).toHaveLength(1);
+	expect(terminal[0]).toContain("[turn completed]");
 	expect(failures).toEqual([]);
 	expect(logs.some((line) => line.startsWith("accepted_turn_closed"))).toBe(false);
 	expect(port.closes).toHaveLength(0);
 	expect(port.sends).toHaveLength(1);
+});
+
+test("terminal text recovery is bounded by attempts and rechecks, then stops", async () => {
+	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const { terminal, first } = await caseB(port);
+	const reads = () => port.workerOutputReads.filter((read) => read.opRef === first.opRef).length;
+	for (let attempt = 0; attempt < 12 && terminal.length === 0; attempt++) await manager!.tick(KEY);
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+	expect(terminal).toHaveLength(1);
+	expect(terminal[0]).toContain("[turn completed]");
+	const settledReads = reads();
+	expect(settledReads).toBeLessThanOrEqual(12);
+	await manager!.tick(KEY);
+	expect(reads()).toBe(settledReads);
+	expect(terminal).toHaveLength(1);
 });
 
 test("a live session that is busy (not idle) past the bound is never released", async () => {
@@ -4080,34 +4080,20 @@ test("an unanswerable liveness probe is not wedge evidence: the turn stays held"
 	expect(port.closes).toHaveLength(0);
 });
 
-test("a throwing liveness probe on a terminal_ok turn with pending output keeps it held", async () => {
+test("a throwing liveness probe on a terminal_ok turn with pending output still posts one notice", async () => {
 	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
-	const { clock, logs, terminal, first } = await caseB(port);
+	const { clock, logs, failures, terminal, first } = await caseB(port);
 	port.appendAssistant(first.sessionId, "the real answer");
 	port.livenessFails = true;
 	clock.offsetMs = 3 * OLD_IDLE_REGISTRY_AGE_MS;
 	await manager!.tick(KEY);
 	expect(logs.some((line) => line.startsWith("wedged_turn_released"))).toBe(false);
-	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
-	expect(terminal).toEqual([]);
-	// A recovered liveness probe still cannot supply the operation's output.
-	port.livenessFails = false;
-	clock.offsetMs = 3 * OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
-	await manager!.tick(KEY);
-	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
-		state: "pending",
-		turn_state: "accepted",
-		turn_op_ref: first.opRef,
-	});
-	expect(terminal).toEqual([]);
-	port.pending.delete(first.opRef);
-	port.seedOperation(first.opRef, first.sessionId, "terminal_ok", "original output restored");
-	await manager!.tick(KEY);
-	await eventually(
-		() => database!.inbox.turnRow(first.opRef)?.turn_state === "done",
-		"restored original output did not settle",
-	);
-	expect(terminal).toEqual(["original output restored"]);
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+	expect(terminal).toHaveLength(1);
+	expect(terminal[0]).toContain("[turn completed]");
+	expect(terminal[0]).not.toContain("the real answer");
+	// A completed operation is not relabelled as a failed one by the recovery notice.
+	expect(failures).toEqual([]);
 });
 
 test("a retired stalled turn terminates its producer and summarizes discarded frames", async () => {
