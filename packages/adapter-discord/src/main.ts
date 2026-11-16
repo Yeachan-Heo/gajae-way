@@ -2933,17 +2933,15 @@ export class ReconnectingGateway {
 				),
 			};
 			console.error(
-				"Discord gateway database was replaced; rewound recovery watermarks and invalidated image completion tombstones.",
+				"Discord gateway database was replaced; rewound recovery watermarks and invalidated image completion tombstones after the gateway socket identity changed.",
 			);
 		}
 		this.persist({ ...next, gatewayDbIdentity: identity });
 	}
 
 	private async gatewayDbIdentity(): Promise<string | undefined> {
-		const home = process.env.GAJAEWAY_HOME ?? join(process.env.HOME ?? "~", ".gajaeway");
-		const path = this.config.gatewayDbPath ?? homeLayout(home).db;
 		try {
-			const info = await stat(path);
+			const info = await stat(this.socketPath);
 			return `${info.dev}:${info.ino}`;
 		} catch {
 			return undefined;

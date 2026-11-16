@@ -1011,9 +1011,7 @@ test("a replaced gateway database invalidates completion tombstones", async () =
 	const channelId = "restore-dm";
 	const id = snowflakeFromTimestamp(Date.now() - 60_000);
 	try {
-		await writeFile(join(home, "gateway.db"), "");
-		const previousHome = process.env.GAJAEWAY_HOME;
-		process.env.GAJAEWAY_HOME = home;
+		await writeFile(join(home, "gateway.sock"), "");
 		await saveRecoveryCursors(cursorPath, {
 			...emptyCursors(),
 			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 60_000) },
@@ -1042,8 +1040,6 @@ test("a replaced gateway database invalidates completion tombstones", async () =
 		const watermark = cursors.recoveredThrough[channelId] ?? cursors.quarantined[channelId]?.watermark;
 		expect(watermark).toBeDefined();
 		expect(BigInt(watermark!)).toBeLessThan(BigInt(snowflakeFromTimestamp(Date.now() - 29 * 24 * 60 * 60 * 1000)));
-		process.env.GAJAEWAY_HOME = previousHome;
-		if (previousHome === undefined) delete process.env.GAJAEWAY_HOME;
 	} finally {
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });
