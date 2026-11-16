@@ -622,6 +622,25 @@ test("a watched human message wakes its waiting session without copying message 
 	expect(delivered(client, "chan-a").join("\n")).not.toContain(reasonSecret);
 });
 
+test("repeating a pending watch keeps the original watch and sends no failure notice", async () => {
+	const { client, database } = await gateway({
+		[KEY_A]: () => "계속 기다리겠습니다.\n[WATCH:gajae-way-dev] 30m waiting for the credential delivery",
+	});
+	say(client, A, "watch-first", "Please wait for the DM credential.");
+	await settle();
+	const [original] = database.inbox.watchRows();
+	expect(original?.state).toBe("pending");
+
+	say(client, A, "watch-again", "Keep waiting for it.");
+	await settle();
+	const text = delivered(client, "chan-a").join("\n");
+	expect(text).not.toContain("failed");
+	expect(text).not.toContain("No watch was registered");
+	expect(text).not.toContain("already watching");
+	expect(text.match(/계속 기다리겠습니다\./g)).toHaveLength(2);
+	expect(database.inbox.watchRows()).toEqual([original]);
+});
+
 test("a watch expires and fires at most once for its next accepted message", async () => {
 	const { database } = await gateway({});
 	const first = {
