@@ -237,9 +237,7 @@ export class ImageOutbox {
 			if (!entries.some((entry) => entry.completed)) return;
 			const kept: PendingImage[] = entries.flatMap((entry) => {
 				if (!entry.completed) return [entry];
-				return entry.dm
-					? [{ messageId: entry.messageId, channelId: entry.channelId, dm: true, restored: true }]
-					: [];
+				return entry.dm ? [{ messageId: entry.messageId, channelId: entry.channelId, dm: true, restored: true }] : [];
 			});
 			await writeEntries(this.#path, kept);
 			this.#entries = kept;
