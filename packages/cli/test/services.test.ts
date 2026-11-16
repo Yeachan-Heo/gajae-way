@@ -1,13 +1,17 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readlink, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { homeLayout } from "@gajae-gateway/home";
+import type { GjcInstallRunner } from "../src/gjc-install";
 import {
 	BROKER_UNIT,
 	discoverLoginPath,
 	GATEWAY_UNIT,
+	installPinnedGjcForServices,
 	installServices,
 	restartStackCommands,
+	servicePinManifest,
 	serviceSpecs,
 	systemdUnitName,
 } from "../src/services";
@@ -278,5 +282,124 @@ test("installServices succeeds even when shell discovery returns empty", async (
 		expect(firstUnit).toContain("/bin");
 	} finally {
 		await cleanup();
+	}
+});
+
+function stubGjcRunner(installed: string[]): GjcInstallRunner {
+	return async (command, cwd) => {
+		if (command[0] === "bun") {
+			const dependency = (
+				JSON.parse(await readFile(join(cwd, "package.json"), "utf8")) as {
+					dependencies: { "gajae-code": string };
+				}
+			).dependencies["gajae-code"];
+			installed.push(dependency);
+			await mkdir(join(cwd, "node_modules", ".bin"), { recursive: true });
+			await writeFile(join(cwd, "node_modules", ".bin", "gjc"), dependency);
+			return { exitCode: 0, stdout: "", stderr: "" };
+		}
+		return { exitCode: 0, stdout: `gjc/${await readFile(command[0] as string, "utf8")}`, stderr: "" };
+	};
+}
+
+async function pinFile(dir: string, name: string, version?: string): Promise<string> {
+	const path = join(dir, name);
+	await writeFile(path, JSON.stringify(version === undefined ? { name } : { name, gjc: { version } }));
+	return path;
+}
+
+test("installPinnedGjcForServices installs the manifest's pin into the private prefix", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "gajaeway-service-pin-"));
+	try {
+		const installed: string[] = [];
+		const manifestPath = await pinFile(dir, "release.json", "0.19.0");
+		const version = await installPinnedGjcForServices({
+			home: dir,
+			manifestPath,
+			runner: stubGjcRunner(installed),
+		});
+		expect(version).toBe("0.19.0");
+		expect(installed).toEqual(["0.19.0"]);
+		expect(await readlink(homeLayout(dir).gjcCurrent)).toBe("0.19.0");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("installPinnedGjcForServices propagates an install failure instead of retrying elsewhere", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "gajaeway-service-pin-"));
+	try {
+		const commands: string[][] = [];
+		const failing: GjcInstallRunner = async (command) => {
+			commands.push([...command]);
+			return { exitCode: 1, stdout: "", stderr: "registry unavailable" };
+		};
+		const manifestPath = await pinFile(dir, "release.json", "0.19.0");
+		await expect(installPinnedGjcForServices({ home: dir, manifestPath, runner: failing })).rejects.toThrow(
+			"registry unavailable",
+		);
+		expect(commands).toHaveLength(1);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("installPinnedGjcForServices refuses a manifest without a pin instead of using another one", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "gajaeway-service-pin-"));
+	try {
+		for (const manifestPath of [join(dir, "missing.json"), await pinFile(dir, "nopin.json")]) {
+			const installed: string[] = [];
+			await expect(
+				installPinnedGjcForServices({ home: dir, manifestPath, runner: stubGjcRunner(installed) }),
+			).rejects.toThrow(manifestPath);
+			expect(installed).toEqual([]);
+		}
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("servicePinManifest names the release manifest beside the target binaries", () => {
+	expect(servicePinManifest("~/bin", { HOME: "/home/op" })).toBe("/home/op/bin/package.json");
+});
+
+test("service repair installs the target release manifest's pin, not the checkout pin", async () => {
+	const binDir = await mkdtemp(join(tmpdir(), "gajaeway-service-target-"));
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-service-home-"));
+	try {
+		await writeFile(join(binDir, "package.json"), JSON.stringify({ name: "gajaeway", gjc: { version: "0.19.3" } }));
+		const installed: string[] = [];
+		const version = await installPinnedGjcForServices({
+			home,
+			manifestPath: servicePinManifest(binDir, { HOME: "/home/op" }),
+			runner: stubGjcRunner(installed),
+		});
+		expect(version).toBe("0.19.3");
+		expect(installed).toEqual(["0.19.3"]);
+	} finally {
+		await rm(binDir, { recursive: true, force: true });
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("service repair fails closed when a bin dir other than this checkout has no release manifest", async () => {
+	const binDir = await mkdtemp(join(tmpdir(), "gajaeway-service-target-"));
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-service-home-"));
+	try {
+		// The checkout still carries its own pin; it must not be installed for a target
+		// that cannot supply one, because that target's broker would refuse to start.
+		const installed: string[] = [];
+		await expect(
+			installPinnedGjcForServices({
+				home,
+				manifestPath: servicePinManifest(binDir, { HOME: "/home/op" }),
+				runner: stubGjcRunner(installed),
+			}),
+		).rejects.toThrow(join(binDir, "package.json"));
+		expect(installed).toEqual([]);
+		expect(await Bun.file(homeLayout(home).gjcCurrent).exists()).toBe(false);
+	} finally {
+		await rm(binDir, { recursive: true, force: true });
+		await rm(home, { recursive: true, force: true });
 	}
 });
