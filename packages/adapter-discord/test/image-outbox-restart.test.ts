@@ -5,12 +5,12 @@ import { join } from "node:path";
 import type { prepareDiscordImages } from "../src/attachments";
 import { imageSourceIdentity } from "../src/attachments";
 import { type DiscordInboundMessage, decideInbound, ReconnectingGateway } from "../src/main";
-import { loadRecoveryCursors } from "../src/recovery";
+import { loadRecoveryCursors, snowflakeFromTimestamp } from "../src/recovery";
 
 const bot = { id: "bot" };
 const image = { mimeType: "image/jpeg" as const, data: "AQIDBA==" };
 const message = {
-	id: "123456789012345678",
+	id: snowflakeFromTimestamp(Date.now() - 60_000),
 	content: "What is in this picture?",
 	author: { id: "owner", username: "owner", bot: false },
 	channel: { id: "new-dm", isDMBased: () => true },
@@ -79,7 +79,7 @@ test("a first-time DM image intent survives restart before preparation", async (
 		return {
 			messages: {
 				fetch: async (query: string | object) => {
-					if (typeof query !== "string") return [];
+					if (typeof query !== "string") return [message];
 					expect(query).toBe(message.id);
 					return message;
 				},
@@ -115,7 +115,7 @@ test("a first-time DM image intent survives restart before preparation", async (
 			return { images: [image], notice: "" };
 		});
 		await restarted.recoverMissedMessages();
-		expect(fetched).toEqual(["new-dm", "new-dm"]);
+		expect(fetched).toEqual(["new-dm"]);
 		expect(preparations).toBe(1);
 		expect(sends).toHaveLength(1);
 		expect(sends[0]).toMatchObject({
@@ -155,7 +155,7 @@ test("an ambiguous gateway ACK replays the exact persisted image request after r
 		messages: {
 			fetch: async (query: string | object) => {
 				if (typeof query === "string") throw new Error("persisted requests must not refetch the message");
-				return [];
+				return [message];
 			},
 		},
 	});

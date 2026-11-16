@@ -91,7 +91,7 @@ A source checkout upgrades through `git`, `bun run build`, and `gajaeway service
 
 ### Gateway and adapter rollout for `chat.images`
 
-For a staged rollout, install and restart the gateway before installing or restarting adapters that require `chat.images`. Verify that the gateway advertises `chat.images` in its negotiated capabilities, then start the new Discord, Slack, or Telegram adapters. An older gateway rejects a new adapter during negotiation before any messages are accepted, including text-only messages; there is intentionally no text-only fallback.
+For a staged rollout, install and restart the gateway before installing or restarting adapters that require `chat.images`. Verify that the gateway advertises `chat.images` in its negotiated capabilities; for Discord also verify `gateway.status.databaseIdentity`, then start the new adapters. Slack and Telegram require only `chat.images`; Discord requires both. An older gateway rejects a new adapter during negotiation before any messages are accepted, including text-only messages; there is intentionally no text-only fallback.
 
 ### macOS upgrade from 0.1.x to 0.2.0
 

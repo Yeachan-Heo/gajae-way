@@ -171,9 +171,13 @@ async function writeEntries(path: string, entries: readonly PendingImage[]): Pro
 		} finally {
 			await parent.close();
 		}
-	} catch {
-		// Best-effort: the rename is already atomic; only the directory entry's
-		// durability window widens on platforms that reject a directory fsync.
+	} catch (error) {
+		// The rename is atomic, but its durability depends on the directory fsync.
+		// Only platforms that cannot fsync a directory may degrade; real I/O errors
+		// must fail admission rather than claim a crash-durable intent.
+		const code = (error as { code?: unknown } | null | undefined)?.code;
+		if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "EISDIR" && code !== "EPERM" && code !== "EBADF")
+			throw error;
 	}
 }
 

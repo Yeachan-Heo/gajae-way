@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { snowflakeFromTimestamp } from "../src/recovery";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import { Client } from "discord.js";
 import { startDiscordAdapter } from "../src/main";
@@ -33,7 +34,7 @@ test("a transient image download failure retries a live new DM without reconnect
 	const reconnect = spyOn(GajaewayClient, "connectSocket").mockResolvedValue(transport as never);
 	let discord: Client | undefined;
 	const message = {
-		id: "123456789012345678",
+		id: snowflakeFromTimestamp(Date.now() - 60_000),
 		content: "What is in this picture?",
 		author: { id: "owner", username: "owner", bot: false },
 		channel: { id: "new-dm", isDMBased: () => true },
@@ -93,7 +94,7 @@ test("a transient image download failure retries a live new DM without reconnect
 		const imageData = chatSends[0].params.images[0].data;
 		expect(typeof imageData).toBe("string");
 		expect(chatSends[0].params).toMatchObject({
-			messageId: "123456789012345678",
+			messageId: message.id,
 			origin: { platform: "discord", kind: "dm", conversationId: "new-dm", peerId: "owner" },
 			text: "What is in this picture?\n[image · photo.png]",
 			images: [{ mimeType: "image/jpeg", data: expect.any(String) }],

@@ -18,6 +18,7 @@ const emptyCursors = () => ({
 	deadLetters: [],
 	deadLetterDigest: {},
 	sequence: 0,
+	gatewayDbIdentity: "test-db",
 });
 
 function dmMessage(id: string, channelId: string, withImage = false) {
@@ -91,7 +92,8 @@ function gateway(
 		withClient
 			? ({
 					request: async (verb: string, params: unknown) => {
-						requests.push({ verb, params });
+						if (verb !== "gateway.status") requests.push({ verb, params });
+						if (!requestImpl && verb === "gateway.status") return { database: { identity: "test-db" } };
 						return requestImpl ? requestImpl(verb, params) : { engaged: false, turnId: null };
 					},
 				} as never)
@@ -885,6 +887,101 @@ test("a request older than gateway dedupe retention is not replayed", async () =
 		expect(adapter.deadLetters[0]!.summary).toContain("dedupe retention");
 		// The bootstrap watermark passed this id, so the terminal evidence compacted safely.
 		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an old source is rejected even when its outbox row was stamped recently", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-source-age-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "source-age-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 31 * 24 * 60 * 60 * 1000);
+	const request = {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, request, createdAt: Date.now() }]));
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(adapter.deadLetters[0]?.summary).toContain("dedupe retention");
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an unknown database identity holds recovery once a generation was adopted", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-identity-unknown-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "identity-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	const requests: Array<{ verb: string; params: any }> = [];
+	let fetches = 0;
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			gatewayDbIdentity: "known-db",
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		const adapter = gateway(
+			cursorPath,
+			async () => {
+				fetches++;
+				return { messages: { fetch: async () => [message] } };
+			},
+			requests,
+			{},
+			async (verb) => (verb === "gateway.status" ? { database: {} } : { engaged: false, turnId: null }),
+		);
+		await bounded(adapter.recoverMissedMessages());
+		expect(fetches).toBe(0);
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a deleted source invalidates a pending exact-request replay", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-source-delete-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "delete-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const request = {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, request, dm: true }]));
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), []);
+		await adapter.invalidateImageSource(id, "image source message was deleted");
+		const persisted = JSON.parse(await readFile(outboxPath, "utf8"));
+		expect(persisted[0]).toMatchObject({ messageId: id, terminal: true });
+		expect(adapter.deadLetters[0]?.summary).toContain("deleted");
 	} finally {
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });

@@ -1452,6 +1452,9 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 	// new message: it goes out as chat.edit and reaches the session as a
 	// [MESSAGE POINTER] update. Partial (uncached) messages carry no author or
 	// content until fetched; fetching is what makes the edit describable.
+	discord.on("messageDelete", (message) => {
+		if (message?.id) void gateway.invalidateImageSource(message.id, "image source message was deleted");
+	});
 	discord.on("messageUpdate", (before, after) => {
 		void (async () => {
 			const message = after.partial ? await after.fetch().catch(() => undefined) : after;
@@ -1459,8 +1462,10 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			const imageEdit =
 				selectNativeImageAttachments(message).length > 0 || selectNativeImageAttachments(before).length > 0;
 			if (imageEdit) {
-				if (typeof message.editedTimestamp === "number" && decideInbound(message, discord.user, config.channels))
+				if (typeof message.editedTimestamp === "number" && decideInbound(message, discord.user, config.channels)) {
 					console.error(`Discord image edit rejected message=${message.id}; native image edits are unsupported.`);
+					void gateway.invalidateImageSource(message.id, "image source message was edited");
+				}
 				return;
 			}
 			const edit = describeMessageEdit(message, discord.user, config.channels, before);
@@ -1784,14 +1789,9 @@ function snowflakeTimestamp(messageId: string): number {
 }
 
 function isImageReplayBeyondDedupe(entry: PendingImage, now = Date.now()): boolean {
-	let createdAt = entry.createdAt;
-	if (createdAt === undefined) {
-		try {
-			createdAt = Number((BigInt(entry.messageId) >> 22n) + 1_420_070_400_000n);
-		} catch {
-			return true;
-		}
-	}
+	const sourceTime = snowflakeTimestamp(entry.messageId);
+	const createdAt = sourceTime > 0 ? sourceTime : entry.createdAt;
+	if (createdAt === undefined) return true;
 	return now - createdAt >= IMAGE_REPLAY_RETENTION_MS;
 }
 
@@ -2327,6 +2327,16 @@ export class ReconnectingGateway {
 	}
 
 	/** Drop every per-id structure after the intent can never need another attempt. */
+	/** A deleted or edited Discord source invalidates a pending exact-request replay. */
+	async invalidateImageSource(messageId: string, summary: string): Promise<void> {
+		try {
+			const entry = await this.#imageOutbox.get(messageId);
+			if (entry && !entry.completed && !entry.terminal) await this.terminateImage(entry, summary);
+		} catch {
+			// A store failure is retried by recovery; never let the event handler reject.
+		}
+	}
+
 	private cleanupImageState(id: string): void {
 		this.#imageAdmissionFailures.delete(id);
 		this.#imageBudgetDeferred.delete(id);
@@ -3204,10 +3214,21 @@ export class ReconnectingGateway {
 		try {
 			result = await client.request<GatewayStatusResult>("gateway.status");
 		} catch {
+			if (fromRecovery && state.gatewayDbIdentity !== undefined) {
+				console.error("Discord gateway database identity unavailable; holding recovery.");
+				return false;
+			}
 			return true;
 		}
 		const identity = result?.database?.identity;
-		if (identity === undefined || identity === state.gatewayDbIdentity) return true;
+		if (identity === undefined) {
+			if (fromRecovery && state.gatewayDbIdentity !== undefined) {
+				console.error("Discord gateway database identity unavailable; holding recovery.");
+				return false;
+			}
+			return true;
+		}
+		if (identity === state.gatewayDbIdentity) return true;
 		const legacy = state.gatewayDbIdentity === undefined;
 		let next: RecoveryCursorState = this.#cursors ?? state;
 		if (!legacy || (await this.hasRecoveryEvidence(next))) {
