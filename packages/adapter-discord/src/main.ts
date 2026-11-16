@@ -1958,6 +1958,13 @@ export class ReconnectingGateway {
 				this.#imageUnsent.delete(message.id);
 			}
 		} catch (error) {
+			// The outbox is the authoritative intent once admitted, but a first-seen DM
+			// must stay discoverable even when admission never succeeds. Register the
+			// recovery target independently before the bounded admission refusal.
+			if (sourceOrigin.kind === "dm") {
+				await this.rememberInboundDm(sourceOrigin);
+				await this.cursorsFlushed;
+			}
 			// Capacity is retried like I/O: scheduleImageRetry runs a recovery pass
 			// before the next attempt, giving watermark-safe compaction a chance to
 			// reclaim completed evidence. Only a real live waiter is eventually
@@ -2235,7 +2242,9 @@ export class ReconnectingGateway {
 			// sorted history pass delivers both. Without a horizon there is nothing to
 			// merge against, so replay directly.
 			const watermark = cursors?.recoveredThrough[entry.channelId] ?? cursors?.quarantined[entry.channelId]?.watermark;
-			if (watermark !== undefined && snowflakeIsAfter(entry.messageId, watermark)) continue;
+			const horizon =
+				watermark ?? (cursors ? snowflakeFromTimestamp(Date.now() - RECOVERY_BOOTSTRAP_LOOKBACK_MS) : undefined);
+			if (horizon !== undefined && snowflakeIsAfter(entry.messageId, horizon)) continue;
 			await this.retryPendingImage(entry);
 		}
 	}

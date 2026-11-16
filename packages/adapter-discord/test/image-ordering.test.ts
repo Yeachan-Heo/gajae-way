@@ -150,6 +150,50 @@ test("recovery delivers an older durable image below the watermark before newer 
 	}
 });
 
+test("without a cursor, durable replay waits behind the bootstrap history window", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-bootstrap-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "bootstrap-dm";
+	const olderId = snowflakeFromTimestamp(Date.now() - 180_000);
+	const imageId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const request = {
+		messageId: imageId,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: imageId, channelId, request }]));
+		const channel = {
+			messages: {
+				fetch: async (query: string | { after?: string }) =>
+					typeof query === "string"
+						? dmMessage(imageId, channelId, true)
+						: !query.after || BigInt(query.after) < BigInt(imageId)
+							? [dmMessage(olderId, channelId), dmMessage(imageId, channelId, true)]
+							: [],
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			olderId,
+			imageId,
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
 test("a failing unrelated channel cannot starve a repaired live image intent below its watermark", async () => {
 	const home = await mkdtemp(join(tmpdir(), "discord-image-order-isolation-"));
 	const cleanupTimers = trackTimers();
@@ -509,6 +553,7 @@ test("an image refused by the admission bound releases the conversation chain", 
 			JSON.parse(await readFile(outboxPath, "utf8")).some((entry: { messageId: string }) => entry.messageId === id),
 		).toBe(false);
 		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect((await loadRecoveryCursors(cursorPath)).knownDms[channelId]).toBeDefined();
 	} finally {
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });
