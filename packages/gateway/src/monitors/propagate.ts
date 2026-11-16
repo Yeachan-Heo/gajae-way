@@ -1350,6 +1350,20 @@ export class MonitorPropagator {
 			let protocolResponseEntryCount: number | null = null;
 			let protocolValidationActive = false;
 			let readinessFailure: { readonly code: string; readonly detail: string } | undefined;
+			let firstBindFailed = false;
+			let firstAttemptBindFailureRecorded = false;
+			const recordFirstAttemptBindFailure = () => {
+				firstAttemptBindFailureRecorded = true;
+				const state = this.#safetyState(sessionOriginKey);
+				state.firstAttemptBindFailures += 1;
+				if (state.firstAttemptBindFailures >= 3) {
+					this.#degradedBindOrigins.add(sessionOriginKey);
+					readinessFailure = {
+						code: "monitor_bind_degraded",
+						detail: `monitor first-attempt bind failed ${state.firstAttemptBindFailures} times consecutively; binding may be slow or queue-saturated (#748)`,
+					};
+				}
+			};
 			let opRef: string | undefined;
 			const flushReadinessFailure = () => {
 				if (!readinessFailure) return;
@@ -1430,6 +1444,7 @@ export class MonitorPropagator {
 								this.#persistBindTimeoutCounter(sessionOriginKey, 0, boundEpoch);
 							}
 						} catch (bindError) {
+							if (rebindAttempts === 0) firstBindFailed = true;
 							lastBindError = bindError;
 							// A request that never left the local queue says nothing about the session key.
 							if (isCliQueueTimeout(bindError)) throw bindError;
@@ -1495,6 +1510,17 @@ export class MonitorPropagator {
 									safety.bindTimeoutFailures = 0;
 									safety.bindTimeoutEpoch = boundEpoch;
 									this.#safety.set(sessionOriginKey, safety);
+									// A successful inline rebind is still a retry, not a first-attempt success.
+									if (
+										rebindAttempts === 0 &&
+										failureCode(bindError, classifyAuthoringFailure(bindError), "bind") === "session_bind_failed" &&
+										claimed.some(
+											(row) =>
+												row.dispatch_attempts === 0 &&
+												this.#database.monitors.eventLiveLeaseOwner(row.event_id, now()) === leaseId,
+										)
+									)
+										recordFirstAttemptBindFailure();
 									continue;
 								}
 							}
@@ -1529,7 +1555,7 @@ export class MonitorPropagator {
 						this.#appliedServiceTiers.set(sessionId, effectiveServiceTier);
 					}
 					// Binding and configuration have recovered even if procedure or payload preparation fails.
-					if (!replayedBatch) {
+					if (!replayedBatch && !firstBindFailed) {
 						this.#safetyState(sessionOriginKey).firstAttemptBindFailures = 0;
 						this.#degradedBindOrigins.delete(sessionOriginKey);
 						if (this.#degradedBindOrigins.size === 0) this.#recordFirstAttemptBindSuccess(sessionOriginKey);
@@ -2129,22 +2155,14 @@ export class MonitorPropagator {
 						}
 					}
 				});
-				// Track consecutive first-attempt bind failures per monitor origin (#748)
+				// A failure already recorded before an inline rebind must not be counted twice.
 				if (
 					transitionedFailure &&
+					!firstAttemptBindFailureRecorded &&
 					code === "session_bind_failed" &&
 					claimed.some((row) => row.dispatch_attempts === 0)
-				) {
-					const state = this.#safetyState(sessionOriginKey);
-					state.firstAttemptBindFailures += 1;
-					if (state.firstAttemptBindFailures >= 3) {
-						this.#degradedBindOrigins.add(sessionOriginKey);
-						readinessFailure = {
-							code: "monitor_bind_degraded",
-							detail: `monitor first-attempt bind failed ${state.firstAttemptBindFailures} times consecutively; binding may be slow or queue-saturated (#748)`,
-						};
-					}
-				}
+				)
+					recordFirstAttemptBindFailure();
 				if (transitionedFailure && !readinessFailure)
 					readinessFailure = { code, detail: `monitor dispatch failed during ${dispatchPhase}` };
 				flushReadinessFailure();

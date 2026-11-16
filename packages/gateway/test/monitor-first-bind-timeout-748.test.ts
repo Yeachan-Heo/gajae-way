@@ -71,7 +71,8 @@ test("first-attempt bind timeout is recorded with queue context and degraded sig
 			await Bun.sleep(10);
 		}
 
-		expect(bindAttempts).toBe(3);
+		// Three first attempts plus the automatic rebind after the third timeout.
+		expect(bindAttempts).toBe(4);
 
 		// Verify all events failed with session_bind_failed
 		for (const eventId of eventIds) {
@@ -386,10 +387,13 @@ test("first-attempt bind failure counter resets on successful bind (#748)", asyn
 
 		const originKey = `monitor/eventtype/test.retry_success/parent=${monitor.monitorId}`;
 
-		// Submit 3 events that will all fail on first attempt
+		// All three first binds fail; the third event recovers on an inline rebind.
+		const firstEvents: string[] = [];
 		for (let i = 0; i < 3; i++) {
-			await pipeline.submitAwaitable(monitor.monitorId, "test.retry_success", {});
+			firstEvents.push(await pipeline.submitAwaitable(monitor.monitorId, "test.retry_success", {}));
 		}
+		expect(database.monitors.eventGet(firstEvents[2])?.stage).toBe("authored_no_delivery");
+		expect(bindAttempts).toBe(4);
 
 		// Wait for degraded signal
 		for (let i = 0; i < 200; i++) {
@@ -407,7 +411,7 @@ test("first-attempt bind failure counter resets on successful bind (#748)", asyn
 		let safetyState = pipeline.sessionSafetyState(originKey);
 		expect(safetyState.firstAttemptBindFailures).toBe(3);
 
-		// Now submit an event that will succeed (it's the 4th bind attempt)
+		// The automatic rebind was a retry; a later first-attempt success clears the streak.
 		const successEventId = await pipeline.submitAwaitable(monitor.monitorId, "test.retry_success", {});
 
 		// Wait for the first-attempt dispatch to succeed without delivery.
@@ -417,7 +421,7 @@ test("first-attempt bind failure counter resets on successful bind (#748)", asyn
 			await Bun.sleep(10);
 		}
 
-		expect(bindAttempts).toBe(4);
+		expect(bindAttempts).toBe(5);
 		expect(database.monitors.eventGet(successEventId)?.stage).toBe("authored_no_delivery");
 
 		// Verify counter was reset after successful bind
