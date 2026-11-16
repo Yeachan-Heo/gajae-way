@@ -35,7 +35,7 @@ import {
 	type BrokerOperationRecord,
 	isBrokerPromptBusyRefusal,
 } from "../store/groups/bindings";
-import { GjcCliUnavailableError, GjcCommandQueueTimeoutError, isBrokerUnavailable } from "./broker";
+import { GjcCliUnavailableError, GjcCommandQueueTimeoutError, isBrokerUnavailable, isCliQueueTimeout } from "./broker";
 import {
 	type FailedTransportCause,
 	type FailedTurnEvidence,
@@ -802,7 +802,8 @@ export class BrokerSessionPort implements SessionPort {
 							// A broker that went away mid-resume says nothing about the
 							// session: the caller waits for it rather than replacing a
 							// resumable session with a cold one.
-							if (error instanceof BrokerAuthorityError || isBrokerUnavailable(error)) throw error;
+							if (error instanceof BrokerAuthorityError || isBrokerUnavailable(error) || isCliQueueTimeout(error))
+								throw error;
 							// Saved authority cannot be resumed: replace it below.
 							console.error(
 								`session_resume_failed origin=${input.originKey} epoch=${input.epoch} session=${existing.sessionId} path=bind detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error))}`,
@@ -815,7 +816,8 @@ export class BrokerSessionPort implements SessionPort {
 				// An unavailable broker cannot vouch for the persisted session; reusing
 				// it would only move the failure to the first send, where it is no
 				// longer retryable. Surface it so the caller can wait for readiness.
-				if (error instanceof BrokerAuthorityError || isBrokerUnavailable(error)) throw error;
+				if (error instanceof BrokerAuthorityError || isBrokerUnavailable(error) || isCliQueueTimeout(error))
+					throw error;
 				// Any other inspect failure (unparsable output, timeout) keeps the binding.
 				indexed = true;
 			}
@@ -1071,7 +1073,8 @@ export class BrokerSessionPort implements SessionPort {
 				if (!state.disowned && state.live !== false) return;
 				lastCode = state.disowned ? "session_unavailable" : "not_live";
 			} catch (error) {
-				if (error instanceof BrokerAuthorityError || isBrokerUnavailable(error)) throw error;
+				if (error instanceof BrokerAuthorityError || isBrokerUnavailable(error) || isCliQueueTimeout(error))
+					throw error;
 				const code = sdkErrorCode(error);
 				if (!isSessionGoneCode(code)) return;
 				lastCode = code;
@@ -2903,6 +2906,8 @@ function sanitizeSdkFailure(error: unknown): Error {
 			stableErrorCode(error.code) ?? "sdk_error",
 			sanitizedDetails(error.details),
 		);
+	// Preserve local pool saturation separately from broker unavailability.
+	if (error instanceof GjcCommandQueueTimeoutError) return error;
 	if (error instanceof GjcCliError) {
 		const code = sdkErrorCode(error) ?? "sdk_error";
 		return new GjcCliError(

@@ -859,6 +859,31 @@ test("generic inspect errors preserve saved authority and do not trigger a repla
 	expect(database.bindings.getSessionRecord("generic-inspect-error")).toMatchObject({ sessionId: "saved-1", epoch: 0 });
 });
 
+test("queue congestion during saved-session inspection cannot fabricate a ready binding", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-inspect-queue-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "saved-1",
+		repo,
+		originKey: "inspect-queue",
+		epoch: 0,
+	});
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: async () => {
+			throw new GjcCommandQueueTimeoutError(30);
+		},
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	await expect(port.bind({ originKey: "inspect-queue", epoch: 0, repo })).rejects.toBeInstanceOf(
+		GjcCommandQueueTimeoutError,
+	);
+	expect(database.bindings.getSessionRecord("inspect-queue")).toEqual({ sessionId: "saved-1", epoch: 0 });
+});
+
 test("structured nonzero session failures survive normalization at the global lifecycle route", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-envelope-error-"));
 	database = await Store.open(join(home, "gateway.db"));

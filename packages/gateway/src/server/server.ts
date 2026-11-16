@@ -4630,16 +4630,17 @@ function reportDeliveryExpired(
 		const current = database.outbox.get(expired.deliveryId);
 		if (current?.state !== "expired") return undefined;
 		const hasMonitorEvents = database.monitors.eventsByBatch(current.turnId).length > 0;
-		database.monitors.eventsFailExpiredDelivery(
+		const eventIds = database.monitors.eventsFailExpiredDelivery(
 			tx,
 			current.turnId,
 			current.deliveryId,
 			current.attempts,
 			safeDiagnosticField(reason),
 		);
-		return { current, hasMonitorEvents };
+		return { current, hasMonitorEvents, eventIds };
 	});
 	if (!expiration) return;
+	runtime.monitors.deliveryExpired(expiration.eventIds);
 	if (!readinessFailureRecorded) {
 		const code = expiration.current.lastError ?? "delivery_expired";
 		runtime.readiness.recordFailure({

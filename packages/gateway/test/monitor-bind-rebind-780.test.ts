@@ -7,7 +7,7 @@ import type { ChatMessagePayload } from "@gajae-gateway/protocol";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { GjcCliUnavailableError } from "../src/orchestrator/broker";
+import { GjcCliUnavailableError, GjcCommandQueueTimeoutError } from "../src/orchestrator/broker";
 import type { SessionPort } from "../src/orchestrator/session-port";
 import { RelayHelloError } from "../src/orchestrator/tail-runner";
 import { Store } from "../src/store";
@@ -1233,6 +1233,197 @@ test("pending session.create scopes stay capped across repeated bind rotations (
 			[0, 1, 2].filter((epoch) => database.bindings.hasPendingSessionCreate(JSON.stringify([originKey, epoch]))),
 		).toHaveLength(2);
 
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("expired monitor deliveries trigger one durable escalation live, during repair, and after a crash (#781)", async () => {
+	for (const mode of ["live", "repair", "restart"] as const) {
+		const home = await mkdtemp(join(tmpdir(), `gajaeway-monitor-expiry-${mode}-`));
+		try {
+			const database = await Store.open(join(home, "gateway.db"));
+			const registry = new MonitorRegistry(database);
+			const monitor = registry.add({
+				name: `expiry-${mode}`,
+				trigger: { kind: "cron", schedule: "* * * * *" },
+				eventTypes: ["test.expiry"],
+				burstPolicy: "serialize",
+			});
+			const origin = `monitor/eventtype/test.expiry/parent=${monitor.monitorId}`;
+			const delivery = new DeliveryService(database);
+			const messages: ChatMessagePayload[] = [];
+			const makePipeline = () =>
+				new MonitorPropagator({
+					database,
+					registry,
+					delivery,
+					sessionPort: {} as SessionPort,
+					memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+					emit: () => {},
+					deliver: (payload) => messages.push(payload),
+					ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "owner" } },
+				});
+			const pipeline = makePipeline();
+			const now = Date.now();
+			for (let i = 0; i < 3; i++) {
+				database.transaction((tx) => {
+					database.monitors.eventCreate(tx, {
+						eventId: `event-${i}`,
+						monitorId: monitor.monitorId,
+						eventType: "test.expiry",
+						sessionOriginKey: origin,
+						payloadJson: "{}",
+						firedAt: new Date(now + i).toISOString(),
+					});
+					database.monitors.eventUpdate(
+						tx,
+						`event-${i}`,
+						i === 2 ? "authored" : "failed_no_retry",
+						i === 2 ? "batch" : null,
+					);
+				});
+			}
+			if (mode === "repair") {
+				delivery.createPending({
+					deliveryId: "expired",
+					turnId: "batch",
+					originKey: "loopback/loopback/owner",
+					payloadJson: "{}",
+				});
+				delivery.expireStale(0, now + 1000);
+				await pipeline.reconcile();
+			} else {
+				const ids = database.transaction((tx) =>
+					database.monitors.eventsFailExpiredDelivery(tx, "batch", "expired", 5, "offline"),
+				);
+				expect(ids).toEqual(["event-2"]);
+				if (mode === "live") pipeline.deliveryExpired(ids);
+				else {
+					expect(database.monitors.pendingExpiredEscalations()).toEqual(["event-2"]);
+					await makePipeline().reconcile();
+				}
+			}
+			expect(database.monitors.eventGet("event-2")?.stage).toBe("failed_no_retry");
+			expect(messages.filter((payload) => payload.text.includes("[monitor escalation]"))).toHaveLength(1);
+			expect(database.monitors.pendingExpiredEscalations()).toEqual([]);
+			await makePipeline().reconcile();
+			expect(messages.filter((payload) => payload.text.includes("[monitor escalation]"))).toHaveLength(1);
+			database.close();
+		} finally {
+			await rm(home, { recursive: true, force: true });
+		}
+	}
+});
+
+test("a success in a mixed batch separates escalation streaks without treating older late success as recovery (#781)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-mixed-streak-"));
+	try {
+		const database = await Store.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "mixed",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.mixed"],
+			burstPolicy: "serialize",
+		});
+		const origin = `monitor/eventtype/test.mixed/parent=${monitor.monitorId}`;
+		const messages: ChatMessagePayload[] = [];
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: {} as SessionPort,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			deliver: (payload) => messages.push(payload),
+			ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "owner" } },
+		});
+		const now = Date.now();
+		const seed = (
+			id: string,
+			offset: number,
+			stage: "failed_no_retry" | "authored_no_delivery" | "authored",
+			batch = "batch",
+		) => {
+			database.transaction((tx) => {
+				database.monitors.eventCreate(tx, {
+					eventId: id,
+					monitorId: monitor.monitorId,
+					eventType: "test.mixed",
+					sessionOriginKey: origin,
+					payloadJson: "{}",
+					firedAt: new Date(now + offset).toISOString(),
+				});
+				database.monitors.eventUpdate(tx, id, stage, batch);
+			});
+		};
+		seed("failure-1", 0, "failed_no_retry");
+		seed("failure-2", 1, "failed_no_retry");
+		seed("failure-3", 2, "authored", "batch-1");
+		const first = database.transaction((tx) =>
+			database.monitors.eventsFailExpiredDelivery(tx, "batch-1", "d1", 5, "offline"),
+		);
+		pipeline.deliveryExpired(first);
+		expect(messages).toHaveLength(1);
+		seed("late-old-success", -1, "authored_no_delivery");
+		seed("another-failure", 3, "authored", "batch-2");
+		pipeline.deliveryExpired(
+			database.transaction((tx) => database.monitors.eventsFailExpiredDelivery(tx, "batch-2", "d2", 5, "offline")),
+		);
+		expect(messages).toHaveLength(1);
+		seed("mixed-success", 4, "authored_no_delivery", "mixed-batch");
+		seed("mixed-failure", 5, "failed_no_retry", "mixed-batch");
+		seed("new-failure-2", 6, "failed_no_retry");
+		seed("new-failure-3", 7, "authored", "batch-3");
+		pipeline.deliveryExpired(
+			database.transaction((tx) => database.monitors.eventsFailExpiredDelivery(tx, "batch-3", "d3", 5, "offline")),
+		);
+		expect(messages).toHaveLength(2);
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("local CLI queue timeouts do not rotate an existing monitor binding (#749, #781)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-local-queue-"));
+	try {
+		const database = await Store.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "queue",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.queue"],
+			burstPolicy: "serialize",
+		});
+		const origin = `monitor/eventtype/test.queue/parent=${monitor.monitorId}`;
+		database.transaction((tx) => database.bindings.bindAtEpoch(tx, origin, "saved", 0));
+		let attempts = 0;
+		const port: Partial<SessionPort> = {
+			bind: async () => {
+				attempts++;
+				const error = new GjcCommandQueueTimeoutError(30);
+				throw attempts % 2 ? error : new Error(error.message);
+			},
+			runExclusive: async (_, fn) => fn(),
+		};
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: port as SessionPort,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+		});
+		for (let i = 0; i < 5; i++) {
+			const id = await pipeline.submitAwaitable(monitor.monitorId, "test.queue", {});
+			expect(database.monitors.failure(id)?.code).toBe("session_bind_failed");
+		}
+		expect(attempts).toBe(5);
+		expect(database.bindings.getSessionRecord(origin)).toEqual({ sessionId: "saved", epoch: 0 });
+		expect(pipeline.sessionSafetyState(origin).bindTimeoutFailures).toBe(0);
 		database.close();
 	} finally {
 		await rm(home, { recursive: true, force: true });

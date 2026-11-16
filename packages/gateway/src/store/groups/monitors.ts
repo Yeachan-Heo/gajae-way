@@ -771,7 +771,18 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				`delivery ${deliveryId} expired after ${attempts} attempts: ${reason}`,
 			);
 		}
+		for (const { event_id } of events) this.#core.metaSet(`monitor_escalation_pending:${event_id}`, "1");
 		return events.map((row) => row.event_id);
+	}
+
+	/** Durable work left when delivery expiry commits before escalation is checked. */
+	pendingExpiredEscalations(): string[] {
+		const prefix = "monitor_escalation_pending:";
+		return this.#core.metaKeysInRange(prefix, `${prefix}\uffff`).map((key) => key.slice(prefix.length));
+	}
+
+	clearExpiredEscalation(eventId: string): void {
+		this.#core.metaDelete(`monitor_escalation_pending:${eventId}`);
 	}
 
 	eventIncrementAttempts(tx: WriteTx, eventId: string): number {
@@ -811,6 +822,21 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				`SELECT * FROM monitor_events WHERE ${where} ORDER BY fired_at ${direction}, rowid ${direction}${limit === undefined ? "" : " LIMIT ? OFFSET ?"}`,
 			)
 			.all(...params) as MonitorEventDbRow[];
+	}
+
+	/** A later terminal success starts a new escalation streak, even in a mixed batch. */
+	successAfterEvent(monitorId: string, sessionOriginKey: string, eventId: string): boolean {
+		return Boolean(
+			this.#db
+				.prepare(
+					`SELECT 1 FROM monitor_events WHERE monitor_id = ? AND session_origin_key = ?
+					 AND stage IN ('delivered', 'authored_no_delivery') AND ${REPLAYABLE_MONITOR}
+					 AND (fired_at > (SELECT fired_at FROM monitor_events WHERE event_id = ?)
+					 OR (fired_at = (SELECT fired_at FROM monitor_events WHERE event_id = ?)
+					 AND rowid > (SELECT rowid FROM monitor_events WHERE event_id = ?))) LIMIT 1`,
+				)
+				.get(monitorId, sessionOriginKey, eventId, eventId, eventId),
+		);
 	}
 
 	eventGet(eventId: string, includeQuarantined = false): MonitorEventDbRow | undefined {

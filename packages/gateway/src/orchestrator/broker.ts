@@ -219,6 +219,15 @@ export function isBrokerUnavailable(error: unknown): boolean {
 	return error instanceof Error && /^gjc sdk request failed: broker_unavailable(?:\s|\(|$)/.test(error.message);
 }
 
+/** Local pool congestion is not broker unavailability, including after error sanitization. */
+export function isCliQueueTimeout(error: unknown): boolean {
+	return (
+		error instanceof GjcCommandQueueTimeoutError ||
+		(error instanceof Error &&
+			/^gjc command queue timed out after \d+ms \(local CLI pool saturated\)/.test(error.message))
+	);
+}
+
 export interface BrokerWaitOptions {
 	readonly initialMs?: number;
 	readonly maxMs?: number;

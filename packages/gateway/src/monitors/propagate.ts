@@ -17,6 +17,7 @@ import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
 import { oversizedMemoryFiles } from "../memory/debloat";
+import { isBrokerUnavailable, isCliQueueTimeout } from "../orchestrator/broker";
 import { sanitizeDiagnostic, sanitizeDiagnosticDetail } from "../orchestrator/rebind";
 import {
 	isSessionBusy,
@@ -715,6 +716,7 @@ export class MonitorPropagator {
 				});
 				this.deliveryConfirmed(delivery.turn_id);
 			}
+			this.deliveryExpired(this.#database.monitors.pendingExpiredEscalations());
 			await this.#recoverUnresolvedTurns();
 			// Replay oldest-first: recovery must re-author events in the order they fired.
 			const resumedAuthoringEvents = new Set<string>();
@@ -1246,6 +1248,8 @@ export class MonitorPropagator {
 		let sessionOriginKey: string;
 		try {
 			const claimedOrigins = claimed.map((row) => {
+				// Validate the actual event type before mapping undeclared types to catch-all.
+				originKey(eventTypeOrigin(row.event_type));
 				const key = row.session_origin_key ?? sessionOriginKeyForEvent(monitor, row.event_type);
 				if (!key) throw new Error("missing monitor event session origin");
 				return key;
@@ -1417,6 +1421,8 @@ export class MonitorPropagator {
 							}
 						} catch (bindError) {
 							lastBindError = bindError;
+							// A request that never left the local queue says nothing about the session key.
+							if (isCliQueueTimeout(bindError)) throw bindError;
 							const safety = this.#safetyState(sessionOriginKey);
 							const pendingCreate = this.#hasPendingCreateIntent(sessionOriginKey, boundEpoch);
 							const currentSession = this.#database.bindings.getSessionRecord(sessionOriginKey);
@@ -2291,6 +2297,19 @@ export class MonitorPropagator {
 			this.#clearConsecutiveFailedEventCount(row.session_origin_key, row.monitor_id);
 		}
 	}
+
+	/** Process expiry transitions after commit; an interrupted or failed check is retried by reconcile. */
+	deliveryExpired(eventIds: readonly string[]): void {
+		for (const eventId of eventIds) {
+			try {
+				const row = this.#database.monitors.eventGet(eventId);
+				if (row?.stage === "failed_no_retry" && !this.#trackTerminalFailure(row)) continue;
+				this.#database.monitors.clearExpiredEscalation(eventId);
+			} catch {
+				console.error(`monitor escalation check failed for expired event ${eventId}`);
+			}
+		}
+	}
 	#safetyState(sessionOriginKey: string): MonitorSessionSafetyState {
 		const existing = this.#safety.get(sessionOriginKey);
 		if (existing) return existing;
@@ -2371,15 +2390,19 @@ export class MonitorPropagator {
 	 * Codex P2 #1: exclude overlap-skipped events from failure-streak boundaries.
 	 * Codex P2 #2: page through rows so interleaved other-origin events cannot hide a same-origin streak.
 	 */
-	#countConsecutiveFailures(monitorId: string, sessionOriginKey: string): number {
+	#countConsecutiveFailures(
+		monitorId: string,
+		sessionOriginKey: string,
+	): { count: number; latestFailureEventId?: string } {
 		const monitor = this.#registry.get(monitorId);
-		if (!monitor?.enabled) return 0;
+		if (!monitor?.enabled) return { count: 0 };
 
 		// Count consecutive recent failures on this monitor, filtered by session origin.
 		// Other origins' rows are skipped, so read newest-first in pages until the streak ends,
 		// reaches the threshold, or the history runs out: interleaved events never hide a streak.
 		const pageSize = MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD * 4;
 		let count = 0;
+		let latestFailureEventId: string | undefined;
 		for (let offset = 0; ; offset += pageSize) {
 			const page = this.#database.monitors.eventRows(monitorId, "newest", false, pageSize, offset);
 			for (const row of page) {
@@ -2388,15 +2411,16 @@ export class MonitorPropagator {
 				// Codex P2 #1: overlap-skipped events are scheduling outcomes, not failures
 				if (row.stage === "skipped") continue;
 				if (row.stage === "failed_no_retry" || row.stage === "contract_unmet") {
+					latestFailureEventId ??= row.event_id;
 					count++;
-					if (count >= MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD) return count;
+					if (count >= MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD) return { count, latestFailureEventId };
 					continue;
 				}
 				// Only a terminal success closes a streak. Retryable `failed` and every
 				// other nonterminal stage remain undecided until a later transition.
-				if (row.stage === "delivered" || row.stage === "authored_no_delivery") return count;
+				if (row.stage === "delivered" || row.stage === "authored_no_delivery") return { count, latestFailureEventId };
 			}
-			if (page.length < pageSize) return count;
+			if (page.length < pageSize) return { count, latestFailureEventId };
 		}
 	}
 
@@ -2405,36 +2429,50 @@ export class MonitorPropagator {
 	 * Issue #780: when K consecutive events fail, escalate once per streak.
 	 */
 	/** Feed a terminal failure into the escalation streak; a removed monitor has no origin left to escalate. */
-	#trackTerminalFailure(row: Pick<MonitorEventDbRow, "monitor_id" | "session_origin_key">): void {
+	#trackTerminalFailure(row: Pick<MonitorEventDbRow, "monitor_id" | "session_origin_key">): boolean {
 		const monitor = this.#registry.get(row.monitor_id);
-		if (!monitor || !row.session_origin_key) return;
-		this.#trackConsecutiveFailedEvent(row.session_origin_key, row.monitor_id);
+		if (!monitor || !row.session_origin_key) return true;
+		return this.#trackConsecutiveFailedEvent(row.session_origin_key, row.monitor_id);
 	}
 
-	#trackConsecutiveFailedEvent(sessionOriginKey: string, monitorId: string): void {
+	#trackConsecutiveFailedEvent(sessionOriginKey: string, monitorId: string): boolean {
 		const state = this.#safetyState(sessionOriginKey);
-		const consecutiveCount = this.#countConsecutiveFailures(monitorId, sessionOriginKey);
+		const { count: consecutiveCount, latestFailureEventId } = this.#countConsecutiveFailures(
+			monitorId,
+			sessionOriginKey,
+		);
 
 		console.error(
 			`monitor failed event for ${sessionOriginKey} (monitor ${monitorId}): consecutive_failures=${consecutiveCount}/${MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD}`,
 		);
 
-		// Escalate when threshold reached and not yet escalated for this streak
-		if (consecutiveCount >= MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD && !state.escalatedForCurrentStreak) {
-			const escalationKey = monitorEscalationKey(sessionOriginKey, monitorId);
-			const alreadyEscalated = this.#database.core.metaGet(escalationKey) !== undefined;
-			if (!alreadyEscalated) {
-				console.error(
-					`monitor escalation triggered for ${sessionOriginKey} (monitor ${monitorId}): consecutive_failures=${consecutiveCount}`,
-				);
-				// Emit escalation with atomic persistence of dedup marker
-				const escalated = this.#emitMonitorEscalation(sessionOriginKey, monitorId, consecutiveCount, escalationKey);
-				// Set in-memory suppression only after durable marker is persisted
-				if (escalated) {
-					state.escalatedForCurrentStreak = true;
-				}
+		if (consecutiveCount < MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD || !latestFailureEventId) return true;
+		const escalationKey = monitorEscalationKey(sessionOriginKey, monitorId);
+		const prior = this.#database.core.metaGet(escalationKey);
+		if (prior !== undefined) {
+			let priorEventId: string | undefined;
+			try {
+				const parsed = JSON.parse(prior) as { eventId?: unknown };
+				if (typeof parsed.eventId === "string") priorEventId = parsed.eventId;
+			} catch {
+				// A malformed marker remains conservative: do not duplicate an alert.
 			}
+			if (!priorEventId || !this.#database.monitors.successAfterEvent(monitorId, sessionOriginKey, priorEventId)) {
+				state.escalatedForCurrentStreak = true;
+				return true;
+			}
+			// Keep the old marker until the replacement notice and marker commit atomically.
+			state.escalatedForCurrentStreak = false;
 		}
+		console.error(
+			`monitor escalation triggered for ${sessionOriginKey} (monitor ${monitorId}): consecutive_failures=${consecutiveCount}`,
+		);
+		if (
+			!this.#emitMonitorEscalation(sessionOriginKey, monitorId, consecutiveCount, escalationKey, latestFailureEventId)
+		)
+			return false;
+		state.escalatedForCurrentStreak = true;
+		return true;
 	}
 
 	/**
@@ -2447,6 +2485,7 @@ export class MonitorPropagator {
 		monitorId: string,
 		failureCount: number,
 		escalationKey: string,
+		eventId: string,
 	): boolean {
 		const monitor = this.#registry.get(monitorId);
 		if (!monitor) return false;
@@ -2483,7 +2522,7 @@ export class MonitorPropagator {
 				);
 				// Mark escalation as sent durably only after outbox enqueue succeeds
 				if (enqueued) {
-					this.#database.core.metaSet(escalationKey, JSON.stringify({ escalatedAt: this.#now(), monitorId }));
+					this.#database.core.metaSet(escalationKey, JSON.stringify({ escalatedAt: this.#now(), monitorId, eventId }));
 				}
 				return enqueued;
 			});
@@ -2524,7 +2563,7 @@ export class MonitorPropagator {
 	 */
 	#clearConsecutiveFailedEventCount(sessionOriginKey: string, monitorId: string): void {
 		const state = this.#safetyState(sessionOriginKey);
-		const consecutiveCount = this.#countConsecutiveFailures(monitorId, sessionOriginKey);
+		const { count: consecutiveCount } = this.#countConsecutiveFailures(monitorId, sessionOriginKey);
 
 		if (consecutiveCount === 0) {
 			console.error(
@@ -3308,6 +3347,11 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase:
 	// hid every configure/request refusal (live: 169 rows in one day, all
 	// GjcCliError exitCode 0 at #dispatchBatch, none actionable).
 	if (error instanceof GjcCliError) {
+		if (phase === "bind" || phase === "configure") return "session_bind_failed";
+		if (phase === "request") return "authoring_turn_failed";
+	}
+	// Local queue congestion is a bind/configuration failure, not evidence of a poisoned session.
+	if (isCliQueueTimeout(error) || isBrokerUnavailable(error)) {
 		if (phase === "bind" || phase === "configure") return "session_bind_failed";
 		if (phase === "request") return "authoring_turn_failed";
 	}
