@@ -4,10 +4,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { snowflakeFromTimestamp } from "../src/recovery";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import { Client } from "discord.js";
 import { startDiscordAdapter } from "../src/main";
+import { snowflakeFromTimestamp } from "../src/recovery";
 
 // The same valid PNG fixture used by the other adapter image tests.
 const png = Uint8Array.from(
