@@ -1656,7 +1656,7 @@ const IMAGE_INTENT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 /** Gateway inbound dedupe retention; a replay older than this is never safe. */
 const IMAGE_REPLAY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 /** Bounded pre-intent admission attempts before releasing ordered ingress. */
-const MAX_IMAGE_ADMISSION_FAILURES = 5;
+const MAX_IMAGE_ADMISSION_FAILURES = 3;
 const RESOLVED_TURN: Promise<void> = Promise.resolve();
 
 /**
@@ -1873,18 +1873,15 @@ export class ReconnectingGateway {
 				this.#imageUnsent.delete(message.id);
 			}
 		} catch (error) {
-			if (error instanceof ImageOutboxCapacityError) {
-				if (recovered || ordered || !this.#imageSettled.has(message.id)) {
-					console.error(
-						`Discord image outbox admission bound reached message=${message.id}; holding recovery progress.`,
-					);
-					throw error;
-				}
-				this.#imageAdmissionFailures.delete(message.id);
-				await this.rejectImageAdmission(message.id, channelId, "image outbox admission bound reached");
-				return "skip";
-			}
+			// Capacity is retried like I/O: scheduleImageRetry runs a recovery pass
+			// before the next attempt, giving watermark-safe compaction a chance to
+			// reclaim completed evidence. Only a real live waiter is eventually
+			// released by the bounded dead letter.
 			const attempts = (this.#imageAdmissionFailures.get(message.id) ?? 0) + 1;
+			const refusal =
+				error instanceof ImageOutboxCapacityError || /admission bound/i.test(String(error))
+					? "image outbox admission bound reached"
+					: "image outbox unavailable";
 			this.#imageAdmissionFailures.set(message.id, attempts);
 			if (this.#imageAdmissionFailures.size > 10_000)
 				this.#imageAdmissionFailures.delete(this.#imageAdmissionFailures.keys().next().value as string);

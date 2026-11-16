@@ -497,10 +497,12 @@ test("an image refused by the admission bound releases the conversation chain", 
 		expect(engagement).toBeDefined();
 		const first = adapter.processImage(message as never, engagement!);
 		const waiter = adapter.waitForImage(message as never, first);
-		expect(await bounded(first)).toBe("skip");
-		await bounded(waiter);
+		expect(await bounded(first)).toBe("unavailable");
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("unavailable");
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("skip");
+		await bounded(waiter, 2_000);
 		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
-		expect(adapter.deadLetters[0]!.summary).toContain("admission bound");
+		expect(adapter.deadLetters[0]!.summary).toContain("admission");
 		expect(
 			JSON.parse(await readFile(outboxPath, "utf8")).some((entry: { messageId: string }) => entry.messageId === id),
 		).toBe(false);
@@ -509,7 +511,7 @@ test("an image refused by the admission bound releases the conversation chain", 
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });
 	}
-}, 12_000);
+}, 30_000);
 
 test("a transient source-fetch failure starts the failure clock and expires", async () => {
 	const home = await mkdtemp(join(tmpdir(), "discord-image-order-source-fail-"));
@@ -890,12 +892,11 @@ test("a persistent pre-intent outbox failure releases ingress after bounded atte
 		const first = adapter.processImage(message as never, engagement!);
 		const waiter = adapter.waitForImage(message as never, first);
 		expect(await bounded(first)).toBe("unavailable");
-		for (let attempt = 0; attempt < 3; attempt++)
-			expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("unavailable");
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("unavailable");
 		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("skip");
 		expect(requests).toEqual([]);
 		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
-		expect(adapter.deadLetters[0]!.summary).toContain("5 admission attempts");
+		expect(adapter.deadLetters[0]!.summary).toContain("3 admission attempts");
 		await bounded(waiter, 2_000);
 	} finally {
 		cleanupTimers();
@@ -990,9 +991,11 @@ test("a history join inherits a capacity hold from the live owner", async () => 
 		const live = adapter.processImage(message as never, engagement!);
 		const waiter = adapter.waitForImage(message as never, live);
 		const history = adapter.processImage(message as never, engagement!, undefined, undefined, true);
-		expect(await bounded(live)).toBe("skip");
+		expect(await bounded(live)).toBe("unavailable");
 		expect(await bounded(history)).toBe("unavailable");
-		await bounded(waiter);
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("unavailable");
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("skip");
+		await bounded(waiter, 2_000);
 		expect(requests).toEqual([]);
 	} finally {
 		cleanupTimers();
