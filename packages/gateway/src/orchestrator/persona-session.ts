@@ -5445,6 +5445,7 @@ class OriginActor {
 	/** Drops actor tracking for a turn that is already closed durably, then serves anything queued behind it. */
 	async #forgetClosed(bound: BoundTurn): Promise<void> {
 		this.#holdSweeps.delete(bound.turn.opRef);
+		this.#producerPresentLogged.delete(bound.turn.opRef);
 		this.#clearStallReconciliation(bound);
 		this.#cancelStatusRecheck(bound);
 		if (bound.retired) {
