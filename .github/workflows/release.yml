@@ -23,23 +23,28 @@ on:
 # shares `github.ref` with every other dispatch from that branch. A group keyed by the
 # branch would reproduce the same loss for manual releases: the second dispatch becomes
 # pending while one is active, and a third replaces that pending run, so a distinct
-# requested release never starts. Branch dispatches are keyed by run instead and never
-# coalesce; only their npm dist-tag writes are ordered, forward-only, by the script. A
-# concurrent dispatch that publishes the same version can fail its `npm publish`, which a
-# rerun resumes and converges. A dispatch run from a tag ref still shares that tag's
-# queue, so it serializes against tag pushes of the same tag.
+# requested release never starts. A dispatch that requests no dist-tag is keyed by run
+# instead and never coalesces. A dispatch that sets `npm_tag` is keyed by that tag
+# instead, so runs from different branch refs that request the same dist-tag share one
+# group and a run's read-then-write cannot interleave with another such writer. Runs that
+# request the same tag queue behind each other, which also takes the single pending slot
+# GitHub allows per group: only the newest pending same-tag request survives, so an older
+# one has to be dispatched again. A dispatch run from a tag ref still shares that tag's
+# queue, so a requested-tag group covers branch dispatches only. A concurrent dispatch
+# that publishes the same version can fail its `npm publish`, which a rerun resumes and
+# converges.
 #
-# Cross-tag ordering of dist-tag writes is enforced by the script, not by GitHub: no
-# write is decided below the tag's live pointer or, for the channel tags `latest` and
-# `next`, below the highest published version in that channel. An explicit tag is
-# re-read immediately before its write, so a release that already moved it is left on the
-# newer version instead of being moved back. A tag a newer release already moved is left alone so its
+# Ordering the script has to do itself - a tag push against any other writer, or any
+# write of a derived channel tag - is enforced there, not by GitHub: no write is decided
+# below the tag's live pointer or, for the channel tags `latest` and `next`, below the
+# highest published version in that channel. An explicit tag is re-read immediately
+# before its write, so a release that already moved it is left on the newer version
+# instead of being moved back. A tag a newer release already moved is left alone so its
 # own GitHub release still gets created, an older fresh version is published under a
 # scratch tag whose name is checked against the tag map read first, the channel tag a run
-# writes is
-# reconciled forward from the version list after that write, and the post-write read
-# fails the run if that tag ends up below its channel floor (at least the version this
-# run wrote) after a retried terminal read, or cannot be read at all.
+# writes is reconciled forward from the version list after that write, and the post-write
+# read fails the run if that tag ends up below its channel floor (at least the version
+# this run wrote) after a retried terminal read, or cannot be read at all.
 # Serialization lives on the publishing job, not on the workflow: concurrency groups are
 # matched case-insensitively, so a workflow-level group would let a case-variant tag
 # (rejected by `canonical-tag`) queue ahead of a valid pending release and replace it.
@@ -98,11 +103,13 @@ jobs:
     needs: [verify, canonical-tag]
     # Reruns of one immutable tag share a group so they publish one at a time; distinct
     # tags never contend, and nothing reaches this queue before the casing check accepts
-    # it. A branch dispatch instead gets its own group: GitHub keeps only one pending run
+    # it. A branch dispatch that names a dist-tag is grouped by that tag, so two refs
+    # writing one custom tag serialize instead of interleaving a read and a write. A
+    # dispatch that names none gets a run-scoped group: GitHub keeps only one pending run
     # per group, so a branch-keyed group would let a newer dispatch replace an earlier
     # pending release and skip its publish job entirely.
     concurrency:
-      group: release-publish-${{ github.ref_type == 'tag' && github.ref || github.run_id }}
+      group: release-publish-${{ github.ref_type == 'tag' && github.ref || (inputs.npm_tag != '' && format('tag-{0}', inputs.npm_tag) || github.run_id) }}
       cancel-in-progress: false
     runs-on: ubuntu-24.04
     permissions:

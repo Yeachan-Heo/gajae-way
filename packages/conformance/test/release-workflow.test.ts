@@ -141,13 +141,22 @@ describe("release dist-tag resolution", () => {
 });
 
 describe("release workflow wiring", () => {
-	test("documents the limits of cross-ref npm dist-tag reconciliation", async () => {
+	test("documents which dist-tag writers the workflow serializes", async () => {
 		const readme = await Bun.file(new URL("../../../README.md", import.meta.url)).text();
 		const publishing = readme.split("### Publishing packages")[1]?.split("### CI/CD")[0] ?? "";
+		// The narrowed guarantee: runs requesting one explicit dist-tag share a group, so
+		// writers of that tag serialize even across refs.
 		expect(publishing).toContain(
-			"Concurrent releases — from different refs, or concurrent manual dispatches of one branch — can temporarily move a tag backwards",
+			"What the workflow does serialize is every writer of one explicitly requested dist-tag",
 		);
-		expect(publishing).toContain("an interrupted or failed reconciliation may leave it stale until a successful retry");
+		expect(publishing).toContain("cannot interleave a read and a write on that tag");
+		// The residual has to stay documented: a derived channel tag is not in that group,
+		// so the README must not promise cross-ref non-regression for every write.
+		expect(publishing).toContain("Serialization therefore covers requested tags, not the channel tag");
+		expect(publishing).toContain("can still interleave, so a concurrent release can move a channel tag backwards");
+		expect(publishing).toContain(
+			"an interrupted or failed reconciliation may leave a tag stale until a successful retry",
+		);
 		expect(publishing).not.toContain("so no tag moves backwards even for the moment");
 	});
 	test("serializes reruns of one immutable tag after the casing gate accepts it", async () => {
@@ -159,28 +168,37 @@ describe("release workflow wiring", () => {
 		// declaration is the cheapest way to reintroduce the queue collision.
 		expect(workflow.match(/^\s*concurrency:/gm) ?? []).toHaveLength(1);
 		expect(publishJob(workflow)).toMatch(
-			/concurrency:\n {6}group: release-publish-\$\{\{ github\.ref_type == 'tag' && github\.ref \|\| github\.run_id \}\}\n {6}cancel-in-progress: false/,
+			/concurrency:\n {6}group: release-publish-\$\{\{ github\.ref_type == 'tag' && github\.ref \|\| \(inputs\.npm_tag != '' && format\('tag-\{0\}', inputs\.npm_tag\) \|\| github\.run_id\) \}\}\n {6}cancel-in-progress: false/,
 		);
 	});
 
-	// GitHub keeps one pending run per group and drops the older pending one. A group keyed
-	// only by `github.ref` would therefore let a second manual dispatch from a branch
-	// replace a distinct pending branch release, whose publish job would never run.
-	test("never coalesces distinct manual branch dispatches", async () => {
+	// Two supported `workflow_dispatch` runs from different refs may request the same
+	// custom dist-tag. Keyed by ref or run, their read-then-write interleaves: the older
+	// run reads the pointer, the newer advances it, and the older write moves it back
+	// until the post-write read accepts the version it just wrote. The requested tag is
+	// therefore its own scope, while tag pushes keep the per-ref scope that stops distinct
+	// tags from displacing each other.
+	test("serializes concurrent writers of one explicitly requested dist-tag across refs", async () => {
 		const workflow = await releaseWorkflow();
 		const group = /^ {6}group: (.+)$/m.exec(publishJob(workflow))?.[1] ?? "";
-		// Tag reruns still share the tag's group and serialize.
-		expect(group).toContain("github.ref_type == 'tag'");
-		// A branch dispatch falls back to a per-run key, so it has no second pending slot
-		// that a later dispatch could displace.
-		expect(group).toContain("github.run_id");
+		// Distinct tags never contend: a tag push stays on its own ref's group.
+		expect(group).toContain("github.ref_type == 'tag' && github.ref");
+		// Nothing ref- or run-specific may key the explicit-tag scope, or two refs
+		// requesting the same tag would not share a group.
+		const tagScope = /inputs\.npm_tag != '' && (.+?) \|\| github\.run_id/.exec(group)?.[1] ?? "";
+		expect(tagScope).toBe("format('tag-{0}', inputs.npm_tag)");
+		// An untagged branch dispatch still falls back to a per-run key, so it has no
+		// second pending slot that a later dispatch could displace.
+		expect(group.endsWith("|| github.run_id) }}")).toBe(true);
 		expect(group).not.toBe("release-publish-${{ github.ref }}");
 	});
 
 	test("documents that branch dispatches are not queued behind each other", async () => {
 		const readme = await Bun.file(new URL("../../../README.md", import.meta.url)).text();
 		const publishing = readme.split("### Publishing packages")[1]?.split("### CI/CD")[0] ?? "";
-		expect(publishing).toContain("Manual dispatches on a branch each run as their own release");
+		expect(publishing).toContain(
+			"manual dispatches on a branch that request no `npm_tag` each run as their own release",
+		);
 		expect(publishing).toContain("so a group keyed by branch would silently skip a distinct requested release");
 	});
 
