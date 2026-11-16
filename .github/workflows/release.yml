@@ -88,17 +88,19 @@ jobs:
     # Two spellings must never publish one tag from two queue keys. Concurrency groups are
     # matched case-insensitively, so a tag differing only in case (`v1.2.3-RC.1` vs
     # `v1.2.3-rc.1`) shares this ref's serialization group. A dispatch `npm_tag` with
-    # surrounding whitespace has the same problem from the other side: the resolver trims
-    # it before publishing while the queue keys on it as written, so ` next ` and `next`
-    # would write one tag from groups that do not serialize. Both variants are rejected
-    # here so they can never publish. The job itself stays unconditional: a job-level `if`
-    # would make `needs` skip publishing for a branch dispatch, which is a documented way
-    # to release, and the workflow would report success with nothing published.
+    # whitespace has the same problem from the other side: the resolver trims its edges,
+    # an interior newline splits the `tag=$TAG` output line, and the queue keys on the
+    # value as written, so ` next ` and `next` (or `canary\ntag=next` and `next`) would
+    # write one tag from groups that do not serialize. A leading `-` would be read as an
+    # npm option. Both shapes are rejected here so they can never publish. The job itself
+    # stays unconditional: a job-level `if` would make `needs` skip publishing for a branch
+    # dispatch, which is a documented way to release, and the workflow would report success
+    # with nothing published.
     runs-on: ubuntu-24.04
     steps:
-      # The gate compares the `npm_tag` input against JavaScript's `trim()`, which removes
-      # Unicode spaces and separators (NBSP, U+2000-U+200A, U+3000, the BOM) as well as
-      # ASCII ones, so it runs the runtime the resolver uses instead of an ASCII class.
+      # The gate runs the predicate the release scripts use (`trim` edges, `\s` anywhere),
+      # which covers Unicode spaces and separators (NBSP, U+2000-U+200A, U+3000, the BOM)
+      # rather than an ASCII class. Bun is the runtime those scripts run on.
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.0
@@ -109,17 +111,24 @@ jobs:
             echo "::error::release tags must be lowercase; got $GITHUB_REF_NAME"
             exit 1
           fi
-      # The publish queue keys on `npm_tag` as written, while `resolveReleaseDistTag`
-      # trims it before `npm publish` writes it, so only the canonical spelling may reach
-      # the queue.
+      # The publish queue keys on `npm_tag` as written, so the accepted value must be the
+      # exact string the resolver returns, the `tag=$TAG` output line uses, and the `--tag`
+      # argument receives. Whitespace is trimmed by the resolver, splits the output line
+      # (an interior newline can inject another output), and is rejected by the script's
+      # own guard; a leading `-` would be read as an npm option. Reject both shapes before
+      # the queue, mirroring `resolveEffectiveTag`.
       - name: require a canonical npm dist-tag
         env:
           NPM_TAG_INPUT: ${{ inputs.npm_tag }}
         run: |
           bun -e '
             const raw = process.env.NPM_TAG_INPUT ?? "";
-            if (raw.trim() !== raw) {
-              console.log("::error::npm_tag must not have leading or trailing whitespace");
+            if (raw.startsWith("-")) {
+              console.log("::error::npm_tag must not start with a hyphen");
+              process.exit(1);
+            }
+            if (/\s/.test(raw)) {
+              console.log("::error::npm_tag must not contain whitespace");
               process.exit(1);
             }
           '

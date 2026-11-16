@@ -181,7 +181,7 @@ describe("release workflow wiring", () => {
 		);
 		// The group key is the tag as written, so the padded spelling has to be rejected;
 		// otherwise the README would promise serialization the workflow does not enforce.
-		expect(publishing).toContain("A dispatched `npm_tag` must not carry leading or trailing whitespace");
+		expect(publishing).toContain("A dispatched `npm_tag` must not contain whitespace or start with `-`");
 		expect(publishing).not.toContain("so no tag moves backwards even for the moment");
 	});
 	test("serializes reruns of one immutable tag after the casing gate accepts it", async () => {
@@ -256,22 +256,27 @@ describe("release workflow wiring", () => {
 		expect(body).toContain("if: github.ref_type == 'tag'");
 		expect(body).toContain("tr '[:upper:]' '[:lower:]'");
 		expect(body).toContain("release tags must be lowercase");
-		// The queue keys on `npm_tag` as written while the resolver trims it, so the same
-		// gate has to reject a padded spelling before the publish job enters a group.
+		// The queue keys on `npm_tag` as written while the resolver and the step output
+		// normalize it, so the same gate has to reject a divergent spelling before the
+		// publish job enters a group.
 		expect(body).toContain("require a canonical npm dist-tag");
 		expect(body).toContain("NPM_TAG_INPUT: ${{ inputs.npm_tag }}");
-		// The gate has to use the resolver's own predicate: an ASCII whitespace class would
-		// let a leading NBSP or BOM through while `String.prototype.trim` removes it.
+		// The gate has to use the scripts' predicates: an ASCII whitespace class would let
+		// NBSP or a BOM through, and a trim-only check would let an interior newline split
+		// the `tag=$TAG` output line.
 		const gateScript = stepScript(body, "require a canonical npm dist-tag");
-		expect(gateScript).toContain("raw.trim() !== raw");
+		expect(gateScript).toContain('raw.startsWith("-")');
+		expect(gateScript).toContain("/\\s/.test(raw)");
 		// Publishing must be gated by the check, not only by the build.
 		expect(workflow).toMatch(/needs: \[verify, canonical-tag\]/);
 	});
 
-	// The publish queue keys on `npm_tag` as written, while `resolveReleaseDistTag` trims
-	// it before `npm publish` writes it: ` next ` and `next` would publish one tag from
-	// two groups that never serialize, reopening the cross-ref race this PR closes. The
-	// gate has to reject the padded spelling before the publish job can enter either group.
+	// The publish queue keys on `npm_tag` as written, while the rest of the pipeline reads
+	// it differently: ` next ` and `next` publish one tag, and `canary\ntag=next` writes a
+	// second output line so the run publishes `next` from the group named after the whole
+	// raw string. Both are two writers of one tag in different groups, which is the race
+	// this PR closes. The gate has to reject those spellings before the publish job enters
+	// any group.
 	test("rejects an npm_tag spelling the publish queue would not share", async () => {
 		const workflow = await releaseWorkflow();
 		const gate = workflow.slice(workflow.indexOf("  canonical-tag:"));
@@ -290,19 +295,31 @@ describe("release workflow wiring", () => {
 				const [stdout] = await Promise.all([new Response(result.stdout).text()]);
 				return { exitCode: await result.exited, stdout };
 			};
-			const rejected = [" next ", "\tnext", "\u00a0next", "\ufeffnext", "next\u3000", "next\n"];
+			const rejected = [
+				" next ",
+				"\tnext",
+				"\u00a0next",
+				"\ufeffnext",
+				"next\u3000",
+				"next\n",
+				"canary\ntag=next",
+				"canary tag",
+				"canary\ttag",
+				"-next",
+				"--major",
+			];
 			for (const value of rejected) {
 				const result = await check(value);
 				expect(result.exitCode).toBe(1);
 				// `::error::` annotations go to stdout, where the runner reads them.
-				expect(result.stdout).toContain("must not have leading or trailing whitespace");
-				// The resolver would have published the trimmed tag, which is the divergence
-				// the gate prevents.
-				expect(resolveReleaseDistTag(value, ["1.2.3"])).toBe(value.trim());
-				expect(value.trim()).not.toBe(value);
+				expect(result.stdout).toContain("::error::npm_tag");
 			}
+			// A padded tag resolves to the plain one: the two would key different groups
+			// while `npm publish` wrote the same tag.
+			expect(resolveReleaseDistTag(" next ", ["1.2.3"])).toBe("next");
+			expect(resolveReleaseDistTag("\u00a0next", ["1.2.3"])).toBe("next");
 			// Canonical spellings and an empty input (derive the channel tag) still pass.
-			for (const value of ["next", "canary", ""]) {
+			for (const value of ["next", "canary", "rc-1", "beta.1", ""]) {
 				expect((await check(value)).exitCode).toBe(0);
 				expect(resolveReleaseDistTag(value, ["1.2.3"])).toBe(value === "" ? "latest" : value);
 			}
