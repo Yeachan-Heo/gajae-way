@@ -3696,16 +3696,9 @@ async function createInboundTurnLifecycle(
 			return { registration, auditIntentId };
 		});
 		if (outcome.auditIntentId) runtime.memory.enqueueExistingId(outcome.auditIntentId);
-		if (outcome.registration.kind === "already_watching") {
-			deliverTerminalLine(
-				renderWatchFailure(
-					line.target,
-					`this conversation is already watching until ${outcome.registration.watch.expires_at}`,
-				),
-				deliveredParts.length,
-			);
-			return;
-		}
+		// The pending watch stays registered with its original expiry, so the request
+		// already holds; reporting it as a failure only appends a misleading notice.
+		if (outcome.registration.kind === "already_watching") return;
 		if (outcome.registration.kind === "replayed" && outcome.registration.watch.state !== "pending") {
 			deliverTerminalLine(
 				`Watch for ${line.target} was already handled (${outcome.registration.watch.state}); it was not reopened.`,
