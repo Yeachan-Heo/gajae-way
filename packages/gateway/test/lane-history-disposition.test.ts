@@ -3,9 +3,12 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { WorkRetireResult } from "@gajae-gateway/protocol";
 import { appendAttempt, closeAttempt, createLaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
+import { GajaewayClient } from "../../sdk/src/client";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
 import { WorkLaneManager } from "../src/orchestrator/work-lane";
+import { startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { type WorkAttemptRuntime, workAttemptDeliveryId, workAttemptReportId } from "../src/store/groups/work";
 import { initializeTestBrokerAuthority, ScriptedSessionPort } from "./session-port.fake";
@@ -181,6 +184,47 @@ test("operator retirement dispositions proven terminal unbound history without d
 	expect(f.database.work.projectionRows()).toEqual(disposed);
 	expect((await f.governor.retire("a", "operator")).retired).toBe(false);
 	expect(f.database.work.projectionRows()).toEqual(disposed);
+});
+
+test("work.retire RPC dispositions eligible unbound history without closing its session", async () => {
+	const f = await fixture();
+	f.putHistory({ state: "awaiting_operator" });
+	const before = f.history();
+	const runtime = f.database.work.workAttemptGet(f.runtime.opRef);
+	const socketPath = join(f.directory, "gateway.sock");
+	const server = await startUnixServer({
+		config: {
+			schemaVersion: 1,
+			home: f.directory,
+			gjc: { agentDir: join(f.directory, "agent") },
+			configPath: join(f.directory, "config.json"),
+			socketPath,
+			dbPath: join(f.directory, "gateway.db"),
+			logVerbosity: "info",
+		},
+		database: f.database,
+		sessionPort: f.port,
+	});
+	let client: GajaewayClient | undefined;
+	try {
+		client = await GajaewayClient.connectSocket(socketPath);
+		const result = await client.request<WorkRetireResult>("work.retire", { name: "a" });
+		expect(result).toEqual({
+			retired: true,
+			sessionKey: f.sessionKey,
+			sessionId: "",
+			closed: false,
+			disposition: "aborted",
+		});
+		expect(f.history().state).toBe("aborted");
+		expect(f.history().attempts).toEqual(before.attempts);
+		expect(f.database.work.workAttemptGet(f.runtime.opRef)).toEqual(runtime);
+		expect(f.port.closes).toEqual([]);
+		expect(f.port.sends).toEqual([]);
+	} finally {
+		await client?.close();
+		await server.stop();
+	}
 });
 
 for (const schemaVersion of [2, 3]) {
@@ -603,7 +647,13 @@ for (const historyState of ["attempt_ended", "awaiting_operator"] as const) {
 					probes++;
 					if (duringProbe) insert();
 				};
-				expect((await f.governor.retire("a", "operator")).retired).toBe(false);
+				const result = await f.governor.retire("a", "operator");
+				expect(result).toMatchObject({
+					retired: false,
+					reason: duringProbe
+						? "historical job changed during disposition; inspect it again"
+						: "historical job has unresolved lane reports",
+				});
 				expect(probes).toBe(duringProbe ? 1 : 0);
 				expect(f.database.work.projectionRows()).toEqual(before);
 				expect(f.database.bindings.getSessionRecord(f.sessionKey)).toEqual(binding);
