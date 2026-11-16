@@ -1546,6 +1546,54 @@ test("a hold whose notice row was pruned is re-noticed once under the same deliv
 	}
 });
 
+test("a crash while scheduling a replacement escalation notice leaves a retryable hold (#785)", async () => {
+	const clock = new VirtualClock();
+	let receipt: EscalationNoticeReceipt = "unconfirmed";
+	const f = await heldOrigin("dead-hold-reissue-crash", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: true,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+		noticeReceipt: () => receipt,
+	});
+	const originalMetaSet = f.db.core.metaSet.bind(f.db.core);
+	let restarted: PersonaSessionManager | undefined;
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		expect(f.notices).toHaveLength(1);
+		staleStatus(f);
+		receipt = "missing";
+		const reissuedKey = `escalation-notice-reissued:${f.heldOpRef}`;
+		let crashed = false;
+		f.db.core.metaSet = (key, value) => {
+			originalMetaSet(key, value);
+			if (key === reissuedKey && !crashed) {
+				crashed = true;
+				throw new Error("simulated crash after reissue marker");
+			}
+		};
+		await expect(f.manager.reconcile(f.originKey)).rejects.toThrow("simulated crash after reissue marker");
+		expect(crashed).toBe(true);
+		f.db.core.metaSet = originalMetaSet;
+		// Neither half of the reissue intent may survive the interrupted transaction.
+		expect(f.db.core.metaGet(reissuedKey)).toBeUndefined();
+		expect(f.db.core.metaGet(`escalation-notice:${f.originKey}#${f.heldOpRef}`)).toBeUndefined();
+		await f.manager.stop();
+		restarted = f.startManager();
+		await restarted.recover();
+		await restarted.reconcile(f.originKey);
+		await until(() => f.notices.length === 2);
+		expect(f.notices[1]?.reason).toBe(UNRESOLVED_HOLD_ESCALATED);
+		expect(f.port.sends.filter((send) => send.opRef === f.heldOpRef)).toHaveLength(0);
+	} finally {
+		f.db.core.metaSet = originalMetaSet;
+		await restarted?.stop();
+		await f.manager.stop();
+	}
+});
+
 test("a reloaded sessions.retiredHoldAbandonMs applies to the live manager", async () => {
 	const f = await heldOrigin("dead-hold-reload", { heldForMs: 11 * MINUTE, live: false });
 	try {

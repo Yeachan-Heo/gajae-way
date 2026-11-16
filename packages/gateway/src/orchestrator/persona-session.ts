@@ -5329,9 +5329,13 @@ class OriginActor {
 	async #reissueEscalationNotice(opRef: string): Promise<void> {
 		const database = this.#manager.database;
 		const reissuedKey = escalationNoticeReissuedKey(opRef);
-		if (database.core.metaGet(reissuedKey) !== undefined) return;
-		database.core.metaSet(reissuedKey, new Date(this.#manager.now()).toISOString());
-		database.core.metaSet(escalationNoticeKey(this.originKey, opRef), "1");
+		const scheduled = database.transaction(() => {
+			if (database.core.metaGet(reissuedKey) !== undefined) return false;
+			database.core.metaSet(reissuedKey, new Date(this.#manager.now()).toISOString());
+			database.core.metaSet(escalationNoticeKey(this.originKey, opRef), "1");
+			return true;
+		});
+		if (!scheduled) return;
 		this.#manager.log(
 			`escalation_notice_reissued origin=${this.originKey} opRef=${opRef} reason=receipt_missing`,
 			"warn",
