@@ -310,6 +310,7 @@ const WORK_REASON_CODES = new Set([
 	"stopped_incomplete",
 	"sdk_failed",
 	"send_rejected",
+	"send_undelivered",
 	"terminal_missing_receipt",
 	"terminal_uncertain",
 	"session_dead",

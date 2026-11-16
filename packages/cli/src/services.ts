@@ -448,43 +448,46 @@ async function readRuntime(home: string): Promise<RuntimeConfig | undefined> {
 }
 
 /**
- * Where `services install|repair` finds the GJC pin, mirroring the runtime guard's candidates
- * (`pinnedGjcCandidatePaths` in packages/gateway/src/orchestrator/broker.ts): the checkout's gateway
- * package.json resolved from this module, then the package.json the release updater places beside the binaries.
+ * The release manifest beside the binaries `services install|repair` targets. It is the only pin
+ * source for a target that supplies a pin: the gateway started from those binaries enforces the
+ * pin from that same manifest, so no other file describes this target. The CLI checkout's own
+ * gateway manifest is deliberately not a candidate — an arbitrary `--bin-dir` is not demonstrably
+ * this checkout, and installing the checkout pin for it is how a release broker came to refuse its
+ * own install with broker_host_version_mismatch. The launchd/systemd definitions run
+ * `<binDir>/gajaeway-gateway`, so this is the manifest the runtime resolves for it.
  */
-export function servicePinCandidates(binDir: string, env: NodeJS.ProcessEnv = process.env): readonly string[] {
-	const repoRoot = dirname(dirname(dirname(dirname(__filename))));
-	return [
-		join(repoRoot, "packages", "gateway", "package.json"),
-		join(expandHome(binDir, env.HOME || homedir()), "package.json"),
-	];
+export function servicePinManifest(binDir: string, env: NodeJS.ProcessEnv = process.env): string {
+	return join(expandHome(binDir, env.HOME || homedir()), "package.json");
 }
 
 /**
- * Install the first pin found among `candidates` into the private prefix and return its version.
- * Unreadable or pin-less candidates are skipped; an install failure propagates instead of falling
- * through to a later candidate whose pin the runtime guard would not enforce.
+ * Install the pin `manifestPath` declares into the private prefix and return its version.
+ * A manifest that is missing, malformed, or pin-less fails the install with the release-directory
+ * remedy: a target that cannot supply its own pin is not served by another manifest's pin, and an
+ * install failure propagates instead of being retried elsewhere.
  */
 export async function installPinnedGjcForServices(options: {
 	readonly home: string;
-	readonly candidates: readonly string[];
+	readonly manifestPath: string;
 	readonly runner?: GjcInstallRunner;
 }): Promise<string> {
-	for (const path of options.candidates) {
-		let version: string;
-		try {
-			version = await readPinnedGjcVersion(path);
-		} catch {
-			continue;
-		}
-		await installPinnedGjc({
-			home: options.home,
-			version,
-			...(options.runner === undefined ? {} : { runner: options.runner }),
-		});
-		return version;
+	let version: string;
+	try {
+		version = await readPinnedGjcVersion(options.manifestPath);
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		const target = dirname(options.manifestPath);
+		throw new Error(
+			`services requires the release manifest beside the target binaries: ${detail}. Install the release into ${target} with 'gajaeway update --force --bin-dir ${target}'`,
+			{ cause: error },
+		);
 	}
-	throw new Error(`could not find a pinned gjc version in any of: ${options.candidates.join(", ")}`);
+	await installPinnedGjc({
+		home: options.home,
+		version,
+		...(options.runner === undefined ? {} : { runner: options.runner }),
+	});
+	return version;
 }
 
 export async function installServices(options: InstallServicesOptions): Promise<readonly string[]> {
