@@ -6753,6 +6753,26 @@ test("#794 completed lane with no origin does not enter awaiting_checks", async 
 	expect(checks.calls).toEqual([{ headSha: head, cwd: f.directory }]);
 });
 
+test("#794 an alternate publishing remote keeps checks tracking after a lookup failure", async () => {
+	const checks = scriptedChecks(undefined);
+	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });
+	const head = await laneRepo(f.directory, "fix/alternate-remote", true);
+	const rename = Bun.spawnSync(["git", "-C", f.directory, "remote", "rename", "origin", "upstream"], {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	expect(rename.exitCode).toBe(0);
+	const result = await started(f, "a", origin);
+	f.port.complete(result.opRef, "done");
+	await until(() => f.job().state === "awaiting_checks");
+	expect(f.job().awaitingChecks).toMatchObject({ prNumber: null, headSha: head });
+	expect(checks.calls).toEqual([{ headSha: head, cwd: f.directory }]);
+
+	checks.set({ prNumber: 794, headSha: head, status: "green", failingChecks: [], prState: "open" });
+	await pollUntil(f, () => f.job().state === "done");
+	expect(checksNotice(f, "[lane a] checks passed")).toContain(`head=${head.slice(0, 12)} pr=794 checks=green`);
+});
+
 test("#595 completed lane with already-green remote-head checks settles without parking", async () => {
 	const checks = scriptedChecks({ prNumber: 496, status: "green", failingChecks: [], prState: "open" });
 	const f = await fixture({ checkStatusClient: checks.client, ownerTarget: () => origin });

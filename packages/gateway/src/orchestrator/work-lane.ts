@@ -3666,11 +3666,16 @@ async function collectRepoFacts(
 				.map((url) => url.trim())
 				.filter(Boolean);
 			if (pushUrlsResult.exitCode !== 0) {
-				// Exit code 2 means "No such remote", which means not pushed
 				if (pushUrlsResult.exitCode === 2) {
-					result.pushed = false;
+					// A --cwd checkout can publish through a remote other than origin.
+					// With any such remote (or a failed listing), publication is unknown.
+					try {
+						const remotes = await runGit(["-C", worktreePath, "remote"], { timeoutMs: timeouts.local });
+						result.pushed = remotes.exitCode === 0 && remotes.stdout.trim() === "" ? false : null;
+					} catch {
+						result.pushed = null;
+					}
 				} else {
-					// Other failures (timeouts, permission issues) remain unknown
 					result.pushed = null;
 				}
 			} else if (pushUrls.length === 0) {
