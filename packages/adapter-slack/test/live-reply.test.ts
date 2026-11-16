@@ -75,7 +75,7 @@ test("a ledger replay of an applied part re-confirms without a platform call", a
 	const live = tracker(api);
 	await live.deliver(part());
 	await live.deliver(part({ deliveryId: "d2", text: "two" }));
-	live.close("turn");
+	await live.close("turn");
 	// The turn ended but d2's confirm may have been lost: the replay is answered.
 	expect(await live.deliver(part({ deliveryId: "d2", text: "[recovered - may be a duplicate] two" }))).toEqual({
 		kind: "replayed",
@@ -145,6 +145,69 @@ test("concurrent parts of one turn apply in arrival order", async () => {
 		live.deliver(part({ deliveryId: "d3", text: "three" })),
 	]);
 	expect(api.updates.map((update) => update[2])).toEqual(["one\n\ntwo", "one\n\ntwo\n\nthree"]);
+});
+
+test("close drains an opening post and queued edits before sealing and preserving replay", async () => {
+	let release!: () => void;
+	const blocked = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const api = new LiveApi();
+	const post = api.postMessage.bind(api);
+	api.postMessage = async (...args) => {
+		await blocked;
+		return post(...args);
+	};
+	const live = tracker(api);
+	const opening = live.deliver(part());
+	const second = live.deliver(part({ deliveryId: "d2", text: "two" }));
+	const third = live.deliver(part({ deliveryId: "d3", text: "three" }));
+	let closed = false;
+	const closing = live.close("turn").then(() => {
+		closed = true;
+	});
+	const late = live.deliver(part({ deliveryId: "late", text: "late" }));
+	await Promise.resolve();
+	expect(closed).toBe(false);
+	release();
+	expect(await opening).toEqual({ kind: "posted" });
+	expect(await second).toEqual({ kind: "folded" });
+	expect(await third).toEqual({ kind: "folded" });
+	await closing;
+	expect(await late).toEqual({ kind: "untracked" });
+	expect(api.updates.map((update) => update[2])).toEqual(["one\n\ntwo", "one\n\ntwo\n\nthree"]);
+	expect(await live.deliver(part({ deliveryId: "d2", text: "replayed" }))).toEqual({ kind: "replayed" });
+	expect(api.updates).toHaveLength(2);
+});
+
+test("close waits for a failed in-flight edit and keeps applied parts replayable", async () => {
+	let release!: () => void;
+	const blocked = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const api = new LiveApi();
+	const live = tracker(api);
+	await live.deliver(part());
+	api.updateMessage = async () => {
+		await blocked;
+		throw new Error("edit failed");
+	};
+	const editing = live.deliver(part({ deliveryId: "d2", text: "two" }));
+	const failed = editing.catch((error: unknown) => error);
+	await Promise.resolve();
+	let closed = false;
+	const closing = live.close("turn").then(() => {
+		closed = true;
+	});
+	await Promise.resolve();
+	expect(closed).toBe(false);
+	release();
+	const error = await failed;
+	expect(error).toBeInstanceOf(Error);
+	expect((error as Error).message).toBe("edit failed");
+	await closing;
+	expect(await live.deliver(part())).toEqual({ kind: "replayed" });
+	expect(await live.deliver(part({ deliveryId: "d2", text: "two" }))).toEqual({ kind: "untracked" });
 });
 
 test("entries expire after the TTL and the table evicts the least recently touched", async () => {
@@ -259,6 +322,57 @@ test("settleSlackDelivery posts normally when the tracker declines", async () =>
 	expect(gateway.requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery" } }]);
 });
 
+test("a live opening that posts one chunk before a definite refusal fails ambiguously", async () => {
+	for (const refusedChunk of [1, 2]) {
+		const api = new LiveApi();
+		const live = tracker(api);
+		const gateway = new Gateway();
+		const post = api.postMessage.bind(api);
+		let calls = 0;
+		api.postMessage = async (...args) => {
+			calls++;
+			if (calls === refusedChunk) throw new SlackApiError(200, "channel_not_found");
+			return post(...args);
+		};
+		await settleSlackDelivery(
+			gateway,
+			api,
+			delivery({ text: "x".repeat(SLACK_MESSAGE_LIMIT + 10), final: false }),
+			console,
+			undefined,
+			undefined,
+			live,
+		);
+		expect(gateway.requests).toEqual([
+			{
+				verb: "delivery.fail",
+				params: {
+					deliveryId: "delivery",
+					reason: expect.stringContaining("channel_not_found"),
+					ambiguous: refusedChunk === 2,
+				},
+			},
+		]);
+		expect(api.posts).toHaveLength(refusedChunk - 1);
+		expect(live.tracked("turn")).toBe(false);
+	}
+});
+
+test("a partially posted live opening retains the Slack refusal as its cause", async () => {
+	const api = new LiveApi();
+	const live = tracker(api);
+	const post = api.postMessage.bind(api);
+	const refusal = new SlackApiError(200, "channel_not_found");
+	let calls = 0;
+	api.postMessage = async (...args) => {
+		if (++calls === 2) throw refusal;
+		return post(...args);
+	};
+	const error = await live.deliver(part({ text: "x".repeat(SLACK_MESSAGE_LIMIT + 10) })).catch((caught) => caught);
+	expect(error).toBeInstanceOf(Error);
+	expect(error.cause).toBe(refusal);
+});
+
 test("the final progress tick closes the live entry even without a terminal delivery", async () => {
 	const api = new LiveApi();
 	const live = tracker(api);
@@ -275,6 +389,7 @@ test("the final progress tick closes the live entry even without a terminal deli
 			final: true,
 		});
 	off();
+	for (let attempt = 0; attempt < 100 && live.tracked("turn"); attempt++) await Bun.sleep(5);
 	expect(live.tracked("turn")).toBe(false);
 	expect(await live.deliver(part({ deliveryId: "d2", text: "late" }))).toEqual({ kind: "untracked" });
 });

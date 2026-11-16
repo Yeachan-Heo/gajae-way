@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HISTORY_RETENTION_MS, Store } from "../src/store";
+import { HISTORY_RETENTION_MS, LATEST_SCHEMA_VERSION, Store } from "../src/store";
 import { ATTEMPT_UPDATED_SWEEP_SQL, HISTORY_SWEEP_SQL } from "../src/store/groups/journal";
 
 const OLD = "2020-01-01T00:00:00.000Z";
@@ -136,7 +136,7 @@ DELETE FROM schema_migrations WHERE version >= 36;
 		database.close();
 		const migrated = await Store.open(path);
 		try {
-			expect(migrated.schemaVersion).toBe(39);
+			expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 			expect(events(raw, "lane_job", "lanejob-6a")).toEqual(["baseline"]);
 			expect(events(raw, "attempt", "gw-j-abababababab")).toEqual(["baseline"]);
 			expect(events(raw, "delivery", "delivery-j")).toEqual(["baseline"]);

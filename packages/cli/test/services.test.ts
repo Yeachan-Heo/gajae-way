@@ -1,12 +1,17 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readlink, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { homeLayout } from "@gajae-gateway/home";
+import type { GjcInstallRunner } from "../src/gjc-install";
 import {
 	BROKER_UNIT,
+	discoverLoginPath,
 	GATEWAY_UNIT,
+	installPinnedGjcForServices,
 	installServices,
 	restartStackCommands,
+	servicePinManifest,
 	serviceSpecs,
 	systemdUnitName,
 } from "../src/services";
@@ -188,4 +193,213 @@ test("restart-stack is one systemctl call on linux and an ordered kickstart chai
 	}
 	// bootout removes the job and leaves the bot offline with no automatic recovery.
 	expect(darwin.flat()).not.toContain("bootout");
+});
+
+test("discoverLoginPath uses SHELL when set and executable", async () => {
+	const env = { SHELL: "/bin/sh" };
+	let ranCommand: string[] | undefined;
+	const runner = async (command: readonly string[]) => {
+		ranCommand = [...command];
+		if (command[0] === "/bin/sh") return "exported PATH value";
+		throw new Error("not reached");
+	};
+
+	const result = await discoverLoginPath(env, runner);
+
+	expect(result).toBe("exported PATH value");
+	expect(ranCommand).toEqual(["/bin/sh", "-lc", 'printf %s "$PATH"']);
+});
+
+function recordingRunner(succeedOn?: string) {
+	const ran: string[] = [];
+	const runner = async (command: readonly string[]) => {
+		ran.push(command[0] ?? "");
+		expect(command.slice(1)).toEqual(["-lc", 'printf %s "$PATH"']);
+		if (command[0] === succeedOn) return `PATH from ${succeedOn}`;
+		throw new Error(`ENOENT: posix_spawn '${command[0]}'`);
+	};
+	return { ran, runner };
+}
+
+test("discoverLoginPath with SHELL unset uses the passwd shell, never /bin/zsh", async () => {
+	const { ran, runner } = recordingRunner("/usr/bin/fish");
+	const result = await discoverLoginPath({}, runner, () => "/usr/bin/fish");
+	expect(result).toBe("PATH from /usr/bin/fish");
+	expect(ran).toEqual(["/usr/bin/fish"]);
+});
+
+test("discoverLoginPath falls back SHELL -> passwd shell -> /bin/bash -> /bin/sh", async () => {
+	const { ran, runner } = recordingRunner("/bin/sh");
+	const result = await discoverLoginPath({ SHELL: "/opt/missing/zsh" }, runner, () => "/usr/bin/fish");
+	expect(result).toBe("PATH from /bin/sh");
+	expect(ran).toEqual(["/opt/missing/zsh", "/usr/bin/fish", "/bin/bash", "/bin/sh"]);
+});
+
+test("discoverLoginPath tries each shell once when SHELL equals the passwd shell", async () => {
+	const { ran, runner } = recordingRunner();
+	await discoverLoginPath({ SHELL: "/bin/bash" }, runner, () => "/bin/bash");
+	expect(ran).toEqual(["/bin/bash", "/bin/sh"]);
+});
+
+test("discoverLoginPath returns an empty login PATH instead of throwing when no shell runs", async () => {
+	const { ran, runner } = recordingRunner();
+	expect(await discoverLoginPath({}, runner, () => undefined)).toBe("");
+	expect(ran).toEqual(["/bin/bash", "/bin/sh"]);
+	expect(ran).not.toContain("/bin/zsh");
+});
+
+test("installServices succeeds even when shell discovery returns empty", async () => {
+	const { home, cleanup } = await configuredHome();
+	const binDir = join(home, "bin");
+	const written = new Map<string, string>();
+	try {
+		await mkdir(binDir);
+		for (const spec of serviceSpecs()) await writeFile(join(binDir, spec.binary), "stub");
+
+		const failingRunner = async () => {
+			throw new Error("shell discovery failed");
+		};
+
+		const paths = await installServices({
+			binDir,
+			platform: "linux",
+			unitDir: join(home, "units"),
+			env: { HOME: home, GAJAEWAY_HOME: home },
+			loginPathRunner: failingRunner,
+			writeFile: (path, contents) => {
+				written.set(path, contents);
+			},
+		});
+
+		// Should still write all units using FALLBACK_PATH_DIRS.
+		expect(paths).toHaveLength(serviceSpecs().length);
+		expect(written.size).toBe(serviceSpecs().length);
+
+		// Verify at least one unit was written and contains fallback paths.
+		const firstUnit = [...written.values()][0] ?? "";
+		expect(firstUnit).toContain("/usr/local/bin");
+		expect(firstUnit).toContain("/usr/bin");
+		expect(firstUnit).toContain("/bin");
+	} finally {
+		await cleanup();
+	}
+});
+
+function stubGjcRunner(installed: string[]): GjcInstallRunner {
+	return async (command, cwd) => {
+		if (command[0] === "bun") {
+			const dependency = (
+				JSON.parse(await readFile(join(cwd, "package.json"), "utf8")) as {
+					dependencies: { "gajae-code": string };
+				}
+			).dependencies["gajae-code"];
+			installed.push(dependency);
+			await mkdir(join(cwd, "node_modules", ".bin"), { recursive: true });
+			await writeFile(join(cwd, "node_modules", ".bin", "gjc"), dependency);
+			return { exitCode: 0, stdout: "", stderr: "" };
+		}
+		return { exitCode: 0, stdout: `gjc/${await readFile(command[0] as string, "utf8")}`, stderr: "" };
+	};
+}
+
+async function pinFile(dir: string, name: string, version?: string): Promise<string> {
+	const path = join(dir, name);
+	await writeFile(path, JSON.stringify(version === undefined ? { name } : { name, gjc: { version } }));
+	return path;
+}
+
+test("installPinnedGjcForServices installs the manifest's pin into the private prefix", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "gajaeway-service-pin-"));
+	try {
+		const installed: string[] = [];
+		const manifestPath = await pinFile(dir, "release.json", "0.19.0");
+		const version = await installPinnedGjcForServices({
+			home: dir,
+			manifestPath,
+			runner: stubGjcRunner(installed),
+		});
+		expect(version).toBe("0.19.0");
+		expect(installed).toEqual(["0.19.0"]);
+		expect(await readlink(homeLayout(dir).gjcCurrent)).toBe("0.19.0");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("installPinnedGjcForServices propagates an install failure instead of retrying elsewhere", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "gajaeway-service-pin-"));
+	try {
+		const commands: string[][] = [];
+		const failing: GjcInstallRunner = async (command) => {
+			commands.push([...command]);
+			return { exitCode: 1, stdout: "", stderr: "registry unavailable" };
+		};
+		const manifestPath = await pinFile(dir, "release.json", "0.19.0");
+		await expect(installPinnedGjcForServices({ home: dir, manifestPath, runner: failing })).rejects.toThrow(
+			"registry unavailable",
+		);
+		expect(commands).toHaveLength(1);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("installPinnedGjcForServices refuses a manifest without a pin instead of using another one", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "gajaeway-service-pin-"));
+	try {
+		for (const manifestPath of [join(dir, "missing.json"), await pinFile(dir, "nopin.json")]) {
+			const installed: string[] = [];
+			await expect(
+				installPinnedGjcForServices({ home: dir, manifestPath, runner: stubGjcRunner(installed) }),
+			).rejects.toThrow(manifestPath);
+			expect(installed).toEqual([]);
+		}
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("servicePinManifest names the release manifest beside the target binaries", () => {
+	expect(servicePinManifest("~/bin", { HOME: "/home/op" })).toBe("/home/op/bin/package.json");
+});
+
+test("service repair installs the target release manifest's pin, not the checkout pin", async () => {
+	const binDir = await mkdtemp(join(tmpdir(), "gajaeway-service-target-"));
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-service-home-"));
+	try {
+		await writeFile(join(binDir, "package.json"), JSON.stringify({ name: "gajaeway", gjc: { version: "0.19.3" } }));
+		const installed: string[] = [];
+		const version = await installPinnedGjcForServices({
+			home,
+			manifestPath: servicePinManifest(binDir, { HOME: "/home/op" }),
+			runner: stubGjcRunner(installed),
+		});
+		expect(version).toBe("0.19.3");
+		expect(installed).toEqual(["0.19.3"]);
+	} finally {
+		await rm(binDir, { recursive: true, force: true });
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("service repair fails closed when a bin dir other than this checkout has no release manifest", async () => {
+	const binDir = await mkdtemp(join(tmpdir(), "gajaeway-service-target-"));
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-service-home-"));
+	try {
+		// The checkout still carries its own pin; it must not be installed for a target
+		// that cannot supply one, because that target's broker would refuse to start.
+		const installed: string[] = [];
+		await expect(
+			installPinnedGjcForServices({
+				home,
+				manifestPath: servicePinManifest(binDir, { HOME: "/home/op" }),
+				runner: stubGjcRunner(installed),
+			}),
+		).rejects.toThrow(join(binDir, "package.json"));
+		expect(installed).toEqual([]);
+		expect(await Bun.file(homeLayout(home).gjcCurrent).exists()).toBe(false);
+	} finally {
+		await rm(binDir, { recursive: true, force: true });
+		await rm(home, { recursive: true, force: true });
+	}
 });

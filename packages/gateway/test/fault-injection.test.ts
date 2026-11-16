@@ -260,6 +260,7 @@ class JournaledBusyPort extends ScriptedSessionPort {
 	override async send(input: SessionSendInput) {
 		if (this.busy === undefined) return await super.send(input);
 		this.sendAttempts.push(input);
+		input.beforeWrite?.();
 		const scope = JSON.stringify([input.sessionId, input.opRef]);
 		this.store.transaction((tx) => {
 			this.store.bindings.beginBrokerOperation(tx, this.authority, {

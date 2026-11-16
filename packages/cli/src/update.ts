@@ -244,7 +244,7 @@ export interface RunUpdateOptions {
 	readonly deps?: UpdateDeps;
 }
 
-async function readPinnedGjcVersion(path: string): Promise<string> {
+export async function readPinnedGjcVersion(path: string): Promise<string> {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(await readFile(path, "utf8"));

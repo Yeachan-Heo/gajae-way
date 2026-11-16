@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { SessionBusyStalledError, type SessionSendInput } from "../src/orchestrator/session-port";
-import { BrokerAuthorityError, Store } from "../src/store";
+import { BrokerAuthorityError, LATEST_SCHEMA_VERSION, Store } from "../src/store";
 import { ScriptedSessionPort } from "./session-port.fake";
 
 let home = "";
@@ -322,7 +322,7 @@ test("upgrading to schema 39 stamps legacy bound/accepted turns so recovery reco
 
 	database = await Store.open(path);
 	const upgraded = database;
-	expect(upgraded.schemaVersion).toBe(39);
+	expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 	const received = upgraded.inbox.turnRow(boundOpRef)!.received_at;
 	expect(upgraded.inbox.sendAttemptedAt(boundOpRef)).toBe(received);
 	expect(upgraded.inbox.sendAttemptedAt(acceptedOpRef)).toBe("2026-10-26T06:00:05.000Z");
@@ -405,7 +405,7 @@ test("upgrading to schema 39 leaves a quarantined legacy turn untouched instead 
 	raw.close();
 
 	database = await Store.open(path);
-	expect(database.schemaVersion).toBe(39);
+	expect(database.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 	expect(database.inbox.sendAttemptedAt(liveOpRef)).toBe(database.inbox.turnRow(liveOpRef)?.dispatched_at ?? undefined);
 	expect(database.inbox.sendAttemptedAt(liveOpRef)).toBeDefined();
 	expect(database.inbox.sendAttemptedAt(quarantinedOpRef)).toBeUndefined();

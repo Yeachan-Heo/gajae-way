@@ -15,8 +15,17 @@ import {
 	SessionTerminalError,
 	sessionRequestStep,
 } from "../src/orchestrator/session-port";
-import { RelayHelloError, TailRunner } from "../src/orchestrator/tail-runner";
-import { Store } from "../src/store";
+import {
+	isRelayTransportFailure,
+	isUnwrittenRelayRequest,
+	MAX_RELAY_REQUEST_FRAME_BYTES,
+	RelayClosedError,
+	RelayHelloError,
+	RelayPayloadTooLargeError,
+	serializeRelayRequestFrame,
+	TailRunner,
+} from "../src/orchestrator/tail-runner";
+import { BrokerAuthorityError, Store } from "../src/store";
 import {
 	createOwnedSessionFixture,
 	initializeTestBrokerAuthority,
@@ -460,6 +469,114 @@ test("session request preserves local prompt fingerprint rejection instead of re
 	await f.handle.close();
 });
 
+test("session send carries image bytes on its existing resident turn.prompt frame", async () => {
+	const f = await fixture({
+		mode: "answer",
+		relayReply: (request) => ({ ok: true, result: { accepted: true, clientRef: request.input.clientRef } }),
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
+	});
+	const images = [{ data: "AAECAwQFBgcICQ==", mimeType: "image/jpeg" as const }];
+	await f.port.send({
+		sessionId: "sdk-1",
+		repo: f.repo,
+		text: "describe this",
+		images,
+		opRef: "gw-image-frame",
+		relay: f.handle,
+	});
+	const frame = f.relay.streams[0]!.written.find((candidate) => candidate.type === "control_request");
+	expect(frame).toMatchObject({
+		type: "control_request",
+		operation: "turn.prompt",
+		input: { text: "describe this", clientRef: "gw-image-frame", images },
+	});
+	expect(JSON.stringify(frame)).toContain(`"data":"${images[0]!.data}"`);
+	expect(f.relay.requests.map((request) => request.operation)).toEqual(["turn.prompt"]);
+	await f.handle.close();
+});
+
+test("session send rejects a changed image set under a reused op ref", async () => {
+	const f = await fixture({
+		mode: "answer",
+		relayReply: (request) => ({ ok: true, result: { accepted: true, clientRef: request.input.clientRef } }),
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
+	});
+	const input = { sessionId: "sdk-1", repo: f.repo, text: "describe this", opRef: "gw-image-fingerprint" };
+	await f.port.send({ ...input, images: [{ data: "AQ==", mimeType: "image/jpeg" }] });
+	const failure = await f.port
+		.send({ ...input, images: [{ data: "Ag==", mimeType: "image/jpeg" }] })
+		.catch((error: unknown) => error);
+	expect(failure).toBeInstanceOf(OpRefError);
+	expect((failure as Error).message).toContain("already used for a different prompt");
+	expect(f.relay.requests.map((request) => request.operation)).toEqual(["turn.prompt"]);
+	await f.handle.close();
+});
+
+test("relay serializer accepts the literal 262144-byte boundary", () => {
+	const frame = {
+		type: "control_request",
+		id: "",
+		connectionId: "",
+		operation: "turn.prompt",
+		input: { text: "", clientRef: "gw-boundary" },
+		confirm: false,
+	};
+	const textBytes = 262144 - Buffer.byteLength(JSON.stringify(frame), "utf8");
+	const serialized = serializeRelayRequestFrame("sdk-1", {
+		...frame,
+		input: { ...frame.input, text: "x".repeat(textBytes) },
+	});
+	expect(MAX_RELAY_REQUEST_FRAME_BYTES).toBe(262144);
+	expect(Buffer.byteLength(serialized, "utf8")).toBe(262144);
+});
+
+test("session send records a typed local rejection before creating an operation intent for an oversized text-and-image prompt", async () => {
+	const f = await fixture({
+		mode: "answer",
+		relayReply: (request) => ({ ok: true, result: { accepted: true, clientRef: request.input.clientRef } }),
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
+	});
+	const input = {
+		sessionId: "sdk-1",
+		repo: f.repo,
+		opRef: "gw-oversized-prompt",
+		text: "x".repeat(240_000),
+		images: [{ data: "AQ==".repeat(10_000), mimeType: "image/jpeg" as const }],
+	};
+	const failure = await f.port.send(input).catch((error: unknown) => error);
+	expect(failure).toBeInstanceOf(RelayPayloadTooLargeError);
+	expect(failure).not.toBeInstanceOf(RelayClosedError);
+	expect((failure as RelayPayloadTooLargeError).code).toBe("prompt_too_large");
+	expect((failure as RelayPayloadTooLargeError).frameBytes).toBeGreaterThan(262144);
+	expect(isRelayTransportFailure(failure)).toBe(false);
+	expect(isUnwrittenRelayRequest(failure)).toBe(true);
+	expect(f.relay.requests).toEqual([]);
+	await f.port.send({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef, text: "small prompt" });
+	expect(f.relay.requests.map((request) => request.operation)).toEqual(["turn.prompt"]);
+	await f.handle.close();
+});
+
+test("an ambiguous prompt send is reconciled without replaying turn.prompt", async () => {
+	const f = await fixture({
+		mode: "tear",
+		relayReply: () => ({ ok: true, result: {} }),
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
+	});
+	const input = { sessionId: "sdk-1", repo: f.repo, text: "do not duplicate", opRef: "gw-ambiguous-image-prompt" };
+	await f.port.send({ ...input, images: [{ data: "AQ==", mimeType: "image/jpeg" }] }).catch(() => undefined);
+	await f.port.send({ ...input, images: [{ data: "AQ==", mimeType: "image/jpeg" }] }).catch(() => undefined);
+	expect(f.relay.requests.map((request) => request.operation)).toEqual(["turn.prompt", "turn.result"]);
+	await f.handle.close();
+});
+
 test("session request still reconciles native client-ref conflict without another submission", async () => {
 	const f = await fixture({
 		mode: "answer",
@@ -487,6 +604,7 @@ test("session request still reconciles native client-ref conflict without anothe
 		repo: f.repo,
 		text: "prompt",
 		opRef: "gw-native-conflict",
+		sampleContext: true,
 	});
 	expect(result.assistant.text).toBe("recovered original result");
 	expect(result.status.operationRef).toBe("gw-native-conflict");
@@ -494,6 +612,7 @@ test("session request still reconciles native client-ref conflict without anothe
 		"turn.prompt",
 		"turn.result",
 		"session.last_assistant",
+		"context.get",
 	]);
 	expect(f.relay.requests[1]?.input).toEqual({ kind: "prompt", clientRef: "gw-native-conflict" });
 	expect(f.relay.streams).toHaveLength(2);
@@ -501,6 +620,197 @@ test("session request still reconciles native client-ref conflict without anothe
 	expect(f.relay.streams[1]!.closed).toBe(true);
 	await f.handle.close();
 });
+
+for (const scenario of [
+	{
+		name: "a good page",
+		reply: { ok: true, page: { items: [{ usage: { percent: 17.74935, contextWindow: 1_000_000 } }] } },
+		expected: { percent: 17.74935, tokens: 177_494 },
+	},
+	{ name: "a refused context.get", reply: { ok: false, error: { code: "unsupported_query" } }, expected: undefined },
+	{ name: "a torn context relay", reply: { ok: true }, expected: undefined, tear: true },
+	{ name: "a malformed context page", reply: { ok: true, page: { items: [null] } }, expected: undefined },
+	{
+		name: "malformed context usage",
+		reply: { ok: true, page: { items: [{ usage: { percent: "17", contextWindow: 1_000_000 } }] } },
+		expected: undefined,
+	},
+] satisfies ReadonlyArray<{ name: string; reply: ScriptedRelayReply; expected: unknown; tear?: boolean }>) {
+	test(`session request reads context usage best-effort on its own relay with ${scenario.name}`, async () => {
+		let closeContextRelay = () => {};
+		const f = await fixture({
+			mode: "answer",
+			relayReply: (request) => {
+				if (request.operation === "context.get") {
+					if ("tear" in scenario && scenario.tear) closeContextRelay();
+					return scenario.reply;
+				}
+				if (request.operation === "session.last_assistant")
+					return { ok: true, page: { items: ["answered"], complete: true } };
+				if (request.operation === "turn.result")
+					return {
+						ok: true,
+						result: {
+							kind: "prompt",
+							clientRef: request.input.clientRef,
+							status: "terminal_ok",
+							receiptState: "present",
+							outcome: { reason: "end_turn", provenance: "agent" },
+						},
+					};
+				return { ok: true, result: {} };
+			},
+			cliReply: () => {
+				throw new Error("CLI must not run");
+			},
+		});
+		closeContextRelay = () => f.relay.streams[1]!.close();
+		const result = await f.port.request({
+			sessionId: "sdk-1",
+			repo: f.repo,
+			text: "author",
+			opRef: "gw-context",
+			sampleContext: true,
+		});
+		expect(result.assistant.text).toBe("answered");
+		expect(result.contextUsage).toEqual(scenario.expected);
+		if (scenario.expected === undefined) expect(result).not.toHaveProperty("contextUsage");
+		expect(f.relay.requests.map((request) => request.operation)).toEqual([
+			"turn.prompt",
+			"turn.result",
+			"session.last_assistant",
+			"context.get",
+		]);
+		// The fixture's first relay is idle; all four operations used request()'s relay.
+		expect(f.relay.streams[0]?.written.filter((frame) => frame.type === "query_request")).toEqual([]);
+		expect(f.relay.streams[1]?.closed).toBe(true);
+		expect(f.cli).toEqual([]);
+		await f.handle.close();
+	});
+}
+
+for (const authorityFailure of [false, true]) {
+	test(`session request ${authorityFailure ? "propagates authority errors" : "ignores thrown errors"} from context usage`, async () => {
+		const f = await fixture({
+			mode: "answer",
+			relayReply: (request) => {
+				if (request.operation === "turn.result")
+					return {
+						ok: true,
+						result: {
+							kind: "prompt",
+							clientRef: request.input.clientRef,
+							status: "terminal_ok",
+							receiptState: "present",
+							outcome: { reason: "end_turn", provenance: "agent" },
+						},
+					};
+				return { ok: true, page: { items: ["answered"], complete: true } };
+			},
+			cliReply: () => {
+				throw new Error("CLI must not run");
+			},
+		});
+		const error = authorityFailure ? new BrokerAuthorityError("quarantined") : new Error("context read failed");
+		f.port.contextUsage = async () => {
+			throw error;
+		};
+		const request = f.port.request({
+			sessionId: "sdk-1",
+			repo: f.repo,
+			text: "author",
+			opRef: "gw-context-error",
+			sampleContext: true,
+		});
+		if (authorityFailure) {
+			const observed = await request.catch((failure: unknown) => failure);
+			expect(observed).toBe(error);
+			expect(sessionRequestStep(observed)).toBe("authority");
+		} else {
+			const result = await request;
+			expect(result.assistant.text).toBe("answered");
+			expect(result).not.toHaveProperty("contextUsage");
+		}
+		expect(f.relay.streams[1]?.closed).toBe(true);
+		await f.handle.close();
+	});
+}
+
+test("session request opts out of context sampling by default without waiting for context.get", async () => {
+	const f = await fixture({
+		mode: "answer",
+		relayReply: (request) => {
+			if (request.operation === "context.get") return { ok: false, error: { code: "unexpected_context_get" } };
+			if (request.operation === "turn.result")
+				return {
+					ok: true,
+					result: {
+						kind: "prompt",
+						clientRef: request.input.clientRef,
+						status: "terminal_ok",
+						receiptState: "present",
+						outcome: { reason: "end_turn", provenance: "agent" },
+					},
+				};
+			return { ok: true, page: { items: ["answered"], complete: true } };
+		},
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
+	});
+	const start = performance.now();
+	const result = await f.port.request({ sessionId: "sdk-1", repo: f.repo, text: "author", opRef: "gw-no-context" });
+	expect(result.assistant.text).toBe("answered");
+	expect(result).not.toHaveProperty("contextUsage");
+	expect(f.relay.requests.map((request) => request.operation)).toEqual([
+		"turn.prompt",
+		"turn.result",
+		"session.last_assistant",
+	]);
+	expect(performance.now() - start).toBeLessThan(1000);
+	await f.handle.close();
+});
+
+for (const empty of ["", "  \n"]) {
+	test(`session request skips context sampling for an empty answer ${JSON.stringify(empty)}`, async () => {
+		const f = await fixture({
+			mode: "answer",
+			relayReply: (request) => {
+				if (request.operation === "context.get") return { ok: false, error: { code: "unexpected_context_get" } };
+				if (request.operation === "turn.result")
+					return {
+						ok: true,
+						result: {
+							kind: "prompt",
+							clientRef: request.input.clientRef,
+							status: "terminal_ok",
+							receiptState: "present",
+							outcome: { reason: "end_turn", provenance: "agent" },
+						},
+					};
+				return { ok: true, page: { items: [empty], complete: true } };
+			},
+			cliReply: () => {
+				throw new Error("CLI must not run");
+			},
+		});
+		const result = await f.port.request({
+			sessionId: "sdk-1",
+			repo: f.repo,
+			text: "author",
+			opRef: "gw-empty-context",
+			sampleContext: true,
+		});
+		expect(result.assistant.text.trim()).toBe("");
+		expect(result).not.toHaveProperty("contextUsage");
+		expect(f.relay.requests.map((request) => request.operation)).toEqual([
+			"turn.prompt",
+			"turn.result",
+			"session.last_assistant",
+		]);
+		await f.handle.close();
+	});
+}
 
 test("session request wraps primitive send rejections with a safe message and original cause", async () => {
 	const f = await fixture({
