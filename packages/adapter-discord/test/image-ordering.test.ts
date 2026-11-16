@@ -1106,13 +1106,16 @@ test("a replay verification fetch bypasses the discord.js message cache", async 
 			async () => ({
 				messages: {
 					fetch: async (query: unknown) => {
-						// discord.js returns a cached, non-partial message for a bare id. Only a forced
-						// fetch observes the delete that landed while the link was down; serving the
-						// cache would replay an image for a message that no longer exists.
-						if (typeof query === "string") return stale;
-						if (singleFetchId(query) === id)
-							throw Object.assign(new Error("Unknown Message"), { code: 10_008, status: 404 });
-						return [];
+						const single = singleFetchId(query);
+						if (single === undefined) return [];
+						// Model discord.js: a bare id, or an object without `force`, is served from the
+						// message cache. Only `force: true` reaches the API and observes the delete
+						// that landed while the link was down; the cache would replay a missing message.
+						if (typeof query === "object" && query !== null && (query as { force?: boolean }).force === true) {
+							if (single === id) throw Object.assign(new Error("Unknown Message"), { code: 10_008, status: 404 });
+							return undefined;
+						}
+						return single === id ? stale : undefined;
 					},
 				},
 			}),
@@ -1148,12 +1151,15 @@ test("an expired signed url is refreshed with a forced fetch, not a cached messa
 			async () => ({
 				messages: {
 					fetch: async (query: unknown) => {
-						if (typeof query === "string") return expired;
-						if (singleFetchId(query) === id) {
+						const single = singleFetchId(query);
+						if (single === undefined) return [];
+						// Model discord.js: only a forced read reaches the API for the re-signed url.
+						if (typeof query === "object" && query !== null && (query as { force?: boolean }).force === true) {
+							if (single !== id) return undefined;
 							served = "fresh";
 							return fresh;
 						}
-						return [];
+						return single === id ? expired : undefined;
 					},
 				},
 			}),

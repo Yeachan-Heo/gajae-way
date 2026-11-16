@@ -2588,7 +2588,10 @@ export class ReconnectingGateway {
 					liveRetry,
 				);
 			},
-			() => this.retryPendingImage(entry, source, ordered, liveRetry),
+			// A scheduled retry runs later than the walk that produced `source`, so that
+			// snapshot must not become evidence a replay verification trusts. Dropping it
+			// makes the retry re-read the source through the forced fetch.
+			() => this.retryPendingImage(entry, undefined, ordered, liveRetry),
 		);
 	}
 
