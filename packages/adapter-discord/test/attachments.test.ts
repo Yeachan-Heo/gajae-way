@@ -7,6 +7,7 @@ import {
 	DISCORD_IMAGE_ALLOWED_HOSTS,
 	describeAttachment,
 	describeInboundBody,
+	imageSourceIdentity,
 	isVoiceMessageAttachment,
 	prepareDiscordImages,
 	selectImageAttachments,
@@ -376,4 +377,41 @@ test("a Map-like collection is read through values() rather than as entry pairs"
 	const collection = new Map([["1", VOICE]]);
 	expect(collectAttachments({ attachments: collection })).toEqual([VOICE]);
 	expect(describeInboundBody({ content: "", attachments: collection })).toBe(describeAttachment(VOICE));
+});
+test("imageSourceIdentity ignores rotated CDN signatures for one attachment", () => {
+	const first = {
+		attachments: [
+			{
+				id: "attachment-a",
+				name: "photo.png",
+				contentType: "image/png",
+				url: "https://cdn.discordapp.com/photo.png?ex=1&is=1&hm=a",
+			},
+		],
+	};
+	const refreshed = {
+		attachments: [
+			{
+				id: "attachment-a",
+				name: "photo.png",
+				contentType: "image/png",
+				url: "https://cdn.discordapp.com/photo.png?ex=2&is=2&hm=b",
+			},
+		],
+	};
+	expect(imageSourceIdentity(first)).toBe(imageSourceIdentity(refreshed));
+});
+
+test("imageSourceIdentity changes when the attachment source changes", () => {
+	const original = {
+		attachments: [
+			{ id: "attachment-a", name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo.png" },
+		],
+	};
+	const edited = {
+		attachments: [
+			{ id: "attachment-b", name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo.png" },
+		],
+	};
+	expect(imageSourceIdentity(original)).not.toBe(imageSourceIdentity(edited));
 });

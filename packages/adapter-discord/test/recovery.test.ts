@@ -2039,3 +2039,12 @@ test("two recovery triggers sharing an identity check start one pass", async () 
 		cleanupTimers();
 	}
 });
+
+test("resetting acknowledged ids allows a restored database to replay them", async () => {
+	const gate = new RecoveryGate();
+	expect(await gate.join("message-1", async () => "acked")).toBe("acked");
+	expect(gate.acked("message-1")).toBe(true);
+	gate.resetAcknowledged();
+	expect(gate.acked("message-1")).toBe(false);
+	expect(await gate.join("message-1", async () => "acked")).toBe("acked");
+});

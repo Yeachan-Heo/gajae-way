@@ -28,6 +28,7 @@ import {
 	DiscordImagePreparationError,
 	describeInboundBody,
 	firstVoiceMessage,
+	imageSourceIdentity,
 	prepareDiscordImages,
 	selectNativeImageAttachments,
 } from "./attachments";
@@ -1934,6 +1935,7 @@ export class ReconnectingGateway {
 		let prepared: { readonly images: PromptImage[]; readonly notice: string } | undefined;
 		let imageSource = message;
 		let refreshed = false;
+		const sourceIdentity = imageSourceIdentity(message);
 		for (let attempt = 1; attempt <= RECOVERY_MAX_ATTEMPTS; attempt++) {
 			try {
 				prepared = await this.prepareImages(imageSource);
@@ -1947,7 +1949,17 @@ export class ReconnectingGateway {
 							message.id,
 						);
 						if (!fresh || typeof fresh !== "object" || !("author" in fresh)) return this.deferImageFailure(entry);
-						imageSource = fresh as DiscordInboundMessage;
+						const refreshedMessage = fresh as DiscordInboundMessage;
+						// The message was refetched because its signed urls expired. If the author
+						// edited it in the meantime, the new attachment is different bytes than the
+						// intent was recorded for; replaying it would answer an image the user
+						// replaced, and re-preparing forever would wedge the conversation.
+						if (
+							imageSourceIdentity(refreshedMessage) !== sourceIdentity ||
+							refreshedMessage.content !== message.content
+						)
+							return this.terminateImage(entry, "image source changed after the message was edited");
+						imageSource = refreshedMessage;
 						refreshed = true;
 						attempt--;
 						continue;
@@ -1966,15 +1978,12 @@ export class ReconnectingGateway {
 		// Never downgrade a pending image to a text-only message; a source that can
 		// never carry the image again is a terminal intent, not a silent wedge.
 		if (prepared.images.length === 0) return this.terminateImage(entry, "image attachment no longer present");
-		let origin = discordMessageOrigin(message);
-		// Recovered input must not cause a Discord-side thread before the gateway's
-		// authoritative admission check. Live input and any retry of a live intent
-		// keep the current behavior: a live attempt may have opened the thread and
-		// crashed before persisting the request, so the retry idempotently adopts
-		// that thread (or opens the one the first attempt never got to) instead of
-		// answering in the parent channel. A history-discovered intent never
-		// creates a thread.
-		if (!recovered || entry.live === true) {
+		// Identity from the Discord message id is stable across a restart; every live
+		// intent's destination (channel or thread) is persisted with it, so a retry
+		// answers where the first attempt already did. A history-discovered intent
+		// never creates a Discord thread.
+		let origin = entry.origin ?? discordMessageOrigin(message);
+		if (entry.origin === undefined && (!recovered || entry.live === true)) {
 			void nameThreadFromMessage(message, origin, unnamed);
 			origin = await maybeCreateThreadOnMention(
 				message,
@@ -2000,6 +2009,10 @@ export class ReconnectingGateway {
 					},
 				},
 			);
+			if (origin !== entry.origin) {
+				entry = { ...entry, origin };
+				await this.#imageOutbox.put(entry);
+			}
 		}
 		const body = withTranscript(describeInboundBody(message), await transcribeIfVoice(message, this.config.voice));
 		const receivedAt =
@@ -2171,6 +2184,31 @@ export class ReconnectingGateway {
 			});
 		} catch {
 			console.error("Discord image outbox terminal compaction failed; retaining rejected-image rows.");
+		}
+	}
+
+	/**
+	 * Completed rows in channels history never revisits cannot be compacted by a
+	 * watermark. Remove them after compaction so live-only traffic in an
+	 * unconfigured channel cannot occupy the completion quota indefinitely.
+	 */
+	private async reclaimUnreachableCompletedImages(): Promise<void> {
+		const reachable = new Set([
+			...Object.keys(this.config.channels ?? {}),
+			...Object.keys(this.#cursors?.knownDms ?? {}),
+			...this.#recoverableIds,
+		]);
+		try {
+			const drop = new Set(
+				(await this.#imageOutbox.load())
+					.filter((entry) => entry.completed && !entry.dm && !reachable.has(entry.channelId))
+					.map((entry) => entry.messageId),
+			);
+			if (drop.size > 0) await this.#imageOutbox.compact((entry) => !drop.has(entry.messageId));
+		} catch (error) {
+			console.error(
+				`Discord unreachable completion reclamation failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
 		}
 	}
 
@@ -2626,7 +2664,10 @@ export class ReconnectingGateway {
 			// Compact only below the watermark that is now durable. Otherwise a crash
 			// could restore an older watermark after the terminal evidence is gone,
 			// resurrecting a rejected intent on the next rewalk.
-			if (!this.#cursorSaveFault) await this.compactTerminalImages();
+			if (!this.#cursorSaveFault) {
+				await this.compactTerminalImages();
+				await this.reclaimUnreachableCompletedImages();
+			}
 		}
 	}
 
@@ -3004,7 +3045,15 @@ export class ReconnectingGateway {
 		const legacy = state.gatewayDbIdentity === undefined;
 		let next: RecoveryCursorState = this.#cursors ?? state;
 		if (!legacy || (await this.hasRecoveryEvidence(next))) {
+			let completedDms: string[] = [];
 			try {
+				completedDms = [
+					...new Set(
+						(await this.#imageOutbox.load())
+							.filter((entry) => entry.dm && entry.completed)
+							.map((entry) => entry.channelId),
+					),
+				];
 				await this.#imageOutbox.invalidateCompleted();
 			} catch {
 				// Rewinding watermarks without clearing completion evidence could leave an
@@ -3012,6 +3061,11 @@ export class ReconnectingGateway {
 				// adoption on the next status poll.
 				return;
 			}
+			// The rewind invalidates completed tombstones; without this the post-rewind
+			// walk would still skip every image this process already delivered, and a
+			// completed DM whose tombstone was just cleared would drop out of history.
+			this.#imageDone.clear();
+			this.#inbound.resetAcknowledged();
 			const latest = this.#cursors ?? state;
 			const floor = snowflakeFromTimestamp(Date.now() - IMAGE_REPLAY_RETENTION_MS);
 			next = {
@@ -3032,6 +3086,9 @@ export class ReconnectingGateway {
 					]),
 				),
 			};
+			const now = Date.now();
+			for (const channelId of completedDms)
+				next = { ...next, knownDms: rememberKnownDm(next, channelId, now).knownDms };
 			console.error(
 				legacy
 					? "Discord recovery cursors predate gateway database identity tracking; rewound their watermarks to the replay floor and invalidated image completion tombstones, so a database restore during the upgrade cannot hide messages."

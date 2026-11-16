@@ -99,7 +99,7 @@ test("sendEdit sends chat.edit, not chat.send, and is not swallowed by the messa
 	const requests: Array<{ verb: string; params: unknown }> = [];
 	const gw = gateway({
 		request: async (verb, params) => {
-			requests.push({ verb, params });
+			if (verb !== "gateway.status") requests.push({ verb, params });
 			return { engaged: true };
 		},
 	});

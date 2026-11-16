@@ -1,5 +1,6 @@
 import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
+import type { OriginRef } from "@gajae-gateway/protocol";
 
 export type PendingImage = {
 	readonly messageId: string;
@@ -9,6 +10,7 @@ export type PendingImage = {
 	readonly completed?: boolean;
 	readonly completedAt?: number;
 	readonly createdAt?: number;
+	readonly origin?: OriginRef;
 	readonly failureAt?: number;
 	readonly audited?: boolean;
 	/** The intent started as live ingress, so a retry may still select its destination. */
@@ -64,6 +66,7 @@ function validateEntry(value: unknown): asserts value is PendingImage {
 		("completed" in value && typeof value.completed !== "boolean") ||
 		("completedAt" in value && typeof value.completedAt !== "number") ||
 		("createdAt" in value && typeof value.createdAt !== "number") ||
+		("origin" in value && !isRecord(value.origin)) ||
 		("failureAt" in value && typeof value.failureAt !== "number") ||
 		("audited" in value && typeof value.audited !== "boolean") ||
 		("live" in value && typeof value.live !== "boolean") ||

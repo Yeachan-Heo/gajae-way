@@ -483,7 +483,7 @@ function reactionDelivery(
 function mockGateway(requests: Request[]): Pick<GatewayClientLike, "request"> {
 	return {
 		request: async <T>(verb: string, params?: unknown) => {
-			requests.push({ verb, params });
+			if (verb !== "gateway.status") requests.push({ verb, params });
 			return {} as T;
 		},
 	};
