@@ -22,9 +22,16 @@ import {
 	ProtocolError,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
+import { withTranscript } from "@gajae-gateway/voice";
 import pkg from "../package.json";
 import { deliveryFailureIsAmbiguous, OutboundLimiter, SlackApiError, SlackWebApi } from "./api";
-import { describeInboundBody, isSlackNativeImage, prepareSlackImages, type SlackFileCarrier } from "./attachments";
+import {
+	describeInboundBody,
+	type InboundBodyOptions,
+	isSlackNativeImage,
+	prepareSlackImages,
+	type SlackFileCarrier,
+} from "./attachments";
 import { SlackDirectory } from "./author";
 import { adapterHome, type LoadedSlackAdapterConfig, loadSlackAdapterConfig } from "./config";
 import { describePanelResponse, type SlackBlockAction } from "./interactions";
@@ -70,6 +77,7 @@ import {
 import { type SlackSlashCommand, SlackSocketMode, type SocketModeOptions } from "./socket";
 import { isPresenceReaction, WorkingStatus } from "./status";
 import { mentionedUserIds, normalizeSlackText } from "./text";
+import { firstSlackVoiceClip, SlackVoiceReplies, transcribeSlackVoiceClip } from "./voice";
 
 export interface GatewayClientLike {
 	request<T = unknown>(verb: string, params?: unknown): Promise<T>;
@@ -199,8 +207,12 @@ export function decideInbound(
 	return { origin, engagement };
 }
 
-export function renderInboundText(message: SlackInboundMessage, names: SlackNames): string {
-	return describeInboundBody({ text: normalizeSlackText(message.text ?? "", names), files: message.files });
+export function renderInboundText(
+	message: SlackInboundMessage,
+	names: SlackNames,
+	options: InboundBodyOptions = {},
+): string {
+	return describeInboundBody({ text: normalizeSlackText(message.text ?? "", names), files: message.files }, options);
 }
 
 /** Only a standalone raw command explicitly addressed to this bot is executable. */
@@ -235,6 +247,7 @@ export function describeMessageEdit(
 	names: SlackNames,
 	channels: Channels,
 	knownOrigin?: OriginRef,
+	options: InboundBodyOptions = {},
 ): DescribedMessageEdit | undefined {
 	if (event.subtype !== "message_changed" || !event.message) return undefined;
 	if (hasNativeImageEdit(event)) return undefined;
@@ -250,9 +263,9 @@ export function describeMessageEdit(
 		channels,
 	);
 	if (!previous) return undefined;
-	const text = renderInboundText(message, names);
+	const text = renderInboundText(message, names, options);
 	// Link previews and other metadata changes are not edits of what the user said.
-	if (text === "" || (event.previous_message && renderInboundText(event.previous_message, names) === text))
+	if (text === "" || (event.previous_message && renderInboundText(event.previous_message, names, options) === text))
 		return undefined;
 	return {
 		...admitted,
@@ -374,6 +387,7 @@ export async function settleSlackDelivery(
 	status?: Pick<WorkingStatus, "clear" | "reassert">,
 	mentions?: MentionDirectory,
 	live?: LiveReplyTracker,
+	voiceReplies?: SlackVoiceReplies,
 ): Promise<void> {
 	if (message.origin.platform !== "slack" || !message.deliveryId) return;
 	if (message.reaction) {
@@ -433,6 +447,7 @@ export async function settleSlackDelivery(
 			});
 			if (outcome.kind !== "untracked") {
 				await gateway.request("delivery.confirm", { deliveryId });
+				await voiceReplies?.reply(api, message, channel, threadTs);
 				return;
 			}
 		}
@@ -441,8 +456,12 @@ export async function settleSlackDelivery(
 			await api.postMessage(channel, chunk, threadTs);
 			visibleTextPosted = true;
 		}
-		// voiceText is intentionally ignored: Slack has no bot voice messages.
 		await gateway.request("delivery.confirm", { deliveryId });
+		// Voice rides AFTER the text, and only after the text landed and the
+		// delivery is confirmed: the readable half is the guaranteed one, and a
+		// slow synthesis must not hold the ledger open into a redelivery. `reply`
+		// never throws, and without a configured speech section it is absent.
+		await voiceReplies?.reply(api, message, channel, threadTs);
 	} catch (error) {
 		await gateway.request("delivery.fail", {
 			deliveryId,
@@ -587,12 +606,13 @@ export function subscribeSlackDeliveries(
 	status?: Pick<WorkingStatus, "clear" | "reassert">,
 	mentions?: MentionDirectory,
 	live?: LiveReplyTracker,
+	voiceReplies?: SlackVoiceReplies,
 ): () => void {
 	const queue = settlementQueue(gateway);
 	return gateway.onChatMessage((message) => {
 		if (message.origin.platform !== "slack") return;
 		queue.run(settlementKey(message.origin), async () => {
-			await settleSlackDelivery(gateway, api, message, log, status, mentions, live).catch((error) =>
+			await settleSlackDelivery(gateway, api, message, log, status, mentions, live, voiceReplies).catch((error) =>
 				log.error(`Slack delivery settlement request failed: ${errorText(error)}`),
 			);
 		});
@@ -671,6 +691,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 		private readonly monitorIntervals = { healthy: 30_000, degraded: 5_000 },
 		private readonly reconnectDelayMs = 500,
 		readonly live?: LiveReplyTracker,
+		readonly voiceReplies?: SlackVoiceReplies,
 	) {
 		if (initialClient) this.adoptClient(initialClient);
 	}
@@ -690,7 +711,15 @@ export class ReconnectingGateway implements GatewayClientLike {
 		this.#deliveryOff?.();
 		// Old in-flight Slack writes still own their place across a gateway reconnect.
 		settlementQueues.set(client, this.#settlements);
-		const off = subscribeSlackDeliveries(client, this.api, console, this.status, this.mentions, this.live);
+		const off = subscribeSlackDeliveries(
+			client,
+			this.api,
+			console,
+			this.status,
+			this.mentions,
+			this.live,
+			this.voiceReplies,
+		);
 		const progressOff =
 			this.status || this.live ? subscribeSlackProgress(client, this.status, console, this.live) : undefined;
 		const handlersOff = client.onChatMessage((message) => {
@@ -786,8 +815,10 @@ export class ReconnectingGateway implements GatewayClientLike {
 		engagement: EngagementContext,
 		receivedAt?: string,
 		images?: readonly PromptImage[],
+		/** The message was spoken, so the reply is owed in both modalities. */
+		voice?: boolean,
 	): Promise<{ engaged?: boolean; turnId?: string | null } | undefined> {
-		const sent = await this.requestRecovered(messageId, origin, text, engagement, receivedAt, images);
+		const sent = await this.requestRecovered(messageId, origin, text, engagement, receivedAt, images, voice);
 		return sent.verdict === "acked" ? sent.result : undefined;
 	}
 
@@ -804,6 +835,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 		engagement: EngagementContext,
 		receivedAt?: string,
 		images?: readonly PromptImage[],
+		voice?: boolean,
 	): Promise<RecoveredSend> {
 		const pending = this.#pendingSends.get(messageId);
 		// Joining an in-flight send shares its verdict; a second caller never claims
@@ -824,6 +856,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 					engagement,
 					...(receivedAt ? { receivedAt } : {}),
 					...(images && images.length > 0 ? { images } : {}),
+					...(voice ? { voice: true } : {}),
 				});
 				this.#inbound.addIfAbsent(messageId);
 				// The gateway already decided engagement - including un-mentioned thread
@@ -986,6 +1019,8 @@ export async function startSlackAdapter(
 		socketFactory?: SocketModeOptions["factory"];
 		log?: Pick<Console, "log" | "error">;
 		imageFetch?: ImageFetch;
+		/** Speech-provider and Slack file transport for voice; tests never touch the network. */
+		voiceFetch?: typeof fetch;
 		recoveryCursorPath?: string;
 		now?: () => number;
 		connectGateway?: (gateway: ReconnectingGateway) => Promise<void>;
@@ -1024,6 +1059,13 @@ export async function startSlackAdapter(
 	const directory = new SlackDirectory(api);
 	const status = new WorkingStatus(api, log);
 	const live = config.liveReplies === true ? new LiveReplyTracker(api, log) : undefined;
+	const voicePorts = {
+		fetch: ports.voiceFetch ?? fetch,
+		log: (line: string) => log.error(`Slack ${line}`),
+	};
+	const voiceReplies = config.voice?.speech ? new SlackVoiceReplies(config.voice.speech, voicePorts) : undefined;
+	// Without a voice section audio keeps its pre-existing `[audio · …]` line.
+	const bodyOptions = { voiceClips: config.voice !== undefined };
 	const gateway = new ReconnectingGateway(
 		config.gatewaySocket ?? join(adapterHome(), "gateway.sock"),
 		api,
@@ -1033,6 +1075,7 @@ export async function startSlackAdapter(
 		{ healthy: 30_000, degraded: 5_000 },
 		500,
 		live,
+		voiceReplies,
 	);
 	const ingress = new OrderedIngress();
 	const imageBudget = new ImagePreparationBudget();
@@ -1143,7 +1186,14 @@ export async function startSlackAdapter(
 			}
 			const edit =
 				envelope.subtype === "message_changed"
-					? describeMessageEdit(envelope, identity, directory, config.channels, messageOrigins.get(messageId))
+					? describeMessageEdit(
+							envelope,
+							identity,
+							directory,
+							config.channels,
+							messageOrigins.get(messageId),
+							bodyOptions,
+						)
 					: undefined;
 			if (envelope.subtype === "message_changed" && !edit) return;
 			const routedOrigin = rememberOrigin(messageId, edit?.origin ?? admitted.origin);
@@ -1159,6 +1209,7 @@ export async function startSlackAdapter(
 						directory,
 						config.channels,
 						messageOrigins.get(messageId),
+						bodyOptions,
 					);
 					if (editToSend) {
 						rememberOrigin(messageId, editToSend.origin);
@@ -1172,8 +1223,21 @@ export async function startSlackAdapter(
 					}
 					return;
 				}
-				const text = extractBotCommand(message, identity.botUserId) ?? renderInboundText(message, directory);
-				if (text === "") return;
+				const command = extractBotCommand(message, identity.botUserId);
+				const rendered = command ?? renderInboundText(message, directory, bodyOptions);
+				if (rendered === "") return;
+				// A voice clip carries no text, so without a transcript the history
+				// shows a url and nothing about what was said. It runs inside this
+				// conversation's ingress chain, so a text sent right after a long clip
+				// still reaches the gateway second.
+				const clip = command === undefined && config.voice ? firstSlackVoiceClip(message.files) : undefined;
+				const text =
+					clip && config.voice
+						? withTranscript(
+								rendered,
+								await transcribeSlackVoiceClip(clip, config.voice.transcription, config.botToken, voicePorts),
+							)
+						: rendered;
 				const engagement = engagementForMessage(message, admitted.origin, identity, directory, config.channels);
 				const origin = routedOrigin;
 				let prepared: Awaited<ReturnType<typeof prepareSlackImages>>;
@@ -1192,7 +1256,11 @@ export async function startSlackAdapter(
 					engagement,
 					timestamp(message.ts),
 					prepared.images,
+					// The modality of the question decides the modality of the answer.
+					clip !== undefined,
 				);
+				if (clip && message.user && typeof result?.turnId === "string")
+					voiceReplies?.rememberSpeaker(result.turnId, message.user);
 				if (result?.engaged) {
 					await rememberThread(origin, message);
 					if (typeof result.turnId === "string")
@@ -1283,7 +1351,7 @@ export async function startSlackAdapter(
 			const admitted = decideInbound(message, identity, directory, config.channels);
 			if (!admitted) return "skip";
 			await prime(message);
-			const text = extractBotCommand(message, identity.botUserId) ?? renderInboundText(message, directory);
+			const text = extractBotCommand(message, identity.botUserId) ?? renderInboundText(message, directory, bodyOptions);
 			if (text === "") return "skip";
 			const messageId = slackMessageId(message.channel, message.ts);
 			const origin = rememberOrigin(messageId, admitted.origin);

@@ -1,6 +1,7 @@
 import type { ImageFetch, ImagePreparationBudget } from "@gajae-gateway/images";
 import { downloadPromptImage, PromptImageDownloadError, preparePromptImages } from "@gajae-gateway/images";
 import type { PromptImage } from "@gajae-gateway/protocol";
+import { formatVoiceDuration } from "@gajae-gateway/voice";
 
 /**
  * Attachment rendering for inbound Discord messages.
@@ -189,7 +190,7 @@ export function describeAttachment(attachment: AttachmentLike): string {
 	const parts: string[] = [];
 	if (isVoiceMessageAttachment(attachment)) {
 		parts.push("voice message");
-		parts.push(`${formatDuration(attachment.duration as number)}`);
+		parts.push(formatVoiceDuration(attachment.duration as number));
 	} else {
 		parts.push(attachmentKind(attachment));
 		const name = nonBlank(attachment.name);
@@ -242,17 +243,6 @@ function attachmentKind(attachment: AttachmentLike): string {
 	if (contentType.startsWith("video/")) return "video";
 	if (contentType.startsWith("audio/")) return "audio";
 	return "file";
-}
-
-/**
- * Formats a voice-message length. Sub-minute clips read in seconds because that
- * is how Discord itself labels them; longer ones get m:ss.
- */
-function formatDuration(seconds: number): string {
-	if (seconds < 60) return `${round(seconds, 1)}s`;
-	const minutes = Math.floor(seconds / 60);
-	const rest = Math.floor(seconds % 60);
-	return `${minutes}:${String(rest).padStart(2, "0")}`;
 }
 
 function formatSize(size: number | null | undefined): string | undefined {

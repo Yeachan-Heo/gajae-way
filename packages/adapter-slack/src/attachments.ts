@@ -1,5 +1,7 @@
 import { downloadPromptImage, type ImageFetch, preparePromptImages } from "@gajae-gateway/images";
 import type { PromptImage } from "@gajae-gateway/protocol";
+import { formatVoiceDuration } from "@gajae-gateway/voice";
+import { isSlackVoiceClip } from "./voice";
 
 /** File descriptions preserve attachment-only Slack messages in the text protocol. */
 export interface SlackFileLike {
@@ -9,7 +11,12 @@ export interface SlackFileLike {
 	readonly mimetype?: string | null;
 	readonly size?: number | null;
 	readonly url_private?: string | null;
+	readonly url_private_download?: string | null;
 	readonly permalink?: string | null;
+	/** `slack_audio` marks a clip recorded in Slack's own voice recorder. */
+	readonly subtype?: string | null;
+	/** Clip length Slack reports for audio and video. */
+	readonly duration_ms?: number | null;
 }
 
 export type SlackFileCarrier = { readonly text?: string | null; readonly files?: readonly SlackFileLike[] | null };
@@ -76,16 +83,14 @@ const SLACK_FILE_ID = /^F[A-Z0-9]{6,}$/;
  * for F0C8PPGAV7G). It is also the only handle left when Slack sends a partial
  * file object without `url_private`.
  */
-export function describeSlackFile(file: SlackFileLike): string {
+export function describeSlackFile(file: SlackFileLike, options: InboundBodyOptions = {}): string {
+	if (options.voiceClips && isSlackVoiceClip(file)) return describeSlackVoiceClip(file);
 	const mime = nonBlank(file.mimetype)?.toLowerCase() ?? "";
 	const kind = isSlackImage(file)
 		? "image"
 		: (["video", "audio"].find((kind) => mime.startsWith(`${kind}/`)) ?? "file");
 	const nativeImage = isSlackNativeImage(file);
-	const id =
-		typeof file.id === "string" && file.id.trim() === file.id && SLACK_FILE_ID.test(file.id)
-			? `id ${file.id}`
-			: undefined;
+	const id = slackFileId(file);
 	const parts = [
 		kind,
 		nonBlank(file.name) ?? nonBlank(file.title),
@@ -96,14 +101,49 @@ export function describeSlackFile(file: SlackFileLike): string {
 	return `[${parts.filter((part) => part !== undefined).join(" · ")}]`;
 }
 
-export function describeInboundBody(message: SlackFileCarrier): string {
+/**
+ * `[voice message · 4.3s · id F… · size · url]`, the same leading label the
+ * Discord adapter uses, so the persona dispatches on one convention. The url
+ * stays because the transcript that follows it is lossy and the audio is the
+ * original.
+ */
+function describeSlackVoiceClip(file: SlackFileLike): string {
+	const duration =
+		typeof file.duration_ms === "number" && Number.isFinite(file.duration_ms) && file.duration_ms >= 0
+			? formatVoiceDuration(file.duration_ms / 1000)
+			: undefined;
+	const parts = [
+		"voice message",
+		duration,
+		slackFileId(file),
+		formatSize(file.size),
+		nonBlank(file.url_private) ?? nonBlank(file.permalink),
+	];
+	return `[${parts.filter((part) => part !== undefined).join(" · ")}]`;
+}
+
+export interface InboundBodyOptions {
+	/**
+	 * Render audio as a voice message. Set only when voice is configured, so a
+	 * deployment without a `voice` section keeps its `[audio · …]` lines.
+	 */
+	readonly voiceClips?: boolean;
+}
+
+export function describeInboundBody(message: SlackFileCarrier, options: InboundBodyOptions = {}): string {
 	const text = message.text ?? "";
 	const files = message.files ?? [];
 	if (files.length === 0) return text;
-	const rendered = files.slice(0, 10).map(describeSlackFile);
+	const rendered = files.slice(0, 10).map((file) => describeSlackFile(file, options));
 	const overflow = files.length - rendered.length;
 	if (overflow > 0) rendered.push(`[+${overflow} more attachment${overflow === 1 ? "" : "s"}]`);
 	return text.trim() === "" ? rendered.join("\n") : `${text}\n${rendered.join("\n")}`;
+}
+
+function slackFileId(file: SlackFileLike): string | undefined {
+	return typeof file.id === "string" && file.id.trim() === file.id && SLACK_FILE_ID.test(file.id)
+		? `id ${file.id}`
+		: undefined;
 }
 
 function nonBlank(value: string | null | undefined): string | undefined {

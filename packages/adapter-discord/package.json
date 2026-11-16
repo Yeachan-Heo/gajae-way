@@ -16,6 +16,7 @@
 		"@gajae-gateway/log": "workspace:*",
 		"@gajae-gateway/protocol": "workspace:*",
 		"@gajae-gateway/sdk": "workspace:*",
+		"@gajae-gateway/voice": "workspace:*",
 		"discord.js": "^14.25.1"
 	}
 }

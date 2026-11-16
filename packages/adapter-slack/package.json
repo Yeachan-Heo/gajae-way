@@ -15,6 +15,7 @@
 		"@gajae-gateway/home": "workspace:*",
 		"@gajae-gateway/log": "workspace:*",
 		"@gajae-gateway/protocol": "workspace:*",
-		"@gajae-gateway/sdk": "workspace:*"
+		"@gajae-gateway/sdk": "workspace:*",
+		"@gajae-gateway/voice": "workspace:*"
 	}
 }

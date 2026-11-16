@@ -18,6 +18,7 @@ import {
 	type SessionModelChoicesResult,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
+import { type TranscriptResult, withTranscript } from "@gajae-gateway/voice";
 import { AttachmentBuilder, Client, GatewayIntentBits, MessageFlags, Partials } from "discord.js";
 import pkg from "../package.json";
 import {
@@ -79,13 +80,7 @@ import {
 } from "./recovery";
 import { type ReplyMessageLike, resolveReplyContext } from "./reply";
 import { type SpeechConfig, type SpeechPorts, synthesizeVoice } from "./speech";
-import {
-	type TranscriptionPorts,
-	type TranscriptResult,
-	transcribeVoiceMessage,
-	type VoiceTranscriptionConfig,
-	withTranscript,
-} from "./voice";
+import { type TranscriptionPorts, transcribeVoiceMessage, type VoiceTranscriptionConfig } from "./voice";
 
 /**
  * Reaction state that must outlive a single delivery: the guild custom-emoji
