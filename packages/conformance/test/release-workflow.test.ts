@@ -260,6 +260,10 @@ describe("release workflow wiring", () => {
 		// gate has to reject a padded spelling before the publish job enters a group.
 		expect(body).toContain("require a canonical npm dist-tag");
 		expect(body).toContain("NPM_TAG_INPUT: ${{ inputs.npm_tag }}");
+		// The gate has to use the resolver's own predicate: an ASCII whitespace class would
+		// let a leading NBSP or BOM through while `String.prototype.trim` removes it.
+		const gateScript = stepScript(body, "require a canonical npm dist-tag");
+		expect(gateScript).toContain("raw.trim() !== raw");
 		// Publishing must be gated by the check, not only by the build.
 		expect(workflow).toMatch(/needs: \[verify, canonical-tag\]/);
 	});
@@ -286,14 +290,22 @@ describe("release workflow wiring", () => {
 				const [stdout] = await Promise.all([new Response(result.stdout).text()]);
 				return { exitCode: await result.exited, stdout };
 			};
-			const padded = await check(" next ");
-			expect(padded.exitCode).toBe(1);
-			// `::error::` annotations go to stdout, where the runner reads them.
-			expect(padded.stdout).toContain("must not have leading or trailing whitespace");
+			const rejected = [" next ", "\tnext", "\u00a0next", "\ufeffnext", "next\u3000", "next\n"];
+			for (const value of rejected) {
+				const result = await check(value);
+				expect(result.exitCode).toBe(1);
+				// `::error::` annotations go to stdout, where the runner reads them.
+				expect(result.stdout).toContain("must not have leading or trailing whitespace");
+				// The resolver would have published the trimmed tag, which is the divergence
+				// the gate prevents.
+				expect(resolveReleaseDistTag(value, ["1.2.3"])).toBe(value.trim());
+				expect(value.trim()).not.toBe(value);
+			}
 			// Canonical spellings and an empty input (derive the channel tag) still pass.
-			expect((await check("next")).exitCode).toBe(0);
-			expect((await check("canary")).exitCode).toBe(0);
-			expect((await check("")).exitCode).toBe(0);
+			for (const value of ["next", "canary", ""]) {
+				expect((await check(value)).exitCode).toBe(0);
+				expect(resolveReleaseDistTag(value, ["1.2.3"])).toBe(value === "" ? "latest" : value);
+			}
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}

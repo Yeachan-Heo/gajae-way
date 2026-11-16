@@ -96,6 +96,12 @@ jobs:
     # to release, and the workflow would report success with nothing published.
     runs-on: ubuntu-24.04
     steps:
+      # The gate compares the `npm_tag` input against JavaScript's `trim()`, which removes
+      # Unicode spaces and separators (NBSP, U+2000-U+200A, U+3000, the BOM) as well as
+      # ASCII ones, so it runs the runtime the resolver uses instead of an ASCII class.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
       - name: require lowercase tag
         if: github.ref_type == 'tag'
         run: |
@@ -110,11 +116,13 @@ jobs:
         env:
           NPM_TAG_INPUT: ${{ inputs.npm_tag }}
         run: |
-          TRIMMED="$(printf '%s' "$NPM_TAG_INPUT" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-          if [ "$TRIMMED" != "$NPM_TAG_INPUT" ]; then
-            echo "::error::npm_tag must not have leading or trailing whitespace"
-            exit 1
-          fi
+          bun -e '
+            const raw = process.env.NPM_TAG_INPUT ?? "";
+            if (raw.trim() !== raw) {
+              console.log("::error::npm_tag must not have leading or trailing whitespace");
+              process.exit(1);
+            }
+          '
 
   publish-npm:
     name: publish npm packages
