@@ -80,6 +80,15 @@ const STATUS_TERMINAL_GRACE_MS = 250;
 /** `turn.result` recheck cadence for a running turn whose end no relay will announce: 250 ms doubling to 5 s. */
 const STATUS_RECHECK_MIN_MS = 250;
 const STATUS_RECHECK_MAX_MS = 5_000;
+/**
+ * A decidable-terminal turn whose text neither the owned relay nor the original
+ * result produced must not hold forever: keep probing briefly for a late
+ * receipt, then post one notice so the conversation is never left silent.
+ */
+const TERMINAL_TEXT_RECOVERY_WINDOW_MS = 60_000;
+const TERMINAL_TEXT_RECOVERY_MAX_ATTEMPTS = 12;
+const TERMINAL_TEXT_UNRECOVERABLE_NOTICE =
+	"[turn completed] The session finished but its result text was not recoverable. Send the request again if you need the answer.";
 const HOST_TERMINATION_RECHECK_MS = 1_000;
 /**
  * A transcript row is judged against the turn's dispatch floor with this much
@@ -270,6 +279,14 @@ function relayUnavailableTrackerKey(opRef: string): string {
 	return `relay_unavailable:${opRef}`;
 }
 
+/**
+ * First miss of a terminal operation's result text. Durable so the bounded
+ * recovery window still expires after a gateway restart instead of restarting.
+ */
+function terminalTextMissKey(opRef: string): string {
+	return `terminal_text_miss:${opRef}`;
+}
+
 const ESCALATION_NOTICE_PREFIX = "escalation-notice:";
 
 /**
@@ -412,6 +429,7 @@ function completeInboundTurn(
 				deterministicBindHoldDeliveryId(trigger.origin_key, trigger.message_id, UNRESOLVED_HOLD_ESCALATED),
 			),
 		);
+	if (changed === 1) store.core.metaDelete(terminalTextMissKey(opRef));
 	return changed;
 }
 
@@ -1485,6 +1503,10 @@ type BoundTurn = PersonaTurnIdentity & {
 	statusRechecks: number;
 	/** A live tail stalled; keep reconciling status until it emits another frame or reaches terminal state. */
 	statusRecheckAfterStall: boolean;
+	/** Terminal status is decidable, but neither the tail nor the original result produced text. */
+	terminalTextMisses: number;
+	/** First terminal-text miss for this turn; bounds how long a late receipt is awaited. */
+	terminalTextFirstMissAtMs?: number;
 	/** First live-tail stall timestamp; only a nonterminal operation can expire against this deadline. */
 	stallStartedAtMs?: number;
 	/** Tail activity version captured when the current stall began. */
@@ -2458,6 +2480,7 @@ class OriginActor {
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
 			statusRecheckAfterStall: false,
+			terminalTextMisses: 0,
 			stallStartedAtMs: undefined,
 			providerRetryAttempt,
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
@@ -2913,6 +2936,7 @@ class OriginActor {
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
 			statusRecheckAfterStall: false,
+			terminalTextMisses: 0,
 			stallStartedAtMs: undefined,
 			providerRetryAttempt,
 			agentErrorRetryScheduled: false,
@@ -4656,12 +4680,38 @@ class OriginActor {
 					}
 				}
 				if (text === undefined) {
-					this.#logRecoveryHoldOnce(
-						bound.turn,
-						notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal",
+					const now = this.#manager.now();
+					// The window is a limit on how long the turn may hold, not on how long
+					// this process may live: recover the first miss from durable state so a
+					// restart cannot restart the budget and leave the turn pending forever.
+					const firstMissKey = terminalTextMissKey(bound.turn.opRef);
+					const recordedFirstMiss = Number.parseInt(this.#manager.database.core.metaGet(firstMissKey) ?? "", 10);
+					const durableFirstMiss =
+						Number.isSafeInteger(recordedFirstMiss) && recordedFirstMiss > 0 ? recordedFirstMiss : undefined;
+					bound.terminalTextFirstMissAtMs ??= durableFirstMiss ?? now;
+					if (durableFirstMiss === undefined)
+						this.#manager.database.core.metaSet(firstMissKey, bound.terminalTextFirstMissAtMs.toString());
+					bound.terminalTextMisses += 1;
+					const exhausted =
+						bound.terminalTextMisses >= TERMINAL_TEXT_RECOVERY_MAX_ATTEMPTS ||
+						now - bound.terminalTextFirstMissAtMs >= TERMINAL_TEXT_RECOVERY_WINDOW_MS;
+					if (!exhausted) {
+						this.#logRecoveryHoldOnce(
+							bound.turn,
+							notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal",
+						);
+						// A missing receipt can arrive late; keep probing on the bounded cadence
+						// instead of waiting for the 60 s recovery sweep.
+						this.#scheduleStatusRecheck(bound);
+						return;
+					}
+					this.#manager.log(
+						`terminal_text_unrecoverable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} misses=${bound.terminalTextMisses} heldMs=${now - bound.terminalTextFirstMissAtMs}`,
+						"warn",
 					);
-					if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
-					return;
+					// The operation completed, so silence is not a valid answer: settle its
+					// trigger with one notice instead of holding the turn forever.
+					text = TERMINAL_TEXT_UNRECOVERABLE_NOTICE;
 				}
 				await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
 			} else if (!bound.retired || bound.answerWanted) {

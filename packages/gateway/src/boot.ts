@@ -157,9 +157,9 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 			await waitForBroker("preflight", () => client.preflight(), options.brokerWait);
 			const persona = new PersonaLoader(config.home);
 			await persona.ensureWorkspace();
-			// Generic product default: memory maintenance crons exist on every fresh
-			// deployment (seeded once; operator removals are never resurrected).
-			seedDefaultMonitors(new MonitorRegistry(database), database);
+			// Opt-out skips seeding before the runtime starts, without consuming seed
+			// flags or changing existing monitors. Unset preserves the seed-once default.
+			if (config.memory?.seedDefaultMonitors !== false) seedDefaultMonitors(new MonitorRegistry(database), database);
 			const ledger = new DeliveryService(database);
 			// Holds escalated by an older gateway have no retention link yet; link
 			// them before the first prune, or a confirmed notice near the cutoff is
