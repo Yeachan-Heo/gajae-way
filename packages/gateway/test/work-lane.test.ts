@@ -1933,6 +1933,19 @@ test("report text marks an unread output as pending instead of unavailable", () 
 		true,
 	);
 	expect(pending).toContain("final_response_pending opRef=gw-op");
+	expect(
+		reportText(
+			"a",
+			"attempt_ended",
+			"session_dead",
+			"gw-op",
+			{ disposition: "unavailable", reads: 0, nextReadAt: null, excerpt: null, proof: null, knownSilence: null },
+			undefined,
+			undefined,
+			true,
+			"completion_check_waiting",
+		),
+	).toContain("final_response_pending opRef=gw-op completion_check_waiting");
 	expect(pending).not.toContain("output_unavailable");
 });
 
@@ -9027,6 +9040,30 @@ test("completion check: a silent attempt still reports a gate status to its pare
 	expect((await settled(second, resteer.opRef)).decision).toBe("suppressed");
 	expect(laneReports(second)).toHaveLength(1);
 	expect(laneReports(second)[0]).toContain("completion_check_exhausted retries=1");
+});
+
+test("completion check: silent status admission and settlement roll back together", async () => {
+	const check = scriptedCompletionCheck([{ kind: "waiting" }]);
+	const f = await fixture(check.options);
+	const attempt = await started(f, "a", origin);
+	let failures = 0;
+	const enqueue = spyOn(f.db.outbox, "enqueue").mockImplementation(() => {
+		failures++;
+		throw new Error("injected status admission failure");
+	});
+	try {
+		f.port.complete(attempt.opRef, "[SILENT]");
+		await until(() => failures > 0);
+		expect(f.db.work.workAttemptGet(attempt.opRef)?.settledAt).toBeNull();
+		expect(f.job().attempts.at(-1)?.endedAt).toBeUndefined();
+		expect(laneReports(f)).toEqual([]);
+	} finally {
+		enqueue.mockRestore();
+	}
+	const runtime = await settled(f, attempt.opRef);
+	expect(runtime.decision).toBe("suppressed");
+	await until(() => laneReports(f).length === 1);
+	expect(laneReports(f)[0]).toContain("completion_check_waiting");
 });
 
 test("completion check: a lane in a PR-checks cycle keeps its retries, deadline and head across a re-steer", async () => {

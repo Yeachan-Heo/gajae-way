@@ -421,6 +421,7 @@ export class WorkLaneManager {
 		record: LaneJobRecord,
 		patch: WorkAttemptSettlement,
 		admission?: WorkAttemptAdmission,
+		onSettled?: (tx: WriteTx, result: WorkAttemptSettleResult) => void,
 	): WorkAttemptSettleResult | undefined {
 		return this.#db.transaction((tx) => {
 			const current = this.#db.work.workAttemptGet(opRef);
@@ -461,6 +462,7 @@ export class WorkLaneManager {
 					payloadJson: JSON.stringify(payload),
 				});
 			}
+			onSettled?.(tx, settled);
 			return settled;
 		});
 	}
@@ -2295,12 +2297,18 @@ export class WorkLaneManager {
 					};
 				}
 			}
+			const statusParent = status && decision === "suppressed" ? runtime.parent : null;
 			const settled = this.#settleAttempt(
 				runtime.opRef,
 				runtime.version,
 				job,
 				{ decision, settledAt: at, ...(output !== runtime.output ? { output } : {}) },
 				admission,
+				statusParent
+					? (tx) => {
+							statusEffects = this.#admitCompletionStatus(name, job, statusParent, text, at, tx);
+						}
+					: undefined,
 			);
 
 			if (!settled) return undefined;
@@ -2309,10 +2317,10 @@ export class WorkLaneManager {
 				// The settled attempt needs no relay; release it before the next attempt attaches its own.
 				await this.#releaseSettledObserver(observer);
 				await this.#startCompletionResteer(name, job, runtime, resteer.text);
-			} else if (status && settled.runtime.decision === "suppressed" && runtime.parent !== null) {
-				// Silence suppresses the worker's own message, not a gate status it never authored:
-				// the attempt keeps its `suppressed` decision and the status becomes a durable report.
-				statusEffects = this.#admitCompletionStatus(name, job, runtime.parent, text, at, runtime.opRef);
+			} else if (statusEffects) {
+				console.error(
+					`completion_check_status_reported name=${name} opRef=${runtime.opRef} parent=${statusParent?.kind}`,
+				);
 			}
 			return settled;
 		});
@@ -2530,7 +2538,7 @@ export class WorkLaneManager {
 	/**
 	 * Reports a completion-check status for a silent attempt. The attempt's own
 	 * decision stays `suppressed` (its message was silent), so this admits a
-	 * lane-level report instead of an attempt admission and survives a restart.
+	 * lane-level report in the same transaction as settlement.
 	 */
 	#admitCompletionStatus(
 		name: string,
@@ -2538,12 +2546,10 @@ export class WorkLaneManager {
 		parent: WorkParent,
 		text: string,
 		at: string,
-		opRef: string,
+		tx: WriteTx,
 	): ChecksReportEffects {
 		const reportRef = newOpRef(`completion-status-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
-		const effects = this.#admitJobReport(name, job, parent, text, reportRef, at);
-		console.error(`completion_check_status_reported name=${name} opRef=${opRef} parent=${parent.kind}`);
-		return effects;
+		return this.#admitJobReport(name, job, parent, text, reportRef, at, tx);
 	}
 	/**
 	 * Reports a completion re-steer that never opened an attempt, so the lane is
@@ -2572,10 +2578,11 @@ export class WorkLaneManager {
 		text: string,
 		reportRef: string,
 		at: string,
+		tx?: WriteTx,
 	): ChecksReportEffects {
 		const reportId = workAttemptReportId(this.#db.instanceId, job.jobId, reportRef);
 		const deliveryId = workAttemptDeliveryId(this.#db.instanceId, job.jobId, reportRef);
-		return this.#db.transaction((tx): ChecksReportEffects => {
+		const admit = (tx: WriteTx): ChecksReportEffects => {
 			this.#putJob(name, job, tx);
 			if (parent?.kind === "persona") {
 				const refused =
@@ -2616,7 +2623,8 @@ export class WorkLaneManager {
 					return { fallback: this.#enqueueFallback(tx, reportRef, parent.root.origin, text, deliveryId) };
 			}
 			return {};
-		});
+		};
+		return tx ? admit(tx) : this.#db.transaction(admit);
 	}
 	#enqueueFallback(
 		tx: WriteTx,
