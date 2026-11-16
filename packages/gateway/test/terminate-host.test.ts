@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,7 +14,14 @@ import { noRelay } from "./session-port.fake";
  * to be a `sdk session-host-internal`. A real child process stands in for the
  * host so the SIGTERM path is exercised for real, not mocked.
  */
-async function harness(pidFor: (sessionId: string) => number | undefined, live = true, inspectErrorCode?: string) {
+async function harness(
+	pidFor: (sessionId: string) => number | undefined,
+	live = true,
+	inspectErrorCode?: string,
+	omitPid = false,
+	sessionFields: Record<string, unknown> = {},
+	inspectExitCode = 0,
+) {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-terminate-"));
 	const database = await Store.open(join(home, "gateway.db"));
 	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
@@ -31,15 +38,15 @@ async function harness(pidFor: (sessionId: string) => number | undefined, live =
 					stdout: JSON.stringify({ ok: false, error: { code: inspectErrorCode, message: "inspect unavailable" } }),
 					stderr: "",
 				};
-			if (pid === undefined)
+			if (pid === undefined && !omitPid)
 				return {
 					exitCode: 1,
 					stdout: JSON.stringify({ ok: false, error: { code: "session_unavailable", message: "gone" } }),
 					stderr: "",
 				};
 			return {
-				exitCode: 0,
-				stdout: JSON.stringify({ ok: true, result: { session: { sessionId, live, pid } } }),
+				exitCode: inspectExitCode,
+				stdout: JSON.stringify({ ok: true, result: { session: { sessionId, live, pid, ...sessionFields } } }),
 				stderr: "",
 			};
 		}
@@ -226,6 +233,211 @@ test("a transient inspect envelope refuses termination without killing the live 
 		expect(child.killed).toBe(false);
 	} finally {
 		child.kill();
+		await h.close();
+	}
+});
+
+test("hostExited rejects live:false for a live pid and never signals even a non-host process", async () => {
+	for (const tag of ["sdk session-host-internal", "some-other-program"]) {
+		const child = fakeHost(tag);
+		const h = await harness(() => child.pid, false);
+		try {
+			expect(await h.port.hostExited({ sessionId: "s-1", repo: h.repo })).toBe(false);
+			expect(child.killed).toBe(false);
+			expect(await Promise.race([child.exited, Bun.sleep(50).then(() => "alive")])).toBe("alive");
+		} finally {
+			child.kill();
+			await child.exited;
+			await h.close();
+		}
+	}
+});
+
+test("hostExited proves an exited pid gone independently of broker liveness", async () => {
+	const child = fakeHost("sdk session-host-internal");
+	const pid = child.pid;
+	child.kill();
+	await child.exited;
+	for (const live of [true, false]) {
+		const h = await harness(() => pid, live);
+		try {
+			expect(await h.port.hostExited({ sessionId: "s-1", repo: h.repo })).toBe(true);
+		} finally {
+			await h.close();
+		}
+	}
+});
+
+/** A real zombie: a parent that never reaps its exited child. Resolves with the zombie's pid. */
+async function zombieHost(): Promise<{ readonly pid: number; readonly parent: ReturnType<typeof Bun.spawn> }> {
+	const parent = Bun.spawn(["perl", "-e", '$|=1; my $p = fork(); if ($p == 0) { exit 0 } print "$p\\n"; sleep 30'], {
+		stdout: "pipe",
+		stderr: "ignore",
+	});
+	const reader = (parent.stdout as ReadableStream<Uint8Array>).getReader();
+	const { value } = await reader.read();
+	reader.releaseLock();
+	const pid = Number(new TextDecoder().decode(value).trim());
+	// Wait until ps reports it as a zombie.
+	for (let i = 0; i < 100; i++) {
+		const ps = Bun.spawnSync(["ps", "-o", "stat=", "-p", String(pid)]);
+		if (ps.stdout.toString().trim().startsWith("Z")) break;
+		await Bun.sleep(10);
+	}
+	return { pid, parent };
+}
+
+test("a zombie host counts as exited: hostExited is true and terminateHost sends no signal", async () => {
+	const zombie = await zombieHost();
+	try {
+		expect(
+			Bun.spawnSync(["ps", "-o", "stat=", "-p", String(zombie.pid)])
+				.stdout.toString()
+				.trim(),
+		).toStartWith("Z");
+		for (const live of [true, false]) {
+			const h = await harness(() => zombie.pid, live);
+			try {
+				expect(await h.port.hostExited({ sessionId: "s-1", repo: h.repo })).toBe(true);
+				expect(await h.port.terminateHost({ sessionId: "s-1", repo: h.repo })).toEqual({ outcome: "already_gone" });
+			} finally {
+				await h.close();
+			}
+		}
+		// Its unreaped parent is still running and was never touched.
+		expect(await Promise.race([zombie.parent.exited, Bun.sleep(50).then(() => "alive")])).toBe("alive");
+	} finally {
+		zombie.parent.kill();
+		await zombie.parent.exited;
+	}
+});
+
+test("a zombie leader with live threads (Linux Zl) is not exit evidence; other zombie states are", async () => {
+	const pid = 4242;
+	const h = await harness(() => pid, false);
+	let stat = "Zl";
+	const spawn = spyOn(Bun, "spawn").mockImplementation((() => ({
+		stdout: new Response(`${pid}     1  ${pid} ${stat}    Fri Nov 13 11:40:54 2026     [host] <defunct>\n`).body,
+		stderr: new Response("").body,
+		exited: Promise.resolve(0),
+	})) as unknown as typeof Bun.spawn);
+	try {
+		for (const [state, exited] of [
+			["Zl", false],
+			["Zsl", false],
+			["Zl+", false],
+			["Z", true],
+			["Z+", true],
+			["Zs", true],
+			["ZN", true],
+		] as const) {
+			stat = state;
+			expect([state, await h.port.hostExited({ sessionId: "s-1", repo: h.repo })]).toEqual([state, exited]);
+		}
+		stat = "Zl";
+		expect(await h.port.terminateHost({ sessionId: "s-1", repo: h.repo })).toEqual({
+			outcome: "refused",
+			reason: "process_inspection_failed:ps_zombie_threads",
+		});
+	} finally {
+		spawn.mockRestore();
+		await h.close();
+	}
+});
+
+test("hostExited never treats an ambiguous or mismatched row's exited pid as the session's exit", async () => {
+	// Several state roots can claim one session; the broker projects one representative row
+	// (`ambiguous: true`). Its dead pid says nothing about the other, possibly live, host.
+	const dead = fakeHost("sdk session-host-internal");
+	const pid = dead.pid;
+	dead.kill();
+	await dead.exited;
+	const other = fakeHost("sdk session-host-internal");
+	try {
+		for (const fields of [{ ambiguous: true }, { sessionId: "s-2" }, { sessionId: undefined }]) {
+			const h = await harness(() => pid, false, undefined, false, fields);
+			try {
+				expect(await h.port.hostExited({ sessionId: "s-1", repo: h.repo })).toBe(false);
+			} finally {
+				await h.close();
+			}
+		}
+		expect(other.killed).toBe(false);
+		const exclusive = await harness(() => pid, false, undefined, false, { ambiguous: false });
+		try {
+			expect(await exclusive.port.hostExited({ sessionId: "s-1", repo: exclusive.repo })).toBe(true);
+		} finally {
+			await exclusive.close();
+		}
+	} finally {
+		other.kill();
+		await other.exited;
+	}
+});
+
+test("hostExited needs a valid host pid in a successful inspect envelope", async () => {
+	// A nonzero inspect exit is a failed invocation even when stdout carries an ok-shaped row.
+	const dead = fakeHost("sdk session-host-internal");
+	const deadPid = dead.pid;
+	dead.kill();
+	await dead.exited;
+	const failed = await harness(() => deadPid, false, undefined, false, {}, 1);
+	try {
+		expect(await failed.port.hostExited({ sessionId: "s-1", repo: failed.repo })).toBe(false);
+	} finally {
+		await failed.close();
+	}
+	for (const pid of [undefined, 0, 1, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+		const h = await harness(() => pid, false, undefined, true);
+		try {
+			expect(await h.port.hostExited({ sessionId: "s-1", repo: h.repo })).toBe(false);
+		} finally {
+			await h.close();
+		}
+	}
+});
+
+test("hostExited rejects session absence and transient inspect envelopes without signaling", async () => {
+	const child = fakeHost("sdk session-host-internal");
+	try {
+		for (const code of ["session_unavailable", "broker_unavailable"]) {
+			const h = await harness(() => child.pid, false, code);
+			try {
+				expect(await h.port.hostExited({ sessionId: "s-1", repo: h.repo })).toBe(false);
+				expect(child.killed).toBe(false);
+			} finally {
+				await h.close();
+			}
+		}
+		const gone = await harness(() => undefined);
+		try {
+			expect(await gone.port.hostExited({ sessionId: "s-1", repo: gone.repo })).toBe(false);
+		} finally {
+			await gone.close();
+		}
+	} finally {
+		child.kill();
+		await child.exited;
+	}
+});
+
+test("hostExited returns false when the OS process probe is unreadable", async () => {
+	const h = await harness(() => process.pid, false);
+	const spawn = spyOn(Bun, "spawn").mockImplementation(() => {
+		throw new Error("ps unavailable");
+	});
+	try {
+		expect(await h.port.hostExited({ sessionId: "s-1", repo: h.repo })).toBe(false);
+		expect(spawn).toHaveBeenCalledTimes(1);
+		expect(spawn.mock.calls[0]?.[0]).toEqual([
+			"ps",
+			"-o",
+			"pid=,ppid=,pgid=,stat=,lstart=,command=",
+			"-p",
+			String(process.pid),
+		]);
+	} finally {
+		spawn.mockRestore();
 		await h.close();
 	}
 });

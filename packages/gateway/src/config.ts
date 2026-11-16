@@ -198,6 +198,8 @@ export interface InterimSpeechConfig {
 }
 
 export interface MemoryConfig {
+	/** Seed built-in memory monitors at boot; unset defaults to true. Does not change existing monitors. */
+	readonly seedDefaultMonitors?: boolean;
 	/**
 	 * Byte size threshold for memory.debloat detector: files in memory/ larger than
 	 * this value (in bytes) are flagged as oversized and routed for restructuring.
@@ -471,9 +473,15 @@ function parseMemory(value: unknown): MemoryConfig {
 	const section = "memory";
 	const input = requireObject(value, section);
 	for (const key of Object.keys(input))
-		if (key !== "debloatByteThreshold") throw new ConfigError("config_invalid", `${section} contains an unknown field`);
+		if (key !== "debloatByteThreshold" && key !== "seedDefaultMonitors")
+			throw new ConfigError("config_invalid", `${section} contains an unknown field`);
+	if (input.seedDefaultMonitors !== undefined && typeof input.seedDefaultMonitors !== "boolean")
+		throw new ConfigError("config_invalid", `${section}.seedDefaultMonitors must be a boolean`);
 	const debloatByteThreshold = parsePositiveInteger(input.debloatByteThreshold, `${section}.debloatByteThreshold`);
-	return debloatByteThreshold === undefined ? {} : { debloatByteThreshold };
+	return {
+		...(debloatByteThreshold === undefined ? {} : { debloatByteThreshold }),
+		...(input.seedDefaultMonitors === undefined ? {} : { seedDefaultMonitors: input.seedDefaultMonitors }),
+	};
 }
 
 function parseStallTimeout(value: unknown): number {
