@@ -69,15 +69,11 @@ const SESSIONS_RECOVERY_BOUND_MIN_MS = 60_000;
 const SESSIONS_RECOVERY_BOUND_MAX_MS = 24 * 60 * 60_000;
 /**
  * An escalated retired hold (#686) whose host stays provably not live this long
- * is closed as abandoned. The user was told at escalation; only the per-minute
- * recovery sweep still read it, and that cost grew without bound (#715).
+ * is parked: kept, its late answer still wanted, but probed hourly instead of
+ * every sweep. The user was told at escalation; only the per-minute recovery
+ * sweep still read it, and that cost grew without bound (#715).
  */
 export const DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS = 24 * 60 * 60_000;
-/**
- * What happens to an escalated retired hold once its host has been not live for
- * `retiredHoldAbandonMs`: `park` keeps the hold and its late answer but probes
- * it hourly instead of every sweep; `close` completes it as a failed turn.
- */
 const SESSIONS_RETIRED_HOLD_ABANDON_MIN_MS = 60 * 60_000;
 const SESSIONS_RETIRED_HOLD_ABANDON_MAX_MS = 30 * 24 * 60 * 60_000;
 

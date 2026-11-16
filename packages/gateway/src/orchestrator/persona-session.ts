@@ -226,6 +226,13 @@ export type EscalationNoticeReceipt = "confirmed" | "unconfirmed" | "missing";
  * told outlives a gateway that stayed down past the confirmed-row retention.
  * Deleted when the hold's turn completes.
  */
+/** The retention link of a trigger's escalation notice; see escalationNoticeDeliveryKey. */
+function escalationNoticeLinkKey(trigger: InboundMessageRow): string {
+	return escalationNoticeDeliveryKey(
+		deterministicBindHoldDeliveryId(trigger.origin_key, trigger.message_id, UNRESOLVED_HOLD_ESCALATED),
+	);
+}
+
 function escalationNoticeDeliveryKey(deliveryId: string): string {
 	return `escalation-notice-delivery:${deliveryId}`;
 }
@@ -253,11 +260,12 @@ export function linkOpenEscalatedHoldNotices(store: Store): number {
 	const prefix = escalatedHoldKey("");
 	let linked = 0;
 	for (const key of store.core.metaKeysInRange(prefix, `${prefix}\uffff`)) {
-		const trigger = store.inbox.turnRow(key.slice(prefix.length));
+		const opRef = key.slice(prefix.length);
+		const trigger = store.inbox.turnRow(opRef);
 		if (!trigger || !openHoldTrigger(trigger)) continue;
-		const linkKey = escalationNoticeDeliveryKey(
-			deterministicBindHoldDeliveryId(trigger.origin_key, trigger.message_id, UNRESOLVED_HOLD_ESCALATED),
-		);
+		// Once the confirmation is durable the row is ordinary history again.
+		if (store.core.metaGet(escalationNoticeConfirmedKey(opRef)) !== undefined) continue;
+		const linkKey = escalationNoticeLinkKey(trigger);
 		if (store.core.metaGet(linkKey) !== undefined) continue;
 		store.core.metaSet(linkKey, trigger.turn_op_ref ?? "");
 		linked++;
@@ -335,6 +343,14 @@ const ESCALATION_NOTICE_PREFIX = "escalation-notice:";
  * Durable intent to post an escalation notice, deleted once the delivery ledger
  * owns it. Inbox retention keeps the trigger row while this key exists.
  */
+/**
+ * Intent value of a notice posted again after its ledger row was pruned. Unlike
+ * the original (#686), which is still owed after the turn settles because the
+ * user was never told, a reissue repeats what was already said, so it is dropped
+ * once the hold is settled.
+ */
+const ESCALATION_NOTICE_REISSUE = "reissue";
+
 function escalationNoticeKey(originKey: string, opRef: string): string {
 	return `${ESCALATION_NOTICE_PREFIX}${originKey}#${opRef}`;
 }
@@ -467,12 +483,12 @@ function completeInboundTurn(
 	if (changed === 1) store.core.metaDelete(retiredHoldParkedKey(opRef));
 	if (changed === 1) store.core.metaDelete(escalationNoticeConfirmedKey(opRef));
 	if (changed === 1) store.core.metaDelete(escalationNoticeReissuedKey(opRef));
-	if (changed === 1 && trigger)
-		store.core.metaDelete(
-			escalationNoticeDeliveryKey(
-				deterministicBindHoldDeliveryId(trigger.origin_key, trigger.message_id, UNRESOLVED_HOLD_ESCALATED),
-			),
-		);
+	if (changed === 1 && trigger) {
+		store.core.metaDelete(escalationNoticeLinkKey(trigger));
+		// A reissue left unposted by a failed retry must not repeat after the answer.
+		const intentKey = escalationNoticeKey(trigger.origin_key, opRef);
+		if (store.core.metaGet(intentKey) === ESCALATION_NOTICE_REISSUE) store.core.metaDelete(intentKey);
+	}
 	if (changed === 1) store.core.metaDelete(terminalTextMissKey(opRef));
 	return changed;
 }
@@ -856,7 +872,7 @@ export interface PersonaSessionManagerOptions {
 	readonly busyStallMs?: number;
 	/** Unknown-state turn on a dead host holds its origin at most this long; default DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS (#686). */
 	readonly unresolvedHoldMs?: number;
-	/** Escalated retired hold on a host not live this long is closed; default DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS. */
+	/** Escalated retired hold on a host not live this long is parked; default DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS. */
 	readonly retiredHoldAbandonMs?: number;
 	/**
 	 * Whether the origin confirmed the escalation notice posted for this trigger.
@@ -2271,6 +2287,17 @@ class OriginActor {
 			if (!trigger) {
 				// Kept as evidence: without its trigger the notice has no origin to post to.
 				this.#manager.log(`escalation_notice_unresolvable origin=${this.originKey} opRef=${opRef}`, "error");
+				continue;
+			}
+			if (!openHoldTrigger(trigger) && database.core.metaGet(key) === ESCALATION_NOTICE_REISSUE) {
+				// The hold settled while its reissue was still unposted: the user was
+				// told once at escalation and now has the outcome; repeating the
+				// notice would be noise. (An unposted original is still owed, #686.)
+				database.core.metaDelete(key);
+				this.#manager.log(
+					`escalation_notice_discarded origin=${this.originKey} opRef=${opRef} reason=trigger_settled`,
+					"warn",
+				);
 				continue;
 			}
 			this.#linkEscalationNotice(trigger);
@@ -5254,10 +5281,12 @@ class OriginActor {
 		if (database.core.metaGet(escalationNoticeKey(this.originKey, opRef)) !== undefined) return false;
 		const trigger = database.inbox.turnRow(opRef);
 		if (!trigger) return false;
-		// A hold escalated before the link existed gets it now, so retention keeps its proof from here on.
-		this.#linkEscalationNotice(trigger);
 		const confirmedKey = escalationNoticeConfirmedKey(opRef);
+		const linkKey = escalationNoticeLinkKey(trigger);
 		if (database.core.metaGet(confirmedKey) === undefined) {
+			// Until the confirmation is durable, the ledger row is the only proof the
+			// user was told, so a hold escalated before the link existed gets it now.
+			this.#linkEscalationNotice(trigger);
 			const receipt = this.#manager.escalationNoticeReceipt(this.originKey, trigger);
 			if (receipt === "missing") {
 				// No row at all: the notice of a hold escalated before the retention
@@ -5271,7 +5300,14 @@ class OriginActor {
 			// Queued is not delivered: an adapter offline past the outbox TTL expires
 			// the notice, and closing then would leave the user told nothing.
 			if (receipt !== "confirmed") return false;
-			database.core.metaSet(confirmedKey, "1");
+			// The durable marker replaces the row as proof: release the retention
+			// pin with it, so a hold parked for months keeps no payload around.
+			database.transaction(() => {
+				database.core.metaSet(confirmedKey, "1");
+				database.core.metaDelete(linkKey);
+			});
+		} else if (database.core.metaGet(linkKey) !== undefined) {
+			database.core.metaDelete(linkKey);
 		}
 		const now = this.#manager.now();
 		const deadSinceKey = retiredHoldDeadSinceKey(opRef);
@@ -5343,9 +5379,7 @@ class OriginActor {
 	/** Keeps the notice row of an open hold past retention; a settled trigger's retried notice is not linked (its proof is no longer needed). */
 	#linkEscalationNotice(trigger: InboundMessageRow): void {
 		if (!openHoldTrigger(trigger)) return;
-		const key = escalationNoticeDeliveryKey(
-			deterministicBindHoldDeliveryId(this.originKey, trigger.message_id, UNRESOLVED_HOLD_ESCALATED),
-		);
+		const key = escalationNoticeLinkKey(trigger);
 		const database = this.#manager.database;
 		if (database.core.metaGet(key) === undefined) database.core.metaSet(key, trigger.turn_op_ref ?? "");
 	}
@@ -5369,7 +5403,7 @@ class OriginActor {
 		const scheduled = database.transaction(() => {
 			if (database.core.metaGet(reissuedKey) !== undefined) return false;
 			database.core.metaSet(reissuedKey, new Date(this.#manager.now()).toISOString());
-			database.core.metaSet(escalationNoticeKey(this.originKey, opRef), "1");
+			database.core.metaSet(escalationNoticeKey(this.originKey, opRef), ESCALATION_NOTICE_REISSUE);
 			return true;
 		});
 		if (!scheduled) return;

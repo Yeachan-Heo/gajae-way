@@ -533,17 +533,22 @@ test("boot links the confirmed notice of every open legacy escalated hold before
 		const openId = hold("legacy-open", "m-open", "gw-p-open");
 		const settledId = hold("legacy-settled", "m-settled", "gw-p-settled");
 		db.transaction((tx) => db.inbox.turnComplete(tx, "gw-p-settled", "turn_failed"));
+		// A third, still open, whose confirmation the gateway already stored: the row is plain history.
+		const confirmedId = hold("legacy-confirmed", "m-confirmed", "gw-p-confirmed");
+		db.core.metaSet("escalation-notice-confirmed:gw-p-confirmed", "1");
 		expect(db.core.metaKeysInRange("escalation-notice-delivery:", "escalation-notice-delivery:\uffff")).toHaveLength(0);
 
 		expect(linkOpenEscalatedHoldNotices(db)).toBe(1);
 		expect(db.core.metaGet(`escalation-notice-delivery:${openId}`)).toBe("gw-p-open");
 		expect(db.core.metaGet(`escalation-notice-delivery:${settledId}`)).toBeUndefined();
+		expect(db.core.metaGet(`escalation-notice-delivery:${confirmedId}`)).toBeUndefined();
 		// Idempotent across restarts.
 		expect(linkOpenEscalatedHoldNotices(db)).toBe(0);
 
 		// The boot prune that follows (here, at a boot past the retention cutoff) keeps the open hold's proof and drops the settled one's.
 		db.transaction((tx) => db.outbox.prune(tx, 7 * 86_400_000, Date.now() + 30 * 86_400_000));
 		expect(db.outbox.get(openId)?.state).toBe("confirmed");
+		expect(db.outbox.get(confirmedId)).toBeUndefined();
 		expect(db.outbox.get(settledId)).toBeUndefined();
 		const open = origin("legacy-open");
 		expect(

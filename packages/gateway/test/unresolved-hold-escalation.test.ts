@@ -1027,9 +1027,11 @@ test("an escalated hold whose host stays not live past retiredHoldAbandonMs is p
 		await f.manager.recover();
 		await until(() => f.port.sends.length === 1);
 		expect(f.notices).toHaveLength(1);
-		// The notice's delivery row is linked to the open hold, so outbox retention keeps its proof.
+		// The notice's delivery row was linked to the open hold until the first sweep read the ledger's
+		// confirmation and stored it durably; from then on the row is ordinary history.
 		const links = () => f.db.core.metaKeysInRange("escalation-notice-delivery:", "escalation-notice-delivery:\uffff");
-		expect(links()).toHaveLength(1);
+		expect(f.db.core.metaGet(`escalation-notice-confirmed:${f.heldOpRef}`)).toBe("1");
+		expect(links()).toHaveLength(0);
 		let statusReads = 0;
 		const status = f.port.status.bind(f.port);
 		f.port.status = async (input) => {
@@ -1057,12 +1059,13 @@ test("an escalated hold whose host stays not live past retiredHoldAbandonMs is p
 				await clock.advance(MINUTE);
 				await restarted.reconcile(f.originKey);
 			}
-			// Parked, never closed: the turn, its escalation marker, its window mark and its notice link all stay.
+			// Parked, never closed: the turn, its escalation marker, its window mark and its confirmation all stay.
 			expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
 			expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBe("1");
 			expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeDefined();
 			expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeDefined();
-			expect(links()).toHaveLength(1);
+			expect(f.db.core.metaGet(`escalation-notice-confirmed:${f.heldOpRef}`)).toBe("1");
+			expect(links()).toHaveLength(0);
 			const parked = f.logs.filter((line) => line.startsWith("retired_hold_parked ") && line.includes(f.heldOpRef));
 			expect(parked).toHaveLength(1);
 			expect(parked[0]).toContain("reason=host_not_live");
@@ -1467,6 +1470,76 @@ test("a notice retried after its hold settled is still posted but never relinks 
 		expect(f.notices[0]?.reason).toBe(UNRESOLVED_HOLD_ESCALATED);
 		expect(f.db.core.metaGet(intentKey)).toBeUndefined();
 		expect(links()).toHaveLength(0);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+/** A hold told once at escalation whose ledger row is gone, with its reissue left unposted by an offline adapter. */
+async function unpostedReissue(name: string) {
+	const clock = new VirtualClock();
+	let receipt: EscalationNoticeReceipt = "unconfirmed";
+	const f = await heldOrigin(name, {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: true,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+		noticeReceipt: () => receipt,
+	});
+	await f.manager.recover();
+	await until(() => f.port.sends.length === 1);
+	expect(f.notices).toHaveLength(1);
+	const status = f.port.status.bind(f.port);
+	staleStatus(f);
+	// The row is pruned later, while the adapter is offline: the reissue is scheduled but not posted.
+	receipt = "missing";
+	f.failNotices(1);
+	await sweepMinutes(clock, f.manager, f.originKey, 2);
+	const intentKey = `escalation-notice:${f.originKey}#${f.heldOpRef}`;
+	expect(f.db.core.metaGet(intentKey)).toBe("reissue");
+	expect(f.db.core.metaGet(`escalation-notice-reissued:${f.heldOpRef}`)).toBeDefined();
+	expect(f.notices).toHaveLength(1);
+	f.port.status = status;
+	return { ...f, clock, intentKey };
+}
+
+test("a reissue left unposted by a failed retry is dropped when its hold completes with the late answer", async () => {
+	const f = await unpostedReissue("reissue-then-answer");
+	try {
+		f.port.setSessionState(f.binding.sessionId, { live: true });
+		f.port.seedAcceptedSend({ sessionId: f.binding.sessionId, repo: "", text: "", opRef: f.heldOpRef });
+		f.port.complete(f.heldOpRef, "late answer");
+		await f.manager.reconcile(f.originKey);
+		await until(() => f.db.inbox.turnRow(f.heldOpRef)?.turn_state === "done");
+		expect(f.db.core.metaGet(f.intentKey)).toBeUndefined();
+		await f.manager.stop();
+		// A restart retries pending notices first: there is nothing left to repeat after the answer.
+		const restarted = f.startManager();
+		try {
+			await restarted.recover();
+			expect(f.notices).toHaveLength(1);
+		} finally {
+			await restarted.stop();
+		}
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a reissue whose hold settled before its retry is discarded, not posted after the answer", async () => {
+	const f = await unpostedReissue("reissue-then-settled");
+	try {
+		// The raw row update, as a crash between the completion and its clean-up would leave it.
+		f.db.transaction((tx) => f.db.inbox.turnComplete(tx, f.heldOpRef, "turn_failed"));
+		await f.manager.recover();
+		expect(f.notices).toHaveLength(1);
+		expect(f.db.core.metaGet(f.intentKey)).toBeUndefined();
+		expect(
+			f.logs.filter((line) => line.startsWith("escalation_notice_discarded ") && line.includes(f.heldOpRef)),
+		).toHaveLength(1);
+		await f.manager.recover();
+		expect(f.notices).toHaveLength(1);
 	} finally {
 		await f.manager.stop();
 	}
