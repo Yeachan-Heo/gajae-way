@@ -5224,23 +5224,26 @@ class OriginActor {
 	}
 
 	/**
-	 * Closes an escalated retired hold (#686) whose host has stayed provably not
+	 * Parks an escalated retired hold (#686) whose host has stayed provably not
 	 * live for `retiredHoldAbandonMs` while its operation state stayed unknown or
 	 * unreadable. #718 keeps such a hold open so a late answer can still land,
-	 * but a host that is gone cannot produce one: the hold only adds per-minute
-	 * status and liveness CLI spawns, and on a long-lived gateway those piled up
-	 * until the broker stopped answering live turns.
+	 * and parking keeps that: the hold, its tail and its answer path stay, only
+	 * the per-minute status spawn becomes hourly. Those spawns are what piled up
+	 * on a long-lived gateway until the broker stopped answering live turns.
+	 * The hold is never closed on this evidence (an absent host PID is not proof
+	 * that every producer of the op exited); any readable status unparks it.
 	 *
-	 * Closing needs all of:
+	 * Parking needs all of:
 	 * - the origin confirmed the escalation notice (not merely queued it), so the
 	 *   user was told before the hold goes quiet; no second notice is sent;
-	 * - a positive `live=false` read when the window opened and when it closed;
+	 * - a positive `live=false` read when the window opened and when it ended;
 	 *   a disowned id or unanswerable liveness proves nothing and keeps waiting;
 	 * - the same host incarnation, and the same activity stamp, at both reads:
 	 *   a host that revived in between (and might have finished the op while
 	 *   status was unreadable) is a new incarnation, and opens a new window;
 	 * - no status other than unknown in between (cleared by the caller).
-	 * Liveness is read only when the window opens and when it closes.
+	 * Liveness is read only when the window opens and when it ends. Returns true
+	 * only when the trigger turned out to be already settled and was forgotten.
 	 */
 	async #parkDeadRetiredHold(bound: BoundTurn): Promise<boolean> {
 		if (!bound.retired || !bound.answerWanted) return false;

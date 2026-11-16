@@ -90,7 +90,7 @@ export interface SessionHostConfig {
 	readonly busyStallMs?: number;
 	/** Bound on an unresolved turn's hold of its origin when its host is gone; default DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS. */
 	readonly unresolvedHoldMs?: number;
-	/** An escalated retired hold whose host stays not live this long is parked or closed; default DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS. */
+	/** An escalated retired hold whose host stays not live this long is parked (probed hourly, never closed); default DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS. */
 	readonly retiredHoldAbandonMs?: number;
 }
 export type GjcServiceTier =
