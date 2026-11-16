@@ -462,7 +462,7 @@ test("preserves MEDIA uploads on ambiguous redelivery", async () => {
 				verb: "delivery.fail",
 				params: {
 					deliveryId: "delivery-1",
-					reason: "connection reset after dispatch",
+					reason: "send_unknown: connection reset after dispatch",
 					ambiguous: true,
 				},
 			},
@@ -593,8 +593,146 @@ test("prefixes ambiguous redelivery and records failed settlement", async () => 
 	};
 	await settleDiscordDelivery(gateway, failing, delivery("reply"));
 	expect(requests).toEqual([
-		{ verb: "delivery.fail", params: { deliveryId: "delivery-1", reason: "timeout after dispatch", ambiguous: true } },
+		{
+			verb: "delivery.fail",
+			params: { deliveryId: "delivery-1", reason: "send_unknown: timeout after dispatch", ambiguous: true },
+		},
 	]);
+});
+
+test("a reply that failed after a part landed is ambiguous and never confirmed", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const sent: string[] = [];
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async () => ({
+				send: async (text: string) => {
+					if (sent.length === 1) throw Object.assign(new Error("Missing Permissions"), { code: 50013 });
+					sent.push(text);
+				},
+			}),
+		},
+	};
+	const original = console.error;
+	console.error = () => {};
+	try {
+		await settleDiscordDelivery(mockGateway(requests), discord, delivery("x".repeat(2_001)));
+	} finally {
+		console.error = original;
+	}
+	// Chunk 1 is on Discord: a retry may duplicate it, so the failure is ambiguous even
+	// though Discord's refusal of chunk 2 is a definitive code.
+	expect(sent.map((text) => text.length)).toEqual([2_000]);
+	expect(requests).toEqual([
+		{
+			verb: "delivery.fail",
+			params: { deliveryId: "delivery-1", reason: "partial_send: Missing Permissions", ambiguous: true },
+		},
+	]);
+});
+
+test("a definitive refusal before anything landed stays definitive", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async () => ({
+				send: async () => Promise.reject(Object.assign(new Error("Missing Permissions"), { code: 50013 })),
+			}),
+		},
+	};
+	const original = console.error;
+	console.error = () => {};
+	try {
+		await settleDiscordDelivery(mockGateway(requests), discord, delivery("reply"));
+	} finally {
+		console.error = original;
+	}
+	expect(requests).toEqual([
+		{ verb: "delivery.fail", params: { deliveryId: "delivery-1", reason: "Missing Permissions", ambiguous: false } },
+	]);
+});
+
+test("a destination lookup that fails transiently is definitive: nothing was dispatched", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const discord: DiscordClientLike = {
+		channels: { fetch: async () => Promise.reject(new Error("fetch failed")) },
+	};
+	const original = console.error;
+	console.error = () => {};
+	try {
+		await settleDiscordDelivery(mockGateway(requests), discord, { ...delivery("reply"), duplicateWarning: true });
+	} finally {
+		console.error = original;
+	}
+	expect(requests).toEqual([
+		{
+			verb: "delivery.fail",
+			params: { deliveryId: "delivery-1", reason: "resolve_failed: fetch failed", ambiguous: false },
+		},
+	]);
+});
+
+test("a delivered reply whose confirm is lost is confirmed on retry, never failed", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const sent: string[] = [];
+	let confirmFailures = 2;
+	const gateway: GatewayClientLike = {
+		...mockGateway(requests),
+		request: async <T>(verb: string, params?: unknown) => {
+			requests.push({ verb, params });
+			if (verb === "delivery.confirm" && confirmFailures-- > 0) throw new Error("gateway connection closed");
+			return {} as T;
+		},
+	};
+	const discord: DiscordClientLike = {
+		channels: { fetch: async () => ({ send: async (text: string) => void sent.push(text) }) },
+	};
+	await settleDiscordDelivery(gateway, discord, delivery("reply"));
+	expect(sent).toEqual(["reply"]);
+	expect(requests.map((request) => request.verb)).toEqual(["delivery.confirm", "delivery.confirm", "delivery.confirm"]);
+});
+
+test("an unanswered confirm is left inflight for the labeled ACK-timeout replay, not failed", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const errors: string[] = [];
+	const gateway: GatewayClientLike = {
+		...mockGateway(requests),
+		request: async <T>(verb: string, params?: unknown): Promise<T> => {
+			requests.push({ verb, params });
+			throw new Error("gateway connection closed");
+		},
+	};
+	const discord: DiscordClientLike = {
+		channels: { fetch: async () => ({ send: async () => {} }) },
+	};
+	const original = console.error;
+	console.error = (line: string) => void errors.push(line);
+	try {
+		await settleDiscordDelivery(gateway, discord, delivery("reply"));
+	} finally {
+		console.error = original;
+	}
+	expect(requests.map((request) => request.verb)).toEqual(["delivery.confirm", "delivery.confirm", "delivery.confirm"]);
+	expect(errors).toEqual(["discord delivery_confirm_unconfirmed deliveryId=delivery-1: gateway connection closed"]);
+});
+
+test("an empty reply posts nothing and settles", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const sent: unknown[] = [];
+	const logs: string[] = [];
+	const discord: DiscordClientLike = {
+		channels: { fetch: async () => ({ send: async (payload: unknown) => void sent.push(payload) }) },
+	};
+	const original = console.log;
+	console.log = (line: string) => void logs.push(line);
+	try {
+		await settleDiscordDelivery(mockGateway(requests), discord, delivery(""));
+	} finally {
+		console.log = original;
+	}
+	expect(sent).toEqual([]);
+	expect(logs).toEqual(["discord_delivery_empty deliveryId=delivery-1 origin=channel-1"]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
 });
 
 const threadDelivery = (text: string): ChatMessagePayload => ({
@@ -630,9 +768,10 @@ test("an archived thread is unarchived before delivery and the reply lands in th
 	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
 });
 
-test("an archived thread that cannot be unarchived falls back to its parent channel and says why", async () => {
+test("an archived thread that cannot be unarchived fails the delivery and posts nothing to the parent", async () => {
 	const requests: Array<{ verb: string; params: unknown }> = [];
 	const sent: Array<[string, unknown]> = [];
+	const fetched: string[] = [];
 	const errors: string[] = [];
 	const thread = {
 		archived: true,
@@ -641,8 +780,10 @@ test("an archived thread that cannot be unarchived falls back to its parent chan
 	};
 	const discord: DiscordClientLike = {
 		channels: {
-			fetch: async (id: string) =>
-				id === "thread-1" ? thread : { send: async (payload: unknown) => void sent.push([id, payload]) },
+			fetch: async (id: string) => {
+				fetched.push(id);
+				return id === "thread-1" ? thread : { send: async (payload: unknown) => void sent.push([id, payload]) };
+			},
 		},
 	};
 	const original = console.error;
@@ -652,23 +793,83 @@ test("an archived thread that cannot be unarchived falls back to its parent chan
 	} finally {
 		console.error = original;
 	}
-	expect(sent).toEqual([
-		[
-			"channel-1",
-			"[thread <#thread-1> is archived and could not be unarchived (Missing Permissions); posting here instead]\nmonitor result",
-		],
+	expect(fetched).toEqual(["thread-1"]);
+	expect(sent).toEqual([]);
+	expect(requests).toEqual([
+		{
+			verb: "delivery.fail",
+			params: {
+				deliveryId: "delivery-1",
+				reason: "thread_archived_unrestorable: Missing Permissions",
+				ambiguous: false,
+			},
+		},
 	]);
 	expect(errors).toEqual([
-		"Discord delivery delivery-1: thread thread-1 is archived and could not be unarchived (Missing Permissions); delivered to parent channel channel-1 instead.",
+		"discord delivery failed origin=thread-1 stage=resolve ambiguous=false: thread_archived_unrestorable: Missing Permissions",
 	]);
-	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
 });
 
-test("a missing public thread falls back to its parent channel and drops the thread reply reference", async () => {
+test("an archived thread whose reopen fails transiently is a definitive lookup failure, not unrestorable", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const sent: Array<[string, unknown]> = [];
+	const thread = {
+		archived: true,
+		setArchived: async () => Promise.reject(new Error("fetch failed")),
+		send: async (payload: unknown) => void sent.push(["thread-1", payload]),
+	};
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async (id: string) =>
+				id === "thread-1" ? thread : { send: async (payload: unknown) => void sent.push([id, payload]) },
+		},
+	};
+	const original = console.error;
+	console.error = () => {};
+	try {
+		await settleDiscordDelivery(mockGateway(requests), discord, threadDelivery("monitor result"));
+	} finally {
+		console.error = original;
+	}
+	expect(sent).toEqual([]);
+	expect(requests).toEqual([
+		{
+			verb: "delivery.fail",
+			params: { deliveryId: "delivery-1", reason: "resolve_failed: fetch failed", ambiguous: false },
+		},
+	]);
+});
+
+test("a thread archived before the post landed (50083) is definitive, not an unknown send", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async () => ({
+				send: async () =>
+					Promise.reject(
+						Object.assign(new Error("Thread is archived"), {
+							code: 50083,
+						}),
+					),
+			}),
+		},
+	};
+	const original = console.error;
+	console.error = () => {};
+	try {
+		await settleDiscordDelivery(mockGateway(requests), discord, threadDelivery("reply"));
+	} finally {
+		console.error = original;
+	}
+	expect(requests).toEqual([
+		{ verb: "delivery.fail", params: { deliveryId: "delivery-1", reason: "Thread is archived", ambiguous: false } },
+	]);
+});
+
+test("a missing public thread fails the delivery as thread_missing and never reaches the parent channel", async () => {
 	const requests: Array<{ verb: string; params: unknown }> = [];
 	const fetched: string[] = [];
 	const sent: Array<[string, unknown]> = [];
-	const errors: string[] = [];
 	const discord: DiscordClientLike = {
 		channels: {
 			fetch: async (id: string) => {
@@ -679,7 +880,7 @@ test("a missing public thread falls back to its parent channel and drops the thr
 		},
 	};
 	const original = console.error;
-	console.error = (line: string) => void errors.push(line);
+	console.error = () => {};
 	try {
 		await settleDiscordDelivery(mockGateway(requests), discord, {
 			...threadDelivery("reply text"),
@@ -688,12 +889,14 @@ test("a missing public thread falls back to its parent channel and drops the thr
 	} finally {
 		console.error = original;
 	}
-	expect(fetched).toEqual(["thread-1", "channel-1"]);
-	expect(sent).toEqual([["channel-1", "[thread <#thread-1> does not exist; posting here instead]\nreply text"]]);
-	expect(errors).toEqual([
-		"Discord delivery delivery-1: thread thread-1 does not exist; delivered to parent channel channel-1 instead.",
+	expect(fetched).toEqual(["thread-1"]);
+	expect(sent).toEqual([]);
+	expect(requests).toEqual([
+		{
+			verb: "delivery.fail",
+			params: { deliveryId: "delivery-1", reason: "thread_missing: Unknown Channel", ambiguous: false },
+		},
 	]);
-	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
 });
 
 test("missing synthetic handoff and lane-report threads fall back to their parent channel", async () => {

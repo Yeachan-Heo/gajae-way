@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readlink, rm, writeFile } from "node:fs/promises";
 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -698,6 +698,95 @@ describe("service installation", () => {
 			await installServices(options);
 			expect(writes).toHaveLength(serviceSpecs().length);
 		} finally {
+			await rm(home, { recursive: true, force: true });
+		}
+	});
+
+	test("services repair installs the target release manifest's GJC pin before writing definitions, and fails when it cannot", async () => {
+		const home = await mkdtemp(join(tmpdir(), "gajaeway-services-pin-"));
+		const saved = { HOME: process.env.HOME, GAJAEWAY_HOME: process.env.GAJAEWAY_HOME };
+		const originalLog = console.log;
+		const originalError = console.error;
+		const previousExitCode = process.exitCode ?? 0;
+		try {
+			process.env.HOME = home;
+			process.env.GAJAEWAY_HOME = home;
+			console.log = () => {};
+			console.error = () => {};
+			await writeFile(join(home, "config.json"), JSON.stringify({ schemaVersion: 1 }));
+			const binDir = join(home, "bin");
+			await mkdir(binDir);
+			for (const spec of serviceSpecs()) await writeFile(join(binDir, spec.binary), "stub");
+			const releaseManifest = join(binDir, "package.json");
+			await writeFile(releaseManifest, JSON.stringify({ name: "gajaeway", gjc: { version: "0.19.3" } }));
+			const args = [
+				"services",
+				"repair",
+				"--bin-dir",
+				binDir,
+				"--platform",
+				"darwin",
+				"--launch-agents-dir",
+				join(home, "LaunchAgents"),
+			];
+			const writes: string[] = [];
+			const writeServiceFile = async (path: string): Promise<void> => {
+				writes.push(path);
+			};
+			const installs: string[] = [];
+			const gjcInstallRunner = async (command: readonly string[], cwd: string) => {
+				if (command[0] === "bun") {
+					const version = (
+						JSON.parse(await readFile(join(cwd, "package.json"), "utf8")) as {
+							dependencies: { "gajae-code": string };
+						}
+					).dependencies["gajae-code"];
+					installs.push(version);
+					await mkdir(join(cwd, "node_modules", ".bin"), { recursive: true });
+					await writeFile(join(cwd, "node_modules", ".bin", "gjc"), version);
+					return { exitCode: 0, stdout: "", stderr: "" };
+				}
+				return { exitCode: 0, stdout: `gjc/${await readFile(command[0] as string, "utf8")}`, stderr: "" };
+			};
+			await main(args, {
+				services: { loginPathRunner: async () => "/usr/bin", writeFile: writeServiceFile, gjcInstallRunner },
+			});
+			expect(installs).toEqual(["0.19.3"]);
+			expect(await readlink(join(home, "gjc", "current"))).toBe("0.19.3");
+			expect(writes).toHaveLength(serviceSpecs().length);
+
+			// A bin dir that cannot supply its own pin is refused before any definition is
+			// written: the CLI checkout's pin is not installable for a target it does not describe.
+			writes.length = 0;
+			installs.length = 0;
+			await rm(join(home, "gjc"), { recursive: true, force: true });
+			await rm(releaseManifest);
+			await main(args, {
+				services: { loginPathRunner: async () => "/usr/bin", writeFile: writeServiceFile, gjcInstallRunner },
+			});
+			expect(process.exitCode).toBe(1);
+			expect(installs).toEqual([]);
+			expect(writes).toHaveLength(0);
+
+			writes.length = 0;
+			process.exitCode = previousExitCode;
+			await writeFile(releaseManifest, JSON.stringify({ name: "gajaeway", gjc: { version: "0.19.3" } }));
+			await main(args, {
+				services: {
+					loginPathRunner: async () => "/usr/bin",
+					writeFile: writeServiceFile,
+					gjcInstallRunner: async () => ({ exitCode: 1, stdout: "", stderr: "registry unavailable" }),
+				},
+			});
+			expect(process.exitCode).toBe(1);
+			expect(writes).toHaveLength(0);
+		} finally {
+			console.log = originalLog;
+			console.error = originalError;
+			process.exitCode = previousExitCode;
+			for (const [key, value] of Object.entries(saved))
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
 			await rm(home, { recursive: true, force: true });
 		}
 	});
