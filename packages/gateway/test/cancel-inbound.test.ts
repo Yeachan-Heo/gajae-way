@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -88,16 +89,80 @@ test("parse rejects empty, duplicate, malformed and unknown params", () => {
 });
 
 test("cancels only the selected unbound pending rows while the drain is held", async () => {
-	const { client, database } = await startServer(true);
+	const { client } = await startServer(true);
 	const ids = ["a1", "a2", "a3"];
-	const result = await client.opsCancelInbound({ restartId: RESTART_ID, messageIds: ids });
-	expect(result.restartId).toBe(RESTART_ID);
-	expect(result.cancelledMessageIds).toEqual(ids);
+	const raw = new Database(join(home, "gateway.db"), { readonly: true });
+	try {
+		const rows = () =>
+			raw
+				.query("SELECT message_id, state, terminal_delivery_id FROM inbound_messages ORDER BY message_id")
+				.all() as Array<{
+				message_id: string;
+				state: string;
+				terminal_delivery_id: string | null;
+			}>;
+		const result = await client.opsCancelInbound({ restartId: RESTART_ID, messageIds: ids });
+		expect(result.restartId).toBe(RESTART_ID);
+		expect(result.cancelledMessageIds).toEqual(ids);
+		const cancelled = rows();
+		for (const row of cancelled) {
+			if (ids.includes(row.message_id)) {
+				expect(row.state).toBe("done");
+				if (row.terminal_delivery_id === null) throw new Error("cancelled row has no receipt");
+				expect(JSON.parse(row.terminal_delivery_id)).toMatchObject({
+					none: "operator_cancelled",
+					restartId: RESTART_ID,
+				});
+			} else {
+				expect(row).toMatchObject({ state: "pending", terminal_delivery_id: null });
+			}
+		}
+		const replay = await client.opsCancelInbound({ restartId: RESTART_ID, messageIds: ids });
+		expect(replay.cancelledMessageIds).toEqual(ids);
+		expect(rows()).toEqual(cancelled);
+	} finally {
+		raw.close();
+	}
+});
 
-	// A replay records the same durable cancellation and must not fail.
-	const replay = await client.opsCancelInbound({ restartId: RESTART_ID, messageIds: ids });
-	expect(replay.cancelledMessageIds).toEqual(ids);
-	void database;
+test("an invalid selection rolls back every requested cancellation", async () => {
+	const { client } = await startServer(true);
+	await expect(client.opsCancelInbound({ restartId: RESTART_ID, messageIds: ["a1", "missing"] })).rejects.toMatchObject(
+		{
+			code: "verb_failed",
+		},
+	);
+	const raw = new Database(join(home, "gateway.db"), { readonly: true });
+	try {
+		expect(
+			raw.query("SELECT state, terminal_delivery_id FROM inbound_messages WHERE message_id = ?").get("a1"),
+		).toEqual({
+			state: "pending",
+			terminal_delivery_id: null,
+		});
+	} finally {
+		raw.close();
+	}
+});
+
+test("aged cancellations remain replayable until the receipt retention period expires", async () => {
+	const { client, database } = await startServer(true);
+	database.transaction((tx) =>
+		database.inbox.enqueue(tx, {
+			messageId: "old-pending",
+			originKey: "discord:dm:owner",
+			originRefJson: '{"platform":"discord","kind":"dm","conversationId":"owner"}',
+			body: "old pending request",
+			receivedAt: "2000-01-01T00:00:00.000Z",
+		}),
+	);
+	const params = { restartId: RESTART_ID, messageIds: ["old-pending"] };
+	await client.opsCancelInbound(params);
+	database.sweep();
+	expect(database.inbox.messageExists("old-pending")).toBe(true);
+	expect((await client.opsCancelInbound(params)).cancelledMessageIds).toEqual(params.messageIds);
+	database.sweep(new Date(Date.now() + 31 * 24 * 60 * 60 * 1000));
+	expect(database.inbox.messageExists("old-pending")).toBe(false);
 });
 
 test("rejects when the matching restart drain is not held", async () => {

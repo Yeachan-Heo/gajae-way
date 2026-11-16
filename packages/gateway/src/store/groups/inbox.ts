@@ -898,7 +898,7 @@ export class InboxGroup {
 
 	/** Retains history/dedupe and a no-delivery receipt without inventing a dispatched turn. */
 	cancelPending(tx: WriteTx, restartId: string, messageIds: readonly string[]): string[] {
-		const receipt = JSON.stringify({ none: "operator_cancelled", restartId });
+		const receipt = JSON.stringify({ none: "operator_cancelled", restartId, cancelledAt: new Date().toISOString() });
 		const pending: string[] = [];
 		for (const messageId of messageIds) {
 			this.#assertNotQuarantined(messageId);
@@ -916,7 +916,22 @@ export class InboxGroup {
 				row.dispatched_at !== null
 			)
 				throw new Error(`inbound ${messageId} is not an unbound platform message`);
-			if (row.state === "done" && row.terminal_delivery_id === receipt) continue;
+			if (row.state === "done" && row.terminal_delivery_id) {
+				try {
+					const previous: unknown = JSON.parse(row.terminal_delivery_id);
+					if (
+						typeof previous === "object" &&
+						previous !== null &&
+						"none" in previous &&
+						previous.none === "operator_cancelled" &&
+						"restartId" in previous &&
+						previous.restartId === restartId
+					)
+						continue;
+				} catch {
+					// A malformed receipt is not evidence of a successful cancellation.
+				}
+			}
 			if (row.state !== "pending" || row.terminal_delivery_id !== null)
 				throw new Error(`inbound ${messageId} is not pending or was cancelled by a different operation`);
 			pending.push(messageId);
@@ -1362,7 +1377,7 @@ export class InboxGroup {
 	sweep(tx: WriteTx, cutoffs: { historyCutoff: string; batch: number }): number {
 		return this.#db
 			.prepare(
-				`DELETE FROM inbound_messages WHERE rowid IN (SELECT rowid FROM inbound_messages WHERE state = 'done' AND received_at < ? AND ${REPLAYABLE_INBOUND} AND NOT EXISTS (SELECT 1 FROM inbound_messages s WHERE s.turn_op_ref = inbound_messages.turn_op_ref AND s.state <> 'done') AND NOT EXISTS (SELECT 1 FROM meta m WHERE m.key = ${ESCALATION_NOTICE_KEY_SQL}) LIMIT ?)`,
+				`DELETE FROM inbound_messages WHERE rowid IN (SELECT rowid FROM inbound_messages WHERE state = 'done' AND (CASE WHEN json_valid(terminal_delivery_id) THEN CASE WHEN json_extract(terminal_delivery_id, '$.none') = 'operator_cancelled' THEN COALESCE(json_extract(terminal_delivery_id, '$.cancelledAt'), received_at) ELSE received_at END ELSE received_at END) < ? AND ${REPLAYABLE_INBOUND} AND NOT EXISTS (SELECT 1 FROM inbound_messages s WHERE s.turn_op_ref = inbound_messages.turn_op_ref AND s.state <> 'done') AND NOT EXISTS (SELECT 1 FROM meta m WHERE m.key = ${ESCALATION_NOTICE_KEY_SQL}) LIMIT ?)`,
 			)
 			.run(tx, cutoffs.historyCutoff, cutoffs.batch).changes;
 	}
