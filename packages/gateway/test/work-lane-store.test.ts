@@ -11,8 +11,8 @@ import { readPinnedGjcVersion } from "../src/orchestrator/broker";
 import { DatabaseStartupError, LATEST_SCHEMA_VERSION, Store } from "../src/store";
 import {
 	resolveLaneReportOrigin,
-	validateWorkRuntime,
 	terminalEvidence,
+	validateWorkRuntime,
 	type WorkAttemptAdmission,
 	type WorkAttemptPatch,
 	type WorkAttemptRuntime,
@@ -428,7 +428,7 @@ describe("work attempt durable transactions", () => {
 		expect(parseLaneJobRecord(f.database.work.laneJobJson(f.runtime.jobId)!).attempts[0]?.endedAt).toBeUndefined();
 	});
 
-	test("held parent admission requires accepted unresolved execution and current binding", async () => {
+	test("held parent admission requires an accepted open attempt and current binding, including during terminal reconciliation", async () => {
 		for (const scenario of ["prepared", "settled", "turn_end", "terminal", "wrong_session", "wrong_epoch"] as const) {
 			const f = await fixture();
 			f.database.transaction((tx) => {
@@ -466,8 +466,16 @@ describe("work attempt durable transactions", () => {
 			const result = f.database.transaction((tx) =>
 				settleAttempt(f.database, tx, child.runtime.opRef, 0, child.closed, f.settlement, child.admission),
 			);
-			expect(result?.runtime.decision).toBe("no_target");
-			expect(f.database.work.laneReportGet(child.runtime.reportId)).toBeUndefined();
+			if (scenario === "turn_end" || scenario === "terminal") {
+				expect(result?.runtime.decision).toBe("reported");
+				expect(f.database.work.laneReportGet(child.runtime.reportId)).toMatchObject({
+					state: "pending",
+					root_json: null,
+				});
+			} else {
+				expect(result?.runtime.decision).toBe("no_target");
+				expect(f.database.work.laneReportGet(child.runtime.reportId)).toBeUndefined();
+			}
 			expect(f.database.outbox.rows()).toEqual(outboxBeforeChild);
 		}
 	});

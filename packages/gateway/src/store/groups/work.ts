@@ -9,7 +9,6 @@ import {
 } from "@gajae-gateway/protocol";
 import {
 	assertValidOpRef,
-	closeAttempt,
 	type LaneJobRecord,
 	type LaneJobState,
 	type PromptStatusBody,
@@ -827,7 +826,7 @@ export class WorkGroup {
 			workAssert(
 				source.settledAt === null &&
 					source.turnEndObservedAt === undefined &&
-					(source.terminal === null || source.terminal.reasonCode === "terminal_missing_receipt") &&
+					(source.terminal === null || unresolvedTerminalReceipt(source.terminal)) &&
 					source.successor === undefined &&
 					workAccepted(source),
 				"successor predecessor is accepted and execution remains open",
@@ -1048,14 +1047,7 @@ export class WorkGroup {
 			if (parent.jobId !== jobId) return false;
 			if (parent.state === "awaiting_operator") {
 				const runtime = this.workAttemptOpenByLane(`work-${name}`);
-				if (
-					!runtime ||
-					runtime.jobId !== jobId ||
-					runtime.sendPhase !== "accepted" ||
-					runtime.terminal !== null ||
-					runtime.turnEndObservedAt !== undefined
-				)
-					return false;
+				if (!runtime || runtime.jobId !== jobId || runtime.sendPhase !== "accepted") return false;
 				const binding = this.#db
 					.prepare("SELECT gjc_session_id, epoch FROM sessions WHERE origin_key = ?")
 					.get(runtime.sessionKey) as { gjc_session_id: string; epoch: number } | null;

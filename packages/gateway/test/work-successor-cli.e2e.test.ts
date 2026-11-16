@@ -173,14 +173,14 @@ test("PR701 SDK rootless child report remains inspectable for accepted open held
 	expect(settled.runtimes.find((r) => r.opRef === child.opRef)?.decision).toBe("reported");
 	expect(settled.laneReports).toHaveLength(1);
 	expect(settled.laneReports[0]).toMatchObject({ parent_name: "rootless-parent", child_op_ref: child.opRef });
-	const delivered = await eventually(
+	const pending = await eventually(
 		() => f.snapshot().laneReports[0],
-		(row) => row?.state === "consumed",
-		"actual parent steer accepted",
+		(row) => row?.state === "pending",
+		"held parent report remains pending",
 	);
-	expect(delivered.body).toContain("durable private child result");
-	expect(delivered.root_json).toBeNull();
-	expect(f.calls("steerAccepted")).toHaveLength(1);
+	expect(pending.body).toContain("durable private child result");
+	expect(pending.root_json).toBeNull();
+	expect(f.calls("steer")).toHaveLength(0);
 	expect(settled.deliveries).toHaveLength(0);
 	await client.close();
 	await f.kill();
@@ -191,6 +191,12 @@ test("PR701 SDK rootless child report remains inspectable for accepted open held
 	expect(status.attempt.opRef).toBe(parent.opRef);
 	expect(status.attempt.endedAt).toBeUndefined();
 	expect(f.snapshot().laneReports).toHaveLength(1);
+	expect(f.snapshot().laneReports[0]).toMatchObject({
+		report_id: pending.report_id,
+		state: "pending",
+		body: pending.body,
+	});
+	expect(f.calls("steer")).toHaveLength(0);
 	expect(f.snapshot().runtimes.find((r) => r.opRef === parent.opRef)).toMatchObject({
 		terminal: null,
 		settledAt: null,
@@ -222,23 +228,24 @@ test("PR701 SDK undelivered rootless report survives SIGKILL with content and no
 	await f.control(child.opRef, { terminal: true, text: "private undelivered child body" });
 	const pending = await eventually(
 		() => f.snapshot(),
-		(s) => s.laneReports[0]?.state === "pending" && f.calls("steer").length > 0,
-		"refused report retained pending",
+		(s) => s.laneReports[0]?.state === "pending",
+		"held parent report retained pending",
 	);
 	const row = pending.laneReports[0]!;
 	expect(row.body).toContain("private undelivered child body");
 	expect(row.root_json).toBeNull();
 	expect(pending.deliveries).toHaveLength(0);
 	expect(f.calls("steerAccepted")).toHaveLength(0);
+	expect(f.calls("steer")).toHaveLength(0);
 	await client.close();
 	await f.kill();
-	const steerCount = f.calls("steer").length;
 	await f.control(parent.opRef, { statusUnavailable: true, live: "indeterminate" });
 	await f.start();
 	const recovered = await eventually(
 		() => f.snapshot(),
-		(s) => s.laneReports[0]?.state === "pending" && f.calls("steer").length > steerCount,
-		"undelivered report preserved and retry refused after restart",
+		(s) =>
+			s.laneReports[0]?.state === "pending" && s.runtimes.some((r) => r.opRef === parent.opRef && r.settledAt === null),
+		"undelivered report preserved while parent remains held after restart",
 	);
 	expect(recovered.laneReports[0]).toMatchObject({
 		report_id: row.report_id,
@@ -255,16 +262,21 @@ test("PR701 SDK undelivered rootless report survives SIGKILL with content and no
 	expect(recovered.jobs.find((j) => j.jobId === parent.jobId)?.attempts).toHaveLength(1);
 	expect(recovered.deliveries).toHaveLength(0);
 	expect(f.calls("steerAccepted")).toHaveLength(0);
+	expect(f.calls("steer")).toHaveLength(0);
 	expect(f.calls("send").filter((c) => c.input.codingRegister === true)).toHaveLength(2);
-	await f.control(parent.opRef, { refuseSteer: false });
-	await f.kill();
-	await f.start();
+	await f.control(parent.opRef, {
+		refuseSteer: false,
+		statusUnavailable: false,
+		missingReceipt: false,
+		terminal: true,
+		text: "parent reconciled",
+	});
 	await eventually(
 		() => f.snapshot().laneReports[0],
 		(report) => report?.state === "consumed",
-		"same durable report accepted by recovery after refusal clears",
+		"same durable report delivered after parent reconciliation",
 	);
-	expect(f.calls("steerAccepted")).toHaveLength(1);
-	expect(f.calls("steerAccepted")[0]?.input.text).toContain(row.body);
+	expect(f.calls("steerAccepted")).toHaveLength(0);
+	expect(f.calls("send").at(-1)?.input.text).toContain(row.body);
 	expect(f.snapshot().deliveries).toHaveLength(0);
 }, 60_000);

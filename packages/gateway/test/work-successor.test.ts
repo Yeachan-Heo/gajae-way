@@ -13,8 +13,8 @@ import {
 } from "../src/orchestrator/lane-governor";
 import { type CheckStatusClient, WorkLaneManager } from "../src/orchestrator/work-lane";
 import { Store } from "../src/store";
-import { workAttemptDeliveryId, workAttemptReportId } from "../src/store/groups/work";
-import { ScriptedSessionPort } from "./session-port.fake";
+import { terminalEvidence, workAttemptDeliveryId, workAttemptReportId } from "../src/store/groups/work";
+import { ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -271,6 +271,273 @@ test("missing execution end holds the predecessor and an authorized isolated suc
 	expect(f.port.sends).toHaveLength(3);
 	expect(f.port.resumes).toHaveLength(0);
 	expect(f.port.closes).toHaveLength(0);
+});
+
+test("an exact successor retry returns the durable send rejection without replay, including after restart", async () => {
+	const f = await fixture();
+	let sends = 0;
+	let successorOp = "";
+	f.port.send = async (input) => {
+		sends++;
+		successorOp = input.opRef;
+		throw steerRefused("definitive refusal");
+	};
+	await expect(f.manager.start(f.request())).rejects.toMatchObject({ detail: { reasonCode: "send_rejected" } });
+	await until(() => f.db.work.workAttemptGet(successorOp)?.settledAt != null);
+	for (const restart of [false, true]) {
+		if (restart) await f.restart();
+		await expect(f.manager.start(f.request())).rejects.toMatchObject({
+			detail: { reasonCode: "send_rejected", opRef: successorOp },
+		});
+		expect(f.db.work.workAttemptGet(f.first.opRef)?.successor?.opRef).toBe(successorOp);
+	}
+	expect(sends).toBe(1);
+});
+
+test("an exact successor retry returns a proven undelivered send without replay after restart", async () => {
+	const f = await fixture();
+	const liveness = f.port.liveness.bind(f.port);
+	f.port.liveness = async (input) => ({ ...(await liveness(input)), activity: { state: "idle", at: Date.now() } });
+	let successorOp = "";
+	let sends = 0;
+	f.port.send = async (input) => {
+		successorOp = input.opRef;
+		sends++;
+		const error = new Error("transport unavailable") as Error & { details: { code: string } };
+		error.details = { code: "transport_unavailable" };
+		throw error;
+	};
+	await expect(f.manager.start(f.request())).rejects.toMatchObject({ detail: { reasonCode: "send_undelivered" } });
+	await until(() => f.db.work.workAttemptGet(successorOp)?.settledAt != null);
+	await f.restart();
+	await expect(f.manager.start(f.request())).rejects.toMatchObject({
+		detail: { reasonCode: "send_undelivered", opRef: successorOp },
+	});
+	expect(sends).toBe(1);
+});
+
+test("a held open parent keeps a rootless child report pending without steering", async () => {
+	const f = await fixture(8, undefined, { runPredecessor: true, allowNested: true });
+	const child = await f.manager.start({
+		name: "held-child",
+		text: "child work",
+		cwd: f.dir,
+		callerSessionId: f.first.sessionId,
+	});
+	if (!child.started) throw new Error("child held");
+	f.port.complete(child.opRef, "child report");
+	await until(() => f.db.work.workAttemptGet(child.opRef)?.settledAt != null);
+	await until(() => f.db.work.laneReportsByParent("predecessor").length === 1);
+	await f.port.runExclusive(workSessionKey("predecessor"), async () => {});
+	expect(f.db.work.laneReportsByParent("predecessor")[0]).toMatchObject({ state: "pending", root_json: null });
+	expect(f.port.steers).toHaveLength(0);
+	expect(f.notices).toHaveLength(0);
+});
+
+test("a stored missing-receipt failure retains its cause without proving the source execution ended", async () => {
+	const f = await fixture();
+	const status = await f.port.status({ sessionId: f.first.sessionId, repo: f.runtime.cwd, opRef: f.first.opRef });
+	const terminal = terminalEvidence(status.status, new Date().toISOString());
+	expect(terminal).toMatchObject({ reasonCode: "prompt_deadline_exceeded", status: { receiptState: "missing" } });
+	f.db.transaction((tx) => {
+		const current = f.db.work.workAttemptGet(f.first.opRef)!;
+		expect(f.db.work.workAttemptUpdate(tx, current.opRef, current.version, { terminal })).toBeDefined();
+	});
+	const successor = await f.manager.start(f.request());
+	expect(successor.started).toBe(true);
+	expect(f.db.work.workAttemptGet(f.first.opRef)).toMatchObject({ settledAt: null, terminal });
+});
+
+test("rootless child report survives a held parent's end evidence until late receipt reconciliation", async () => {
+	const f = await fixture(8, undefined, { runPredecessor: true, allowNested: true });
+	expect(f.runtime.parent).toBeNull();
+	expect(f.job().state).toBe("awaiting_operator");
+	const native = await f.liveStatus({ sessionId: f.first.sessionId, repo: f.runtime.cwd, opRef: f.first.opRef });
+	const missingStatus = f.port.status.bind(f.port);
+	f.port.status = async (input) => {
+		const result = await missingStatus(input);
+		return input.opRef === f.first.opRef
+			? { ...result, status: { ...result.status, commandId: native.status.commandId, turnId: native.status.turnId } }
+			: result;
+	};
+	let correlatedProbes = 0;
+	f.port.turnRunning = async () => {
+		correlatedProbes++;
+		return true;
+	};
+	await until(() => correlatedProbes > 0);
+	const fetchOutput = f.port.fetchWorkerOutput.bind(f.port);
+	let reading = false;
+	let release!: () => void;
+	const barrier = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	f.port.fetchWorkerOutput = async (input) => {
+		if (input.opRef === f.first.opRef) {
+			reading = true;
+			await barrier;
+		}
+		return fetchOutput(input);
+	};
+	try {
+		f.port.emitTurnEnd(f.first.sessionId, f.first.opRef, "agent_end");
+		await until(() => reading);
+		expect(f.db.work.workAttemptGet(f.first.opRef)).toMatchObject({
+			settledAt: null,
+			terminal: { status: { receiptState: "missing" } },
+		});
+		const child = await f.manager.start({
+			name: "held-child",
+			text: "child work",
+			cwd: f.dir,
+			callerSessionId: f.first.sessionId,
+		});
+		if (!child.started) throw new Error("child held");
+		f.port.complete(child.opRef, "child result retained");
+		await until(() => f.db.work.workAttemptGet(child.opRef)?.settledAt != null);
+		const report = f.db.work.laneReportsByParent("predecessor")[0];
+		expect(report).toMatchObject({ state: "pending", root_json: null, child_op_ref: child.opRef });
+		expect(f.port.steers).toHaveLength(0);
+		expect(f.notices).toHaveLength(0);
+		f.port.status = f.liveStatus;
+		f.port.complete(f.first.opRef, "late successful parent result");
+		release();
+		await until(() => f.db.work.workAttemptGet(f.first.opRef)?.settledAt != null);
+		await until(() => f.db.work.laneReportsByParent("predecessor")[0]?.state === "consumed");
+		const delivered = f.db.work.laneReportsByParent("predecessor")[0]!;
+		expect(delivered).toMatchObject({ state: "consumed", claim_kind: "wake" });
+		expect(f.port.sends.at(-1)?.text).toContain("child result retained");
+	} finally {
+		release();
+	}
+});
+
+for (const initialMode of ["start", "run"] as const) {
+	test(`nested successor authorization follows the caller's captured owner across ${initialMode}/run and lane reuse`, async () => {
+		const f = await fixture(8, undefined, { allowNested: true });
+		const personaA = crypto.randomUUID();
+		const personaB = crypto.randomUUID();
+		f.db.transaction((tx) => {
+			f.db.bindings.bind(tx, "discord/channel/owner-a", personaA);
+			f.db.bindings.bind(tx, "discord/channel/owner-b", personaB);
+		});
+		const abort = new AbortController();
+		const calls: Promise<unknown>[] = [];
+		const parent = async (mode: "start" | "run", callerSessionId: string, resume: boolean) => {
+			const params = { name: "owner-parent", text: "parent work", cwd: f.dir, callerSessionId, resume };
+			if (mode === "start") {
+				const result = await f.manager.start(params);
+				if (!result.started) throw new Error("parent held");
+				return result;
+			}
+			const before = f.port.sends.length;
+			calls.push(f.manager.run(params, {}, abort.signal).catch(() => undefined));
+			await until(() => f.port.sends.length > before);
+			return f.port.sends.at(-1)!;
+		};
+		const finish = async (attempt: { opRef: string }) => {
+			f.port.complete(attempt.opRef, "parent complete");
+			await until(() => f.db.work.workAttemptGet(attempt.opRef)?.settledAt != null);
+		};
+		try {
+			const firstParent = await parent(initialMode, personaA, false);
+			const child = await f.manager.start({
+				name: "child-source",
+				text: "child work",
+				repo: f.repo,
+				base: f.base,
+				callerSessionId: firstParent.sessionId,
+			});
+			if (!child.started) throw new Error("child held");
+			const childRuntime = f.db.work.workAttemptGet(child.opRef)!;
+			expect(childRuntime.authorizationOwner).toEqual({
+				kind: "lane",
+				name: "owner-parent",
+				rootOriginKey: "discord/channel/owner-a",
+			});
+			const previousStatus = f.port.status.bind(f.port);
+			f.port.status = async (input) =>
+				input.opRef !== child.opRef
+					? previousStatus(input)
+					: {
+							operationRef: child.opRef,
+							status: {
+								status: "failed",
+								clientRef: child.opRef,
+								commandId: "child-command",
+								turnId: "child-turn",
+								startedAt: Date.parse(childRuntime.startedAt),
+								terminalAt: Date.parse(childRuntime.startedAt) + 1,
+								receiptState: "missing",
+							},
+							summaryCompleted: true,
+						};
+			await until(() => f.job("child-source").state === "awaiting_operator");
+			await finish(firstParent);
+			const reused = await parent("run", personaB, true);
+			const request = {
+				name: "child-successor",
+				text: "separate work",
+				repo: f.repo,
+				base: f.base,
+				callerSessionId: reused.sessionId,
+				successorOf: {
+					name: "child-source",
+					opRef: child.opRef,
+					sessionId: child.sessionId,
+					acknowledgeUnresolved: true,
+				},
+			};
+			await expect(f.manager.start(request)).rejects.toMatchObject({
+				detail: { reasonCode: "successor_report_owner_mismatch" },
+			});
+			expect(f.db.work.workAttemptGet(child.opRef)?.successor).toBeUndefined();
+			await finish(reused);
+			const originalOwner = await parent("run", personaA, true);
+			const authorized = await f.manager.start({ ...request, callerSessionId: originalOwner.sessionId });
+			if (!authorized.started) throw new Error("successor held");
+			expect(f.db.work.workAttemptGet(authorized.opRef)?.authorizationOwner).toEqual(childRuntime.authorizationOwner);
+			expect(f.db.work.workAttemptGet(authorized.opRef)?.parent).toEqual(childRuntime.parent);
+			expect(f.db.work.workAttemptGet(child.opRef)?.successor?.opRef).toBe(authorized.opRef);
+			await finish(originalOwner);
+		} finally {
+			abort.abort();
+			await Promise.all(calls);
+		}
+	});
+}
+
+test("a nested caller without captured owner cannot authorize a successor", async () => {
+	const f = await fixture(8, undefined, { runPredecessor: true, allowNested: true, noOwner: true });
+	const child = await f.manager.start({
+		name: "unowned-child",
+		text: "child work",
+		repo: f.repo,
+		base: f.base,
+		callerSessionId: f.first.sessionId,
+	});
+	if (!child.started) throw new Error("child held");
+	expect(f.db.work.workAttemptGet(child.opRef)?.authorizationOwner).toEqual({
+		kind: "lane",
+		name: "predecessor",
+		rootOriginKey: null,
+	});
+	await expect(
+		f.manager.start({
+			name: "unowned-successor",
+			text: "new work",
+			repo: f.repo,
+			base: f.base,
+			callerSessionId: f.first.sessionId,
+			successorOf: {
+				name: "unowned-child",
+				opRef: child.opRef,
+				sessionId: child.sessionId,
+				acknowledgeUnresolved: true,
+			},
+		}),
+	).rejects.toMatchObject({ detail: { reasonCode: "successor_report_owner_mismatch" } });
+	expect(f.db.work.workAttemptGet(child.opRef)?.successor).toBeUndefined();
 });
 
 test("linked recovery remains inspectable during a transport gap and never replays an uncertain send", async () => {

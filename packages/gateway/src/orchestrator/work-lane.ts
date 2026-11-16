@@ -159,7 +159,12 @@ function sameAuthorizationOwner(
 ): boolean {
 	if (!left || !right) return false;
 	if (left.kind === "persona") return right.kind === "persona" && left.originKey === right.originKey;
-	return right.kind === "lane" && left.name === right.name && left.rootOriginKey === right.rootOriginKey;
+	return (
+		right.kind === "lane" &&
+		left.name === right.name &&
+		left.rootOriginKey !== null &&
+		left.rootOriginKey === right.rootOriginKey
+	);
 }
 function successorRequestFingerprint(input: WorkInput): string {
 	return createHash("sha256")
@@ -167,7 +172,7 @@ function successorRequestFingerprint(input: WorkInput): string {
 		.digest("hex");
 }
 function hasDefinitiveTerminal(runtime: WorkAttemptRuntime): boolean {
-	return runtime.terminal !== null && runtime.terminal.reasonCode !== "terminal_missing_receipt";
+	return runtime.terminal !== null && !unresolvedTerminalReceipt(runtime.terminal);
 }
 interface Observer {
 	readonly runtime: WorkAttemptRuntime;
@@ -734,6 +739,13 @@ export class WorkLaneManager {
 		if (parent?.kind === "lane") return parent.root;
 		return null;
 	}
+	#callerAuthorizationOwner(caller: WorkParent | null): WorkAuthorizationOwner | null {
+		if (caller?.kind !== "lane") return authorizationOwner(caller);
+		const runtime = this.#latestRuntime(caller.name);
+		const owner = runtime ? runtimeAuthorizationOwner(runtime) : null;
+		const rootOriginKey = owner?.kind === "persona" ? owner.originKey : (owner?.rootOriginKey ?? null);
+		return { kind: "lane", name: caller.name, rootOriginKey };
+	}
 	#assertNoNestedCycle(childName: string, parentName: string): void {
 		const visited = new Set<string>();
 		let name = parentName;
@@ -938,7 +950,7 @@ export class WorkLaneManager {
 		if (input.successorOf && mode !== "start") invalid("successorOf");
 		const caller = this.#resolveCaller(input, mode);
 		const parent = mode === "start" ? caller : null;
-		const context: StartContext = { parent, authorizationOwner: authorizationOwner(caller), runCall };
+		const context: StartContext = { parent, authorizationOwner: this.#callerAuthorizationOwner(caller), runCall };
 		if (this.#job(input.name)) return await this.#startAdmitted(input, mode, context);
 		const admitting = this.#admissions.get(input.name);
 		// Do not queue another admission behind an in-flight start of this name.
@@ -1059,12 +1071,19 @@ export class WorkLaneManager {
 					throw new ProtocolError("invalid_params", "isolated successor refused", {
 						reasonCode: "successor_request_mismatch",
 					});
-				if (!hasAcceptanceEvidence(existing))
+				if (!hasAcceptanceEvidence(existing)) {
+					if (existing.terminal?.reasonCode === "send_rejected" || existing.terminal?.reasonCode === "send_undelivered")
+						throw workError(
+							`work ${existing.terminal.reasonCode === "send_rejected" ? "send rejected" : "send undelivered"}`,
+							existing.terminal.reasonCode,
+							existing,
+						);
 					throw workError(
 						"designated successor acceptance remains unproven; observe it, do not replay",
 						"send_acceptance_uncertain",
 						existing,
 					);
+				}
 				return {
 					started: true,
 					alreadyStarted: true,
@@ -2766,7 +2785,13 @@ export class WorkLaneManager {
 				const open = job.attempts.find((attempt) => attempt.endedAt === undefined);
 				if (open) {
 					const runtime = this.#attemptByOpRef(open.opRef);
-					if (runtime && !runtime.terminal && this.#binding(runtime))
+					if (
+						runtime &&
+						job.state !== "awaiting_operator" &&
+						!runtime.terminal &&
+						!runtime.turnEndObservedAt &&
+						this.#binding(runtime)
+					)
 						await this.#claimAndSteerLaneReport(row, job, runtime);
 					continue;
 				}
