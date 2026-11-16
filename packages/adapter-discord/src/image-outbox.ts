@@ -11,6 +11,10 @@ export type PendingImage = {
 	readonly createdAt?: number;
 	readonly failureAt?: number;
 	readonly audited?: boolean;
+	/** The intent started as live ingress, so a retry may still select its destination. */
+	readonly live?: boolean;
+	/** The gateway explicitly declined this send: no work ran, so no quota-charged tombstone. */
+	readonly declined?: boolean;
 	readonly dm?: boolean;
 };
 
@@ -21,6 +25,13 @@ const MAX_UNRESOLVED_IMAGES = 1_000;
 const MAX_TERMINAL_IMAGES_PER_CHANNEL = 500;
 const MAX_TERMINAL_IMAGES = 10_000;
 const MAX_COMPLETED_IMAGES = 10_000;
+/**
+ * Declined sends keep dedupe evidence, not delivery evidence: they never gate
+ * admission and never keep an authorized image out, so they carry their own
+ * bound and are evicted oldest-first. Losing one only costs a re-declined
+ * retry; the gateway's inbound ledger still owns exactly-once.
+ */
+const MAX_DECLINED_IMAGES = 2_000;
 
 export class ImageOutboxCapacityError extends Error {
 	constructor() {
@@ -55,7 +66,10 @@ function validateEntry(value: unknown): asserts value is PendingImage {
 		("createdAt" in value && typeof value.createdAt !== "number") ||
 		("failureAt" in value && typeof value.failureAt !== "number") ||
 		("audited" in value && typeof value.audited !== "boolean") ||
+		("live" in value && typeof value.live !== "boolean") ||
+		("declined" in value && typeof value.declined !== "boolean") ||
 		("dm" in value && typeof value.dm !== "boolean") ||
+		(value.declined === true && value.completed !== true) ||
 		(value.terminal === true && value.completed === true)
 	) {
 		throw new TypeError("Invalid pending image record");
@@ -104,11 +118,21 @@ function pruneEntries(entries: readonly PendingImage[]): PendingImage[] {
 		try {
 			snowflakeTime(entry.messageId);
 			kept.push(entry);
-		} catch {
-			continue;
-		}
+		} catch {}
 	}
-	return kept;
+	const declined = kept.filter((entry) => entry.declined === true);
+	if (declined.length <= MAX_DECLINED_IMAGES) return kept;
+	const evicted = new Set(
+		declined
+			.sort(
+				(a, b) =>
+					(a.completedAt ?? 0) - (b.completedAt ?? 0) ||
+					(a.messageId < b.messageId ? -1 : a.messageId > b.messageId ? 1 : 0),
+			)
+			.slice(0, declined.length - MAX_DECLINED_IMAGES)
+			.map((entry) => entry.messageId),
+	);
+	return kept.filter((entry) => entry.declined !== true || !evicted.has(entry.messageId));
 }
 
 async function writeEntries(path: string, entries: readonly PendingImage[]): Promise<void> {
@@ -232,7 +256,9 @@ export class ImageOutbox {
 			if (index === -1 && !entry.completed && !entry.terminal) {
 				const unresolved = pruned.filter((pending) => !pending.completed && !pending.terminal);
 				const terminal = pruned.filter((pending) => pending.terminal);
-				const completed = pruned.filter((pending) => pending.completed);
+				// Declined tombstones are reclaimable evidence, never delivery quota:
+				// one declined image must not be able to block a later authorized one.
+				const completed = pruned.filter((pending) => pending.completed && pending.declined !== true);
 				if (
 					unresolved.length >= MAX_UNRESOLVED_IMAGES ||
 					terminal.filter((pending) => pending.channelId === entry.channelId).length >=

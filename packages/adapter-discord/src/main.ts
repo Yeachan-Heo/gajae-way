@@ -7,6 +7,7 @@ import {
 	type ChatMessagePayload,
 	type ChatProgressPayload,
 	type EngagementContext,
+	type GatewayStatusResult,
 	type OriginRef,
 	PRESENCE_ALL_MARKERS,
 	type PresenceState,
@@ -61,6 +62,7 @@ import {
 	pruneKnownDms,
 	RECOVERY_ATTEMPT_BACKOFF_MS,
 	RECOVERY_BOOTSTRAP_LOOKBACK_MS,
+	RECOVERY_KNOWN_DM_TTL_MS,
 	RECOVERY_MAX_ATTEMPTS,
 	RECOVERY_MAX_PAGES,
 	RECOVERY_RETRY_BASE_MS,
@@ -1702,6 +1704,15 @@ function isImageIntentExpired(entry: PendingImage, now = Date.now()): boolean {
 	return entry.failureAt !== undefined && now - entry.failureAt >= IMAGE_INTENT_MAX_AGE_MS;
 }
 
+/** Discord snowflake creation time in epoch milliseconds; 0 for a malformed id. */
+function snowflakeTimestamp(messageId: string): number {
+	try {
+		return Number((BigInt(messageId) >> 22n) + 1_420_070_400_000n);
+	} catch {
+		return 0;
+	}
+}
+
 function isImageReplayBeyondDedupe(entry: PendingImage, now = Date.now()): boolean {
 	let createdAt = entry.createdAt;
 	if (createdAt === undefined) {
@@ -1717,6 +1728,7 @@ function isImageReplayBeyondDedupe(entry: PendingImage, now = Date.now()): boole
 export class ReconnectingGateway {
 	#client: GajaewayClient | undefined;
 	#reconnecting = false;
+	#reconnectCount = 0;
 	#attempt = 0;
 	#deliveryOff: (() => void) | undefined;
 	#progressOff: (() => void) | undefined;
@@ -1866,6 +1878,7 @@ export class ReconnectingGateway {
 					messageId: message.id,
 					channelId,
 					createdAt: Date.now(),
+					...(recovered ? {} : { live: true }),
 					...(sourceOrigin.kind === "dm" ? { dm: true } : {}),
 				};
 				await this.#imageOutbox.put(entry);
@@ -1887,7 +1900,7 @@ export class ReconnectingGateway {
 				this.#imageAdmissionFailures.delete(this.#imageAdmissionFailures.keys().next().value as string);
 			if (attempts < MAX_IMAGE_ADMISSION_FAILURES || recovered || ordered || !this.#imageSettled.has(message.id)) {
 				console.error(
-					`Discord image outbox admission failed message=${message.id} attempt=${attempts}; retrying without sending.`,
+					`Discord image outbox admission failed message=${message.id} attempt=${attempts} (${refusal}); retrying without sending.`,
 				);
 				throw error;
 			}
@@ -1955,8 +1968,13 @@ export class ReconnectingGateway {
 		if (prepared.images.length === 0) return this.terminateImage(entry, "image attachment no longer present");
 		let origin = discordMessageOrigin(message);
 		// Recovered input must not cause a Discord-side thread before the gateway's
-		// authoritative admission check. Live input keeps the current behavior.
-		if (!recovered) {
+		// authoritative admission check. Live input and any retry of a live intent
+		// keep the current behavior: a live attempt may have opened the thread and
+		// crashed before persisting the request, so the retry idempotently adopts
+		// that thread (or opens the one the first attempt never got to) instead of
+		// answering in the parent channel. A history-discovered intent never
+		// creates a thread.
+		if (!recovered || entry.live === true) {
 			void nameThreadFromMessage(message, origin, unnamed);
 			origin = await maybeCreateThreadOnMention(
 				message,
@@ -2228,6 +2246,7 @@ export class ReconnectingGateway {
 			return this.terminateImage(entry, "image replay exceeds gateway dedupe retention");
 		}
 		if (isImageIntentExpired(entry)) return this.terminateImage(entry, "image intent unresolved for 24 hours");
+		let declined = false;
 		const verdict = await this.#inbound.join(entry.messageId, async () => {
 			const client = this.#client;
 			if (!client) {
@@ -2244,6 +2263,7 @@ export class ReconnectingGateway {
 			}
 			try {
 				const response = await client.request<{ engaged?: boolean; turnId?: string | null }>("chat.send", request);
+				declined = response?.engaged === false;
 				onResponse?.(response);
 				if (response?.engaged && onResponse !== undefined) {
 					// Presence belongs to the live path only; a restart replay must not
@@ -2290,12 +2310,16 @@ export class ReconnectingGateway {
 		}
 		// Keep only a completion tombstone. Before this durable write, a crash
 		// replays the exact request; afterwards history skips the acknowledged id.
+		// An explicit decline still leaves a tombstone (so a later pass does not
+		// redownload the bytes) but marks it reclaimable: it must never count
+		// against the global completion quota.
 		this.forgetAttempts(entry.messageId);
 		await this.#imageOutbox.put({
 			messageId: entry.messageId,
 			channelId: entry.channelId,
 			completed: true,
 			completedAt: Date.now(),
+			...(declined ? { declined: true } : {}),
 			...(entry.dm ? { dm: true } : {}),
 		});
 		return "acked";
@@ -2369,7 +2393,7 @@ export class ReconnectingGateway {
 					engagement,
 					this.unnamedThreads,
 					RESOLVED_TURN,
-					true,
+					!liveRetry,
 					ordered,
 					liveRetry,
 				);
@@ -2473,16 +2497,26 @@ export class ReconnectingGateway {
 				);
 				return;
 			}
-			const pruned = pruneKnownDms(this.#cursors, Date.now());
+			const now = Date.now();
+			const pruned = pruneKnownDms(this.#cursors, now);
 			if (pruned !== this.#cursors) this.persist(pruned);
-			// Outbox rows remember their DM identity even after tombstoning, so a
-			// cursor store that was broken when the image landed is repaired here.
-			// Batch into one persist: one fsync per pass, not per tombstone.
-			let withDms: RecoveryCursorState = this.#cursors;
+			// Outbox rows repair a cursor store that was broken when the image landed.
+			// Only rows that still need delivery qualify: a completed or terminal row
+			// is historical evidence, and stamping it with `now` would promote an old,
+			// never-configured DM into the bounded retention set and evict a genuinely
+			// recent DM that still needs history recovery. Record each remaining row's
+			// own observation time, oldest first, so retention order matches recency.
+			const observed = new Map<string, number>();
 			for (const entry of pendingImages ?? []) {
-				if (entry.dm && !withDms.knownDms[entry.channelId])
-					withDms = rememberKnownDm(withDms, entry.channelId, Date.now());
+				if (!entry.dm || entry.completed || entry.terminal || this.#cursors.knownDms[entry.channelId]) continue;
+				const at = entry.createdAt ?? entry.failureAt ?? snowflakeTimestamp(entry.messageId);
+				if (at <= 0 || now - at >= RECOVERY_KNOWN_DM_TTL_MS) continue;
+				observed.set(entry.channelId, Math.max(observed.get(entry.channelId) ?? 0, at));
 			}
+			let withDms: RecoveryCursorState = this.#cursors;
+			for (const [channelId, at] of [...observed].sort((a, b) => a[1] - b[1]))
+				withDms = rememberKnownDm(withDms, channelId, at);
+			withDms = pruneKnownDms(withDms, now);
 			if (withDms !== this.#cursors) {
 				this.#cursors = withDms;
 				this.persist(withDms);
@@ -2604,6 +2638,15 @@ export class ReconnectingGateway {
 	/** True while a backoff retry of the recovery pass is armed. */
 	get recoveryRetryPending(): boolean {
 		return this.#retryTimer !== undefined;
+	}
+
+	/**
+	 * Test seam: how many reconnects THIS adapter instance armed. The reconnect log line
+	 * is process-global, so a leaked timer from another test's adapter cannot be told
+	 * apart from this one's; an instance counter can.
+	 */
+	get reconnectCount(): number {
+		return this.#reconnectCount;
 	}
 
 	/** Recovers one conversation and discovers child threads when this is a configured parent. */
@@ -2904,21 +2947,51 @@ export class ReconnectingGateway {
 		);
 	}
 
-	private async reconcileGatewayRestore(): Promise<void> {
+	/** Single-flight guard: concurrent monitor ticks and recovery passes adopt one identity once. */
+	#restoreCheck: Promise<void> | undefined;
+
+	private reconcileGatewayRestore(): Promise<void> {
+		this.#restoreCheck ??= this.checkGatewayRestore().finally(() => {
+			this.#restoreCheck = undefined;
+		});
+		return this.#restoreCheck;
+	}
+
+	/**
+	 * Adopts the gateway database identity the socket reports and reconciles the
+	 * cursors written under a different one.
+	 *
+	 * Cursor files predating identity tracking have watermarks but no baseline. If
+	 * an operator restored the database before that first baseline was recorded,
+	 * recovery would resume after messages the restored backup lacks. The first
+	 * identity is therefore only adopted as-is when the state carries no recovery
+	 * evidence; a populated legacy state is rewound to the replay floor and its
+	 * image completion tombstones are invalidated once, exactly like a detected
+	 * database replacement.
+	 */
+	private async checkGatewayRestore(): Promise<void> {
 		const state = this.#cursors;
 		const client = this.#client;
-		if (!state || !client || state.gatewayDbIdentity === undefined) return;
-		let result: { database?: { identity?: string } } | undefined;
+		if (!state || !client) return;
+		let result: GatewayStatusResult | undefined;
 		try {
-			result = await client.request<{ database?: { identity?: string } }>("gateway.status");
+			result = await client.request<GatewayStatusResult>("gateway.status");
 		} catch {
 			return;
 		}
 		const identity = result?.database?.identity;
 		if (identity === undefined || identity === state.gatewayDbIdentity) return;
-		let next = state;
-		if (state.gatewayDbIdentity !== undefined) {
-			await this.#imageOutbox.invalidateCompleted();
+		const legacy = state.gatewayDbIdentity === undefined;
+		let next: RecoveryCursorState = this.#cursors ?? state;
+		if (!legacy || (await this.hasRecoveryEvidence(next))) {
+			try {
+				await this.#imageOutbox.invalidateCompleted();
+			} catch {
+				// Rewinding watermarks without clearing completion evidence could leave an
+				// acknowledged image suppressed forever. Keep the old state and retry the
+				// adoption on the next status poll.
+				return;
+			}
 			const latest = this.#cursors ?? state;
 			const floor = snowflakeFromTimestamp(Date.now() - IMAGE_REPLAY_RETENTION_MS);
 			next = {
@@ -2940,10 +3013,29 @@ export class ReconnectingGateway {
 				),
 			};
 			console.error(
-				"Discord gateway database was replaced; rewound recovery watermarks and invalidated image completion tombstones after the gateway socket identity changed.",
+				legacy
+					? "Discord recovery cursors predate gateway database identity tracking; rewound their watermarks to the replay floor and invalidated image completion tombstones, so a database restore during the upgrade cannot hide messages."
+					: "Discord gateway database was replaced; rewound recovery watermarks and invalidated image completion tombstones after the gateway socket identity changed.",
 			);
 		}
 		this.persist({ ...next, gatewayDbIdentity: identity });
+	}
+
+	/** True when a cursor state recorded progress that a database restore could invalidate. */
+	private async hasRecoveryEvidence(state: RecoveryCursorState): Promise<boolean> {
+		if (
+			Object.keys(state.recoveredThrough).length > 0 ||
+			Object.keys(state.quarantined).length > 0 ||
+			Object.keys(state.knownDms).length > 0 ||
+			Object.keys(state.attempts).length > 0 ||
+			Object.keys(state.deadLetterDigest).length > 0 ||
+			state.deadLetters.length > 0
+		)
+			return true;
+		// A completion tombstone can suppress a replay even when no watermark was ever
+		// written (live-only traffic), so it counts as evidence too.
+		const pending = await this.#imageOutbox.load().catch(() => undefined);
+		return pending === undefined ? true : pending.some((entry) => entry.completed === true);
 	}
 
 	/** Serialized, fire-and-forget cursor-store write; a failed persist only widens the gap. */
@@ -3218,18 +3310,13 @@ export class ReconnectingGateway {
 		setTimeout(
 			() => {
 				if (this.#client !== client) return;
-				void client.request<{ database?: { identity?: string } }>("gateway.status").then(
+				void client.request<GatewayStatusResult>("gateway.status").then(
 					(result) => {
 						const identity = result?.database?.identity;
-						if (
-							identity !== undefined &&
-							this.#cursors !== undefined &&
-							this.#cursors.gatewayDbIdentity === undefined
-						) {
-							this.persist({ ...this.#cursors, gatewayDbIdentity: identity });
-						} else if (identity !== undefined && identity !== this.#cursors?.gatewayDbIdentity) {
+						// Includes the first observed identity: a populated legacy state must be
+						// reconciled before it is adopted as the baseline.
+						if (identity !== undefined && identity !== this.#cursors?.gatewayDbIdentity)
 							void this.reconcileGatewayRestore();
-						}
 						this.monitor(client, 0);
 					},
 					() => {
@@ -3246,6 +3333,7 @@ export class ReconnectingGateway {
 	private scheduleReconnect(): void {
 		if (this.#reconnecting) return;
 		this.#reconnecting = true;
+		this.#reconnectCount++;
 		this.#client = undefined;
 		this.#deliveryOff?.();
 		void this.downAlarm?.down();

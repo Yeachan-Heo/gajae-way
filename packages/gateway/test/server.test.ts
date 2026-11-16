@@ -255,6 +255,9 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	await waitFor(client.frames, 3);
 	expect(client.frames[2].result.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
+	// The shared GatewayStatusResult contract carries the database identity the
+	// Discord adapter uses to detect a restore; the wire result must match it.
+	expect(client.frames[2].result.database).toEqual({ identity: expect.stringMatching(/^\d+:\d+$/) });
 	expect(client.frames[2].result.readiness).toMatchObject({ ready: true, state: "ready", reason: null, failure: null });
 	expect(client.frames[2].result.contextDiff).toEqual({
 		unread: 0,

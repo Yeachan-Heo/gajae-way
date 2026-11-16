@@ -179,6 +179,30 @@ describe("ImageOutbox", () => {
 		expect((await outbox.load()).filter((entry) => entry.completed)).toHaveLength(10_000);
 	});
 
+	test("declined tombstones never consume the completed admission quota", async () => {
+		const base = 1571558400000000000n;
+		await writeFile(
+			path,
+			JSON.stringify(
+				Array.from({ length: 10_000 }, (_, index) => ({
+					messageId: String(base + BigInt(index)),
+					channelId: "channel",
+					completed: true,
+					completedAt: Date.now(),
+					declined: true,
+				})),
+			),
+		);
+		const outbox = new ImageOutbox(path);
+		const admitted: PendingImage = { messageId: String(base + 20_000n), channelId: "channel" };
+		// Ten thousand declines from bot-visible channels must not keep an authorized
+		// image out; only real completions hold delivery quota.
+		await expect(outbox.put(admitted)).resolves.toBeUndefined();
+		const loaded = await outbox.load();
+		expect(loaded).toContainEqual(admitted);
+		expect(loaded.filter((entry) => entry.declined === true).length).toBeLessThanOrEqual(2_000);
+	});
+
 	test("refuses a new unresolved intent past the admission bound", async () => {
 		const base = 123456789012345600n;
 		const entries = Array.from({ length: 1_000 }, (_, index) => ({

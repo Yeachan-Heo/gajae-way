@@ -73,7 +73,8 @@ async function fixture(options: { dm?: boolean; watermarkPast?: boolean } = {}) 
 		() => bot,
 		{
 			request: async (verb: string, params: unknown) => {
-				requests.push({ verb, params });
+				// Identity polling is additive infrastructure, not image delivery.
+				if (verb !== "gateway.status") requests.push({ verb, params });
 				return { engaged: false, turnId: null };
 			},
 			onChatMessage: () => () => {},
@@ -125,6 +126,9 @@ async function assertDelivered(f: Awaited<ReturnType<typeof fixture>>, dm = fals
 			channelId: f.channelId,
 			completed: true,
 			completedAt: expect.any(Number),
+			// The fake gateway returns `engaged:false`, which is an explicit decline:
+			// the tombstone stays for dedupe but is reclaimable evidence, not quota.
+			declined: true,
 			...(dm ? { dm: true } : {}),
 		},
 	]);

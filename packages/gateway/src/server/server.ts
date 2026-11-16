@@ -1566,7 +1566,8 @@ async function handleRequest(
 ): Promise<void> {
 	const gatewayStartedAt = options.startedAt ?? new Date().toISOString();
 	switch (request.verb) {
-		case "gateway.status":
+		case "gateway.status": {
+			const dbIdentity = await databaseIdentity(options.config.dbPath);
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
@@ -1577,7 +1578,7 @@ async function handleRequest(
 					pid: process.pid,
 					startedAt: gatewayStartedAt,
 					schemaVersion: options.database.schemaVersion,
-					database: { identity: await databaseIdentity(options.config.dbPath) },
+					...(dbIdentity === undefined ? {} : { database: { identity: dbIdentity } }),
 					readiness: (() => {
 						const drainId = runtime.personaSessions.restartDrainId;
 						if (drainId !== undefined) {
@@ -1609,6 +1610,7 @@ async function handleRequest(
 				},
 			});
 			return;
+		}
 		case "gateway.shutdown":
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { stopping: true } });
 			await stop();

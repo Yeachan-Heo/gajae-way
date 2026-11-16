@@ -141,7 +141,7 @@ test("recovery delivers an older durable image below the watermark before newer 
 			olderId,
 			newerId,
 		]);
-		expect(requests[0].params).toEqual(request);
+		expect(requests.find((entry) => entry.verb === "chat.send")?.params).toEqual(request);
 		await bounded(adapter.recoverMissedMessages());
 		expect(requests.filter((entry) => entry.verb === "chat.send")).toHaveLength(2);
 	} finally {
@@ -223,7 +223,7 @@ test("a cursor-store write failure does not block image delivery or duplicate it
 		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("acked");
 		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([id]);
 		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
-			{ messageId: id, channelId, completed: true, completedAt: expect.any(Number), dm: true },
+			{ messageId: id, channelId, completed: true, completedAt: expect.any(Number), declined: true, dm: true },
 		]);
 		await rm(cursorPath, { recursive: true });
 		await saveRecoveryCursors(cursorPath, emptyCursors());
@@ -335,7 +335,9 @@ test("a terminal chat.send rejection is dead-lettered after the bounded attempt 
 		expect(engagement).toBeDefined();
 		let sends = 0;
 		const client = {
-			request: async () => {
+			request: async (verb: string) => {
+				// The first status poll of the database identity is additive, not a send.
+				if (verb !== "chat.send") return {};
 				sends++;
 				throw Object.assign(new Error("frame exceeds limit"), { code: "payload_too_large" });
 			},
@@ -787,7 +789,8 @@ test("a duplicate live image event is coalesced while its first send is settling
 		adapter.adoptClient({
 			request: async (verb: string, params: unknown) => {
 				requests.push({ verb, params });
-				sends++;
+				// The first status poll of the database identity is additive, not a send.
+				if (verb === "chat.send") sends++;
 				return { engaged: false, turnId: null };
 			},
 		} as never);
@@ -796,7 +799,7 @@ test("a duplicate live image event is coalesced while its first send is settling
 		await bounded(waiter);
 		expect(sends).toBe(2);
 		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
-			{ messageId: id, channelId, completed: true, completedAt: expect.any(Number), dm: true },
+			{ messageId: id, channelId, completed: true, completedAt: expect.any(Number), declined: true, dm: true },
 		]);
 	} finally {
 		cleanupTimers();
@@ -1079,6 +1082,43 @@ test("live completion compacts eligible evidence without a recovery pass", async
 	}
 }, 12_000);
 
+test("a declined image is marked reclaimable evidence instead of completion quota", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-declined-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	// A bot-visible channel that is never configured for recovery: its row has no
+	// watermark to compact against, so a quota-charged tombstone would accumulate
+	// until it blocked images in every other channel.
+	const channelId = "bot-visible-guild-channel";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = {
+		id,
+		content: "look at this",
+		author: { id: "human", username: "human", bot: false },
+		channel: { id: channelId, name: "general" },
+		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo.png" }],
+	};
+	try {
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), [], {});
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("acked");
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([
+			{
+				messageId: id,
+				channelId,
+				completed: true,
+				completedAt: expect.any(Number),
+				declined: true,
+			},
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
 test("a persisted image request replays even when the recovery cursor is unreadable", async () => {
 	const home = await mkdtemp(join(tmpdir(), "discord-image-order-cursor-read-"));
 	const cleanupTimers = trackTimers();
@@ -1100,7 +1140,7 @@ test("a persisted image request replays even when the recovery cursor is unreada
 		await bounded(adapter.recoverMissedMessages());
 		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([id]);
 		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
-			{ messageId: id, channelId, completed: true, completedAt: expect.any(Number), dm: true },
+			{ messageId: id, channelId, completed: true, completedAt: expect.any(Number), declined: true, dm: true },
 		]);
 	} finally {
 		cleanupTimers();

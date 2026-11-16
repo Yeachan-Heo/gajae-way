@@ -67,6 +67,8 @@ test("a first-time DM image intent survives restart before preparation", async (
 	const cursorPath = join(home, "recovery-cursor.json");
 	const sends: Array<{ verb: string; params: unknown }> = [];
 	const request = async (verb: string, params: unknown) => {
+		// Identity polling is additive infrastructure, not a send.
+		if (verb === "gateway.status") return {};
 		sends.push({ verb, params });
 		return { engaged: false, turnId: null };
 	};
@@ -96,6 +98,7 @@ test("a first-time DM image intent survives restart before preparation", async (
 				messageId: message.id,
 				channelId: "new-dm",
 				dm: true,
+				live: true,
 				createdAt: expect.any(Number),
 				failureAt: expect.any(Number),
 			},
@@ -122,7 +125,14 @@ test("a first-time DM image intent survives restart before preparation", async (
 			},
 		});
 		expect(await outbox(home)).toEqual([
-			{ messageId: message.id, channelId: "new-dm", completed: true, completedAt: expect.any(Number), dm: true },
+			{
+				messageId: message.id,
+				channelId: "new-dm",
+				completed: true,
+				completedAt: expect.any(Number),
+				declined: true,
+				dm: true,
+			},
 		]);
 		await restarted.recoverMissedMessages();
 		expect(sends).toHaveLength(1);
@@ -151,6 +161,8 @@ test("an ambiguous gateway ACK replays the exact persisted image request after r
 			cursorPath,
 			fetchChannel,
 			async (verb, params) => {
+				// Identity polling is additive infrastructure, not a send.
+				if (verb === "gateway.status") return {};
 				sends.push({ verb, params });
 				throw new Error("connection lost after gateway accepted request");
 			},
@@ -179,6 +191,7 @@ test("an ambiguous gateway ACK replays the exact persisted image request after r
 			cursorPath,
 			fetchChannel,
 			async (verb, params) => {
+				if (verb === "gateway.status") return {};
 				sends.push({ verb, params });
 				return { engaged: false, turnId: null };
 			},
@@ -192,7 +205,14 @@ test("an ambiguous gateway ACK replays the exact persisted image request after r
 		expect(sends).toHaveLength(2);
 		expect(sends[1]).toEqual({ verb: "chat.send", params: persisted[0].request });
 		expect(await outbox(home)).toEqual([
-			{ messageId: message.id, channelId: "new-dm", completed: true, completedAt: expect.any(Number), dm: true },
+			{
+				messageId: message.id,
+				channelId: "new-dm",
+				completed: true,
+				completedAt: expect.any(Number),
+				declined: true,
+				dm: true,
+			},
 		]);
 		await restarted.recoverMissedMessages();
 		expect(sends).toHaveLength(2);

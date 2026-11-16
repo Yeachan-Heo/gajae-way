@@ -1,13 +1,14 @@
-import { afterAll, beforeAll, expect, test } from "bun:test";
+import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DiscordImagePreparationError, type prepareDiscordImages } from "../src/attachments";
 import type { DiscordInboundMessage } from "../src/main";
 import { decideInbound, describeMessageEdit, LruSet, monitorFailureDecision, ReconnectingGateway } from "../src/main";
 import {
 	classifyRecoveryFailure,
 	loadRecoveryCursors,
+	RECOVERY_BOOTSTRAP_LOOKBACK_MS,
 	RECOVERY_DEAD_LETTER_CAP,
 	RECOVERY_KNOWN_DM_CAP,
 	RECOVERY_KNOWN_DM_TTL_MS,
@@ -270,7 +271,7 @@ test("gateway rejection is retried inside the pass and then persisted once", asy
 	const client = {
 		request: async (verb: string) => {
 			requests.push(verb);
-			if (reject) {
+			if (verb === "chat.send" && reject) {
 				reject = false;
 				throw new Error("gateway unavailable");
 			}
@@ -281,8 +282,9 @@ test("gateway rejection is retried inside the pass and then persisted once", asy
 	const first = await firstGateway.recoverMissedMessages();
 	expect(first).toBeUndefined();
 	// The rejected send burned one attempt and the in-pass retry acked it: two chat.sends,
-	// one watermark. A reconnect afterwards has nothing left to replay.
-	expect(requests).toEqual(["chat.send", "chat.send"]);
+	// one watermark. A reconnect afterwards has nothing left to replay. (The first status
+	// poll of the database identity is a separate, additive request.)
+	expect(requests.filter((verb) => verb !== "gateway.status")).toEqual(["chat.send", "chat.send"]);
 	await settle();
 	const persisted = await loadRecoveryCursors(cursorPath);
 	expect(persisted.recoveredThrough).toEqual({ "channel-1": inbound.id });
@@ -291,7 +293,7 @@ test("gateway rejection is retried inside the pass and then persisted once", asy
 	const secondGateway = wiredGateway(fakeChannel([inbound]), client, cursorPath);
 	await secondGateway.recoverMissedMessages();
 	await secondGateway.recoverMissedMessages();
-	expect(requests).toEqual(["chat.send", "chat.send"]);
+	expect(requests.filter((verb) => verb !== "gateway.status")).toEqual(["chat.send", "chat.send"]);
 });
 
 test("cold-start recovery waits for both gateway client and Discord user", async () => {
@@ -568,6 +570,22 @@ function wiredGateway(
  */
 function settle(ms = 10): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Cancels adapter timers (image retry, reconnect) before the state directory is removed. */
+function trackTimers(): () => void {
+	const realSetTimeout = globalThis.setTimeout;
+	const timers: ReturnType<typeof setTimeout>[] = [];
+	const spy = spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+		const timer = realSetTimeout(...args);
+		timer.unref?.();
+		timers.push(timer);
+		return timer;
+	}) as typeof setTimeout);
+	return () => {
+		for (const timer of timers) clearTimeout(timer);
+		spy.mockRestore();
+	};
 }
 
 const channelOrigin = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
@@ -1089,7 +1107,7 @@ test("deterministic native image failures use bounded terminal recovery without 
 		await gateway.recoverMissedMessages();
 		await gateway.cursorsFlushed;
 		const state = await loadRecoveryCursors(cursorPath);
-		expect(requests).toEqual([]);
+		expect(requests.filter((entry) => entry.verb !== "gateway.status")).toEqual([]);
 		expect(prepareCalls).toBe(1);
 		expect(state.deadLetters).toHaveLength(1);
 		expect(state.deadLetters[0]).toMatchObject({
@@ -1552,9 +1570,6 @@ test("a rejected engagement.reaction is logged, never a reconnect (live: 313 rec
 	const logs: string[] = [];
 	const original = console.error;
 	console.error = (line: unknown) => void logs.push(String(line));
-	const originalLog = console.log;
-	const reconnects: string[] = [];
-	console.log = (line: unknown) => void reconnects.push(String(line));
 	try {
 		const gateway = wiredGateway(
 			fakeChannel([]),
@@ -1577,14 +1592,14 @@ test("a rejected engagement.reaction is logged, never a reconnect (live: 313 rec
 		const failed = () => logs.some((line) => line.includes("engagement.reaction failed: unhealthy_failed_closed"));
 		for (let attempt = 0; attempt < 200 && !failed(); attempt++) await settle(5);
 		expect(failed()).toBe(true);
-		// Only THIS adapter's reconnects count. console.log is process-global and
-		// the Slack adapter's unref'd 30 s monitor timer, left by an earlier test
-		// file in the same run, can fire into this window (CI, linux-x64:
-		// "Slack adapter gateway reconnecting in 36661ms.").
-		expect(reconnects.filter((line) => /^Discord .*reconnecting/.test(line))).toEqual([]);
+		// Only THIS adapter's reconnects count. The reconnect log line is
+		// process-global and identical for every adapter, so a leaked timer from an
+		// earlier test file can fire into this window (CI, linux-arm64:
+		// "Discord adapter gateway reconnecting in 4452ms."). The instance counter
+		// cannot observe another adapter's reconnect, so it stays deterministic.
+		expect(gateway.reconnectCount).toBe(0);
 	} finally {
 		console.error = original;
-		console.log = originalLog;
 	}
 });
 
@@ -1696,4 +1711,230 @@ test("a channel mention answered in a new thread types in the thread and arms pr
 	await gateway.requestInbound("m-1", threadOrigin, "<@bot> hey", engagement, undefined, undefined, "channel-1");
 	expect(began).toEqual(["thread-1"]);
 	expect(armed).toEqual([["thread-1", "m-1", engagement, "channel-1"]]);
+});
+
+test("a live image retry adopts the thread destination the first attempt never persisted", async () => {
+	const cursorPath = join(home, "live-image-thread-retry", "recovery-cursor.json");
+	const cleanupTimers = trackTimers();
+	// Older than the bootstrap window, so recovery resolves this durable intent
+	// directly instead of waiting for a later history page.
+	const id = snowflakeFromTimestamp(Date.now() - RECOVERY_BOOTSTRAP_LOOKBACK_MS - 60_000);
+	const started: string[] = [];
+	const sent: Array<{ verb: string; params: Record<string, any> }> = [];
+	let preparations = 0;
+	const inbound = Object.assign(message(id, { content: `<@${bot.id}> describe this` }), {
+		startThread: async () => {
+			started.push(id);
+			return { id: "thread-1" };
+		},
+	});
+	const channel = {
+		messages: {
+			fetch: async (query: string | { after?: string; limit?: number }) => (typeof query === "string" ? inbound : []),
+		},
+	};
+	const gateway = new ReconnectingGateway(
+		"socket",
+		{ channels: { fetch: async () => channel } } as never,
+		{ tokenFile: "token", token: "redacted", configPath: "config", channels: { "channel-1": {} } } as never,
+		undefined,
+		undefined,
+		cursorPath,
+		() => bot,
+		{
+			request: async (verb: string, params: unknown) => {
+				sent.push({ verb, params: params as Record<string, any> });
+				return { engaged: true, turnId: "turn-1" };
+			},
+			onChatMessage: () => () => {},
+		} as never,
+		async () => {},
+		undefined,
+		undefined,
+		async () => {
+			preparations++;
+			if (preparations <= RECOVERY_MAX_ATTEMPTS) throw new Error("temporary CDN failure");
+			return { images: [{ data: "AQID", mimeType: "image/jpeg" as const }], notice: "" };
+		},
+	);
+	try {
+		const engagement = decideInbound(inbound, bot, {});
+		expect(engagement).toBeDefined();
+		expect(await gateway.processImage(inbound, engagement!)).toBe("unavailable");
+		// Preparation failed before any destination was chosen; the live retry must
+		// still answer in the mention's thread instead of falling back to the parent.
+		expect(started).toEqual([]);
+
+		await gateway.recoverMissedMessages();
+		expect(started).toEqual([id]);
+		const sends = sent.filter((entry) => entry.verb === "chat.send");
+		expect(sends).toHaveLength(1);
+		expect(sends[0]?.params.origin).toMatchObject({
+			platform: "discord",
+			kind: "thread",
+			conversationId: "thread-1",
+			parentId: "channel-1",
+		});
+	} finally {
+		cleanupTimers();
+	}
+});
+
+test("a stale completed DM tombstone never refreshes retention or evicts a recent DM", async () => {
+	const cursorPath = join(home, "stale-dm-tombstone", "recovery-cursor.json");
+	const cleanupTimers = trackTimers();
+	const recent = new Date(Date.now() - 60_000).toISOString();
+	const knownDms = Object.fromEntries(
+		Array.from({ length: RECOVERY_KNOWN_DM_CAP }, (_, index) => [
+			`dm-${index}`,
+			{ lastSeenAt: recent, seq: index + 1 },
+		]),
+	);
+	await saveRecoveryCursors(cursorPath, {
+		...cursorState({}),
+		knownDms,
+		sequence: RECOVERY_KNOWN_DM_CAP,
+	});
+	// A retained tombstone for an old, never-configured DM. It must not be stamped
+	// with `now` and take the newest retention slot from a live DM.
+	await writeFile(
+		join(dirname(cursorPath), "image-outbox.json"),
+		JSON.stringify([
+			{
+				messageId: "123456789012345678",
+				channelId: "dm-old-tombstone",
+				completed: true,
+				completedAt: Date.now() - 24 * 60 * 60 * 1000,
+				dm: true,
+			},
+		]),
+	);
+	const gateway = wiredGateway(fakeChannel([]), { request: async () => ({}) }, cursorPath);
+	try {
+		await gateway.recoverMissedMessages();
+		await gateway.cursorsFlushed;
+		const state = await loadRecoveryCursors(cursorPath);
+		expect(state.knownDms["dm-old-tombstone"]).toBeUndefined();
+		expect(Object.keys(state.knownDms)).toHaveLength(RECOVERY_KNOWN_DM_CAP);
+		for (let index = 0; index < RECOVERY_KNOWN_DM_CAP; index++) expect(state.knownDms[`dm-${index}`]).toBeDefined();
+	} finally {
+		cleanupTimers();
+	}
+});
+
+test("a populated legacy cursor state is rewound before its first database identity is adopted", async () => {
+	const directory = join(home, "legacy-db-identity");
+	const cursorPath = join(directory, "recovery-cursor.json");
+	const cleanupTimers = trackTimers();
+	const recent = snowflakeFromTimestamp(Date.now() - 60_000);
+	await saveRecoveryCursors(cursorPath, {
+		...cursorState({ "channel-1": recent }),
+		quarantined: { "thread-7": { watermark: recent, seq: 1 } },
+		sequence: 1,
+	});
+	const outboxPath = join(directory, "image-outbox.json");
+	await writeFile(
+		outboxPath,
+		JSON.stringify([{ messageId: "123456789012345679", channelId: "dm-1", completed: true, completedAt: Date.now() }]),
+	);
+	const gateway = wiredGateway(fakeChannel([]), { request: async () => ({}) }, cursorPath);
+	const adopt = async () =>
+		gateway.adoptClient({
+			request: async (verb: string) => (verb === "gateway.status" ? { database: { identity: "8:42" } } : {}),
+		} as never);
+	try {
+		await adopt();
+		let state = await loadRecoveryCursors(cursorPath);
+		for (let attempt = 0; attempt < 200 && state.gatewayDbIdentity === undefined; attempt++) {
+			await settle(5);
+			state = await loadRecoveryCursors(cursorPath);
+		}
+		expect(state.gatewayDbIdentity).toBe("8:42");
+		// The legacy watermark is rewound to the replay floor, not adopted as-is.
+		expect(state.recoveredThrough["channel-1"]).not.toBe(recent);
+		expect(snowflakeIsAfter(recent, state.recoveredThrough["channel-1"] as string)).toBe(true);
+		expect(snowflakeIsAfter(recent, state.quarantined["thread-7"]?.watermark as string)).toBe(true);
+		// Completion evidence from the unknown baseline is invalidated with it.
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([]);
+	} finally {
+		cleanupTimers();
+	}
+});
+
+test("an empty cursor store adopts its first database identity without rewinding", async () => {
+	const cursorPath = join(home, "fresh-db-identity", "recovery-cursor.json");
+	const cleanupTimers = trackTimers();
+	const gateway = wiredGateway(fakeChannel([]), { request: async () => ({}) }, cursorPath);
+	try {
+		gateway.adoptClient({
+			request: async (verb: string) => (verb === "gateway.status" ? { database: { identity: "9:99" } } : {}),
+		} as never);
+		let state = await loadRecoveryCursors(cursorPath);
+		for (let attempt = 0; attempt < 200 && state.gatewayDbIdentity === undefined; attempt++) {
+			await settle(5);
+			state = await loadRecoveryCursors(cursorPath);
+		}
+		expect(state.gatewayDbIdentity).toBe("9:99");
+		expect(state.recoveredThrough).toEqual({});
+	} finally {
+		cleanupTimers();
+	}
+});
+
+test("a live image retry adopts the thread a crashed attempt already created", async () => {
+	const directory = join(home, "live-image-thread-adopt");
+	const cursorPath = join(directory, "recovery-cursor.json");
+	const cleanupTimers = trackTimers();
+	const id = snowflakeFromTimestamp(Date.now() - RECOVERY_BOOTSTRAP_LOOKBACK_MS - 60_000);
+	const inbound = Object.assign(message(id, { content: `<@${bot.id}> describe this` }), {
+		startThread: async () => {
+			// The previous attempt created the thread and crashed before persisting the
+			// request; Discord reports the duplicate instead of returning the thread.
+			throw Object.assign(new Error("A thread has already been created for this message"), { code: 16_0004 });
+		},
+	});
+	const parent = { messages: { fetch: async (query: unknown) => (typeof query === "string" ? inbound : []) } };
+	const adopted = { id, parentId: "channel-1", messages: { fetch: async () => [] } };
+	const sent: Array<{ verb: string; params: Record<string, any> }> = [];
+	const gateway = new ReconnectingGateway(
+		"socket",
+		{
+			channels: { fetch: async (channelId: string) => (channelId === id ? adopted : parent) },
+		} as never,
+		{ tokenFile: "token", token: "redacted", configPath: "config", channels: { "channel-1": {} } } as never,
+		undefined,
+		undefined,
+		cursorPath,
+		() => bot,
+		{
+			request: async (verb: string, params: unknown) => {
+				if (verb === "gateway.status") return {};
+				sent.push({ verb, params: params as Record<string, any> });
+				return { engaged: true, turnId: "turn-1" };
+			},
+			onChatMessage: () => () => {},
+		} as never,
+		async () => {},
+		undefined,
+		undefined,
+		async () => ({ images: [{ data: "AQID", mimeType: "image/jpeg" as const }], notice: "" }),
+	);
+	try {
+		await mkdir(directory, { recursive: true });
+		await writeFile(
+			join(directory, "image-outbox.json"),
+			JSON.stringify([{ messageId: id, channelId: "channel-1", createdAt: Date.now(), live: true }]),
+		);
+		await gateway.recoverMissedMessages();
+		const sends = sent.filter((entry) => entry.verb === "chat.send");
+		expect(sends).toHaveLength(1);
+		expect(sends[0]?.params.origin).toMatchObject({
+			platform: "discord",
+			kind: "thread",
+			conversationId: id,
+			parentId: "channel-1",
+		});
+	} finally {
+		cleanupTimers();
+	}
 });
