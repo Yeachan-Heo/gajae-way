@@ -2461,6 +2461,10 @@ export class ReconnectingGateway {
 			this.scheduleRecoveryRetry();
 			return;
 		}
+		// A database-identity reconciliation must finish before this pass captures a
+		// watermark; otherwise its rewind would land mid-pass and the pass would
+		// re-advance the channel, losing the [floor, watermark) interval.
+		if (this.#restoreCheck) await this.#restoreCheck;
 		const botUser = this.getBotUser();
 		if (!this.#client || !botUser) {
 			// A fired retry that cannot proceed (no gateway link yet, Discord not ready) must
@@ -2486,7 +2490,7 @@ export class ReconnectingGateway {
 			// for the sorted history pass instead of overtaking older missed text. A
 			// failed load leaves it undefined and still replays every durable intent.
 			await this.ensureCursors();
-			await this.reconcileGatewayRestore();
+			await this.reconcileGatewayRestore(true);
 			// The durable image consumer is independent of history recovery: an exact
 			// persisted request needs neither the cursor nor a history read, and a live
 			// image was admitted ahead of history in the first place.
@@ -2950,8 +2954,8 @@ export class ReconnectingGateway {
 	/** Single-flight guard: concurrent monitor ticks and recovery passes adopt one identity once. */
 	#restoreCheck: Promise<void> | undefined;
 
-	private reconcileGatewayRestore(): Promise<void> {
-		this.#restoreCheck ??= this.checkGatewayRestore().finally(() => {
+	private reconcileGatewayRestore(fromRecovery = false): Promise<void> {
+		this.#restoreCheck ??= this.checkGatewayRestore(fromRecovery).finally(() => {
 			this.#restoreCheck = undefined;
 		});
 		return this.#restoreCheck;
@@ -2969,7 +2973,12 @@ export class ReconnectingGateway {
 	 * image completion tombstones are invalidated once, exactly like a detected
 	 * database replacement.
 	 */
-	private async checkGatewayRestore(): Promise<void> {
+	private async checkGatewayRestore(fromRecovery = false): Promise<void> {
+		// A rewind must never land inside a running recovery pass: the pass captured the
+		// old watermark, so it would re-advance that channel after the rewind and the
+		// [floor, old watermark) interval would never be replayed. The pass reconciles
+		// itself before it reads cursors; every other caller waits for the next poll.
+		if (this.#recovering && !fromRecovery) return;
 		const state = this.#cursors;
 		const client = this.#client;
 		if (!state || !client) return;
@@ -3023,17 +3032,11 @@ export class ReconnectingGateway {
 
 	/** True when a cursor state recorded progress that a database restore could invalidate. */
 	private async hasRecoveryEvidence(state: RecoveryCursorState): Promise<boolean> {
-		if (
-			Object.keys(state.recoveredThrough).length > 0 ||
-			Object.keys(state.quarantined).length > 0 ||
-			Object.keys(state.knownDms).length > 0 ||
-			Object.keys(state.attempts).length > 0 ||
-			Object.keys(state.deadLetterDigest).length > 0 ||
-			state.deadLetters.length > 0
-		)
-			return true;
-		// A completion tombstone can suppress a replay even when no watermark was ever
-		// written (live-only traffic), so it counts as evidence too.
+		// Only state that can suppress a message matters: a watermark past a gap and a
+		// completion tombstone that skips a replay. knownDms/attempts/dead letters say
+		// nothing about how far history was walked, so they must not force a rewind on a
+		// fresh install that merely handled live traffic before its first status poll.
+		if (Object.keys(state.recoveredThrough).length > 0 || Object.keys(state.quarantined).length > 0) return true;
 		const pending = await this.#imageOutbox.load().catch(() => undefined);
 		return pending === undefined ? true : pending.some((entry) => entry.completed === true);
 	}

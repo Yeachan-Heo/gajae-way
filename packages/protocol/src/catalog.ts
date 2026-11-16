@@ -54,9 +54,10 @@ export interface GatewayStatusResult {
 	readonly readiness?: GatewayReadinessResult;
 	/**
 	 * Identity of the gateway database file this process opened (`dev:ino`). A change
-	 * between status polls means an operator replaced or restored the database, so
-	 * durable client cursors written against the previous file may now skip messages.
-	 * Absent on older gateways and when the file cannot be stat'ed.
+	 * between status polls means an operator replaced the file (the supported restore
+	 * path swaps it), so durable client cursors written against the previous database
+	 * may now skip messages. Absent on older gateways and when the file cannot be
+	 * stat'ed.
 	 */
 	readonly database?: { readonly identity: string };
 	/** Session census (grows in later phases). */

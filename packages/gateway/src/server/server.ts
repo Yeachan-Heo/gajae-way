@@ -1404,12 +1404,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	return runtime;
 }
 /**
- * Monitor-batch settlement (issue #29 defect 2): the delivery ledger row for a
- * monitor batch carries turn_id === batch_id. When the adapter confirms that
- * delivery, every event of the batch that has already reached `authored`
- * advances to `delivered`. Failure paths never mark `delivered`: on
- * delivery.fail the events stay `authored` (distinguishable, operator-visible)
- * while the ledger row itself records failed/ambiguous.
+ * Identity of the database file this gateway process opened. The supported offline
+ * restore swaps the file, so `dev:ino` changes; an in-place rewrite of the live file
+ * keeps its inode and is outside the supported restore path.
  */
 async function databaseIdentity(path: string): Promise<string | undefined> {
 	try {
@@ -1420,6 +1417,14 @@ async function databaseIdentity(path: string): Promise<string | undefined> {
 	}
 }
 
+/**
+ * Monitor-batch settlement (issue #29 defect 2): the delivery ledger row for a
+ * monitor batch carries turn_id === batch_id. When the adapter confirms that
+ * delivery, every event of the batch that has already reached `authored`
+ * advances to `delivered`. Failure paths never mark `delivered`: on
+ * delivery.fail the events stay `authored` (distinguishable, operator-visible)
+ * while the ledger row itself records failed/ambiguous.
+ */
 function settleMonitorBatch(database: Store, deliveryId: string, stage: MonitorEventStage): void {
 	const delivery = database.outbox.get(deliveryId);
 	if (!delivery) return;

@@ -1938,3 +1938,55 @@ test("a live image retry adopts the thread a crashed attempt already created", a
 		cleanupTimers();
 	}
 });
+
+test("a database-identity rewind never lands inside a running recovery pass", async () => {
+	const cursorPath = join(home, "rewind-during-pass", "recovery-cursor.json");
+	const cleanupTimers = trackTimers();
+	const legacy = snowflakeFromTimestamp(Date.now() - 60_000);
+	await saveRecoveryCursors(cursorPath, cursorState({ "channel-1": legacy }));
+	let releaseHistory!: () => void;
+	const historyGate = new Promise<void>((resolve) => {
+		releaseHistory = resolve;
+	});
+	let historyStarted!: () => void;
+	const started = new Promise<void>((resolve) => {
+		historyStarted = resolve;
+	});
+	const channel = {
+		messages: {
+			fetch: async (query: unknown) => {
+				if (typeof query === "string") return undefined;
+				historyStarted();
+				await historyGate;
+				return [];
+			},
+		},
+	};
+	const gateway = wiredGateway(channel as never, { request: async () => ({}) }, cursorPath);
+	try {
+		const pass = gateway.recoverMissedMessages();
+		await started;
+		// A status poll observes the new identity while the pass is in flight. It must
+		// not rewind now: the pass still holds the pre-rewind watermark and would
+		// re-advance the channel after the rewind.
+		gateway.adoptClient({
+			request: async (verb: string) => (verb === "gateway.status" ? { database: { identity: "4:2" } } : {}),
+		} as never);
+		await settle(50);
+		expect((await loadRecoveryCursors(cursorPath)).gatewayDbIdentity).toBeUndefined();
+		releaseHistory();
+		await pass;
+		expect((await loadRecoveryCursors(cursorPath)).gatewayDbIdentity).toBeUndefined();
+
+		// The next pass reconciles first, then walks history from the rewound floor.
+		await gateway.recoverMissedMessages();
+		await gateway.cursorsFlushed;
+		const state = await loadRecoveryCursors(cursorPath);
+		expect(state.gatewayDbIdentity).toBe("4:2");
+		expect(state.recoveredThrough["channel-1"]).not.toBe(legacy);
+		expect(snowflakeIsAfter(legacy, state.recoveredThrough["channel-1"] as string)).toBe(true);
+	} finally {
+		releaseHistory();
+		cleanupTimers();
+	}
+});
