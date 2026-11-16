@@ -13,20 +13,45 @@ export interface LiveBroker {
 	stop(): Promise<void>;
 }
 
-export async function superviseLiveBroker(executable: string, agentDir: string): Promise<LiveBroker> {
+export async function superviseLiveBroker(
+	executable: string,
+	agentDir: string,
+	options: { readonly env?: Record<string, string>; readonly cwd?: string } = {},
+): Promise<LiveBroker> {
 	const discoveryPath = join(agentDir, "sdk", "broker.json");
 	const existing = await readBrokerDiscovery(discoveryPath, defaultPidAlive);
 	if (existing) return { pid: existing.pid, stop: async () => {} };
 	const child = Bun.spawn([executable, "sdk", "broker", "run", "--agent-dir", agentDir], {
-		env: { ...process.env, GJC_CODING_AGENT_DIR: agentDir, GJC_SDK_BROKER_AUTOSTART: "0" },
+		cwd: options.cwd,
+		env: { ...(options.env ?? process.env), GJC_CODING_AGENT_DIR: agentDir, GJC_SDK_BROKER_AUTOSTART: "0" },
 		stdin: "ignore",
 		stdout: "ignore",
 		stderr: "pipe",
 	});
 	const stop = async () => {
 		if (child.exitCode !== null || child.signalCode !== null) return;
-		child.kill("SIGTERM");
-		await child.exited;
+		for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+			try {
+				child.kill(signal);
+			} catch {
+				// Only observing exit proves the child is gone.
+			}
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				const exited = await Promise.race([
+					child.exited.then(() => true),
+					new Promise<false>((resolve) => {
+						timer = setTimeout(() => resolve(false), 2_000);
+					}),
+				]);
+				if (exited) return;
+			} catch {
+				// An unsuccessful exit observation must still attempt escalation.
+			} finally {
+				clearTimeout(timer);
+			}
+		}
+		throw new Error(`broker ${child.pid} exit unconfirmed after bounded TERM/KILL waits`);
 	};
 	const deadline = Date.now() + 30_000;
 	while (Date.now() < deadline) {

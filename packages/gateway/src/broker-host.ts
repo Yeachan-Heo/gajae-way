@@ -63,6 +63,8 @@ export async function runBrokerHost(config: GatewayConfig): Promise<number> {
 			...brokerEnv,
 		};
 		const version = await versionOf(exe, env, config.home);
+		// The release beside the running binary owns the pin (see pinnedGjcCandidatePaths), so
+		// the host and `gajaeway services install` resolve the same version for this install.
 		const pinned = readPinnedGjcVersion();
 		if (version !== pinned)
 			throw new Error(`broker_host_version_mismatch running=${version ?? "unknown"} required=${pinned}`);
@@ -162,8 +164,9 @@ export async function runForegroundBroker(
 	options: ForegroundBrokerOptions = {},
 	args: readonly string[] = [exe, "sdk", "broker", "run", "--agent-dir", agentDir],
 ): Promise<number> {
-	// The broker and SDK hosts share this private group, so watchdog restarts can
-	// stop them together. Linux also retains systemd's cgroup cleanup fence.
+	// Own the broker's private group. Lifecycle hosts may detach into their own
+	// groups; broker-group exit alone does not prove those hosts have exited.
+	// Linux additionally retains systemd's cgroup cleanup fence.
 	const child = Bun.spawn([...args], {
 		cwd,
 		env,

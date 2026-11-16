@@ -38,3 +38,17 @@ test("plain urls and prose stay untouched", () => {
 	const body = "see https://example.com/page and [not an attachment] and image: foo.png";
 	expect(redactHistoricalAttachments(body)).toBe(body);
 });
+
+test("native image descriptions without URLs are marked as historical and remain idempotent", () => {
+	for (const body of [
+		"[image · image.png · id F01234567 · 12 KB]",
+		"[image · 12 KB · included as a native image input]",
+		"[image · 12 KB · /private/attachments/photo.jpg]",
+	]) {
+		const historical = redactHistoricalAttachments(body);
+		expect(historical).toContain("past attachment; not part of this message, do not fetch");
+		expect(historical).not.toContain("included as a native image input");
+		expect(historical).not.toContain("/private/attachments");
+		expect(redactHistoricalAttachments(historical)).toBe(historical);
+	}
+});

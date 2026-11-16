@@ -1,8 +1,10 @@
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { homedir, userInfo } from "node:os";
+import { dirname, join } from "node:path";
 import { homeLayout } from "@gajae-gateway/home";
 import { parseRuntimeConfig, type RuntimeConfig, RuntimeConfigError } from "@gajae-gateway/protocol";
+import { type GjcInstallRunner, installPinnedGjc } from "./gjc-install";
+import { readPinnedGjcVersion } from "./update";
 
 const CONFIG_SCHEMA_VERSION = 1;
 
@@ -172,12 +174,37 @@ export async function defaultLoginPathRunner(command: readonly string[]): Promis
 	return stdout;
 }
 
+function defaultPasswdShell(): string | undefined {
+	try {
+		return userInfo().shell ?? undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Discover the login PATH by running a login shell with `-lc` (#39). Candidates are
+ * SHELL, the account's passwd shell, /bin/bash, then /bin/sh. When none can run,
+ * return "" so mergePathEntries falls back to FALLBACK_PATH_DIRS instead of failing
+ * an update whose binaries are already installed (#734).
+ */
 export async function discoverLoginPath(
 	env: NodeJS.ProcessEnv = process.env,
 	runner: LoginPathRunner = defaultLoginPathRunner,
+	passwdShell: () => string | undefined = defaultPasswdShell,
 ): Promise<string> {
-	const shell = env.SHELL || "/bin/zsh";
-	return await runner([shell, "-lc", LOGIN_PATH_COMMAND]);
+	const candidates = new Set<string>();
+	if (env.SHELL) candidates.add(env.SHELL);
+	const accountShell = passwdShell();
+	if (accountShell) candidates.add(accountShell);
+	candidates.add("/bin/bash");
+	candidates.add("/bin/sh");
+	for (const shell of candidates) {
+		try {
+			return await runner([shell, "-lc", LOGIN_PATH_COMMAND]);
+		} catch {}
+	}
+	return "";
 }
 
 export async function resolvePath(options: ResolvePathOptions): Promise<string> {
@@ -418,6 +445,49 @@ async function readRuntime(home: string): Promise<RuntimeConfig | undefined> {
 		const message = error instanceof RuntimeConfigError ? error.message : String(error);
 		throw new Error(`invalid runtime configuration ${configPath}: ${message}`);
 	}
+}
+
+/**
+ * The release manifest beside the binaries `services install|repair` targets. It is the only pin
+ * source for a target that supplies a pin: the gateway started from those binaries enforces the
+ * pin from that same manifest, so no other file describes this target. The CLI checkout's own
+ * gateway manifest is deliberately not a candidate — an arbitrary `--bin-dir` is not demonstrably
+ * this checkout, and installing the checkout pin for it is how a release broker came to refuse its
+ * own install with broker_host_version_mismatch. The launchd/systemd definitions run
+ * `<binDir>/gajaeway-gateway`, so this is the manifest the runtime resolves for it.
+ */
+export function servicePinManifest(binDir: string, env: NodeJS.ProcessEnv = process.env): string {
+	return join(expandHome(binDir, env.HOME || homedir()), "package.json");
+}
+
+/**
+ * Install the pin `manifestPath` declares into the private prefix and return its version.
+ * A manifest that is missing, malformed, or pin-less fails the install with the release-directory
+ * remedy: a target that cannot supply its own pin is not served by another manifest's pin, and an
+ * install failure propagates instead of being retried elsewhere.
+ */
+export async function installPinnedGjcForServices(options: {
+	readonly home: string;
+	readonly manifestPath: string;
+	readonly runner?: GjcInstallRunner;
+}): Promise<string> {
+	let version: string;
+	try {
+		version = await readPinnedGjcVersion(options.manifestPath);
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		const target = dirname(options.manifestPath);
+		throw new Error(
+			`services requires the release manifest beside the target binaries: ${detail}. Install the release into ${target} with 'gajaeway update --force --bin-dir ${target}'`,
+			{ cause: error },
+		);
+	}
+	await installPinnedGjc({
+		home: options.home,
+		version,
+		...(options.runner === undefined ? {} : { runner: options.runner }),
+	});
+	return version;
 }
 
 export async function installServices(options: InstallServicesOptions): Promise<readonly string[]> {

@@ -188,9 +188,16 @@ export interface EngagementContext {
 	readonly replyTo?: ReplyContext;
 }
 
+export interface PromptImage {
+	readonly data: string;
+	readonly mimeType: "image/jpeg";
+}
+
 export interface ChatSendParams {
 	readonly origin: OriginRef;
 	readonly text: string;
+	/** Prepared, bounded JPEG images attached to the prompt. */
+	readonly images?: readonly PromptImage[];
 	/** Stable platform message id for idempotent live/backfill ingestion. */
 	readonly messageId?: string;
 	/** Platform event time, when available; ordering and age policy use this value. */
@@ -428,9 +435,17 @@ export interface SessionListResult {
 
 /**
  * `/model set` choices (session.modelChoices): preset names from the gjc
- * profile's `models.yml` `profiles:` map plus the configured gateway selector.
- * Fails soft: an unreadable catalog yields an empty list, never an error.
+ * profile's `models.yml` `profiles:` map plus the configured gateway selector,
+ * then the `provider/model` ids gjc lists (`gjc --list-models`). Fails soft: an
+ * unreadable catalog yields fewer (or no) choices, never an error. Preset names
+ * are private to the owner: the result is empty unless `authorId` is the
+ * configured owner (`ownerTarget.origin.peerId`).
  */
+export interface SessionModelChoicesParams {
+	/** Platform user id of whoever is typing the `/model set` choice. */
+	readonly authorId?: string;
+}
+
 export interface SessionModelChoicesResult {
 	readonly choices: readonly string[];
 }
@@ -566,6 +581,12 @@ export interface MonitorSpec {
 	readonly model?: MonitorModelSelection;
 	/** Absent means inherit the gateway default; present overrides this monitor's request tier. */
 	readonly serviceTier?: MonitorServiceTier;
+	/**
+	 * After an answered authoring turn at or above this session context size in
+	 * tokens, arm a roll. The next fresh dispatch starts a new session epoch
+	 * seeded with the monitor digest. Unset means never roll on context size.
+	 */
+	readonly contextRollTokens?: number;
 	/** Inject each reportable authored result as an internal report into this conversation session. */
 	readonly reportTo?: OriginRef | null;
 	readonly enabled?: boolean;
@@ -579,8 +600,10 @@ export interface MonitorRecord extends MonitorSpec {
 	readonly enabled: boolean;
 }
 
-export interface MonitorUpdateParams extends Partial<Omit<MonitorSpec, "trigger">> {
+export interface MonitorUpdateParams extends Partial<Omit<MonitorSpec, "trigger" | "contextRollTokens">> {
 	readonly monitorId: string;
+	/** Null clears the observed-usage roll threshold on update. */
+	readonly contextRollTokens?: number | null;
 	/** Replace the trigger spec; use schedule to change only a cron schedule. */
 	readonly trigger?: TriggerSpec;
 	/** Change the schedule while retaining the monitor's existing cron trigger. */
@@ -722,6 +745,10 @@ export interface PromptStatusBody {
 		readonly kind?: string;
 		readonly reason?: string;
 		readonly provenance?: string;
+		readonly code?: string;
+		readonly providerCode?: string;
+		readonly phase?: string;
+		readonly category?: string;
 		readonly failureCauseDiagnostic?: string;
 	};
 	/** Gateway-filtered safe failure codes/messages, never raw SDK exceptions. */
@@ -745,6 +772,17 @@ export interface WorkStatusResult {
 		readonly endState?: string;
 	} | null;
 	readonly op: PromptStatusBody | null;
+	/**
+	 * A fresh lane whose start is still being admitted (clone, worktree, bind,
+	 * send) has no durable record yet: state `admitting`. If that admission
+	 * failed, state `admission_failed` carries the bounded reason until the next
+	 * start of the name (#707).
+	 */
+	readonly admission?: {
+		readonly startedAt: string;
+		readonly failedAt?: string;
+		readonly reason?: string;
+	};
 	/** Repository binding information (issue #480) */
 	readonly repository?: {
 		/** Repository identity: a Git URL or the absolute local path supplied to work.start. */
@@ -752,6 +790,36 @@ export interface WorkStatusResult {
 		readonly branch: string;
 		readonly base?: string;
 	};
+}
+
+/**
+ * Standing operator directives (#604): constraints added mid-conversation that
+ * every matching lane must follow. A directive added from a persona session
+ * applies to the lanes that conversation started; one added outside any
+ * conversation (the host operator) applies to every lane.
+ */
+export interface WorkDirectiveParams {
+	readonly action: "add" | "list" | "remove";
+	/** The directive text (add). */
+	readonly text?: string;
+	/** The directive to remove (remove). */
+	readonly id?: string;
+	readonly callerSessionId?: string;
+}
+
+export interface WorkDirective {
+	readonly id: string;
+	/** `owner` for every lane, otherwise the persona origin key whose lanes it binds. */
+	readonly scope: string;
+	readonly text: string;
+	readonly createdAt: string;
+}
+
+export interface WorkDirectiveResult {
+	/** Directives visible to the caller after the action. */
+	readonly directives: readonly WorkDirective[];
+	/** Add only: the open lanes the new directive was steered into. */
+	readonly propagated?: readonly { readonly name: string; readonly steered: boolean; readonly reason?: string }[];
 }
 
 export interface WorkSteerParams {
@@ -774,9 +842,12 @@ export interface WorkRetireParams {
  * so the next `work.run` for that name creates a fresh session. A lane with an
  * open attempt is never retired from under its turn.
  *
- * When `force` is true, skip attempt-state checks and require broker liveness
- * proving the session dead or disowned; if found dead, close as `host_lost` and
- * rebind the epoch. `allDead` retires all dead lanes at once (implies force).
+ * When `force` is true, skip attempt-state checks and apply one of two paths:
+ * 1. Broker liveness proof the session is dead or disowned: close as `host_lost` and rebind the epoch.
+ * 2. Live session with idle foreground activity, unknown broker op status, no running background jobs,
+ *    and an open attempt: settle the attempt as `operator_abandoned` and close the session. This abandonment
+ *    path may fail if close() errors and the session remains live (binding is preserved).
+ * `allDead` retires all dead lanes at once (implies force with path 1).
  */
 export type WorkRetireResult =
 	| {
@@ -983,7 +1054,39 @@ export type CycleGateReason =
 	| "monitor_dispatch_failing"
 	| "broker_respawn_churn"
 	| "broker_index_lock_blocked"
-	| "broker_agent_unprovisioned";
+	| "broker_agent_unprovisioned"
+	| "origin_silent";
+
+/**
+ * Why an unanswered origin is not moving, derived from durable state only:
+ * `send_not_attempted` (bound, prompt never sent), `session_busy_wait` (the host
+ * refused the prompt as busy), `operation_state_unknown` (sent, acceptance
+ * unconfirmed), `turn_running` (accepted, not finished), `dispatch_pending`
+ * (nothing bound: waiting on bind, host capacity or dispatch retry).
+ */
+export type OriginHoldReason =
+	| "send_not_attempted"
+	| "session_busy_wait"
+	| "operation_state_unknown"
+	| "turn_running"
+	| "dispatch_pending";
+
+/** An origin whose user messages have gone unanswered past the silence threshold (#688). */
+export interface SilentOriginView {
+	readonly originKey: string;
+	/** Oldest unanswered platform message on the origin. */
+	readonly oldestMessageId: string;
+	readonly oldestPendingAgeMs: number;
+	/** Unanswered platform messages older than the threshold. */
+	readonly unanswered: number;
+	/** Pending lane report backlog (internal diagnostic messages, not user messages). */
+	readonly pendingLaneReports?: number;
+	/** Oldest pending lane report when the backlog exceeds the threshold (#766). */
+	readonly oldestLaneReportAgeMs?: number;
+	/** The nonterminal trigger that owns the origin's current epoch; null when none is bound. */
+	readonly blockingOpRef: string | null;
+	readonly holdReason: OriginHoldReason;
+}
 
 /**
  * Free space on the filesystem holding the broker-bound GJC agent directory.
@@ -1121,6 +1224,8 @@ export interface OpsCycleResult {
 		readonly consecutive: number;
 		readonly lastFiredAt: string;
 	}[];
+	/** Origins with user messages unanswered past the silence threshold; non-empty raises `origin_silent`. */
+	readonly silentOrigins: readonly SilentOriginView[];
 	/** Delivery ledger census across all states. */
 	readonly deliveries: {
 		readonly pending: number;
@@ -1238,7 +1343,7 @@ export interface VerbCatalogV01 {
 	"delivery.fail": { params: DeliveryFailParams; result: { readonly recorded: true } };
 	"session.recall": { params: SessionRecallParams; result: SessionRecallResult };
 	"session.list": { params: undefined; result: SessionListResult };
-	"session.modelChoices": { params: undefined; result: SessionModelChoicesResult };
+	"session.modelChoices": { params: SessionModelChoicesParams; result: SessionModelChoicesResult };
 	"memory.audit": { params: undefined; result: MemoryOperationAccepted };
 	"memory.autolink": { params: undefined; result: MemoryOperationAccepted };
 	"memory.status": { params: { readonly opRef: string }; result: MemoryOperationStatusResult };
@@ -1287,6 +1392,7 @@ export interface VerbCatalogV01 {
 	"work.steer": { params: WorkSteerParams; result: WorkSteerResult };
 	"work.jobs": { params: WorkJobsParams | undefined; result: WorkJobsResult };
 	"work.retire": { params: WorkRetireParams; result: WorkRetireResult };
+	"work.directive": { params: WorkDirectiveParams; result: WorkDirectiveResult };
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
 	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
 	"engagement.panel_response": { params: EngagementPanelResponseParams; result: EngagementPanelResponseResult };
@@ -1339,6 +1445,7 @@ export const VERBS_V01 = [
 	"work.steer",
 	"work.jobs",
 	"work.retire",
+	"work.directive",
 	"chat.react",
 	"engagement.reaction",
 	"engagement.panel_response",

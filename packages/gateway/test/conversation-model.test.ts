@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Store } from "../src/store";
+import { LATEST_SCHEMA_VERSION, Store } from "../src/store";
 import { parseModelSelection } from "../src/store/groups/bindings";
 
 async function openAt(): Promise<{ db: Store; path: string }> {
@@ -95,7 +95,7 @@ describe("conversation model override", () => {
 		}
 	});
 
-	test("the override survives a reopen and the schema reports 38", async () => {
+	test("the override survives a reopen and the schema reports 39", async () => {
 		const { db, path } = await openAt();
 		db.transaction((tx) => db.bindings.modelSet(tx, "discord:c1", { preset: "lunamaxxing-local" }));
 		db.close();
@@ -103,7 +103,7 @@ describe("conversation model override", () => {
 		expect(reopened.bindings.modelGet("discord:c1")?.selection).toEqual({ preset: "lunamaxxing-local" });
 		const raw = new Database(path);
 		const row = raw.query<{ v: number }, []>("SELECT MAX(version) AS v FROM schema_migrations").get();
-		expect(row?.v).toBe(38);
+		expect(row?.v).toBe(LATEST_SCHEMA_VERSION);
 		raw.close();
 		reopened.close();
 	});

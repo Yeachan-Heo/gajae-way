@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import {
@@ -11,6 +11,8 @@ import {
 	ProtocolError,
 	parseOriginKey,
 	validateOriginRef,
+	type WorkDirective,
+	type WorkDirectiveResult,
 	type WorkStartResult,
 	type WorkStatusResult,
 	type WorkSteerResult,
@@ -42,6 +44,8 @@ import {
 	type LaneReportRow,
 	resolveLaneReportOrigin,
 	terminalEvidence,
+	unresolvedTerminalReceipt,
+	WORK_OUTCOME_TOKENS,
 	type WorkAttemptAdmission,
 	type WorkAttemptPatch,
 	type WorkAttemptRuntime,
@@ -57,6 +61,7 @@ import {
 } from "../store/groups/work";
 import type { WriteTx } from "../store/tx";
 import { type BrokerWaitOptions, isBrokerUnavailable, waitForBroker } from "./broker";
+import { isEmbeddedModuleDir } from "./embedded-module";
 import { readFailedTransportCause } from "./failed-turn-evidence";
 import { GIT_COMMAND_TIMEOUT_MS, runGit } from "./git-command";
 import {
@@ -90,6 +95,7 @@ const GIT_TIMEOUTS: GitTimeouts = { local: GIT_COMMAND_TIMEOUT_MS, clone: 30_000
 const reasons = new Set([
 	"end_turn",
 	"prompt_deadline_exceeded",
+	"provider_transport",
 	"cancelled",
 	"max_tokens",
 	"max_turn_requests",
@@ -108,6 +114,8 @@ const reasons = new Set([
 /** Minimum spacing between streamed-frame activity writes for one attempt. */
 const ACTIVITY_TOUCH_MS = 1_000;
 const HOST_LOST_GRACE_MS = 30_000;
+/** Conversation platforms a lane report can be admitted into as an internal turn. */
+const PERSONA_PARENT_PLATFORMS: readonly string[] = ["discord", "slack", "telegram", "loopback"];
 /** Re-steers on red PR checks before the lane settles failed (#481). */
 const AWAITING_CHECKS_RETRY_LIMIT = 2;
 /** How long a lane may wait in awaiting_checks before it settles with a timeout. */
@@ -142,10 +150,10 @@ interface Observer {
 	readonly binding: { readonly sessionId: string | null; readonly epoch: number } | undefined;
 	tail?: TailHandle;
 	attaching?: Promise<void>;
+	disposal?: Promise<void>;
 	task?: Promise<void>;
 	timer?: ReturnType<typeof setTimeout>;
 	wakeRequested?: boolean;
-	text?: string;
 	touchedAt?: number;
 	turnEndObservedAt?: string;
 	/** First of an unbroken run of host-gone verdicts; any other observation resets it. */
@@ -158,6 +166,12 @@ interface Observer {
 interface Waiter {
 	readonly owner: object;
 	readonly finish: (error?: Error) => void;
+}
+interface RunCall {
+	readonly owner: object;
+	active: boolean;
+	opRef?: string;
+	text?: string;
 }
 export interface CheckStatusSnapshot {
 	readonly prNumber: number;
@@ -232,6 +246,7 @@ interface WorkInput {
 }
 interface StartContext {
 	readonly parent: WorkParent | null;
+	readonly runCall?: RunCall;
 	readonly opRef?: string;
 	readonly wakeReportId?: string;
 	/** Only the check-polling path may add an attempt while the lane is parked. */
@@ -254,11 +269,6 @@ export function getServiceDirectory(): string {
 	} catch {
 		return anchor;
 	}
-}
-
-/** True for the virtual directory a `bun build --compile` binary embeds its modules under. */
-export function isEmbeddedModuleDir(dir: string): boolean {
-	return dir === "/$bunfs/root" || dir.startsWith("/$bunfs/") || /^[A-Z]:[\\/]~BUN[\\/]/i.test(dir);
 }
 
 /** Nearest existing ancestor's realpath with the missing tail re-appended. */
@@ -286,9 +296,19 @@ export class WorkLaneManager {
 	readonly #db: Store;
 	readonly #port: SessionPort;
 	readonly #observers = new Map<string, Observer>();
+	/** Includes dropped observers no longer reachable through #observers. */
+	readonly #observerDisposals = new Set<Promise<void>>();
 	/** Consecutive reconciliation failures per open attempt; cleared by a successful tick or settlement. */
 	readonly #failures = new Map<string, { failures: number; reason: string }>();
 	readonly #waiters = new Map<string, Set<Waiter>>();
+	/** Exact output belongs to an interested invocation, not its observer or later waiter. */
+	readonly #runCalls = new Map<string, RunCall>();
+	/**
+	 * Fresh-lane starts between request acceptance and their durable lane record,
+	 * plus the last failed one per name, so `work.status` never reports an
+	 * accepted start as an unknown lane (#707).
+	 */
+	readonly #admissions = new Map<string, { startedAt: string; failedAt?: string; reason?: string }>();
 	readonly #detachedOwners = new WeakSet<object>();
 	#generationRecovery?: Promise<void>;
 	#recovery?: Promise<void>;
@@ -501,7 +521,10 @@ export class WorkLaneManager {
 				const effects = this.#settleChecks(
 					name,
 					record,
-					{ kind: "ended", reason: "lane force-retired before checks settled" },
+					{
+						kind: "ended",
+						reason: `lane ${reason === "operator_retired" ? "retired" : "force-retired"} before checks settled`,
+					},
 					undefined,
 					endedAt,
 				);
@@ -527,10 +550,10 @@ export class WorkLaneManager {
 				? undefined
 				: terminal.reasonCode
 			: "host_lost";
-		const output =
-			runtime.output.disposition === "pending"
-				? { ...runtime.output, disposition: "unavailable" as const, nextReadAt: null }
-				: runtime.output;
+		const pendingOutput = runtime.output.disposition === "pending";
+		const output = pendingOutput
+			? { ...runtime.output, disposition: "unavailable" as const, nextReadAt: null }
+			: runtime.output;
 		const awaitingChecks = record.awaitingChecks;
 		const closed = closeAttempt({
 			record,
@@ -557,7 +580,16 @@ export class WorkLaneManager {
 						: {}),
 				}
 			: undefined;
-		const text = reportText(name, endState, terminal.reasonCode, opRef, output, reportFacts);
+		const text = reportText(
+			name,
+			endState,
+			terminal.reasonCode,
+			opRef,
+			output,
+			reportFacts,
+			terminal.status,
+			pendingOutput,
+		);
 		// Note: settleForceRetiredAttempt is synchronous, so we don't have repo facts here
 		let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 		let admission: WorkAttemptAdmission | undefined;
@@ -682,6 +714,7 @@ export class WorkLaneManager {
 		const lanePrefix = "work/task/";
 		const callerLane = callerOrigin?.startsWith(lanePrefix) ? callerOrigin.slice(lanePrefix.length) : undefined;
 		let callerPersona: OriginRef | undefined;
+		let callerMonitor: OriginRef | undefined;
 		let triggerMessageId: string | undefined;
 		if (callerOrigin && callerLane === undefined) {
 			try {
@@ -700,10 +733,10 @@ export class WorkLaneManager {
 						origin = admitted;
 					}
 				}
-				if (["discord", "slack", "telegram", "loopback"].includes(origin.platform)) {
+				if (PERSONA_PARENT_PLATFORMS.includes(origin.platform)) {
 					callerPersona = origin;
 					triggerMessageId = activeTurn?.triggerMessageId;
-				}
+				} else if (origin.platform === "monitor") callerMonitor = origin;
 			} catch {
 				/* Unknown and non-persona origins fall back to ownerTarget for starts. */
 			}
@@ -739,11 +772,23 @@ export class WorkLaneManager {
 			console.error(`work_parent_resolved verb=start name=${input.name} source=session kind=persona`);
 			return parent;
 		}
+		// A monitor turn reports to the conversation its monitor delivers to; an
+		// unusable target falls back to the owner with the reason on the log line.
+		let fallback = "";
+		if (callerMonitor) {
+			const resolved = this.#monitorTargetParent(callerMonitor);
+			const monitorLabel = callerMonitor.parentId ? ` monitor=${callerMonitor.parentId}` : "";
+			if ("parent" in resolved) {
+				console.error(`work_parent_resolved verb=start name=${input.name} source=monitor kind=persona${monitorLabel}`);
+				return resolved.parent;
+			}
+			fallback = ` fallback=monitor_${resolved.reason}${monitorLabel}`;
+		}
 		const owner = this.#options.ownerTarget?.();
 		if (owner) {
 			try {
 				validateOriginRef(owner);
-				if (["discord", "slack", "telegram", "loopback"].includes(owner.platform)) {
+				if (PERSONA_PARENT_PLATFORMS.includes(owner.platform)) {
 					// Capture trigger message ID from the ownerTarget's origin for threading
 					let ownerTriggerMessageId: string | undefined;
 					const ownerOriginKey = originKey(owner);
@@ -757,15 +802,30 @@ export class WorkLaneManager {
 						origin: structuredClone(owner),
 						...(ownerTriggerMessageId ? { triggerMessageId: ownerTriggerMessageId } : {}),
 					};
-					console.error(`work_parent_resolved verb=start name=${input.name} source=owner kind=persona`);
+					console.error(`work_parent_resolved verb=start name=${input.name} source=owner kind=persona${fallback}`);
 					return parent;
 				}
 			} catch {
 				/* Invalid owner origins cannot become report targets. */
 			}
 		}
-		console.error(`work_parent_resolved verb=start name=${input.name} source=none kind=none`);
+		console.error(`work_parent_resolved verb=start name=${input.name} source=none kind=none${fallback}`);
 		return null;
+	}
+	#monitorTargetParent(monitorOrigin: OriginRef): { readonly parent: WorkParent } | { readonly reason: string } {
+		// Event-type sessions from before #177 are not scoped to one monitor.
+		if (!monitorOrigin.parentId) return { reason: "id_missing" };
+		const targetJson = this.#db.monitors.channelTargetJson(monitorOrigin.parentId);
+		if (targetJson === undefined) return { reason: "not_found" };
+		if (targetJson === null) return { reason: "no_channel_target" };
+		let target: OriginRef;
+		try {
+			target = validateOriginRef((JSON.parse(targetJson) as { origin: OriginRef }).origin);
+		} catch {
+			return { reason: "channel_target_invalid" };
+		}
+		if (!PERSONA_PARENT_PLATFORMS.includes(target.platform)) return { reason: "channel_target_not_chat" };
+		return { parent: { kind: "persona", originKey: originKey(target), origin: target } };
 	}
 	#laneNotice(
 		name: string,
@@ -790,27 +850,66 @@ export class WorkLaneManager {
 		return this.#start(parseInput(params), "start");
 	}
 	async run(params: unknown, owner: object, signal?: AbortSignal) {
-		const started = await this.#start(parseInput(params), "run");
-		if (!started.started) {
-			const { started: _, ...held } = started;
-			return held;
+		const call: RunCall = { owner, active: true };
+		const abort = () => this.#releaseRunCall(call);
+		signal?.addEventListener("abort", abort, { once: true });
+		if (signal?.aborted) abort();
+		try {
+			const started = await this.#start(parseInput(params), "run", call);
+			if (!started.started) {
+				const { started: _, ...held } = started;
+				return held;
+			}
+			await this.#wait(started.opRef, owner, signal);
+			const runtime = this.#db.work.workAttemptGet(started.opRef)!;
+			const reason = runtime.terminal?.reasonCode ?? "terminal_uncertain";
+			if (reason !== "end_turn") throw workError("work attempt did not complete", reason, runtime);
+			const text = call.text;
+			if (text === undefined) throw workError("work output unavailable", "output_unavailable", runtime);
+			return { held: false as const, text, jobId: runtime.jobId, opRef: runtime.opRef, sessionKey: runtime.sessionKey };
+		} finally {
+			signal?.removeEventListener("abort", abort);
+			this.#releaseRunCall(call);
 		}
-		await this.#wait(started.opRef, owner, signal);
-		const runtime = this.#db.work.workAttemptGet(started.opRef)!;
-		const reason = runtime.terminal?.reasonCode ?? "terminal_uncertain";
-		if (reason !== "end_turn") throw workError("work attempt did not complete", reason, runtime);
-		const text = this.#observers.get(runtime.opRef)?.text;
-		if (text === undefined) throw workError("work output unavailable", "output_unavailable", runtime);
-		return { held: false as const, text, jobId: runtime.jobId, opRef: runtime.opRef, sessionKey: runtime.sessionKey };
 	}
-	async #start(input: WorkInput, mode: "start" | "run"): Promise<WorkStartResult> {
+	#releaseRunCall(call: RunCall): void {
+		call.active = false;
+		call.text = undefined;
+		if (call.opRef !== undefined && this.#runCalls.get(call.opRef) === call) this.#runCalls.delete(call.opRef);
+	}
+	async #start(input: WorkInput, mode: "start" | "run", runCall?: RunCall): Promise<WorkStartResult> {
 		this.#live();
 		const parent = this.#resolveCaller(input, mode);
-		this.#job(input.name);
+		if (this.#job(input.name)) return await this.#startAdmitted(input, mode, { parent, runCall });
+		const admitting = this.#admissions.get(input.name);
+		// A same-name retry (for example after a caller timeout) must not queue a
+		// second clone, bind or send behind the admission still in progress.
+		if (admitting && admitting.failedAt === undefined)
+			return {
+				started: false,
+				held: true,
+				jobId: laneJobIdentity(input.name).jobId,
+				state: "admitting",
+				reason: "the lane start is still being admitted; check work.status",
+			};
+		const admission = { startedAt: this.#at() };
+		this.#admissions.set(input.name, admission);
+		try {
+			const result = await this.#startAdmitted(input, mode, { parent, runCall });
+			if (this.#admissions.get(input.name) === admission) this.#admissions.delete(input.name);
+			return result;
+		} catch (error) {
+			if (this.#admissions.get(input.name) === admission) {
+				if (this.#job(input.name)) this.#admissions.delete(input.name);
+				else this.#admissions.set(input.name, { ...admission, failedAt: this.#at(), reason: failureReason(error) });
+			}
+			throw error;
+		}
+	}
+	async #startAdmitted(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
 		await this.recover();
 		this.#live();
-		const sessionKey = workSessionKey(input.name);
-		return this.#port.runExclusive(sessionKey, () => this.#startLocked(input, mode, { parent }));
+		return this.#port.runExclusive(workSessionKey(input.name), () => this.#startLocked(input, mode, context));
 	}
 	async #startLocked(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
 		this.#live();
@@ -995,18 +1094,37 @@ export class WorkLaneManager {
 		job = appendAttempt(initialJob, { opRef, sessionId: binding.sessionId, startedAt: runtime.startedAt });
 		this.#prepareAttempt(runtime, job);
 
+		if (context.runCall?.active && !this.#detachedOwners.has(context.runCall.owner)) {
+			context.runCall.opRef = opRef;
+			this.#runCalls.set(opRef, context.runCall);
+		}
 		const observer = this.#register(runtime);
 		this.#attach(observer);
 		await observer.attaching;
+		if (!this.#writeCurrent(observer)) {
+			// This invocation has not called send. That local fact survives broker
+			// revocation, but must not overwrite a concurrent acceptance or terminal.
+			const current = this.#db.work.workAttemptGet(opRef);
+			const notSubmitted =
+				current && !current.settledAt && !current.terminal && !hasAcceptanceEvidence(current)
+					? this.#updateAttempt(opRef, current.version, {
+							terminal: { kind: "local", observedAt: this.#at(), reasonCode: "send_rejected" },
+						})
+					: undefined;
+			this.#live();
+			if (notSubmitted) throw workError("work send rejected", "send_rejected", notSubmitted);
+			throw workError("work send acceptance uncertain", "send_acceptance_uncertain", runtime);
+		}
 		let accepted = false;
 		let rejected = false;
 		let source: "receipt" | "status" = "receipt";
+		let transportUnavailableError = false;
 		try {
 			const receipt = await this.#port.send({
 				sessionId: runtime.sessionId,
 				repo: runtime.cwd,
 				opRef,
-				text: input.text,
+				text: this.#withDirectives(input.text, context.parent),
 				...(observer.tail ? { relay: observer.tail } : {}),
 				...(notice ? { systemPreamble: notice.text } : {}),
 				codingRegister: true,
@@ -1021,6 +1139,10 @@ export class WorkLaneManager {
 				typeof error === "object" && error !== null && "details" in error
 					? (error.details as { code?: unknown } | undefined)?.code
 					: undefined;
+			// Track transport_unavailable specifically: the message was definitely not delivered
+			if (!rejected && code === "transport_unavailable") {
+				transportUnavailableError = true;
+			}
 			console.error(
 				`work_send_error opRef=${opRef} code=${typeof code === "string" && /^[a-z_]{1,64}$/.test(code) ? code : "transport_unavailable"}`,
 			);
@@ -1033,9 +1155,11 @@ export class WorkLaneManager {
 			throw workError("work send acceptance uncertain", "send_acceptance_uncertain", runtime);
 		}
 		let latest = this.#db.work.workAttemptGet(opRef)!;
+		let statusFromQuery: PromptStatusBody | undefined;
 		if (!accepted && !rejected) {
 			try {
-				accepted = provesAcceptance(await this.#query(latest, observer.tail));
+				statusFromQuery = await this.#query(latest, observer.tail);
+				accepted = provesAcceptance(statusFromQuery);
 				source = "status";
 			} catch {
 				/* Observation owns recovery; never replay. */
@@ -1048,6 +1172,34 @@ export class WorkLaneManager {
 			this.#live();
 			throw workError("work send acceptance uncertain", "send_acceptance_uncertain", runtime);
 		}
+		// Detect provably undelivered sends: transport_unavailable AND session has no record of the operation
+		// AND broker-reported activity is idle AND session has no accepted command/user turn for this clientRef.
+		// Missing/unreported activity counts as NOT idle (per #779 rule).
+		let sendUndelivered = false;
+		if (
+			transportUnavailableError &&
+			statusFromQuery &&
+			statusFromQuery.status === "unknown" &&
+			!accepted &&
+			!rejected
+		) {
+			// Require positive broker evidence: activity must be idle AND no accepted turn/command
+			try {
+				if (this.#port.liveness) {
+					const liveness = await this.#port.liveness({ sessionId: runtime.sessionId, repo: runtime.cwd });
+					// Missing activity counts as NOT idle per #779; only settle on positive idle evidence
+					const activityIsIdle = liveness.activity?.state === "idle";
+					// Check if there's no accepted command/user turn for this clientRef
+					const noAcceptedTurn = !statusFromQuery.commandId && !statusFromQuery.turnId;
+					// Only settle if we have positive evidence of both idle + no accepted turn
+					if (activityIsIdle && noAcceptedTurn) {
+						sendUndelivered = true;
+					}
+				}
+			} catch {
+				// If liveness check fails, don't settle (uncertain)
+			}
+		}
 		latest =
 			this.#updateAttempt(
 				opRef,
@@ -1058,16 +1210,30 @@ export class WorkLaneManager {
 							sendPhase: "uncertain",
 							...(rejected
 								? { terminal: { kind: "local", observedAt: this.#at(), reasonCode: "send_rejected" } as const }
-								: {}),
+								: sendUndelivered
+									? { terminal: { kind: "local", observedAt: this.#at(), reasonCode: "send_undelivered" } as const }
+									: {}),
 						},
 			) ?? latest;
 		this.#schedule(observer, 0);
 		if (rejected) throw workError("work send rejected", "send_rejected", latest);
+		if (sendUndelivered) throw workError("work send undelivered", "send_undelivered", latest);
 		if (!accepted) throw workError("work send acceptance uncertain", "send_acceptance_uncertain", latest);
 		return { started: true, jobId, opRef, sessionKey, sessionId: runtime.sessionId };
 	}
 	async status(params: unknown): Promise<WorkStatusResult> {
 		const name = parseName(params);
+		const admission = this.#job(name) ? undefined : this.#admissions.get(name);
+		if (admission)
+			return {
+				jobId: laneJobIdentity(name).jobId,
+				state: admission.failedAt === undefined ? "admitting" : "admission_failed",
+				sessionId: "",
+				lastActivityAt: null,
+				attempt: null,
+				op: null,
+				admission: { ...admission },
+			};
 		const job = this.#job(name, true)!;
 		const key = workSessionKey(name);
 		const binding = this.#db.bindings.getSessionRecord(key);
@@ -1119,6 +1285,100 @@ export class WorkLaneManager {
 					}
 				: {}),
 		};
+	}
+	/**
+	 * Standing operator directives (#604). They are stored durably, prepended to
+	 * every later attempt of a matching lane, and steered into matching lanes that
+	 * are running when one is added, so a mid-conversation prohibition reaches
+	 * work already under way instead of living only in the conversation's memory.
+	 */
+	async directive(params: unknown): Promise<WorkDirectiveResult> {
+		if (!params || typeof params !== "object" || Array.isArray(params)) invalid("params");
+		const { action, text, id, callerSessionId } = params as Record<string, unknown>;
+		if (callerSessionId !== undefined && typeof callerSessionId !== "string") invalid("callerSessionId");
+		this.#live();
+		const scope = this.#directiveScope(callerSessionId);
+		const visible = () =>
+			this.#directives().filter(
+				(directive) =>
+					scope === OWNER_DIRECTIVE_SCOPE || directive.scope === scope || directive.scope === OWNER_DIRECTIVE_SCOPE,
+			);
+		if (action === "list") return { directives: visible() };
+		if (action === "remove") {
+			if (typeof id !== "string" || !DIRECTIVE_ID.test(id)) invalid("id");
+			const target = this.#directives().find((directive) => directive.id === id);
+			if (!target || (scope !== OWNER_DIRECTIVE_SCOPE && target.scope !== scope))
+				throw new ProtocolError("invalid_params", "unknown work directive", { reasonCode: "unknown_directive", id });
+			this.#db.core.metaDelete(`${DIRECTIVE_KEY_PREFIX}${id}`);
+			return { directives: visible() };
+		}
+		if (action !== "add") invalid("action");
+		if (typeof text !== "string" || !text.trim() || text.length > MAX_DIRECTIVE_CHARS) invalid("text");
+		if (this.#directives().filter((directive) => directive.scope === scope).length >= MAX_DIRECTIVES_PER_SCOPE)
+			throw new ProtocolError(
+				"invalid_params",
+				`at most ${MAX_DIRECTIVES_PER_SCOPE} directives per scope; remove one first`,
+				{
+					reasonCode: "directive_limit",
+				},
+			);
+		const directive: WorkDirective = {
+			id: `wd-${randomUUID().slice(0, 8)}`,
+			scope,
+			text: text.trim(),
+			createdAt: this.#at(),
+		};
+		this.#db.core.metaSet(`${DIRECTIVE_KEY_PREFIX}${directive.id}`, JSON.stringify(directive));
+		const names = new Set<string>();
+		for (const runtime of this.#db.work.workAttemptOpen(1000)) {
+			if (!runtime.sessionKey.startsWith(WORK_SESSION_PREFIX)) continue;
+			if (directiveApplies(directive, laneDirectiveScope(runtime.parent)))
+				names.add(runtime.sessionKey.slice(WORK_SESSION_PREFIX.length));
+		}
+		const propagated: { name: string; steered: boolean; reason?: string }[] = [];
+		for (const name of names) {
+			try {
+				const result = await this.steer({ name, text: directiveText([directive], "new") });
+				propagated.push(result.steered ? { name, steered: true } : { name, steered: false, reason: result.reason });
+			} catch (error) {
+				const reason =
+					error instanceof ProtocolError
+						? String((error.detail as { reasonCode?: unknown } | undefined)?.reasonCode ?? error.code)
+						: "steer_failed";
+				propagated.push({ name, steered: false, reason });
+			}
+		}
+		console.error(
+			`work_directive_added id=${directive.id} scope=${scope} lanes=${propagated.length} steered=${propagated.filter((lane) => lane.steered).length}`,
+		);
+		return { directives: visible(), propagated };
+	}
+	#directiveScope(callerSessionId: string | undefined): string {
+		const callerOrigin = callerSessionId ? this.#db.bindings.originForSessionId(callerSessionId) : undefined;
+		if (callerOrigin === undefined) return OWNER_DIRECTIVE_SCOPE;
+		if (callerOrigin.startsWith(WORK_SESSION_PREFIX))
+			throw new ProtocolError("unauthorized", "a work lane cannot set operator directives", {
+				reasonCode: "directive_from_lane",
+			});
+		return callerOrigin;
+	}
+	#directives(): WorkDirective[] {
+		const directives: WorkDirective[] = [];
+		for (const key of this.#db.core.metaKeysInRange(DIRECTIVE_KEY_PREFIX, `${DIRECTIVE_KEY_PREFIX}\uffff`)) {
+			try {
+				const value = JSON.parse(this.#db.core.metaGet(key) ?? "") as WorkDirective;
+				if (typeof value.text === "string" && typeof value.scope === "string" && typeof value.id === "string")
+					directives.push(value);
+			} catch {
+				console.error(`work_directive_unreadable key=${key}`);
+			}
+		}
+		return directives.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+	}
+	#withDirectives(text: string, parent: WorkParent | null): string {
+		const scope = laneDirectiveScope(parent);
+		const active = this.#directives().filter((directive) => directiveApplies(directive, scope));
+		return active.length === 0 ? text : `${directiveText(active, "standing")}\n\n${text}`;
 	}
 	async steer(params: unknown): Promise<WorkSteerResult> {
 		const name = parseName(params);
@@ -1265,11 +1525,45 @@ export class WorkLaneManager {
 	#dropObserver(observer: Observer, error: unknown): void {
 		const opRef = observer.runtime.opRef;
 		console.error(`work_observer_failed opRef=${JSON.stringify(opRef)} error=${failureReason(error)}`);
+		void this.#disposeObserver(observer);
+		if (this.#observers.get(opRef) === observer) this.#observers.delete(opRef);
+		this.#failures.delete(opRef);
+	}
+	/** Revoke callbacks immediately; dispose relays without waiting on our own tick. */
+	#disposeObserver(observer: Observer): Promise<void> {
+		if (observer.disposal) return observer.disposal;
 		observer.abort.abort();
 		if (observer.timer) clearTimeout(observer.timer);
 		observer.timer = undefined;
-		if (this.#observers.get(opRef) === observer) this.#observers.delete(opRef);
-		this.#failures.delete(opRef);
+		const report = (error: unknown) => {
+			console.error(`work_observer_cleanup_failed opRef=${observer.runtime.opRef} reason=${failureReason(error)}`);
+		};
+		const closeTail = async () => {
+			const tail = observer.tail;
+			observer.tail = undefined;
+			try {
+				await tail?.close();
+			} catch (error) {
+				report(error);
+			}
+		};
+		const disposal = Promise.resolve()
+			.then(async () => {
+				// Closing an acquired handle first also releases a pending ready wait.
+				await closeTail();
+				try {
+					await observer.attaching;
+				} catch (error) {
+					report(error);
+				}
+				// A late attachment is fenced and closes itself; retain cleanup ownership
+				// until that completion, including any handle acquired before revocation.
+				await closeTail();
+			})
+			.finally(() => this.#observerDisposals.delete(disposal));
+		observer.disposal = disposal;
+		this.#observerDisposals.add(disposal);
+		return disposal;
 	}
 	/** Counts the failure and reports it once per distinct reason instead of on every poll. */
 	#failed(observer: Observer, error: unknown): void {
@@ -1321,6 +1615,7 @@ export class WorkLaneManager {
 				sessionId: runtime.sessionId,
 				brokerGeneration: observer.generation,
 				repo: runtime.cwd,
+				signal: observer.abort.signal,
 				originKey: runtime.sessionKey,
 				onTurnActivity: invalidateActivity,
 				onObserverLifecycle: (kind) => {
@@ -1498,8 +1793,7 @@ export class WorkLaneManager {
 		if (!this.#writeCurrent(observer)) return;
 		let runtime = this.#db.work.workAttemptGet(observer.runtime.opRef)!;
 		if (runtime.settledAt) return;
-		const unresolvedReceipt =
-			runtime.terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined;
+		const unresolvedReceipt = unresolvedTerminalReceipt(runtime.terminal) && runtime.turnEndObservedAt === undefined;
 		if (!runtime.terminal || unresolvedReceipt) this.#attach(observer);
 		// A saved SDK terminal is still incomplete without execution-end proof.
 		// Recovery must refresh it through the same fenced path as a fresh status.
@@ -1536,6 +1830,7 @@ export class WorkLaneManager {
 			let terminal = status
 				? terminalEvidence(status, this.#at())
 				: { kind: "local" as const, observedAt: this.#at(), reasonCode: "host_lost" };
+			let hostDeathProved = false;
 			if (unresolvedReceipt && !terminal) {
 				observer.receiptDeadSince = undefined;
 				return;
@@ -1547,13 +1842,13 @@ export class WorkLaneManager {
 					(["commandId", "turnId"] as const).some(
 						(key) => runtime.terminal?.status?.[key] !== undefined && runtime.terminal.status[key] !== status[key],
 					) ||
-					(terminal?.reasonCode !== "terminal_missing_receipt" && status.receiptState !== "present"))
+					(!unresolvedTerminalReceipt(terminal) && status.receiptState !== "present"))
 			) {
 				observer.receiptDeadSince = undefined;
 				return;
 			}
 			if (
-				terminal?.reasonCode === "terminal_missing_receipt" &&
+				unresolvedTerminalReceipt(terminal) &&
 				runtime.turnEndObservedAt === undefined &&
 				observer.turnEndObservedAt === undefined
 			) {
@@ -1568,12 +1863,16 @@ export class WorkLaneManager {
 				if (idle === false) return;
 				if (idle === undefined) {
 					if (!(await this.#missingReceiptHostDead(observer, runtime, status!))) return;
-					terminal = { kind: "local", observedAt: this.#at(), reasonCode: "session_dead" };
+					hostDeathProved = true;
+					// Host death proves execution ended; it cannot replace an SDK failure cause.
+					if (status?.status !== "failed")
+						terminal = { kind: "local", observedAt: this.#at(), reasonCode: "session_dead" };
 				}
 				if (observer.activityVersion !== activityVersion) {
 					observer.receiptDeadSince = undefined;
 					return;
 				}
+				if (hostDeathProved && terminal?.kind === "broker") observer.turnEndObservedAt ??= this.#at();
 				if (idle === true) {
 					if (
 						!proofTail ||
@@ -1591,23 +1890,30 @@ export class WorkLaneManager {
 			// Keep saved terminal evidence immutable until output proves a late
 			// receipt. A refreshed terminal receipt or confirmed host death can
 			// release retrieval, but cannot rewrite the original outcome by itself.
-			if (unresolvedReceipt && terminal?.reasonCode !== "terminal_missing_receipt")
-				observer.turnEndObservedAt ??= this.#at();
+			if (unresolvedReceipt && !unresolvedTerminalReceipt(terminal)) observer.turnEndObservedAt ??= this.#at();
 			const turnEndObservedAt = runtime.turnEndObservedAt ?? observer.turnEndObservedAt;
+			const patchParts: Array<Partial<WorkAttemptPatch>> = [];
+			if (hostDeathProved && terminal?.kind === "broker" && !runtime.terminal)
+				patchParts.push({ output: { ...runtime.output, disposition: "unavailable", nextReadAt: null } });
+			if (runtime.sendPhase !== "accepted" && status && provesAcceptance(status)) {
+				patchParts.push({
+					sendPhase: "accepted" as const,
+					sendEvidence: runtime.sendEvidence ?? { source: "status" as const, observedAt: this.#at() },
+				});
+			}
+			if (turnEndObservedAt && runtime.turnEndObservedAt === undefined) {
+				patchParts.push({ turnEndObservedAt });
+			}
+			if (terminal && !runtime.terminal) {
+				patchParts.push({ terminal });
+			}
+			const patch = Object.assign({}, ...patchParts);
 			runtime =
-				this.#updateAttempt(runtime.opRef, runtime.version, {
-					...(status && provesAcceptance(status)
-						? {
-								sendPhase: "accepted" as const,
-								sendEvidence: runtime.sendEvidence ?? { source: "status" as const, observedAt: this.#at() },
-							}
-						: {}),
-					...(turnEndObservedAt && runtime.turnEndObservedAt === undefined ? { turnEndObservedAt } : {}),
-					...(terminal && !runtime.terminal ? { terminal } : {}),
-				}) ?? runtime;
+				(Object.keys(patch).length > 0 ? this.#updateAttempt(runtime.opRef, runtime.version, patch) : undefined) ??
+				runtime;
 			if (!runtime.terminal) return;
 		}
-		if (runtime.terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined) {
+		if (unresolvedTerminalReceipt(runtime.terminal) && runtime.turnEndObservedAt === undefined) {
 			const turnEndObservedAt = observer.turnEndObservedAt;
 			if (!turnEndObservedAt) return;
 			runtime =
@@ -1663,11 +1969,10 @@ export class WorkLaneManager {
 					};
 					const silent = isSilentOutput(result.text);
 					const terminal = runtime.terminal!;
-					// A terminal first observed with receiptState=missing whose same-op
-					// final body then proves present is a late receipt, not a missing one
-					// (#248): re-derive the end state from the reconciled receipt.
+					// A proven original same-op body resolves receipt uncertainty, not
+					// execution by inference. Re-derive its actual terminal outcome.
 					const reconciled =
-						terminal.kind === "broker" && terminal.status?.receiptState === "missing"
+						terminal.kind === "broker" && terminal.status !== undefined && unresolvedTerminalReceipt(terminal)
 							? terminalEvidence(
 									safeStatus({
 										...terminal.status,
@@ -1695,7 +2000,8 @@ export class WorkLaneManager {
 					});
 					if (!updated) return;
 					runtime = updated;
-					if (runtime.mode === "run" && this.#waiters.has(runtime.opRef)) observer.text = result.text;
+					const call = this.#runCalls.get(runtime.opRef);
+					if (call) call.text = result.text;
 				} else if (result.status === "unavailable" || reads >= 3) {
 					runtime =
 						this.#updateAttempt(runtime.opRef, runtime.version, {
@@ -1715,10 +2021,11 @@ export class WorkLaneManager {
 			const name = runtime.sessionKey.slice("work/task/".length);
 			const at = this.#at();
 			const reason = runtime.terminal?.reasonCode ?? "unknown";
-			// Extract transport cause for sdk_failed/terminal_missing_receipt failures
+			// Preserve bounded transport diagnostics independently of the classified cause.
 			let output = runtime.output;
 			if (
-				(reason === "sdk_failed" || reason === "terminal_missing_receipt") &&
+				(["sdk_failed", "provider_transport", "prompt_deadline_exceeded"].includes(reason) ||
+					unresolvedTerminalReceipt(runtime.terminal)) &&
 				output.disposition === "unavailable" &&
 				!output.transportCause
 			) {
@@ -1749,6 +2056,9 @@ export class WorkLaneManager {
 					console.error(`work_transport_cause_read_error opRef=${runtime.opRef} reason=${failureReason(error)}`);
 				}
 			}
+			// Diagnostics may suspend while shutdown, generation recovery or a
+			// binding change revokes this observer without changing runtime.version.
+			if (!this.#writeCurrent(observer)) return;
 			const endState = workAttemptEndState(reason);
 			let job = closeAttempt({
 				record: this.#job(name, true)!,
@@ -1808,7 +2118,7 @@ export class WorkLaneManager {
 			}
 			if (job.state !== "awaiting_checks") job = clearAwaitingChecks(job);
 
-			const text = reportText(name, endState, reason, runtime.opRef, output, facts);
+			const text = reportText(name, endState, reason, runtime.opRef, output, facts, runtime.terminal?.status);
 			let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 			let admission: WorkAttemptAdmission | undefined;
 			if (runtime.wakeReportId !== null && !hasAcceptanceEvidence(runtime)) {
@@ -1917,8 +2227,9 @@ export class WorkLaneManager {
 		}
 		if (this.#current(observer) && this.#db.work.workAttemptGet(runtime.opRef)?.settledAt) {
 			observer.tail?.setTurnRunning(false);
-			await observer.tail?.close();
-			observer.tail = undefined;
+			await this.#disposeObserver(observer);
+			if (this.#observers.get(runtime.opRef) === observer) this.#observers.delete(runtime.opRef);
+			this.#failures.delete(runtime.opRef);
 		}
 	}
 	#finishWaiters(opRef: string): void {
@@ -2488,11 +2799,9 @@ export class WorkLaneManager {
 				const prior = this.#observers.get(runtime.opRef);
 				if (prior && this.#writeCurrent(prior)) continue;
 				if (prior) {
-					prior.abort.abort();
-					if (prior.timer) clearTimeout(prior.timer);
-					await prior.attaching;
+					const disposal = this.#disposeObserver(prior);
 					await prior.task;
-					await prior.tail?.close();
+					await disposal;
 				}
 				if (this.#stopped) return;
 				const observer = this.#register(runtime);
@@ -2509,9 +2818,36 @@ export class WorkLaneManager {
 					statusError = error;
 				}
 				if (!this.#current(observer)) continue;
+				if (status?.status === "unknown" && this.#port.promptRefusal) {
+					// Serialize with live send/retry owners. Unknown alone is never a
+					// rejection: only the port's durable non-admission proof may end it.
+					const rejected = await this.#port.runExclusive(runtime.sessionKey, async () => {
+						const latest = this.#db.work.workAttemptGet(runtime.opRef);
+						if (!this.#writeCurrent(observer) || !latest || latest.terminal || hasAcceptanceEvidence(latest))
+							return false;
+						try {
+							if (
+								this.#port.promptRefusal?.({ sessionId: latest.sessionId, repo: latest.cwd, opRef: latest.opRef }) !==
+								"busy"
+							)
+								return false;
+						} catch {
+							return false; // Unavailable refusal evidence remains unknown.
+						}
+						return (
+							this.#updateAttempt(latest.opRef, latest.version, {
+								terminal: { kind: "local", observedAt: this.#at(), reasonCode: "send_rejected" },
+							}) !== undefined
+						);
+					});
+					if (rejected) {
+						this.#schedule(observer, 0);
+						continue;
+					}
+					if (!this.#current(observer)) continue;
+				}
 				const terminal = status && terminalEvidence(status, this.#at());
-				const terminalStillRunning =
-					terminal?.reasonCode === "terminal_missing_receipt" && runtime.turnEndObservedAt === undefined;
+				const terminalStillRunning = unresolvedTerminalReceipt(terminal) && runtime.turnEndObservedAt === undefined;
 				if (terminal && !terminalStillRunning && this.#writeCurrent(observer)) {
 					this.#updateAttempt(runtime.opRef, runtime.version, {
 						...(provesAcceptance(status!)
@@ -2605,6 +2941,10 @@ export class WorkLaneManager {
 	#wait(opRef: string, owner: object, signal?: AbortSignal): Promise<void> {
 		this.#live();
 		if (this.#detachedOwners.has(owner)) throw new ProtocolError("gateway_shutting_down", "gateway is stopping");
+		if (signal?.aborted)
+			throw new ProtocolError("verb_failed", "work wait detached; attempt remains observable", {
+				reasonCode: "work_wait_detached",
+			});
 		if (this.#db.work.workAttemptGet(opRef)?.settledAt) return Promise.resolve();
 		return new Promise<void>((resolve, reject) => {
 			const set = this.#waiters.get(opRef) ?? new Set<Waiter>();
@@ -2644,29 +2984,28 @@ export class WorkLaneManager {
 	}
 	detachWaiters(owner: object): void {
 		this.#detachedOwners.add(owner);
+		for (const call of this.#runCalls.values()) if (call.owner === owner) this.#releaseRunCall(call);
 		for (const set of this.#waiters.values())
 			for (const waiter of [...set])
 				if (waiter.owner === owner) waiter.finish(new ProtocolError("gateway_shutting_down", "gateway is stopping"));
 	}
 	async #detachObservers(): Promise<void> {
 		const observers = [...this.#observers.values()];
-		for (const observer of observers) {
-			observer.abort.abort();
-			if (observer.timer) clearTimeout(observer.timer);
-		}
 		await Promise.all(
 			observers.map(async (observer) => {
-				await observer.attaching;
+				const disposal = this.#disposeObserver(observer);
 				await observer.task;
-				await observer.tail?.close();
+				await disposal;
 			}),
 		);
+		while (this.#observerDisposals.size) await Promise.all([...this.#observerDisposals]);
 		this.#observers.clear();
 	}
 
 	stop(): Promise<void> {
 		if (this.#stopPromise) return this.#stopPromise;
 		this.#stopped = true;
+		for (const call of this.#runCalls.values()) this.#releaseRunCall(call);
 		for (const set of this.#waiters.values())
 			for (const waiter of [...set]) waiter.finish(new ProtocolError("gateway_shutting_down", "gateway is stopping"));
 		const lanesStopped = this.#options.lanes.stop();
@@ -2738,6 +3077,32 @@ function makeRuntime(
 		version: 0,
 	};
 }
+const WORK_SESSION_PREFIX = "work/task/";
+const OWNER_DIRECTIVE_SCOPE = "owner";
+const DIRECTIVE_KEY_PREFIX = "work_directive:";
+const DIRECTIVE_ID = /^wd-[0-9a-f]{8}$/;
+const MAX_DIRECTIVE_CHARS = 2_000;
+const MAX_DIRECTIVES_PER_SCOPE = 50;
+
+/** The persona conversation a lane answers to, or `owner` for lanes started outside one. */
+function laneDirectiveScope(parent: WorkParent | null): string {
+	if (parent?.kind === "persona") return parent.originKey;
+	if (parent?.kind === "lane" && parent.root) return parent.root.originKey;
+	return OWNER_DIRECTIVE_SCOPE;
+}
+
+function directiveApplies(directive: WorkDirective, laneScope: string): boolean {
+	return directive.scope === OWNER_DIRECTIVE_SCOPE || directive.scope === laneScope;
+}
+
+function directiveText(directives: readonly WorkDirective[], kind: "standing" | "new"): string {
+	const lead =
+		kind === "new"
+			? "[New standing directive from your operator. It overrides your task from now on: follow it before your next tool call, and stop any step that violates it.]"
+			: "[Standing directives from your operator. They override anything in the task below; follow them for the whole lane.]";
+	return [lead, ...directives.map((directive) => `- (${directive.id}) ${directive.text}`)].join("\n");
+}
+
 function invalid(field: string): never {
 	throw new ProtocolError("invalid_params", "invalid work parameters", { reasonCode: "invalid_work_params", field });
 }
@@ -2968,14 +3333,17 @@ function safeStatus(status: PromptStatusBody): PromptStatusBody {
 			...(status.outcome.reason
 				? { reason: reasons.has(status.outcome.reason) ? status.outcome.reason : "stopped_incomplete" }
 				: {}),
-			...(["stopped", "success", "failure", "cancelled", "completed"].includes(status.outcome.kind ?? "")
-				? { kind: status.outcome.kind }
-				: {}),
-			...(["client_cancel", "runtime", "broker", "receipt"].includes(status.outcome.provenance ?? "")
-				? { provenance: status.outcome.provenance }
-				: {}),
+			...Object.fromEntries(
+				(Object.keys(WORK_OUTCOME_TOKENS) as Array<keyof typeof WORK_OUTCOME_TOKENS>)
+					.filter((key) => (WORK_OUTCOME_TOKENS[key] as readonly string[]).includes(status.outcome![key] ?? ""))
+					.map((key) => [key, status.outcome![key]]),
+			),
 		};
-	if (status.error) result.error = { code: reasons.has(status.error.code ?? "") ? status.error.code : "sdk_failed" };
+	if (status.error)
+		result.error = {
+			code:
+				status.error.code === "agent_error" || reasons.has(status.error.code ?? "") ? status.error.code : "sdk_failed",
+		};
 	return result;
 }
 /** Called only after #query has validated the operation and client reference. */
@@ -3049,6 +3417,8 @@ export function reportText(
 	opRef: string,
 	output: WorkAttemptRuntime["output"],
 	facts?: Awaited<ReturnType<typeof collectRepoFacts>>,
+	status?: PromptStatusBody,
+	pendingOutput = false,
 ): string {
 	const checks = facts?.checkStatus;
 	const checksVerified =
@@ -3064,12 +3434,14 @@ export function reportText(
 	const head = `[lane ${name}] ${label}: ${lead}`;
 	let body =
 		output.disposition === "unavailable"
-			? reason === "terminal_missing_receipt"
-				? `final_response_missing opRef=${opRef}`
-				: "output_unavailable"
+			? pendingOutput
+				? `final_response_pending opRef=${opRef}`
+				: reason === "terminal_missing_receipt" || status?.receiptState === "missing"
+					? `final_response_missing opRef=${opRef}`
+					: "output_unavailable"
 			: (output.excerpt ?? "");
 	// Include transport cause details if present
-	if (reason === "terminal_missing_receipt" && output.transportCause) {
+	if ((reason === "terminal_missing_receipt" || status?.receiptState === "missing") && output.transportCause) {
 		const transport = output.transportCause;
 		const parts: string[] = [body, `cause=transport`];
 		if (transport.nativeErrorCode) parts.push(transport.nativeErrorCode);
@@ -3083,6 +3455,15 @@ export function reportText(
 
 	// Reserve the suffix for repository facts so large output excerpts cannot hide check evidence.
 	const factsLines: string[] = [];
+	if (status?.status === "failed") {
+		if (status.receiptState) factsLines.push(`receiptState=${status.receiptState}`);
+		if (status.error?.code === "agent_error" || reasons.has(status.error?.code ?? ""))
+			factsLines.push(`errorCode=${status.error!.code}`);
+		for (const key of Object.keys(WORK_OUTCOME_TOKENS) as Array<keyof typeof WORK_OUTCOME_TOKENS>) {
+			const token = status.outcome?.[key];
+			if (token && (WORK_OUTCOME_TOKENS[key] as readonly string[]).includes(token)) factsLines.push(`${key}=${token}`);
+		}
+	}
 	if (facts?.headSha) {
 		factsLines.push(`head=${facts.headSha.slice(0, 12)}`);
 	}

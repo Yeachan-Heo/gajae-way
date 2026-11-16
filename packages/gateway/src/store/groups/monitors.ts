@@ -37,6 +37,8 @@ export interface MonitorFailureRow {
 	readonly protocol_reason: ProtocolFailureReason | null;
 	readonly response_byte_length: number | null;
 	readonly response_entry_count: number | null;
+	readonly session_id: string | null;
+	readonly op_ref: string | null;
 }
 
 export interface RecentMonitorFailureRow {
@@ -220,11 +222,12 @@ export class MonitorsGroup {
 			modelJson: string | null;
 			serviceTier: string | null;
 			procedureFilesJson?: string | null;
+			contextRollTokens?: number | null;
 		},
 	): void {
 		this.#db
 			.prepare(
-				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json, context_roll_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 			)
 			.run(
 				tx,
@@ -241,6 +244,7 @@ export class MonitorsGroup {
 				row.modelJson,
 				row.serviceTier,
 				row.procedureFilesJson ?? null,
+				row.contextRollTokens ?? null,
 			);
 	}
 
@@ -258,10 +262,11 @@ export class MonitorsGroup {
 		model_json: string | null;
 		service_tier: string | null;
 		procedure_files_json: string | null;
+		context_roll_tokens: number | null;
 	}> {
 		return this.#db
 			.prepare(
-				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json FROM monitors ORDER BY created_at",
+				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json, context_roll_tokens FROM monitors ORDER BY created_at",
 			)
 			.all() as Array<{
 			monitor_id: string;
@@ -277,7 +282,16 @@ export class MonitorsGroup {
 			model_json: string | null;
 			service_tier: string | null;
 			procedure_files_json: string | null;
+			context_roll_tokens: number | null;
 		}>;
+	}
+
+	/** The stored channel target JSON; `undefined` when no such monitor exists. */
+	channelTargetJson(monitorId: string): string | null | undefined {
+		const row = this.#db.prepare("SELECT channel_target_json FROM monitors WHERE monitor_id = ?").get(monitorId) as {
+			channel_target_json: string | null;
+		} | null;
+		return row ? row.channel_target_json : undefined;
 	}
 
 	update(
@@ -294,12 +308,13 @@ export class MonitorsGroup {
 			modelJson: string | null;
 			serviceTier: string | null;
 			procedureFilesJson: string | null;
+			contextRollTokens: number | null;
 		},
 	): boolean {
 		return (
 			this.#db
 				.prepare(
-					"UPDATE monitors SET name = ?, trigger_json = ?, event_types_json = ?, burst_policy = ?, channel_target_json = ?, enabled = ?, instruction = ?, model_json = ?, service_tier = ?, procedure_files_json = ? WHERE monitor_id = ?",
+					"UPDATE monitors SET name = ?, trigger_json = ?, event_types_json = ?, burst_policy = ?, channel_target_json = ?, enabled = ?, instruction = ?, model_json = ?, service_tier = ?, procedure_files_json = ?, context_roll_tokens = ? WHERE monitor_id = ?",
 				)
 				.run(
 					tx,
@@ -313,6 +328,7 @@ export class MonitorsGroup {
 					row.modelJson,
 					row.serviceTier,
 					row.procedureFilesJson,
+					row.contextRollTokens,
 					row.id,
 				).changes > 0
 		);
@@ -509,7 +525,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		detail: string,
 		now = Date.now(),
 		terminal = false,
-		options?: MonitorFailureOptions,
+		options?: MonitorFailureOptions & { sessionId?: string; opRef?: string },
 	): boolean {
 		this.#core.assertNotQuarantined("monitor", eventId);
 		const changes = this.#db
@@ -701,6 +717,22 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		return { retried: true, previousStage: row.stage };
 	}
 
+	/**
+	 * Reopen a given-up event for late-result recovery: back to `failed` with its
+	 * exhausted reclaim budget kept, so reconcile can only resume the saved turn,
+	 * never send a fresh prompt.
+	 */
+	eventReopenGivenUp(tx: WriteTx, eventId: string, now = Date.now()): boolean {
+		const nowIso = new Date(now).toISOString();
+		return (
+			this.#db
+				.prepare(
+					"UPDATE monitor_events SET stage = 'failed', updated_at = ? WHERE event_id = ? AND stage = 'failed_no_retry' AND NOT EXISTS (SELECT 1 FROM authored_outputs a WHERE a.event_id = monitor_events.event_id) AND NOT EXISTS (SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.expires_at > ?)",
+				)
+				.run(tx, nowIso, eventId, nowIso).changes > 0
+		);
+	}
+
 	eventsFailExpiredDelivery(
 		tx: WriteTx,
 		turnId: string,
@@ -788,6 +820,18 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				`SELECT * FROM monitor_events WHERE batch_id = ? AND ${REPLAYABLE_MONITOR} ORDER BY fired_at DESC, rowid DESC`,
 			)
 			.all(batchId) as MonitorEventDbRow[];
+	}
+
+	/** Terminal events whose latest failure is `code` and whose saved authoring-turn pointer is still kept. */
+	eventsGivenUp(code: string): MonitorEventDbRow[] {
+		return this.#db
+			.prepare(
+				`SELECT * FROM monitor_events WHERE stage = 'failed_no_retry' AND ${REPLAYABLE_MONITOR}
+				AND (SELECT f.code FROM monitor_failures f WHERE f.event_id = monitor_events.event_id ORDER BY f.rowid DESC LIMIT 1) = ?
+				AND EXISTS (SELECT 1 FROM meta m WHERE m.key = 'monitor_authoring_turn:' || monitor_events.event_id)
+				ORDER BY fired_at, rowid`,
+			)
+			.all(code) as MonitorEventDbRow[];
 	}
 
 	eventsOpen(): MonitorEventDbRow[] {
@@ -883,7 +927,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		return (
 			(this.#db
 				.prepare(
-					"SELECT event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 1",
+					"SELECT event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count, session_id, op_ref FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 1",
 				)
 				.get(eventId) as MonitorFailureRow | null) ?? undefined
 		);
@@ -902,7 +946,13 @@ ORDER BY monitor_failures.rowid DESC LIMIT ?`,
 			.all(limit) as RecentMonitorFailureRow[];
 	}
 
-	failureRecord(tx: WriteTx, eventId: string, code: string, detail: string, options?: MonitorFailureOptions): void {
+	failureRecord(
+		tx: WriteTx,
+		eventId: string,
+		code: string,
+		detail: string,
+		options?: MonitorFailureOptions & { sessionId?: string; opRef?: string },
+	): void {
 		const protocolFailure = options?.protocolFailure;
 		if (protocolFailure) {
 			if (!(PROTOCOL_FAILURE_REASONS as readonly string[]).includes(protocolFailure.reason))
@@ -920,7 +970,7 @@ ORDER BY monitor_failures.rowid DESC LIMIT ?`,
 		const failedAt = new Date().toISOString();
 		this.#db
 			.prepare(
-				"INSERT INTO monitor_failures (event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+				"INSERT INTO monitor_failures (event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count, session_id, op_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 			)
 			.run(
 				tx,
@@ -931,6 +981,8 @@ ORDER BY monitor_failures.rowid DESC LIMIT ?`,
 				protocolFailure?.reason ?? null,
 				protocolFailure?.responseByteLength ?? null,
 				protocolFailure?.responseEntryCount ?? null,
+				options?.sessionId ?? null,
+				options?.opRef ?? null,
 			);
 		this.#db
 			.prepare(
@@ -1060,6 +1112,8 @@ ORDER BY monitor_failures.rowid DESC LIMIT ?`,
 			this.#db.prepare("DELETE FROM monitor_failures WHERE event_id = ?").run(tx, event_id);
 			this.#db.prepare("DELETE FROM dispatch_leases WHERE event_id = ?").run(tx, event_id);
 			this.#db.prepare("DELETE FROM monitor_events WHERE event_id = ?").run(tx, event_id);
+			// A pointer outliving its event can never be recovered or matched again.
+			this.#core.metaDelete(`monitor_authoring_turn:${event_id}`);
 		}
 		const slots = this.#db
 			.prepare(

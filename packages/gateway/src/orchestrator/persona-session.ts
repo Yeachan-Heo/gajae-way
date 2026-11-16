@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { LogLevel } from "@gajae-gateway/log";
+import type { PromptImage } from "@gajae-gateway/protocol";
 import {
 	assertControlAllowed,
 	assertValidOpRef,
@@ -7,21 +8,26 @@ import {
 	CLIENT_REF_CONFLICT_CODE,
 	decideRecovery,
 	GjcCliError,
+	type HoldKind,
 	isOpRefRejection,
 	isTerminalStatus,
 	OpRefRejectedError,
+	type PromptStatus,
 	projectOpState,
 	type StatusReport,
 } from "@gajae-gateway/subsession";
 import {
+	DEFAULT_SESSIONS_BUSY_STALL_MS,
 	DEFAULT_SESSIONS_IDLE_RETIRE_MS,
 	DEFAULT_SESSIONS_MAX_LIVE_HOSTS,
+	DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
 	type GjcModelSelection,
 	type GjcServiceTier,
 	type SessionHostConfig,
 } from "../config";
 import { BrokerAuthorityError, type Store } from "../store";
 import {
+	editedOriginalId,
 	type InboundMessageRow,
 	type InboundTurn,
 	type TerminalUnlinkedReason,
@@ -33,18 +39,17 @@ import type { FailedTurnEvidence } from "./failed-turn-evidence";
 import { isSessionGoneCode } from "./gjc-contract";
 import { GjcRuntimeError, sanitizeDiagnostic } from "./rebind";
 import {
-	isSilentReply,
 	ModelNotSelectedError,
 	type SessionBinding,
+	SessionBusyStalledError,
 	type SessionContextUsage,
-	type SessionLiveness,
 	type SessionPort,
-	spokenParts,
 	type TerminateHostOutcome,
 } from "./session-port";
 import {
 	deterministicInterimDeliveryId,
 	isRelayTransportFailure,
+	MAX_RELAY_REQUEST_FRAME_BYTES,
 	TailCapacityError,
 	type TailFrame,
 	type TailHandle,
@@ -74,6 +79,15 @@ const STATUS_TERMINAL_GRACE_MS = 250;
 /** `turn.result` recheck cadence for a running turn whose end no relay will announce: 250 ms doubling to 5 s. */
 const STATUS_RECHECK_MIN_MS = 250;
 const STATUS_RECHECK_MAX_MS = 5_000;
+/**
+ * A decidable-terminal turn whose text neither the owned relay nor the original
+ * result produced must not hold forever: keep probing briefly for a late
+ * receipt, then post one notice so the conversation is never left silent.
+ */
+const TERMINAL_TEXT_RECOVERY_WINDOW_MS = 60_000;
+const TERMINAL_TEXT_RECOVERY_MAX_ATTEMPTS = 12;
+const TERMINAL_TEXT_UNRECOVERABLE_NOTICE =
+	"[turn completed] The session finished but its result text was not recoverable. Send the request again if you need the answer.";
 const HOST_TERMINATION_RECHECK_MS = 1_000;
 /**
  * A transcript row is judged against the turn's dispatch floor with this much
@@ -93,7 +107,27 @@ const SUBMISSION_RETRY_DELAY_MS = 3_000;
 const STEER_REPLAY_ATTEMPTS = 2;
 /** Bind failures back off exponentially from DISPATCH_FAILURE_RETRY_MS up to this ceiling. */
 const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
-/** Identical bind failures before the broker's own discovery file is judged. */
+const LOCAL_PREFLIGHT_REJECTION_PREFIX = "persona-local-preflight-rejection:";
+const PROMPT_TOO_LARGE_CODE = "prompt_too_large";
+
+class SendTurnNoLongerBoundError extends Error {}
+
+/** The pre-send compaction may still be running on the host; the send must wait for evidence it is over. */
+class CompactionUnresolvedError extends Error {
+	constructor(code: string | undefined) {
+		super(`compaction may still be running${code ? ` (${code})` : ""}`);
+		this.name = "CompactionUnresolvedError";
+	}
+}
+
+function localPreflightRejectionKey(opRef: string): string {
+	return `${LOCAL_PREFLIGHT_REJECTION_PREFIX}${opRef}`;
+}
+
+function localPreflightRejection(store: Store, opRef: string): string | undefined {
+	const code = store.core.metaGet(localPreflightRejectionKey(opRef));
+	return code === PROMPT_TOO_LARGE_CODE ? code : undefined;
+}
 
 function freshTurnMetaKey(originKey: string, epoch: number, triggerMessageId: string): string {
 	return `fresh_turn_attempt:${originKey}:${epoch}:${triggerMessageId}`;
@@ -131,6 +165,182 @@ function providerTransportRetryAttempt(
 	return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
+/** `work`'s result, or undefined when it is still running at `deadlineMs` (epoch ms). */
+async function beforeDeadline<T>(work: Promise<T>, deadlineMs: number): Promise<T | undefined> {
+	if (!Number.isFinite(deadlineMs)) return await work;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			work,
+			new Promise<undefined>((resolve) => {
+				timer = setTimeout(() => resolve(undefined), Math.max(0, deadlineMs - Date.now()));
+			}),
+		]);
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+	}
+}
+
+/** An escalated hold (#686) whose late answer is still wanted; restored on adoption after a restart. */
+function escalatedHoldKey(opRef: string): string {
+	return `escalated-hold:${opRef}`;
+}
+
+/** Session of an origin whose last pre-send compaction may still be running. */
+function unresolvedCompactionKey(originKey: string): string {
+	return `compaction-unresolved:${originKey}`;
+}
+
+/** Track relay unavailable events for a turn to detect unresponsive relays even on live hosts (#766). */
+function relayUnavailableTrackerKey(opRef: string): string {
+	return `relay_unavailable:${opRef}`;
+}
+
+/**
+ * First miss of a terminal operation's result text. Durable so the bounded
+ * recovery window still expires after a gateway restart instead of restarting.
+ */
+function terminalTextMissKey(opRef: string): string {
+	return `terminal_text_miss:${opRef}`;
+}
+
+const ESCALATION_NOTICE_PREFIX = "escalation-notice:";
+
+/**
+ * Durable intent to post an escalation notice, deleted once the delivery ledger
+ * owns it. Inbox retention keeps the trigger row while this key exists.
+ */
+function escalationNoticeKey(originKey: string, opRef: string): string {
+	return `${ESCALATION_NOTICE_PREFIX}${originKey}#${opRef}`;
+}
+
+/** Origins holding an undelivered escalation notice; op-refs never contain `#`, origin keys may. */
+function escalationNoticeOrigins(store: Store): string[] {
+	return store.core
+		.metaKeysInRange(ESCALATION_NOTICE_PREFIX, `${ESCALATION_NOTICE_PREFIX}\uffff`)
+		.map((key) => key.slice(ESCALATION_NOTICE_PREFIX.length, key.lastIndexOf("#")));
+}
+
+function stalledExitProofKey(opRef: string): string {
+	return `stalled-turn-exit:${createHash("sha256")
+		.update(JSON.stringify([opRef]))
+		.digest("hex")}`;
+}
+
+type StalledExitOwner = {
+	readonly opRef: string;
+	readonly originKey: string;
+	readonly sessionId: string;
+	readonly epoch: number;
+	readonly repo: string;
+};
+
+/** The durable turn and current broker must still own the exact original producer. */
+function stalledExitOwner(store: Store, owner: StalledExitOwner) {
+	const row = store.inbox.turnRow(owner.opRef);
+	const authority = store.bindings.authority;
+	if (
+		!authority ||
+		!row ||
+		row.state !== "pending" ||
+		(row.turn_state !== "accepted" && row.turn_state !== "bound") ||
+		row.origin_key !== owner.originKey ||
+		row.bound_session_id !== owner.sessionId ||
+		row.turn_epoch !== owner.epoch ||
+		store.bindings.isQuarantined("inbound", row.message_id)
+	)
+		return undefined;
+	try {
+		const binding = store.bindings.assertOwnedSession(owner.sessionId, owner.repo, authority);
+		if (binding.originKey !== owner.originKey || binding.epoch !== owner.epoch || binding.repo !== owner.repo)
+			return undefined;
+		return { ...owner, authority };
+	} catch (error) {
+		if (error instanceof BrokerAuthorityError) return undefined;
+		throw error;
+	}
+}
+
+function confirmedStalledExit(store: Store, owner: StalledExitOwner): boolean {
+	const current = stalledExitOwner(store, owner);
+	const raw = store.core.metaGet(stalledExitProofKey(owner.opRef));
+	if (!current || raw === undefined) return false;
+	try {
+		const proof = JSON.parse(raw);
+		return (
+			proof !== null &&
+			proof.version === 1 &&
+			(proof.outcome === "terminated" || proof.outcome === "already_gone") &&
+			proof.opRef === current.opRef &&
+			proof.originKey === current.originKey &&
+			proof.sessionId === current.sessionId &&
+			proof.epoch === current.epoch &&
+			proof.repo === current.repo &&
+			proof.authority?.identity === current.authority.identity &&
+			proof.authority?.canonicalAgentDir === current.authority.canonicalAgentDir
+		);
+	} catch {
+		return false;
+	}
+}
+
+function persistStalledExit(
+	store: Store,
+	owner: ReturnType<typeof stalledExitOwner>,
+	outcome: "terminated" | "already_gone",
+): boolean {
+	if (!owner) return false;
+	return store.transaction(() => {
+		const current = stalledExitOwner(store, owner);
+		if (
+			!current ||
+			current.authority.identity !== owner.authority.identity ||
+			current.authority.canonicalAgentDir !== owner.authority.canonicalAgentDir
+		)
+			return false;
+		const key = stalledExitProofKey(owner.opRef);
+		// Never repair or overwrite a foreign/malformed proof into authority.
+		if (store.core.metaGet(key) !== undefined) return confirmedStalledExit(store, owner);
+		store.core.metaSet(key, JSON.stringify({ ...current, version: 1, outcome }));
+		return true;
+	});
+}
+
+function ownedTurnPrompt(store: Store, opRef: string) {
+	const trigger = store.inbox.turnRow(opRef);
+	if (!trigger?.bound_session_id || trigger.turn_epoch === null) return undefined;
+	const authority = store.bindings.authority;
+	const repo = store.bindings.workLaneRepoBySessionId(trigger.bound_session_id);
+	if (!authority || !repo) return undefined;
+	try {
+		const owned = store.bindings.assertOwnedSession(trigger.bound_session_id, repo, authority);
+		if (owned.originKey !== trigger.origin_key || owned.epoch !== trigger.turn_epoch) return undefined;
+		return { sessionId: owned.sessionId, opRef, originKey: owned.originKey, epoch: owned.epoch, repo: owned.repo };
+	} catch (error) {
+		if (error instanceof BrokerAuthorityError) return undefined;
+		throw error;
+	}
+}
+
+/** Release refusal evidence only after this captured owner completes durably. */
+function completeInboundTurn(
+	store: Store,
+	tx: WriteTx,
+	opRef: string,
+	unlinkedReason: TerminalUnlinkedReason = "no_delivery",
+): number {
+	const prompt = ownedTurnPrompt(store, opRef);
+	const consumeExit = prompt !== undefined && confirmedStalledExit(store, prompt);
+	const changed = store.inbox.turnComplete(tx, opRef, unlinkedReason);
+	if (changed === 1 && prompt) store.bindings.abandonBrokerPromptBusyRefusal(tx, prompt);
+	if (changed === 1 && consumeExit) store.core.metaDelete(stalledExitProofKey(opRef));
+	if (changed === 1) store.core.metaDelete(escalatedHoldKey(opRef));
+	// Clean up relay unavailability tracker when turn completes (#766)
+	if (changed === 1) store.core.metaDelete(relayUnavailableTrackerKey(opRef));
+	if (changed === 1) store.core.metaDelete(terminalTextMissKey(opRef));
+	return changed;
+}
+
 export function retryInboundTurn(store: Store, tx: WriteTx, opRef: string): number {
 	store.core.assertActive(tx);
 	const trigger = store.inbox.turnRow(opRef);
@@ -141,8 +351,12 @@ export function retryInboundTurn(store: Store, tx: WriteTx, opRef: string): numb
 	const key = freshTurnMetaKey(trigger.origin_key, trigger.turn_epoch, trigger.message_id);
 	const prior = Number.parseInt(store.core.metaGet(key) ?? "0", 10);
 	const attempt = Number.isSafeInteger(prior) && prior >= 0 ? prior + 1 : 1;
+	const prompt = ownedTurnPrompt(store, opRef);
+	const consumeExit = prompt !== undefined && confirmedStalledExit(store, prompt);
 	store.core.metaSet(key, String(attempt));
-	store.inbox.turnRequeue(tx, opRef);
+	const changed = store.inbox.turnRequeue(tx, opRef);
+	if (changed > 0 && prompt) store.bindings.abandonBrokerPromptBusyRefusal(tx, prompt);
+	if (changed > 0 && consumeExit) store.core.metaDelete(stalledExitProofKey(opRef));
 	return attempt;
 }
 
@@ -216,7 +430,7 @@ export function resetFailedTurn(
 		(cap !== undefined && cap !== "0" && !input.bypassCap)
 	)
 		return undefined;
-	if (store.inbox.turnComplete(tx, input.opRef, "turn_failed") !== 1)
+	if (completeInboundTurn(store, tx, input.opRef, "turn_failed") !== 1)
 		throw new Error("failed turn completion lost its fence");
 	store.core.metaSet(dedupeKey, "1");
 	store.core.metaSet(capKey, "1");
@@ -228,21 +442,6 @@ export const BIND_WEDGE_PROBE_STRIKES = 5;
 const HOST_CAPACITY_RETRY_MS = 5_000;
 export type HostRetireReason = "host_capacity" | "host_idle";
 export type HostAdmission = { readonly admitted: true } | { readonly admitted: false; readonly live: number };
-/** Consecutive recovery sweeps (60s apart) an unknown op on a live idle session is held before release. */
-const HOLD_RELEASE_SWEEPS = 2;
-/**
- * An ACCEPTED turn still unresolved (status in_flight/unknown/unreadable, or
- * terminal_ok with its output never provable) on a session the broker reports
- * live and `idle` for this long is wedged, not working: nothing will ever
- * settle it (live 2026-09-29: a host whose prompt was force-ended mid-tool
- * kept `turn.result` in_flight forever; another's receipt stayed `missing`).
- * It is released - answer recovered from the transcript, host ended if the
- * turn is not terminal - instead of held until an operator restarts the host.
- * A session doing anything but idling is never released by this rule.
- */
-export const WEDGED_TURN_IDLE_MS = 10 * 60_000;
-/** A held turn's liveness is re-probed for the wedge rule at most this often (reconcile runs every few seconds). */
-const WEDGED_PROBE_INTERVAL_MS = 30_000;
 /**
  * Sends between full persona preambles on one session when nothing proved the
  * context lost it. A compaction that both starts and regrows inside one turn
@@ -289,6 +488,8 @@ export const PERSONA_RESTART_DRAIN_MAX_WAIT_MS = 300_000;
  */
 export interface PersonaTurnLifecycle {
 	readonly text: string;
+	/** Image inputs associated with the trigger; image rows cannot be consumed as text-only steers. */
+	readonly images?: readonly PromptImage[];
 	/**
 	 * Stable persona preamble. The actor puts it into a session's context on the
 	 * first send, after it changes, after the context shrank (compaction) or a
@@ -350,6 +551,12 @@ export interface PersonaTurnIdentity {
 export interface PersonaTurnStartInput extends PersonaTurnIdentity {
 	/** The trigger row; the one prompt body of this turn. */
 	readonly trigger: InboundMessageRow;
+	/**
+	 * Present only for a settlement lifecycle: the context an already sent prompt
+	 * durably claimed, or only the failed trigger for a local preflight rejection.
+	 * No new context window is prepared or committed for it (#686).
+	 */
+	readonly sentContextIds?: readonly string[];
 }
 
 export interface PersonaTailFrameInput extends PersonaTurnIdentity {
@@ -395,6 +602,11 @@ export interface PersonaBindHoldInput {
 	readonly notice: string;
 	readonly verdict: BrokerLivenessVerdict | undefined;
 }
+
+/** Bind-hold reason for a turn whose unresolved hold was escalated to a retired hold (#686). */
+export const UNRESOLVED_HOLD_ESCALATED = "unresolved_hold_escalated";
+const UNRESOLVED_HOLD_NOTICE =
+	"[turn held] I could not confirm whether my answer to an earlier message finished, so I will not run it again. Newer messages continue in a fresh session; if that earlier answer still arrives, it will be posted here.";
 
 export const AGENT_RUN_GRACE_MS = 120_000;
 export const AGENT_RUN_MAX_MS = 6 * 60 * 60_000;
@@ -492,10 +704,20 @@ export interface PersonaSessionManagerOptions {
 	}) => void;
 	/** Reports a session as ready after it accepts an inbound turn. */
 	readonly onSessionReady?: (input: { readonly originKey: string; readonly at: number }) => void;
+	/** Fires once when a restart drain id first takes the dispatch hold; repeated drain calls for it do not. */
+	readonly onRestartDrainStarted?: (restartId: string) => void;
+	/** Fires when a restart drain is cancelled and dispatch resumes without this process exiting for it. */
+	readonly onRestartDrainCancelled?: (restartId: string) => void;
+	/** Fires when a supervisor's dispatch hold is handed to an owner restart. */
+	readonly onRestartDrainTransferred?: (restartId: string, nextRestartId: string) => void;
 	/** Cap on concurrently live persona session hosts; default DEFAULT_SESSIONS_MAX_LIVE_HOSTS. */
 	readonly maxLiveHosts?: number;
 	/** Idle persona hosts older than this are ended by sweepIdleHosts; default DEFAULT_SESSIONS_IDLE_RETIRE_MS. */
 	readonly hostIdleRetireMs?: number;
+	/** Busy host without progress for this long is ended and rebound; default DEFAULT_SESSIONS_BUSY_STALL_MS (#687). */
+	readonly busyStallMs?: number;
+	/** Unknown-state turn on a dead host holds its origin at most this long; default DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS (#686). */
+	readonly unresolvedHoldMs?: number;
 	/** Called when a reverse request from the SDK host arrives. */
 	readonly onReverseRequest?: (input: {
 		originKey: string;
@@ -546,6 +768,9 @@ export class PersonaSessionManager {
 	readonly #onSessionCreateFailure: PersonaSessionManagerOptions["onSessionCreateFailure"];
 	readonly #onPreSendFailure: PersonaSessionManagerOptions["onPreSendFailure"];
 	readonly #onSessionReady: PersonaSessionManagerOptions["onSessionReady"];
+	readonly #onRestartDrainStarted: PersonaSessionManagerOptions["onRestartDrainStarted"];
+	readonly #onRestartDrainCancelled: PersonaSessionManagerOptions["onRestartDrainCancelled"];
+	readonly #onRestartDrainTransferred: PersonaSessionManagerOptions["onRestartDrainTransferred"];
 	readonly #log: (line: string, level?: LogLevel) => void;
 	readonly #actors = new Map<string, OriginActor>();
 	/** Host slots claimed by bind attempts that have not yet become live actors. */
@@ -554,6 +779,8 @@ export class PersonaSessionManager {
 	#hostReplacementAdmissionOwner: OriginActor | undefined;
 	#maxLiveHosts: number;
 	#hostIdleRetireMs: number;
+	#busyStallMs: number;
+	#unresolvedHoldMs: number;
 	#draining = false;
 	#restartDrainId: string | undefined;
 	#stopped = false;
@@ -588,12 +815,29 @@ export class PersonaSessionManager {
 			DEFAULT_SESSIONS_IDLE_RETIRE_MS,
 			"hostIdleRetireMs",
 		);
+		this.#busyStallMs = positiveInteger(options.busyStallMs, DEFAULT_SESSIONS_BUSY_STALL_MS, "busyStallMs");
+		this.#unresolvedHoldMs = positiveInteger(
+			options.unresolvedHoldMs,
+			DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
+			"unresolvedHoldMs",
+		);
 		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
 		this.#onSloEvent = options.onSloEvent;
 		this.#onBindFailure = options.onBindFailure;
 		this.#onSessionCreateFailure = options.onSessionCreateFailure;
 		this.#onPreSendFailure = options.onPreSendFailure;
 		this.#onSessionReady = options.onSessionReady;
+		this.#onRestartDrainStarted = options.onRestartDrainStarted;
+		this.#onRestartDrainCancelled = options.onRestartDrainCancelled;
+		this.#onRestartDrainTransferred = options.onRestartDrainTransferred;
+	}
+
+	#observeRestartDrain(event: string, notify: () => void): void {
+		try {
+			notify();
+		} catch (error) {
+			this.#log(`persona restart drain ${event} observer failed: ${safeDiagnostic(error)}`, "error");
+		}
 	}
 
 	/** Call only after inboundEnqueue's durable acceptance boundary. */
@@ -652,6 +896,20 @@ export class PersonaSessionManager {
 		if (this.#stopped) return;
 		this.#maxLiveHosts = positiveInteger(config?.maxLiveHosts, DEFAULT_SESSIONS_MAX_LIVE_HOSTS, "maxLiveHosts");
 		this.#hostIdleRetireMs = positiveInteger(config?.idleRetireMs, DEFAULT_SESSIONS_IDLE_RETIRE_MS, "hostIdleRetireMs");
+		this.#busyStallMs = positiveInteger(config?.busyStallMs, DEFAULT_SESSIONS_BUSY_STALL_MS, "busyStallMs");
+		this.#unresolvedHoldMs = positiveInteger(
+			config?.unresolvedHoldMs,
+			DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
+			"unresolvedHoldMs",
+		);
+	}
+
+	get busyStallMs(): number {
+		return this.#busyStallMs;
+	}
+
+	get unresolvedHoldMs(): number {
+		return this.#unresolvedHoldMs;
 	}
 
 	get maxLiveHosts(): number {
@@ -772,10 +1030,16 @@ export class PersonaSessionManager {
 		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).rebindModel(selection));
 	}
 
-	/** Recovers nonterminal turns, pending inputs, and terminal turns' unresolved held steers after restart. */
+	/**
+	 * Recovers nonterminal turns, pending inputs, terminal turns' unresolved held
+	 * steers and undelivered escalation notices after restart. A notice intent is
+	 * its own discovery source: its turn may have settled and its binding been
+	 * cleared, leaving nothing else that would ever visit the origin.
+	 */
 	recover(): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
 		const origins = new Set<string>([
+			...escalationNoticeOrigins(this.#database),
 			...this.#database.inbox.nonterminalOrigins(),
 			...this.#database.inbox.pendingOrigins(),
 			...this.#database.inbox.heldSteerOrigins(),
@@ -866,13 +1130,17 @@ export class PersonaSessionManager {
 		if (this.#stopped) return "stopped";
 		if (this.#restartDrainId !== undefined && this.#restartDrainId !== restartId)
 			throw new Error(`restart drain already owned by ${this.#restartDrainId}`);
+		const firstEntry = this.#restartDrainId === undefined;
 		this.#restartDrainId = restartId;
 		const deadline = Date.now() + waitMs;
 		this.#log(`persona_restart_drain_started id=${restartId} waitMs=${waitMs}`);
+		if (firstEntry) this.#observeRestartDrain("start", () => this.#onRestartDrainStarted?.(restartId));
 		for (;;) {
 			if (this.#stopped || this.#restartDrainId !== restartId) return "stopped";
 			const actors = [...this.#actors.values()];
-			const checks = Promise.all(actors.map((actor) => actor.enqueue(async () => actor.hasUnsettledTurns())));
+			const checks = Promise.all(
+				actors.map((actor) => actor.enqueue(async () => await actor.hasUnsettledTurns(deadline))),
+			);
 			let timer: ReturnType<typeof setTimeout> | undefined;
 			const timedOut = Symbol("restart drain timed out");
 			let unsettled: (boolean | undefined)[] | typeof timedOut;
@@ -909,6 +1177,7 @@ export class PersonaSessionManager {
 		if (this.#restartDrainId !== restartId) return false;
 		this.#restartDrainId = undefined;
 		this.#log(`persona_restart_drain_cancelled id=${restartId}`);
+		this.#observeRestartDrain("cancel", () => this.#onRestartDrainCancelled?.(restartId));
 		for (const actor of this.#actors.values())
 			void actor
 				.enqueue(async () => await actor.admit())
@@ -924,6 +1193,7 @@ export class PersonaSessionManager {
 		if (this.#restartDrainId !== restartId) return false;
 		this.#restartDrainId = nextRestartId;
 		this.#log(`persona_restart_drain_transferred from=${restartId} to=${nextRestartId}`);
+		this.#observeRestartDrain("transfer", () => this.#onRestartDrainTransferred?.(restartId, nextRestartId));
 		return true;
 	}
 
@@ -1054,11 +1324,14 @@ export class PersonaSessionManager {
 		await this.#onHeldSteerAccepted?.(input);
 	}
 
-	async emitBindHold(input: PersonaBindHoldInput): Promise<void> {
+	/** False when the notice hook failed; a durable notice intent is then retried. */
+	async emitBindHold(input: PersonaBindHoldInput): Promise<boolean> {
 		try {
 			await this.#onBindHold?.(input);
+			return true;
 		} catch (error) {
 			this.#log(`persona_bind_hold_notice_failed origin=${input.originKey} detail=${safeDiagnostic(error)}`, "error");
+			return false;
 		}
 	}
 
@@ -1087,6 +1360,8 @@ type BoundTurn = PersonaTurnIdentity & {
 	 * delivered and its terminal completes the turn like a current one.
 	 */
 	answerWanted: boolean;
+	/** Only blocked restart probes are shared across the drain loop's short polling interval. */
+	restartDrainVerdict?: { checkedAtMs: number; blocked: true };
 	/**
 	 * The relay that owned this turn is gone (died mid-turn, or the turn was
 	 * adopted after a restart): its content will never arrive on a stream, so
@@ -1100,6 +1375,10 @@ type BoundTurn = PersonaTurnIdentity & {
 	statusRechecks: number;
 	/** A live tail stalled; keep reconciling status until it emits another frame or reaches terminal state. */
 	statusRecheckAfterStall: boolean;
+	/** Terminal status is decidable, but neither the tail nor the original result produced text. */
+	terminalTextMisses: number;
+	/** First terminal-text miss for this turn; bounds how long a late receipt is awaited. */
+	terminalTextFirstMissAtMs?: number;
 	/** First live-tail stall timestamp; only a nonterminal operation can expire against this deadline. */
 	stallStartedAtMs?: number;
 	/** Tail activity version captured when the current stall began. */
@@ -1110,6 +1389,14 @@ type BoundTurn = PersonaTurnIdentity & {
 	stallHostTerminated?: boolean;
 	/** SIGTERM was accepted, but the host process has not yet been confirmed exited. */
 	stallHostTerminating?: boolean;
+	/**
+	 * The transcript showed, before the stall cutoff stopped the host, that the
+	 * reply the owned relay delivered ended with stopReason "stop" (#768). A
+	 * stopped host answers no transcript read, so closure cannot probe it later.
+	 */
+	stallReplyConcluded?: boolean;
+	/** Original authority captured before signalling; never refreshed into a new broker's proof. */
+	stallExitOwner?: NonNullable<ReturnType<typeof stalledExitOwner>>;
 	/** A stalled retired hold already attempted its one allowed host termination. */
 	retiredHostTerminationAttempted?: boolean;
 	/** Repeated output discarded from a retired turn is summarized once per discard interval. */
@@ -1314,8 +1601,60 @@ class OriginActor {
 		return this.#state;
 	}
 
-	hasUnsettledTurns(): boolean {
-		return this.#state !== "idle" || this.#current !== undefined || this.#retired.size > 0;
+	/**
+	 * Restart-drain check. `deadlineMs` (epoch ms) is the drain's own deadline: a
+	 * host probe still running then counts as blocked and releases this actor's
+	 * queue, so a hung status read or inspect cannot hold up the origin after
+	 * the drain has given up.
+	 */
+	async hasUnsettledTurns(deadlineMs = Number.POSITIVE_INFINITY): Promise<boolean> {
+		if (this.#state !== "idle" || this.#current !== undefined) return true;
+		for (const bound of this.#retired.values()) {
+			// Only a detached escalated hold whose operation is not reported active and
+			// whose host process is proven exited by OS `ps` can be skipped: recovery
+			// readopts it from the durable marker and pending trigger, and no producer
+			// can be lost. Registry liveness alone is not process-exit evidence.
+			if (
+				bound.answerWanted !== true ||
+				bound.detached !== true ||
+				this.#manager.database.core.metaGet(escalatedHoldKey(bound.turn.opRef)) === undefined
+			) {
+				bound.restartDrainVerdict = undefined;
+				return true;
+			}
+			// Only a blocked verdict is cached. An exemption is re-proven on every
+			// drain poll, because it lets the restart go ahead while this turn's
+			// producer would be lost if the host were in fact still running.
+			const verdict = bound.restartDrainVerdict;
+			if (verdict && this.#manager.now() - verdict.checkedAtMs < STATUS_RECHECK_MIN_MS) return true;
+			const blocked = await beforeDeadline(this.#restartDrainProbe(bound), deadlineMs);
+			if (blocked === undefined) return true;
+			if (this.#stopped || this.#manager.stopped) return true;
+			bound.restartDrainVerdict = blocked ? { checkedAtMs: this.#manager.now(), blocked: true } : undefined;
+			if (blocked) return true;
+		}
+		return false;
+	}
+
+	/** True unless the held operation is reported settled and its host process is proven exited. */
+	async #restartDrainProbe(bound: BoundTurn): Promise<boolean> {
+		try {
+			const report = await this.#statusForRecovery(bound.sessionId, bound.turn.opRef);
+			if (this.#stopped || this.#manager.stopped) return true;
+			const port = this.#manager.port;
+			// A report for another (or no) operation says nothing about this one, as in recovery.
+			if (
+				report.operationRef !== bound.turn.opRef ||
+				report.status.status === "accepted" ||
+				report.status.status === "in_flight" ||
+				port.hostExited === undefined
+			)
+				return true;
+			return (await port.hostExited({ sessionId: bound.sessionId, repo: this.#manager.repo })) !== true;
+		} catch {
+			// Unreadable host evidence keeps the producer fence.
+			return true;
+		}
 	}
 
 	enqueue<T>(work: () => Promise<T>): Promise<T | undefined> {
@@ -1432,29 +1771,21 @@ class OriginActor {
 
 	async recover(): Promise<void> {
 		this.#recoveryScanned = true;
-		for (const turn of this.#manager.database.inbox.nonterminalTurns(this.originKey)) {
+		await this.#emitEscalationNotices();
+		const turns = this.#manager.database.inbox.nonterminalTurns(this.originKey);
+		const open = new Set(turns.map((turn) => turn.opRef));
+		for (const key of this.#loggedRecoveryHolds) {
+			const opRef = key.split(":")[0];
+			if (opRef && !open.has(opRef)) this.#loggedRecoveryHolds.delete(key);
+		}
+		for (const turn of turns) {
 			if (this.#current?.turn.opRef === turn.opRef || this.#retired.has(retiredKey({ epoch: turn.epoch, turn })))
 				continue;
 			try {
 				await this.#recoverTurn(turn);
 			} catch (error) {
-				// A BOUND (never acknowledged) turn whose session the broker disowns
-				// when the tail is attached has no operation anywhere: release it
-				// like the other disowned paths instead of crashing the actor. Every
-				// main cutover from a schema-16 home hit this (three boxes, 2026-09-05)
-				// and each needed the row hand-edited before the origin worked again.
-				if (turn.state === "bound" && sdkStatusErrorCode(error) === "session_unavailable") {
-					const retired = turn.epoch < this.#epoch();
-					const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
-						const attempt = retryInboundTurn(this.#manager.database, tx, turn.opRef);
-						const nextEpoch = retired ? this.#epoch() : this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
-						return { attempt, nextEpoch };
-					});
-					this.#manager.log(
-						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${turn.sessionId} attempt=${attempt} reason=tail_attach_disowned`,
-					);
-					continue;
-				}
+				// A lost ACK or unavailable tail does not prove non-admission.
+				// Leave the durable operation/session/epoch intact for later recovery.
 				// One unrecoverable turn must not abort recovery of the others.
 				this.#manager.log(
 					`recovery_turn_failed origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
@@ -1475,10 +1806,328 @@ class OriginActor {
 		return true;
 	}
 
+	async #settleLocalPreflightRejection(bound: BoundTurn, code: string): Promise<void> {
+		if (code !== PROMPT_TOO_LARGE_CODE) return;
+		const opRef = bound.turn.opRef;
+		const key = localPreflightRejectionKey(opRef);
+		if (localPreflightRejection(this.#manager.database, opRef) !== code) return;
+		const message = `the prompt exceeded the ${MAX_RELAY_REQUEST_FRAME_BYTES}-byte request limit before it was sent; reduce the text or number of images and send again`;
+		const error = new GjcRuntimeError(`${code}: ${message}`, { code, message });
+		this.#manager.log(
+			`persona_send_preflight_rejected origin=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} opRef=${opRef} reason=${code}`,
+			"warn",
+		);
+		bound.tail?.setTurnRunning(false);
+		try {
+			await bound.tail?.close();
+		} catch (closeError) {
+			this.#manager.log(
+				`send_preflight_tail_close_failed origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(closeError)}`,
+				"warn",
+			);
+		}
+		bound.tail = undefined;
+		if (!bound.retired || bound.answerWanted) {
+			try {
+				await bound.lifecycle.onFailure?.({ ...bound, error, forceFailureNotice: true });
+			} catch (noticeError) {
+				this.#manager.log(
+					`send_preflight_failure_notice_failed origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(noticeError)}`,
+					"error",
+				);
+				this.#scheduleStatusRecheck(bound);
+				throw noticeError;
+			}
+		}
+		const unlinkedReason: TerminalUnlinkedReason = bound.retired && !bound.answerWanted ? "retired" : "turn_failed";
+		const completed = this.#manager.database.transaction((tx) => {
+			const prompt = ownedTurnPrompt(this.#manager.database, opRef);
+			const authority = this.#manager.database.bindings.authority;
+			const changed = completeInboundTurn(this.#manager.database, tx, opRef, unlinkedReason);
+			if (changed === 1 && prompt && authority)
+				this.#manager.database.bindings.releaseBrokerOperation(
+					tx,
+					authority,
+					"turn.prompt",
+					JSON.stringify([prompt.sessionId, opRef]),
+					opRef,
+				);
+			if (changed === 1 || this.#manager.database.inbox.turnRow(opRef)?.turn_state === "done")
+				this.#manager.database.core.metaDelete(key);
+			return changed;
+		});
+		await this.#notifySettled(bound);
+		if (completed > 0 || this.#manager.database.inbox.turnRow(opRef)?.turn_state === "done")
+			await this.#settleAfterTerminal(bound);
+	}
+
+	/**
+	 * Why a bound trigger provably never reached the host (#685): no durable send
+	 * intent was stamped before the relay stream write, or the port holds an authenticated
+	 * `busy` refusal for its op-ref. Undefined means the prompt may have landed.
+	 */
+	#unadmittedReason(opRef: string, sessionId: string | null): "send_not_attempted" | "prompt_busy_refused" | undefined {
+		if (!this.#manager.database.inbox.sendAttempted(opRef)) return "send_not_attempted";
+		if (!sessionId || !this.#manager.port.promptRefusal) return undefined;
+		try {
+			return this.#manager.port.promptRefusal({ sessionId, repo: this.#manager.repo, opRef }) === "busy"
+				? "prompt_busy_refused"
+				: undefined;
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			// No refusal evidence is readable: the turn keeps the conservative hold.
+			this.#manager.log(
+				`send_unadmitted_probe_failed origin=${this.originKey} session=${sessionId} opRef=${opRef} detail=${safeDiagnostic(error)}`,
+				"warn",
+			);
+			return undefined;
+		}
+	}
+
+	/**
+	 * Returns a bound trigger that was provably never admitted to pending so it is
+	 * answered by a fresh op-ref. A retired epoch's trigger is closed instead: the
+	 * origin was reset after it, so it must not resurface in the new conversation.
+	 * A turn whose prompt may have landed is left for reconcile; it is never resent.
+	 */
+	#releaseUnadmittedTurn(turn: InboundTurn, retired: boolean, source: "recovery" | "dispatch"): boolean {
+		if (localPreflightRejection(this.#manager.database, turn.opRef)) return false;
+		const reason = this.#unadmittedReason(turn.opRef, turn.sessionId);
+		if (!reason) return false;
+		const attempt = this.#manager.database.transaction((tx) => {
+			if (!retired) return retryInboundTurn(this.#manager.database, tx, turn.opRef);
+			completeInboundTurn(this.#manager.database, tx, turn.opRef, "retired");
+			return undefined;
+		});
+		this.#manager.log(
+			`recovery_requeue_unsent origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${reason} source=${source} action=${retired ? "close_retired" : `requeue attempt=${attempt}`}`,
+			"warn",
+		);
+		return true;
+	}
+
+	/**
+	 * Bounds how long one unresolved turn may silence its origin (#686). Once its
+	 * operation state has stayed unknown past `unresolvedHoldMs` since the send
+	 * and its host is provably not live, the turn moves to a retired hold - the
+	 * same hold `/new` leaves behind: it keeps reconciling, a late result is still
+	 * delivered, and the op is never resent - the epoch rotates so pending
+	 * messages continue on a fresh session, and the origin gets one notice.
+	 * Pending messages are kept; nothing is discarded.
+	 *
+	 * A turn whose epoch was already retired (a restart or `/new` moved the origin
+	 * on while it was unresolved) is bounded the same way (#705): it gets the same
+	 * input fence, retired hold and one notice, without rotating an epoch the
+	 * origin has already left. The escalation marker makes it exactly once.
+	 */
+	async #escalateUnresolvedHold(
+		turn: InboundTurn,
+		bound: BoundTurn | undefined,
+		evidence: { readonly status?: PromptStatus | "unavailable"; readonly holdKind?: HoldKind } = {},
+	): Promise<boolean> {
+		if (this.#stopped || this.#manager.stopped || bound?.retired) return false;
+		if (bound && this.#current !== bound) return false;
+		const retiredEpoch = turn.epoch !== this.#epoch();
+		// A live BoundTurn is always on the current epoch; only a recovered row can be retired.
+		if (retiredEpoch && bound) return false;
+		const database = this.#manager.database;
+		if (database.core.metaGet(escalatedHoldKey(turn.opRef)) !== undefined) {
+			// Already escalated: a crash between the durable escalation and its adoption
+			// leaves the held op unobserved, so a recovered row is adopted again here.
+			const heldSession = turn.sessionId;
+			if (bound || !heldSession) return false;
+			if (this.#current?.turn.opRef === turn.opRef || this.#retired.has(retiredKey({ epoch: turn.epoch, turn })))
+				return false;
+			if (!(await this.#adoptEscalatedHold(turn, heldSession))) return false;
+			this.#manager.log(
+				`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=unresolved_hold_readopted`,
+				"warn",
+			);
+			return true;
+		}
+		// The hold starts at the send. A row stamped by the schema 39 backfill
+		// ('pre-migration-39') or bound before dispatch was recorded falls back to
+		// its bind and then its arrival, so an old stranded row is still bounded (#705).
+		const sinceMs = [
+			database.inbox.sendAttemptedAt(turn.opRef),
+			database.inbox.turnDispatchedAt(turn.opRef),
+			database.inbox.turnRow(turn.opRef)?.received_at,
+		]
+			// Only an ISO timestamp counts: Date.parse reads the marker as the year 2039.
+			.map((at) => (typeof at === "string" && /^\d{4}-\d{2}-\d{2}T/.test(at) ? Date.parse(at) : Number.NaN))
+			.find((ms) => Number.isFinite(ms));
+		if (sinceMs === undefined) return false;
+		const heldMs = this.#manager.now() - sinceMs;
+		if (heldMs < this.#manager.unresolvedHoldMs) return false;
+		const sessionId = bound?.sessionId ?? turn.sessionId;
+		if (!sessionId) return false;
+		// Check for relay unavailable evidence even if the host is live (#766).
+		// A live host whose relay is unresponsive should escalate if the evidence spans long enough.
+		const relayTrackerTs = database.core.metaGet(relayUnavailableTrackerKey(turn.opRef));
+		const hasRelayUnavailableEvidence =
+			relayTrackerTs !== undefined &&
+			this.#manager.now() - Number.parseInt(relayTrackerTs, 10) >= this.#manager.unresolvedHoldMs;
+		// A dead host is always evidence; a live unresponsive relay is if evidence spans long enough.
+		const host = await this.#bindingState(sessionId);
+		if (!hasRelayUnavailableEvidence && host.live !== false && host.disowned !== true) return false;
+		let status = evidence.status;
+		if (!bound) {
+			// A turn recovery never adopted carries no status verdict yet: read it fresh.
+			const report = await this.#statusForRecovery(sessionId, turn.opRef);
+			status = report.status.status;
+			// An accepted or in-flight op may still be mutating the workspace; no hold
+			// kind lifts that fence, whatever the broker liveness says (#772).
+			if (status === "accepted" || status === "in_flight") return false;
+			// Terminal-uncertain and ambiguous-authority holds escalate on a settled
+			// (terminal) status too; every other hold needs an unknown one (#772).
+			const settledEscalates =
+				evidence.holdKind === "operation_uncertain" || evidence.holdKind === "ambiguous_authority";
+			if (status !== "unknown" && !settledEscalates) return false;
+			// A settled status only speaks for the held op when the report names it:
+			// a mismatched or missing identity is an authority shift, never evidence (#772).
+			if (status !== "unknown" && report.operationRef !== turn.opRef) return false;
+		}
+		const trigger = database.inbox.turnRow(turn.opRef);
+		if (!trigger) return false;
+		// One transaction: the fresh epoch, the held op's answer-wanted
+		// disposition, its replayable notice, and a fence over every input its
+		// prompt may have carried (trigger, claimed context, steers) so the fresh
+		// session never sees the possibly accepted request as unread. Messages
+		// that arrived after the send keep their unread context.
+		const { nextEpoch, closedInputs } = database.transaction((tx) => {
+			const epoch = retiredEpoch ? this.#epoch() : database.bindings.rotateEpoch(tx, this.originKey);
+			database.core.metaSet(escalatedHoldKey(turn.opRef), "1");
+			database.core.metaSet(escalationNoticeKey(this.originKey, turn.opRef), "1");
+			const claimed = database.inbox.sentContextIds(turn.opRef);
+			database.inbox.contextConsume(tx, claimed);
+			// A queued message the held prompt already carried is that op's input,
+			// never a fresh trigger: resending it could repeat its action.
+			const closed = database.inbox.closeClaimedPending(tx, {
+				originKey: this.originKey,
+				epoch: turn.epoch,
+				opRef: turn.opRef,
+				messageIds: claimed,
+			});
+			return { nextEpoch: epoch, closedInputs: closed };
+		});
+		this.#holdSweeps.delete(turn.opRef);
+		// Clean up logged holds for this opRef when it's escalated
+		for (const key of this.#loggedRecoveryHolds) {
+			if (key.startsWith(`${turn.opRef}:`)) this.#loggedRecoveryHolds.delete(key);
+		}
+		for (const row of closedInputs) {
+			// Whether the model read it is unknown: release its ownership without a 👀.
+			await this.#manager.emitHeldSteerAccepted({ originKey: this.originKey, row, opRef: turn.opRef, abandoned: true });
+			this.#manager.log(
+				`escalation_claimed_input_closed origin=${this.originKey} opRef=${turn.opRef} message=${row.message_id}`,
+				"warn",
+			);
+		}
+		this.#manager.log(
+			`recovery_hold_escalated origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} heldMs=${heldMs} evidence="status=${status ?? "unknown"} holdKind=${evidence.holdKind ?? "none"} live=${host.live ?? "unknown"} disowned=${host.disowned ?? false}"`,
+			"warn",
+		);
+		if (bound) {
+			bound.retired = true;
+			bound.answerWanted = true;
+			// The user was told; only the bounded retired-reattach schedule and the
+			// periodic sweep read its status from here on (#715).
+			bound.tailEvidenceUnavailable = false;
+			bound.statusRecheckAfterStall = false;
+			this.#clearStallReconciliation(bound);
+			bound.tail?.setTurnRunning(false);
+			await bound.tail?.close();
+			bound.detached = true;
+			this.#retired.set(retiredKey(bound), bound);
+			this.#current = undefined;
+			this.#state = "idle";
+			await bound.lifecycle.onRetired?.(bound);
+			this.#scheduleRetiredReattach(bound);
+		} else {
+			// On failure the escalation marker stays durable: the next recovery scan re-adopts it.
+			await this.#adoptEscalatedHold(turn, sessionId);
+		}
+		this.#manager.log(
+			`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=unresolved_hold_escalated`,
+			"warn",
+		);
+		await this.#emitEscalationNotices();
+		return true;
+	}
+
+	/**
+	 * Adopts an escalated hold's recovered row as a detached retired turn so the
+	 * periodic sweep reads its status and a late answer is still delivered. Used
+	 * by the escalation itself and by recovery after a restart that lost it.
+	 */
+	async #adoptEscalatedHold(turn: InboundTurn, sessionId: string): Promise<boolean> {
+		try {
+			// Adopted without a relay: the host is gone. Periodic reconcile reads
+			// its status; a reattach is tried on the bounded retired schedule.
+			const adopted = await this.#adoptRecoveredTurn(turn, sessionId, true, true);
+			// No bounded-cadence rechecks for an escalated hold: the sweep reads it (#715).
+			adopted.tailEvidenceUnavailable = false;
+			this.#clearStallReconciliation(adopted);
+			adopted.detached = true;
+			this.#scheduleRetiredReattach(adopted);
+			return true;
+		} catch (error) {
+			this.#manager.log(
+				`retired_hold_adopt_failed origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
+				"warn",
+			);
+			return false;
+		}
+	}
+
+	/**
+	 * Posts every escalation notice whose intent is durable but not yet handed to
+	 * the delivery ledger. Delivery ids are deterministic per trigger, so a notice
+	 * replayed after a crash or a failed hook is posted once.
+	 */
+	async #emitEscalationNotices(): Promise<void> {
+		const database = this.#manager.database;
+		const prefix = escalationNoticeKey(this.originKey, "");
+		for (const key of database.core.metaKeysInRange(prefix, `${prefix}\uffff`)) {
+			const opRef = key.slice(prefix.length);
+			const trigger = database.inbox.turnRow(opRef);
+			if (!trigger) {
+				// Kept as evidence: without its trigger the notice has no origin to post to.
+				this.#manager.log(`escalation_notice_unresolvable origin=${this.originKey} opRef=${opRef}`, "error");
+				continue;
+			}
+			const delivered = await this.#manager.emitBindHold({
+				originKey: this.originKey,
+				trigger,
+				reason: UNRESOLVED_HOLD_ESCALATED,
+				notice: UNRESOLVED_HOLD_NOTICE,
+				verdict: undefined,
+			});
+			if (delivered) database.core.metaDelete(key);
+		}
+	}
+
 	async #recoverTurn(turn: InboundTurn): Promise<void> {
 		if (this.#quarantinedTurn(turn.opRef)) return;
 		const currentEpoch = this.#epoch();
 		const retired = turn.epoch < currentEpoch;
+		const localRejection = localPreflightRejection(this.#manager.database, turn.opRef);
+		if (localRejection) {
+			const sessionId = turn.sessionId;
+			if (!sessionId) {
+				this.#manager.log(
+					`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=local_preflight_session_unavailable`,
+					"warn",
+				);
+				return;
+			}
+			// The durable gateway-side rejection is authoritative for this op-ref;
+			// recovery must not ask the broker about a prompt that was never issued.
+			const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, true);
+			await this.#settleLocalPreflightRejection(bound, localRejection);
+			return;
+		}
+		if (turn.state === "bound" && this.#releaseUnadmittedTurn(turn, retired, "recovery")) return;
 		const sessionId = turn.sessionId;
 		if (!sessionId) {
 			// A turn is bound with its session in one statement; a null session
@@ -1489,80 +2138,37 @@ class OriginActor {
 			);
 			return;
 		}
+		// Confirmed producer exit survives registry loss. Read the original native
+		// operation first, without inspect/liveness/resume or opening a new relay.
+		if (
+			confirmedStalledExit(this.#manager.database, {
+				opRef: turn.opRef,
+				originKey: this.originKey,
+				sessionId,
+				epoch: turn.epoch,
+				repo: this.#manager.repo,
+			})
+		) {
+			const status = await this.#statusForRecovery(sessionId, turn.opRef);
+			const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, true);
+			bound.stallHostTerminated = true;
+			await this.#reconcileBound(bound, status);
+			return;
+		}
 		// The table's authority decision is deliberately inspect -> status -> inspect.
 		// A broker replacement between either inspect is an authority shift, never a
 		// reason to resend an accepted operation.
 		const first = await this.#inspectForRecovery(sessionId);
 		const status = await this.#statusForRecovery(sessionId, turn.opRef);
 		const second = await this.#inspectForRecovery(sessionId);
-		// A bound (never acknowledged) turn whose session the runtime cannot answer
-		// for at all (both inspects failed AND status is unreachable) — e.g. a
-		// pre-cutover store the current gjc no longer reads — has no operation the
-		// runtime could be holding, so releasing its trigger back to pending is
-		// exactly-once-safe: the next dispatch binds a live session. A reachable
-		// runtime, even with an unknown status, keeps the hold: it may have
-		// accepted the send.
-		const disownedByBroker =
-			status.unreachable === true &&
-			(status.unreachableCode === "session_unavailable" || (first.failed && second.failed));
-		// An ACCEPTED op may have run and acted, so it is NEVER requeued. When the
-		// broker disowns the id AND the session is provably not live (inspect
-		// answered live=false, or is gone), nothing can still be running there:
-		// the turn is closed (the owner told it was cut off). A merely
-		// unreachable but possibly-live session holds.
+		// Registry liveness describes broker ownership, not producer-process exit.
+		// Unavailable status cannot close or replay an accepted operation.
 		const raw = this.#manager.port.liveness
 			? await this.#manager.port.liveness({ sessionId, repo: this.#manager.repo })
 			: undefined;
-		if (turn.state === "bound" && status.status.status === "unknown" && disownedByBroker) {
-			const attempt = this.#manager.database.transaction((tx) =>
-				retryInboundTurn(this.#manager.database, tx, turn.opRef),
-			);
-			// The usual cause on a live binding is a host that closed itself after
-			// 30 idle minutes (`host hello did not arrive`). Its saved session is
-			// intact: resume it once and re-send this never-run turn under the same
-			// session and epoch, so the conversation keeps its memory. A deleted or
-			// disowned session, or a second failure of the same turn, rebinds below.
-			if (!retired && attempt === 1 && raw?.deleted !== true && raw?.disowned !== true) {
-				try {
-					await this.#manager.port.resume({
-						sessionId,
-						repo: this.#manager.repo,
-						originKey: this.originKey,
-						epoch: turn.epoch,
-					});
-					this.#manager.log(
-						`session_resumed origin=${this.originKey} epoch=${turn.epoch} session=${sessionId} opRef=${turn.opRef} reason=host_idle_closed`,
-					);
-					return;
-				} catch (error) {
-					if (error instanceof BrokerAuthorityError) throw error;
-					this.#manager.log(
-						`session_resume_failed origin=${this.originKey} epoch=${turn.epoch} session=${sessionId} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
-					);
-				}
-			}
-			const nextEpoch = retired
-				? currentEpoch
-				: this.#manager.database.transaction((tx) => this.#manager.database.bindings.rotateEpoch(tx, this.originKey));
-			// The binding itself is unusable: recreate through the existing rebind
-			// primitive (epoch bump) so the next dispatch binds a fresh live session.
-			// A retired turn's epoch was already rotated away from; it simply
-			// re-enters the queue under the current one (its send never ran, so
-			// the message is owed a turn, not a permanent hold).
-			this.#manager.log(
-				`recovery_requeue_unaccepted origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} attempt=${attempt}${retired ? " reason=retired_router_disowned" : ""}`,
-			);
-			return;
-		}
-		// Closing ACCEPTED work needs positive death evidence from the broker itself
-		// (inspect or liveness answering not-live, or a disown). Two failed inspects
-		// are a transport outage, not death, and a live liveness answer vetoes it.
-		const provablyDead =
-			raw?.live !== true &&
-			((first.session !== undefined && first.session.live === false) || raw?.live === false || raw?.disowned === true);
-		if (turn.state === "accepted" && provablyDead && status.status.status === "unknown" && disownedByBroker) {
-			const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, true);
-			await this.#closeAcceptedOnDeadSession(bound, "session_gone_at_recovery");
+		if (turn.state === "bound" && status.status.status === "unknown") {
+			if (await this.#escalateUnresolvedHold(turn, undefined)) return;
+			this.#logRecoveryHoldOnce(turn, "operation_state_unknown");
 			return;
 		}
 		const authorityShifted =
@@ -1572,9 +2178,8 @@ class OriginActor {
 			!sameRecoveryAuthority(first.session, second.session);
 		const session = second.session;
 
-		// gjc >= 0.16.0 omits locator.repo, so the subsession normalizer yields
-		// undefined for a perfectly known session; the raw envelope is the
-		// liveness authority and the normalized record only adds repo/deleted.
+		// Raw liveness remains independent evidence when inspect did not return
+		// a normalizable record; a normalized locator also checks workspace identity.
 		const rawLive = raw?.live;
 		const knownById = rawLive !== undefined && raw?.disowned !== true;
 		const recoveryInput = {
@@ -1656,39 +2261,28 @@ class OriginActor {
 				await this.#recreateAfterResumeFailure(turn, retired);
 				return;
 			case "operator_hold": {
-				// A live session whose runtime has NO record of this op-ref and whose
-				// prompt queue is empty cannot be running it: the send never landed
-				// (gateway restarted between send and ack). Release + rebind after the
-				// hold has persisted across HOLD_RELEASE_SWEEPS consecutive sweeps so a
-				// transient index lag never triggers a duplicate.
-				const count = (this.#holdSweeps.get(turn.opRef) ?? 0) + 1;
-				this.#holdSweeps.set(turn.opRef, count);
-				// Only a BOUND (never acknowledged) turn may be released on a live
-				// session. An ACCEPTED op on a live session is held until its terminal
-				// arrives: the runtime answering "unknown" while a host boots is not
-				// proof the send was lost, and re-firing it double-posts
-				// (layofflabs-2, 2026-09-02).
-				const liveIdle = status.status.status === "unknown" && raw?.live === true && !retired && turn.state === "bound";
-				if (liveIdle && count >= HOLD_RELEASE_SWEEPS && (await this.#queueIsEmpty(sessionId))) {
-					this.#holdSweeps.delete(turn.opRef);
-					const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
-						const attempt = retryInboundTurn(this.#manager.database, tx, turn.opRef);
-						const nextEpoch = this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
-						return { attempt, nextEpoch };
-					});
-					this.#manager.log(
-						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} attempt=${attempt} reason=unknown_op_on_live_idle_session sweeps=${count}`,
-					);
-					await this.#dispatchNext();
-					return;
-				}
-				this.#manager.log(
-					`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${decision.reason} sweeps=${count}`,
-					"warn",
-				);
+				// Unknown status and an empty queue do not authenticate non-admission.
+				// Also escalate terminal_uncertain and ambiguous authority holds after unresolvedHoldMs (#772).
+				if (await this.#escalateUnresolvedHold(turn, undefined, { holdKind: decision.holdKind })) return;
+				this.#logRecoveryHoldOnce(turn, decision.reason);
 				return;
 			}
 		}
+	}
+
+	/**
+	 * Recovery scans run every minute; an unchanged hold is logged once per
+	 * (op-ref, reason) and again only when its reason changes (#705).
+	 */
+	/** Logs a hold once per reason; alternating reasons log once each per op-ref (#772, #705). */
+	#logRecoveryHoldOnce(turn: InboundTurn, reason: string, extra?: string): void {
+		const key = `${turn.opRef}:${reason}`;
+		if (this.#loggedRecoveryHolds.has(key)) return;
+		this.#loggedRecoveryHolds.add(key);
+		this.#manager.log(
+			`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${reason}${extra ? ` ${extra}` : ""}`,
+			"warn",
+		);
 	}
 
 	async #adoptRecoveredTurn(
@@ -1706,6 +2300,13 @@ class OriginActor {
 			sessionId,
 			turn,
 			trigger,
+			// A locally rejected, unfenced prompt never acquired a send-context claim.
+			// Settle its trigger without selecting or consuming other unread context.
+			sentContextIds:
+				localPreflightRejection(this.#manager.database, turn.opRef) &&
+				!this.#manager.database.inbox.sendAttempted(turn.opRef)
+					? [editedOriginalId(trigger.message_id) ?? trigger.message_id]
+					: this.#manager.database.inbox.sentContextIds(turn.opRef),
 		});
 		let tail: TailHandle | undefined;
 		let detached = false;
@@ -1745,11 +2346,12 @@ class OriginActor {
 			hadToolActivity: true,
 			permissionRequestObserved: false,
 			agentErrorRetryScheduled: false,
-			answerWanted: false,
+			answerWanted: this.#manager.database.core.metaGet(escalatedHoldKey(turn.opRef)) !== undefined,
 			tailEvidenceUnavailable: true,
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
 			statusRecheckAfterStall: false,
+			terminalTextMisses: 0,
 			stallStartedAtMs: undefined,
 			providerRetryAttempt,
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
@@ -1786,18 +2388,8 @@ class OriginActor {
 	}
 
 	readonly #holdSweeps = new Map<string, number>();
-	/** Last wedge-rule liveness probe per held op-ref (manager clock). */
-	readonly #wedgeProbeAt = new Map<string, number>();
-
-	async #queueIsEmpty(sessionId: string, relay?: TailHandle): Promise<boolean> {
-		const port = this.#manager.port;
-		if (!port.queueEmpty) return false;
-		try {
-			return await port.queueEmpty({ sessionId, repo: this.#manager.repo, ...(relay ? { relay } : {}) });
-		} catch {
-			return false;
-		}
-	}
+	/** Logged recovery hold reasons to dedupe alternating reasons; keyed by "opRef:reason" (#772). */
+	readonly #loggedRecoveryHolds = new Set<string>();
 
 	/** Liveness of a binding from the raw broker envelope; the normalized inspect where the port has no raw read. */
 	async #bindingState(sessionId: string): Promise<{
@@ -1831,22 +2423,15 @@ class OriginActor {
 		}
 	}
 
-	async #statusForRecovery(
-		sessionId: string,
-		opRef: string,
-	): Promise<StatusReport & { unreachable?: boolean; unreachableCode?: string }> {
+	async #statusForRecovery(sessionId: string, opRef: string): Promise<StatusReport> {
 		try {
 			return await this.#manager.port.status({ sessionId, repo: this.#manager.repo, opRef });
-		} catch (error) {
-			// Transport/session-unreachable, as opposed to a reachable runtime that
-			// reported an undecidable operation state. `session_unavailable` is the
-			// broker itself disowning the id: nothing can be in flight there.
+		} catch {
+			// Endpoint loss is unknown operation state, not producer-exit evidence.
 			return {
 				operationRef: opRef,
 				status: { status: "unknown" },
 				summaryCompleted: false,
-				unreachable: true,
-				...(sdkStatusErrorCode(error) ? { unreachableCode: sdkStatusErrorCode(error) } : {}),
 			};
 		}
 	}
@@ -1909,6 +2494,138 @@ class OriginActor {
 	 * is armed, new admissions wait for it instead of hammering the broker. The
 	 * row stays pending throughout and is never expired.
 	 */
+	/**
+	 * A bound trigger failed after `bindTurn` but before `port.send` journaled a
+	 * `turn.prompt` intent, so no prompt can have landed. Leaving it bound would
+	 * fence the origin forever (recovery only proves state for issued prompts), so
+	 * it always returns to pending. Positive proof that the session is gone
+	 * rotates the epoch and rebinds inline; any other failure (a transient
+	 * broker_unavailable, a queue timeout) keeps the session and retries with
+	 * backoff, because a generic failure is no authority to replace it.
+	 */
+	async #requeuePreSend(
+		stage: "start_turn" | "attach" | "prepare_context",
+		sessionId: string,
+		epoch: number,
+		opRef: string,
+		error: unknown,
+	): Promise<void> {
+		const sessionGone = await this.#sessionProvablyGone(sessionId, error);
+		const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => ({
+			attempt: retryInboundTurn(this.#manager.database, tx, opRef),
+			nextEpoch: sessionGone ? this.#manager.database.bindings.rotateEpoch(tx, this.originKey) : undefined,
+		}));
+		if (sessionGone) {
+			this.#bindFailures += 1;
+			const attempts = this.#bindFailures;
+			this.#manager.log(
+				`send_session_disowned action=inline_rebind stage=${stage} origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} session=${sessionId} attempt=${attempts} detail=${safeDiagnostic(error)}`,
+				"warn",
+			);
+			await this.#terminateRetiredSession(sessionId, "session_gone");
+			if (attempts < MAX_SEND_REBIND_ATTEMPTS) await this.#dispatchNext();
+			else {
+				this.#scheduleDispatchRetry(
+					Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(attempts - 1, 10)),
+				);
+				this.#manager.releaseHostAdmission(this);
+			}
+			return;
+		}
+		this.#manager.releaseHostAdmission(this);
+		this.#preSendFailures += 1;
+		const failures = this.#preSendFailures;
+		// The attach caller already degraded session-create readiness.
+		if (stage !== "attach") this.#manager.recordPreSendFailure(this.originKey, safeDiagnostic(error));
+		this.#manager.log(
+			`send_pre_send_requeue stage=${stage} origin=${this.originKey} epoch=${epoch} opRef=${opRef} session=${sessionId} attempt=${attempt} failures=${failures} detail=${safeDiagnostic(error)}`,
+			"warn",
+		);
+		this.#scheduleDispatchRetry(
+			Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(failures - 1, 10)),
+		);
+	}
+
+	/**
+	 * `port.send` failed with positive proof the prompt was never admitted (a
+	 * durable `busy` refusal), so the trigger returns to pending under a fresh
+	 * op-ref. A busy wait that saw no host progress (#687) first ends the wedged
+	 * host; the next dispatch then resumes the stored binding on a new host.
+	 */
+	async #releaseUnadmittedSend(current: BoundTurn, error: unknown, reason: string): Promise<void> {
+		const { opRef } = current.turn;
+		const attempt = this.#manager.database.transaction((tx) => retryInboundTurn(this.#manager.database, tx, opRef));
+		this.#current = undefined;
+		this.#state = "idle";
+		try {
+			await current.tail?.close();
+		} catch (closeError) {
+			this.#manager.log(
+				`send_pre_send_tail_close_failed origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(closeError)}`,
+				"warn",
+			);
+		}
+		await this.#notifyReleased(current);
+		if (error instanceof SessionBusyStalledError) {
+			this.#manager.log(
+				`session_busy_stalled origin=${this.originKey} epoch=${current.epoch} session=${current.sessionId} opRef=${opRef} attempt=${attempt} silentMs=${error.silentMs} evidence="${error.evidence}"`,
+				"warn",
+			);
+			if (await this.#endBusyStalledHost(current.sessionId)) {
+				await this.#dispatchNext();
+				return;
+			}
+		} else
+			this.#manager.log(
+				`send_unadmitted_requeue origin=${this.originKey} epoch=${current.epoch} session=${current.sessionId} opRef=${opRef} attempt=${attempt} reason=${reason} detail=${safeDiagnostic(error)}`,
+				"warn",
+			);
+		this.#preSendFailures += 1;
+		this.#scheduleDispatchRetry(
+			Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(this.#preSendFailures - 1, 10)),
+		);
+	}
+
+	/**
+	 * Ends a host that refused prompts as busy without progress. No operation of
+	 * this origin is admitted on it (the refusal is durable), so there is no
+	 * accepted op whose exit must be proven; the stored binding is kept and the
+	 * next dispatch takes the `session.resume` branch with history intact.
+	 */
+	async #endBusyStalledHost(sessionId: string): Promise<boolean> {
+		const port = this.#manager.port;
+		if (!port.terminateHost) return false;
+		let result: TerminateHostOutcome;
+		try {
+			result = await port.terminateHost({ sessionId, repo: this.#manager.repo });
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			this.#manager.log(
+				`session_busy_host_terminate_failed origin=${this.originKey} session=${sessionId} detail=${safeDiagnostic(error)}`,
+				"error",
+			);
+			return false;
+		}
+		const ended = result.outcome === "terminated" || result.outcome === "already_gone";
+		this.#manager.log(
+			`session_busy_host_terminated origin=${this.originKey} session=${sessionId} outcome=${result.outcome}${
+				"pid" in result ? ` pid=${result.pid}` : ""
+			}${result.outcome === "refused" ? ` detail=${result.reason}` : ""}`,
+			ended ? "warn" : "error",
+		);
+		if (!ended) {
+			if (result.outcome === "terminating") {
+				this.#hostTerminatingSessionId = sessionId;
+				this.#scheduleHostTerminationRecheck(sessionId);
+			}
+			return false;
+		}
+		if (this.#observer?.sessionId === sessionId) await this.#closeObserver("host_terminated");
+		if (this.#hostSessionId === sessionId) this.#hostSessionId = undefined;
+		this.#manager.hostFreed();
+		return true;
+	}
+
 	async #dispatchNext(): Promise<void> {
 		if (
 			this.#manager.draining ||
@@ -1927,10 +2644,38 @@ class OriginActor {
 			}
 			return;
 		}
+		const epoch = this.#epoch();
+		const unresolved = this.#manager.database.inbox
+			.nonterminalTurns(this.originKey)
+			.find((turn) => turn.epoch === epoch);
+		if (unresolved && localPreflightRejection(this.#manager.database, unresolved.opRef)) {
+			await this.#recoverTurn(unresolved);
+			return;
+		}
+		if (
+			unresolved &&
+			!(
+				unresolved.state === "bound" &&
+				!this.#quarantinedTurn(unresolved.opRef) &&
+				this.#releaseUnadmittedTurn(unresolved, false, "dispatch")
+			)
+		) {
+			// Recovery may hold without adopting an actor-local current turn. Its
+			// durable ownership still fences new admission and session mutation,
+			// but only up to the unresolved-hold bound (#686).
+			if (await this.#escalateUnresolvedHold(unresolved, undefined)) {
+				await this.#dispatchNext();
+				return;
+			}
+			this.#manager.log(
+				`recovery_hold origin=${this.originKey} epoch=${epoch} opRef=${unresolved.opRef} reason=nonterminal_turn_owns_epoch`,
+				"warn",
+			);
+			return;
+		}
 		await this.#resolveStaleHolds();
 		const trigger = this.#manager.database.inbox.pendingOldest(this.originKey);
 		if (!trigger) return;
-		const epoch = this.#epoch();
 		const turnAttempt = freshTurnAttempt(this.#manager.database, this.originKey, epoch, trigger.message_id);
 		const providerRetryAttempt = providerTransportRetryAttempt(
 			this.#manager.database,
@@ -2000,47 +2745,21 @@ class OriginActor {
 				trigger: bound,
 			});
 		} catch (error) {
-			this.#manager.releaseHostAdmission(this);
-			throw error;
+			await this.#requeuePreSend("start_turn", binding.sessionId, epoch, opRef, error);
+			return;
 		}
 		let tail: TailHandle;
 		try {
 			tail = await this.#attachTail(binding.sessionId, epoch, false);
 		} catch (error) {
-			// No prompt was sent, so this lifecycle can never reach a terminal: the
-			// trigger is re-dispatched under a new one (below, or by recovery).
 			await this.#releaseLifecycle(lifecycle, {
 				originKey: this.originKey,
 				epoch,
 				sessionId: binding.sessionId,
 				turn,
 			});
-			// No send was attempted. A broker disown code or positive liveness
-			// proof can therefore release this row without replaying accepted work.
-			// A generic failure alone is not authority to replace the session.
 			this.#manager.recordSessionCreateFailure(this.originKey, "session_attach_failed", safeDiagnostic(error));
-			if (!(await this.#sessionProvablyGone(binding.sessionId, error))) {
-				this.#manager.releaseHostAdmission(this);
-				throw error;
-			}
-			const nextEpoch = this.#manager.database.transaction((tx) => {
-				retryInboundTurn(this.#manager.database, tx, opRef);
-				return this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
-			});
-			this.#bindFailures += 1;
-			const attempts = this.#bindFailures;
-			this.#manager.log(
-				`send_session_disowned action=inline_rebind stage=attach origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} session=${binding.sessionId} attempt=${attempts} detail=${safeDiagnostic(error)}`,
-				"warn",
-			);
-			await this.#terminateRetiredSession(binding.sessionId, "session_gone");
-			if (attempts < MAX_SEND_REBIND_ATTEMPTS) await this.#dispatchNext();
-			else {
-				this.#scheduleDispatchRetry(
-					Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(attempts - 1, 10)),
-				);
-				this.#manager.releaseHostAdmission(this);
-			}
+			await this.#requeuePreSend("attach", binding.sessionId, epoch, opRef, error);
 			return;
 		}
 		// Before the turn starts: the stall clock is not running yet and the
@@ -2049,8 +2768,22 @@ class OriginActor {
 		try {
 			context = await this.#prepareContext(binding.sessionId, epoch, opRef, tail);
 		} catch (error) {
-			this.#manager.releaseHostAdmission(this);
-			throw error;
+			try {
+				await tail.close();
+			} catch (closeError) {
+				this.#manager.log(
+					`send_pre_send_tail_close_failed origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(closeError)}`,
+					"warn",
+				);
+			}
+			await this.#releaseLifecycle(lifecycle, {
+				originKey: this.originKey,
+				epoch,
+				sessionId: binding.sessionId,
+				turn,
+			});
+			await this.#requeuePreSend("prepare_context", binding.sessionId, epoch, opRef, error);
+			return;
 		}
 		const dispatchedAtMs = this.#dispatchFloorMs(opRef);
 		const current: BoundTurn = {
@@ -2072,6 +2805,7 @@ class OriginActor {
 			statusTerminalHolds: 0,
 			statusRechecks: 0,
 			statusRecheckAfterStall: false,
+			terminalTextMisses: 0,
 			stallStartedAtMs: undefined,
 			providerRetryAttempt,
 			agentErrorRetryScheduled: false,
@@ -2152,10 +2886,24 @@ class OriginActor {
 				sessionId: binding.sessionId,
 				repo: this.#manager.repo,
 				text: lifecycle.text,
+				...(lifecycle.images ? { images: lifecycle.images } : {}),
 				opRef,
 				relay: tail,
+				busyStallMs: this.#manager.busyStallMs,
 				...(preamble.text ? { systemPreamble: preamble.text } : {}),
 				...(lifecycle.sendModelFallback ? { model: lifecycle.sendModelFallback } : {}),
+				beforeWrite: () => {
+					// The exact frame is already validated; persist intent and context before it can land.
+					if (
+						!this.#manager.database.transaction((tx) =>
+							this.#manager.database.inbox.markSendAttempted(tx, opRef, [...(lifecycle.contextMessageIds ?? [])]),
+						)
+					)
+						throw new SendTurnNoLongerBoundError();
+				},
+				onPayloadTooLarge: () => {
+					this.#manager.database.core.metaSet(localPreflightRejectionKey(opRef), PROMPT_TOO_LARGE_CODE);
+				},
 			});
 			tail.correlate(opRef, receipt);
 			this.#manager.database.transaction((tx) => this.#manager.database.inbox.turnAccept(tx, opRef));
@@ -2165,6 +2913,18 @@ class OriginActor {
 			this.#bindEpochPoisoned = false;
 			this.#clearBindWedgeProbe();
 		} catch (error) {
+			if (error instanceof SendTurnNoLongerBoundError) {
+				this.#current = undefined;
+				this.#state = "idle";
+				await tail.close();
+				await this.#notifyReleased(current);
+				this.#manager.log(`persona_send_skipped origin=${this.originKey} opRef=${opRef} reason=turn_not_bound`, "warn");
+				return;
+			}
+			if (localPreflightRejection(this.#manager.database, opRef)) {
+				await this.#settleLocalPreflightRejection(current, PROMPT_TOO_LARGE_CODE);
+				return;
+			}
 			if (error instanceof ModelNotSelectedError && error.opRef === opRef) {
 				const refusal = new GjcRuntimeError(
 					"model_not_selected: request was not admitted because no model is selected",
@@ -2195,46 +2955,9 @@ class OriginActor {
 				if (cleanupFailure) throw cleanupFailure;
 				return;
 			}
-			// Only the established session_unavailable status proves this send did
-			// not land. A session_not_found returned after port.send is ambiguous:
-			// the broker may have accepted the operation before the CLI failed.
-			if (sdkStatusErrorCode(error) === "session_unavailable") {
-				this.#manager.recordSessionCreateFailure(this.originKey, "session_send_disowned", safeDiagnostic(error));
-				await tail.close();
-				const nextEpoch = this.#manager.database.transaction((tx) => {
-					retryInboundTurn(this.#manager.database, tx, opRef);
-					return this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
-				});
-				this.#current = undefined;
-				this.#state = "idle";
-				await this.#notifyReleased(current);
-				// The per-trigger fresh-turn ordinal restarts with the epoch, so the
-				// burst is counted at the actor: consecutive "no usable session"
-				// failures (bind OR send) until one dispatch succeeds. Bounded burst
-				// of immediate replacements - each a new session bootstrapped with
-				// the last 24h of channel context - then the condition is logged as
-				// unrecoverable for the operator and retried with backoff. The
-				// message is never dropped.
-				this.#bindFailures += 1;
-				const attempts = this.#bindFailures;
-				this.#manager.log(
-					`send_session_disowned action=inline_rebind stage=send origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} attempt=${attempts}`,
-					"error",
-				);
-				// The broker disowned it, but the host process may still be running
-				// (observed: fc41da9b, disowned yet live for hours). End it.
-				await this.#terminateRetiredSession(current.sessionId, "session_gone");
-				if (attempts < MAX_SEND_REBIND_ATTEMPTS) await this.#dispatchNext();
-				else {
-					if (attempts === MAX_SEND_REBIND_ATTEMPTS)
-						this.#manager.log(
-							`persona_send_unrecoverable origin=${this.originKey} opRef=${opRef} attempts=${attempts} reason=${sdkStatusErrorCode(error)}`,
-							"error",
-						);
-					this.#scheduleDispatchRetry(
-						Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(attempts - 1, 10)),
-					);
-				}
+			const unadmitted = this.#unadmittedReason(opRef, binding.sessionId);
+			if (unadmitted || error instanceof SessionBusyStalledError) {
+				await this.#releaseUnadmittedSend(current, error, unadmitted ?? "prompt_busy_refused");
 				return;
 			}
 			// A command failure can occur after broker acceptance. Reconcile its exact
@@ -2376,6 +3099,7 @@ class OriginActor {
 	#preSendFailures = 0;
 	/** A terminal_uncertain bind poisons this epoch's idempotency key; retries cannot make that key decidable. */
 	#bindEpochPoisoned = false;
+	/** Identical bind failures before the broker's own discovery file is judged. */
 	#sameDetailBindFailures = 0;
 	#lastBindDetail: string | undefined;
 	#bindHoldProbed = false;
@@ -2608,6 +3332,8 @@ class OriginActor {
 	 * turn) or the session refused and is being recovered.
 	 */
 	async #steerRow(current: BoundTurn, row: InboundMessageRow): Promise<boolean> {
+		// turn.steer is text-only; uncertain persisted image data stays queued as well.
+		if (hasPersistedImages(row.images_json)) return false;
 		if (
 			this.#manager.database.bindings.isQuarantined("inbound", row.message_id) ||
 			this.#quarantinedTurn(current.turn.opRef)
@@ -3120,61 +3846,6 @@ class OriginActor {
 	}
 
 	/**
-	 * "Unobservable" is not "failed". A session whose tail returns nothing and
-	 * whose status reads `unknown` can still have answered: the persona keeps
-	 * working and writes its reply to the transcript, and only the gateway's
-	 * view is dark (wedged event ring - gajae-code#5681, or a pin-exhausted
-	 * host). Releasing such a turn as unlanded posted `[turn failed]` to the room
-	 * 5-6 minutes in, while the answer sat in the transcript (4 of 4 such
-	 * failures on 2026-09-17/18 had a written answer). Before releasing, read the
-	 * transcript directly: an assistant row written after this turn dispatched,
-	 * on a session that is live and idle, is this turn's answer. Deliver it and
-	 * settle the turn as terminal_ok. Returns true when it did.
-	 */
-	async #deliverUnobservedAnswer(bound: BoundTurn, sweeps: number): Promise<boolean> {
-		const port = this.#manager.port;
-		if (!port.fetchAssistantSince || bound.dispatchedAtMs === undefined) return false;
-		if (bound.retired && !bound.answerWanted) return false;
-		let found: Awaited<ReturnType<NonNullable<typeof port.fetchAssistantSince>>>;
-		try {
-			found = await port.fetchAssistantSince({
-				sessionId: bound.sessionId,
-				repo: this.#manager.repo,
-				notBeforeMs: bound.dispatchedAtMs,
-				...this.#liveRelay(bound),
-			});
-		} catch (error) {
-			this.#manager.log(
-				`unobserved_answer_probe_failed origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
-				"error",
-			);
-			return false;
-		}
-		const text = found?.text?.trim();
-		if (!text) return false;
-		this.#manager.log(
-			`unobserved_answer_delivered origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} session=${bound.sessionId} sweeps=${sweeps} chars=${text.length}`,
-		);
-		const status = {
-			operationRef: bound.turn.opRef,
-			status: { status: "terminal_ok", receiptState: "present" },
-			summary: { completed: true },
-			summaryCompleted: true,
-		} as unknown as StatusReport;
-		await bound.lifecycle.onTerminal?.({ ...bound, text, status });
-		this.#holdSweeps.delete(bound.turn.opRef);
-		// Acceptance and terminal closure share one durable turn boundary.
-		this.#manager.database.transaction((tx) => {
-			if (this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state === "bound")
-				this.#manager.database.inbox.turnAccept(tx, bound.turn.opRef);
-			this.#manager.database.inbox.turnComplete(tx, bound.turn.opRef);
-		});
-		await this.#notifySettled(bound);
-		await this.#settleAfterTerminal(bound);
-		return true;
-	}
-
-	/**
 	 * A turn can fail AFTER it wrote its answer: a tool call that times out
 	 * ends the whole run (#210), and a relay that went dark mid-turn never
 	 * showed the reply. When no assistant text reached the consumer, read the
@@ -3207,91 +3878,30 @@ class OriginActor {
 	}
 
 	/**
-	 * How long the session has been live and `idle`, when that is at least
-	 * WEDGED_TURN_IDLE_MS on an ACCEPTED turn at least that old; otherwise
-	 * undefined and the turn keeps its hold. A busy host (running a tool,
-	 * streaming), an unanswerable probe, or an activity without a timestamp is
-	 * never release evidence. `supplied` reuses a probe the caller already made.
+	 * Check if the turn's last assistant message has stopReason "stop",
+	 * indicating the agent properly concluded and did not have an error.
+	 * Returns true if the last message is confirmed to end with stopReason "stop",
+	 * false if it has a different stopReason, and undefined if unreadable.
 	 */
-	async #wedgedIdleMs(bound: BoundTurn, supplied?: SessionLiveness): Promise<number | undefined> {
+	async #lastAssistantIsAnswering(bound: BoundTurn): Promise<boolean | undefined> {
 		const port = this.#manager.port;
-		if (!port.liveness) return undefined;
-		if (this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state !== "accepted") return undefined;
-		const now = this.#manager.now();
-		if (bound.dispatchedAtMs !== undefined && now - bound.dispatchedAtMs < WEDGED_TURN_IDLE_MS) return undefined;
-		let probe = supplied;
-		if (!probe) {
-			const last = this.#wedgeProbeAt.get(bound.turn.opRef);
-			if (last !== undefined && now - last < WEDGED_PROBE_INTERVAL_MS) return undefined;
-			this.#wedgeProbeAt.set(bound.turn.opRef, now);
-			try {
-				probe = await port.liveness({ sessionId: bound.sessionId, repo: this.#manager.repo });
-			} catch {
-				return undefined;
-			}
-		}
-		if (probe.live !== true || probe.disowned || probe.activity?.state !== "idle") return undefined;
-		const idleMs = this.#manager.now() - probe.activity.at;
-		return idleMs >= WEDGED_TURN_IDLE_MS ? idleMs : undefined;
-	}
-
-	/**
-	 * A wedged turn's answer from the transcript: the last assistant row written
-	 * since dispatch that says something (a trailing `[SILENT]` from a later
-	 * wake-up loses to it), else the silent row. `alreadyDelivered` = every part
-	 * of it is already confirmed posted to this origin in the delivery ledger
-	 * (under another turn) and must not be posted again; a copy the tail showed
-	 * under THIS turn is deduplicated by the terminal path's per-part claim.
-	 * `unreadable` keeps the hold.
-	 */
-	async #wedgedAnswer(bound: BoundTurn): Promise<{ text?: string; alreadyDelivered: boolean } | "unreadable"> {
-		const port = this.#manager.port;
-		if (bound.retired && !bound.answerWanted) return { alreadyDelivered: false };
-		if (!port.fetchAssistantSince || bound.dispatchedAtMs === undefined) return { alreadyDelivered: false };
-		let found: Awaited<ReturnType<NonNullable<typeof port.fetchAssistantSince>>>;
+		if (!port.fetchAssistantSince || bound.dispatchedAtMs === undefined) return undefined;
 		try {
-			found = await port.fetchAssistantSince({
+			const found = await port.fetchAssistantSince({
 				sessionId: bound.sessionId,
 				repo: this.#manager.repo,
 				notBeforeMs: bound.dispatchedAtMs,
-				preferSpoken: true,
+				...this.#liveRelay(bound),
 			});
+			// Correlate with the text from the tail to ensure we're looking at the same message
+			if (!found || found.text !== bound.lastAssistantText) return undefined;
+			return found.stopReason === "stop";
 		} catch (error) {
 			this.#manager.log(
-				`wedged_turn_transcript_unreadable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+				`stall_last_assistant_probe_failed origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
 			);
-			return "unreadable";
+			return undefined;
 		}
-		const text = found?.text?.trim();
-		if (!text) return { alreadyDelivered: false };
-		const parts = spokenParts(text);
-		if (parts.length === 0) return { text, alreadyDelivered: false };
-		const posted = new Set(
-			this.#manager.database.outbox
-				.confirmedTextsSince(this.originKey, new Date(bound.dispatchedAtMs - TURN_FLOOR_SKEW_MS).toISOString())
-				.map((posted) => posted.trim()),
-		);
-		return { text, alreadyDelivered: posted.has(text) || parts.every((part) => posted.has(part)) };
-	}
-
-	/**
-	 * Hands a wedged turn's transcript answer to the lifecycle as its terminal
-	 * text (an already-posted one flagged so it is recorded, not re-posted).
-	 * Returns true when something was actually posted.
-	 */
-	async #postWedgedAnswer(
-		bound: BoundTurn,
-		answer: { readonly text?: string; readonly alreadyDelivered: boolean },
-		status: StatusReport,
-	): Promise<boolean> {
-		if (answer.text === undefined) return false;
-		await bound.lifecycle.onTerminal?.({
-			...bound,
-			text: answer.text,
-			status,
-			...(answer.alreadyDelivered ? { alreadyPosted: true } : {}),
-		});
-		return !answer.alreadyDelivered && !isSilentReply(answer.text);
 	}
 
 	/** True while `bound` is still this actor's current or retired turn and the actor runs. */
@@ -3301,54 +3911,6 @@ class OriginActor {
 			!this.#manager.stopped &&
 			(this.#current === bound || this.#retired.get(retiredKey(bound)) === bound)
 		);
-	}
-
-	/**
-	 * An accepted turn whose operation never settles (status in_flight, unknown
-	 * or unreadable) on a session idle past WEDGED_TURN_IDLE_MS: the host
-	 * finished whatever it was doing and nothing will ever end this turn. Post
-	 * the answer the transcript holds, end the host, and close the turn the way
-	 * a dead session's is closed - never re-sent, binding rotated, held steers
-	 * resolved. Returns true when it did (or the turn is no longer tracked).
-	 */
-	async #releaseWedgedTurn(bound: BoundTurn, reason: string, supplied?: SessionLiveness): Promise<boolean> {
-		const idleMs = await this.#wedgedIdleMs(bound, supplied);
-		if (idleMs === undefined) return false;
-		const answer = await this.#wedgedAnswer(bound);
-		if (answer === "unreadable") return false;
-		if (!this.#stillTracked(bound)) return true;
-		const status = {
-			operationRef: bound.turn.opRef,
-			status: { status: "terminal_ok", receiptState: "present" },
-			summary: { completed: true },
-			summaryCompleted: true,
-		} as unknown as StatusReport;
-		const delivered = await this.#postWedgedAnswer(bound, answer, status);
-		this.#manager.log(
-			`wedged_turn_released origin=${this.originKey} opRef=${bound.turn.opRef} reason=${reason} idleMs=${idleMs} delivered=${delivered}`,
-		);
-		if (bound.retired) await this.#terminateRetiredSession(bound.sessionId, "wedged_idle", bound);
-		else if (this.#manager.port.terminateHost) {
-			try {
-				const ended = await this.#manager.port.terminateHost({
-					sessionId: bound.sessionId,
-					repo: this.#manager.repo,
-				});
-				this.#manager.log(
-					`wedged_turn_host origin=${this.originKey} session=${bound.sessionId} outcome=${ended.outcome}${"pid" in ended ? ` pid=${ended.pid}` : ""}${ended.outcome === "refused" ? ` detail=${ended.reason}` : ""}`,
-				);
-			} catch (error) {
-				this.#manager.log(
-					`wedged_turn_host origin=${this.originKey} session=${bound.sessionId} outcome=error detail=${safeDiagnostic(error)}`,
-				);
-			}
-		}
-		await this.#closeAcceptedOnDeadSession(
-			bound,
-			"wedged_idle",
-			answer.text === undefined ? undefined : { unlinkedReason: isSilentReply(answer.text) ? "silent" : "no_delivery" },
-		);
-		return true;
 	}
 
 	/** Stops a current operation only after its live tail stayed silent and status remained nonterminal past the hard bound. */
@@ -3395,6 +3957,13 @@ class OriginActor {
 			this.#clearStallReconciliation(bound);
 			return false;
 		}
+		// Read the stopReason proof while the host can still serve the transcript.
+		bound.stallReplyConcluded =
+			bound.lastAssistantText !== undefined && (await this.#lastAssistantIsAnswering(bound)) === true;
+		if (!canTerminate()) {
+			this.#clearStallReconciliation(bound);
+			return false;
+		}
 		const authorizeTermination = async () => {
 			if (!canTerminate()) return false;
 			try {
@@ -3405,6 +3974,14 @@ class OriginActor {
 				return false;
 			}
 		};
+		const exitOwner = stalledExitOwner(this.#manager.database, {
+			opRef: bound.turn.opRef,
+			originKey: this.originKey,
+			sessionId: bound.sessionId,
+			epoch: bound.epoch,
+			repo: this.#manager.repo,
+		});
+		if (!exitOwner) return false;
 		let result: TerminateHostOutcome;
 		try {
 			result = await port.terminateHost({
@@ -3423,6 +4000,7 @@ class OriginActor {
 			return false;
 		}
 		if (result.outcome === "terminating") {
+			bound.stallExitOwner ??= exitOwner;
 			bound.stallHostTerminating = true;
 			if (this.#hostTerminatingSessionId !== bound.sessionId) {
 				this.#hostTerminatingSessionId = bound.sessionId;
@@ -3466,6 +4044,8 @@ class OriginActor {
 			}
 			return false;
 		}
+		// Persist before observer, tail, status or lifecycle cleanup can yield.
+		if (!persistStalledExit(this.#manager.database, bound.stallExitOwner ?? exitOwner, result.outcome)) return false;
 		const firstHostTermination = !bound.stallHostTerminated;
 		bound.stallHostTerminated = true;
 		if (this.#observer?.sessionId === bound.sessionId) await this.#closeObserver("host_terminated");
@@ -3495,7 +4075,7 @@ class OriginActor {
 			}
 			return false;
 		}
-		if (isTerminalStatus(latest.status.status)) {
+		if (latest.operationRef !== bound.turn.opRef || isTerminalStatus(latest.status.status)) {
 			await this.#reconcileBound(bound, latest);
 			return true;
 		}
@@ -3504,7 +4084,7 @@ class OriginActor {
 			`stalled_turn_cutoff origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} session=${bound.sessionId} elapsedMs=${this.#manager.now() - (bound.stallStartedAtMs ?? this.#manager.now())} outcome=${result.outcome} status=${latest.status.status}`,
 			"warn",
 		);
-		await this.#closeAcceptedOnDeadSession(bound, "stalled_no_terminal_event");
+		await this.#closeTerminatedStalledTurn(bound);
 		return true;
 	}
 
@@ -3529,6 +4109,12 @@ class OriginActor {
 			// for commands. Keeping a closed handle here made status throw forever.
 			bound.tail = undefined;
 			bound.detached = true;
+			// Record first-outage time on relay death to detect unresponsive relays (#766).
+			// This ensures statusOf records evidence even on the CLI-only path after detach.
+			const trackerKey = relayUnavailableTrackerKey(bound.turn.opRef);
+			if (this.#manager.database.core.metaGet(trackerKey) === undefined) {
+				this.#manager.database.core.metaSet(trackerKey, this.#manager.now().toString());
+			}
 		}
 		if (!bound.tailEvidenceUnavailable) {
 			bound.tailEvidenceUnavailable = true;
@@ -3628,11 +4214,15 @@ class OriginActor {
 			}
 		}
 		// Only the owned relay's correlated agent_end/agent_failed proves the turn's
-		// content stream is complete. An `idle` broadcast reaches every relay on the
-		// session - including one reopened after the owner died, which never saw the
-		// final message - so it only wakes a status reconcile. Treating it as tail
-		// evidence settled the turn with its last mid-work line as the answer (#228).
-		const ownedTerminal = frame.rawKind === "agent_end" || frame.rawKind === "agent_failed";
+		// content stream is complete. The tail admits correlated frames only when
+		// they match this turn, but it passes uncorrelated lifecycle ends through as
+		// idle broadcasts: those reach every relay on the session, including one that
+		// never saw the final message. Like an `idle` activity broadcast, such an end
+		// only wakes a status reconcile. Treating it as tail evidence settled the turn
+		// with its last mid-work line as the answer (#228).
+		const ownedTerminal =
+			(frame.rawKind === "agent_end" || frame.rawKind === "agent_failed") &&
+			(frame.commandId !== undefined || frame.turnId !== undefined);
 		if (ownedTerminal && !bound.tailEvidenceUnavailable) bound.tailTerminalObserved = true;
 		if (ownedTerminal || frame.idle) await this.#reconcileBound(bound);
 	}
@@ -3647,13 +4237,8 @@ class OriginActor {
 		const bound = this.#findBound(sessionId, epoch, brokerGeneration);
 		if (!bound) return;
 		this.#manager.log(`stall_alert originKey=${this.originKey} sessionId=${sessionId} silentMs=${elapsedMs}`, "warn");
-		// If turn is in recovery_hold and not already retired, retire it so pending inbound
-		// can start a fresh trigger turn in the next epoch.
-		const inRecoveryHold =
-			!bound.retired && !retired && !bound.statusRecheckAfterStall && this.#holdSweeps.has(bound.turn.opRef);
-		if (inRecoveryHold) {
-			bound.retired = true;
-		}
+		// Observation uncertainty does not retire a turn or revoke its tracking.
+		// Keep the same owner on the guarded status/cancellation path.
 		if (!bound.retired && !retired) {
 			bound.statusRecheckAfterStall = true;
 			bound.stallStartedAtMs ??= this.#manager.now();
@@ -3694,15 +4279,6 @@ class OriginActor {
 				"warn",
 			);
 			this.#holdSweeps.delete(bound.turn.opRef);
-			// If we just retired a turn in recovery_hold, dispatch pending inbound as a new trigger turn.
-			if (inRecoveryHold) {
-				// Clear the current turn if this is the bound turn, and set state to idle for dispatch.
-				if (this.#current === bound) {
-					this.#current = undefined;
-					this.#state = "idle";
-				}
-				await this.#dispatchNext();
-			}
 			await this.#reconcileBound(bound);
 		}
 	}
@@ -3764,13 +4340,23 @@ class OriginActor {
 		const base = { sessionId: bound.sessionId, repo: this.#manager.repo, opRef: bound.turn.opRef };
 		if (!bound.tail || bound.detached) return await this.#manager.port.status(base);
 		try {
-			return await this.#manager.port.status({ ...base, relay: bound.tail });
+			const report = await this.#manager.port.status({ ...base, relay: bound.tail });
+			// Clear relay unavailable tracker on successful relay/status answer (#766)
+			this.#manager.database.core.metaDelete(relayUnavailableTrackerKey(bound.turn.opRef));
+			return report;
 		} catch (error) {
 			if (!isRelayTransportFailure(error)) throw error;
 			this.#manager.log(
 				`status_relay_unavailable origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
 				"error",
 			);
+			// Track relay unavailable evidence to detect unresponsive relays on live hosts (#766).
+			// Record only the first unavailable timestamp for the current unavailability streak;
+			// it is cleared on successful relay/status answer and scoped per op so it cannot leak.
+			const trackerKey = relayUnavailableTrackerKey(bound.turn.opRef);
+			if (this.#manager.database.core.metaGet(trackerKey) === undefined) {
+				this.#manager.database.core.metaSet(trackerKey, this.#manager.now().toString());
+			}
 			return await this.#manager.port.status(base);
 		}
 	}
@@ -3778,100 +4364,68 @@ class OriginActor {
 	async #reconcileBound(bound: BoundTurn, knownReport?: StatusReport): Promise<void> {
 		if (this.#stopped || this.#manager.stopped) return;
 		if (this.#quarantinedTurn(bound.turn.opRef)) return;
+		const localRejection = localPreflightRejection(this.#manager.database, bound.turn.opRef);
+		if (localRejection) {
+			await this.#settleLocalPreflightRejection(bound, localRejection);
+			return;
+		}
+		bound.stallHostTerminated = confirmedStalledExit(this.#manager.database, {
+			opRef: bound.turn.opRef,
+			originKey: this.originKey,
+			sessionId: bound.sessionId,
+			epoch: bound.epoch,
+			repo: this.#manager.repo,
+		});
 		let report: StatusReport;
 		try {
 			report = knownReport ?? (await this.#statusOf(bound));
 		} catch (error) {
 			if (this.#stopped || this.#manager.stopped) return;
-			// The broker disowning the id (session_unavailable) with the session
-			// provably not live means nothing is running there: release the turn
-			// and rebind instead of holding an adopted turn forever. A retired turn
-			// whose answer is still wanted (session replaced under it after a steer
-			// refusal) is judged the same way: held forever, its lifecycle kept
-			// announcing a turn that never ran (live: "working… (286m)", 2026-09-05).
-			if (sdkStatusErrorCode(error) === "session_unavailable") {
-				const raw = this.#manager.port.liveness
-					? await this.#manager.port.liveness({ sessionId: bound.sessionId, repo: this.#manager.repo })
-					: undefined;
-				// A BOUND (never acknowledged) turn never reached the model, so it is
-				// safe to re-fire on the broker's word alone. An ACCEPTED turn may have
-				// run and acted: it is NEVER re-sent. On positive evidence the session
-				// is dead (live=false or disowned) it is closed; an unanswerable
-				// liveness probe holds it.
-				const state = this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state;
-				const dead = raw?.live === false || raw?.disowned === true;
-				const wanted = !bound.retired || bound.answerWanted;
-				if (state === "bound" && wanted && raw?.live !== true) {
-					await this.#releaseUnlanded(bound, "router_disowned");
-					return;
-				}
-				if (state === "accepted" && dead) {
-					await this.#closeAcceptedOnDeadSession(
-						bound,
-						bound.stallHostTerminated ? "stalled_no_terminal_event" : "session_gone",
-					);
-					return;
-				}
-				// Live and idle long past any work: the status endpoint will never
-				// answer for this turn again (a host whose prompt was force-ended).
-				if (state === "accepted" && raw && (await this.#releaseWedgedTurn(bound, "status_unavailable", raw))) return;
+			// Endpoint/registry loss cannot prove producer exit. Only the separately
+			// guarded stalled-host termination permits cutoff without native terminal.
+			const state = this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state;
+			if ((state === "accepted" || state === "bound") && bound.stallHostTerminated) {
+				await this.#closeTerminatedStalledTurn(bound);
+				return;
 			}
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`,
-				"warn",
-			);
+			if (await this.#escalateUnresolvedHold(bound.turn, bound, { status: "unavailable" })) {
+				await this.#dispatchNext();
+				return;
+			}
+			this.#logRecoveryHoldOnce(bound.turn, "status_unavailable", `detail=${safeDiagnostic(error)}`);
 			// A turn no relay will announce the end of must not wait for the 60 s
 			// sweep after one unreadable status: keep rechecking at the bounded cadence.
 			if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
 			return;
 		}
 		if (this.#stopped || this.#manager.stopped) return;
-		if (report.status.status === "unknown") {
+		if (bound.stallHostTerminated && report.operationRef !== bound.turn.opRef) {
+			this.#logRecoveryHoldOnce(bound.turn, "operation_ref_mismatch");
+			this.#scheduleStatusRecheck(bound);
+			return;
+		}
+		// Check for relay unavailable evidence even with "in_flight" status (#766).
+		const relayTrackerTs = this.#manager.database.core.metaGet(relayUnavailableTrackerKey(bound.turn.opRef));
+		const hasRelayUnavailableEvidence =
+			relayTrackerTs !== undefined &&
+			this.#manager.now() - Number.parseInt(relayTrackerTs, 10) >= this.#manager.unresolvedHoldMs;
+		if (report.status.status === "unknown" || (report.status.status === "in_flight" && hasRelayUnavailableEvidence)) {
 			const count = (this.#holdSweeps.get(bound.turn.opRef) ?? 0) + 1;
 			this.#holdSweeps.set(bound.turn.opRef, count);
 			const state = this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state;
-			if (state === "accepted" && bound.stallHostTerminated) {
-				await this.#closeAcceptedOnDeadSession(bound, "stalled_no_terminal_event");
+			if ((state === "accepted" || state === "bound") && bound.stallHostTerminated) {
+				await this.#closeTerminatedStalledTurn(bound);
 				return;
 			}
-			// This is the live counterpart of startup's operator_hold recovery.
-			// A BOUND turn has no broker acknowledgement. When the live session
-			// reports no such operation and its prompt queue remains empty across
-			// two sweeps, the send did not land; holding it forever bricks the
-			// origin. ACCEPTED work is different and remains protected from replay.
-			if (state === "bound" && (!bound.retired || bound.answerWanted) && count >= HOLD_RELEASE_SWEEPS) {
-				let live: boolean | undefined;
-				let disowned = false;
-				try {
-					if (this.#manager.port.liveness) {
-						const liveness = await this.#manager.port.liveness({
-							sessionId: bound.sessionId,
-							repo: this.#manager.repo,
-						});
-						live = liveness.live;
-						disowned = liveness.disowned === true;
-					} else {
-						live = (await this.#manager.port.inspect({ sessionId: bound.sessionId, repo: this.#manager.repo }))?.live;
-					}
-				} catch {
-					// An indeterminate liveness probe is not release evidence.
-				}
-				const dead = live === false || disowned;
-				const liveIdle = live === true && (await this.#queueIsEmpty(bound.sessionId, this.#liveRelay(bound).relay));
-				if (liveIdle && (await this.#deliverUnobservedAnswer(bound, count))) return;
-				if (dead || liveIdle) {
-					await this.#releaseUnlanded(
-						bound,
-						`${dead ? "unknown_op_on_dead_session" : "unknown_op_on_live_idle_session"} sweeps=${count}`,
-					);
-					return;
-				}
+			// Neither a missing acknowledgement nor queue/session observations
+			// establish non-admission or authorize a new operation identity.
+			if (await this.#escalateUnresolvedHold(bound.turn, bound, { status: report.status.status })) {
+				await this.#dispatchNext();
+				return;
 			}
-			if (state === "accepted" && (await this.#releaseWedgedTurn(bound, "operation_state_unknown"))) return;
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=operation_state_unknown sweeps=${count}`,
-				"warn",
-			);
+			const reason =
+				report.status.status === "unknown" ? "operation_state_unknown" : "relay_unavailable_holds_in_flight";
+			this.#logRecoveryHoldOnce(bound.turn, reason, `sweeps=${count}`);
 			if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
 			return;
 		}
@@ -3879,9 +4433,10 @@ class OriginActor {
 		if (this.#manager.database.inbox.turnRow(bound.turn.opRef)?.turn_state === "bound")
 			this.#manager.database.transaction((tx) => this.#manager.database.inbox.turnAccept(tx, bound.turn.opRef));
 		if (!isTerminalStatus(report.status.status)) {
-			// Reported running while the host has idled past the bound: the run
-			// ended without settling its operation and never will.
-			if (await this.#releaseWedgedTurn(bound, `status_${report.status.status}`)) return;
+			if (bound.stallHostTerminated) {
+				await this.#closeTerminatedStalledTurn(bound);
+				return;
+			}
 			if (
 				bound.statusRecheckAfterStall &&
 				bound.stallStartedAtMs !== undefined &&
@@ -3912,10 +4467,7 @@ class OriginActor {
 			// reconcile authority — completes the turn below, corroborated by an
 			// explicit log line instead of a silent shortcut.
 			bound.statusTerminalHolds += 1;
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=tail_terminal_evidence_unavailable`,
-				"warn",
-			);
+			this.#logRecoveryHoldOnce(bound.turn, "tail_terminal_evidence_unavailable");
 			const timer = this.#manager.schedule(() => {
 				this.#graceTimers.delete(timer);
 				if (this.#stopped || this.#manager.stopped) return;
@@ -3991,36 +4543,40 @@ class OriginActor {
 					}
 				}
 				if (text === undefined) {
-					// Terminal, but its output will never be provable (receipt missing)
-					// and the host has idled past the bound: the transcript is the only
-					// place the answer lives. The host is healthy and is left alone.
-					const idleMs = await this.#wedgedIdleMs(bound);
-					const answer = idleMs === undefined ? undefined : await this.#wedgedAnswer(bound);
-					if (idleMs === undefined || answer === undefined || answer === "unreadable") {
-						this.#manager.log(
-							`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=${notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal"}`,
-							"warn",
+					const now = this.#manager.now();
+					// The window is a limit on how long the turn may hold, not on how long
+					// this process may live: recover the first miss from durable state so a
+					// restart cannot restart the budget and leave the turn pending forever.
+					const firstMissKey = terminalTextMissKey(bound.turn.opRef);
+					const recordedFirstMiss = Number.parseInt(this.#manager.database.core.metaGet(firstMissKey) ?? "", 10);
+					const durableFirstMiss =
+						Number.isSafeInteger(recordedFirstMiss) && recordedFirstMiss > 0 ? recordedFirstMiss : undefined;
+					bound.terminalTextFirstMissAtMs ??= durableFirstMiss ?? now;
+					if (durableFirstMiss === undefined)
+						this.#manager.database.core.metaSet(firstMissKey, bound.terminalTextFirstMissAtMs.toString());
+					bound.terminalTextMisses += 1;
+					const exhausted =
+						bound.terminalTextMisses >= TERMINAL_TEXT_RECOVERY_MAX_ATTEMPTS ||
+						now - bound.terminalTextFirstMissAtMs >= TERMINAL_TEXT_RECOVERY_WINDOW_MS;
+					if (!exhausted) {
+						this.#logRecoveryHoldOnce(
+							bound.turn,
+							notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal",
 						);
-						if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
+						// A missing receipt can arrive late; keep probing on the bounded cadence
+						// instead of waiting for the 60 s recovery sweep.
+						this.#scheduleStatusRecheck(bound);
 						return;
 					}
-					if (!this.#stillTracked(bound)) return;
-					const delivered = await this.#postWedgedAnswer(bound, answer, report);
-					// Finished with nothing in the transcript at all: say so instead of
-					// completing in silence.
-					if (answer.text === undefined)
-						await bound.lifecycle.onFailure?.({
-							...bound,
-							error: new GjcRuntimeError("output_unavailable: the turn finished but its answer could not be read", {
-								code: "output_unavailable",
-								message: "the turn finished but its answer could not be read",
-							}),
-							status: report,
-						});
 					this.#manager.log(
-						`wedged_turn_released origin=${this.originKey} opRef=${bound.turn.opRef} reason=terminal_output_pending idleMs=${idleMs} delivered=${delivered}`,
+						`terminal_text_unrecoverable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} misses=${bound.terminalTextMisses} heldMs=${now - bound.terminalTextFirstMissAtMs}`,
+						"warn",
 					);
-				} else await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
+					// The operation completed, so silence is not a valid answer: settle its
+					// trigger with one notice instead of holding the turn forever.
+					text = TERMINAL_TEXT_UNRECOVERABLE_NOTICE;
+				}
+				await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
 			} else if (!bound.retired || bound.answerWanted) {
 				if (bound.agentErrorRetryScheduled) return;
 				const openTool = bound.openTool && {
@@ -4091,7 +4647,8 @@ class OriginActor {
 		const completed = resetApplied
 			? 1
 			: this.#manager.database.transaction((tx) => {
-					const changed = this.#manager.database.inbox.turnComplete(
+					const changed = completeInboundTurn(
+						this.#manager.database,
 						tx,
 						bound.turn.opRef,
 						bound.retired && !bound.answerWanted ? "retired" : "no_delivery",
@@ -4236,8 +4793,23 @@ class OriginActor {
 	 * send, so no prompt ever lands on a session gjc would compact first. A
 	 * compaction that fails or is unavailable is logged and the send goes ahead:
 	 * gjc's own compaction and the wedged-submission reset stay the fallback.
+	 *
+	 * A compaction that may still be running (gjc's request timed out, or no gjc
+	 * answer was read) never lets the send through: a prompt sent now queues
+	 * behind it on the session's ordered controls and times out as an ambiguous
+	 * send. The turn goes back to pending, and each retry needs evidence that
+	 * the run is over: a readable context below the line (it landed), or the
+	 * host's answer to a second `compaction.run` sent on the relay, which gjc's
+	 * ordered dispatcher runs only after the first. An unreadable context, a
+	 * refusal before dispatch and a missing reply are not evidence.
 	 */
 	async #prepareContext(sessionId: string, epoch: number, opRef: string, tail: TailHandle): Promise<PreparedContext> {
+		// Durable, so a restarted gateway keeps holding until the run is proven over.
+		const unresolvedKey = unresolvedCompactionKey(this.originKey);
+		const unresolvedOn = this.#manager.database.core.metaGet(unresolvedKey);
+		// A run left unresolved on another session says nothing about this one.
+		if (unresolvedOn !== undefined && unresolvedOn !== sessionId) this.#manager.database.core.metaDelete(unresolvedKey);
+		const unresolved = unresolvedOn === sessionId;
 		let usage: SessionContextUsage | undefined;
 		try {
 			usage = await this.#manager.port.contextUsage?.({ sessionId, repo: this.#manager.repo, relay: tail });
@@ -4246,26 +4818,52 @@ class OriginActor {
 			this.#manager.log(
 				`persona_context_unreadable origin=${this.originKey} session=${sessionId} detail=${safeDiagnostic(error)}`,
 			);
-			return { compacted: false };
+			if (!unresolved) return { compacted: false };
 		}
-		if (!usage || usage.tokens < PERSONA_COMPACTION_TOKENS) return { ...(usage ? { usage } : {}), compacted: false };
+		const belowLine = usage !== undefined && usage.tokens < PERSONA_COMPACTION_TOKENS;
+		if (unresolved && belowLine) {
+			// The earlier run landed: the context is compacted and the persona goes back in.
+			this.#manager.database.core.metaDelete(unresolvedKey);
+			this.#manager.log(
+				`persona_compaction_resolved origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage!.tokens} evidence=context_below_line`,
+			);
+			return { compacted: true };
+		}
+		if (!unresolved && (usage === undefined || belowLine)) return { ...(usage ? { usage } : {}), compacted: false };
+		// Written ahead of the run: a gateway that stops while it is in flight must
+		// come back holding, since the host keeps compacting regardless.
+		if (!unresolved) this.#manager.database.core.metaSet(unresolvedKey, sessionId);
 		const startedAt = this.#manager.now();
-		const { status } = await this.#manager.port.runCompaction({
+		const { status, code, outcomeUnknown, answered } = await this.#manager.port.runCompaction({
 			sessionId,
 			repo: this.#manager.repo,
 			originKey: this.originKey,
+			relay: tail,
 		});
 		this.#manager.log(
-			`persona_compaction origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage.tokens} status=${status} elapsedMs=${this.#manager.now() - startedAt}`,
+			`persona_compaction origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage?.tokens ?? "unknown"} status=${status}${code ? ` code=${code}` : ""}${outcomeUnknown ? " outcome=unknown" : ""}${unresolved ? " after=unresolved" : ""} elapsedMs=${this.#manager.now() - startedAt}`,
 		);
-		return status === "succeeded" ? { compacted: true } : { usage, compacted: false };
+		// Behind an unresolved run, only the host dispatcher's answer to this run
+		// proves the earlier one is over (gjc orders them): a refusal before
+		// dispatch or a reply that never came does not. The hold lasts until such
+		// an answer, a readable context below the line, the host's death or /new.
+		// A receipt is the host's answer on either path, and a host without
+		// compaction.run cannot have one running.
+		const settled = answered === true || status === "succeeded" || status === "skipped" || status === "unavailable";
+		if (outcomeUnknown || (unresolved && !settled)) throw new CompactionUnresolvedError(code);
+		// Answered, or a first run that never reached the host (refused before
+		// dispatch, frame never written): nothing is left compacting.
+		this.#manager.database.core.metaDelete(unresolvedKey);
+		// The earlier run may have compacted even if this one failed ("already
+		// compacted"): resolve it as compacted so the persona goes back in.
+		if (unresolved || status === "succeeded") return { compacted: true };
+		return { ...(usage ? { usage } : {}), compacted: false };
 	}
 
 	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {
 		if (this.#observer && this.#observer.epoch !== this.#epoch()) await this.#closeObserver("epoch_changed");
 		if (this.#observer?.sessionId === bound.sessionId && (bound.stallHostTerminated || bound.stallHostTerminating))
 			await this.#closeObserver("host_terminated");
-		this.#wedgeProbeAt.delete(bound.turn.opRef);
 		this.#clearStallReconciliation(bound);
 		this.#cancelStatusRecheck(bound);
 		bound.tail?.setTurnRunning(false);
@@ -4293,7 +4891,8 @@ class OriginActor {
 		if (bound.retired) {
 			this.#retired.delete(retiredKey(bound));
 			this.#clearRetiredReattach(bound);
-			await this.#terminateRetiredSession(bound.sessionId, "retired_turn_reconciled", bound);
+			if (!bound.stallHostTerminated)
+				await this.#terminateRetiredSession(bound.sessionId, "retired_turn_reconciled", bound);
 			return;
 		}
 		if (this.#current === bound) {
@@ -4346,60 +4945,20 @@ class OriginActor {
 	}
 
 	/**
-	 * Drops a turn whose send provably never ran: trigger back to plain pending,
-	 * lifecycle told it will never see a terminal, and a fresh dispatch. A
-	 * current turn also rotates the epoch (its binding is unusable); a retired
-	 * one was already rotated away from and must not tear down the live
-	 * replacement session under the current epoch.
+	 * Closes a stalled turn only after guarded host termination positively
+	 * confirmed producer exit. Registry absence alone never authorizes cutoff.
+	 * The original trigger is completed without replay and the owner is notified.
 	 */
-	async #releaseUnlanded(bound: BoundTurn, reason: string): Promise<void> {
-		this.#holdSweeps.delete(bound.turn.opRef);
-		this.#wedgeProbeAt.delete(bound.turn.opRef);
-		this.#clearStallReconciliation(bound);
-		this.#cancelStatusRecheck(bound);
-		bound.tail?.setTurnRunning(false);
-		this.#flushStaleOutput(bound, "unlanded");
-		await bound.tail?.close();
-		const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
-			const attempt = retryInboundTurn(this.#manager.database, tx, bound.turn.opRef);
-			const nextEpoch = bound.retired ? this.#epoch() : this.#manager.database.bindings.rotateEpoch(tx, this.originKey);
-			return { attempt, nextEpoch };
-		});
-		if (bound.retired) {
-			this.#retired.delete(retiredKey(bound));
-			this.#clearRetiredReattach(bound);
-			await this.#terminateRetiredSession(bound.sessionId, "retired_turn_unlanded", bound);
-		} else if (this.#current === bound) {
-			this.#current = undefined;
-			this.#state = "idle";
-		}
-		this.#manager.log(
-			`recovery_requeue_unaccepted origin=${this.originKey} epoch=${bound.epoch} nextEpoch=${nextEpoch} opRef=${bound.turn.opRef} session=${bound.sessionId} attempt=${attempt} reason=${reason}`,
-		);
-		await this.#notifyReleased(bound);
-		// The canonical admission rule applies to the released row: a running
-		// replacement turn takes it as a steer, an idle origin sends it next.
-		if (this.#state === "turn-running") await this.#steerPending();
-		else await this.#dispatchNext();
-	}
-
-	/**
-	 * Closes an ACCEPTED turn whose session is provably gone (the broker disowns
-	 * the id and liveness answers not-live). The model may already have run and
-	 * acted, so the trigger is NEVER re-sent: it is completed, the owner is told
-	 * the turn was cut off (live turns only; a /new-retired turn is discarded
-	 * silently), its unresolved held steers are closed with it, the binding is
-	 * rotated so the next message gets a fresh session, and the origin moves on.
-	 * Holding it instead re-checked a dead endpoint forever and blocked the
-	 * conversation (live: a broker restart held four origins for minutes).
-	 */
-	async #closeAcceptedOnDeadSession(
-		bound: BoundTurn,
-		reason: string,
-		/** The turn's answer was already handled (posted, silent, or posted before): no cut-off notice. */
-		answered?: { readonly unlinkedReason: TerminalUnlinkedReason },
-	): Promise<void> {
+	async #closeTerminatedStalledTurn(bound: BoundTurn): Promise<void> {
+		if (!bound.stallHostTerminated) return;
 		const database = this.#manager.database;
+		const owner = {
+			opRef: bound.turn.opRef,
+			originKey: this.originKey,
+			sessionId: bound.sessionId,
+			epoch: bound.epoch,
+			repo: this.#manager.repo,
+		};
 		// Only a still-open trigger is closed: a repeat call after completion (or
 		// after a restart that already closed it) sends no second notice.
 		const open = database.inbox.turnRow(bound.turn.opRef);
@@ -4407,12 +4966,8 @@ class OriginActor {
 			await this.#forgetClosed(bound);
 			return;
 		}
+		if (!confirmedStalledExit(database, owner)) return;
 		this.#holdSweeps.delete(bound.turn.opRef);
-		const stalledCutoff = reason === "stalled_no_terminal_event";
-		if (!stalledCutoff) {
-			this.#clearStallReconciliation(bound);
-			this.#cancelStatusRecheck(bound);
-		}
 		bound.tail?.setTurnRunning(false);
 		this.#flushStaleOutput(bound, "session_gone");
 		await bound.tail?.close();
@@ -4420,18 +4975,25 @@ class OriginActor {
 		// The notice is persisted BEFORE the trigger closes. If persisting it
 		// throws, the trigger stays open and the next sweep retries the same
 		// deterministic notice: a closed turn never silently loses it.
-		if (!discarded && !answered) {
-			const message = stalledCutoff
-				? "the session running this turn produced no terminal event before the stall deadline; the request was not resent"
-				: "the session running this turn was lost before it finished";
+		if (!discarded) {
+			const message =
+				"the session running this turn produced no terminal event before the stall deadline; the request was not resent";
 			try {
+				// A delivered reply that properly concluded (stopReason "stop", probed
+				// before the host was stopped) already answered the user: no notice.
+				// An unreadable or non-"stop" transcript keeps the notice (fail safe).
+				const forceFailureNotice = bound.stallReplyConcluded !== true;
+				if (!forceFailureNotice)
+					this.#manager.log(
+						`stall_turn_answered_properly origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} last_stop_reason=stop`,
+					);
 				await bound.lifecycle.onFailure?.({
 					...bound,
 					error: new GjcRuntimeError(`session_unavailable: ${message}`, { code: "session_unavailable", message }),
-					...(stalledCutoff ? { forceFailureNotice: true } : {}),
+					forceFailureNotice,
 				});
 			} catch (error) {
-				if (stalledCutoff) this.#scheduleStatusRecheck(bound);
+				this.#scheduleStatusRecheck(bound);
 				throw error;
 			}
 		}
@@ -4439,29 +5001,28 @@ class OriginActor {
 		// a crash between them cannot leave the next message aimed at the dead session.
 		// Only the CURRENT turn of the CURRENT epoch rotates: a retired turn or a
 		// turn a newer epoch already replaced never tears down the live binding.
-		const rotate =
-			!bound.retired &&
-			this.#current === bound &&
-			database.bindings.getSessionRecord(this.originKey)?.epoch === bound.epoch;
 		let completed: number;
 		try {
 			completed = database.transaction((tx) => {
-				const changed = database.inbox.turnComplete(
-					tx,
-					bound.turn.opRef,
-					discarded ? "retired" : (answered?.unlinkedReason ?? "turn_failed"),
-				);
+				if (!confirmedStalledExit(database, owner)) throw new Error("stalled exit completion lost its fence");
+				const session = database.bindings.getSessionRecord(this.originKey);
+				const rotate =
+					!bound.retired &&
+					this.#current === bound &&
+					session?.epoch === bound.epoch &&
+					session.sessionId === bound.sessionId;
+				const changed = completeInboundTurn(database, tx, bound.turn.opRef, discarded ? "retired" : "turn_failed");
 				if (changed === 1 && rotate) database.bindings.rotateEpoch(tx, this.originKey);
 				return changed;
 			});
 		} catch (error) {
-			if (stalledCutoff) this.#scheduleStatusRecheck(bound);
+			this.#scheduleStatusRecheck(bound);
 			throw error;
 		}
 		for (const held of database.inbox.steersHeld(bound.turn.opRef))
 			await this.#abandonHeldSteer(held, bound.turn.opRef, bound);
 		this.#manager.log(
-			`${discarded ? "retired_turn_closed" : "accepted_turn_closed"} origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} session=${bound.sessionId} reason=${reason}`,
+			`${discarded ? "retired_turn_closed" : "accepted_turn_closed"} origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} session=${bound.sessionId} reason=stalled_no_terminal_event`,
 		);
 		if (completed === 0) {
 			await this.#forgetClosed(bound);
@@ -4474,7 +5035,6 @@ class OriginActor {
 	/** Drops actor tracking for a turn that is already closed durably, then serves anything queued behind it. */
 	async #forgetClosed(bound: BoundTurn): Promise<void> {
 		this.#holdSweeps.delete(bound.turn.opRef);
-		this.#wedgeProbeAt.delete(bound.turn.opRef);
 		this.#clearStallReconciliation(bound);
 		this.#cancelStatusRecheck(bound);
 		if (bound.retired) {
@@ -4551,10 +5111,7 @@ class OriginActor {
 						this.#scheduleRetiredReattach(bound, attempt + 1);
 						return;
 					}
-					this.#manager.log(
-						`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=retired_tail_reattach_failed detail=${safeDiagnostic(error)}`,
-						"warn",
-					);
+					this.#logRecoveryHoldOnce(bound.turn, "retired_tail_reattach_failed", `detail=${safeDiagnostic(error)}`);
 					return;
 				}
 				// A reopened relay never carries the retired turn's content; its
@@ -4615,6 +5172,22 @@ class OriginActor {
 			this.#scheduleHostTerminationRecheck(sessionId);
 			return;
 		}
+		// Reset may have retired the signalled turn while its confirmation timer
+		// remained pending. Resolve only that captured original, never its successor.
+		const bound = [this.#current, ...this.#retired.values()].find((candidate) => {
+			const owner = candidate?.stallExitOwner;
+			return (
+				candidate !== undefined &&
+				owner !== undefined &&
+				candidate.sessionId === sessionId &&
+				owner.sessionId === sessionId &&
+				owner.opRef === candidate.turn.opRef &&
+				owner.originKey === this.originKey &&
+				owner.epoch === candidate.epoch &&
+				owner.repo === this.#manager.repo
+			);
+		});
+		const exitOwner = bound?.stallExitOwner;
 		let result: TerminateHostOutcome;
 		try {
 			result = await port.terminateHost({ sessionId, repo: this.#manager.repo });
@@ -4626,10 +5199,11 @@ class OriginActor {
 			this.#scheduleHostTerminationRecheck(sessionId);
 			return;
 		}
+		// No awaited cleanup may precede the durable confirmation.
+		if (bound && !persistStalledExit(this.#manager.database, exitOwner, result.outcome)) return;
 		if (this.#observer?.sessionId === sessionId) await this.#closeObserver("host_terminated");
 		this.#hostTerminatingSessionId = undefined;
 		if (this.#hostSessionId === sessionId) this.#hostSessionId = undefined;
-		const bound = this.#current?.sessionId === sessionId ? this.#current : undefined;
 		if (bound) {
 			bound.stallHostTerminating = false;
 			bound.stallHostTerminated = true;
@@ -4642,10 +5216,15 @@ class OriginActor {
 		if (bound) await this.#reconcileBound(bound);
 	}
 
-	/** Bounded status poll for a lost or stalled tail; one timer per turn, backing off. */
+	/**
+	 * Bounded status poll for a lost or stalled tail; one timer per turn, backing off.
+	 * An escalated retired hold is never polled this way: its user was already
+	 * told, so the periodic sweep alone reads it (#715: 5 s polls ran for hours).
+	 */
 	#scheduleStatusRecheck(bound: BoundTurn): void {
 		const key = `status:${retiredKey(bound)}`;
 		if (this.#retiredReattachTimers.has(key)) return;
+		if (bound.retired && this.#manager.database.core.metaGet(escalatedHoldKey(bound.turn.opRef)) !== undefined) return;
 		const delay = Math.min(STATUS_RECHECK_MAX_MS, STATUS_RECHECK_MIN_MS * 2 ** bound.statusRechecks);
 		bound.statusRechecks += 1;
 		const timer = this.#manager.schedule(() => {
@@ -5043,6 +5622,16 @@ export function steerDirectedAtPersona(row: InboundMessageRow): boolean {
 		readonly replyTo?: { readonly fromSelf?: boolean };
 	};
 	return engagement.group !== true || engagement.mentioned === true || engagement.replyTo?.fromSelf === true;
+}
+
+function hasPersistedImages(imagesJson: string | null): boolean {
+	if (imagesJson === null) return false;
+	try {
+		const parsed: unknown = JSON.parse(imagesJson);
+		return !Array.isArray(parsed) || parsed.length > 0;
+	} catch {
+		return true;
+	}
 }
 
 function laneSteerText(row: InboundMessageRow, lifecycle?: PersonaTurnLifecycle): string {

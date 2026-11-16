@@ -8,14 +8,16 @@ import { appendAttempt, closeAttempt, createLaneJobRecord, parseLaneJobRecord } 
 import { bootGateway } from "../src/boot";
 import { buildDeliveryPayload, DeliveryService } from "../src/delivery/delivery";
 import { readPinnedGjcVersion } from "../src/orchestrator/broker";
-import { DatabaseStartupError, Store } from "../src/store";
+import { DatabaseStartupError, LATEST_SCHEMA_VERSION, Store } from "../src/store";
 import {
 	resolveLaneReportOrigin,
+	terminalEvidence,
 	type WorkAttemptAdmission,
 	type WorkAttemptPatch,
 	type WorkAttemptRuntime,
 	type WorkAttemptSettlement,
 	WorkAttemptStateError,
+	type WorkAttemptTerminalEvidence,
 	workAccepted,
 	workAttemptDeliveryId,
 	workAttemptReportId,
@@ -239,6 +241,86 @@ function seedLinkedWakeReport(
 }
 
 describe("work attempt durable transactions", () => {
+	for (const cause of ["provider", "deadline", "rejected", "runtime"] as const) {
+		test(`#696 ${cause} cause and missing receipt survive durable round-trip`, async () => {
+			const f = await fixture();
+			f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+			const status = {
+				status: "failed" as const,
+				receiptState: "missing" as const,
+				clientRef: f.runtime.opRef,
+				error: { code: cause === "deadline" ? "prompt_deadline_exceeded" : "agent_error" },
+				outcome: {
+					kind: "failed",
+					code: cause === "deadline" ? "prompt_deadline_exceeded" : "prompt_failed",
+					phase: "post_start",
+					provenance: cause === "deadline" ? "deadline" : "agent_failed",
+					category:
+						cause === "provider"
+							? "provider_transport"
+							: cause === "rejected"
+								? "provider_rejected"
+								: cause === "runtime"
+									? "agent_runtime"
+									: "deadline",
+					...(cause === "provider" ? { providerCode: "server_is_overloaded" } : {}),
+				},
+			};
+			const terminal = terminalEvidence(status, END)!;
+			f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 0, { terminal }));
+			expect(f.database.work.workAttemptGet(f.runtime.opRef)?.terminal).toEqual(terminal);
+			expect(terminal.reasonCode).toBe(
+				cause === "provider" ? "provider_transport" : cause === "deadline" ? "prompt_deadline_exceeded" : "sdk_failed",
+			);
+		});
+	}
+	for (const [field, token] of [
+		["kind", "arbitrary"],
+		["code", "private-token"],
+		["providerCode", "PRIVATE_SECRET"],
+		["phase", "arbitrary"],
+		["category", "arbitrary"],
+		["provenance", "arbitrary"],
+		["message", "private text"],
+		["failureCauseDiagnostic", "private diagnostic"],
+		["toString", "private token"],
+	] as const) {
+		test(`#696 durable outcome rejects unsafe ${field}`, async () => {
+			const f = await fixture();
+			f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+			expect(() =>
+				f.database.transaction((tx) =>
+					updateAttempt(f.database, tx, f.runtime.opRef, 0, {
+						terminal: {
+							kind: "broker",
+							observedAt: END,
+							reasonCode: "sdk_failed",
+							status: { status: "failed", receiptState: "missing", outcome: { [field]: token } },
+						},
+					}),
+				),
+			).toThrow();
+			expect(f.database.work.workAttemptGet(f.runtime.opRef)?.terminal).toBeNull();
+		});
+	}
+	test("#696 durable terminal identity must belong to the operation", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		for (const identity of [{ clientRef: "gw-foreign" }, { turnId: "private arbitrary identity" }]) {
+			expect(() =>
+				f.database.transaction((tx) =>
+					updateAttempt(f.database, tx, f.runtime.opRef, 0, {
+						terminal: {
+							kind: "broker",
+							observedAt: END,
+							reasonCode: "sdk_failed",
+							status: { status: "failed", receiptState: "missing", ...identity },
+						},
+					}),
+				),
+			).toThrow();
+		}
+	});
 	for (const mode of ["start", "run"] as const) {
 		test(`${mode} publishes worker metadata and activity atomically at prepare and settlement`, async () => {
 			const f = await fixture();
@@ -898,7 +980,7 @@ describe("work attempt durable transactions", () => {
 
 		const migrated = await Store.open(f.path);
 		handles.push(migrated);
-		expect(migrated.schemaVersion).toBe(38);
+		expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 		expect(migrated.work.workAttemptGet(f.runtime.opRef)).toMatchObject({
 			decision: "fallback",
 			parent: { kind: "persona", origin: LOOPBACK_ORIGIN, originKey: originKey(LOOPBACK_ORIGIN) },
@@ -967,7 +1049,7 @@ DELETE FROM schema_migrations WHERE version > 34;
 
 		const migrated = await Store.open(f.path);
 		handles.push(migrated);
-		expect(migrated.schemaVersion).toBe(38);
+		expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 		expect(migrated.work.laneJobJson(f.record.jobId)).toBe(JSON.stringify(f.record));
 		expect(() =>
 			f.raw.query("UPDATE lane_jobs SET updated_at = ? WHERE job_id = ?").run(END, f.record.jobId),
@@ -1039,7 +1121,7 @@ DELETE FROM schema_migrations WHERE version >= 21;
 			originKey: f.runtime.sessionKey,
 			epoch: f.runtime.epoch,
 		});
-		expect(migrated.schemaVersion).toBe(38);
+		expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 		expect(migrated.work.laneJobJson(f.runtime.jobId)).toBe(JSON.stringify(f.record));
 		const historical = { ...f.runtime, mode: "historical" as const, sendPhase: "uncertain" as const, parent: null };
 		migrated.transaction((tx) => prepareAttempt(migrated, tx, historical, f.record));
@@ -1051,4 +1133,172 @@ DELETE FROM schema_migrations WHERE version >= 21;
 		).toBe("no_target");
 		expect(migrated.outbox.rows()).toHaveLength(0);
 	});
+
+	test("no-op update does not journal attempt_updated and does not bump version", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+
+		// Attempt a no-op patch (all fields already set to same values)
+		const patched = f.database.transaction((tx) => {
+			const current = f.database.work.workAttemptGet(f.runtime.opRef)!;
+			const patch: WorkAttemptPatch = {
+				sendPhase: current.sendPhase,
+				output: current.output,
+			};
+			return updateAttempt(f.database, tx, f.runtime.opRef, current.version, patch);
+		});
+
+		// No-op update should return the current runtime without bumping version
+		expect(patched).toBeTruthy();
+		expect(patched!.version).toBe(0);
+
+		// No journal entry should be created for no-op update
+		const journalEvents = f.raw
+			.query<{ event_type: string }, [string]>(
+				"SELECT event_type FROM work_journal WHERE entity = 'attempt' AND entity_key = ? ORDER BY seq",
+			)
+			.all(f.runtime.opRef)
+			.map((row) => row.event_type);
+
+		// Should only have the initial "attempt_started" event
+		expect(journalEvents).toEqual(["attempt_started"]);
+	});
+
+	test("real field change journals attempt_updated and bumps version", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+
+		// Attempt an actual update (changing a field)
+		const patched = f.database.transaction((tx) => {
+			const current = f.database.work.workAttemptGet(f.runtime.opRef)!;
+			const patch: WorkAttemptPatch = {
+				sendPhase: "accepted",
+				sendEvidence: { source: "status", observedAt: START },
+			};
+			return updateAttempt(f.database, tx, f.runtime.opRef, current.version, patch);
+		});
+
+		// Update should succeed and bump version
+		expect(patched).toBeTruthy();
+		expect(patched!.version).toBe(1);
+		expect(patched!.sendPhase).toBe("accepted");
+
+		// Journal should have the acceptance event (not update, since this changes acceptance status)
+		const journalEventsReal = f.raw
+			.query<{ event_type: string }, [string]>(
+				"SELECT event_type FROM work_journal WHERE entity = 'attempt' AND entity_key = ? ORDER BY seq",
+			)
+			.all(f.runtime.opRef)
+			.map((row) => row.event_type);
+
+		expect(journalEventsReal).toEqual(["attempt_started", "attempt_accepted"]);
+	});
+
+	test("stale expected version on no-op patch still conflicts", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+
+		// First, bump the version with a real update
+		f.database.transaction((tx) => {
+			const current = f.database.work.workAttemptGet(f.runtime.opRef)!;
+			const patch: WorkAttemptPatch = {
+				sendPhase: "accepted",
+				sendEvidence: { source: "status", observedAt: START },
+			};
+			updateAttempt(f.database, tx, f.runtime.opRef, current.version, patch);
+		});
+
+		// Now try a no-op update with the stale version (0, but current is 1)
+		const patched = f.database.transaction((tx) => {
+			const current = f.database.work.workAttemptGet(f.runtime.opRef)!;
+			const patch: WorkAttemptPatch = {
+				sendPhase: current.sendPhase,
+			};
+			// Use stale version
+			return updateAttempt(f.database, tx, f.runtime.opRef, 0, patch);
+		});
+
+		// Should fail due to version mismatch
+		expect(patched).toBeUndefined();
+	});
+
+	test("boot replay with no-op updates still reconstructs state correctly", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+
+		// Do some mixed updates: real changes and no-ops
+		f.database.transaction((tx) => {
+			let current = f.database.work.workAttemptGet(f.runtime.opRef)!;
+			const realPatch: WorkAttemptPatch = {
+				sendPhase: "accepted",
+				sendEvidence: { source: "status", observedAt: START },
+			};
+			current = updateAttempt(f.database, tx, f.runtime.opRef, current.version, realPatch)!;
+
+			// No-op update (should not journal)
+			const noopPatch: WorkAttemptPatch = {
+				sendPhase: current.sendPhase,
+			};
+			current = updateAttempt(f.database, tx, f.runtime.opRef, current.version, noopPatch) || current;
+
+			// Another no-op update
+			const anotherNoop: WorkAttemptPatch = {
+				output: current.output,
+			};
+			updateAttempt(f.database, tx, f.runtime.opRef, current.version, anotherNoop);
+		});
+
+		// Store the runtime before wiping
+		const beforeWipe = f.database.work.workAttemptGet(f.runtime.opRef)!;
+
+		// Wipe the runtime table and replay from journal
+		f.raw.exec("DELETE FROM work_attempt_runtime");
+		const replayResult = f.database.replayJournal();
+		expect(replayResult.attempts).toBe(1);
+
+		// Verify replayed state matches what we had before
+		const afterReplay = f.database.work.workAttemptGet(f.runtime.opRef)!;
+		expect(afterReplay.version).toBe(beforeWipe.version);
+		expect(afterReplay.sendPhase).toBe(beforeWipe.sendPhase);
+		expect(afterReplay.sendEvidence).toEqual(beforeWipe.sendEvidence);
+	});
+});
+
+test("#778: settles and validates force-retired attempt with operator_abandoned reason", async () => {
+	const f = await fixture();
+	f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+
+	// Create terminal evidence with operator_abandoned reason
+	const terminalWithAbandon: WorkAttemptTerminalEvidence = {
+		kind: "local",
+		observedAt: END,
+		reasonCode: "operator_abandoned",
+	};
+
+	const settlement: WorkAttemptSettlement = {
+		terminal: terminalWithAbandon,
+		output: f.settlement.output,
+		decision: "report",
+		settledAt: END,
+	};
+
+	// Should not throw during settlement
+	const result = f.database.transaction((tx) =>
+		settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, settlement, f.admission),
+	);
+
+	// Verify settlement succeeded
+	expect(result).toBeDefined();
+	// This fixture has no deliverable persona target, so the report settles as fallback
+	expect(result?.runtime.decision).toBe("fallback");
+	// Verify the terminal reason code is preserved
+	expect(result?.runtime.terminal?.reasonCode).toBe("operator_abandoned");
+
+	// Verify the runtime can be retrieved and validates
+	const retrieved = f.database.work.workAttemptGet(f.runtime.opRef);
+	expect(retrieved).toBeDefined();
+	if (retrieved) {
+		expect(retrieved.terminal?.reasonCode).toBe("operator_abandoned");
+		// validateWorkRuntime is called internally when retrieving, so if we got here, validation passed
+	}
 });

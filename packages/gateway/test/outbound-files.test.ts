@@ -10,6 +10,12 @@ import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-p
 
 const SLACK_ORIGIN = { platform: "slack", kind: "channel", conversationId: "C1" } as const;
 const DISCORD_ORIGIN = { platform: "discord", kind: "channel", conversationId: "chan-1" } as const;
+const TELEGRAM_TOPIC_ORIGIN = {
+	platform: "telegram",
+	kind: "topic",
+	conversationId: "-100123.99",
+	parentId: "-100123",
+} as const;
 const SLACK_TRIGGER = "C1:1726543210.000100";
 
 let directory = "";
@@ -93,7 +99,11 @@ async function gateway(
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
-		channels: { "slack:C1": { engagement: "open" }, "chan-1": { engagement: "open" } },
+		channels: {
+			"slack:C1": { engagement: "open" },
+			"chan-1": { engagement: "open" },
+			"telegram:-100123": { engagement: "open" },
+		},
 	};
 	const database = await Store.open(config.dbPath);
 	const answer = reply(directory);
@@ -219,6 +229,29 @@ test("a readable file outside the workspace is refused with a visible note, neve
 		"호스트 파일입니다",
 		"(file not sent: hosts - only files inside the workspace or a configured outbound root are sent)",
 	]);
+});
+
+test("a Telegram topic reply turns a MEDIA: line into its own file delivery in the same topic", async () => {
+	const { client } = await gateway((home) => `보고서입니다\nMEDIA:${join(home, "workspace", "report.csv")}`);
+	sendMessage(client, TELEGRAM_TOPIC_ORIGIN, "tg-1");
+	await settle();
+	const delivered = messages(client.frames);
+	expect(delivered.map((frame) => frame.payload.text)).toEqual(["보고서입니다", "📎 report.csv"]);
+	const [file] = fileMessages(delivered);
+	if (!file) throw new Error("no file delivery");
+	expect(file.payload.file).toMatchObject({ name: "report.csv", size: 8 });
+	// The adapter routes by origin (chat + topic), exactly like the text part.
+	expect(delivered.map((frame) => (frame.payload as { origin?: unknown }).origin)).toEqual([
+		TELEGRAM_TOPIC_ORIGIN,
+		TELEGRAM_TOPIC_ORIGIN,
+	]);
+	expect(file.payload.deliveryId).toBe(
+		deterministicFileDeliveryId(
+			"telegram/topic/-100123.99/parent=-100123",
+			"tg-1",
+			join(directory, "workspace", "report.csv"),
+		),
+	);
 });
 
 test("on a platform without ledger uploads the MEDIA: line is passed through for the adapter", async () => {
