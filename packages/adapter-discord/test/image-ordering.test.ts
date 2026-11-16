@@ -498,7 +498,9 @@ test("an intent unacknowledged for 24 hours is dead-lettered instead of wedging 
 	const id = snowflakeFromTimestamp(Date.now() - 120_000);
 	const requests: Array<{ verb: string; params: any }> = [];
 	const channel = {
-		messages: { fetch: async (query?: unknown) => (singleFetchId(query) !== undefined ? dmMessage(id, channelId, true) : []) },
+		messages: {
+			fetch: async (query?: unknown) => (singleFetchId(query) !== undefined ? dmMessage(id, channelId, true) : []),
+		},
 	};
 	try {
 		await saveRecoveryCursors(cursorPath, {
@@ -897,7 +899,9 @@ test("a request older than gateway dedupe retention is not replayed", async () =
 		const adapter = gateway(
 			cursorPath,
 			async () => ({
-				messages: { fetch: async (query: unknown) => (singleFetchId(query) === id ? dmMessage(id, channelId, true) : []) },
+				messages: {
+					fetch: async (query: unknown) => (singleFetchId(query) === id ? dmMessage(id, channelId, true) : []),
+				},
 			}),
 			requests,
 		);
@@ -938,7 +942,9 @@ test("an old source is rejected even when its outbox row was stamped recently", 
 		const adapter = gateway(
 			cursorPath,
 			async () => ({
-				messages: { fetch: async (query: unknown) => (singleFetchId(query) === id ? dmMessage(id, channelId, true) : []) },
+				messages: {
+					fetch: async (query: unknown) => (singleFetchId(query) === id ? dmMessage(id, channelId, true) : []),
+				},
 			}),
 			requests,
 		);
@@ -1666,7 +1672,9 @@ test("a persisted image request replays even when the recovery cursor is unreada
 		const adapter = gateway(
 			cursorPath,
 			async () => ({
-				messages: { fetch: async (query: unknown) => (singleFetchId(query) === id ? dmMessage(id, channelId, true) : []) },
+				messages: {
+					fetch: async (query: unknown) => (singleFetchId(query) === id ? dmMessage(id, channelId, true) : []),
+				},
 			}),
 			requests,
 		);
@@ -2609,7 +2617,9 @@ test("a request-bearing restored DM retry never evicts a live DM", async () => {
 		);
 		const adapter = gateway(
 			cursorPath,
-			async () => ({ messages: { fetch: async (query: unknown) => (singleFetchId(query) === id ? dmMessage(id, "dm-a", true) : []) } }),
+			async () => ({
+				messages: { fetch: async (query: unknown) => (singleFetchId(query) === id ? dmMessage(id, "dm-a", true) : []) },
+			}),
 			requests,
 			{},
 			async (verb) =>
