@@ -56,7 +56,7 @@ import {
 	installPinnedGjcForServices,
 	installServices,
 	type ServicePlatform,
-	servicePinCandidates,
+	servicePinManifest,
 	serviceUsage,
 } from "./services";
 import { type RunSetupOptions, runSetup } from "./setup";
@@ -1219,7 +1219,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				const service = parseServicesArgs(parsed.rest);
 				const gjcVersion = await installPinnedGjcForServices({
 					home: gatewayHome(),
-					candidates: servicePinCandidates(service.binDir),
+					manifestPath: servicePinManifest(service.binDir),
 					...(options.services?.gjcInstallRunner === undefined ? {} : { runner: options.services.gjcInstallRunner }),
 				});
 				console.log(`installed pinned gjc ${gjcVersion}`);

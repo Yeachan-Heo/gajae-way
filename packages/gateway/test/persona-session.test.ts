@@ -3058,6 +3058,87 @@ test("terminal text recovery is bounded by attempts and rechecks, then stops", a
 	expect(terminal).toHaveLength(1);
 });
 
+test("terminal text recovery window survives a gateway restart instead of restarting", async () => {
+	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const clock = { offsetMs: 0 };
+	const logs: string[] = [];
+	const terminal: string[] = [];
+	const failures: string[] = [];
+	const timing = { now: () => Date.now() + clock.offsetMs };
+	await harness(
+		port,
+		{
+			terminal: (text) => terminal.push(text),
+			failure: (message) => failures.push(message),
+		},
+		(line) => logs.push(line),
+		timing,
+	);
+	enqueue("m-1", "question");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	const first = port.sends[0]!;
+	port.pending.add(first.opRef);
+	port.seedOperation(first.opRef, first.sessionId, "terminal_ok", "");
+	port.setActivity(first.sessionId, "idle");
+	await manager!.tick(KEY);
+	await eventually(
+		() => logs.some((line) => line.includes("reason=no_assistant_text_for_terminal") && line.includes(first.opRef)),
+		"terminal_ok with pending output was not held",
+	);
+	const missKey = `terminal_text_miss:${first.opRef}`;
+	const firstMissAt = database!.core.metaGet(missKey);
+	expect(firstMissAt).toBeDefined();
+
+	// Restart three quarters of the way through the window. The first miss is durable, so
+	// the recovered actor continues the same window; a deadline restarted on boot would
+	// still be held here and would not expire until a full window after the restart.
+	clock.offsetMs = 45_000;
+	await manager!.stop();
+	database!.close();
+	database = await Store.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		submissionRetryDelayMs: 1,
+		log: (line) => logs.push(line),
+		...timing,
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onTerminal: ({ text }) => {
+				terminal.push(text);
+			},
+			onFailure: ({ error }) => {
+				failures.push(error.message);
+			},
+		}),
+	});
+	await manager.recover();
+	expect(database.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
+	expect(terminal).toEqual([]);
+
+	// Recovery reads the status itself, so the baseline is taken after it: the tick below
+	// must re-check on its own, and the restart and that miss leave the deadline untouched.
+	const readsAfterRecover = port.statusReads.length;
+	await manager.tick(KEY);
+	await eventually(() => port.statusReads.length > readsAfterRecover, "recovered turn did not re-check its status");
+	expect(database.core.metaGet(missKey)).toBe(firstMissAt);
+	expect(database.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
+	expect(terminal).toEqual([]);
+
+	// Past the original deadline, not merely a full window after the restart.
+	clock.offsetMs = MINUTE + 1_000;
+	await manager.tick(KEY);
+	await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "done", "window did not expire");
+	expect(terminal).toHaveLength(1);
+	expect(terminal[0]).toContain("[turn completed]");
+	expect(failures).toEqual([]);
+	expect(database.core.metaGet(missKey)).toBeUndefined();
+});
+
 test("a live session that is busy (not idle) past the bound is never released", async () => {
 	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
 	const { clock, logs, terminal, first } = await wedgedHarness(port);

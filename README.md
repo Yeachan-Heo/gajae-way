@@ -128,7 +128,7 @@ export GAJAEWAY_HOME="$HOME/.gajaeway"
 ./dist/gajaeway ops cycle --json
 ```
 
-There is no dispatchable `gajaeway up` command. For persistent deployment, `gajaeway services install --bin-dir DIR` writes launchd/systemd definitions; installation does not load or start them. Use an absolute binary directory and follow the service-manager instructions in the [Deployment Guide](docs/deployment.md).
+There is no dispatchable `gajaeway up` command. For persistent deployment, `gajaeway services install --bin-dir DIR` writes launchd/systemd definitions; installation does not load or start them. `DIR` is the release directory — the binaries plus the `package.json` beside them that `update` installs — and must be absolute. Follow the service-manager instructions in the [Deployment Guide](docs/deployment.md).
 
 **Docker Compose: setup helper, not a complete runtime stack**
 
