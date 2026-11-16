@@ -7,6 +7,7 @@ import {
 	DISCORD_IMAGE_ALLOWED_HOSTS,
 	describeAttachment,
 	describeInboundBody,
+	imageSourceIdentity,
 	isVoiceMessageAttachment,
 	prepareDiscordImages,
 	selectImageAttachments,
@@ -376,4 +377,13 @@ test("a Map-like collection is read through values() rather than as entry pairs"
 	const collection = new Map([["1", VOICE]]);
 	expect(collectAttachments({ attachments: collection })).toEqual([VOICE]);
 	expect(describeInboundBody({ content: "", attachments: collection })).toBe(describeAttachment(VOICE));
+});
+test("imageSourceIdentity changes when the attachment source changes", () => {
+	const original = {
+		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo-a.png" }],
+	};
+	const edited = {
+		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo-b.png" }],
+	};
+	expect(imageSourceIdentity(original)).not.toBe(imageSourceIdentity(edited));
 });

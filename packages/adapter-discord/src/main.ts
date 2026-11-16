@@ -28,6 +28,7 @@ import {
 	DiscordImagePreparationError,
 	describeInboundBody,
 	firstVoiceMessage,
+	imageSourceIdentity,
 	prepareDiscordImages,
 	selectNativeImageAttachments,
 } from "./attachments";
@@ -1919,6 +1920,7 @@ export class ReconnectingGateway {
 		let prepared: { readonly images: PromptImage[]; readonly notice: string } | undefined;
 		let imageSource = message;
 		let refreshed = false;
+		const sourceIdentity = imageSourceIdentity(message);
 		for (let attempt = 1; attempt <= RECOVERY_MAX_ATTEMPTS; attempt++) {
 			try {
 				prepared = await this.prepareImages(imageSource);
@@ -1932,7 +1934,11 @@ export class ReconnectingGateway {
 							message.id,
 						);
 						if (!fresh || typeof fresh !== "object" || !("author" in fresh)) return this.deferImageFailure(entry);
-						imageSource = fresh as DiscordInboundMessage;
+						const refreshedMessage = fresh as DiscordInboundMessage;
+						const refreshedIdentity = imageSourceIdentity(refreshedMessage);
+						if (refreshedIdentity !== sourceIdentity || refreshedMessage.content !== message.content)
+							return this.terminateImage(entry, "image source changed after the message was edited");
+						imageSource = refreshedMessage;
 						refreshed = true;
 						attempt--;
 						continue;
@@ -2597,7 +2603,29 @@ export class ReconnectingGateway {
 			// Compact only below the watermark that is now durable. Otherwise a crash
 			// could restore an older watermark after the terminal evidence is gone,
 			// resurrecting a rejected intent on the next rewalk.
-			if (!this.#cursorSaveFault) await this.compactTerminalImages();
+			if (!this.#cursorSaveFault) {
+				await this.compactTerminalImages();
+				await this.reclaimUnreachableCompletedImages();
+			}
+		}
+	}
+
+	/** Completed rows in channels history never revisits cannot be compacted by a watermark. */
+	private async reclaimUnreachableCompletedImages(): Promise<void> {
+		const reachable = new Set([
+			...Object.keys(this.config.channels ?? {}),
+			...Object.keys(this.#cursors?.knownDms ?? {}),
+			...this.#recoverableIds,
+		]);
+		try {
+			for (const entry of await this.#imageOutbox.load()) {
+				if (entry.completed && !entry.dm && !reachable.has(entry.channelId))
+					await this.#imageOutbox.remove(entry.messageId);
+			}
+		} catch (error) {
+			console.error(
+				`Discord unreachable completion reclamation failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
 		}
 	}
 
@@ -2951,11 +2979,15 @@ export class ReconnectingGateway {
 		let next = state;
 		if (state.gatewayDbIdentity !== undefined || legacyState) {
 			this.#imageDone.clear();
+			this.#inbound.resetAcknowledged();
+			const completedDms = (await this.#imageOutbox.load()).filter((entry) => entry.dm).map((entry) => entry.channelId);
 			await this.#imageOutbox.invalidateCompleted();
 			const latest = this.#cursors ?? state;
 			const floor = snowflakeFromTimestamp(Date.now() - IMAGE_REPLAY_RETENTION_MS);
 			next = {
 				...latest,
+				knownDms: completedDms.reduce((state, channelId) => rememberKnownDm(state, channelId, Date.now()), latest)
+					.knownDms,
 				recoveredThrough: Object.fromEntries(
 					Object.entries(latest.recoveredThrough).map(([id, watermark]) => [
 						id,

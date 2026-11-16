@@ -1118,6 +1118,85 @@ test("a retried image adopts its persisted thread destination", async () => {
 	}
 }, 12_000);
 
+test("completed DM tombstones are rebound into recovery targets before invalidation", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-restore-dm-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { other: snowflakeFromTimestamp(Date.now() - 60_000) },
+			gatewayDbIdentity: "0:0",
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{
+					messageId: snowflakeFromTimestamp(Date.now() - 60_000),
+					channelId: "lost-dm",
+					dm: true,
+					completed: true,
+					completedAt: Date.now(),
+				},
+			]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			[],
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "new-db" } } : { engaged: false, turnId: null },
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		expect((await loadRecoveryCursors(cursorPath)).knownDms["lost-dm"]).toBeDefined();
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("completed rows outside every recovery target are reclaimed", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-reclaim-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { other: snowflakeFromTimestamp(Date.now() - 60_000) },
+			gatewayDbIdentity: "0:0",
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{
+					messageId: snowflakeFromTimestamp(Date.now() - 60_000),
+					channelId: "unconfigured-orphan",
+					completed: true,
+					completedAt: Date.now(),
+				},
+			]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			[],
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "new-db" } } : { engaged: false, turnId: null },
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
 test("completed DM tombstones do not refresh recovery recency", async () => {
 	const home = await mkdtemp(join(tmpdir(), "discord-image-order-recency-"));
 	const cleanupTimers = trackTimers();

@@ -85,6 +85,13 @@ export function selectImageAttachments(message: AttachmentCarrier): AttachmentLi
 }
 
 /** PNG/JPEG attachments accepted as native prompt inputs, never fetching other formats. */
+/** Stable identity for the image bytes a message currently points at. */
+export function imageSourceIdentity(message: AttachmentCarrier): string {
+	return selectNativeImageAttachments(message)
+		.map((attachment) => `${attachment.url ?? ""}\u0000${attachment.name ?? ""}\u0000${attachment.size ?? ""}`)
+		.join("\u0001");
+}
+
 export function selectNativeImageAttachments(message: AttachmentCarrier): AttachmentLike[] {
 	return collectAttachments(message).filter(isNativeImageAttachment);
 }

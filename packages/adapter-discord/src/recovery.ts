@@ -162,6 +162,11 @@ export class RecoveryGate {
 		return this.#acked.has(messageId);
 	}
 
+	/** Forget process-local acknowledgements after the gateway database is replaced. */
+	resetAcknowledged(): void {
+		this.#acked.clear();
+	}
+
 	/** Bounded memory: forget acked ids beyond the limit (least-recently added first). */
 	forgetBeyond(limit: number): void {
 		while (this.#acked.size > limit) this.#acked.delete(this.#acked.values().next().value as string);
