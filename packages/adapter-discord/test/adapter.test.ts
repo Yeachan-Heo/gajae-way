@@ -1359,18 +1359,39 @@ test("slash commands /new and /reset map to gateway session resets with the invo
 		},
 	};
 	let replied = "";
+	const acked: string[] = [];
+	let deferredBeforeSend = false;
 	const interaction = {
 		isChatInputCommand: () => true,
 		commandName: "new",
 		id: "itx-1",
 		user: { id: "owner-1", username: "bellman" },
 		channel: { id: "channel-9", type: 0 },
+		deferReply: async () => {
+			acked.push("defer");
+		},
+		editReply: async (options: { content: string }) => {
+			acked.push("edit");
+			replied = options.content;
+		},
 		reply: async (options: { content: string }) => {
+			acked.push("reply");
 			replied = options.content;
 		},
 	};
-	await handleSlashCommand(interaction as never, gateway as never, { error: () => {} });
+	const ackingGateway = {
+		requestInbound: async (messageId: string, _origin: unknown, text: string, engagement: unknown) => {
+			deferredBeforeSend = acked.includes("defer");
+			sent.push({ messageId, text, engagement });
+			return { engaged: true };
+		},
+	};
+	await handleSlashCommand(interaction as never, ackingGateway as never, { error: () => {} });
 	expect(sent).toHaveLength(1);
+	// The interaction is acknowledged before the gateway round trip, then resolved
+	// with editReply: a reply after the round trip expires within Discord's 3 s window.
+	expect(deferredBeforeSend).toBe(true);
+	expect(acked).toEqual(["defer", "edit"]);
 	expect(sent[0]).toMatchObject({
 		messageId: "slash-itx-1",
 		text: "/new",
@@ -1410,6 +1431,10 @@ test("/model subcommands map to the gateway's /model text verbs, not to a sessio
 				user: { id: "owner-1", username: "bellman" },
 				channel: { id: "channel-9", type: 0 },
 				options: { getSubcommand: () => subcommand, getString: () => choice },
+				deferReply: async () => {},
+				editReply: async (options: { content: string }) => {
+					replies.push(options.content);
+				},
 				reply: async (options: { content: string }) => {
 					replies.push(options.content);
 				},
@@ -1490,6 +1515,10 @@ test("a declined slash command answers not-authorized instead of claiming a rese
 			id: "itx-2",
 			user: { id: "intruder", username: "mallory" },
 			channel: { id: "channel-9", type: 0 },
+			deferReply: async () => {},
+			editReply: async (options: { content: string }) => {
+				replied = options.content;
+			},
 			reply: async (options: { content: string }) => {
 				replied = options.content;
 			},
@@ -1498,6 +1527,37 @@ test("a declined slash command answers not-authorized instead of claiming a rese
 		{ error: () => {} },
 	);
 	expect(replied).toContain("not authorized");
+});
+
+test("an unconfirmed slash command is acknowledged first and reported as unconfirmed, not refused", async () => {
+	// A gateway refusal (`engaged: false`) and an unanswered round trip (`undefined`)
+	// must not read the same: the command may already have been applied.
+	const acked: string[] = [];
+	let replied = "";
+	await handleSlashCommand(
+		{
+			isChatInputCommand: () => true,
+			commandName: "model",
+			id: "itx-3",
+			user: { id: "owner-1", username: "bellman" },
+			channel: { id: "channel-9", type: 0 },
+			options: { getSubcommand: () => "show", getString: () => null },
+			deferReply: async () => {
+				acked.push("defer");
+			},
+			editReply: async (options: { content: string }) => {
+				replied = options.content;
+			},
+			reply: async () => {
+				throw new Error("reply must not be used after deferring");
+			},
+		} as never,
+		{ requestInbound: async () => undefined } as never,
+		{ error: () => {} },
+	);
+	expect(acked).toEqual(["defer"]);
+	expect(replied).toContain("did not confirm");
+	expect(replied).not.toContain("not authorized");
 });
 
 test("presence is shown for every engaged turn: DMs, mentions, and un-mentioned group/thread follow-ups", async () => {
