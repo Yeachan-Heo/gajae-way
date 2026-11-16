@@ -1,11 +1,11 @@
 import { Database } from "bun:sqlite";
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LOOPBACK_ORIGIN, originKey } from "@gajae-gateway/protocol";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { type DatabaseStartupError, LATEST_SCHEMA_VERSION, Store } from "../src/store";
+import { type DatabaseStartupError, LATEST_SCHEMA_VERSION, Store, StoreCore } from "../src/store";
 
 test("migrates the sessions foundation", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-"));
@@ -356,6 +356,85 @@ test("legacy database with auto_vacuum=0 is converted on open and gives its free
 		expect((raw.query("PRAGMA auto_vacuum").get() as { auto_vacuum: number }).auto_vacuum).toBe(2);
 		raw.close();
 	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("legacy context floors survive vacuum and future inserts after deleted high rowids", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-context-vacuum-"));
+	const path = join(directory, "gateway.db");
+	const origin = "loopback/loopback/one";
+	const emptyOrigin = "loopback/loopback/empty";
+	const floorAt = "2026-10-26T00:00:00.000Z";
+	try {
+		const seed = await Store.open(path);
+		seed.close();
+		const legacy = new Database(path);
+		legacy.exec(`
+			PRAGMA auto_vacuum = NONE; VACUUM;
+			DROP TABLE conversation_context;
+			CREATE TABLE conversation_context (message_id TEXT PRIMARY KEY, origin_key TEXT NOT NULL, author_id TEXT, author_name TEXT, body TEXT NOT NULL, received_at TEXT NOT NULL, consumed_at TEXT);
+			CREATE INDEX conversation_context_unread ON conversation_context (origin_key, consumed_at, received_at);
+			CREATE INDEX conversation_context_retention ON conversation_context (consumed_at, received_at);
+			DELETE FROM schema_migrations WHERE version = 43;
+		`);
+		legacy
+			.query(
+				"INSERT INTO conversation_context (rowid, message_id, origin_key, body, received_at) VALUES (?, ?, ?, ?, ?)",
+			)
+			.run(100, "before", origin, "old", floorAt);
+		legacy
+			.query(
+				"INSERT INTO conversation_context (rowid, message_id, origin_key, body, received_at) VALUES (?, ?, ?, ?, ?)",
+			)
+			.run(101, "after", origin, "new", floorAt);
+		legacy
+			.query("INSERT INTO conversation_context_state (origin_key, floor_at, floor_row_id) VALUES (?, ?, ?)")
+			.run(origin, floorAt, 100);
+		legacy
+			.query("INSERT INTO conversation_context_state (origin_key, floor_at, floor_row_id) VALUES (?, ?, ?)")
+			.run(emptyOrigin, floorAt, 200);
+		legacy.close();
+
+		const store = await Store.open(path);
+		try {
+			expect(store.inbox.recentContext(origin, 10, floorAt).map((row) => row.id)).toEqual(["after"]);
+			const window = store.transaction((tx) => store.inbox.contextWindow(tx, origin, "trigger", new Date(floorAt)));
+			expect(window.selectedMessageIds).toEqual(["after"]);
+			store.transaction((tx) =>
+				store.inbox.contextRecord(tx, {
+					messageId: "after-empty",
+					originKey: emptyOrigin,
+					body: "new",
+					receivedAt: floorAt,
+				}),
+			);
+			expect(store.inbox.recentContext(emptyOrigin, 10, floorAt).map((row) => row.id)).toEqual(["after-empty"]);
+		} finally {
+			store.close();
+		}
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("failed auto-vacuum conversion warns instead of claiming success", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-vacuum-readonly-"));
+	const path = join(directory, "gateway.db");
+	const raw = new Database(path);
+	raw.exec("CREATE TABLE data (value TEXT); INSERT INTO data VALUES ('legacy');");
+	raw.close();
+	const core = await StoreCore.openReadonly(path);
+	const info = spyOn(console, "info").mockImplementation(() => {});
+	const warn = spyOn(console, "warn").mockImplementation(() => {});
+	try {
+		core.enableAutoVacuum();
+		expect(warn.mock.calls.some(([line]) => String(line).includes("store_auto_vacuum_conversion_failed"))).toBe(true);
+		expect(info.mock.calls.some(([line]) => String(line).includes("store_auto_vacuum_enabled"))).toBe(false);
+	} finally {
+		info.mockRestore();
+		warn.mockRestore();
+		core.close();
 		await rm(directory, { recursive: true, force: true });
 	}
 });

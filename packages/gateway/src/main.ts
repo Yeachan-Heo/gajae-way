@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { exitOnLeaseHeld, LeaseError, LeaseHeldError } from "@gajae-gateway/home";
 
 import { installStructuredLogging } from "@gajae-gateway/log";
-import { type BootedGateway, bootGateway } from "./boot";
+import { type BootedGateway, bootGateway, prepareStdioConsole } from "./boot";
 import { runBrokerAgentCommand } from "./broker-agent/command";
 import { runBrokerHost } from "./broker-host";
 import { gatewayHome, loadConfig } from "./config";
@@ -107,6 +107,9 @@ if (command === "config" && args[0] === "check") {
 		process.exitCode = await runRestore(backup[0], { home: gatewayHome(), abort });
 	}
 } else if (command === "daemon") {
+	const stdio = args.includes("--stdio");
+	// The sink records info as info while its underlying echo stays off stdout.
+	if (stdio) prepareStdioConsole();
 	let booted: BootedGateway | undefined;
 	const disposeLogging = installStructuredLogging({
 		path: join(gatewayHome(), "gateway.log"),
@@ -141,7 +144,8 @@ if (command === "config" && args[0] === "check") {
 	};
 	try {
 		const server = await bootGateway({
-			stdio: args.includes("--stdio"),
+			stdio,
+			stdioConsolePrepared: stdio,
 			broker: { onLiveOutageExceeded },
 		});
 		booted = server;

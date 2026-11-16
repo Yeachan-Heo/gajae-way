@@ -328,29 +328,24 @@ export class StoreCore {
 		const pagesBefore = this.getPageCount();
 		const startMs = Date.now();
 
-		// SQLite auto_vacuum pragma must be followed by VACUUM to take effect on a non-empty database
-		// Set the mode and immediately VACUUM to commit the change
 		try {
+			// Converting an existing file requires VACUUM after changing the pragma.
 			this.#database.exec("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;");
-		} catch (error) {
-			// VACUUM can fail on readonly databases or in-memory dbs, just try to set the pragma
-			try {
-				this.#database.exec("PRAGMA auto_vacuum = INCREMENTAL;");
-			} catch {
-				// If both fail, continue without auto_vacuum
+			const mode = this.#database.query<{ auto_vacuum: number }, []>("PRAGMA auto_vacuum").get()?.auto_vacuum;
+			if (mode !== 2) throw new Error(`unexpected auto_vacuum mode: ${mode ?? "unknown"}`);
+			if (pagesBefore > 1) {
+				console.info(
+					JSON.stringify({
+						store_auto_vacuum_enabled: {
+							pages_before: pagesBefore,
+							pages_after: this.getPageCount(),
+							ms: Date.now() - startMs,
+						},
+					}),
+				);
 			}
-		}
-
-		const pagesAfter = this.getPageCount();
-		const durationMs = Date.now() - startMs;
-
-		// Only log if we actually ran VACUUM (i.e., for legacy databases with significant data)
-		if (pagesBefore > 1 && durationMs > 0) {
-			console.info(
-				JSON.stringify({
-					store_auto_vacuum_enabled: { pages_before: pagesBefore, pages_after: pagesAfter, ms: durationMs },
-				}),
-			);
+		} catch (error) {
+			console.warn(`store_auto_vacuum_conversion_failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 

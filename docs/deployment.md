@@ -109,7 +109,7 @@ gajaeway ops restart-stack --status
 
 Before census, stop the gateway service and disable managed startup for the entire cutover window; follow [Explicit broker-authority cutover](runbooks/gajaeway-v1.md#explicit-broker-authority-cutover) and retain its census and cutover evidence. The final restart loads a missing macOS LaunchAgent from its plist, including `dev.gajaeway.broker` once its provision manifest exists.
 
-Check `schemaVersion` in the census report before cutover. This procedure requires the current schema 42; cutover refuses older databases. Gateway startup migrates older schemas only after confirming that configured `gjc.agentDir` matches the authority recorded in the database. If census reports an older version, stop here, migrate under the recorded authority, stop the gateway again, and repeat census. Do not start it against the new private directory or manually alter the recorded authority.
+Check `schemaVersion` in the census report before cutover. This procedure requires the current schema 43; cutover refuses older databases. Gateway startup migrates older schemas only after confirming that configured `gjc.agentDir` matches the authority recorded in the database. If census reports an older version, stop here, migrate under the recorded authority, stop the gateway again, and repeat census. Do not start it against the new private directory or manually alter the recorded authority.
 
 ## Home and configuration
 
@@ -552,7 +552,7 @@ If a service command times out with an indeterminate outcome, the restart receip
 
 An update-triggered restart stops the broker, runs journaled `broker-agent provision --mode update` under the broker lease, then starts the broker. If provisioning is unrecoverable, the restart receipt says to run `gajaeway setup --broker-agent`; inspect the provision status before restarting. On Linux, the service manager names the broker unit `gajaeway-broker.service`; on macOS the supervisor uses `dev.gajaeway.broker`.
 
-`ops cycle` includes the private broker agent's status and source/copy drift. It also reports `broker_respawn_churn`, `broker_index_lock_blocked`, and `gjc_unverified_version` when those gates apply, and `origin_silent` when a user message has gone unanswered for 15 minutes (see the runbook). The current schema is 42; `broker_quarantine` and `broker_cutovers` remain part of the broker-authority evidence.
+`ops cycle` includes the private broker agent's status and source/copy drift. It also reports `broker_respawn_churn`, `broker_index_lock_blocked`, and `gjc_unverified_version` when those gates apply, and `origin_silent` when a user message has gone unanswered for 15 minutes (see the runbook). The current schema is 43; `broker_quarantine` and `broker_cutovers` remain part of the broker-authority evidence.
 
 ## Speech gate
 

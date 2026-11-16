@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 42;
+export const LATEST_SCHEMA_VERSION = 43;
 
 export interface MigrationHost {
 	readonly database: {
@@ -933,6 +933,32 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(42, new Date().toISOString());
+		});
+	}
+	if (current < 43) {
+		// Preserve the rowids used by context floors through VACUUM and future deletes.
+		host.withTransaction(() => {
+			host.database.execute(`
+				CREATE TABLE conversation_context_v43 (
+					context_row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+					message_id TEXT UNIQUE, origin_key TEXT NOT NULL, author_id TEXT, author_name TEXT,
+					body TEXT NOT NULL, received_at TEXT NOT NULL, consumed_at TEXT
+				);
+				INSERT INTO conversation_context_v43 (context_row_id, message_id, origin_key, author_id, author_name, body, received_at, consumed_at)
+					SELECT rowid, message_id, origin_key, author_id, author_name, body, received_at, consumed_at FROM conversation_context;
+				DROP TABLE conversation_context;
+				ALTER TABLE conversation_context_v43 RENAME TO conversation_context;
+				CREATE INDEX conversation_context_unread ON conversation_context (origin_key, consumed_at, received_at);
+				CREATE INDEX conversation_context_retention ON conversation_context (consumed_at, received_at);
+				INSERT INTO sqlite_sequence (name, seq)
+					SELECT 'conversation_context', (SELECT COALESCE(MAX(floor_row_id), 0) FROM conversation_context_state)
+					WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'conversation_context');
+				UPDATE sqlite_sequence SET seq = MAX(seq, (SELECT COALESCE(MAX(floor_row_id), 0) FROM conversation_context_state))
+					WHERE name = 'conversation_context';
+			`);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(43, new Date().toISOString());
 		});
 	}
 }
