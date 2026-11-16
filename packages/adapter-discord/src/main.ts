@@ -2048,9 +2048,11 @@ export class ReconnectingGateway {
 					try {
 						const channel = await this.discord.channels.fetch(channelId);
 						if (!isRecoverableChannel(channel)) return this.deferImageFailure(entry);
-						const fresh: unknown = await (channel.messages as unknown as { fetch(id: string): Promise<unknown> }).fetch(
-							message.id,
-						);
+						// The refresh exists to replace expired signed urls; a cache hit would
+						// return the same expired urls, so the fetch is forced.
+						const fresh: unknown = await (
+							channel.messages as unknown as { fetch(options: { message: string; force: boolean }): Promise<unknown> }
+						).fetch({ message: message.id, force: true });
 						if (!fresh || typeof fresh !== "object" || !("author" in fresh)) return this.deferImageFailure(entry);
 						const refreshedMessage = fresh as DiscordInboundMessage;
 						// The message was refetched because its signed urls expired. If the author
@@ -2085,7 +2087,14 @@ export class ReconnectingGateway {
 		// A delete or edit can invalidate the row while images were preparing. Re-read
 		// the authoritative row before persisting a request or creating a destination;
 		// the stale local entry must not resurrect a terminally invalidated intent.
-		const latest = await this.#imageOutbox.get(message.id).catch(() => undefined);
+		// An unreadable store is never evidence that the intent is still live, so a
+		// failed read defers instead of preparing and sending blind.
+		let latest: PendingImage | undefined;
+		try {
+			latest = await this.#imageOutbox.get(message.id);
+		} catch {
+			return this.deferImageFailure(entry);
+		}
 		if (latest?.completed) return "skip";
 		if (latest?.terminal) {
 			if (!latest.audited) await this.recordTerminalImage(latest, "image intent was previously rejected");
@@ -2427,7 +2436,13 @@ export class ReconnectingGateway {
 			// A delete/edit can invalidate the row while preparation, thread creation, or
 			// this gate's wait is pending. Re-read the authoritative row before dispatch so
 			// a stale owner never sends content whose source was removed or replaced.
-			const latest = await this.#imageOutbox.get(entry.messageId).catch(() => undefined);
+			// A failed read is not proof of a live intent: refuse rather than fail open.
+			let latest: PendingImage | undefined;
+			try {
+				latest = await this.#imageOutbox.get(entry.messageId);
+			} catch {
+				return "unavailable";
+			}
 			if (latest?.terminal || latest?.completed) return "unavailable";
 			const client = this.#client;
 			if (!client) {
@@ -2599,11 +2614,14 @@ export class ReconnectingGateway {
 			return { outcome: "gone", summary: "destination is no longer a recoverable channel" };
 		let message: unknown;
 		try {
+			// discord.js serves a cached non-partial message for a bare id, which would
+			// replay bytes from before a same-process delete or edit. Verification must
+			// read the API's current state, so the fetch is forced.
 			message = await (
 				channel.messages as unknown as {
-					fetch(id: string): Promise<unknown>;
+					fetch(options: { message: string; force: boolean }): Promise<unknown>;
 				}
-			).fetch(messageId);
+			).fetch({ message: messageId, force: true });
 		} catch (error) {
 			if (isGone(error)) return { outcome: "gone", summary: `message unavailable: ${summarizeRecoveryFailure(error)}` };
 			return { outcome: "unavailable", summary: "message fetch failed" };

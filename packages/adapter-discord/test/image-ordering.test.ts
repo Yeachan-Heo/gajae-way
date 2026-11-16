@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { ImagePreparationBudgetError } from "@gajae-gateway/images";
-import { DiscordImagePreparationError } from "../src/attachments";
+import { DiscordImagePreparationError, imageSourceIdentity } from "../src/attachments";
 import { decideInbound, ReconnectingGateway } from "../src/main";
 import { loadRecoveryCursors, saveRecoveryCursors, snowflakeFromTimestamp } from "../src/recovery";
 
@@ -32,6 +32,15 @@ function dmMessage(id: string, channelId: string, withImage = false) {
 			: [],
 	};
 }
+
+/**
+ * discord.js fetches one message by bare id or by `{ message, force }`. Test doubles accept
+ * both so a forced verification fetch and a history page can share one fake.
+ */
+const singleFetchId = (query: unknown): string | undefined =>
+	typeof query === "string" ? query : (query as { message?: string } | undefined)?.message;
+const historyAfter = (query: unknown): string | undefined =>
+	typeof query === "string" ? undefined : (query as { after?: string } | undefined)?.after;
 
 function deferred() {
 	let release!: () => void;
@@ -132,9 +141,11 @@ test("recovery delivers an older durable image below the watermark before newer 
 		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: olderId, channelId, request }]));
 		const channel = {
 			messages: {
-				fetch: async (query: string | { after?: string }) => {
-					if (typeof query === "string") return query === olderId ? dmMessage(olderId, channelId, true) : undefined;
-					return !query.after || BigInt(query.after) < BigInt(newerId) ? [later] : [];
+				fetch: async (query: unknown) => {
+					const single = singleFetchId(query);
+					if (single !== undefined) return single === olderId ? dmMessage(olderId, channelId, true) : undefined;
+					const after = historyAfter(query);
+					return !after || BigInt(after) < BigInt(newerId) ? [later] : [];
 				},
 			},
 		};
@@ -177,12 +188,13 @@ test("without a cursor, durable replay waits behind the bootstrap history window
 		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: imageId, channelId, request }]));
 		const channel = {
 			messages: {
-				fetch: async (query: string | { after?: string }) =>
-					typeof query === "string"
-						? dmMessage(imageId, channelId, true)
-						: !query.after || BigInt(query.after) < BigInt(imageId)
-							? [dmMessage(olderId, channelId), dmMessage(imageId, channelId, true)]
-							: [],
+				fetch: async (query: unknown) => {
+					if (singleFetchId(query) !== undefined) return dmMessage(imageId, channelId, true);
+					const after = historyAfter(query);
+					return !after || BigInt(after) < BigInt(imageId)
+						? [dmMessage(olderId, channelId), dmMessage(imageId, channelId, true)]
+						: [];
+				},
 			},
 		};
 		const adapter = gateway(cursorPath, async () => channel, requests);
@@ -227,7 +239,7 @@ test("a failing unrelated channel cannot starve a repaired live image intent bel
 								},
 							},
 						}
-					: { messages: { fetch: async (query: string | object) => (typeof query === "string" ? message : []) } },
+					: { messages: { fetch: async (query: unknown) => (singleFetchId(query) !== undefined ? message : []) } },
 			requests,
 			{ "broken-channel": { engagement: "open" } },
 		);
@@ -257,7 +269,7 @@ test("a cursor-store write failure does not block image delivery or duplicate it
 	try {
 		await saveRecoveryCursors(cursorPath, emptyCursors());
 		const channel = {
-			messages: { fetch: async (query: string | object) => (typeof query === "string" ? message : [message]) },
+			messages: { fetch: async (query: unknown) => (singleFetchId(query) !== undefined ? message : [message]) },
 		};
 		const adapter = gateway(cursorPath, async () => channel, requests);
 		await bounded(adapter.recoverMissedMessages());
@@ -301,8 +313,8 @@ test("a deleted image message is dead-lettered instead of retrying forever", asy
 		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: id, channelId }]));
 		const channel = {
 			messages: {
-				fetch: async (query: string | object) => {
-					if (typeof query !== "string") return [];
+				fetch: async (query: unknown) => {
+					if (singleFetchId(query) === undefined) return [];
 					throw Object.assign(new Error("Unknown Message"), { code: 10_008, status: 404 });
 				},
 			},
@@ -365,7 +377,7 @@ test("a terminal chat.send rejection is dead-lettered after the bounded attempt 
 	const message = dmMessage(id, channelId, true);
 	const requests: Array<{ verb: string; params: any }> = [];
 	const channel = {
-		messages: { fetch: async (query: string | object) => (typeof query === "string" ? message : []) },
+		messages: { fetch: async (query: unknown) => (singleFetchId(query) !== undefined ? message : []) },
 	};
 	try {
 		await saveRecoveryCursors(cursorPath, emptyCursors());
@@ -418,7 +430,7 @@ test("recovery does not wait behind a live image whose ingress turn is still hel
 	const requests: Array<{ verb: string; params: any }> = [];
 	const turn = deferred();
 	const channel = {
-		messages: { fetch: async (query: string | object) => (typeof query === "string" ? message : [message]) },
+		messages: { fetch: async (query: unknown) => (singleFetchId(query) !== undefined ? message : [message]) },
 	};
 	try {
 		await saveRecoveryCursors(cursorPath, emptyCursors());
@@ -449,7 +461,7 @@ test("consecutive preparation failures re-arm the image retry timer", async () =
 	const requests: Array<{ verb: string; params: any }> = [];
 	let preparations = 0;
 	const channel = {
-		messages: { fetch: async (query?: unknown) => (typeof query === "string" ? message : []) },
+		messages: { fetch: async (query?: unknown) => (singleFetchId(query) !== undefined ? message : []) },
 	};
 	try {
 		await saveRecoveryCursors(cursorPath, emptyCursors());
@@ -486,7 +498,7 @@ test("an intent unacknowledged for 24 hours is dead-lettered instead of wedging 
 	const id = snowflakeFromTimestamp(Date.now() - 120_000);
 	const requests: Array<{ verb: string; params: any }> = [];
 	const channel = {
-		messages: { fetch: async (query?: unknown) => (typeof query === "string" ? dmMessage(id, channelId, true) : []) },
+		messages: { fetch: async (query?: unknown) => (singleFetchId(query) !== undefined ? dmMessage(id, channelId, true) : []) },
 	};
 	try {
 		await saveRecoveryCursors(cursorPath, {
@@ -643,9 +655,10 @@ test("an in-window pending image stays behind older missed history", async () =>
 		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: imageId, channelId, request }]));
 		const channel = {
 			messages: {
-				fetch: async (query: string | { after?: string }) => {
-					if (typeof query === "string") return imageMessage;
-					return !query.after || BigInt(query.after) < BigInt(imageId) ? [imageMessage, text] : [];
+				fetch: async (query: unknown) => {
+					if (singleFetchId(query) !== undefined) return imageMessage;
+					const after = historyAfter(query);
+					return !after || BigInt(after) < BigInt(imageId) ? [imageMessage, text] : [];
 				},
 			},
 		};
@@ -752,9 +765,10 @@ test("a first-time channel uses the bootstrap floor before independent image rep
 		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: imageId, channelId, request }]));
 		const channel = {
 			messages: {
-				fetch: async (query: string | { after?: string }) => {
-					if (typeof query === "string") return imageMessage;
-					return !query.after || BigInt(query.after) < BigInt(imageId) ? [imageMessage, text] : [];
+				fetch: async (query: unknown) => {
+					if (singleFetchId(query) !== undefined) return imageMessage;
+					const after = historyAfter(query);
+					return !after || BigInt(after) < BigInt(imageId) ? [imageMessage, text] : [];
 				},
 			},
 		};
@@ -794,7 +808,7 @@ test("a recovered image is admitted without creating a thread first", async () =
 	try {
 		await saveRecoveryCursors(cursorPath, emptyCursors());
 		const channel = {
-			messages: { fetch: async (query?: unknown) => (typeof query === "string" ? message : [message]) },
+			messages: { fetch: async (query?: unknown) => (singleFetchId(query) !== undefined ? message : [message]) },
 		};
 		const adapter = gateway(cursorPath, async () => channel, requests, { [channelId]: { engagement: "open" } });
 		await bounded(adapter.recoverMissedMessages());
@@ -883,7 +897,7 @@ test("a request older than gateway dedupe retention is not replayed", async () =
 		const adapter = gateway(
 			cursorPath,
 			async () => ({
-				messages: { fetch: async (query: string) => (query === id ? dmMessage(id, channelId, true) : []) },
+				messages: { fetch: async (query: unknown) => (singleFetchId(query) === id ? dmMessage(id, channelId, true) : []) },
 			}),
 			requests,
 		);
@@ -924,7 +938,7 @@ test("an old source is rejected even when its outbox row was stamped recently", 
 		const adapter = gateway(
 			cursorPath,
 			async () => ({
-				messages: { fetch: async (query: string) => (query === id ? dmMessage(id, channelId, true) : []) },
+				messages: { fetch: async (query: unknown) => (singleFetchId(query) === id ? dmMessage(id, channelId, true) : []) },
 			}),
 			requests,
 		);
@@ -1032,8 +1046,8 @@ test("a persisted request revalidates its source before the first replay", async
 			cursorPath,
 			async () => ({
 				messages: {
-					fetch: async (query: string) => {
-						if (typeof query !== "string" || query !== id) return [];
+					fetch: async (query: unknown) => {
+						if (singleFetchId(query) !== id) return [];
 						throw Object.assign(new Error("Unknown Message"), { code: 10_008, status: 404 });
 					},
 				},
@@ -1045,6 +1059,118 @@ test("a persisted request revalidates its source before the first replay", async
 		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
 		expect(adapter.deadLetters[0]?.summary).toContain("message unavailable");
 		expect(JSON.parse(await readFile(outboxPath, "utf8"))[0]).toMatchObject({ messageId: id, terminal: true });
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a replay verification fetch bypasses the discord.js message cache", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-replay-cache-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "cache-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const stale = dmMessage(id, channelId, true);
+	const request = {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 30_000) },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{
+					messageId: id,
+					channelId,
+					dm: true,
+					request,
+					sourceIdentity: imageSourceIdentity(stale),
+					sourceText: "describe this",
+				},
+			]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async (query: unknown) => {
+						// discord.js returns a cached, non-partial message for a bare id. Only a forced
+						// fetch observes the delete that landed while the link was down; serving the
+						// cache would replay an image for a message that no longer exists.
+						if (typeof query === "string") return stale;
+						if (singleFetchId(query) === id)
+							throw Object.assign(new Error("Unknown Message"), { code: 10_008, status: 404 });
+						return [];
+					},
+				},
+			}),
+			requests,
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(adapter.deadLetters[0]?.summary).toContain("message unavailable");
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))[0]).toMatchObject({ messageId: id, terminal: true });
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an expired signed url is refreshed with a forced fetch, not a cached message", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-refresh-forced-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "refresh-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const expired = dmMessage(id, channelId, true);
+	// Re-signing changes the url, not the attachment identity the intent was recorded for.
+	const fresh = dmMessage(id, channelId, true);
+	(fresh.attachments[0] as { url?: string }).url = "https://cdn.discordapp.com/photo.png?signature=fresh";
+	const requests: Array<{ verb: string; params: any }> = [];
+	let served = "expired";
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		const adapter = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async (query: unknown) => {
+						if (typeof query === "string") return expired;
+						if (singleFetchId(query) === id) {
+							served = "fresh";
+							return fresh;
+						}
+						return [];
+					},
+				},
+			}),
+			requests,
+			{},
+			undefined,
+			async () => {
+				// A cache hit would return the same expired url and this refresh could never
+				// succeed, wedging the intent until it dead-lettered.
+				if (served === "expired") throw new DiscordImagePreparationError("retryable", "expired signed url", true);
+				return { images: [image], notice: "" };
+			},
+		);
+		const engagement = decideInbound(expired as never, bot, {});
+		expect(engagement).toBeDefined();
+		expect(await bounded(adapter.processImage(expired as never, engagement!))).toBe("acked");
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toHaveLength(1);
 	} finally {
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });
@@ -1078,8 +1204,8 @@ test("a transient source read during replay defers instead of dead-lettering", a
 			cursorPath,
 			async () => ({
 				messages: {
-					fetch: async (query: string) => {
-						if (typeof query !== "string" || query !== id) return [];
+					fetch: async (query: unknown) => {
+						if (singleFetchId(query) !== id) return [];
 						throw new Error("socket hang up");
 					},
 				},
@@ -1126,8 +1252,8 @@ test("a permission-only source read during replay defers instead of dead-letteri
 			cursorPath,
 			async () => ({
 				messages: {
-					fetch: async (query: string) => {
-						if (typeof query !== "string" || query !== id) return [];
+					fetch: async (query: unknown) => {
+						if (singleFetchId(query) !== id) return [];
 						throw Object.assign(new Error("Missing Access"), { code: 50_001, status: 403 });
 					},
 				},
@@ -1177,7 +1303,7 @@ test("a persisted request whose source attachment was replaced is not replayed",
 		(edited.attachments[0] as { id?: string }).id = "attachment-new";
 		const adapter = gateway(
 			cursorPath,
-			async () => ({ messages: { fetch: async (query: string) => (query === id ? edited : []) } }),
+			async () => ({ messages: { fetch: async (query: unknown) => (singleFetchId(query) === id ? edited : []) } }),
 			requests,
 		);
 		await bounded(adapter.recoverMissedMessages());
@@ -1534,7 +1660,7 @@ test("a persisted image request replays even when the recovery cursor is unreada
 		const adapter = gateway(
 			cursorPath,
 			async () => ({
-				messages: { fetch: async (query: string) => (query === id ? dmMessage(id, channelId, true) : []) },
+				messages: { fetch: async (query: unknown) => (singleFetchId(query) === id ? dmMessage(id, channelId, true) : []) },
 			}),
 			requests,
 		);
@@ -2179,12 +2305,11 @@ test("a failed cursor checkpoint preserves completed DM evidence until restore c
 			cursorPath,
 			async () => ({
 				messages: {
-					fetch: async (query: string | { after?: string }) =>
-						typeof query === "string"
-							? dmMessage(id, "lost-dm", true)
-							: !query.after || BigInt(query.after) < BigInt(id)
-								? [dmMessage(id, "lost-dm", true)]
-								: [],
+					fetch: async (query: unknown) => {
+						if (singleFetchId(query) !== undefined) return dmMessage(id, "lost-dm", true);
+						const after = historyAfter(query);
+						return !after || BigInt(after) < BigInt(id) ? [dmMessage(id, "lost-dm", true)] : [];
+					},
 				},
 			}),
 			requests,
@@ -2414,7 +2539,7 @@ test("a restored DM replay never evicts a live known DM", async () => {
 				id === "dm-a"
 					? {
 							messages: {
-								fetch: async (query: unknown) => (typeof query === "string" ? message : [message]),
+								fetch: async (query: unknown) => (singleFetchId(query) !== undefined ? message : [message]),
 							},
 						}
 					: { messages: { fetch: async () => [] } },
@@ -2478,7 +2603,7 @@ test("a request-bearing restored DM retry never evicts a live DM", async () => {
 		);
 		const adapter = gateway(
 			cursorPath,
-			async () => ({ messages: { fetch: async (query: string) => (query === id ? dmMessage(id, "dm-a", true) : []) } }),
+			async () => ({ messages: { fetch: async (query: unknown) => (singleFetchId(query) === id ? dmMessage(id, "dm-a", true) : []) } }),
 			requests,
 			{},
 			async (verb) =>

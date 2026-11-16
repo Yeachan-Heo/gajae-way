@@ -32,6 +32,9 @@ import {
 } from "../src/recovery";
 
 const bot = { id: "bot-9" };
+/** discord.js accepts a bare id or `{ message, force }`; the fake must accept both. */
+const singleFetchId = (query: unknown): string | undefined =>
+	typeof query === "string" ? query : (query as { message?: string } | undefined)?.message;
 
 /** Full cursor-store state from just its watermarks. */
 function cursorState(recoveredThrough: Record<string, string>): RecoveryCursorState {
@@ -1816,7 +1819,7 @@ test("a live image retry adopts the thread destination the first attempt never p
 	});
 	const channel = {
 		messages: {
-			fetch: async (query: string | { after?: string; limit?: number }) => (typeof query === "string" ? inbound : []),
+			fetch: async (query: unknown) => (singleFetchId(query) !== undefined ? inbound : []),
 		},
 	};
 	const gateway = new ReconnectingGateway(
@@ -1981,7 +1984,7 @@ test("a live image retry adopts the thread a crashed attempt already created", a
 			throw Object.assign(new Error("A thread has already been created for this message"), { code: 16_0004 });
 		},
 	});
-	const parent = { messages: { fetch: async (query: unknown) => (typeof query === "string" ? inbound : []) } };
+	const parent = { messages: { fetch: async (query: unknown) => (singleFetchId(query) !== undefined ? inbound : []) } };
 	const adopted = { id, parentId: "channel-1", messages: { fetch: async () => [] } };
 	const sent: Array<{ verb: string; params: Record<string, any> }> = [];
 	const gateway = new ReconnectingGateway(
@@ -2043,7 +2046,7 @@ test("a database-identity rewind never lands inside a running recovery pass", as
 	const channel = {
 		messages: {
 			fetch: async (query: unknown) => {
-				if (typeof query === "string") return undefined;
+				if (singleFetchId(query) !== undefined) return undefined;
 				historyStarted();
 				await historyGate;
 				return [];
@@ -2086,7 +2089,7 @@ test("two recovery triggers sharing an identity check start one pass", async () 
 	const channel = {
 		messages: {
 			fetch: async (query: unknown) => {
-				if (typeof query === "string") return undefined;
+				if (singleFetchId(query) !== undefined) return undefined;
 				historyFetches++;
 				return [];
 			},

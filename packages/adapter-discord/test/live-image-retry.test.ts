@@ -10,6 +10,10 @@ import { startDiscordAdapter } from "../src/main";
 import { snowflakeFromTimestamp } from "../src/recovery";
 
 // The same valid PNG fixture used by the other adapter image tests.
+/** discord.js accepts a bare id or `{ message, force }`; the fake must accept both. */
+const singleFetchId = (query: unknown): string | undefined =>
+	typeof query === "string" ? query : (query as { message?: string } | undefined)?.message;
+
 const png = Uint8Array.from(
 	Buffer.from(
 		"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGP4z8DAAMIM/4EAAB/uBfsL2WiLAAAAAElFTkSuQmCC",
@@ -52,7 +56,7 @@ test("a transient image download failure retries a live new DM without reconnect
 		Object.defineProperty(this, "user", { value: { id: "bot" }, configurable: true });
 		// Recovery may inspect a newly remembered DM; it must never call Discord REST.
 		this.channels.fetch = (async () => ({
-			messages: { fetch: async (query: unknown) => (typeof query === "string" ? message : [message]) },
+			messages: { fetch: async (query: unknown) => (singleFetchId(query) !== undefined ? message : [message]) },
 		})) as never;
 		return "offline-test-token";
 	});

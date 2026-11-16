@@ -8,6 +8,9 @@ import { type DiscordInboundMessage, decideInbound, ReconnectingGateway } from "
 import { loadRecoveryCursors, snowflakeFromTimestamp } from "../src/recovery";
 
 const bot = { id: "bot" };
+/** discord.js accepts a bare id or `{ message, force }`; the fake must accept both. */
+const singleFetchId = (query: unknown): string | undefined =>
+	typeof query === "string" ? query : (query as { message?: string } | undefined)?.message;
 const image = { mimeType: "image/jpeg" as const, data: "AQIDBA==" };
 const message = {
 	id: snowflakeFromTimestamp(Date.now() - 60_000),
@@ -78,9 +81,10 @@ test("a first-time DM image intent survives restart before preparation", async (
 		fetched.push(id);
 		return {
 			messages: {
-				fetch: async (query: string | object) => {
-					if (typeof query !== "string") return [message];
-					expect(query).toBe(message.id);
+				fetch: async (query: unknown) => {
+					const single = singleFetchId(query);
+					if (single === undefined) return [message];
+					expect(single).toBe(message.id);
 					return message;
 				},
 			},
@@ -153,8 +157,10 @@ test("an ambiguous gateway ACK replays the exact persisted image request after r
 	let preparations = 0;
 	const fetchChannel = async () => ({
 		messages: {
-			fetch: async (query: string | object) => {
-				if (typeof query === "string") throw new Error("persisted requests must not refetch the message");
+			fetch: async (query: unknown) => {
+				// Replay verification re-reads the source; the fake reports it still exists.
+				const single = singleFetchId(query);
+				if (single !== undefined) return single === message.id ? message : undefined;
 				return [message];
 			},
 		},
