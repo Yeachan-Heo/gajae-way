@@ -1826,3 +1826,63 @@ test("legacy populated cursors rewind on the first gateway identity", async () =
 		await rm(home, { recursive: true, force: true });
 	}
 }, 12_000);
+
+test("a restored DM replay never evicts a live known DM", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-restore-replay-cap-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const recent = new Date(Date.now() - 60_000).toISOString();
+	const completedAt = Date.now() - 60 * 60 * 1000;
+	const row = {
+		messageId: snowflakeFromTimestamp(completedAt),
+		channelId: "dm-a",
+		dm: true,
+		completed: true,
+		completedAt,
+	};
+	const message = dmMessage(row.messageId, "dm-a", true);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			knownDms: Object.fromEntries(
+				Array.from({ length: 100 }, (_, index) => [`dm-${index}`, { lastSeenAt: recent, seq: index + 1 }]),
+			),
+			sequence: 100,
+			gatewayDbIdentity: "0:0",
+		});
+		await writeFile(outboxPath, JSON.stringify([row]));
+		const adapter = gateway(
+			cursorPath,
+			async (id) =>
+				id === "dm-a"
+					? {
+							messages: {
+								fetch: async (query: unknown) => (typeof query === "string" ? message : [message]),
+							},
+						}
+					: { messages: { fetch: async () => [] } },
+			requests,
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "new-db" } } : { engaged: true, turnId: "turn-1" },
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		const cursors = await loadRecoveryCursors(cursorPath);
+		expect(Object.keys(cursors.knownDms)).toHaveLength(100);
+		expect(cursors.knownDms["dm-0"]).toBeDefined();
+		// The restored target replays from the outbox row, never from a promoted slot.
+		expect(cursors.knownDms["dm-a"]).toBeUndefined();
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			row.messageId,
+		]);
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toMatchObject([
+			{ messageId: row.messageId, completed: true, dm: true },
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);

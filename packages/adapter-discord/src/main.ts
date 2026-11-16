@@ -1990,11 +1990,18 @@ export class ReconnectingGateway {
 		}
 		// Best-effort: the durable outbox already makes this channel discoverable.
 		// A failing cursor store must not silence the DM's image while text flows.
-		await this.rememberInboundDm(sourceOrigin);
-		// Give the registration its write before the first send, so an unknown DM is
-		// in knownDms when a later restart has to find it. A broken store resolves
-		// this chain without throwing; the outbox remains the authoritative intent.
-		await this.cursorsFlushed;
+		//
+		// A restored intent is already a durable replay target and may belong to a DM
+		// beyond the bounded known-DM set; registering it here would give it the newest
+		// retention slot and evict a genuinely live DM. The row itself keeps the channel
+		// discoverable until the replay completes.
+		if (!entry?.restored) {
+			await this.rememberInboundDm(sourceOrigin);
+			// Give the registration its write before the first send, so an unknown DM is
+			// in knownDms when a later restart has to find it. A broken store resolves
+			// this chain without throwing; the outbox remains the authoritative intent.
+			await this.cursorsFlushed;
+		}
 		if (entry.completed) return "skip";
 		if (entry.terminal) {
 			if (!entry.audited) await this.recordTerminalImage(entry, "image intent was previously rejected");
