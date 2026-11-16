@@ -459,7 +459,7 @@ export class ScriptedSessionPort implements SessionPort {
 							clientRef: input.opRef,
 							terminalAt: operation.terminalAt,
 							receiptState: "present",
-							outcome: { reason: "end_turn" },
+							outcome: operation.terminalOutcome ?? { reason: "end_turn" },
 						}
 					: operation.state === "failed"
 						? {
@@ -839,7 +839,18 @@ export class ScriptedSessionPort implements SessionPort {
 		this.#resumeFailures.set(sessionId, new Error(message));
 	}
 
-	seedOperation(opRef: string, sessionId: string, state: Operation["state"] = "in_flight", text = ""): void {
+	/**
+	 * Seed an operation the port never sent. `terminalOutcome` overrides the
+	 * canonical successful `end_turn` stop so a test can model a turn that ended
+	 * without completing (refusal, max_tokens, cancellation).
+	 */
+	seedOperation(
+		opRef: string,
+		sessionId: string,
+		state: Operation["state"] = "in_flight",
+		text = "",
+		terminalOutcome?: Record<string, string>,
+	): void {
 		const existing = this.#operations.get(opRef);
 		const now = Date.now();
 		this.#operations.set(opRef, {
@@ -847,6 +858,7 @@ export class ScriptedSessionPort implements SessionPort {
 			state,
 			text,
 			startedAt: existing?.startedAt ?? now,
+			...(terminalOutcome ? { terminalOutcome } : {}),
 			...(state !== "in_flight" ? { terminalAt: now } : {}),
 		});
 	}
@@ -1021,6 +1033,8 @@ type Operation = {
 	failureOutcome?: Record<string, string>;
 	readonly startedAt: number;
 	terminalAt?: number;
+	/** Terminal stop facts for a `terminal_ok` turn that did not complete. */
+	readonly terminalOutcome?: Record<string, string>;
 	readonly commandId?: string;
 	readonly turnId?: string;
 	omitStartedAtForOp?: boolean;

@@ -2941,3 +2941,137 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 		}
 	});
 });
+
+describe("#704 follow-up: historical recovery is bounded per sweep", () => {
+	test("one saved operation is probed per sweep and the cursor covers every candidate", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-history-cursor-"));
+		database = await Store.open(join(home, "gateway.db"));
+		const db = database;
+		const registry = new MonitorRegistry(db);
+		const monitor = registry.add({
+			name: "history",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["history.tick"],
+		});
+
+		// Three saved operations were given up and still need a status probe.
+		const opRefs: string[] = [];
+		for (let index = 0; index < 3; index++) {
+			const eventId = crypto.randomUUID();
+			const opRef = crypto.randomUUID();
+			opRefs.push(opRef);
+			createEvent(db, {
+				eventId,
+				monitorId: monitor.monitorId,
+				eventType: "history.tick",
+				payloadJson: "{}",
+				firedAt: new Date(Date.now() - 60_000).toISOString(),
+			});
+			for (let attempt = 0; attempt < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS; attempt++) {
+				updateEvent(db, eventId, "failed");
+				db.transaction((tx) => db.monitors.eventIncrementAttempts(tx, eventId));
+			}
+			db.transaction((tx) => db.monitors.eventTerminalFail(tx, eventId, "authoring_turn_unresolved", "unresolved"));
+			db.core.metaSet(
+				`monitor_authoring_turn:${eventId}`,
+				JSON.stringify({ sessionId: "s1", opRef, eventIds: [eventId] }),
+			);
+		}
+
+		const sessionPort = fakeSessionPort(async () => "[]");
+		const statusRead = sessionPort.status.bind(sessionPort);
+		const probed: string[] = [];
+		sessionPort.status = async (input) => {
+			if (opRefs.includes(input.opRef)) probed.push(input.opRef);
+			return await statusRead(input);
+		};
+
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry,
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(db),
+			emit: () => {},
+		});
+		propagators.push(propagator);
+
+		// One sweep examines one saved operation, not the whole backlog.
+		await propagator.reconcile();
+		expect(probed).toHaveLength(1);
+		expect(db.core.metaGet("monitor_authoring_recovery_cursor")).toBeDefined();
+
+		await propagator.reconcile();
+		await propagator.reconcile();
+		expect(probed).toHaveLength(3);
+		expect(new Set(probed)).toEqual(new Set(opRefs));
+
+		// Past the last candidate the scan wraps instead of abandoning the round-robin.
+		await propagator.reconcile();
+		expect(probed).toHaveLength(3);
+		expect(db.core.metaGet("monitor_authoring_recovery_cursor")).toBe("");
+		await propagator.reconcile();
+		expect(probed).toHaveLength(4);
+	});
+});
+
+describe("#704 follow-up: a terminal turn that did not complete is never authored as success", () => {
+	test("a refusal stop keeps its pointer and never persists or delivers the result", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-incomplete-turn-"));
+		database = await Store.open(join(home, "gateway.db"));
+		const db = database;
+		const monitor = new MonitorRegistry(db).add({
+			name: "proactive",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["proactive.tick"],
+		});
+		const eventId = crypto.randomUUID();
+		const opRef = crypto.randomUUID();
+		createEvent(db, {
+			eventId,
+			monitorId: monitor.monitorId,
+			eventType: "proactive.tick",
+			payloadJson: "{}",
+			firedAt: new Date().toISOString(),
+		});
+		const pointer = JSON.stringify({ sessionId: "s1", opRef, eventIds: [eventId] });
+		db.core.metaSet(`monitor_authoring_turn:${eventId}`, pointer);
+
+		const sessionPort = fakeSessionPort(async () => "[]");
+		// A terminal transition with a present receipt whose stop did not complete.
+		sessionPort.seedOperation(
+			opRef,
+			"s1",
+			"terminal_ok",
+			JSON.stringify([{ eventId, note: "must never be delivered" }]),
+			{ kind: "stopped", provenance: "agent", reason: "refusal" },
+		);
+		let clock = Date.now();
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry: new MonitorRegistry(db),
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(db),
+			emit: () => {},
+			now: () => clock,
+		});
+		propagators.push(propagator);
+
+		await propagator.reconcile();
+
+		expect(db.monitors.authoredOutput(eventId)).toBeUndefined();
+		expect(stage(db, eventId)).toBe("failed");
+		expect(db.monitors.eventGet(eventId)?.dispatch_attempts).toBe(1);
+		expect(db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBe(pointer);
+
+		// Past the retry backoff the same stopped turn is harvested again, and it still
+		// never becomes success or loses the pointer that keeps the identity.
+		clock += MONITOR_EVENT_RETRY_BACKOFF_MS[1]! + 1000;
+		await propagator.reconcile();
+		expect(db.monitors.eventGet(eventId)?.dispatch_attempts).toBe(2);
+		expect(db.monitors.authoredOutput(eventId)).toBeUndefined();
+		expect(stage(db, eventId)).toBe("failed");
+		expect(db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBe(pointer);
+	});
+});
