@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatMessagePayload } from "@gajae-gateway/protocol";
@@ -295,6 +295,52 @@ test("#180/#369: typed targets survive restart and echoed instructions retain ap
 		expect(delivered[0]!.origin).toEqual(channelTarget.origin);
 		// The mention comes from the typed field, not from the author remembering it.
 		expect(delivered[0]!.text).toBe(`<@1468532331001413743> ${note}`);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("memory.debloat: the authoring turn sees the oversized memory files scanned at dispatch", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-debloat-"));
+	try {
+		const memory = join(directory, "memory");
+		await mkdir(join(memory, "people"), { recursive: true });
+		await writeFile(join(memory, "people", "big.md"), "x".repeat(501));
+		await writeFile(join(memory, "people", "small.md"), "x".repeat(500));
+		const database = await Store.open(join(directory, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "memory-debloat",
+			trigger: { kind: "cron", schedule: "15 4 * * *" },
+			eventTypes: ["memory.debloat"],
+		});
+		const prompts: string[] = [];
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: new ScriptedSessionPort({
+				onSend: (input, scripted) => {
+					prompts.push(input.text);
+					const [event] = JSON.parse(input.text.match(/\[\{.*\]$/s)![0]) as Array<{ eventId: string }>;
+					scripted.complete(input.opRef, JSON.stringify([{ eventId: event!.eventId, note: "[SILENT]" }]));
+				},
+			}),
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			memoryDebloat: { root: memory, thresholdBytes: 500 },
+		});
+		pipeline.submit(monitor.monitorId, "memory.debloat", { at: "2026-10-22T04:15:00.000Z" });
+		for (let i = 0; i < 100 && prompts.length === 0; i++) await Bun.sleep(10);
+		const [event] = JSON.parse(prompts[0]!.match(/\[\{.*\]$/s)![0]) as Array<{ payload: unknown }>;
+		expect(event!.payload).toEqual({
+			at: "2026-10-22T04:15:00.000Z",
+			thresholdBytes: 500,
+			oversized: [{ path: "people/big.md", bytes: 501 }],
+		});
+		expect(prompts[0]).toContain("when oversized is empty the note is [SILENT]");
+		await pipeline.drain();
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });

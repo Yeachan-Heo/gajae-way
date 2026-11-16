@@ -78,6 +78,7 @@ export * from "./open-work";
 export { OWNER_FILE, type OwnedTable, type OwnerGroup, TABLE_OWNER } from "./ownership";
 export { classifySql, type SqlClassification } from "./sql-classify";
 export {
+	ATTEMPT_UPDATE_RETENTION_MS,
 	type BrokerAuthorityCensus,
 	CONFIRMED_DELIVERY_RETENTION_MS,
 	HISTORY_RETENTION_MS,

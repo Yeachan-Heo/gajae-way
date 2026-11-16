@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { containsSilenceToken, isSilenceToken } from "@gajae-gateway/protocol";
+import { stat } from "node:fs/promises";
+import { containsSilenceToken, isSilenceToken, type PromptImage } from "@gajae-gateway/protocol";
 import {
 	assertControlAllowed,
 	assertValidOpRef,
@@ -20,14 +21,21 @@ import {
 	type PromptStatusBody,
 	parseEnvelope,
 	parseStatusReport,
+	projectOpState,
 	type SendReceipt,
 	type StatusReport,
 	TranscriptIncompleteError,
 } from "@gajae-gateway/subsession";
-import type { GjcModelSelection, GjcServiceTier } from "../config";
+import { DEFAULT_SESSIONS_BUSY_STALL_MS, type GjcModelSelection, type GjcServiceTier } from "../config";
 import { BrokerAuthorityError, type Store } from "../store";
-import type { BrokerAuthority, BrokerOperationKind, BrokerOperationRecord } from "../store/groups/bindings";
-import { GjcCliUnavailableError, isBrokerUnavailable } from "./broker";
+import {
+	BROKER_PROMPT_BUSY_REFUSAL,
+	type BrokerAuthority,
+	type BrokerOperationKind,
+	type BrokerOperationRecord,
+	isBrokerPromptBusyRefusal,
+} from "../store/groups/bindings";
+import { GjcCliUnavailableError, GjcCommandQueueTimeoutError, isBrokerUnavailable } from "./broker";
 import {
 	type FailedTransportCause,
 	type FailedTurnEvidence,
@@ -40,6 +48,7 @@ import { isSessionGoneCode } from "./gjc-contract";
 import { isRebindableCode, sanitizeDiagnostic } from "./rebind";
 import {
 	isRelayTransportFailure,
+	isUnwrittenRelayRequest,
 	type RelayResponse,
 	type TailAttachInput,
 	type TailHandle,
@@ -87,7 +96,7 @@ export interface SessionLiveness {
 	readonly activity?: SessionActivity;
 	/** The broker still holds the saved session but marks it deleted. */
 	readonly deleted?: boolean;
-	/** `locator.repo`, or the `locator.cwd` gjc >= 0.16.0 reports in its place. */
+	/** The broker's canonical `locator.cwd`. */
 	readonly workspace?: string;
 	/** The (last) host process identity; a closed session keeps its dead host's. */
 	readonly hostIncarnation?: string;
@@ -113,9 +122,22 @@ export function isSilentReply(text: string): boolean {
 }
 
 export interface SessionPort {
+	/** Positive local non-admission evidence, not native execution-end proof. */
+	promptRefusal?(input: { sessionId: string; repo: string; opRef: string }): "busy" | undefined;
 	bind(input: SessionBindInput): Promise<SessionBinding>;
 	inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined>;
 	liveness?(input: { sessionId: string; repo: string }): Promise<SessionLiveness>;
+	/**
+	 * Read-only: true only when a successful (exit 0) broker inspect envelope names this session,
+	 * is not flagged `ambiguous` (competing unresolved authority roots), carries a
+	 * safe integer host pid > 1, and OS `ps` reports that pid gone. This proves the
+	 * exit of the broker's selected host row, not of every past incarnation.
+	 * False for failed inspect,
+	 * session absence without a pid, an ambiguous or mismatched row, a
+	 * missing/invalid pid, a live (even reused) pid, or unreadable `ps`. Never
+	 * signals a process. BrokerAuthorityError is rethrown.
+	 */
+	hostExited?(input: { sessionId: string; repo: string }): Promise<boolean>;
 	/** True when the session's prompt queue has no pending messages (queue.messages.list empty). */
 	queueEmpty?(input: { sessionId: string; repo: string; relay?: TailHandle }): Promise<boolean>;
 	/** Live execution/queued-turn state from context.get; undefined is not idle proof. */
@@ -196,7 +218,7 @@ export interface SessionPort {
 		preferSpoken?: boolean;
 	}): Promise<LastAssistantResult | undefined>;
 	attachTail(input: TailAttachInput): Promise<TailHandle>;
-	runCompaction(input: SessionCompactionInput): Promise<{ readonly status: SessionCompactionStatus }>;
+	runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult>;
 	/** Emits live-tail stall signals; the owning actor applies bounded recovery policy. */
 	checkStalls(now?: number): void;
 	/** Sets the tail-silence threshold that triggers stall handling. */
@@ -221,6 +243,22 @@ export interface RunningHostJob {
 
 export type SessionCompactionStatus = "succeeded" | "failed" | "skipped" | "unavailable";
 
+export interface SessionCompactionResult {
+	readonly status: SessionCompactionStatus;
+	/** Stable SDK error code of a run that did not succeed, when gjc reported one. */
+	readonly code?: string;
+	/**
+	 * A `failed` run that may still be compacting on the host: gjc's request
+	 * timed out, its outcome is uncertain after send, or no gjc answer was read.
+	 */
+	readonly outcomeUnknown?: boolean;
+	/**
+	 * The host's ordered control dispatcher answered this run (relay runs only):
+	 * the run is over, and so is every ordered control queued before it.
+	 */
+	readonly answered?: boolean;
+}
+
 /** Session context usage: percent of the model's context window and the token count it stands for. */
 export interface SessionContextUsage {
 	readonly percent: number;
@@ -231,6 +269,11 @@ export interface SessionCompactionInput {
 	readonly sessionId: string;
 	readonly repo: string;
 	readonly originKey: string;
+	/**
+	 * The session's live relay. When given, the run goes straight to the host,
+	 * whose own control reply tells a finished run from a lost reply (`answered`).
+	 */
+	readonly relay?: TailHandle;
 }
 
 export interface SessionBindInput {
@@ -257,6 +300,7 @@ export interface SessionSendInput {
 	readonly sessionId: string;
 	readonly repo: string;
 	readonly text: string;
+	readonly images?: readonly PromptImage[];
 	readonly opRef: string;
 	/** Trusted bootstrap/policy material attached to this exact turn. */
 	readonly systemPreamble?: string;
@@ -265,11 +309,20 @@ export interface SessionSendInput {
 	/** How long a `busy` refusal is retried before it surfaces as a failure. */
 	readonly busyWaitMs?: number;
 	/**
+	 * How long a `busy` host may show no progress (activity stamp and transcript
+	 * unchanged) before the wait gives up with `SessionBusyStalledError` (#687).
+	 */
+	readonly busyStallMs?: number;
+	/**
 	 * The session's resident relay. The prompt is submitted on it so the host
 	 * streams the turn's content to this handle; without one the port opens a
 	 * throwaway relay for the send (the turn then has no live observer).
 	 */
 	readonly relay?: TailHandle;
+	/** Durable caller fence, committed after exact frame validation and before each prompt write. */
+	readonly beforeWrite?: () => void;
+	/** Durable local rejection, recorded synchronously before a too-large error escapes. */
+	readonly onPayloadTooLarge?: () => void;
 }
 
 export interface SessionSteerInput {
@@ -332,9 +385,13 @@ export type WorkerOutputResult =
 	| {
 			readonly status: "unavailable";
 			readonly code: "output_unavailable" | "invalid_evidence" | "identity_mismatch" | "incomplete_body" | "cancelled";
+			/** Only an identity-validated terminal receipt explicitly declaring absence. */
+			readonly definitiveLoss?: true;
 	  };
 
 export interface SessionRequestInput extends SessionSendInput {
+	/** Best-effort post-turn context sampling. Off unless explicitly requested. */
+	readonly sampleContext?: boolean;
 	/** Stable caller identity carried into tail observability. */
 	readonly originKey?: string;
 	/**
@@ -396,6 +453,7 @@ export interface SessionRequestResult {
 	readonly receipt: SendReceipt;
 	readonly status: StatusReport;
 	readonly assistant: LastAssistantResult;
+	readonly contextUsage?: SessionContextUsage;
 }
 
 export class SessionRequestTimeoutError extends Error {
@@ -416,7 +474,11 @@ export class SessionTerminalError extends Error {
 	readonly status: StatusReport;
 
 	constructor(status: StatusReport) {
-		const detail = status.status.error?.message ?? status.status.error?.code ?? status.status.status;
+		const detail =
+			status.status.error?.message ??
+			status.status.error?.code ??
+			status.status.outcome?.reason ??
+			status.status.status;
 		super(`session operation ${status.operationRef} ended ${status.status.status}: ${detail}`);
 		this.name = "SessionTerminalError";
 		this.status = status;
@@ -434,6 +496,27 @@ export class ModelNotSelectedError extends Error {
 		super("turn.prompt explicitly refused: model_not_selected");
 		this.name = "ModelNotSelectedError";
 		this.opRef = opRef;
+	}
+}
+
+/**
+ * The pre-send busy wait saw the host report `busy` with no progress evidence
+ * (activity stamp and transcript size/mtime unchanged) for `silentMs`. The
+ * busy refusal is already durable, so the prompt was provably never accepted.
+ */
+export class SessionBusyStalledError extends Error {
+	readonly sessionId: string;
+	readonly opRef: string;
+	readonly silentMs: number;
+	readonly evidence: string;
+
+	constructor(sessionId: string, opRef: string, silentMs: number, evidence: string) {
+		super(`session ${sessionId} stayed busy without progress for ${silentMs}ms`);
+		this.name = "SessionBusyStalledError";
+		this.sessionId = sessionId;
+		this.opRef = opRef;
+		this.silentMs = silentMs;
+		this.evidence = evidence;
 	}
 }
 
@@ -477,6 +560,8 @@ function createRotationMetaKey(originKey: string): string {
 export const SESSION_BUSY_CODE = "busy";
 const DEFAULT_BUSY_WAIT_MS = 10 * 60_000;
 const BUSY_POLL_MS = 2_000;
+/** Progress probes (one `session inspect` plus a transcript stat) run at most this often. */
+const BUSY_PROGRESS_SAMPLE_MS = 30_000;
 const CONTEXT_QUERY_TIMEOUT_MS = 5_000;
 /**
  * `compaction.run` answers only after gjc finished compacting, which takes tens
@@ -484,6 +569,22 @@ const CONTEXT_QUERY_TIMEOUT_MS = 5_000;
  * 2026-09-30); the default 30s command bound reported such runs as failed.
  */
 const COMPACTION_TIMEOUT_MS = 5 * 60_000;
+/**
+ * Part of the end-to-end compaction budget left for gjc's own timeout reply:
+ * gjc's request budget is COMPACTION_TIMEOUT_MS minus this, inside a process
+ * bound (CLI slot wait included) of COMPACTION_TIMEOUT_MS.
+ */
+const COMPACTION_REPLY_GRACE_MS = 15_000;
+/**
+ * gjc host refusals of a control before its ordered dispatch (host admission,
+ * activation and dispatch preflight in gjc 0.20.0 `sdk/host`).
+ */
+const COMPACTION_PRE_DISPATCH_REFUSALS: ReadonlySet<string> = new Set([
+	"session_quiescing",
+	"not_activated",
+	"operation_not_session_owned",
+	"operation_prohibited",
+]);
 
 type SignaledHost = {
 	readonly pid: number;
@@ -845,6 +946,44 @@ export class BrokerSessionPort implements SessionPort {
 			),
 		);
 	}
+	/** Concurrent status/ACK paths must return the first persisted acceptance. */
+	#completePromptOperation(intent: BrokerOperationRecord, receipt: SendReceipt): SendReceipt {
+		return this.#database.transaction((tx) => {
+			this.#database.bindings.assertAuthority(this.#authority);
+			const current = this.#database.bindings.brokerOperation(this.#authority, "turn.prompt", intent.scope);
+			if (!current || current.operationRef !== intent.operationRef || current.requestJson !== intent.requestJson)
+				throw new OpRefError("prompt journal identity changed before completion");
+			if (current.state === "complete") {
+				const cached = recordOf(JSON.parse(current.resultJson!));
+				const nativeIdentityConflict =
+					(cached?.commandId !== undefined &&
+						receipt.commandId !== undefined &&
+						cached.commandId !== receipt.commandId) ||
+					(cached?.turnId !== undefined && receipt.turnId !== undefined && cached.turnId !== receipt.turnId);
+				if (
+					cached?.sessionId === receipt.sessionId &&
+					typeof cached.sessionId === "string" &&
+					cached.sessionId.length > 0 &&
+					cached.operationRef === intent.operationRef &&
+					receipt.operationRef === intent.operationRef &&
+					typeof cached.acceptedAt === "string" &&
+					cached.taskKey === "gateway" &&
+					!nativeIdentityConflict
+				)
+					return cached as unknown as SendReceipt;
+				throw new OpRefError("prompt accepted receipt identity changed");
+			}
+			this.#database.bindings.completeBrokerOperation(
+				tx,
+				this.#authority,
+				"turn.prompt",
+				intent.scope,
+				intent.operationRef,
+				JSON.stringify(receipt),
+			);
+			return receipt;
+		});
+	}
 
 	#releaseCloseOperation(sessionId: string): void {
 		const previous = this.#database.bindings.brokerOperation(this.#authority, "session.close", sessionId);
@@ -921,9 +1060,8 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	/**
-	 * Raw liveness judged on the broker envelope: gjc >= 0.16.0 omits
-	 * `locator.repo`, which makes the subsession normalizer return undefined for a
-	 * perfectly well-known session. `disowned` = the broker rejects the id.
+	 * Raw liveness judged on the broker envelope. `disowned` means the broker
+	 * rejects the id, rather than merely reporting a host that is not live.
 	 * `activity` is the host's own `{state, at}` when inspect reports one.
 	 * External probes keep transient failures unknown; resume/readiness use the
 	 * strict helper so broker outages remain retryable.
@@ -947,7 +1085,7 @@ export class BrokerSessionPort implements SessionPort {
 				session?: {
 					live?: unknown;
 					deleted?: unknown;
-					locator?: { repo?: unknown; cwd?: unknown };
+					locator?: { cwd?: unknown };
 					activity?: { state?: unknown; at?: unknown };
 					hostIncarnation?: unknown;
 				};
@@ -968,7 +1106,7 @@ export class BrokerSessionPort implements SessionPort {
 		const live = session?.live;
 		const state = session?.activity?.state;
 		const at = session?.activity?.at;
-		const workspace = session?.locator?.repo ?? session?.locator?.cwd;
+		const workspace = session?.locator?.cwd;
 		const host = session?.hostIncarnation;
 		return {
 			live: typeof live === "boolean" ? live : undefined,
@@ -985,6 +1123,52 @@ export class BrokerSessionPort implements SessionPort {
 	async inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined> {
 		this.#assertOwned(input);
 		return await this.#safe(async () => await inspectSession(this.#controller(input.repo), input.sessionId));
+	}
+
+	async hostExited(input: { sessionId: string; repo: string }): Promise<boolean> {
+		try {
+			this.#assertOwned(input);
+			const host = await this.#inspectHost(input);
+			// An ambiguous row is one of several hosts claiming the session; its pid speaks for no other.
+			// A failed (nonzero) inspect invocation is never exit evidence, whatever its stdout says.
+			return (
+				host.ok &&
+				host.succeeded &&
+				host.exclusive &&
+				host.pid !== undefined &&
+				(await processCommand(host.pid)).outcome === "gone"
+			);
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			return false;
+		}
+	}
+
+	async #inspectHost(input: {
+		sessionId: string;
+	}): Promise<
+		| { ok: true; pid: number | undefined; live: boolean | undefined; exclusive: boolean; succeeded: boolean }
+		| { ok: false; code: string | undefined }
+	> {
+		const result = await this.#cli(["sdk", "session", "inspect", input.sessionId], { timeoutMs: 10_000 });
+		const envelope = JSON.parse(result.stdout) as {
+			ok?: unknown;
+			result?: { session?: { sessionId?: unknown; pid?: unknown; live?: unknown; ambiguous?: unknown } };
+			error?: { code?: unknown; message?: unknown };
+		};
+		if (envelope.ok !== true) return { ok: false, code: stableErrorCode(envelope.error?.code) };
+		const session = envelope.result?.session;
+		return {
+			ok: true,
+			pid:
+				typeof session?.pid === "number" && Number.isSafeInteger(session.pid) && session.pid > 1
+					? session.pid
+					: undefined,
+			live: typeof session?.live === "boolean" ? session.live : undefined,
+			// The row names exactly this session and the broker flags no competing authority root.
+			exclusive: session?.sessionId === input.sessionId && session.ambiguous !== true,
+			succeeded: result.exitCode === 0,
+		};
 	}
 
 	/**
@@ -1019,26 +1203,15 @@ export class BrokerSessionPort implements SessionPort {
 		let pid: number | undefined;
 		let live: boolean | undefined;
 		try {
-			const result = await this.#cli(["sdk", "session", "inspect", input.sessionId], {
-				timeoutMs: 10_000,
-			});
-			const envelope = JSON.parse(result.stdout) as {
-				ok?: unknown;
-				result?: { session?: { pid?: unknown; live?: unknown } };
-				error?: { code?: unknown; message?: unknown };
-			};
-			if (envelope.ok !== true) {
-				const code = stableErrorCode(envelope.error?.code);
+			const host = await this.#inspectHost(input);
+			if (!host.ok) {
+				const code = host.code;
 				return isSessionGoneCode(code)
 					? { outcome: "refused", reason: "inspect_failed:session_gone_without_process_identity" }
 					: { outcome: "refused", reason: `inspect_failed:${code ?? "invalid_envelope"}` };
 			}
-			const session = envelope.result?.session;
-			pid =
-				typeof session?.pid === "number" && Number.isSafeInteger(session.pid) && session.pid > 1
-					? session.pid
-					: undefined;
-			live = typeof session?.live === "boolean" ? session.live : undefined;
+			pid = host.pid;
+			live = host.live;
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
 			return isSessionGoneCode(sdkErrorCode(error))
@@ -1255,17 +1428,19 @@ export class BrokerSessionPort implements SessionPort {
 		this.#assertOwned(input);
 		assertValidOpRef(input.opRef);
 		if (input.text.trim().length === 0) throw new OpRefError("prompt text must not be empty");
+		const text = renderPrompt(input.systemPreamble, input.text);
 		// `turn.prompt` is not idempotent at the broker (a reused clientRef is
 		// refused), so the gateway journals it: intent before the relay call,
-		// receipt after. A retry of a completed op ref gets the stored receipt;
-		// a retry of a pending one (crash or broker restart mid-send) first asks
-		// the broker whether that clientRef was accepted and only sends if not.
+		// receipt after. Completed acceptance returns the stored receipt; only
+		// a durable busy refusal can be re-armed for another submission. Pending
+		// intents reconcile the same clientRef and never resend on unknown.
 		// The hash covers every field that shapes the turn, so an op ref reused
 		// with the same text but another preamble or model is a different prompt.
+		const promptIdentity = input.images?.length
+			? [input.text, input.systemPreamble ?? null, input.model ?? null, input.images]
+			: [input.text, input.systemPreamble ?? null, input.model ?? null];
 		const requestJson = JSON.stringify({
-			prompt: createHash("sha256")
-				.update(JSON.stringify([input.text, input.systemPreamble ?? null, input.model ?? null]))
-				.digest("hex"),
+			prompt: createHash("sha256").update(JSON.stringify(promptIdentity)).digest("hex"),
 		});
 		const intent = this.#beginOperation(
 			"turn.prompt",
@@ -1275,7 +1450,8 @@ export class BrokerSessionPort implements SessionPort {
 		);
 		if (intent.requestJson !== requestJson)
 			throw new OpRefError(`op ref ${input.opRef} was already used for a different prompt`);
-		if (intent.state === "complete") return JSON.parse(intent.resultJson!) as SendReceipt;
+		if (intent.state === "complete" && !isBrokerPromptBusyRefusal(intent))
+			return JSON.parse(intent.resultJson!) as SendReceipt;
 		let relay: TailHandle;
 		try {
 			relay =
@@ -1288,11 +1464,11 @@ export class BrokerSessionPort implements SessionPort {
 			throw error;
 		}
 		try {
-			const receipt = intent.resumed
-				? await this.#acceptedPrompt(input, relay)
-				: await this.#submitPrompt(input, relay, intent);
-			this.#completeOperation(intent, receipt);
-			return receipt;
+			const receipt =
+				intent.resumed && !isBrokerPromptBusyRefusal(intent)
+					? await this.#acceptedPrompt(input, relay)
+					: await this.#submitPrompt(input, relay, intent, text);
+			return this.#completePromptOperation(intent, receipt);
 		} finally {
 			if (!input.relay) await relay.close();
 		}
@@ -1319,31 +1495,77 @@ export class BrokerSessionPort implements SessionPort {
 		};
 	}
 
-	async #submitPrompt(input: SessionSendInput, relay: TailHandle, intent: BrokerOperationRecord): Promise<SendReceipt> {
+	async #submitPrompt(
+		input: SessionSendInput,
+		relay: TailHandle,
+		intent: BrokerOperationRecord,
+		text: string,
+	): Promise<SendReceipt> {
 		if (input.model) {
 			try {
 				await this.setModel({ sessionId: input.sessionId, repo: input.repo, selection: input.model });
 			} catch (error) {
 				// Model selection is preflight: no turn.prompt was issued yet.
-				this.#releaseOperation(intent);
+				if (!isBrokerPromptBusyRefusal(intent)) this.#releaseOperation(intent);
 				throw error;
 			}
 		}
-		const text = renderPrompt(input.systemPreamble, input.text);
-		// The prompt is submitted on the session's resident relay so that this
+		// The prompt is submitted on the session's resident relay so that the
 		// connection OWNS the turn: the host streams the turn's content only to
 		// the connection that submitted it. A caller without a relay gets one
 		// for the duration of the send.
-		const deadline = this.#now() + (input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
+		const stallMs = input.busyStallMs ?? DEFAULT_SESSIONS_BUSY_STALL_MS;
+		// A configured stall bound is always reachable: the busy wait outlasts it
+		// by one sample, so a wedged host is replaced rather than requeued forever.
+		const deadline =
+			this.#now() +
+			Math.max(
+				input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS,
+				input.busyStallMs === undefined ? 0 : input.busyStallMs + BUSY_PROGRESS_SAMPLE_MS,
+			);
 		let waited = false;
+		let submission = intent;
+		// Progress evidence while the host refuses with `busy` (#687): a host that
+		// claims to be busy but never moves its activity stamp or transcript is
+		// wedged, and waiting it out would block the origin until the deadline.
+		let progress: string | undefined;
+		let progressAt = this.#now();
+		let nextSampleAt = 0;
 		for (;;) {
+			const retryingBusy = isBrokerPromptBusyRefusal(submission);
+			if (retryingBusy) {
+				submission = this.#database.transaction((tx) =>
+					this.#database.bindings.rearmBrokerPromptOperation(tx, this.#authority, submission),
+				);
+				if (submission.state === "complete") return JSON.parse(submission.resultJson!) as SendReceipt;
+				if (submission.resumed) return await this.#acceptedPrompt(input, relay);
+			}
 			try {
 				this.#database.bindings.assertAuthority(this.#authority);
 			} catch (error) {
 				this.#releaseOperation(intent);
 				throw error;
 			}
-			const response = await relay.control("turn.prompt", { text, clientRef: input.opRef });
+			let response: RelayResponse;
+			try {
+				response = await relay.control(
+					"turn.prompt",
+					{
+						text,
+						clientRef: input.opRef,
+						...(input.images?.length ? { images: input.images } : {}),
+					},
+					{ beforeWrite: input.beforeWrite, onPayloadTooLarge: input.onPayloadTooLarge },
+				);
+			} catch (error) {
+				// The retry never reached the host (relay gone before the frame was
+				// written, e.g. the host exited while we waited): the authenticated
+				// busy refusal still stands, so the op stays provably unadmitted (#689).
+				if (retryingBusy && isUnwrittenRelayRequest(error))
+					this.#completeOperation(submission, BROKER_PROMPT_BUSY_REFUSAL);
+				else if (isUnwrittenRelayRequest(error)) this.#releaseOperation(submission);
+				throw error;
+			}
 			this.#database.bindings.assertAuthority(this.#authority);
 			if (response.ok) {
 				const result = recordOf(response.result) ?? {};
@@ -1371,16 +1593,73 @@ export class BrokerSessionPort implements SessionPort {
 			// `busy` is occupancy, not failure: the prompt was never accepted and
 			// the op-ref is still unused. Wait for the session to go idle
 			// (bounded) and resend under the same op-ref before giving up.
-			if (!isSessionBusy(error) || this.#now() >= deadline) {
-				this.#releaseOperation(intent);
+			if (!isSessionBusy(error)) {
+				this.#releaseOperation(submission);
 				throw error;
 			}
+			// Preserve the authenticated non-acceptance before deliberately waiting.
+			// A crash here must not look like a possibly accepted submission.
+			this.#completeOperation(submission, BROKER_PROMPT_BUSY_REFUSAL);
+			const sampledAt = this.#now();
+			if (sampledAt >= nextSampleAt) {
+				nextSampleAt = sampledAt + BUSY_PROGRESS_SAMPLE_MS;
+				const sample = await this.#busyProgress(input);
+				// An incomplete sample is not evidence of a stall: restart the clock.
+				if (sample === undefined || sample !== progress) {
+					progress = sample;
+					progressAt = sampledAt;
+				} else if (sampledAt - progressAt >= stallMs)
+					throw new SessionBusyStalledError(input.sessionId, input.opRef, sampledAt - progressAt, sample);
+			}
+			if (this.#now() >= deadline) throw error;
+			submission = { ...submission, state: "complete", resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL) };
 			if (!waited) {
 				waited = true;
 				console.info(`session_busy_wait session=${input.sessionId} opRef=${input.opRef}`);
 			}
 			await this.#sleep(BUSY_POLL_MS);
 		}
+	}
+
+	/**
+	 * Fingerprint of a busy host's progress: the inspect activity stamp AND the
+	 * saved transcript's size/mtime. Both are required; with either unreadable
+	 * the sample is undefined, so a stall is never concluded from partial
+	 * evidence (a quiet long call may move only the part that could not be read).
+	 */
+	async #busyProgress(input: { sessionId: string; repo: string; opRef: string }): Promise<string | undefined> {
+		const unavailable = (source: string, detail: string): undefined => {
+			console.warn(
+				`session_busy_probe_unavailable session=${input.sessionId} opRef=${input.opRef} source=${source} detail=${sanitizeDiagnostic(detail)}`,
+			);
+			return undefined;
+		};
+		let activity: SessionActivity | undefined;
+		try {
+			activity = (await this.#readLiveness(input)).activity;
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			return unavailable("inspect", String(error));
+		}
+		if (!activity) return unavailable("inspect", "no activity stamp");
+		const transcript = await locateSavedTranscript(this.#authority.canonicalAgentDir, input.sessionId);
+		if (transcript === undefined) return unavailable("transcript", "saved transcript not located");
+		try {
+			const info = await stat(transcript);
+			return `activity=${activity.state}@${activity.at} transcript=${info.size}@${Math.trunc(info.mtimeMs)}`;
+		} catch (error) {
+			return unavailable("transcript", String(error));
+		}
+	}
+	promptRefusal(input: { sessionId: string; repo: string; opRef: string }): "busy" | undefined {
+		this.#assertOwned(input);
+		this.#database.bindings.assertAuthority(this.#authority);
+		const intent = this.#database.bindings.brokerOperation(
+			this.#authority,
+			"turn.prompt",
+			JSON.stringify([input.sessionId, input.opRef]),
+		);
+		return intent?.operationRef === input.opRef && isBrokerPromptBusyRefusal(intent) ? "busy" : undefined;
 	}
 
 	async steer(input: SessionSteerInput): Promise<void> {
@@ -1694,7 +1973,7 @@ export class BrokerSessionPort implements SessionPort {
 		sdk: SdkTransport,
 	): Promise<LastAssistantResult | undefined> {
 		let cursor: string | undefined;
-		type Row = { role?: string; ts?: string; textSummary?: string; body?: string };
+		type Row = { role?: string; ts?: string; textSummary?: string; body?: string; stopReason?: string };
 		const rowText = (row: Row): string =>
 			(typeof row.body === "string" && row.body) || (typeof row.textSummary === "string" ? row.textSummary : "");
 		let latest: Row | undefined;
@@ -1708,7 +1987,7 @@ export class BrokerSessionPort implements SessionPort {
 			const page = (
 				envelope as {
 					page?: {
-						items?: Array<{ role?: string; ts?: string; textSummary?: string; body?: string }>;
+						items?: Array<{ role?: string; ts?: string; textSummary?: string; body?: string; stopReason?: string }>;
 						complete?: unknown;
 						continuationCursor?: unknown;
 					};
@@ -1726,7 +2005,7 @@ export class BrokerSessionPort implements SessionPort {
 			if (page.complete === true) {
 				const chosen = (input.preferSpoken ? latestSpoken : undefined) ?? latest;
 				if (!chosen) return undefined;
-				return { text: rowText(chosen), pages, complete: true };
+				return { text: rowText(chosen), pages, complete: true, stopReason: chosen.stopReason };
 			}
 			const next = typeof page.continuationCursor === "string" ? page.continuationCursor : undefined;
 			if (!next || seenCursors.has(next))
@@ -1754,12 +2033,29 @@ export class BrokerSessionPort implements SessionPort {
 		return await this.#tailRunner.attach(input);
 	}
 
-	async runCompaction(input: SessionCompactionInput): Promise<{ readonly status: SessionCompactionStatus }> {
+	async runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult> {
 		this.#assertOwned(input);
+		if (input.relay) return await this.#runCompactionOnRelay(input, input.relay);
 		try {
 			const result = parseEnvelope<Record<string, unknown>>(
 				await this.#cli(
-					["sdk", "session", "raw", "control", input.sessionId, "--op", "compaction.run", "--json-input", "{}"],
+					[
+						"sdk",
+						"session",
+						"raw",
+						"control",
+						input.sessionId,
+						"--op",
+						"compaction.run",
+						"--json-input",
+						"{}",
+						// gjc replies only once the compaction is done; without this its
+						// default session request budget (40 s) gives up while the host
+						// keeps compacting.
+						"--timeout-ms",
+						String(COMPACTION_TIMEOUT_MS - COMPACTION_REPLY_GRACE_MS),
+					],
+					// One end-to-end deadline: CLI slot wait and request share it.
 					{ timeoutMs: COMPACTION_TIMEOUT_MS },
 				),
 				"compaction.run",
@@ -1773,9 +2069,48 @@ export class BrokerSessionPort implements SessionPort {
 			if (error instanceof BrokerAuthorityError) throw error;
 			const code = sdkErrorCode(error);
 			if (code === "unsupported_operation" || code === "not_supported" || code === "unknown_operation")
-				return { status: "unavailable" };
-			return { status: "failed" };
+				return { status: "unavailable", code };
+			// A run that never got a CLI slot never reached gjc.
+			if (error instanceof GjcCommandQueueTimeoutError) return { status: "failed", code: "queue_timeout" };
+			// gjc's request timeout settles only the client: the host keeps compacting.
+			// So may a run whose process was cut off or never printed gjc's envelope.
+			// Other structured CLI failures keep their code but do not prove the host
+			// finished (the CLI also reports a lost reply as operation_failed); only the
+			// relay path reports `answered`.
+			const outcomeUnknown =
+				code === "timeout" || code === "uncertain_after_send" || !(error instanceof GjcCliError && error.details);
+			return { status: "failed", ...(code ? { code } : {}), ...(outcomeUnknown ? { outcomeUnknown } : {}) };
 		}
+	}
+
+	async #runCompactionOnRelay(input: SessionCompactionInput, relay: TailHandle): Promise<SessionCompactionResult> {
+		let response: RelayResponse;
+		try {
+			response = await relay.control("compaction.run", {}, { timeoutMs: COMPACTION_TIMEOUT_MS });
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			// A frame never written never reached the host.
+			if (isUnwrittenRelayRequest(error)) return { status: "failed", code: "relay_unwritten" };
+			// No reply (timeout, relay lost after the write): the host may still be compacting.
+			return { status: "failed", outcomeUnknown: true };
+		}
+		this.#database.bindings.assertAuthority(this.#authority);
+		if (response.ok) {
+			const result = recordOf(response.result) ?? {};
+			this.#tailRunner.recordCompactionReceipt({ sessionId: input.sessionId, originKey: input.originKey, result });
+			if (result.started === true || result.status === "started" || result.status === "completed")
+				return { status: "succeeded", answered: true };
+			if (result.skipped === true || result.status === "skipped") return { status: "skipped", answered: true };
+			return { status: "failed", answered: true };
+		}
+		const code = stableErrorCode(response.error?.code);
+		if (code === "unsupported_operation" || code === "not_supported" || code === "unknown_operation")
+			return { status: "unavailable", code };
+		// Refused before the host's ordered dispatch: the run never started and
+		// proves nothing about controls queued earlier. Any other failure is the
+		// dispatcher's answer for this run, including compaction's own failures.
+		const refusedBeforeDispatch = code !== undefined && COMPACTION_PRE_DISPATCH_REFUSALS.has(code);
+		return { status: "failed", ...(code ? { code } : {}), ...(refusedBeforeDispatch ? {} : { answered: true }) };
 	}
 
 	checkStalls(now = this.#now()): void {
@@ -1878,6 +2213,9 @@ export class BrokerSessionPort implements SessionPort {
 			} catch (sendError) {
 				if (sendError instanceof BrokerAuthorityError) throw markSessionRequestStep(sendError, "authority");
 				const taggedSendError = markSessionRequestStep(sendError, "send");
+				// Preserve local validation/fingerprint or journal-identity errors.
+				// Recovery must not disguise them as a prior operation's success.
+				if (sendError instanceof OpRefError) throw taggedSendError;
 				// A transport/control failure may occur after the runtime accepted the
 				// prompt. Query the SAME clientRef before retrying; monitor authoring
 				// otherwise ran the event, produced a final answer, then executed it
@@ -1906,16 +2244,30 @@ export class BrokerSessionPort implements SessionPort {
 			}
 			if (!isTerminalStatus(status.status.status))
 				throw markSessionRequestStep(new SessionRequestTimeoutError(input.sessionId, input.opRef, status), "status");
-			if (status.status.status !== "terminal_ok")
+			// Native terminal_ok also includes cancellation, refusal and budget
+			// stops; missing/unknown receipts remain holds. Reuse the canonical
+			// projection before consuming an assistant response as this answer.
+			if (projectOpState(status.status) !== "completed")
 				throw markSessionRequestStep(new SessionTerminalError(status), "status");
+			const assistant = await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo, relay }).catch(
+				(error: unknown) => {
+					throw markSessionRequestStep(error, "last_assistant");
+				},
+			);
+			let contextUsage: SessionContextUsage | undefined;
+			// An empty answer cannot arm a size roll, so it never pays for a context read.
+			if (input.sampleContext && assistant.text.trim()) {
+				try {
+					contextUsage = await this.contextUsage({ sessionId: input.sessionId, repo: input.repo, relay });
+				} catch (error) {
+					if (error instanceof BrokerAuthorityError) throw markSessionRequestStep(error, "authority");
+				}
+			}
 			result = {
 				receipt,
 				status,
-				assistant: await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo, relay }).catch(
-					(error: unknown) => {
-						throw markSessionRequestStep(error, "last_assistant");
-					},
-				),
+				assistant,
+				...(contextUsage === undefined ? {} : { contextUsage }),
 			};
 		} catch (error) {
 			requestFailed = true;
@@ -2125,8 +2477,12 @@ export function parseWorkerOutputResponse(
 	}
 	if (result.status === "accepted" || result.status === "in_flight")
 		return { status: "absent", code: "output_pending" };
+	const unresolvedFailure =
+		result.status === "failed" &&
+		(result.receiptState === undefined ||
+			["missing", "unknown", "absent"].some((state) => state === result.receiptState));
 	if (
-		(result.status !== "terminal_ok" && !(result.status === "failed" && result.receiptState === "missing")) ||
+		(result.status !== "terminal_ok" && !unresolvedFailure) ||
 		typeof result.terminalAt !== "number" ||
 		!Number.isFinite(result.terminalAt) ||
 		result.terminalAt < input.notBeforeMs
@@ -2140,9 +2496,9 @@ export function parseWorkerOutputResponse(
 			result.startedAt > result.terminalAt)
 	)
 		return { status: "unavailable", code: "invalid_evidence" };
-	// A request deadline can publish a failed/missing result before the live
-	// execution's final receipt arrives. Keep that result inside the same bounded
-	// retrieval budget as terminal_ok/missing, never an assumed final failure.
+	// A failed operation's nonpresent receipt is not definitive output loss.
+	// Keep validated, content-free responses inside the same bounded retrieval
+	// budget; malformed states and unproven content remain fail-closed.
 	if (result.status === "failed")
 		return result.content === undefined && result.textSummary === undefined
 			? { status: "absent", code: "output_pending" }
@@ -2156,7 +2512,7 @@ export function parseWorkerOutputResponse(
 		// is retryable within the bounded read budget. A terminal op whose receipt
 		// is `absent` contradicts the SDK contract and is not.
 		return result.receiptState === "absent"
-			? { status: "unavailable", code: "output_unavailable" }
+			? { status: "unavailable", code: "output_unavailable", definitiveLoss: true }
 			: { status: "absent", code: "output_pending" };
 	}
 	if (content.truncated === true) return { status: "unavailable", code: "incomplete_body" };
@@ -2335,10 +2691,14 @@ async function waitForProcessExit(
 	}
 }
 
-/** `ps` is the portable process read on macOS and Linux; only a clean no-match proves the pid is gone. */
+/**
+ * `ps` is the portable process read on macOS and Linux. Gone is a clean
+ * no-match, or a zombie without live threads: it runs nothing, and its pid
+ * cannot be reused until its parent reaps it.
+ */
 async function processCommand(pid: number): Promise<ProcessCommandInspection> {
 	try {
-		const proc = Bun.spawn(["ps", "-o", "pid=,ppid=,pgid=,lstart=,command=", "-p", String(pid)], {
+		const proc = Bun.spawn(["ps", "-o", "pid=,ppid=,pgid=,stat=,lstart=,command=", "-p", String(pid)], {
 			stdout: "pipe",
 			stderr: "pipe",
 			env: { ...process.env, LC_ALL: "C" },
@@ -2351,15 +2711,20 @@ async function processCommand(pid: number): Promise<ProcessCommandInspection> {
 		const line = stdout.trim();
 		if (exitCode === 0 && line.length > 0) {
 			const match =
-				/^(\d+)\s+(\d+)\s+(\d+)\s+([A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})(?:\s+(.*))?$/.exec(
+				/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+([A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})(?:\s+(.*))?$/.exec(
 					line,
 				);
 			if (!match || Number(match[1]) !== pid) return { outcome: "unreadable", reason: "ps_pid_mismatch" };
+			if (match[4]!.startsWith("Z")) {
+				// Linux keeps an exited thread-group leader as a zombie while sibling
+				// threads still run; ps marks that with "l". Neither live nor gone.
+				return match[4]!.includes("l") ? { outcome: "unreadable", reason: "ps_zombie_threads" } : { outcome: "gone" };
+			}
 			return {
 				outcome: "live",
-				identity: `${match[1]}:${match[4]}`,
+				identity: `${match[1]}:${match[5]}`,
 				context: `${match[2]}:${match[3]}`,
-				command: match[5]?.trim() ?? "",
+				command: match[6]?.trim() ?? "",
 			};
 		}
 		if (exitCode === 1 && line.length === 0 && stderr.trim().length === 0) return { outcome: "gone" };
@@ -2404,6 +2769,11 @@ function stableErrorCode(value: unknown): string | undefined {
  * A bare `operation_failed` without the key reference stays a same-key retry.
  */
 function poisonedCreateKeyCode(error: unknown, idempotencyKey: string): string | undefined {
+	// GJC 0.19's legacy-history fence is not a disposable poisoned key. Its
+	// public code is also operation_failed/unknown, but changing key or target
+	// would bypass the broker's explicit requirement for operator reconciliation.
+	if (error instanceof GjcCliError && error.diagnostics.includes("lifecycle_legacy_history_ambiguous"))
+		return undefined;
 	const code = sdkErrorCode(error);
 	if (isRebindableCode(code)) return code;
 	if (code !== "operation_failed" || !(error instanceof GjcCliError)) return undefined;
@@ -2482,6 +2852,7 @@ function sanitizeSdkFailure(error: unknown): Error {
 			error.exitCode,
 			sanitizeDiagnostic(error.stderr),
 			sanitizedDetails(error.details),
+			error.diagnostics,
 		);
 	}
 	return new Error(sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error");

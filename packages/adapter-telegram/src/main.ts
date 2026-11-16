@@ -1,23 +1,60 @@
+import { constants } from "node:fs";
+import { open, realpath } from "node:fs/promises";
 import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 
-import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajae-gateway/protocol";
+import {
+	type ChatMessagePayload,
+	type ChatSendResult,
+	type EngagementContext,
+	type FileRef,
+	type OriginRef,
+	OUTBOUND_FILE_MAX_BYTES,
+	originKey,
+	type PromptImage,
+	ProtocolError,
+} from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import {
 	describeInboundBody,
+	prepareTelegramImage,
 	pruneTelegramAttachments,
 	type TelegramAttachmentCarrier,
+	TelegramAttachmentRetryableError,
 	type TelegramAttachmentSaver,
 	TelegramAttachmentStore,
 	type TelegramFileApi,
 	telegramAttachment,
 } from "./attachments";
 import { adapterHome, type LoadedTelegramAdapterConfig, loadTelegramAdapterConfig } from "./config";
+import {
+	escapeHtml,
+	markdownToTelegramHtml,
+	splitTelegramHtml,
+	TELEGRAM_MESSAGE_LIMIT,
+	TELEGRAM_PARSE_MODE,
+	telegramHtmlToPlainText,
+} from "./format";
 import { type TelegramMessageOriginShape, telegramMessageOrigin } from "./origin";
 import { telegramReactionFor } from "./reactions";
 import { resolveTelegramReplyContext, type TelegramReplyMessageShape } from "./reply";
 import { TelegramAdapterState } from "./state";
 
-const TELEGRAM_MESSAGE_LIMIT = 4_096;
+/**
+ * sendPhoto refuses photos over 10 MB (https://core.telegram.org/bots/api#sendphoto).
+ * Decimal megabytes keep us under the limit whichever unit Telegram means;
+ * anything larger goes out as a document, which Telegram accepts up to 50 MB.
+ */
+export const TELEGRAM_PHOTO_MAX_BYTES = 10_000_000;
+/**
+ * Deliveries settle one at a time per chat, so a Bot API request that never
+ * answers would hold back every later reply to that chat. Each request is
+ * abandoned after this long; the delivery then fails as ambiguous.
+ */
+export const TELEGRAM_REQUEST_TIMEOUT_MS = 30_000;
+/** Uploads carry up to 50 MB, so they get longer than a JSON call. */
+export const TELEGRAM_UPLOAD_TIMEOUT_MS = 120_000;
+/** getUpdates long-polls for this long before answering with no updates. */
+const TELEGRAM_POLL_SECONDS = 30;
 const ATTACHMENT_PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 export interface GatewayClientLike {
@@ -72,55 +109,177 @@ export class TelegramApiError extends Error {
 	constructor(
 		readonly status: number,
 		message: string,
+		/** Telegram's flood-control `parameters.retry_after`, in seconds, when it sent one. */
+		readonly retryAfterSeconds?: number,
 	) {
 		super(message);
 		this.name = "TelegramApiError";
 	}
 }
 
+/** One local file to upload; `name` is the file name Telegram shows. */
+export interface TelegramUpload {
+	readonly name: string;
+	readonly bytes: Uint8Array;
+}
+
+/** Where a reply lands: the chat, and the forum topic inside it when there is one. */
+export interface TelegramUploadTarget {
+	readonly chatId: string;
+	readonly messageThreadId?: number;
+	readonly caption?: string;
+}
+
+export interface TelegramBotApiTimeouts {
+	readonly requestMs: number;
+	readonly uploadMs: number;
+}
+
 export class TelegramBotApi implements TelegramFileApi {
 	constructor(
 		readonly token: string,
 		readonly fetcher: FetchLike = fetch,
+		readonly timeouts: TelegramBotApiTimeouts = {
+			requestMs: TELEGRAM_REQUEST_TIMEOUT_MS,
+			uploadMs: TELEGRAM_UPLOAD_TIMEOUT_MS,
+		},
 	) {}
 
-	async call<T>(method: string, parameters: Record<string, unknown> = {}, signal?: AbortSignal): Promise<T> {
-		const response = await this.fetcher(`https://api.telegram.org/bot${this.token}/${method}`, {
+	/**
+	 * The timeout covers the whole exchange, response body included, and is
+	 * combined with any caller signal.
+	 */
+	async call<T>(
+		method: string,
+		parameters: Record<string, unknown> = {},
+		signal?: AbortSignal,
+		timeoutMs: number = this.timeouts.requestMs,
+	): Promise<T> {
+		const response = await this.#post(method, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify(parameters),
-			signal,
+			signal: withTimeout(timeoutMs, signal),
 		});
+		return this.#result<T>(method, response);
+	}
+
+	/** Posts one photo (JPEG/PNG/WebP, at most {@link TELEGRAM_PHOTO_MAX_BYTES}) into the chat or topic. */
+	sendPhoto(target: TelegramUploadTarget, file: TelegramUpload): Promise<{ readonly message_id?: number }> {
+		return this.#upload("sendPhoto", "photo", target, file);
+	}
+
+	/** Posts any file as a document into the chat or topic. */
+	sendDocument(target: TelegramUploadTarget, file: TelegramUpload): Promise<{ readonly message_id?: number }> {
+		return this.#upload("sendDocument", "document", target, file);
+	}
+
+	/**
+	 * multipart/form-data upload: the bytes and their file name travel in one
+	 * request, so nothing is left half-posted on failure.
+	 */
+	async #upload<T>(
+		method: "sendPhoto" | "sendDocument",
+		field: "photo" | "document",
+		target: TelegramUploadTarget,
+		file: TelegramUpload,
+	): Promise<T> {
+		const form = new FormData();
+		form.append("chat_id", target.chatId);
+		if (target.messageThreadId !== undefined) form.append("message_thread_id", String(target.messageThreadId));
+		if (target.caption !== undefined) form.append("caption", target.caption);
+		form.append(field, new Blob([file.bytes as Uint8Array<ArrayBuffer>]), file.name);
+		const response = await this.#post(method, {
+			method: "POST",
+			body: form,
+			signal: withTimeout(this.timeouts.uploadMs),
+		});
+		return this.#result<T>(method, response);
+	}
+
+	/**
+	 * The request url embeds the bot token, and a transport error may echo it, so
+	 * such errors are rethrown with the token removed. They stay plain Errors so
+	 * the delivery is still treated as ambiguous (the request may have landed).
+	 */
+	async #post(method: string, init: RequestInit): Promise<Response> {
+		try {
+			return await this.fetcher(`https://api.telegram.org/bot${this.token}/${method}`, init);
+		} catch (error) {
+			throw new Error(`Telegram ${method} request failed: ${this.#redact(error)}`);
+		}
+	}
+
+	#redact(error: unknown): string {
+		const message = error instanceof Error ? error.message : String(error);
+		return this.token ? message.replaceAll(this.token, "<redacted>") : message;
+	}
+
+	/**
+	 * The request was dispatched before any of this runs, so only an answer that
+	 * proves it was refused is a definitive TelegramApiError: a parsed Telegram
+	 * rejection (`ok: false`), or a 4xx whose body is not a Telegram answer. A body
+	 * that fails to arrive (reset, timeout), a 2xx that is not a well-formed
+	 * success, or a 5xx proxy page means Telegram may already have posted, so
+	 * those stay plain Errors and the delivery is reported ambiguous.
+	 */
+	async #result<T>(method: string, response: Response): Promise<T> {
+		let text: string;
+		try {
+			text = await response.text();
+		} catch (error) {
+			throw new Error(`Telegram ${method} response failed: ${this.#redact(error)}`);
+		}
 		let body: unknown;
 		try {
-			body = await response.json();
+			body = JSON.parse(text);
 		} catch {
-			throw new TelegramApiError(response.status, `Telegram ${method} returned an invalid response`);
+			body = undefined;
 		}
-		if (!response.ok || !isTelegramResult(body)) {
+		if (isObject(body) && body.ok === false) {
 			const description =
-				isObject(body) && typeof body.description === "string" ? body.description : `Telegram ${method} failed`;
-			throw new TelegramApiError(response.status, description);
+				typeof body.description === "string" ? this.#redact(body.description) : `Telegram ${method} failed`;
+			const retryAfter = isObject(body.parameters) ? body.parameters.retry_after : undefined;
+			throw new TelegramApiError(
+				response.status,
+				description,
+				typeof retryAfter === "number" && Number.isFinite(retryAfter) && retryAfter >= 0 ? retryAfter : undefined,
+			);
 		}
-		return body.result as T;
+		if (response.ok && isTelegramResult(body)) return body.result as T;
+		const detail = `Telegram ${method} returned an invalid response (HTTP ${response.status})`;
+		if (response.status >= 400 && response.status < 500) throw new TelegramApiError(response.status, detail);
+		throw new Error(detail);
 	}
 
 	getUpdates(offset?: number): Promise<TelegramUpdate[]> {
 		// `allowed_updates` REPLACES Telegram's default set, so "message" has to be
 		// listed explicitly to keep the existing text path working while opting into
 		// "message_reaction" (which is never in the default set).
-		return this.call("getUpdates", {
-			timeout: 30,
-			allowed_updates: ["message", "message_reaction"],
-			...(offset === undefined ? {} : { offset }),
-		});
+		return this.call(
+			"getUpdates",
+			{
+				timeout: TELEGRAM_POLL_SECONDS,
+				allowed_updates: ["message", "message_reaction"],
+				...(offset === undefined ? {} : { offset }),
+			},
+			undefined,
+			// The long poll legitimately holds the request open for its whole window.
+			TELEGRAM_POLL_SECONDS * 1_000 + this.timeouts.requestMs,
+		);
 	}
 
-	sendMessage(chatId: string, text: string, messageThreadId?: number): Promise<unknown> {
+	sendMessage(
+		chatId: string,
+		text: string,
+		messageThreadId?: number,
+		parseMode?: typeof TELEGRAM_PARSE_MODE,
+	): Promise<unknown> {
 		return this.call("sendMessage", {
 			chat_id: chatId,
 			text,
 			...(messageThreadId === undefined ? {} : { message_thread_id: messageThreadId }),
+			...(parseMode === undefined ? {} : { parse_mode: parseMode }),
 		});
 	}
 
@@ -146,12 +305,54 @@ export class TelegramBotApi implements TelegramFileApi {
 	}
 }
 
-export function chunkTelegramMessage(text: string): string[] {
-	if (text.length === 0) return [""];
-	const chunks: string[] = [];
-	for (let offset = 0; offset < text.length; offset += TELEGRAM_MESSAGE_LIMIT)
-		chunks.push(text.slice(offset, offset + TELEGRAM_MESSAGE_LIMIT));
-	return chunks;
+function withTimeout(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+	const timeout = AbortSignal.timeout(timeoutMs);
+	return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+const DUPLICATE_WARNING_PREFIX = `${escapeHtml("[recovered - may be a duplicate]")} `;
+
+/**
+ * Renders a persona reply the way GJC's Telegram notifier does: Markdown becomes
+ * Telegram HTML, then the result is split without breaking a tag or entity (open
+ * tags are closed and reopened across chunks). Every chunk leaves room for the
+ * duplicate-warning prefix, so a resumed delivery can warn on whichever chunk
+ * it resends first. A reply that renders to markup with no visible text (`>`,
+ * `# `) is posted as its literal text instead of not at all.
+ */
+function telegramDeliveryChunks(text: string): string[] {
+	const max = TELEGRAM_MESSAGE_LIMIT - DUPLICATE_WARNING_PREFIX.length;
+	const html = markdownToTelegramHtml(text);
+	const markupOnly = telegramHtmlToPlainText(html).trim() === "" && text.trim() !== "";
+	// The literal fallback drops NUL just as the renderer does: it must never reach Telegram.
+	return splitTelegramHtml(markupOnly ? escapeHtml(text.replaceAll("\u0000", "")) : html, max);
+}
+
+/** The Telegram HTML messages one delivery posts, in order. */
+export function renderTelegramDelivery(text: string, duplicateWarning = false): string[] {
+	const chunks = telegramDeliveryChunks(text);
+	return duplicateWarning
+		? chunks.map((chunk, index) => (index === 0 ? DUPLICATE_WARNING_PREFIX + chunk : chunk))
+		: chunks;
+}
+
+/** Telegram's HTML parser rejects the chunk itself; resending it unformatted is safe. */
+function isEntityParseError(error: unknown): boolean {
+	return error instanceof TelegramApiError && error.status === 400 && /can't parse entities/i.test(error.message);
+}
+
+async function sendTelegramHtml(
+	bot: Pick<TelegramBotApi, "sendMessage">,
+	chatId: string,
+	html: string,
+	messageThreadId: number | undefined,
+): Promise<void> {
+	try {
+		await bot.sendMessage(chatId, html, messageThreadId, TELEGRAM_PARSE_MODE);
+	} catch (error) {
+		if (!isEntityParseError(error)) throw error;
+		await bot.sendMessage(chatId, telegramHtmlToPlainText(html), messageThreadId);
+	}
 }
 
 export function deliveryFailureIsAmbiguous(error: unknown): boolean {
@@ -159,26 +360,176 @@ export function deliveryFailureIsAmbiguous(error: unknown): boolean {
 	return !(error instanceof TelegramApiError);
 }
 
+/**
+ * A partly delivered reply ends ambiguous so the ledger keeps it (and warns on a
+ * replay after restart), but a retry whose next chunk Telegram refuses again
+ * gets no further: the stall that reaches this count reports definitive
+ * non-delivery, so the ledger's definitive-failure cap ends the delivery instead
+ * of retrying it for the whole freshness window. A transport failure stays
+ * ambiguous (the chunk may have landed) and is resent alone, under the
+ * duplicate warning, until the freshness window ends.
+ */
+const TELEGRAM_PARTIAL_STALL_LIMIT = 5;
+/**
+ * Longest total flood-control wait one settlement honors; a longer `retry_after`
+ * fails the attempt and leaves the wait to the ledger's retry backoff. A
+ * settlement that outlasts the gateway's 60-second ack window is replayed onto
+ * the same per-chat queue and finds its progress, so it resumes rather than
+ * reposting.
+ */
+const TELEGRAM_RETRY_AFTER_BUDGET_MS = 30_000;
+/** Bounds the in-memory progress kept for deliveries this process settled. */
+const TELEGRAM_PROGRESS_LIMIT = 256;
+
+interface TelegramChunkProgress {
+	/**
+	 * The chunks rendered on first sight; a resume never re-renders, so boundaries
+	 * cannot shift. A fully posted delivery drops them (0 of 0 sent).
+	 */
+	readonly chunks: readonly string[];
+	/** Chunks Telegram accepted, in order. `sent === chunks.length` means posted in full. */
+	sent: number;
+	/** The chunk at `sent` may have been posted (transport failure), so its resend carries the warning. */
+	uncertain: boolean;
+	/** Retries that got no further chunk accepted. */
+	stalls: number;
+}
+
+/**
+ * What this process already posted for each delivery, so a ledger retry resumes
+ * at the first chunk Telegram has not accepted instead of reposting the reply
+ * from its first chunk, and a delivery replayed after it was posted in full
+ * (a lost confirm, an ack-timeout replay) is confirmed without reposting. The
+ * gateway ledger never re-dispatches a confirmed delivery on its own, so a
+ * completed entry is only ever hit by such a replay. Memory only: after an
+ * adapter restart (or an eviction) the ledger replays the reply from its first
+ * chunk under the duplicate warning, and a definitive refusal of such a replay
+ * counts toward the ledger's definitive-failure cap.
+ */
+export class TelegramDeliveryProgress {
+	readonly #entries = new Map<string, TelegramChunkProgress>();
+
+	get(deliveryId: string): TelegramChunkProgress | undefined {
+		return this.#entries.get(deliveryId);
+	}
+
+	remember(deliveryId: string, entry: TelegramChunkProgress): void {
+		this.#entries.delete(deliveryId);
+		this.#entries.set(deliveryId, entry);
+		// Completed entries only absorb replays; unresolved ones hold a resume point,
+		// so they are evicted last.
+		for (const evictUnresolved of [false, true])
+			for (const [id, oldest] of this.#entries) {
+				if (this.#entries.size <= TELEGRAM_PROGRESS_LIMIT) return;
+				if (evictUnresolved || oldest.sent === oldest.chunks.length) this.#entries.delete(id);
+			}
+	}
+}
+
+export interface TelegramSettleOptions {
+	/** Shared across settlements so retries resume; a fresh one remembers nothing. */
+	readonly progress?: TelegramDeliveryProgress;
+	readonly sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * A flood-control refusal posted nothing, so the chunk may be resent after its
+ * wait. At least one second per wait, so a `retry_after: 0` answer cannot spin
+ * inside the wait budget.
+ */
+function floodWaitMs(error: unknown): number | undefined {
+	return error instanceof TelegramApiError && error.status === 429 && error.retryAfterSeconds !== undefined
+		? Math.max(1, error.retryAfterSeconds) * 1_000
+		: undefined;
+}
+
 export async function settleTelegramDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	bot: Pick<TelegramBotApi, "sendMessage">,
 	state: TelegramAdapterState,
 	message: ChatMessagePayload,
+	options: TelegramSettleOptions = {},
 ): Promise<void> {
 	if (message.origin.platform !== "telegram" || !message.deliveryId) return;
 	const deliveryId = message.deliveryId;
+	const progress = options.progress ?? new TelegramDeliveryProgress();
+	const sleep = options.sleep ?? Bun.sleep;
+	const known = progress.get(deliveryId);
+	if (known && known.sent === known.chunks.length) {
+		await gateway.request("delivery.confirm", { deliveryId });
+		return;
+	}
+	let chunks: readonly string[];
+	try {
+		chunks = known?.chunks ?? telegramDeliveryChunks(message.text);
+	} catch (error) {
+		// Nothing was sent, so a reply that cannot be rendered is definitively not
+		// delivered; the ledger's definitive-failure cap ends it.
+		await gateway.request("delivery.fail", {
+			deliveryId,
+			reason: `Telegram rendering failed: ${error instanceof Error ? error.message : String(error)}`,
+			ambiguous: false,
+		});
+		return;
+	}
+	// A known entry already knows what Telegram accepted, so the gateway's
+	// duplicate flag (raised for any ambiguous retry) does not apply to it.
+	const entry: TelegramChunkProgress = known ?? {
+		chunks,
+		sent: 0,
+		uncertain: message.duplicateWarning === true,
+		stalls: 0,
+	};
+	const startedAt = entry.sent;
+	let waitedMs = 0;
 	try {
 		const route = state.routeFor(message.origin);
 		if (!route)
 			throw new TelegramApiError(400, `No persisted Telegram reply route for ${message.origin.conversationId}`);
-		const text = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text;
-		for (const chunk of chunkTelegramMessage(text)) await bot.sendMessage(route.chatId, chunk, route.messageThreadId);
+		while (entry.sent < entry.chunks.length) {
+			const chunk = entry.chunks[entry.sent] ?? "";
+			try {
+				await sendTelegramHtml(
+					bot,
+					route.chatId,
+					entry.uncertain ? DUPLICATE_WARNING_PREFIX + chunk : chunk,
+					route.messageThreadId,
+				);
+			} catch (error) {
+				const waitMs = floodWaitMs(error);
+				if (waitMs === undefined || waitedMs + waitMs > TELEGRAM_RETRY_AFTER_BUDGET_MS) throw error;
+				waitedMs += waitMs;
+				await sleep(waitMs);
+				continue;
+			}
+			entry.sent++;
+			entry.uncertain = false;
+			progress.remember(deliveryId, entry);
+		}
+		// A fully posted reply only absorbs replays: keep a chunkless marker
+		// (0 of 0 sent) instead of up to a megabyte of rendered text.
+		if (entry.chunks.length > 0) progress.remember(deliveryId, { chunks: [], sent: 0, uncertain: false, stalls: 0 });
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
+		const transport = deliveryFailureIsAmbiguous(error);
+		const posted = entry.sent === entry.chunks.length;
+		if (!posted && entry.sent > 0) {
+			// A definitive refusal only proves this attempt did not land; an earlier
+			// uncertain send of the same chunk still may have, so its label stays.
+			entry.uncertain ||= transport;
+			// Only consecutive retries that get no further count: a chunk that
+			// finally landed must not charge its stalls to the next one.
+			entry.stalls = entry.sent === startedAt ? entry.stalls + 1 : 0;
+		}
+		// A redelivery this process holds no progress for (adapter restart, evicted
+		// entry) has lost its resume point and just reposted the prefix, so a
+		// definitive refusal is counted definitive: the ledger's attempt cap then
+		// bounds such replays exactly as it bounded base's from-the-start resends.
+		const resumable = known !== undefined || message.redelivered !== true;
 		await gateway.request("delivery.fail", {
 			deliveryId,
 			reason: error instanceof Error ? error.message : String(error),
-			ambiguous: deliveryFailureIsAmbiguous(error),
+			ambiguous: transport || posted || (entry.sent > 0 && resumable && entry.stalls < TELEGRAM_PARTIAL_STALL_LIMIT),
 		});
 	}
 }
@@ -207,15 +558,17 @@ export async function settleTelegramReaction(
 		const route = state.routeFor(message.origin);
 		if (!route)
 			throw new TelegramApiError(400, `No persisted Telegram reply route for ${message.origin.conversationId}`);
+		const target = telegramReactionMessageId(reaction.targetMessageId, route.chatId);
+		if (typeof target !== "string") throw new TelegramApiError(400, target.invalid);
 		if (action === "remove") {
 			// Remove the reaction by passing no emoji
-			await bot.setMessageReaction(route.chatId, reaction.targetMessageId, undefined);
+			await bot.setMessageReaction(route.chatId, target, undefined);
 		} else {
 			const mapped = telegramReactionFor(reaction);
 			// TelegramApiError keeps `deliveryFailureIsAmbiguous` honest: an emoji Telegram
 			// refuses is definitively not delivered, exactly like a rejected API call.
 			if ("unsupported" in mapped) throw new TelegramApiError(400, mapped.unsupported);
-			await bot.setMessageReaction(route.chatId, reaction.targetMessageId, mapped.emoji);
+			await bot.setMessageReaction(route.chatId, target, mapped.emoji);
 		}
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
@@ -227,20 +580,208 @@ export async function settleTelegramReaction(
 	}
 }
 
+/**
+ * Settles a file delivery (a persona `MEDIA:<path>` line the gateway checked):
+ * upload the file into the same chat and forum topic the text reply goes to,
+ * post nothing else, then confirm or fail the delivery's own ledger entry.
+ *
+ * Photos (see {@link telegramPhotoEligible}) go through sendPhoto so they render
+ * inline; everything else, and any photo Telegram refuses as a photo, goes
+ * through sendDocument. A refused photo posted nothing, so the document retry
+ * cannot duplicate it. A transport failure is never retried here: the upload may
+ * have landed, so it is reported ambiguous and the ledger decides.
+ */
+export async function settleTelegramFile(
+	gateway: Pick<GatewayClientLike, "request">,
+	bot: Partial<Pick<TelegramBotApi, "sendPhoto" | "sendDocument">>,
+	state: TelegramAdapterState,
+	message: ChatMessagePayload,
+): Promise<void> {
+	if (message.origin.platform !== "telegram" || !message.deliveryId || !message.file) return;
+	const deliveryId = message.deliveryId;
+	try {
+		if (!bot.sendPhoto || !bot.sendDocument)
+			throw new TelegramApiError(400, "this Telegram client cannot upload files");
+		const route = state.routeFor(message.origin);
+		if (!route)
+			throw new TelegramApiError(400, `No persisted Telegram reply route for ${message.origin.conversationId}`);
+		const bytes = await readOutboundFile(message.file);
+		const upload: TelegramUpload = { name: message.file.name, bytes };
+		const target: TelegramUploadTarget = {
+			chatId: route.chatId,
+			...(route.messageThreadId === undefined ? {} : { messageThreadId: route.messageThreadId }),
+			...(message.duplicateWarning ? { caption: `[recovered - may be a duplicate] ${message.text}` } : {}),
+		};
+		let sent = false;
+		if (telegramPhotoEligible(bytes)) {
+			try {
+				await bot.sendPhoto(target, upload);
+				sent = true;
+			} catch (error) {
+				if (!telegramRefusedPhoto(error)) throw error;
+			}
+		}
+		if (!sent) await bot.sendDocument(target, upload);
+		await gateway.request("delivery.confirm", { deliveryId });
+	} catch (error) {
+		await gateway.request("delivery.fail", {
+			deliveryId,
+			reason: error instanceof Error ? error.message : String(error),
+			ambiguous: deliveryFailureIsAmbiguous(error),
+		});
+	}
+}
+
+/**
+ * True for bytes sendPhoto can show inline: a JPEG, PNG or WebP (decided by
+ * magic bytes, not the file name, because Telegram decodes the content) within
+ * the photo size limit. GIF is deliberately excluded: sendPhoto keeps only a
+ * still frame, while a GIF sent with sendDocument is shown as an animation.
+ */
+export function telegramPhotoEligible(bytes: Uint8Array): boolean {
+	if (bytes.byteLength > TELEGRAM_PHOTO_MAX_BYTES) return false;
+	const startsWith = (offset: number, signature: readonly number[]) =>
+		signature.every((byte, index) => bytes[offset + index] === byte);
+	return (
+		startsWith(0, [0xff, 0xd8, 0xff]) ||
+		startsWith(0, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) ||
+		(startsWith(0, [0x52, 0x49, 0x46, 0x46]) && startsWith(8, [0x57, 0x45, 0x42, 0x50]))
+	);
+}
+
+/**
+ * A 400 whose description names a photo/image processing error
+ * (`PHOTO_INVALID_DIMENSIONS`, `PHOTO_SAVE_FILE_INVALID`, `IMAGE_PROCESS_FAILED`, ...):
+ * Telegram refused these bytes as a photo, not the chat or the request. Other
+ * 400s (chat or topic not found, missing rights) would fail a document too.
+ */
+function telegramRefusedPhoto(error: unknown): boolean {
+	return (
+		error instanceof TelegramApiError &&
+		error.status === 400 &&
+		/\b(?:PHOTO_[A-Z_]+|IMAGE_PROCESS_FAILED)\b/.test(error.message)
+	);
+}
+
+/**
+ * Reads the checked file again at delivery time and refuses it if it is no
+ * longer the file the gateway approved: the open must not follow a symlink, the
+ * descriptor must still resolve to the checked path, and the size must match
+ * exactly. O_NONBLOCK keeps the open of a path swapped for a FIFO from waiting
+ * for a writer (which would block it forever and, with it, every later delivery
+ * to that chat), so the FIFO is refused as not a regular file; it does not
+ * change reads from a regular file. O_NOCTTY keeps a swapped-in terminal from
+ * becoming the controlling tty before it is refused. Every refusal is a
+ * definitive non-delivery (nothing was posted).
+ */
+async function readOutboundFile(file: FileRef): Promise<Uint8Array> {
+	if (!Number.isSafeInteger(file.size) || file.size < 1 || file.size > OUTBOUND_FILE_MAX_BYTES)
+		throw new TelegramApiError(400, `${file.name} has an invalid checked size`);
+	let handle: Awaited<ReturnType<typeof open>>;
+	try {
+		handle = await open(
+			file.path,
+			constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK | constants.O_NOCTTY,
+		);
+	} catch (error) {
+		throw new TelegramApiError(
+			400,
+			`cannot open ${file.name}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	try {
+		const descriptorPath =
+			process.platform === "linux"
+				? `/proc/self/fd/${handle.fd}`
+				: process.platform === "darwin"
+					? `/dev/fd/${handle.fd}`
+					: undefined;
+		if (!descriptorPath || (await realpath(descriptorPath)) !== file.path)
+			throw new TelegramApiError(400, `${file.name} changed after the gateway checked it`);
+		const stat = await handle.stat();
+		if (!stat.isFile() || stat.size !== file.size || stat.size > OUTBOUND_FILE_MAX_BYTES)
+			throw new TelegramApiError(400, `${file.name} changed after the gateway checked it`);
+		const bytes = Buffer.allocUnsafe(file.size + 1);
+		let length = 0;
+		while (length < bytes.length) {
+			const read = await handle.read(bytes, length, bytes.length - length, null);
+			if (read.bytesRead === 0) break;
+			length += read.bytesRead;
+		}
+		if (length !== file.size) throw new TelegramApiError(400, `${file.name} changed while the adapter read it`);
+		return bytes.subarray(0, length);
+	} catch (error) {
+		if (error instanceof TelegramApiError) throw error;
+		throw new TelegramApiError(
+			400,
+			`cannot read ${file.name}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	} finally {
+		await handle.close().catch(() => {});
+	}
+}
+
+/**
+ * Settles each conversation's deliveries one at a time, in the order the gateway
+ * sent them. One reply can fan out into a text delivery and several file
+ * deliveries; settled concurrently, a small upload overtakes a large one and the
+ * chat shows them out of order. Different conversations still settle in parallel,
+ * and a failed settlement never blocks the deliveries queued behind it.
+ */
+export class TelegramDeliveryOrder {
+	readonly #chains = new Map<string, Promise<void>>();
+
+	constructor(private readonly log: Pick<Console, "error"> = console) {}
+
+	run(key: string, task: () => Promise<void>): void {
+		const previous = this.#chains.get(key) ?? Promise.resolve();
+		const next = previous
+			.then(task)
+			.catch((error: unknown) =>
+				this.log.error(
+					`Telegram delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
+				),
+			);
+		this.#chains.set(key, next);
+		void next.then(() => {
+			if (this.#chains.get(key) === next) this.#chains.delete(key);
+		});
+	}
+
+	/** Resolves once every queued delivery, including ones queued while waiting, has settled. */
+	async drain(): Promise<void> {
+		while (this.#chains.size > 0) await Promise.all([...this.#chains.values()]);
+	}
+}
+
+/**
+ * The Telegram conversation a delivery lands in: its persisted chat and forum
+ * topic, so origins that share a destination share one order. An origin without
+ * a route fails settlement anyway; it is still ordered by its own key.
+ */
+export function telegramDeliveryKey(state: TelegramAdapterState, origin: OriginRef): string {
+	const route = state.routeFor(origin);
+	return route ? `route:${route.chatId}:${route.messageThreadId ?? ""}` : `origin:${originKey(origin)}`;
+}
+
 export function subscribeTelegramDeliveries(
 	gateway: GatewayClientLike,
-	bot: Pick<TelegramBotApi, "sendMessage" | "setMessageReaction">,
+	bot: Pick<TelegramBotApi, "sendMessage" | "setMessageReaction"> &
+		Partial<Pick<TelegramBotApi, "sendPhoto" | "sendDocument">>,
 	state: TelegramAdapterState,
-	log: Pick<Console, "error"> = console,
+	order: TelegramDeliveryOrder = new TelegramDeliveryOrder(),
+	progress: TelegramDeliveryProgress = new TelegramDeliveryProgress(),
 ): () => void {
 	return gateway.onChatMessage((message) => {
-		const settled = message.reaction
-			? settleTelegramReaction(gateway, bot, state, message)
-			: settleTelegramDelivery(gateway, bot, state, message);
-		void settled.catch((error) =>
-			log.error(
-				`Telegram delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
-			),
+		if (message.origin.platform !== "telegram" || !message.deliveryId) return;
+		// A file delivery's text is only the "📎 name" fallback; it must never be
+		// posted as a message when the upload itself is what was asked for.
+		order.run(telegramDeliveryKey(state, message.origin), () =>
+			message.reaction
+				? settleTelegramReaction(gateway, bot, state, message)
+				: message.file
+					? settleTelegramFile(gateway, bot, state, message)
+					: settleTelegramDelivery(gateway, bot, state, message, { progress }),
 		);
 	});
 }
@@ -252,23 +793,30 @@ export class TelegramAdapter {
 		readonly botUserId: string,
 		readonly config: Pick<LoadedTelegramAdapterConfig, "chats">,
 		readonly attachments: TelegramAttachmentSaver,
+		readonly replyBot: Pick<TelegramBotApi, "sendMessage">,
 	) {}
 
 	async handleUpdate(gateway: Pick<GatewayClientLike, "request">, update: TelegramUpdate): Promise<boolean> {
-		if (!(await this.state.acceptUpdate(update.update_id))) return false;
+		if (!Number.isSafeInteger(update.update_id)) throw new Error("Telegram update_id must be a safe integer");
+		if (this.state.updateId !== undefined && update.update_id <= this.state.updateId) return false;
 		// An inbound reaction is engagement metadata, never a turn: it is reported via
 		// engagement.reaction and must never reach chat.send.
 		const reaction = describeTelegramReaction(update.message_reaction, this.botUserId);
 		if (reaction) {
-			await gateway.request("engagement.reaction", reaction);
-			return true;
+			try {
+				await gateway.request("engagement.reaction", reaction);
+			} catch (error) {
+				if (!(error instanceof ProtocolError) || error.code !== "invalid_params") throw error;
+				return this.state.rejectUpdate(update.update_id, "engagement.reaction");
+			}
+			return this.state.acceptUpdate(update.update_id);
 		}
 		const message = update.message;
-		if (!message?.from) return true;
+		if (!message?.from) return this.state.acceptUpdate(update.update_id);
 		// A photo or file has no `text`; forwarding text alone dropped it without a trace.
 		const content = message.text ?? message.caption ?? "";
 		const attachment = telegramAttachment(message);
-		if (content === "" && !attachment) return true;
+		if (content === "" && !attachment) return this.state.acceptUpdate(update.update_id);
 		const origin = telegramMessageOrigin(message);
 		await this.state.rememberOrigin(origin, origin.kind === "topic" ? message.message_thread_id : undefined);
 		const baseEngagement = engagementForMessage(message, origin, this.botUsername, this.botUserId);
@@ -276,16 +824,88 @@ export class TelegramAdapter {
 			origin.kind !== "dm" && this.config.chats?.[origin.parentId ?? origin.conversationId]?.engagement === "open"
 				? { ...baseEngagement, mentioned: true }
 				: baseEngagement;
-		const stored = attachment
-			? await this.attachments.save(attachment, String(message.chat.id), message.message_id)
-			: undefined;
-		await gateway.request("chat.send", {
-			origin,
-			text: describeInboundBody(content, attachment, stored),
-			engagement,
-		});
-		return true;
+		let stored: Awaited<ReturnType<TelegramAttachmentSaver["save"]>> | undefined;
+		let images: PromptImage[] | undefined;
+		let imageNotice = "";
+		if (attachment?.kind === "image") {
+			try {
+				stored = await this.attachments.save(attachment, String(message.chat.id), message.message_id);
+				if (!stored) throw new Error("image attachment was not saved");
+				if (!("path" in stored) && stored.retryable) throw new TelegramAttachmentRetryableError();
+				const prepared = await prepareTelegramImage(stored);
+				if (prepared.images.length === 0) throw new Error("image preparation produced no images");
+				images = prepared.images;
+				imageNotice = prepared.notice;
+			} catch (error) {
+				if (error instanceof TelegramAttachmentRetryableError) throw error;
+				// Telegram has no local allowlist that proves a failure notice is authorized.
+				// Do not dispatch a text-only turn or post into a chat the gateway may reject.
+				console.error(
+					`Telegram inbound image rejected message=${telegramInboundMessageId(message.chat.id, message.message_id)}.`,
+				);
+				return this.state.acceptUpdate(update.update_id);
+			}
+		} else if (attachment) {
+			stored = await this.attachments.save(attachment, String(message.chat.id), message.message_id);
+			if (!("path" in stored) && stored.retryable) throw new TelegramAttachmentRetryableError();
+		}
+		const body = describeInboundBody(content, attachment, stored, images !== undefined);
+		let accepted: ChatSendResult;
+		try {
+			accepted = await gateway.request<ChatSendResult>("chat.send", {
+				origin,
+				text: body,
+				engagement,
+				messageId: telegramInboundMessageId(message.chat.id, message.message_id),
+				...(images ? { images } : {}),
+			});
+		} catch (error) {
+			if (!(error instanceof ProtocolError) || error.code !== "invalid_params") throw error;
+			return this.state.rejectUpdate(update.update_id, "chat.send");
+		}
+		if (accepted.engaged && accepted.turnId !== null && imageNotice) {
+			try {
+				for (const chunk of renderTelegramDelivery(`Image processing: ${imageNotice}`))
+					await sendTelegramHtml(this.replyBot, String(message.chat.id), chunk, message.message_thread_id);
+			} catch {
+				console.error(
+					`Telegram image processing notice failed message=${telegramInboundMessageId(message.chat.id, message.message_id)}.`,
+				);
+			}
+		}
+		return this.state.acceptUpdate(update.update_id);
 	}
+}
+
+/**
+ * The gateway-wide id of a Telegram message. A Telegram message id is unique
+ * only within its chat, while the gateway keys inbound rows, context entries and
+ * reaction targets by one global id, so the id carries the chat (`<chat id>:<message
+ * id>`, the same shape as Slack's `channel:ts`). Every id this adapter reports
+ * (the message itself, the message it replies to, the message a user reacted to)
+ * uses this shape, so the persona sees one id per message and can react to it.
+ */
+export function telegramInboundMessageId(chatId: number | string, messageId: number | string): string {
+	return `${chatId}:${messageId}`;
+}
+
+/**
+ * Resolves a gateway reaction target to a Telegram message id in `chatId`. Only an
+ * id from telegramInboundMessageId for that same chat resolves: the gateway keys
+ * its reaction budget (duplicates, per-message cap, add/remove pairing) by the
+ * target string, so one Telegram message must have exactly one spelling, and a
+ * bare id would be a second one. Anything else (a bare id, an id of another chat,
+ * or a gateway-minted UUID from a row keyed before inbound ids carried the chat)
+ * fails definitively without calling Telegram.
+ */
+export function telegramReactionMessageId(targetMessageId: string, chatId: string): string | { invalid: string } {
+	// Canonical decimals only (no leading zero): `22:0555` would alias `22:555` at Telegram.
+	const scoped = /^(-?\d+):([1-9]\d*)$/.exec(targetMessageId);
+	const messageId = scoped?.[1] === chatId ? scoped[2] : undefined;
+	if (messageId !== undefined && Number.isSafeInteger(Number(messageId))) return messageId;
+	return {
+		invalid: `Telegram cannot react to message ${targetMessageId}: it is not a <chat id>:<message id> in chat ${chatId}`,
+	};
 }
 
 export interface TelegramReactionEvent {
@@ -326,7 +946,7 @@ export function describeTelegramReaction(
 	const authorName = update.user?.username ?? update.user?.first_name ?? update.actor_chat?.title;
 	return {
 		origin,
-		targetMessageId: String(update.message_id),
+		targetMessageId: telegramInboundMessageId(update.chat.id, update.message_id),
 		emoji,
 		action,
 		engagement: {
@@ -363,7 +983,10 @@ export function engagementForMessage(
 		...(message.from?.is_bot ? { authorIsBot: true } : {}),
 		...(authorName ? { authorName } : {}),
 		...(message.chat.title ? { channelLabel: message.chat.title } : {}),
-		...(replyTo ? { replyTo } : {}),
+		// `reply_to_message` is always in the same chat, so its id is scoped like the message's own.
+		...(replyTo
+			? { replyTo: { ...replyTo, messageId: telegramInboundMessageId(message.chat.id, replyTo.messageId) } }
+			: {}),
 	};
 }
 
@@ -385,6 +1008,7 @@ export async function startTelegramAdapter(config: LoadedTelegramAdapterConfig):
 		String(identity.id),
 		config,
 		new TelegramAttachmentStore(attachmentDirectory, bot),
+		bot,
 	);
 	const gateway = new ReconnectingGateway(config.gatewaySocket ?? defaultGatewaySocket(), bot, state);
 	await gateway.connectInitial();
@@ -404,6 +1028,12 @@ class ReconnectingGateway implements GatewayClientLike {
 	#reconnecting = false;
 	#attempt = 0;
 	#deliveryOff: (() => void) | undefined;
+	// Shared across reconnects so a delivery replayed on a new connection still
+	// waits behind the conversation's in-flight settlement.
+	readonly #deliveryOrder = new TelegramDeliveryOrder();
+	// Shared across reconnects so a retry replayed on a new connection resumes
+	// after the chunks this process already posted.
+	readonly #deliveryProgress = new TelegramDeliveryProgress();
 	#handlers = new Set<(message: ChatMessagePayload) => void>();
 
 	constructor(
@@ -424,6 +1054,7 @@ class ReconnectingGateway implements GatewayClientLike {
 		try {
 			const options = {
 				clientName: "adapter-telegram",
+				requiredCapabilities: ["chat.images"],
 				onRetry: (attempt: number, delayMs: number, error: unknown) =>
 					console.warn(
 						`gateway_socket_waiting client=adapter-telegram path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${error instanceof Error ? error.message : String(error)}`,
@@ -435,7 +1066,13 @@ class ReconnectingGateway implements GatewayClientLike {
 			this.#client = client;
 			this.#attempt = 0;
 			this.#deliveryOff?.();
-			this.#deliveryOff = subscribeTelegramDeliveries(client, this.bot, this.state);
+			this.#deliveryOff = subscribeTelegramDeliveries(
+				client,
+				this.bot,
+				this.state,
+				this.#deliveryOrder,
+				this.#deliveryProgress,
+			);
 			this.monitor(client);
 		} catch {
 			this.scheduleReconnect();
@@ -447,7 +1084,7 @@ class ReconnectingGateway implements GatewayClientLike {
 		try {
 			return await this.#client.request<T>(verb, params);
 		} catch (error) {
-			this.scheduleReconnect();
+			if (!(error instanceof ProtocolError) || error.code !== "invalid_params") this.scheduleReconnect();
 			throw error;
 		}
 	}

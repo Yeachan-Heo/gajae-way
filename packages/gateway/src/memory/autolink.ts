@@ -87,7 +87,7 @@ function frontmatterValue(text: string, key: string): string | undefined {
 	return value || undefined;
 }
 
-function isGeneratedFile(text: string): boolean {
+export function isGeneratedFile(text: string): boolean {
 	return frontmatterValue(text, "generated_by") !== undefined;
 }
 

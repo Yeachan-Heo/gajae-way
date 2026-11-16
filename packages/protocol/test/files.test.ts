@@ -22,9 +22,10 @@ test("only a line that starts with MEDIA: is a directive; prose mentioning it is
 	expect(parseFileReply("`MEDIA:/tmp/a.csv`")).toBeUndefined();
 });
 
-test("only Slack uploads files through the ledger; the fallback text names the file", () => {
+test("Slack and Telegram upload files through the ledger; the fallback text names the file", () => {
 	expect(platformSupportsFiles("slack")).toBe(true);
+	expect(platformSupportsFiles("telegram")).toBe(true);
+	// Discord attaches MEDIA: lines natively from the text, not through the ledger.
 	expect(platformSupportsFiles("discord")).toBe(false);
-	expect(platformSupportsFiles("telegram")).toBe(false);
 	expect(fileFallbackText({ name: "report.csv" })).toBe("📎 report.csv");
 });

@@ -42,6 +42,7 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		monitorStages: new Map(),
 		monitorFailures: [],
 		monitorAuthoringLost: [],
+		silentOrigins: [],
 		memoryClosing: false,
 		instanceId: "test-instance",
 		activeLanes: 0,
@@ -79,10 +80,13 @@ const boundSession = {
 
 describe("runtime cycle projection", () => {
 	test("a gjc newer than the verified contract is a gate; verified and unknown versions are not", () => {
-		expect(projectRuntimeCycle(sources({ gjcVersion: "0.19.0" }), generatedAt).gates).toContain(
+		expect(projectRuntimeCycle(sources({ gjcVersion: "0.21.0" }), generatedAt).gates).toContain(
 			"gjc_unverified_version",
 		);
-		expect(projectRuntimeCycle(sources({ gjcVersion: "0.18.7" }), generatedAt).gates).not.toContain(
+		expect(projectRuntimeCycle(sources({ gjcVersion: "0.20.0" }), generatedAt).gates).not.toContain(
+			"gjc_unverified_version",
+		);
+		expect(projectRuntimeCycle(sources({ gjcVersion: "0.19.3" }), generatedAt).gates).not.toContain(
 			"gjc_unverified_version",
 		);
 		expect(projectRuntimeCycle(sources({ gjcVersion: undefined }), generatedAt).gates).not.toContain(

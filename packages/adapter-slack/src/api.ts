@@ -199,7 +199,12 @@ export class SlackWebApi {
 		this.limiter = resolved.limiter;
 	}
 
-	async call<T>(method: string, parameters: Record<string, unknown> = {}, token?: string): Promise<T> {
+	async call<T>(
+		method: string,
+		parameters: Record<string, unknown> = {},
+		token?: string,
+		signal?: AbortSignal,
+	): Promise<T> {
 		// Response URLs are already credentials: never forward the bot token to them.
 		const responseUrl = method.startsWith("https://");
 		// Slack honours a JSON body only on write methods (chat.*, reactions.add/remove,
@@ -212,18 +217,26 @@ export class SlackWebApi {
 		let response: Response | undefined;
 		let retryAfterMs = 0;
 		for (let attempt = 0; ; attempt++) {
-			response = await this.fetcher(responseUrl ? method : `https://slack.com/api/${method}`, {
-				method: "POST",
-				headers: {
-					"content-type": encoding === "json" ? "application/json" : "application/x-www-form-urlencoded",
-					...(responseUrl ? {} : { Authorization: `Bearer ${token ?? this.botToken}` }),
-				},
-				body: encoding === "json" ? JSON.stringify(parameters) : formEncode(parameters),
-			});
+			try {
+				response = await this.fetcher(responseUrl ? method : `https://slack.com/api/${method}`, {
+					method: "POST",
+					headers: {
+						"content-type": encoding === "json" ? "application/json" : "application/x-www-form-urlencoded",
+						...(responseUrl ? {} : { Authorization: `Bearer ${token ?? this.botToken}` }),
+					},
+					body: encoding === "json" ? JSON.stringify(parameters) : formEncode(parameters),
+					...(signal ? { signal } : {}),
+				});
+			} catch (err) {
+				// If the request was aborted, propagate the error
+				if (signal?.aborted || (err instanceof Error && err.name === "AbortError")) throw err;
+				// Other fetch errors are treated as network failures
+				throw err;
+			}
 			// A 429, or a 200 whose body says `ratelimited`, both mean "slow down".
 			// Honour Retry-After (seconds), bounded, then give up as ambiguous. Never a
 			// definitive refusal: Slack did not judge the payload.
-			const limited = response.status === 429 || (await bodySaysRateLimited(response));
+			const limited = response.status === 429 || (response.ok && (await bodySaysRateLimited(response)));
 			if (!limited) break;
 			const header = Number(response.headers.get("retry-after"));
 			retryAfterMs = Math.min(
@@ -238,11 +251,8 @@ export class SlackWebApi {
 			if (!response.ok) throw new SlackApiError(response.status, `http_${response.status}`);
 			return undefined as T;
 		}
-		// Delivery ambiguity is decided by the error class: a SlackApiError is Slack
-		// saying no, everything else is "we do not know". An unreadable or truncated
-		// body is the second kind - Slack may well have accepted the write - so it
-		// must NOT become a SlackApiError, or the ledger would record a definitive
-		// non-delivery for a message the room can already see.
+		// An unreadable or truncated body cannot prove Slack rejected the write.
+		// Structured errors retain their status and code for ambiguity classification.
 		let body: unknown;
 		try {
 			body = await response.json();
@@ -407,8 +417,8 @@ export class SlackWebApi {
 		return historyPage(await this.call<HistoryResponse>("conversations.replies", { channel, ts, ...options }));
 	}
 
-	connectionsOpen(appToken: string): Promise<{ readonly url: string }> {
-		return this.call("apps.connections.open", {}, appToken);
+	connectionsOpen(appToken: string, signal?: AbortSignal): Promise<{ readonly url: string }> {
+		return this.call("apps.connections.open", {}, appToken, signal);
 	}
 
 	respond(responseUrl: string, payload: Record<string, unknown>): Promise<void> {
@@ -418,9 +428,14 @@ export class SlackWebApi {
 	}
 }
 
-/** Transport failure cannot prove whether Slack accepted the write before disconnecting. */
+/** Server failures and transport failures cannot prove whether Slack accepted the write. */
 export function deliveryFailureIsAmbiguous(error: unknown): boolean {
-	return !(error instanceof SlackApiError);
+	return (
+		!(error instanceof SlackApiError) ||
+		(error.status >= 500 && error.status < 600) ||
+		error.code === "internal_error" ||
+		error.code === "fatal_error"
+	);
 }
 
 function historyPage(body: HistoryResponse): SlackHistoryPage {

@@ -297,7 +297,7 @@ export function testOnlyBrokerDependencies(options: { reply?: (prompt: string) =
 					sessionId,
 					live: true,
 					deleted: false,
-					locator: { repo },
+					locator: { cwd: repo },
 					activity: { state: activeRuns.has(sessionId!) ? "working" : "idle", at: Date.now() },
 				},
 			});
