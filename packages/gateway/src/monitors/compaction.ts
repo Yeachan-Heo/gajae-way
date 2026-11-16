@@ -21,8 +21,9 @@ import type { ProtocolFailureReason } from "@gajae-gateway/protocol";
  * handle explicit protocol and stuck-session evidence without requesting
  * compaction.
  * Invariants:
- * - A healthy monitor is NEVER rolled. Turn count is observational only.
- * - A context-triggered roll requires consecutive context-class authoring
+ * - A healthy monitor is never rolled unless its owner set contextRollTokens.
+ *   Turn count is observational only.
+ * - A context-failure roll requires consecutive context-class authoring
  *   failures AND a native-compaction attempt that did not succeed.
  * - Other rolls require repeated protocol failures or positive stuck-session
  *   evidence; they never masquerade as context exhaustion.
@@ -305,6 +306,7 @@ export function classifyAuthoringFailure(error: unknown): AuthoringFailureClass 
  * that path does not roll.
  */
 export type SessionRollReason =
+	| "context_budget"
 	| "context_failures_native_compaction_unavailable"
 	| "context_failures_native_compaction_failed"
 	| "context_failures_native_compaction_skipped"
@@ -328,8 +330,8 @@ const ROLL_REASON_BY_STATUS: Partial<Record<NativeCompactionStatus, SessionRollR
  * The whole roll decision, pure and in one expression.
  *
  * Returns the structured reason to roll, or undefined to keep the session.
- * Note what is absent: turn count. A session that keeps answering is never
- * rolled no matter how many turns it has taken.
+ * Note what is absent: turn count. Size-based rolls are armed separately only
+ * when the owner opted in with contextRollTokens.
  */
 export function decideSessionRoll(input: {
 	readonly consecutiveContextFailures: number;

@@ -12,7 +12,7 @@ import {
 import type { SessionBindInput, SessionSteerInput } from "../src/orchestrator/session-port";
 import type { TailAttachInput } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { Store } from "../src/store";
+import { LATEST_SCHEMA_VERSION, Store } from "../src/store";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 const DIRECT_ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "canonical-redteam" } as const;
@@ -1225,7 +1225,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 `);
 		raw.close();
 		const upgraded = await Store.open(path);
-		expect(upgraded.schemaVersion).toBe(39);
+		expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 		const count = new (await import("bun:sqlite")).Database(path, { readonly: true })
 			.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM inbound_messages")
 			.get()?.n;
