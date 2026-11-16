@@ -2193,10 +2193,16 @@ export class ReconnectingGateway {
 	 * unconfigured channel cannot occupy the completion quota indefinitely.
 	 */
 	private async reclaimUnreachableCompletedImages(): Promise<void> {
+		// Durable scope only: per-pass discovery is incomplete by definition (a thread
+		// fetch can fail or fall outside the discovery window), and reclaiming a target
+		// a later pass will read loses evidence the gateway's dedupe window no longer
+		// covers.
+		const cursors = this.#cursors;
 		const reachable = new Set([
 			...Object.keys(this.config.channels ?? {}),
-			...Object.keys(this.#cursors?.knownDms ?? {}),
-			...this.#recoverableIds,
+			...Object.keys(cursors?.knownDms ?? {}),
+			...Object.keys(cursors?.recoveredThrough ?? {}),
+			...Object.keys(cursors?.quarantined ?? {}),
 		]);
 		try {
 			const drop = new Set(
@@ -2583,6 +2589,7 @@ export class ReconnectingGateway {
 			const seen = new Set<string>();
 			this.#recoverableIds = new Set(queue);
 			let incomplete = pendingImages === undefined;
+			let discoveryComplete = true;
 			for (let index = 0; index < queue.length; index++) {
 				const conversationId = queue[index] as string;
 				if (seen.has(conversationId)) continue;
@@ -2593,6 +2600,7 @@ export class ReconnectingGateway {
 						incomplete = true;
 						blocked.add(conversationId);
 					}
+					if (!result.discoveryComplete) discoveryComplete = false;
 					if (this.#unreadableRecoveryTargets.has(conversationId)) blocked.add(conversationId);
 					for (const threadId of result.threadIds) {
 						if (seen.has(threadId)) continue;
@@ -2642,7 +2650,7 @@ export class ReconnectingGateway {
 				}
 			}
 			this.persist(retainRecoveryCursors(this.#cursors, this.#recoverableIds));
-			completed = !incomplete;
+			completed = !incomplete && discoveryComplete;
 		} catch (error) {
 			console.error(
 				`Discord recovery pass failed: ${error instanceof Error ? error.message : String(error)}; retrying with backoff.`,
@@ -2666,7 +2674,9 @@ export class ReconnectingGateway {
 			// resurrecting a rejected intent on the next rewalk.
 			if (!this.#cursorSaveFault) {
 				await this.compactTerminalImages();
-				await this.reclaimUnreachableCompletedImages();
+				// Only a pass that read every target can decide a channel is unreachable:
+				// a failed thread discovery would otherwise hide live targets for good.
+				if (completed) await this.reclaimUnreachableCompletedImages();
 			}
 		}
 	}
@@ -2710,7 +2720,11 @@ export class ReconnectingGateway {
 		channelId: string,
 		botUser: unknown,
 		discoverThreads: boolean,
-	): Promise<{ readonly incomplete: boolean; readonly threadIds: readonly string[] }> {
+	): Promise<{
+		readonly incomplete: boolean;
+		readonly threadIds: readonly string[];
+		readonly discoveryComplete: boolean;
+	}> {
 		let fetched: unknown;
 		try {
 			fetched = await this.discord.channels.fetch(channelId);
@@ -2719,7 +2733,7 @@ export class ReconnectingGateway {
 				console.error(
 					`Discord recovery could not fetch conversation ${channelId}: ${error instanceof Error ? error.message : String(error)}; cursor unchanged, retrying with backoff.`,
 				);
-				return { incomplete: true, threadIds: [] };
+				return { incomplete: true, threadIds: [], discoveryComplete: true };
 			}
 			return {
 				incomplete: this.noteUnreadableRecoveryTarget(
@@ -2727,15 +2741,20 @@ export class ReconnectingGateway {
 					error instanceof Error ? error.message : String(error),
 				),
 				threadIds: [],
+				discoveryComplete: true,
 			};
 		}
 		if (!isRecoverableChannel(fetched)) {
 			return {
 				incomplete: this.noteUnreadableRecoveryTarget(channelId, "deleted, no access, or not a text channel"),
 				threadIds: [],
+				discoveryComplete: true,
 			};
 		}
-		const threadIds = discoverThreads ? await discoverRecoveryThreadIds(fetched, channelId, Date.now()) : [];
+		const discovery = discoverThreads
+			? await discoverRecoveryThreadIds(fetched, channelId, Date.now())
+			: { threadIds: [] as readonly string[], complete: true };
+		const threadIds = discovery.threadIds;
 
 		const cursors = this.#cursors;
 		// A quarantined watermark (channel previously dropped from config) counts: resuming
@@ -2758,7 +2777,8 @@ export class ReconnectingGateway {
 				)
 				.sort((a, b) => (snowflakeIsAfter(a.messageId, b.messageId) ? 1 : a.messageId === b.messageId ? 0 : -1));
 			for (const entry of older) {
-				if ((await this.retryPendingImage(entry)) === "unavailable") return { incomplete: true, threadIds };
+				if ((await this.retryPendingImage(entry)) === "unavailable")
+					return { incomplete: true, threadIds, discoveryComplete: discovery.complete };
 			}
 		}
 		const outcome = await recoverConversation(fetched, {
@@ -2851,11 +2871,15 @@ export class ReconnectingGateway {
 			// quarantine it under the same bound the channel-fetch path uses, so healthy
 			// conversations can complete and the dead one is probed again on reconnect.
 			if (outcome.fetchErrorPermanent)
-				return { incomplete: this.noteUnreadableRecoveryTarget(channelId, outcome.fetchError), threadIds };
+				return {
+					incomplete: this.noteUnreadableRecoveryTarget(channelId, outcome.fetchError),
+					threadIds,
+					discoveryComplete: discovery.complete,
+				};
 			console.error(
 				`Discord recovery could not read history for channel ${channelId}: ${outcome.fetchError}; other channels continue, retrying with backoff.`,
 			);
-			return { incomplete: true, threadIds };
+			return { incomplete: true, threadIds, discoveryComplete: discovery.complete };
 		}
 		if (outcome.failed) {
 			const reason =
@@ -2865,7 +2889,7 @@ export class ReconnectingGateway {
 			console.error(
 				`Discord recovery paused for channel ${channelId} at message ${outcome.advancedTo}; ${reason}, retrying with backoff.`,
 			);
-			return { incomplete: true, threadIds };
+			return { incomplete: true, threadIds, discoveryComplete: discovery.complete };
 		}
 		if (outcome.truncated) {
 			const progress =
@@ -2875,7 +2899,7 @@ export class ReconnectingGateway {
 			console.error(
 				`Discord recovery hit the ${RECOVERY_MAX_PAGES}-page bound for channel ${channelId} after ${outcome.delivered} fresh message(s), ${outcome.duplicates} duplicate(s), and ${outcome.skipped} skip(s); ${progress}.`,
 			);
-			return { incomplete: true, threadIds };
+			return { incomplete: true, threadIds, discoveryComplete: discovery.complete };
 		}
 		if (outcome.delivered > 0 || outcome.duplicates > 0 || outcome.skipped > 0 || outcome.discarded > 0) {
 			console.log(
@@ -2886,7 +2910,7 @@ export class ReconnectingGateway {
 		// quarantines an unreadable conversation has to survive a pass whose fetch or history
 		// read failed, or the bound would never be reached.
 		this.clearUnreadableRecoveryTarget(channelId);
-		return { incomplete: false, threadIds };
+		return { incomplete: false, threadIds, discoveryComplete: discovery.complete };
 	}
 
 	private noteUnreadableRecoveryTarget(conversationId: string, reason: string): boolean {
@@ -3045,15 +3069,16 @@ export class ReconnectingGateway {
 		const legacy = state.gatewayDbIdentity === undefined;
 		let next: RecoveryCursorState = this.#cursors ?? state;
 		if (!legacy || (await this.hasRecoveryEvidence(next))) {
-			let completedDms: string[] = [];
+			let completedDms: Array<{ channelId: string; at: number }> = [];
 			try {
-				completedDms = [
-					...new Set(
-						(await this.#imageOutbox.load())
-							.filter((entry) => entry.dm && entry.completed)
-							.map((entry) => entry.channelId),
-					),
-				];
+				const observed = new Map<string, number>();
+				for (const entry of await this.#imageOutbox.load()) {
+					if (!entry.dm || !entry.completed) continue;
+					const at = entry.completedAt ?? snowflakeTimestamp(entry.messageId);
+					if (at <= 0) continue;
+					observed.set(entry.channelId, Math.max(observed.get(entry.channelId) ?? 0, at));
+				}
+				completedDms = [...observed].map(([channelId, at]) => ({ channelId, at }));
 				await this.#imageOutbox.invalidateCompleted();
 			} catch {
 				// Rewinding watermarks without clearing completion evidence could leave an
@@ -3087,8 +3112,18 @@ export class ReconnectingGateway {
 				),
 			};
 			const now = Date.now();
-			for (const channelId of completedDms)
-				next = { ...next, knownDms: rememberKnownDm(next, channelId, now).knownDms };
+			const cutoff = now - RECOVERY_KNOWN_DM_TTL_MS;
+			// Rebind oldest-first below every existing live slot: a completed DM that only
+			// needs a history target must never displace a genuinely recent live DM when
+			// the bounded set is full. Expired tombstones cannot be rewound into the floor.
+			const known = { ...next.knownDms };
+			let seq = Math.min(...Object.values(known).map((entry) => entry.seq), next.sequence + 1);
+			for (const { channelId, at } of completedDms
+				.filter((entry) => entry.at >= cutoff && known[entry.channelId] === undefined)
+				.sort((a, b) => a.at - b.at)) {
+				known[channelId] = { lastSeenAt: new Date(Math.min(at, now)).toISOString(), seq: --seq };
+			}
+			next = { ...next, knownDms: pruneKnownDms({ ...next, knownDms: known }, now).knownDms };
 			console.error(
 				legacy
 					? "Discord recovery cursors predate gateway database identity tracking; rewound their watermarks to the replay floor and invalidated image completion tombstones, so a database restore during the upgrade cannot hide messages."
@@ -3467,9 +3502,10 @@ async function discoverRecoveryThreadIds(
 	parent: RecoverableChannel,
 	parentId: string,
 	nowMs: number,
-): Promise<readonly string[]> {
+): Promise<{ readonly threadIds: readonly string[]; readonly complete: boolean }> {
 	const manager = (parent as { readonly threads?: Partial<RecoveryThreadManagerLike> }).threads;
-	if (!manager || typeof manager.fetchActive !== "function" || typeof manager.fetchArchived !== "function") return [];
+	if (!manager || typeof manager.fetchActive !== "function" || typeof manager.fetchArchived !== "function")
+		return { threadIds: [], complete: true };
 	const candidates: Array<{ readonly thread: RecoveryThreadLike; readonly archived: boolean }> = [];
 	let failed = false;
 	try {
@@ -3505,7 +3541,7 @@ async function discoverRecoveryThreadIds(
 		console.warn(
 			`Discord recovery thread discovery for channel ${parentId} was partial; ${ids.size} readable thread(s) remain eligible and other conversations continue.`,
 		);
-	return [...ids];
+	return { threadIds: [...ids], complete: !failed };
 }
 
 function isRecoveryThread(value: unknown, parentId: string): value is RecoveryThreadLike {
