@@ -1990,3 +1990,52 @@ test("a database-identity rewind never lands inside a running recovery pass", as
 		cleanupTimers();
 	}
 });
+
+test("two recovery triggers sharing an identity check start one pass", async () => {
+	const cursorPath = join(home, "single-flight-pass", "recovery-cursor.json");
+	const cleanupTimers = trackTimers();
+	let historyFetches = 0;
+	const channel = {
+		messages: {
+			fetch: async (query: unknown) => {
+				if (typeof query === "string") return undefined;
+				historyFetches++;
+				return [];
+			},
+		},
+	};
+	let releaseStatus!: () => void;
+	const statusGate = new Promise<void>((resolve) => {
+		releaseStatus = resolve;
+	});
+	let statusStarted!: () => void;
+	const started = new Promise<void>((resolve) => {
+		statusStarted = resolve;
+	});
+	const gateway = wiredGateway(channel as never, { request: async () => ({}) }, cursorPath);
+	try {
+		gateway.adoptClient({
+			request: async (verb: string) => {
+				if (verb === "gateway.status") {
+					statusStarted();
+					await statusGate;
+					return {};
+				}
+				return {};
+			},
+		} as never);
+		await started;
+		// Both triggers wait on the same in-flight identity check. The first to resume
+		// owns the pass; the second must re-test the latch rather than start a second.
+		const first = gateway.recoverMissedMessages();
+		const second = gateway.recoverMissedMessages();
+		await settle(20);
+		releaseStatus();
+		await Promise.all([first, second]);
+		await settle(50);
+		expect(historyFetches).toBe(1);
+	} finally {
+		releaseStatus();
+		cleanupTimers();
+	}
+});

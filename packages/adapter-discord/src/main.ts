@@ -2156,7 +2156,11 @@ export class ReconnectingGateway {
 		try {
 			await this.#imageOutbox.compact((entry) => {
 				if (!entry.completed && !entry.terminal) return true;
-				const watermark = cursors.recoveredThrough[entry.channelId] ?? cursors.quarantined[entry.channelId]?.watermark;
+				// Read the live cursors per entry: a database-identity rewind may land while
+				// compaction is running, and comparing against the pre-rewind watermark would
+				// drop evidence the lowered floor still needs.
+				const live = this.#cursors ?? cursors;
+				const watermark = live.recoveredThrough[entry.channelId] ?? live.quarantined[entry.channelId]?.watermark;
 				if (watermark === undefined || snowflakeIsAfter(entry.messageId, watermark)) return true;
 				// Keep a short post-watermark grace so an in-flight settlement still
 				// observes the evidence before it is compacted below the watermark.
@@ -2465,6 +2469,13 @@ export class ReconnectingGateway {
 		// watermark; otherwise its rewind would land mid-pass and the pass would
 		// re-advance the channel, losing the [floor, watermark) interval.
 		if (this.#restoreCheck) await this.#restoreCheck;
+		// The wait above yields, so another trigger may have started a pass in the
+		// meantime. Re-test the latch before claiming ownership; otherwise both would
+		// run, and the first finisher would clear #recovering under the survivor.
+		if (this.#recovering) {
+			this.scheduleRecoveryRetry();
+			return;
+		}
 		const botUser = this.getBotUser();
 		if (!this.#client || !botUser) {
 			// A fired retry that cannot proceed (no gateway link yet, Discord not ready) must
