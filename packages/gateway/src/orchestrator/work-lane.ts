@@ -65,6 +65,7 @@ import {
 import type { WriteTx } from "../store/tx";
 import { type BrokerWaitOptions, isBrokerUnavailable, waitForBroker } from "./broker";
 import type { CompletionCheckClient } from "./completion-check";
+import { isEmbeddedModuleDir } from "./embedded-module";
 import { readFailedTransportCause } from "./failed-turn-evidence";
 import { GIT_COMMAND_TIMEOUT_MS, runGit } from "./git-command";
 import {
@@ -280,11 +281,6 @@ export function getServiceDirectory(): string {
 	} catch {
 		return anchor;
 	}
-}
-
-/** True for the virtual directory a `bun build --compile` binary embeds its modules under. */
-export function isEmbeddedModuleDir(dir: string): boolean {
-	return dir === "/$bunfs/root" || dir.startsWith("/$bunfs/") || /^[A-Z]:[\\/]~BUN[\\/]/i.test(dir);
 }
 
 /** Nearest existing ancestor's realpath with the missing tail re-appended. */
@@ -566,10 +562,10 @@ export class WorkLaneManager {
 				? undefined
 				: terminal.reasonCode
 			: "host_lost";
-		const output =
-			runtime.output.disposition === "pending"
-				? { ...runtime.output, disposition: "unavailable" as const, nextReadAt: null }
-				: runtime.output;
+		const pendingOutput = runtime.output.disposition === "pending";
+		const output = pendingOutput
+			? { ...runtime.output, disposition: "unavailable" as const, nextReadAt: null }
+			: runtime.output;
 		const awaitingChecks = record.awaitingChecks;
 		const closed = closeAttempt({
 			record,
@@ -596,7 +592,16 @@ export class WorkLaneManager {
 						: {}),
 				}
 			: undefined;
-		const text = reportText(name, endState, terminal.reasonCode, opRef, output, reportFacts, terminal.status);
+		const text = reportText(
+			name,
+			endState,
+			terminal.reasonCode,
+			opRef,
+			output,
+			reportFacts,
+			terminal.status,
+			pendingOutput,
+		);
 		// Note: settleForceRetiredAttempt is synchronous, so we don't have repo facts here
 		let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
 		let admission: WorkAttemptAdmission | undefined;
@@ -2242,6 +2247,7 @@ export class WorkLaneManager {
 				output,
 				facts,
 				runtime.terminal?.status,
+				false,
 				check?.kind === "settle" ? check.token : undefined,
 			);
 			let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted" | "resteered";
@@ -3613,6 +3619,7 @@ export function reportText(
 	output: WorkAttemptRuntime["output"],
 	facts?: Awaited<ReturnType<typeof collectRepoFacts>>,
 	status?: PromptStatusBody,
+	pendingOutput = false,
 	/** Fixed token for a completion check that did not simply pass; never the check's own output. */
 	completion?: string,
 ): string {
@@ -3630,9 +3637,11 @@ export function reportText(
 	const head = `[lane ${name}] ${label}: ${lead}`;
 	let body =
 		output.disposition === "unavailable"
-			? reason === "terminal_missing_receipt" || status?.receiptState === "missing"
-				? `final_response_missing opRef=${opRef}`
-				: "output_unavailable"
+			? pendingOutput
+				? `final_response_pending opRef=${opRef}`
+				: reason === "terminal_missing_receipt" || status?.receiptState === "missing"
+					? `final_response_missing opRef=${opRef}`
+					: "output_unavailable"
 			: (output.excerpt ?? "");
 	// Include transport cause details if present
 	if ((reason === "terminal_missing_receipt" || status?.receiptState === "missing") && output.transportCause) {
