@@ -123,7 +123,12 @@ test("schema 41 upgrade adds nullable images_json without changing old rows", as
 	database = undefined;
 
 	const legacy = new Database(join(home, "gateway.db"));
-	legacy.exec("ALTER TABLE inbound_messages DROP COLUMN images_json; DELETE FROM schema_migrations WHERE version = 42");
+	legacy.exec(
+		"ALTER TABLE inbound_messages DROP COLUMN images_json; DELETE FROM schema_migrations WHERE version >= 42",
+	);
+	expect(
+		legacy.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_migrations").get()?.version,
+	).toBe(41);
 	legacy.close();
 
 	database = await Store.open(join(home, "gateway.db"));

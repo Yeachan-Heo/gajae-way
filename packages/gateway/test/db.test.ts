@@ -376,8 +376,11 @@ test("legacy context floors survive vacuum and future inserts after deleted high
 			CREATE TABLE conversation_context (message_id TEXT PRIMARY KEY, origin_key TEXT NOT NULL, author_id TEXT, author_name TEXT, body TEXT NOT NULL, received_at TEXT NOT NULL, consumed_at TEXT);
 			CREATE INDEX conversation_context_unread ON conversation_context (origin_key, consumed_at, received_at);
 			CREATE INDEX conversation_context_retention ON conversation_context (consumed_at, received_at);
-			DELETE FROM schema_migrations WHERE version = 43;
+			DELETE FROM schema_migrations WHERE version >= 43;
 		`);
+		expect(
+			legacy.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_migrations").get()?.version,
+		).toBe(42);
 		legacy
 			.query(
 				"INSERT INTO conversation_context (rowid, message_id, origin_key, body, received_at) VALUES (?, ?, ?, ?, ?)",
@@ -398,6 +401,7 @@ test("legacy context floors survive vacuum and future inserts after deleted high
 
 		const store = await Store.open(path);
 		try {
+			expect(store.schemaVersion).toBe(43);
 			expect(store.inbox.recentContext(origin, 10, floorAt).map((row) => row.id)).toEqual(["after"]);
 			const window = store.transaction((tx) => store.inbox.contextWindow(tx, origin, "trigger", new Date(floorAt)));
 			expect(window.selectedMessageIds).toEqual(["after"]);
@@ -412,6 +416,26 @@ test("legacy context floors survive vacuum and future inserts after deleted high
 			expect(store.inbox.recentContext(emptyOrigin, 10, floorAt).map((row) => row.id)).toEqual(["after-empty"]);
 		} finally {
 			store.close();
+		}
+		const reopened = await Store.open(path);
+		try {
+			expect(reopened.inbox.recentContext(origin, 10, floorAt).map((row) => row.id)).toEqual(["after"]);
+			expect(reopened.inbox.recentContext(emptyOrigin, 10, floorAt).map((row) => row.id)).toEqual(["after-empty"]);
+		} finally {
+			reopened.close();
+		}
+		const migrated = new Database(path, { readonly: true });
+		try {
+			expect(
+				migrated
+					.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 43")
+					.get()?.count,
+			).toBe(1);
+			expect(
+				migrated.query<{ name: string; pk: number }, []>("PRAGMA table_info(conversation_context)").all(),
+			).toContainEqual(expect.objectContaining({ name: "context_row_id", pk: 1 }));
+		} finally {
+			migrated.close();
 		}
 	} finally {
 		await rm(directory, { recursive: true, force: true });
