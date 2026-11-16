@@ -85,7 +85,8 @@ test("a capture closes and shutdown drains while every git helper holds its outp
 		await queue.drain();
 		expect(performance.now() - started).toBeLessThan(10_000);
 		expect(queue.failures).toBe(0);
-		expect(errors).not.toHaveBeenCalled();
+		// Console is process-global; other concurrently running suites may log.
+		expect(errors.mock.calls.filter(([line]) => !String(line).startsWith("Discord "))).toEqual([]);
 		expect(database.memory.get(id)).toMatchObject({ state: "receipted", attempts: 1 });
 		const commits = await memoryGit(memoryRoot(home), ["log", "--format=%H", "--grep", `Gajaeway-Mutation-Id: ${id}`]);
 		expect(commits.split("\n").filter(Boolean)).toHaveLength(1);

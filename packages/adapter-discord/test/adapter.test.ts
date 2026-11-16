@@ -713,7 +713,11 @@ test("an unanswered confirm is left inflight for the labeled ACK-timeout replay,
 		console.error = original;
 	}
 	expect(requests.map((request) => request.verb)).toEqual(["delivery.confirm", "delivery.confirm", "delivery.confirm"]);
-	expect(errors).toEqual(["discord delivery_confirm_unconfirmed deliveryId=delivery-1: gateway connection closed"]);
+	// Other adapter tests may leave a recovery log in flight; this assertion owns
+	// only delivery-confirm diagnostics.
+	expect(errors.filter((line) => line.startsWith("discord delivery_confirm"))).toEqual([
+		"discord delivery_confirm_unconfirmed deliveryId=delivery-1: gateway connection closed",
+	]);
 });
 
 test("an empty reply posts nothing and settles", async () => {
