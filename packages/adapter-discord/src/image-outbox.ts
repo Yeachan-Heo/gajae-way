@@ -1,5 +1,6 @@
 import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
+import type { OriginRef } from "@gajae-gateway/protocol";
 
 export type PendingImage = {
 	readonly messageId: string;
@@ -9,6 +10,7 @@ export type PendingImage = {
 	readonly completed?: boolean;
 	readonly completedAt?: number;
 	readonly createdAt?: number;
+	readonly origin?: OriginRef;
 	readonly failureAt?: number;
 	readonly audited?: boolean;
 	readonly dm?: boolean;
@@ -104,9 +106,7 @@ function pruneEntries(entries: readonly PendingImage[]): PendingImage[] {
 		try {
 			snowflakeTime(entry.messageId);
 			kept.push(entry);
-		} catch {
-			continue;
-		}
+		} catch {}
 	}
 	return kept;
 }

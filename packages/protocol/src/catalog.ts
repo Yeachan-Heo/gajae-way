@@ -50,6 +50,8 @@ export interface GatewayStatusResult {
 	readonly pid: number;
 	readonly startedAt: string;
 	readonly schemaVersion: number;
+	/** Gateway database generation identity; additive, older gateways omit it. */
+	readonly database?: { readonly identity?: string };
 	/** Functional health when reported; older gateways may omit this additive field. */
 	readonly readiness?: GatewayReadinessResult;
 	/** Session census (grows in later phases). */

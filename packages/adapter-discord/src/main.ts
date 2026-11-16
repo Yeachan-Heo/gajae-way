@@ -7,6 +7,7 @@ import {
 	type ChatMessagePayload,
 	type ChatProgressPayload,
 	type EngagementContext,
+	type GatewayStatusResult,
 	type OriginRef,
 	PRESENCE_ALL_MARKERS,
 	type PresenceState,
@@ -41,7 +42,7 @@ import {
 	type StatusReactionsMode,
 } from "./config";
 import { GatewayDownAlarm, lastLogLine } from "./down-alert";
-import { ImageOutbox, ImageOutboxCapacityError, type PendingImage } from "./image-outbox";
+import { ImageOutbox, type PendingImage } from "./image-outbox";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
 import { loadDiscordMedia, parseDiscordMedia } from "./outgoing-attachments";
 import {
@@ -1723,6 +1724,7 @@ export class ReconnectingGateway {
 	readonly #inbound = new RecoveryGate();
 	readonly #imageOutbox: ImageOutbox;
 	readonly #imageOwners = new Map<string, Promise<ImageOutcome>>();
+	#legacyCursor = false;
 	readonly #imageRetries = new Map<string, ReturnType<typeof setTimeout>>();
 	readonly #imageRetryAttempts = new Map<string, number>();
 	readonly #imageSettled = new Map<string, Set<() => void>>();
@@ -1878,10 +1880,6 @@ export class ReconnectingGateway {
 			// reclaim completed evidence. Only a real live waiter is eventually
 			// released by the bounded dead letter.
 			const attempts = (this.#imageAdmissionFailures.get(message.id) ?? 0) + 1;
-			const refusal =
-				error instanceof ImageOutboxCapacityError || /admission bound/i.test(String(error))
-					? "image outbox admission bound reached"
-					: "image outbox unavailable";
 			this.#imageAdmissionFailures.set(message.id, attempts);
 			if (this.#imageAdmissionFailures.size > 10_000)
 				this.#imageAdmissionFailures.delete(this.#imageAdmissionFailures.keys().next().value as string);
@@ -1953,10 +1951,11 @@ export class ReconnectingGateway {
 		// Never downgrade a pending image to a text-only message; a source that can
 		// never carry the image again is a terminal intent, not a silent wedge.
 		if (prepared.images.length === 0) return this.terminateImage(entry, "image attachment no longer present");
-		let origin = discordMessageOrigin(message);
+		let origin = entry.origin ?? discordMessageOrigin(message);
 		// Recovered input must not cause a Discord-side thread before the gateway's
-		// authoritative admission check. Live input keeps the current behavior.
-		if (!recovered) {
+		// authoritative admission check. A live retry adopts the destination already
+		// persisted with its intent instead of creating a second thread.
+		if (!recovered && !entry.origin) {
 			void nameThreadFromMessage(message, origin, unnamed);
 			origin = await maybeCreateThreadOnMention(
 				message,
@@ -1982,6 +1981,10 @@ export class ReconnectingGateway {
 					},
 				},
 			);
+			if (origin !== entry.origin) {
+				entry = { ...entry, origin };
+				await this.#imageOutbox.put(entry);
+			}
 		}
 		const body = withTranscript(describeInboundBody(message), await transcribeIfVoice(message, this.config.voice));
 		const receivedAt =
@@ -2228,6 +2231,7 @@ export class ReconnectingGateway {
 			return this.terminateImage(entry, "image replay exceeds gateway dedupe retention");
 		}
 		if (isImageIntentExpired(entry)) return this.terminateImage(entry, "image intent unresolved for 24 hours");
+		let engaged: boolean | undefined;
 		const verdict = await this.#inbound.join(entry.messageId, async () => {
 			const client = this.#client;
 			if (!client) {
@@ -2244,6 +2248,7 @@ export class ReconnectingGateway {
 			}
 			try {
 				const response = await client.request<{ engaged?: boolean; turnId?: string | null }>("chat.send", request);
+				engaged = response?.engaged;
 				onResponse?.(response);
 				if (response?.engaged && onResponse !== undefined) {
 					// Presence belongs to the live path only; a restart replay must not
@@ -2287,6 +2292,21 @@ export class ReconnectingGateway {
 			// owner does not arm a retry for an already dead-lettered intent.
 			const latest = await this.#imageOutbox.get(entry.messageId).catch(() => undefined);
 			return latest?.terminal && latest.audited ? "skip" : "unavailable";
+		}
+		if (
+			engaged === false &&
+			onResponse !== undefined &&
+			(request.engagement as { mentioned?: boolean }).mentioned !== true &&
+			!entry.dm &&
+			this.config.channels?.[entry.channelId] === undefined &&
+			!this.#recoverableIds.has(entry.channelId)
+		) {
+			// An explicit decline in a channel history never revisits is not a delivered
+			// turn. Drop the request instead of charging a completion tombstone to the
+			// global evidence quota; gateway message-id dedupe still makes a crash replay safe.
+			this.forgetAttempts(entry.messageId);
+			await this.#imageOutbox.remove(entry.messageId);
+			return "acked";
 		}
 		// Keep only a completion tombstone. Before this durable write, a crash
 		// replays the exact request; afterwards history skips the acknowledged id.
@@ -2480,7 +2500,7 @@ export class ReconnectingGateway {
 			// Batch into one persist: one fsync per pass, not per tombstone.
 			let withDms: RecoveryCursorState = this.#cursors;
 			for (const entry of pendingImages ?? []) {
-				if (entry.dm && !withDms.knownDms[entry.channelId])
+				if (entry.dm && !entry.completed && !withDms.knownDms[entry.channelId])
 					withDms = rememberKnownDm(withDms, entry.channelId, Date.now());
 			}
 			if (withDms !== this.#cursors) {
@@ -2872,6 +2892,9 @@ export class ReconnectingGateway {
 		this.#cursorLoads ??= loadRecoveryCursors(this.recoveryCursorPath)
 			.then((state) => {
 				this.#cursors = state;
+				this.#legacyCursor =
+					state.gatewayDbIdentity === undefined &&
+					(Object.keys(state.recoveredThrough).length > 0 || Object.keys(state.quarantined).length > 0);
 				this.#cursorFault = undefined;
 			})
 			.catch((error: unknown) => {
@@ -2904,20 +2927,30 @@ export class ReconnectingGateway {
 		);
 	}
 
-	private async reconcileGatewayRestore(): Promise<void> {
+	private async reconcileGatewayRestore(observedIdentity?: string): Promise<void> {
 		const state = this.#cursors;
 		const client = this.#client;
-		if (!state || !client || state.gatewayDbIdentity === undefined) return;
-		let result: { database?: { identity?: string } } | undefined;
-		try {
-			result = await client.request<{ database?: { identity?: string } }>("gateway.status");
-		} catch {
+		if (!state || !client) return;
+		let identity = observedIdentity;
+		const legacyState = this.#legacyCursor;
+		if (identity === undefined) {
+			if (!legacyState && state.gatewayDbIdentity === undefined) return;
+			try {
+				identity = (await client.request<GatewayStatusResult>("gateway.status"))?.database?.identity;
+			} catch {
+				return;
+			}
+		}
+		if (identity === undefined) {
+			this.#legacyCursor = false;
 			return;
 		}
-		const identity = result?.database?.identity;
-		if (identity === undefined || identity === state.gatewayDbIdentity) return;
+		if (identity === state.gatewayDbIdentity) {
+			this.#legacyCursor = false;
+			return;
+		}
 		let next = state;
-		if (state.gatewayDbIdentity !== undefined) {
+		if (state.gatewayDbIdentity !== undefined || legacyState) {
 			await this.#imageOutbox.invalidateCompleted();
 			const latest = this.#cursors ?? state;
 			const floor = snowflakeFromTimestamp(Date.now() - IMAGE_REPLAY_RETENTION_MS);
@@ -3221,14 +3254,16 @@ export class ReconnectingGateway {
 				void client.request<{ database?: { identity?: string } }>("gateway.status").then(
 					(result) => {
 						const identity = result?.database?.identity;
+						const legacy = this.#legacyCursor;
 						if (
 							identity !== undefined &&
 							this.#cursors !== undefined &&
-							this.#cursors.gatewayDbIdentity === undefined
+							this.#cursors.gatewayDbIdentity === undefined &&
+							!legacy
 						) {
 							this.persist({ ...this.#cursors, gatewayDbIdentity: identity });
-						} else if (identity !== undefined && identity !== this.#cursors?.gatewayDbIdentity) {
-							void this.reconcileGatewayRestore();
+						} else if (identity !== undefined && (legacy || identity !== this.#cursors?.gatewayDbIdentity)) {
+							void this.reconcileGatewayRestore(identity);
 						}
 						this.monitor(client, 0);
 					},

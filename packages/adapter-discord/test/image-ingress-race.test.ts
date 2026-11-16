@@ -73,7 +73,7 @@ async function fixture(options: { dm?: boolean; watermarkPast?: boolean } = {}) 
 		() => bot,
 		{
 			request: async (verb: string, params: unknown) => {
-				requests.push({ verb, params });
+				if (verb !== "gateway.status") requests.push({ verb, params });
 				return { engaged: false, turnId: null };
 			},
 			onChatMessage: () => () => {},

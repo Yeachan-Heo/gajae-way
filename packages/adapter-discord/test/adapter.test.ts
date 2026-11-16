@@ -81,7 +81,7 @@ test("recovery does not send a text fallback when the shared image budget reject
 		() => ({ id: "bot" }),
 		{
 			request: async (verb: string, params: unknown) => {
-				requests.push({ verb, params });
+				if (verb !== "gateway.status") requests.push({ verb, params });
 				return { engaged: false };
 			},
 			onChatMessage: () => () => {},
@@ -919,7 +919,7 @@ test("delivery subscription filters non-Discord and missing delivery ids", async
 	const requests: Array<{ verb: string; params: unknown }> = [];
 	const gateway: GatewayClientLike = {
 		request: async <T>(verb: string, params?: unknown) => {
-			requests.push({ verb, params });
+			if (verb !== "gateway.status") requests.push({ verb, params });
 			return {} as T;
 		},
 		onChatMessage: (listener) => {
@@ -1156,7 +1156,7 @@ function delivery(text: string): ChatMessagePayload {
 function mockGateway(requests: Array<{ verb: string; params: unknown }>): GatewayClientLike {
 	return {
 		request: async <T>(verb: string, params?: unknown) => {
-			requests.push({ verb, params });
+			if (verb !== "gateway.status") requests.push({ verb, params });
 			return {} as T;
 		},
 		onChatMessage: () => () => {},

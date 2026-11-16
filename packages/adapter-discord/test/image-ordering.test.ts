@@ -90,7 +90,7 @@ function gateway(
 		withClient
 			? ({
 					request: async (verb: string, params: unknown) => {
-						requests.push({ verb, params });
+						if (verb !== "gateway.status") if (verb !== "gateway.status") requests.push({ verb, params });
 						return requestImpl ? requestImpl(verb, params) : { engaged: false, turnId: null };
 					},
 				} as never)
@@ -786,7 +786,7 @@ test("a duplicate live image event is coalesced while its first send is settling
 		expect(await bounded(first)).toBe("unavailable");
 		adapter.adoptClient({
 			request: async (verb: string, params: unknown) => {
-				requests.push({ verb, params });
+				if (verb !== "gateway.status") requests.push({ verb, params });
 				sends++;
 				return { engaged: false, turnId: null };
 			},
@@ -1028,8 +1028,10 @@ test("a replaced gateway database invalidates completion tombstones", async () =
 			async (verb) =>
 				verb === "gateway.status" ? { database: { identity: "new-db" } } : { engaged: false, turnId: null },
 		);
+		expect((await loadRecoveryCursors(cursorPath)).gatewayDbIdentity).toBe("0:0");
 		await bounded(adapter.recoverMissedMessages());
 		await adapter.cursorsFlushed;
+		expect((await loadRecoveryCursors(cursorPath)).gatewayDbIdentity).toBe("new-db");
 		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([]);
 		const cursors = await loadRecoveryCursors(cursorPath);
 		expect(cursors.gatewayDbIdentity).toBeDefined();
@@ -1073,6 +1075,93 @@ test("live completion compacts eligible evidence without a recovery pass", async
 		const rows = JSON.parse(await readFile(outboxPath, "utf8")) as Array<{ messageId: string }>;
 		expect(rows.map((row) => row.messageId)).not.toContain(old);
 		expect(rows.map((row) => row.messageId)).toContain(id);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a retried image adopts its persisted thread destination", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-origin-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "origin-guild";
+	const id = snowflakeFromTimestamp(Date.now() - 25 * 60 * 60 * 1000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{
+					messageId: id,
+					channelId,
+					origin: { platform: "discord", kind: "thread", conversationId: "thread-1", parentId: channelId },
+					request: {
+						messageId: id,
+						text: "describe this\n[image · photo.png]",
+						images: [image],
+						origin: { platform: "discord", kind: "thread", conversationId: "thread-1", parentId: channelId },
+						engagement: { mentioned: true, group: false, authorId: "human" },
+					},
+				},
+			]),
+		);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		await bounded(adapter.recoverMissedMessages());
+		const send = requests.find((entry) => entry.verb === "chat.send");
+		expect(send?.params.origin).toMatchObject({ kind: "thread", conversationId: "thread-1" });
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("completed DM tombstones do not refresh recovery recency", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-recency-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(
+			outboxPath,
+			JSON.stringify([{ messageId: id, channelId: "old-dm", completed: true, completedAt: Date.now(), dm: true }]),
+		);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), []);
+		await bounded(adapter.recoverMissedMessages());
+		expect((await loadRecoveryCursors(cursorPath)).knownDms["old-dm"]).toBeUndefined();
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("legacy populated cursors rewind on the first gateway identity", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-legacy-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "legacy-dm";
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 60_000) },
+		});
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			[],
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "first-db" } } : { engaged: false, turnId: null },
+		);
+		await bounded(adapter.recoverMissedMessages());
+		const cursors = await loadRecoveryCursors(cursorPath);
+		const watermark = cursors.recoveredThrough[channelId] ?? cursors.quarantined[channelId]?.watermark;
+		expect(watermark).toBeDefined();
+		expect(BigInt(watermark!)).toBeLessThan(BigInt(snowflakeFromTimestamp(Date.now() - 29 * 24 * 60 * 60 * 1000)));
 	} finally {
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });

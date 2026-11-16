@@ -269,7 +269,7 @@ test("gateway rejection is retried inside the pass and then persisted once", asy
 	let reject = true;
 	const client = {
 		request: async (verb: string) => {
-			requests.push(verb);
+			if (verb !== "gateway.status") requests.push(verb);
 			if (reject) {
 				reject = false;
 				throw new Error("gateway unavailable");
@@ -1077,7 +1077,7 @@ test("deterministic native image failures use bounded terminal recovery without 
 			fakeChannel([rejected]),
 			{
 				request: async (verb, params) => {
-					requests.push({ verb, params });
+					if (verb !== "gateway.status") requests.push({ verb, params });
 					return { engaged: false };
 				},
 			},
@@ -1156,7 +1156,7 @@ test("recovered image resize notice is sent only for a fresh engaged acknowledge
 		fakeChannel([inbound]),
 		{
 			request: async (verb, params) => {
-				requests.push({ verb, params });
+				if (verb !== "gateway.status") requests.push({ verb, params });
 				return { engaged: true, turnId: "turn-image-accepted" };
 			},
 		},
@@ -1206,7 +1206,7 @@ test("unsupported images and ordinary attachments reach chat.send as captioned t
 		fakeChannel([inbound]),
 		{
 			request: async (verb, params) => {
-				requests.push({ verb, params });
+				if (verb !== "gateway.status") requests.push({ verb, params });
 				return { engaged: true, turnId: "turn-text-attachments" };
 			},
 		},
