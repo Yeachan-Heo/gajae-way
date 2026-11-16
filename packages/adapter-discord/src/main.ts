@@ -1,3 +1,4 @@
+import { stat } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import { ImagePreparationBudget } from "@gajae-gateway/images";
@@ -2189,6 +2190,7 @@ export class ReconnectingGateway {
 					this.#imageDone.add(id);
 					if (this.#imageDone.size > 10_000) this.#imageDone.delete(this.#imageDone.values().next().value as string);
 					this.cleanupImageState(id);
+					void this.compactTerminalImages();
 				}
 				return result;
 			});
@@ -2870,9 +2872,18 @@ export class ReconnectingGateway {
 
 	private ensureCursors(): Promise<void> {
 		this.#cursorLoads ??= loadRecoveryCursors(this.recoveryCursorPath)
-			.then((state) => {
+			.then(async (state) => {
 				this.#cursors = state;
 				this.#cursorFault = undefined;
+				const identity = await this.gatewayDbIdentity();
+				if (identity !== undefined && state.gatewayDbIdentity !== undefined && identity !== state.gatewayDbIdentity) {
+					await this.#imageOutbox.invalidateCompleted();
+					console.error(
+						"Discord gateway database was replaced; invalidated image completion tombstones for history reconciliation.",
+					);
+				}
+				if (identity !== undefined && identity !== state.gatewayDbIdentity)
+					this.persist({ ...state, gatewayDbIdentity: identity });
 			})
 			.catch((error: unknown) => {
 				// Observable and retryable: drop the memoized load so the next recovery pass
@@ -2902,6 +2913,15 @@ export class ReconnectingGateway {
 				this.#recoverableIds,
 			),
 		);
+	}
+
+	private async gatewayDbIdentity(): Promise<string | undefined> {
+		try {
+			const info = await stat(join(dirname(this.socketPath), "gateway.db"));
+			return `${info.dev}:${info.ino}`;
+		} catch {
+			return undefined;
+		}
 	}
 
 	/** Serialized, fire-and-forget cursor-store write; a failed persist only widens the gap. */

@@ -77,9 +77,10 @@ function gateway(
 	requestImpl?: (verb: string, params: unknown) => Promise<unknown>,
 	prepareImpl?: () => Promise<{ images: Array<{ data: string; mimeType: "image/jpeg" }>; notice: string }>,
 	withClient = true,
+	socketPath = "unused-socket",
 ) {
 	return new ReconnectingGateway(
-		"unused-socket",
+		socketPath,
 		{ channels: { fetch: fetchChannel } } as never,
 		{ token: "unused", tokenFile: "unused", configPath: "unused", channels } as never,
 		undefined,
@@ -993,6 +994,74 @@ test("a history join inherits a capacity hold from the live owner", async () => 
 		expect(await bounded(history)).toBe("unavailable");
 		await bounded(waiter);
 		expect(requests).toEqual([]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a replaced gateway database invalidates completion tombstones", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-restore-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "restore-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	try {
+		await writeFile(join(home, "gateway.db"), "");
+		await saveRecoveryCursors(cursorPath, { ...emptyCursors(), gatewayDbIdentity: "0:0" });
+		await writeFile(
+			outboxPath,
+			JSON.stringify([{ messageId: id, channelId, completed: true, completedAt: Date.now() }]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			[],
+			{},
+			undefined,
+			undefined,
+			true,
+			join(home, "gateway.sock"),
+		);
+		await bounded(adapter.recoverMissedMessages());
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("live completion compacts eligible evidence without a recovery pass", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-live-compact-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "live-compact-dm";
+	const old = snowflakeFromTimestamp(Date.now() - 8 * 24 * 60 * 60 * 1000);
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: old, channelId, completed: true, completedAt: Date.now() - 8 * 24 * 60 * 60 * 1000 },
+			]),
+		);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), []);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("acked");
+		await delay(20);
+		const rows = JSON.parse(await readFile(outboxPath, "utf8")) as Array<{ messageId: string }>;
+		expect(rows.map((row) => row.messageId)).not.toContain(old);
+		expect(rows.map((row) => row.messageId)).toContain(id);
 	} finally {
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });

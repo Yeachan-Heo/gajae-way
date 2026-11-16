@@ -200,6 +200,18 @@ export class ImageOutbox {
 		return this.#entries;
 	}
 
+	/** Drop completion tombstones after the gateway database was replaced. */
+	async invalidateCompleted(): Promise<void> {
+		return this.#serialize(async () => {
+			const entries = await this.#loadEntries();
+			const kept = entries.filter((entry) => !entry.completed);
+			if (kept.length === entries.length) return;
+			await writeEntries(this.#path, kept);
+			this.#entries = kept;
+			this.#index = new Map(kept.map((entry) => [entry.messageId, entry]));
+		});
+	}
+
 	async get(messageId: string): Promise<PendingImage | undefined> {
 		return this.#serialize(async () => {
 			await this.#loadEntries();

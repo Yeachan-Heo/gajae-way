@@ -98,6 +98,8 @@ export interface RecoveryCursorState {
 	readonly deadLetterDigest: Readonly<Record<string, RecoveryDeadLetterDigest>>;
 	/** Monotonic allocator for the `seq` fields above. */
 	readonly sequence: number;
+	/** Inode of gateway.db seen at the last cursor write; detects operator restore. */
+	readonly gatewayDbIdentity?: string;
 }
 
 export type RecoveryGateResult = "acked" | "duplicate" | "unavailable";
@@ -199,6 +201,7 @@ export async function loadRecoveryCursors(path: string): Promise<RecoveryCursorS
 		// Never hand back a sequence below anything already stored, or fresh entries would
 		// collide with old ones and the retention order would be wrong after a restart.
 		sequence: Math.max(stored, ...seqs, 0),
+		...(typeof record.gatewayDbIdentity === "string" ? { gatewayDbIdentity: record.gatewayDbIdentity } : {}),
 	};
 }
 
