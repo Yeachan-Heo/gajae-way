@@ -1,3 +1,7 @@
+import type { ImageFetch, ImagePreparationBudget } from "@gajae-gateway/images";
+import { downloadPromptImage, PromptImageDownloadError, preparePromptImages } from "@gajae-gateway/images";
+import type { PromptImage } from "@gajae-gateway/protocol";
+
 /**
  * Attachment rendering for inbound Discord messages.
  *
@@ -9,12 +13,8 @@
  * landed in the conversation-context ledger. Images and files sent without a
  * caption disappeared the same way.
  *
- * The fix renders attachments into the message body as a text line per
- * attachment, including the CDN url. That keeps the change inside the adapter:
- * no protocol field, no schema migration, and every downstream consumer
- * (context ledger, memory capture, turn header) sees the attachment because it
- * is simply part of the text. The persona has a shell, so a url is all it needs
- * to fetch and transcribe or inspect the file itself.
+ * Native images are downloaded and prepared as bounded prompt inputs; other
+ * attachments remain described in text. Image descriptions omit signed CDN urls.
  *
  * Discord CDN urls are signed and expire (roughly a day), so a body kept in
  * memory is not a durable handle to the bytes — anything that needs the file
@@ -55,6 +55,109 @@ export type AttachmentCarrier = {
 	readonly attachments?: AttachmentSource | null | undefined;
 };
 
+export const DISCORD_IMAGE_ALLOWED_HOSTS = ["cdn.discordapp.com", "media.discordapp.net"] as const;
+
+export type DiscordImagePreparationPorts = {
+	readonly download: typeof downloadPromptImage;
+	readonly prepare: typeof preparePromptImages;
+	readonly fetch?: ImageFetch;
+};
+
+export class DiscordImagePreparationError extends Error {
+	constructor(
+		readonly disposition: "retryable" | "terminal",
+		message = disposition === "terminal" ? "Discord image input rejected." : "Discord image download failed.",
+	) {
+		super(message);
+		this.name = "DiscordImagePreparationError";
+	}
+}
+
+const DEFAULT_IMAGE_PREPARATION_PORTS: DiscordImagePreparationPorts = {
+	download: downloadPromptImage,
+	prepare: preparePromptImages,
+};
+
+/** All image attachments, including formats that are not accepted as native prompt inputs. */
+export function selectImageAttachments(message: AttachmentCarrier): AttachmentLike[] {
+	return collectAttachments(message).filter(isImageAttachment);
+}
+
+/** PNG/JPEG attachments accepted as native prompt inputs, never fetching other formats. */
+export function selectNativeImageAttachments(message: AttachmentCarrier): AttachmentLike[] {
+	return collectAttachments(message).filter(isNativeImageAttachment);
+}
+
+/** Share one preparation budget between all live and recovered messages. */
+export function createDiscordImagePreparer(budget: ImagePreparationBudget): typeof prepareDiscordImages {
+	return (message, ports) =>
+		selectNativeImageAttachments(message).length === 0
+			? prepareDiscordImages(message, ports)
+			: budget.run(() => prepareDiscordImages(message, ports));
+}
+
+/** Prepare supported Discord image attachments for a native prompt. */
+export async function prepareDiscordImages(
+	message: AttachmentCarrier,
+	ports: DiscordImagePreparationPorts = DEFAULT_IMAGE_PREPARATION_PORTS,
+): Promise<{ readonly images: PromptImage[]; readonly notice: string }> {
+	const attachments = selectNativeImageAttachments(message);
+	if (attachments.length === 0) return { images: [], notice: "" };
+	if (attachments.length > 4)
+		throw new DiscordImagePreparationError("terminal", "Discord messages support at most 4 images.");
+	const urls = attachments.map((attachment) => {
+		const url = nonBlank(attachment.url);
+		if (!url || (typeof attachment.size === "number" && attachment.size > MAX_DISCORD_IMAGE_SOURCE_BYTES))
+			throw new DiscordImagePreparationError("terminal");
+		return url;
+	});
+	const downloads = await Promise.allSettled(urls.map((url) => downloadDiscordImage(url, ports)));
+	const sources = downloads.map((download) => {
+		if (download.status === "rejected") throw download.reason;
+		return download.value;
+	});
+	try {
+		return await ports.prepare(sources);
+	} catch {
+		throw new DiscordImagePreparationError("terminal");
+	}
+}
+
+const MAX_DISCORD_IMAGE_SOURCE_BYTES = 20 * 1024 * 1024;
+
+async function downloadDiscordImage(url: string, ports: DiscordImagePreparationPorts): Promise<Uint8Array> {
+	try {
+		return await ports.download(url, {
+			allowedHosts: DISCORD_IMAGE_ALLOWED_HOSTS,
+			...(ports.fetch ? { fetch: ports.fetch } : {}),
+		});
+	} catch (error) {
+		throw new DiscordImagePreparationError(
+			error instanceof PromptImageDownloadError && !error.retryable ? "terminal" : "retryable",
+		);
+	}
+}
+
+function isImageAttachment(attachment: AttachmentLike): boolean {
+	const contentType = normalizedContentType(attachment);
+	return contentType ? contentType.startsWith("image/") : hasImageFilename(attachment);
+}
+
+function isNativeImageAttachment(attachment: AttachmentLike): boolean {
+	const contentType = normalizedContentType(attachment);
+	if (contentType) return contentType === "image/png" || contentType === "image/jpeg";
+	return /\.(?:png|jpe?g)$/i.test(nonBlank(attachment.name) ?? "");
+}
+
+function normalizedContentType(attachment: AttachmentLike): string | undefined {
+	const contentType = nonBlank(attachment.contentType);
+	return contentType?.split(";", 1)[0]?.trim().toLowerCase();
+}
+
+function hasImageFilename(attachment: AttachmentLike): boolean {
+	return /\.(?:apng|avif|bmp|gif|heic|heif|jpe?g|png|svg|tiff?|webp)$/i.test(nonBlank(attachment.name) ?? "");
+}
+
 /** A voice message is the one attachment kind that carries duration and waveform. */
 export function isVoiceMessageAttachment(attachment: AttachmentLike): boolean {
 	return (
@@ -94,7 +197,9 @@ export function describeAttachment(attachment: AttachmentLike): string {
 	}
 	const size = formatSize(attachment.size);
 	if (size) parts.push(size);
-	if (url) parts.push(url);
+	// Native PNG/JPEG bytes are sent separately. Keep links to other image formats
+	// visible because they remain ordinary text attachments rather than prompt images.
+	if (url && !isNativeImageAttachment(attachment)) parts.push(url);
 	return `[${parts.join(" · ")}]`;
 }
 
@@ -132,8 +237,8 @@ export function collectAttachments(message: AttachmentCarrier): AttachmentLike[]
 }
 
 function attachmentKind(attachment: AttachmentLike): string {
-	const contentType = nonBlank(attachment.contentType)?.toLowerCase() ?? "";
-	if (contentType.startsWith("image/")) return "image";
+	const contentType = normalizedContentType(attachment) ?? "";
+	if (isImageAttachment(attachment)) return "image";
 	if (contentType.startsWith("video/")) return "video";
 	if (contentType.startsWith("audio/")) return "audio";
 	return "file";

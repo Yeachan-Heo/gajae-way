@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { assertNoPrivateWorkspaceDeps } from "./release-packages";
+import { assertNoPrivateWorkspaceDeps, RELEASE_ORDER, parseNpmViewResult } from "./release-packages";
 
-const RELEASE_PACKAGE_NAMES = new Set(["@gajae-gateway/protocol", "@gajae-gateway/sdk"]);
+const RELEASE_PACKAGE_NAMES = new Set(["@gajae-gateway/protocol", "@gajae-gateway/images", "@gajae-gateway/sdk"]);
 const RELEASE_PACKAGE_NAMES_WITH_PRIVATE = new Set([...RELEASE_PACKAGE_NAMES, "@gajae-gateway/home"]);
 
 const WORKSPACE_PACKAGES = new Map([
 	["@gajae-gateway/protocol", { name: "@gajae-gateway/protocol", private: false }],
+	["@gajae-gateway/images", { name: "@gajae-gateway/images", private: false }],
 	["@gajae-gateway/sdk", { name: "@gajae-gateway/sdk", private: false }],
 	["@gajae-gateway/home", { name: "@gajae-gateway/home", private: true }],
 	["@gajae-gateway/log", { name: "@gajae-gateway/log", private: false }],
@@ -27,11 +28,16 @@ const PRIVATE_WORKSPACE_DEPENDENCY_FIXTURES = [
 ] as const;
 
 describe("release package workspace dependency guard", () => {
+	test("releases images after protocol and before dependent packages", () => {
+		expect(RELEASE_ORDER).toEqual(["protocol", "images", "sdk", "cli"]);
+	});
+
 	test("allows dependencies on released workspace packages and external packages", () => {
 		const manifest = {
 			name: "@gajae-gateway/cli",
 			dependencies: {
 				"@gajae-gateway/protocol": "0.1.8",
+				"@gajae-gateway/images": "0.1.0",
 				"@gajae-gateway/sdk": "0.1.8",
 				kleur: "^4.1.5",
 			},
@@ -44,9 +50,9 @@ describe("release package workspace dependency guard", () => {
 
 	for (const fixture of PRIVATE_WORKSPACE_DEPENDENCY_FIXTURES) {
 		test(`rejects private workspace dependencies in ${fixture.section}`, () => {
-			expect(() => assertNoPrivateWorkspaceDeps(fixture.manifest, WORKSPACE_PACKAGES, RELEASE_PACKAGE_NAMES_WITH_PRIVATE)).toThrow(
-				"@gajae-gateway/home",
-			);
+			expect(() =>
+				assertNoPrivateWorkspaceDeps(fixture.manifest, WORKSPACE_PACKAGES, RELEASE_PACKAGE_NAMES_WITH_PRIVATE),
+			).toThrow("@gajae-gateway/home");
 		});
 	}
 
@@ -59,5 +65,39 @@ describe("release package workspace dependency guard", () => {
 		expect(() => assertNoPrivateWorkspaceDeps(manifest, WORKSPACE_PACKAGES, RELEASE_PACKAGE_NAMES)).toThrow(
 			"not in the release map",
 		);
+	});
+});
+
+describe("npm registry checks", () => {
+	test("parseNpmViewResult detects already published version", () => {
+		const result = parseNpmViewResult("0.5.0\n", "", 0, "0.5.0");
+		expect(result).toEqual({ alreadyPublished: true });
+	});
+
+	test("parseNpmViewResult handles version not found (404)", () => {
+		const result = parseNpmViewResult("", "404 Not Found", 1, "0.5.0");
+		expect(result).toEqual({ alreadyPublished: false });
+	});
+
+	test("parseNpmViewResult reports other registry errors", () => {
+		const result = parseNpmViewResult("", "ENEEDAUTH: no trusted publisher exists", 1, "0.5.0");
+		expect(result).toEqual({
+			alreadyPublished: false,
+			error: "ENEEDAUTH: no trusted publisher exists",
+		});
+	});
+
+	test("parseNpmViewResult reports unexpected version from npm", () => {
+		const result = parseNpmViewResult("0.4.0\n", "", 0, "0.5.0");
+		expect(result.alreadyPublished).toBe(false);
+		expect(result.error).toContain("unexpected version");
+	});
+
+	test("parseNpmViewResult reports error when both stdout and stderr are present", () => {
+		const result = parseNpmViewResult("some output", "E_TIMEOUT", 1, "0.5.0");
+		expect(result).toEqual({
+			alreadyPublished: false,
+			error: "E_TIMEOUT",
+		});
 	});
 });

@@ -362,7 +362,7 @@ test("an ambiguous send-stage relay close does not roll the session", async () =
 	};
 	brokerPort.attachTail = async () => relay as never;
 	brokerPort.send = async () => {
-		throw new RelayClosedError("s1", "connection closed after prompt submission");
+		throw new RelayClosedError("s1", "connection closed after prompt submission", true);
 	};
 	brokerPort.status = async () => ({ status: { status: "unknown" } }) as never;
 	const brokerRequest = brokerPort.request.bind(brokerPort);
@@ -494,4 +494,30 @@ test("only consecutive prior-run-busy terminal failures enter the recovery strea
 		});
 	}
 	expect(db.bindings.getSessionRecord(sessionOriginKey)?.epoch ?? 0).toBe(0);
+});
+
+test("the authoring pointer retires atomically with its fenced dispatch transition", async () => {
+	const { db, monitor, propagator, databasePath } = await harness();
+	const eventId = seedEvent(db, monitor.monitorId, "admitted");
+	const pointerKey = `monitor_authoring_turn:${eventId}`;
+	// Fault injection: block the pointer retirement and the catch-path failure
+	// transition, so the only observable state is what the fenced write committed.
+	const faults = new Database(databasePath);
+	try {
+		faults.exec(
+			`CREATE TRIGGER block_authoring_pointer_delete BEFORE DELETE ON meta WHEN old.key = '${pointerKey}' BEGIN SELECT RAISE(ABORT, 'authoring pointer delete blocked'); END;`,
+		);
+		faults.exec(
+			`CREATE TRIGGER block_event_failure BEFORE UPDATE ON monitor_events WHEN NEW.event_id = '${eventId}' AND NEW.stage = 'failed' BEGIN SELECT RAISE(ABORT, 'event failure transition blocked'); END;`,
+		);
+	} finally {
+		faults.close();
+	}
+
+	await expect(propagator.reconcile()).rejects.toThrow();
+
+	// A stale attempt must not commit `dispatched` while its pointer cleanup fails:
+	// both land in one transaction, so the failed retirement rolls the fence back.
+	expect(stageOf(db, eventId)).toBe("batched");
+	expect(db.core.metaGet(pointerKey)).toBeDefined();
 });

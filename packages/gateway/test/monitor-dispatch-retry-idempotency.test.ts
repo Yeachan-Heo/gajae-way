@@ -220,7 +220,8 @@ test("issue #187: a completed exhausted turn is resumed and its authored result 
 		"authored_no_delivery",
 	]);
 	expect(state.sessionPort.sends.map((send) => send.opRef)).toEqual([OP_REF]);
-	expect(state.sessionPort.sendAttempts.map((send) => send.opRef)).toEqual([OP_REF, OP_REF]);
+	// A completed saved turn is harvested from its own result: no send is even attempted (#702).
+	expect(state.sessionPort.sendAttempts.map((send) => send.opRef)).toEqual([OP_REF]);
 	expect(state.sessionPort.binds).toHaveLength(bindCountBeforeRecovery);
 	expect(state.pipeline.sessionSafetyState(state.sessionOriginKey).pendingRoll).toBe(
 		"context_failures_native_compaction_unavailable",
