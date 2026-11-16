@@ -332,7 +332,7 @@ test("a deleted image message is dead-lettered instead of retrying forever", asy
 	}
 }, 12_000);
 
-test("an unreadable history channel still reaches a terminal image diagnosis", async () => {
+test("a requestless intent survives a repairable permission failure instead of dead-lettering", async () => {
 	const home = await mkdtemp(join(tmpdir(), "discord-image-order-blocked-"));
 	const cleanupTimers = trackTimers();
 	const cursorPath = join(home, "recovery-cursor.json");
@@ -356,12 +356,13 @@ test("an unreadable history channel still reaches a terminal image diagnosis", a
 		};
 		const adapter = gateway(cursorPath, async () => channel, requests);
 		await bounded(adapter.recoverMissedMessages());
+		// A crash between intent admission and request persistence must not turn an
+		// operator-fixable permission outage into a permanent rejection.
 		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
-		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
-		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
-			{ messageId: id, channelId, terminal: true, audited: true },
-		]);
-		await bounded(adapter.waitForImage({ id } as never, Promise.resolve("unavailable")), 2_000);
+		expect(adapter.deadLetters).toEqual([]);
+		const persisted = JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))[0];
+		expect(persisted.terminal).toBeUndefined();
+		expect(persisted.failureAt).toBeNumber();
 	} finally {
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });
@@ -1790,24 +1791,34 @@ test("terminal image rows are compacted only after the watermark passes them", a
 	const cleanupTimers = trackTimers();
 	const cursorPath = join(home, "recovery-cursor.json");
 	const channelId = "channel-1";
-	const below = snowflakeFromTimestamp(Date.now() - 8 * 24 * 60 * 60 * 1000);
+	const insideChannel = "channel-2";
+	const below = snowflakeFromTimestamp(Date.now() - 31 * 24 * 60 * 60 * 1000);
 	const above = snowflakeFromTimestamp(Date.now() + 60_000);
+	const inside = snowflakeFromTimestamp(Date.now() - 20 * 24 * 60 * 60 * 1000);
 	try {
 		await saveRecoveryCursors(cursorPath, {
 			...emptyCursors(),
-			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+			recoveredThrough: {
+				[channelId]: snowflakeFromTimestamp(Date.now() - 30 * 24 * 60 * 60 * 1000),
+				[insideChannel]: snowflakeFromTimestamp(Date.now() - 19 * 24 * 60 * 60 * 1000),
+			},
 		});
 		await writeFile(
 			join(home, "image-outbox.json"),
 			JSON.stringify([
 				{ messageId: below, channelId, terminal: true, audited: true },
 				{ messageId: above, channelId, terminal: true, audited: true },
+				{ messageId: inside, channelId: insideChannel, terminal: true, audited: true },
 			]),
 		);
 		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), []);
 		await bounded(adapter.recoverMissedMessages());
+		// `inside` sits past its channel's watermark but still inside the 30-day replay
+		// horizon: a restore rewinds history by that horizon, so its evidence must
+		// survive or the rejected image would be rediscovered as a fresh send.
 		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
 			{ messageId: above, channelId, terminal: true, audited: true },
+			{ messageId: inside, channelId: insideChannel, terminal: true, audited: true },
 		]);
 	} finally {
 		cleanupTimers();
@@ -2389,14 +2400,14 @@ test("audited terminal rows in unconfigured channels get a recovery watermark an
 	const cursorPath = join(home, "recovery-cursor.json");
 	const outboxPath = join(home, "image-outbox.json");
 	const channelId = "unconfigured-channel";
-	const id = snowflakeFromTimestamp(Date.now() - 8 * 24 * 60 * 60 * 1000);
+	const id = snowflakeFromTimestamp(Date.now() - 31 * 24 * 60 * 60 * 1000);
 	const message = { ...dmMessage(id, channelId, true), channel: { id: channelId } };
 	let channelFetches = 0;
 	const requests: Array<{ verb: string; params: any }> = [];
 	try {
 		await saveRecoveryCursors(cursorPath, {
 			...emptyCursors(),
-			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 9 * 24 * 60 * 60 * 1000) },
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 32 * 24 * 60 * 60 * 1000) },
 		});
 		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, terminal: true, audited: true }]));
 		const adapter = gateway(

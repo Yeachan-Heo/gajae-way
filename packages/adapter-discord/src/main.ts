@@ -2302,8 +2302,12 @@ export class ReconnectingGateway {
 				// observes the evidence before it is compacted below the watermark.
 				const age = Date.now() - (entry.completedAt ?? 0);
 				if (entry.completed) return age < IMAGE_REPLAY_RETENTION_MS;
+				// Restore reconciliation rewinds history by the full replay horizon. A terminal
+				// row compacted inside that window would be rediscovered as a fresh send — an
+				// edited message still carries its new image — so hold the evidence just as long
+				// as a completion tombstone.
 				const timestamp = Number((BigInt(entry.messageId) >> 22n) + 1_420_070_400_000n);
-				return Date.now() - timestamp < 7 * 24 * 60 * 60 * 1000;
+				return Date.now() - timestamp < IMAGE_REPLAY_RETENTION_MS;
 			});
 		} catch {
 			console.error("Discord image outbox terminal compaction failed; retaining rejected-image rows.");
@@ -2569,7 +2573,11 @@ export class ReconnectingGateway {
 				// instead of spending another API call on a fetch that may not be allowed.
 				let inbound = source?.id === current.messageId ? source : undefined;
 				if (!inbound) {
-					const fetched = await this.fetchImageSource(current.channelId, current.messageId);
+					// A crash between intent admission and request persistence leaves a
+					// requestless row. A permission failure here is operator-fixable, exactly as
+					// on the request-bearing path, so it must stay retryable instead of being
+					// dead-lettered by a broad permanent-unreadable classification.
+					const fetched = await this.fetchImageSource(current.channelId, current.messageId, true);
 					if (!("message" in fetched))
 						return fetched.outcome === "gone"
 							? this.terminateImage(current, fetched.summary)
