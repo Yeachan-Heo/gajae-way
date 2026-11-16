@@ -998,6 +998,11 @@ test("completed image evidence compacts only below the recovery watermark", asyn
 	const below = snowflakeFromTimestamp(Date.now() - 120_000);
 	const above = snowflakeFromTimestamp(Date.now() + 60_000);
 	const row = (messageId: string, completedAt: number) => ({ messageId, channelId, completed: true, completedAt });
+	const withinRestoreWindow = row(below, Date.now() - 8 * 24 * 60 * 60 * 1000);
+	const beyondRestoreWindow = row(
+		snowflakeFromTimestamp(Date.now() - 31 * 24 * 60 * 60 * 1000),
+		Date.now() - 31 * 24 * 60 * 60 * 1000,
+	);
 	try {
 		await saveRecoveryCursors(cursorPath, {
 			...emptyCursors(),
@@ -1005,15 +1010,12 @@ test("completed image evidence compacts only below the recovery watermark", asyn
 			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
 			sequence: 1,
 		});
-		await writeFile(
-			outboxPath,
-			JSON.stringify([row(below, Date.now() - 8 * 24 * 60 * 60 * 1000), row(above, Date.now())]),
-		);
+		await writeFile(outboxPath, JSON.stringify([withinRestoreWindow, beyondRestoreWindow, row(above, Date.now())]));
 		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), []);
 		await bounded(adapter.recoverMissedMessages());
 		expect(
 			JSON.parse(await readFile(outboxPath, "utf8")).map((entry: { messageId: string }) => entry.messageId),
-		).toEqual([above]);
+		).toEqual([withinRestoreWindow.messageId, above]);
 	} finally {
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });
@@ -1194,20 +1196,20 @@ test("live completion compacts eligible evidence without a recovery pass", async
 	const cursorPath = join(home, "recovery-cursor.json");
 	const outboxPath = join(home, "image-outbox.json");
 	const channelId = "live-compact-dm";
-	const old = snowflakeFromTimestamp(Date.now() - 8 * 24 * 60 * 60 * 1000);
+	const old = snowflakeFromTimestamp(Date.now() - 31 * 24 * 60 * 60 * 1000);
 	const id = snowflakeFromTimestamp(Date.now() - 60_000);
 	const message = dmMessage(id, channelId, true);
 	try {
 		await saveRecoveryCursors(cursorPath, {
 			...emptyCursors(),
-			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 30 * 24 * 60 * 60 * 1000) },
 			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
 			sequence: 1,
 		});
 		await writeFile(
 			outboxPath,
 			JSON.stringify([
-				{ messageId: old, channelId, completed: true, completedAt: Date.now() - 8 * 24 * 60 * 60 * 1000 },
+				{ messageId: old, channelId, completed: true, completedAt: Date.now() - 31 * 24 * 60 * 60 * 1000 },
 			]),
 		);
 		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), []);

@@ -384,7 +384,11 @@ test("an active thread gap is recovered once through its configured parent", asy
 		cursorPath,
 		() => bot,
 		{
-			request: async (_verb: string, params?: unknown) => void sent.push((params as { messageId: string }).messageId),
+			request: async (verb: string, params?: unknown) => {
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
+				sent.push((params as { messageId: string }).messageId);
+				return {};
+			},
 			onChatMessage: () => () => {},
 		} as never,
 		async () => {},
@@ -394,6 +398,36 @@ test("an active thread gap is recovered once through its configured parent", asy
 	expect((await loadRecoveryCursors(cursorPath)).recoveredThrough["thread-1"]).toBe(missed.id);
 	await gateway.recoverMissedMessages();
 	expect(sent).toEqual([missed.id]);
+});
+
+test("a rejected identity probe holds recovery instead of advancing a stale cursor", async () => {
+	const cursorPath = join(home, "identity-probe-failure", "recovery-cursor.json");
+	const missed = message(snowflakeFromTimestamp(Date.now() - 60_000));
+	const sent: string[] = [];
+	await saveRecoveryCursors(cursorPath, cursorState({}));
+	const gateway = wiredGateway(
+		fakeChannel([missed]),
+		{
+			request: async (verb: string) => {
+				if (verb === "gateway.status") throw new Error("status unavailable");
+				return {};
+			},
+		},
+		cursorPath,
+		{ "channel-1": {} },
+		() => bot,
+		undefined,
+		null,
+	);
+	const cleanupTimers = trackTimers();
+	try {
+		await gateway.recoverMissedMessages();
+		expect(sent).toEqual([]);
+		expect((await loadRecoveryCursors(cursorPath)).recoveredThrough["channel-1"]).toBeUndefined();
+		expect(gateway.recoveryRetryPending).toBe(true);
+	} finally {
+		cleanupTimers();
+	}
 });
 
 test("a permission-dead thread keeps its gap and does not block sibling recovery", async () => {
@@ -578,16 +612,8 @@ function wiredGateway(
 	statusIdentity: string | null = "test-db",
 ): ReconnectingGateway {
 	const request = async (verb: string, params?: unknown) => {
-		const result = await client.request(verb, params);
-		if (
-			statusIdentity !== null &&
-			verb === "gateway.status" &&
-			result !== null &&
-			typeof result === "object" &&
-			!("database" in result)
-		)
-			return { ...result, database: { identity: statusIdentity } };
-		return result;
+		if (statusIdentity !== null && verb === "gateway.status") return { database: { identity: statusIdentity } };
+		return client.request(verb, params);
 	};
 	return new ReconnectingGateway(
 		"socket",

@@ -2283,7 +2283,7 @@ export class ReconnectingGateway {
 				// Keep a short post-watermark grace so an in-flight settlement still
 				// observes the evidence before it is compacted below the watermark.
 				const age = Date.now() - (entry.completedAt ?? 0);
-				if (entry.completed) return age < 7 * 24 * 60 * 60 * 1000;
+				if (entry.completed) return age < IMAGE_REPLAY_RETENTION_MS;
 				const timestamp = Number((BigInt(entry.messageId) >> 22n) + 1_420_070_400_000n);
 				return Date.now() - timestamp < 7 * 24 * 60 * 60 * 1000;
 			});
@@ -3214,6 +3214,10 @@ export class ReconnectingGateway {
 		try {
 			result = await client.request<GatewayStatusResult>("gateway.status");
 		} catch {
+			if (fromRecovery) {
+				console.error("Discord gateway database identity probe failed; holding recovery.");
+				return false;
+			}
 			return true;
 		}
 		const identity = result?.database?.identity;
