@@ -48,7 +48,10 @@ on:
 # Serialization lives on the publishing job, not on the workflow: concurrency groups are
 # matched case-insensitively, so a workflow-level group would let a case-variant tag
 # (rejected by `canonical-tag`) queue ahead of a valid pending release and replace it.
-# Gating the queue behind that check means only accepted releases ever contend.
+# Gating the queue behind those checks means only accepted releases ever contend, and the
+# requested-tag key is then the exact string the script publishes: the same job rejects an
+# `npm_tag` with surrounding whitespace, which the resolver would trim to a different tag
+# than the group it queued in.
 
 jobs:
   # Runs the same verification the build workflow runs before anything is
@@ -81,13 +84,16 @@ jobs:
       - run: bun test packages/
 
   canonical-tag:
-    name: require a canonical release tag
-    # Concurrency groups are matched case-insensitively, so a tag differing only in case
-    # (`v1.2.3-RC.1` vs `v1.2.3-rc.1`) shares this ref's serialization group. The variant
-    # is rejected here so it can never publish into that group. The job itself stays
-    # unconditional: a job-level `if` would make `needs` skip publishing for a branch
-    # dispatch, which is a documented way to release, and the workflow would report
-    # success with nothing published.
+    name: require canonical release inputs
+    # Two spellings must never publish one tag from two queue keys. Concurrency groups are
+    # matched case-insensitively, so a tag differing only in case (`v1.2.3-RC.1` vs
+    # `v1.2.3-rc.1`) shares this ref's serialization group. A dispatch `npm_tag` with
+    # surrounding whitespace has the same problem from the other side: the resolver trims
+    # it before publishing while the queue keys on it as written, so ` next ` and `next`
+    # would write one tag from groups that do not serialize. Both variants are rejected
+    # here so they can never publish. The job itself stays unconditional: a job-level `if`
+    # would make `needs` skip publishing for a branch dispatch, which is a documented way
+    # to release, and the workflow would report success with nothing published.
     runs-on: ubuntu-24.04
     steps:
       - name: require lowercase tag
@@ -97,14 +103,26 @@ jobs:
             echo "::error::release tags must be lowercase; got $GITHUB_REF_NAME"
             exit 1
           fi
+      # The publish queue keys on `npm_tag` as written, while `resolveReleaseDistTag`
+      # trims it before `npm publish` writes it, so only the canonical spelling may reach
+      # the queue.
+      - name: require a canonical npm dist-tag
+        env:
+          NPM_TAG_INPUT: ${{ inputs.npm_tag }}
+        run: |
+          TRIMMED="$(printf '%s' "$NPM_TAG_INPUT" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          if [ "$TRIMMED" != "$NPM_TAG_INPUT" ]; then
+            echo "::error::npm_tag must not have leading or trailing whitespace"
+            exit 1
+          fi
 
   publish-npm:
     name: publish npm packages
     needs: [verify, canonical-tag]
     # Reruns of one immutable tag share a group so they publish one at a time; distinct
-    # tags never contend, and nothing reaches this queue before the casing check accepts
-    # it. A branch dispatch that names a dist-tag is grouped by that tag, so two refs
-    # writing one custom tag serialize instead of interleaving a read and a write. A
+    # tags never contend, and nothing reaches this queue before the canonical-tag checks
+    # accept it. A branch dispatch that names a dist-tag is grouped by that tag, so two
+    # refs writing one custom tag serialize instead of interleaving a read and a write. A
     # dispatch that names none gets a run-scoped group: GitHub keeps only one pending run
     # per group, so a branch-keyed group would let a newer dispatch replace an earlier
     # pending release and skip its publish job entirely.

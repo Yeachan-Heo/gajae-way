@@ -21,6 +21,25 @@ function publishJob(workflow: string): string {
 	return job.slice(0, job.indexOf("\n  build-binaries:"));
 }
 
+// Returns the shell body of a named step so a gate can be executed, not just pattern-matched.
+function stepScript(job: string, name: string): string {
+	const start = job.indexOf(`      - name: ${name}`);
+	if (start < 0) return "";
+	const step = job.slice(start);
+	const run = /^ {8}run: \|\n/m.exec(step);
+	if (!run) return "";
+	const lines: string[] = [];
+	for (const line of step.slice(run.index + run[0].length).split("\n")) {
+		if (line.trim() === "") {
+			lines.push("");
+			continue;
+		}
+		if (!line.startsWith("          ")) break;
+		lines.push(line.slice(10));
+	}
+	return lines.join("\n").trim();
+}
+
 describe("release dist-tag resolution", () => {
 	test("derives latest for a stable release", () => {
 		expect(resolveReleaseDistTag("", ["1.2.3", "1.2.3", "1.2.3"])).toBe("latest");
@@ -157,6 +176,9 @@ describe("release workflow wiring", () => {
 		expect(publishing).toContain(
 			"an interrupted or failed reconciliation may leave a tag stale until a successful retry",
 		);
+		// The group key is the tag as written, so the padded spelling has to be rejected;
+		// otherwise the README would promise serialization the workflow does not enforce.
+		expect(publishing).toContain("A dispatched `npm_tag` must not carry leading or trailing whitespace");
 		expect(publishing).not.toContain("so no tag moves backwards even for the moment");
 	});
 	test("serializes reruns of one immutable tag after the casing gate accepts it", async () => {
@@ -231,8 +253,47 @@ describe("release workflow wiring", () => {
 		expect(body).toContain("if: github.ref_type == 'tag'");
 		expect(body).toContain("tr '[:upper:]' '[:lower:]'");
 		expect(body).toContain("release tags must be lowercase");
+		// The queue keys on `npm_tag` as written while the resolver trims it, so the same
+		// gate has to reject a padded spelling before the publish job enters a group.
+		expect(body).toContain("require a canonical npm dist-tag");
+		expect(body).toContain("NPM_TAG_INPUT: ${{ inputs.npm_tag }}");
 		// Publishing must be gated by the check, not only by the build.
 		expect(workflow).toMatch(/needs: \[verify, canonical-tag\]/);
+	});
+
+	// The publish queue keys on `npm_tag` as written, while `resolveReleaseDistTag` trims
+	// it before `npm publish` writes it: ` next ` and `next` would publish one tag from
+	// two groups that never serialize, reopening the cross-ref race this PR closes. The
+	// gate has to reject the padded spelling before the publish job can enter either group.
+	test("rejects an npm_tag spelling the publish queue would not share", async () => {
+		const workflow = await releaseWorkflow();
+		const gate = workflow.slice(workflow.indexOf("  canonical-tag:"));
+		const script = stepScript(gate, "require a canonical npm dist-tag");
+		expect(script).toContain("NPM_TAG_INPUT");
+		const root = await realpath(await mkdtemp(join(tmpdir(), "release npm tag gate ")));
+		try {
+			const file = join(root, "check.sh");
+			await writeFile(file, `${script}\n`);
+			const check = async (value: string) => {
+				const result = Bun.spawn(["bash", file], {
+					env: { ...process.env, NPM_TAG_INPUT: value },
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const [stdout] = await Promise.all([new Response(result.stdout).text()]);
+				return { exitCode: await result.exited, stdout };
+			};
+			const padded = await check(" next ");
+			expect(padded.exitCode).toBe(1);
+			// `::error::` annotations go to stdout, where the runner reads them.
+			expect(padded.stdout).toContain("must not have leading or trailing whitespace");
+			// Canonical spellings and an empty input (derive the channel tag) still pass.
+			expect((await check("next")).exitCode).toBe(0);
+			expect((await check("canary")).exitCode).toBe(0);
+			expect((await check("")).exitCode).toBe(0);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 
 	test("creates the GitHub release only for a tag ref", async () => {
