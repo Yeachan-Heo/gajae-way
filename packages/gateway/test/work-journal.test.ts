@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HISTORY_RETENTION_MS, Store } from "../src/store";
+import { HISTORY_RETENTION_MS, LATEST_SCHEMA_VERSION, Store } from "../src/store";
 import { ATTEMPT_UPDATED_SWEEP_SQL, HISTORY_SWEEP_SQL } from "../src/store/groups/journal";
 
 const OLD = "2020-01-01T00:00:00.000Z";
@@ -136,7 +136,7 @@ DELETE FROM schema_migrations WHERE version >= 36;
 		database.close();
 		const migrated = await Store.open(path);
 		try {
-			expect(migrated.schemaVersion).toBe(38);
+			expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 			expect(events(raw, "lane_job", "lanejob-6a")).toEqual(["baseline"]);
 			expect(events(raw, "attempt", "gw-j-abababababab")).toEqual(["baseline"]);
 			expect(events(raw, "delivery", "delivery-j")).toEqual(["baseline"]);
@@ -183,7 +183,7 @@ test("aggressive attempt_updated sweep deletes superseded rows correctly", async
 
 		raw.exec(
 			`INSERT INTO work_journal (entity, entity_key, event_type, row_json, recorded_at)
-			 VALUES 
+			 VALUES
 			 ('attempt', '${opRef}', 'attempt_started', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
 			 ('attempt', '${opRef}', 'attempt_updated', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
 			 ('attempt', '${opRef}', 'attempt_updated', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
@@ -227,7 +227,7 @@ test("terminal attempt events are not deleted by attempt_updated sweep", async (
 
 		raw.exec(
 			`INSERT INTO work_journal (entity, entity_key, event_type, row_json, recorded_at)
-			 VALUES 
+			 VALUES
 			 ('attempt', '${opRef}', 'attempt_started', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
 			 ('attempt', '${opRef}', 'attempt_updated', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}'),
 			 ('attempt', '${opRef}', 'attempt_terminal', '{"op_ref":"${opRef}"}', '${oldTime.toISOString()}')`,

@@ -26,7 +26,7 @@ import {
 	type UpdateDeps,
 } from "../src/update";
 
-const PINNED_GJC = "0.19.0";
+const PINNED_GJC = "0.20.0";
 
 async function homeWithConfig(): Promise<string> {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-update-home-"));

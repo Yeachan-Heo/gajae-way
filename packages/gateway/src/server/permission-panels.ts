@@ -28,6 +28,7 @@ interface PendingPermissionPanel {
 }
 
 export type PanelResponseKind = "option_selected" | "approved" | "denied";
+export type PanelResponseRejection = "panel_not_found" | "unauthorized_responder" | "option_not_offered";
 
 export interface PermissionPanelsOptions {
 	/** Persists and broadcasts the panel message to the adapters. */
@@ -107,7 +108,7 @@ export class PermissionPanels {
 		responderId: string;
 		responseKind: PanelResponseKind;
 		selectedOptionId?: string;
-	}): Promise<string | undefined> {
+	}): Promise<PanelResponseRejection | undefined> {
 		const panel = this.#pending.get(input.panelId);
 		if (!panel || panel.expiresAt <= this.#now()) return "panel_not_found";
 		if (input.responderId !== panel.authorId) return "unauthorized_responder";

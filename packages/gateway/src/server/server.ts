@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { readFile, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
+import { validatePromptImages } from "@gajae-gateway/images";
 import {
 	CAPABILITIES,
 	type ChatMessagePayload,
@@ -30,6 +31,7 @@ import {
 	OUTBOUND_FILES_PER_TURN_CAP,
 	originKey,
 	PROFILE_VERSION,
+	type PromptImage,
 	ProtocolError,
 	parseFileReply,
 	parseOriginKey,
@@ -47,7 +49,13 @@ import {
 	WORK_JOBS_MAX_LIMIT,
 } from "@gajae-gateway/protocol";
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
-import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
+import {
+	type ConfigOverrides,
+	DEFAULT_SESSIONS_MAX_LIVE_HOSTS,
+	type GatewayConfig,
+	type ReloadResult,
+	reloadConfig,
+} from "../config";
 import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
 import { type KevShadowInput, kevShadowEnabled, recordKevShadow } from "../engagement/kev-shadow";
@@ -61,7 +69,11 @@ import {
 	threadMuteKey,
 } from "../engagement/policy";
 import { isAbstentionNarration, preTurnSkip, speechGateApplies } from "../engagement/speech-gate";
-import { FunctionalReadiness } from "../functional-readiness";
+import {
+	FUNCTIONAL_READINESS_FAILURE_THRESHOLD,
+	FUNCTIONAL_READINESS_WINDOW_MS,
+	FunctionalReadiness,
+} from "../functional-readiness";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { SECRET_GUARD_SYSTEM_NOTICE, SecretGuard, secretSourcesFromEnv } from "../guard/secret-guard";
 import { autolinkCorpus } from "../memory/autolink";
@@ -76,6 +88,7 @@ import { MonitorRuntime } from "../monitors/runtime";
 import { DEFAULT_CRON_CATCH_UP, nextCronFire } from "../monitors/triggers/cron";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
+import { OriginSilentAlerter } from "../ops/origin-silent";
 import { DEFAULT_SLO_DAYS, evaluateSlo, type SloRecorder } from "../ops/slo";
 import type { GlobalGjcClient } from "../orchestrator/broker";
 import { ghCheckStatusClient } from "../orchestrator/gh-checks";
@@ -92,6 +105,7 @@ import {
 	type PersonaTurnLifecycle,
 	type PersonaTurnSettledInput,
 	type PersonaTurnStartInput,
+	UNRESOLVED_HOLD_ESCALATED,
 } from "../orchestrator/persona-session";
 import {
 	formatFailureChatNotice,
@@ -110,7 +124,12 @@ import { getServiceDirectory, laneLastCommits, utf8Prefix, WorkLaneManager } fro
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { Store } from "../store";
-import { type InboundMessageRow, type TerminalUnlinkedReason, terminalDeliveryIds } from "../store/groups/inbox";
+import {
+	editedOriginalId,
+	type InboundMessageRow,
+	type TerminalUnlinkedReason,
+	terminalDeliveryIds,
+} from "../store/groups/inbox";
 import type { MonitorEventStage } from "../store/groups/monitors";
 import type { ExpiredDeliveryRow } from "../store/groups/outbox";
 import { deriveActivity } from "./activity";
@@ -160,6 +179,8 @@ const RESTART_HARD_EXIT_MS = 35_000;
 const OWNER_RESTART_SUPERVISOR_CANCEL_WAIT_MS = 30_000;
 /** Owner restart gives the supervisor the rest of the drain maximum to finish or settle. */
 const OWNER_RESTART_SUPERVISOR_WAIT_MS = PERSONA_RESTART_DRAIN_MAX_WAIT_MS - OWNER_RESTART_SUPERVISOR_CANCEL_WAIT_MS;
+/** How long boot waits for in-flight persona turns under an inherited restart drain; the fence itself stays held. */
+const PERSISTED_RESTART_DRAIN_BOOT_TIMEOUT_MS = 30_000;
 /** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
 const RECENT_HISTORY_WINDOW_MS = 24 * 60 * 60_000;
 const RECENT_HISTORY_MAX = 300;
@@ -346,6 +367,7 @@ async function applyConfigReload(
 	runtime.config = result.config;
 	runtime.personaSessions.setStallTimeoutMs(result.config.stallTimeoutMs);
 	runtime.personaSessions.setHostLimits(result.config.sessions);
+	options.broker?.setMaxPoolSize(result.config.sessions?.maxLiveHosts ?? DEFAULT_SESSIONS_MAX_LIVE_HOSTS);
 	console.info(
 		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
 	);
@@ -618,6 +640,7 @@ function notifyOwnerRestartCancelled(
 	requestId: string,
 	origin: OriginRef,
 	reason = "a persona reply was not confirmed as delivered before the drain deadline",
+	replyToMessageId?: string,
 ): void {
 	const payload = {
 		turnId: crypto.randomUUID(),
@@ -625,12 +648,13 @@ function notifyOwnerRestartCancelled(
 		role: "assistant" as const,
 		text: `Restart cancelled: ${reason}.`,
 		final: true,
+		...(replyToMessageId ? { replyToMessageId } : {}),
 	};
 	if (origin.platform === "loopback") {
 		connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: requestId, payload });
 		return;
 	}
-	const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
+	const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text, replyToMessageId);
 	if (!delivery) return;
 	runtime.delivery.markInflight(delivery.deliveryId as string);
 	broadcastDelivery(runtime, delivery);
@@ -999,11 +1023,13 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		...(options.personaNow ? { now: options.personaNow } : {}),
 		maxLiveHosts: options.config.sessions?.maxLiveHosts,
 		hostIdleRetireMs: options.config.sessions?.idleRetireMs,
+		busyStallMs: options.config.sessions?.busyStallMs,
+		unresolvedHoldMs: options.config.sessions?.unresolvedHoldMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
 		brokerAvailable: () => options.broker?.isAvailable ?? true,
 		// biome-ignore lint/style/noNonNullAssertion: broker is non-null when lambda is called
 		brokerLiveness: options.broker ? () => options.broker!.judgeLiveness() : undefined,
-		onBindHold: ({ originKey, trigger, notice }: PersonaBindHoldInput) => {
+		onBindHold: ({ originKey, trigger, notice, reason }: PersonaBindHoldInput) => {
 			let origin: OriginRef;
 			try {
 				origin = validateOriginRef(JSON.parse(trigger.origin_ref_json) as OriginRef);
@@ -1016,7 +1042,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				return;
 			}
 			const context = runtime.inbound.get(trigger.message_id);
-			const deliveryId = deterministicBindHoldDeliveryId(originKey, trigger.message_id);
+			const deliveryId = deterministicBindHoldDeliveryId(originKey, trigger.message_id, reason);
 			const payload = runtime.delivery.prepare(
 				context?.turnId ?? crypto.randomUUID(),
 				origin,
@@ -1035,7 +1061,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				? undefined
 				: (JSON.parse(row.origin_ref_json) as { platform?: string }).platform === "loopback"
 					? undefined
-					: (editedMessageId(row.message_id) ?? row.message_id),
+					: (editedOriginalId(row.message_id) ?? row.message_id),
 		onHeldSteerAccepted: ({ row, abandoned }) => {
 			const turnId = runtime.inbound.get(row.message_id)?.turnId;
 			runtime.inbound.delete(row.message_id);
@@ -1086,8 +1112,12 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		onRestartDrainTransferred: (restartId, nextRestartId) => restartNotices.transferred(restartId, nextRestartId),
 	});
 	if (restartDrainId !== undefined) {
+		// An inherited drain is never released at boot: a dead supervisor does not prove the service-manager
+		// operation settled. The restart supervisor reattaches and releases it, or the operator runs
+		// `ops restart-stack --recover`; until then readiness reports `restart_drain_held`.
+		console.warn(`persisted restart drain inherited on boot; persona dispatch held id=${restartDrainId}`);
 		void personaSessions
-			.drainForRestart(restartDrainId, 0)
+			.drainForRestart(restartDrainId, PERSISTED_RESTART_DRAIN_BOOT_TIMEOUT_MS)
 			.catch((error: unknown) =>
 				console.error(`persisted restart drain failed id=${restartDrainId} detail=${diagnostic(error)}`),
 			);
@@ -1170,7 +1200,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		deliverFallback: (payload) => broadcastDelivery(runtime, payload),
 		checkStatusClient: ghCheckStatusClient(),
 	});
+	const originSilent = new OriginSilentAlerter(options.database, () => runtime.config.ownerTarget?.origin);
 	const reconcileTimer = setInterval(() => {
+		alertSilentOrigins(runtime, originSilent);
 		void monitors.reconcile();
 		void personaSessions
 			.recover()
@@ -1270,7 +1302,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		clearTimeout(retentionBootTimer);
 	};
 	const brokerWithGeneration = options.broker as
-		| (GlobalGjcClient & { onGeneration?: GlobalGjcClient["onGeneration"] })
+		| (GlobalGjcClient & {
+				onGeneration?: GlobalGjcClient["onGeneration"];
+				setOnStartupWedgeAlert?: GlobalGjcClient["setOnStartupWedgeAlert"];
+		  })
 		| undefined;
 	const stopBrokerGenerationListener =
 		typeof brokerWithGeneration?.onGeneration === "function"
@@ -1290,6 +1325,26 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 							.catch((error: unknown) => console.error(`gjc version refresh failed: ${diagnostic(error)}`));
 				})
 			: undefined;
+	// A broker that keeps failing startup parks every origin silently (#800): tell the owner once.
+	if (typeof brokerWithGeneration?.setOnStartupWedgeAlert === "function") {
+		brokerWithGeneration.setOnStartupWedgeAlert((detail) => {
+			const ownerOrigin = runtime.config.ownerTarget?.origin;
+			if (ownerOrigin) {
+				const ownerDeliveryId = `broker-startup-wedge:${crypto.randomUUID()}`;
+				const alertText = `[operator alert] broker startup wedged: reason=${detail.reason}${
+					detail.blockingPath ? ` blockingPath=${detail.blockingPath}` : ""
+				}`;
+				const ownerPayload = runtime.delivery.prepare(
+					crypto.randomUUID(),
+					ownerOrigin,
+					alertText,
+					undefined,
+					ownerDeliveryId,
+				);
+				if (ownerPayload) broadcastDelivery(runtime, ownerPayload);
+			}
+		});
+	}
 	runtime = {
 		config: options.config,
 		stopping: false,
@@ -1513,7 +1568,26 @@ async function handleRequest(
 					pid: process.pid,
 					startedAt: gatewayStartedAt,
 					schemaVersion: options.database.schemaVersion,
-					readiness: runtime.readiness.snapshot(),
+					readiness: (() => {
+						const drainId = runtime.personaSessions.restartDrainId;
+						if (drainId !== undefined) {
+							return {
+								ready: false,
+								state: "degraded" as const,
+								windowMs: FUNCTIONAL_READINESS_WINDOW_MS,
+								failureThreshold: FUNCTIONAL_READINESS_FAILURE_THRESHOLD,
+								reason: `gateway: restart_drain_held (restarts fenced, active personas blocked)`,
+								failure: {
+									category: "session_create" as const,
+									code: "restart_drain_held",
+									detail: `restart drain held id=${drainId}; new persona dispatches are blocked`,
+									at: new Date().toISOString(),
+									consecutiveFailures: 1,
+								},
+							};
+						}
+						return runtime.readiness.snapshot();
+					})(),
 					sessions: { active: options.database.bindings.activeSessionCount },
 					delivery: runtime.delivery.status(),
 					contextDiff: options.database.inbox.contextDiagnostics(),
@@ -1673,6 +1747,11 @@ async function handleRequest(
 			if (failOutcome === "transitioned") {
 				const failedRow = runtime.delivery.get(params.deliveryId);
 				const code = failedRow?.lastError ?? "other";
+				// The adapter's exact reason (stage prefix and platform message) is kept in the
+				// log; the ledger stores only its allowlisted code.
+				console.error(
+					`delivery_failed deliveryId=${params.deliveryId} code=${code} state=${failedRow?.state ?? "unknown"} reason=${safeDiagnosticField(params.reason)}`,
+				);
 				runtime.readiness.recordFailure({
 					category: "delivery",
 					code,
@@ -1749,6 +1828,11 @@ async function handleRequest(
 						: request.verb === "work.status"
 							? await runtime.work.status(request.params)
 							: await runtime.work.steer(request.params);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			return;
+		}
+		case "work.directive": {
+			const result = await runtime.work.directive(request.params);
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 			return;
 		}
@@ -1964,6 +2048,12 @@ async function handleRequest(
 			return;
 		}
 		case "session.modelChoices": {
+			// Preset names are the owner's private configuration: anyone else typing
+			// `/model set` gets no suggestions, the same owner gate as `/model` itself.
+			if (!ownerAuthored(runtime.config, request.params)) {
+				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { choices: [] } });
+				return;
+			}
 			const choices = await listModelChoices(
 				options.broker?.agentDir,
 				runtime.config.model,
@@ -2411,33 +2501,41 @@ async function handleRequest(
 				(params?.responseKind as string) === "option_selected"
 					? ((params?.selectedOptionId as string) || "").trim().slice(0, 256)
 					: undefined;
-			const authorId = (engagement?.authorId as string) || "";
-			const actor = typeof engagement?.authorName === "string" ? (engagement.authorName as string) : undefined;
+			let rejection: Awaited<ReturnType<typeof runtime.permissionPanels.respond>>;
+			try {
+				rejection = await runtime.permissionPanels.respond({
+					panelId,
+					responderId,
+					responseKind: responseKind as PanelResponseKind,
+					selectedOptionId,
+				});
+			} catch (error) {
+				throw new ProtocolError("verb_failed", `Failed to submit panel response: ${diagnostic(error)}`);
+			}
+			if (rejection) {
+				console.error(
+					`panel_response_rejected reason=${rejection} panel=${JSON.stringify(panelId)} responder=${JSON.stringify(responderId)}`,
+				);
+				throw new ProtocolError(
+					rejection === "unauthorized_responder" ? "unauthorized" : "invalid_params",
+					`Failed to submit panel response: ${rejection}`,
+				);
+			}
 
-			const coordinatorError = await runtime.permissionPanels
-				.respond({ panelId, responderId, responseKind: responseKind as PanelResponseKind, selectedOptionId })
-				.catch((error: unknown) => `response_error: ${diagnostic(error)}`);
-
-			// Record the panel response in the context ledger (audit trail)
+			// Record only accepted responses in model-visible context.
 			const responseBody =
 				responseKind === "option_selected"
-					? `[panel] answered question ${panelId} with option ${selectedOptionId}${coordinatorError ? ` (error: ${coordinatorError})` : ""}`
-					: `[panel] ${responseKind} panel ${panelId}${coordinatorError ? ` (error: ${coordinatorError})` : ""}`;
+					? `[panel] answered question ${panelId} with option ${selectedOptionId}`
+					: `[panel] ${responseKind} panel ${panelId}`;
 
 			options.database.transaction((tx) =>
 				options.database.inbox.contextRecord(tx, {
 					messageId: `panel/${responseKind}/${panelId}/${responderId}/${new Date().toISOString()}/${crypto.randomUUID().slice(0, 8)}`,
 					originKey: originKey(origin),
-					authorId,
-					...(actor ? { authorName: actor } : {}),
+					authorId: responderId,
 					body: responseBody,
 				}),
 			);
-
-			// Report result to adapter
-			if (coordinatorError) {
-				throw new ProtocolError("verb_failed", `Failed to submit panel response: ${coordinatorError}`);
-			}
 
 			connection.write({
 				v: PROFILE_VERSION,
@@ -2470,17 +2568,41 @@ async function sendChat(
 		| {
 				origin?: unknown;
 				text?: unknown;
+				images?: unknown;
 				messageId?: unknown;
 				receivedAt?: unknown;
 				voice?: unknown;
-				engagement?: { mentioned?: unknown; group?: unknown; authorId?: unknown };
+				engagement?: { mentioned?: unknown; group?: unknown; authorId?: unknown; replyTo?: { messageId?: unknown } };
 		  }
 		| undefined;
-	if (!params || typeof params.text !== "string" || !params.text)
+	if (!params) throw new ProtocolError("invalid_params", "chat.send requires parameters");
+	let promptImages: PromptImage[];
+	try {
+		promptImages = validatePromptImages(params.images);
+	} catch (error) {
+		throw new ProtocolError(
+			"invalid_params",
+			error instanceof Error ? error.message : "chat.send requires valid prompt images",
+		);
+	}
+	if (typeof params.text !== "string" && !(params.text === undefined && promptImages.length > 0))
+		throw new ProtocolError("invalid_params", "chat.send requires text or prompt images");
+	if (!params.text && promptImages.length === 0)
 		throw new ProtocolError("invalid_params", "chat.send requires non-empty text");
 	if (typeof params.messageId === "string" && isInternalReportMessageId(params.messageId))
 		throw new ProtocolError("invalid_params", "internal report identifiers cannot be sent to chat");
-	const userText: string = params.text;
+	const userText: string =
+		params.text ||
+		`The user sent ${promptImages.length} image${promptImages.length === 1 ? "" : "s"} without accompanying text.`;
+	if (
+		promptImages.length > 0 &&
+		(userText === "/new" ||
+			userText === "/reset" ||
+			userText === "/restart" ||
+			userText === "/model" ||
+			userText.startsWith("/model "))
+	)
+		throw new ProtocolError("invalid_params", "chat.send cannot combine prompt images with control commands");
 	let origin: ReturnType<typeof validateOriginRef>;
 	try {
 		origin = validateOriginRef(params.origin as typeof LOOPBACK_ORIGIN);
@@ -2489,11 +2611,19 @@ async function sendChat(
 	}
 	const key = originKey(origin);
 	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database.inbox);
-	// `/model` is a privileged control path. Apply the same direct-message and
-	// group authorisation policy as ordinary engagement before inspecting or
-	// mutating the durable override.
+	const replyToMessageId =
+		typeof params.engagement?.replyTo?.messageId === "string" && params.engagement.replyTo.messageId
+			? params.engagement.replyTo.messageId
+			: undefined;
+	// `/model` is an owner-only control path: it changes the cost and behaviour
+	// of the owner's persona and `show` reveals private preset names. Ordinary
+	// engagement authorisation applies first, then the author must be the
+	// configured owner. Loopback is the local operator socket itself.
 	if (userText === "/model" || userText.startsWith("/model ")) {
-		if (!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp)) {
+		if (
+			!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp) ||
+			(origin.platform !== "loopback" && !ownerAuthored(runtime.config, params.engagement))
+		) {
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
@@ -2514,6 +2644,7 @@ async function sendChat(
 			role: "assistant" as const,
 			text: outcome.text,
 			final: true,
+			...(replyToMessageId ? { replyToMessageId } : {}),
 		};
 		connection.write({
 			v: PROFILE_VERSION,
@@ -2524,7 +2655,7 @@ async function sendChat(
 		if (origin.platform === "loopback")
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: request.id, payload });
 		else {
-			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
+			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text, replyToMessageId);
 			if (delivery) {
 				runtime.delivery.markInflight(delivery.deliveryId as string);
 				for (const recipient of runtime.connections)
@@ -2538,12 +2669,9 @@ async function sendChat(
 		// Owner-only: restarts the gateway process. The supervisor (launchd
 		// KeepAlive / systemd Restart=always) brings it back; sessions are durable
 		// and resume through recovery, so the persona keeps its transcript.
-		const owner = ownerPeerIdOf(runtime.config);
-		const authorId = (params.engagement as { authorId?: string } | undefined)?.authorId;
 		if (
 			!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp) ||
-			owner === undefined ||
-			authorId !== owner
+			!ownerAuthored(runtime.config, params.engagement)
 		) {
 			connection.write({
 				v: PROFILE_VERSION,
@@ -2559,6 +2687,7 @@ async function sendChat(
 			role: "assistant" as const,
 			text: "Restarting the gateway; back in a few seconds.",
 			final: true,
+			...(replyToMessageId ? { replyToMessageId } : {}),
 		};
 		connection.write({
 			v: PROFILE_VERSION,
@@ -2569,7 +2698,7 @@ async function sendChat(
 		if (origin.platform === "loopback")
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: request.id, payload });
 		else {
-			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
+			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text, replyToMessageId);
 			if (delivery) {
 				runtime.delivery.markInflight(delivery.deliveryId as string);
 				for (const recipient of runtime.connections)
@@ -2614,6 +2743,7 @@ async function sendChat(
 						request.id,
 						origin,
 						"the stack supervisor did not finish its current service command before the takeover deadline",
+						replyToMessageId,
 					);
 					return;
 				}
@@ -2633,7 +2763,7 @@ async function sendChat(
 			if (outcome === "timed_out") {
 				console.warn("owner restart cancelled; persona reply delivery was not confirmed before the drain deadline");
 				await runtime.personaSessions.cancelRestartDrain(ownerRestartId);
-				notifyOwnerRestartCancelled(connection, runtime, request.id, origin);
+				notifyOwnerRestartCancelled(connection, runtime, request.id, origin, undefined, replyToMessageId);
 				return;
 			}
 			// Exit non-zero on purpose: launchd KeepAlive=true and systemd
@@ -2670,6 +2800,7 @@ async function sendChat(
 			role: "assistant" as const,
 			text: "Started a fresh session.",
 			final: true,
+			...(replyToMessageId ? { replyToMessageId } : {}),
 		};
 		connection.write({
 			v: PROFILE_VERSION,
@@ -2680,7 +2811,7 @@ async function sendChat(
 		if (origin.platform === "loopback")
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: request.id, payload });
 		else {
-			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
+			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text, replyToMessageId);
 			if (delivery) {
 				runtime.delivery.markInflight(delivery.deliveryId as string);
 				for (const recipient of runtime.connections)
@@ -2742,6 +2873,13 @@ async function sendChat(
 	const engaged = engagementDecision.engaged && !botAudienceGuardSpent;
 	const inboundMessageId = typeof params.messageId === "string" && params.messageId ? params.messageId : undefined;
 	const receivedAt = parseReceivedAt(params.receivedAt);
+	const imagesJson = promptImages.length > 0 ? JSON.stringify(promptImages) : undefined;
+	const expectedImagesJson = imagesJson ?? null;
+	if (engaged && inboundMessageId) {
+		const existingImagesJson = options.database.inbox.messageImagesJson(inboundMessageId, key);
+		if (existingImagesJson !== undefined && existingImagesJson !== expectedImagesJson)
+			throw new ProtocolError("invalid_params", "messageId was already accepted with different image content");
+	}
 	// Declined messages are still context, never commands (protocol contract): every
 	// platform message lands in the conversation-context ledger so the next engaged
 	// turn reads the full unread diff since the persona's last reply.
@@ -2849,6 +2987,7 @@ async function sendChat(
 				originKey: key,
 				originRefJson: JSON.stringify(origin),
 				body: userText,
+				imagesJson,
 				// The delivery-side gate needs the same bypass decision after a restart,
 				// so it travels with the durable row.
 				engagementJson: params.engagement
@@ -2858,8 +2997,18 @@ async function sendChat(
 			// The unmute commits with the addressed message it answers, so a crash can
 			// never leave an accepted unmute action behind a still-muted thread.
 			if (accepted && muteKey !== undefined && muteAddressed) options.database.inbox.unmuteThread(tx, muteKey);
-			if (!accepted || !nonLoopback || authorIsBot)
-				return { accepted, watchWakeOrigins: [] as string[], memoryIntentIds: [] as string[] };
+			if (!accepted) {
+				const existingImagesJson = options.database.inbox.messageImagesJson(messageId, key);
+				return {
+					accepted,
+					imageConflict:
+						existingImagesJson === undefined ? promptImages.length > 0 : existingImagesJson !== expectedImagesJson,
+					watchWakeOrigins: [] as string[],
+					memoryIntentIds: [] as string[],
+				};
+			}
+			if (!nonLoopback || authorIsBot)
+				return { accepted, imageConflict: false, watchWakeOrigins: [] as string[], memoryIntentIds: [] as string[] };
 
 			const matchedAt = new Date().toISOString();
 			const sourceAt = receivedAt ?? matchedAt;
@@ -2916,9 +3065,11 @@ async function sendChat(
 				watchWakeOrigins.push(watch.watcher_origin_key);
 				memoryIntentIds.push(intentId);
 			}
-			return { accepted, watchWakeOrigins, memoryIntentIds };
+			return { accepted, imageConflict: false, watchWakeOrigins, memoryIntentIds };
 		}),
 	);
+	if (admission.imageConflict)
+		throw new ProtocolError("invalid_params", "messageId was already accepted with different image content");
 	if (!admission.accepted) {
 		// Duplicate message id: already accepted once, so acknowledge without dispatching.
 		connection.write({
@@ -2960,12 +3111,6 @@ export function renderMessageEdit(messageId: string, text: string): string {
 /** One durable row per (message, edit content): a replayed edit event collides, a further edit does not. */
 export function messageEditId(messageId: string, text: string): string {
 	return `edit:${messageId}:${createHash("sha256").update(text).digest("hex").slice(0, 16)}`;
-}
-
-/** The platform message an edit row points at, or undefined for an ordinary inbound row. */
-export function editedMessageId(inboundMessageId: string): string | undefined {
-	const match = /^edit:(.+):[0-9a-f]{16}$/.exec(inboundMessageId);
-	return match?.[1];
 }
 
 async function editChat(
@@ -3020,6 +3165,9 @@ async function editChat(
 		declined();
 		return;
 	}
+	const originalImagesJson = options.database.inbox.messageImagesJson(params.messageId, key);
+	if (originalImagesJson !== undefined && originalImagesJson !== null)
+		throw new ProtocolError("invalid_params", "chat.edit cannot edit a message with prompt images");
 	// The recorded body now says what the message says now.
 	options.database.transaction((tx) =>
 		options.database.inbox.updateContextBody(tx, key, params.messageId as string, params.text as string),
@@ -3106,6 +3254,7 @@ async function createInboundTurnLifecycle(
 	const key = row.origin_key;
 	const origin = validateOriginRef(JSON.parse(row.origin_ref_json) as typeof LOOPBACK_ORIGIN);
 	const userText = row.body;
+	const promptImages = row.images_json === null ? [] : validatePromptImages(JSON.parse(row.images_json) as unknown);
 	const nonLoopback = origin.platform !== "loopback";
 	const engagement = row.engagement_json
 		? (JSON.parse(row.engagement_json) as {
@@ -3138,17 +3287,26 @@ async function createInboundTurnLifecycle(
 	const agentsMdChanged = hasAgentsMdBaseline
 		? bootstrapState.agentsMdDigest !== agentsMdSnapshot.digest
 		: legacyBootstrappedSession;
-	if (!hasAgentsMdBaseline || agentsMdChanged)
-		options.database.transaction((tx) =>
-			options.database.bindings.recordSessionAgentsBaseline(tx, key, input.epoch, agentsMdSnapshot.digest),
-		);
+	// The baseline advances only when a turn carrying this AGENTS.md state
+	// succeeds (with the bootstrap, below). Recording it here, before the send,
+	// let a pre-send retry in the same epoch see the update as already delivered
+	// and drop it for good (#676 review).
+	// A recovered settlement cannot know which AGENTS.md state its prompt
+	// carried, so it never advances the baseline; a later turn resends a change.
+	const agentsMdBaselinePending = input.sentContextIds === undefined && (!hasAgentsMdBaseline || agentsMdChanged);
 	const agentsMdSection = agentsMdChanged ? updatedAgentsMdSection(agentsMdSnapshot) : undefined;
 	const internalTriggerText = () =>
 		row.message_id.startsWith("agent-run/") ? userText : laneReportTriggerText(userText);
 	let turnText = laneReport ? internalTriggerText() : userText;
 	let contextMessageIds: readonly string[] = [];
 	let contextOmissionRevision = 0;
-	if (nonLoopback) {
+	if (nonLoopback && input.sentContextIds !== undefined) {
+		// Settling a turn that was already sent: it owns exactly what its prompt
+		// claimed. Preparing a window now would expire/truncate rows and hand it
+		// unread context it never saw (#686). No omission revision is committed.
+		contextMessageIds = [...input.sentContextIds];
+		contextOmissionRevision = -1;
+	} else if (nonLoopback) {
 		const prepared = options.database.transaction((tx) =>
 			options.database.inbox.contextWindow(tx, key, row.message_id),
 		);
@@ -3156,11 +3314,11 @@ async function createInboundTurnLifecycle(
 		// lives there); commit that id, not the synthetic edit row.
 		contextMessageIds = laneReport
 			? [...prepared.selectedMessageIds]
-			: [...prepared.selectedMessageIds, editedMessageId(row.message_id) ?? row.message_id];
+			: [...prepared.selectedMessageIds, editedOriginalId(row.message_id) ?? row.message_id];
 		contextOmissionRevision = prepared.omissionRevision;
 		const lines = prepared.rows.map(
 			(entry) =>
-				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${clipContextBody(entry.body, 4000)}`,
+				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${clipContextBody(redactHistoricalAttachments(entry.body), 4000)}`,
 		);
 		const omitted = prepared.expiredCount + prepared.truncatedCount;
 		const omittedRange =
@@ -3201,6 +3359,9 @@ async function createInboundTurnLifecycle(
 					: ""
 		}`;
 		turnText = `${header}${laneReport ? internalTriggerText() : `${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`}`;
+	}
+	if (promptImages.length > 0) {
+		turnText += `\n\n[Current message: ${promptImages.length} native image(s) attached, resized/JPEG-compressed for model input; fine detail may be lost. Images mentioned only in earlier messages are not attached.]`;
 	}
 
 	const bootstrap = bootstrapPending
@@ -3282,7 +3443,7 @@ async function createInboundTurnLifecycle(
 			) !== deliveryId
 		)
 			return;
-		const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, text, undefined, deliveryId);
+		const payload = runtime.delivery.prepare(turnId, origin, text, undefined, deliveryId);
 		if (!payload) return;
 		deliveredParts.push(text);
 		assistantDeliveryStarted = true;
@@ -3300,7 +3461,7 @@ async function createInboundTurnLifecycle(
 		const hop = extendHandoffChain(incomingHandoff?.chain ?? [], key, resolved.originKey);
 		return hop.ok ? { ...resolved, chain: hop.chain } : hop;
 	};
-	const relaySourceMessageId = editedMessageId(row.message_id) ?? row.message_id;
+	const relaySourceMessageId = editedOriginalId(row.message_id) ?? row.message_id;
 	const relayProvenance = (chain: readonly string[]): HandoffProvenance => ({
 		chain,
 		sourceOriginKey: key,
@@ -3521,7 +3682,7 @@ async function createInboundTurnLifecycle(
 	 */
 	const deliverFiles = async (paths: readonly string[], replyTo: string | undefined) => {
 		const notify = (deliveryId: string, text: string) => {
-			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, text, replyTo, deliveryId, false);
+			const payload = runtime.delivery.prepare(turnId, origin, text, replyTo, deliveryId, false);
 			if (!payload) return;
 			deliveredIds.push(payload.deliveryId as string);
 			assistantDeliveryStarted = true;
@@ -3550,7 +3711,7 @@ async function createInboundTurnLifecycle(
 				notify(`${deliveryId}-x`, `(file not sent: ${checked.name} - ${checked.reason})`);
 				continue;
 			}
-			const payload = runtime.delivery.prepareFile(crypto.randomUUID(), origin, checked.file, deliveryId, replyTo);
+			const payload = runtime.delivery.prepareFile(turnId, origin, checked.file, deliveryId, replyTo);
 			if (!payload) continue;
 			deliveredIds.push(payload.deliveryId as string);
 			assistantDeliveryStarted = true;
@@ -3607,7 +3768,7 @@ async function createInboundTurnLifecycle(
 						);
 						continue;
 					}
-					const payload = runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+					const payload = runtime.delivery.prepareReaction(turnId, origin, {
 						targetMessageId: wanted.targetMessageId,
 						emoji: wanted.emoji,
 						emojiName: wanted.emojiName,
@@ -3636,7 +3797,7 @@ async function createInboundTurnLifecycle(
 						);
 						continue;
 					}
-					const payload = runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+					const payload = runtime.delivery.prepareReaction(turnId, origin, {
 						targetMessageId,
 						emoji: wanted.emoji,
 						emojiName: wanted.emojiName,
@@ -3694,8 +3855,8 @@ async function createInboundTurnLifecycle(
 				? undefined
 				: origin.kind === "channel" &&
 						nonLoopback &&
-						isSlackMessageId(editedMessageId(row.message_id) ?? row.message_id)
-					? (editedMessageId(row.message_id) ?? row.message_id)
+						isSlackMessageId(editedOriginalId(row.message_id) ?? row.message_id)
+					? (editedOriginalId(row.message_id) ?? row.message_id)
 					: origin.kind === "dm" && typeof engagement?.replyTo?.messageId === "string" && engagement.replyTo.messageId
 						? engagement.replyTo.messageId
 						: undefined;
@@ -3744,6 +3905,13 @@ async function createInboundTurnLifecycle(
 			if (post) {
 				planned.push({ body, post });
 				continue;
+			}
+			// A malformed Discord reply target would fail the whole delivery; drop just the reference.
+			if (replyTarget && origin.platform === "discord" && !isDiscordSnowflake(replyTarget)) {
+				console.log(
+					`gateway reply_target_invalid origin=${originKey(origin)} target=${JSON.stringify(sanitizeDiagnostic(replyTarget).slice(0, 80))}; delivering without the reference`,
+				);
+				replyTarget = undefined;
 			}
 			const replyTo = replyTarget || inboundThreadRoot;
 			planned.push({ body, ...(replyTo ? { replyTo } : {}) });
@@ -3800,12 +3968,12 @@ async function createInboundTurnLifecycle(
 			// while the persona keeps streaming. Only the terminal reply - or the
 			// unconditional final progress tick - tears it down.
 			const payload = runtime.delivery.prepare(
-				crypto.randomUUID(),
+				turnId,
 				origin,
 				step.body,
 				step.replyTo,
 				deliveryId,
-				source === "terminal",
+				source === "terminal" && step === local.at(-1),
 			);
 			if (!payload) continue;
 			deliveredParts.push(step.body);
@@ -3999,7 +4167,7 @@ async function createInboundTurnLifecycle(
 		steered.source === "lane_report"
 			? undefined
 			: nonLoopback
-				? (editedMessageId(steered.message_id) ?? steered.message_id)
+				? (editedOriginalId(steered.message_id) ?? steered.message_id)
 				: undefined;
 	// A Slack channel session carries several bot-rooted threads, so [SHUTUP]
 	// mutes the thread of the latest chat message this turn took in, not the
@@ -4025,6 +4193,8 @@ async function createInboundTurnLifecycle(
 			options.database.transaction((tx) => {
 				if (nonLoopback)
 					options.database.inbox.contextCommitWindow(tx, key, contextMessageIds, contextOmissionRevision);
+				if (agentsMdBaselinePending)
+					options.database.bindings.recordSessionAgentsBaseline(tx, key, input.epoch, agentsMdSnapshot.digest);
 				if (bootstrap)
 					options.database.bindings.markSessionBootstrapped(tx, key, input.epoch, {
 						includedSections: bootstrap.includedSections,
@@ -4202,6 +4372,7 @@ async function createInboundTurnLifecycle(
 
 	return {
 		text: turnText,
+		...(promptImages.length > 0 ? { images: promptImages } : {}),
 		systemPreamble,
 		...(sessionBootstrap ? { sessionBootstrap } : {}),
 		...(effectiveModel ? { effectiveModel } : {}),
@@ -4382,7 +4553,7 @@ function acknowledgeSteer(runtime: Runtime, steered: InboundMessageRow, turnId: 
 		const origin = validateOriginRef(JSON.parse(steered.origin_ref_json) as OriginRef);
 		if (!isChatPlatform(origin.platform)) return;
 		if (!steerAddressedPersona(steered)) return;
-		const targetMessageId = editedMessageId(steered.message_id) ?? steered.message_id;
+		const targetMessageId = editedOriginalId(steered.message_id) ?? steered.message_id;
 		if (!isPlatformMessageId(targetMessageId)) return;
 		const eyes = resolveReactionEmoji("👀");
 		if (!eyes || eyes.isCustom === true || !platformSupportsReaction(origin.platform, eyes.name)) return;
@@ -4402,7 +4573,7 @@ function acknowledgeSteer(runtime: Runtime, steered: InboundMessageRow, turnId: 
 		}
 		broadcastDelivery(
 			runtime,
-			runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+			runtime.delivery.prepareReaction(turnId ?? crypto.randomUUID(), origin, {
 				targetMessageId,
 				emoji: eyes.unicode,
 				emojiName: eyes.name,
@@ -4417,6 +4588,23 @@ function acknowledgeSteer(runtime: Runtime, steered: InboundMessageRow, turnId: 
 function broadcastMonitorEvent(runtime: Runtime, payload: MonitorEventRecord): void {
 	for (const recipient of runtime.connections)
 		if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "monitor.event", payload });
+}
+
+/** Owner DM per `origin_silent` incident and when it clears (#688); each DM is queued with its incident transition. */
+function alertSilentOrigins(runtime: Runtime, alerter: OriginSilentAlerter): void {
+	let transitions: ReturnType<OriginSilentAlerter["sweep"]>;
+	try {
+		transitions = alerter.sweep(Date.now());
+	} catch (error) {
+		console.error(`origin silent sweep failed: ${diagnostic(error)}`);
+		return;
+	}
+	for (const transition of transitions) {
+		console.warn(
+			`origin_silent_${transition.kind} origin=${transition.originKey} delivery=${transition.deliveryId}${transition.payload ? "" : " owner=unconfigured"}`,
+		);
+		if (transition.payload) broadcastDelivery(runtime, transition.payload);
+	}
 }
 
 function reportDeliveryExpired(
@@ -4498,8 +4686,10 @@ function deterministicDeliveryExpiredNoticeId(deliveryId: string): string {
 	return `gw-x-${createHash("sha256").update(deliveryId).digest("hex").slice(0, 32)}`;
 }
 
-function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string): string {
-	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|bind_hold`).digest("hex").slice(0, 32)}`;
+/** One bind-hold notice per trigger, and one separate notice when that trigger's unresolved hold is escalated (#686). */
+function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string, reason: string): string {
+	const kind = reason === UNRESOLVED_HOLD_ESCALATED ? UNRESOLVED_HOLD_ESCALATED : "bind_hold";
+	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|${kind}`).digest("hex").slice(0, 32)}`;
 }
 
 /** One deliverable part of a persona answer: here (optionally threaded) or posted to another conversation. */
@@ -4680,6 +4870,14 @@ export function currentConversationNotice(origin: OriginRef): string {
 		`When a new message arrives while you are working, it interrupts you: any foreground command is moved to the background so you can answer. Always answer it in words, right away; a reaction alone is never the whole answer to a message from the owner.${isChatPlatform(origin.platform) ? " The gateway already marks the message 👀 when it lands, so do not spend your reply on another reaction." : ""}`,
 	].join("\n");
 }
+/**
+ * A Discord reply target must be a snowflake: Discord rejects anything else as 50035 Invalid Form
+ * Body before posting, which would lose the whole reply (#763).
+ */
+function isDiscordSnowflake(value: string): boolean {
+	return /^\d{17,20}$/.test(value);
+}
+
 /** A Slack platform message id is `channel:ts`; synthetic trigger ids (`slash-…`, `edit:…`) never thread. */
 function isSlackMessageId(value: string): boolean {
 	return /^[A-Z][A-Z0-9]+:\d+\.\d+$/.test(value);
@@ -4721,15 +4919,27 @@ function writeError(connection: Connection, error: unknown, id?: string): void {
 	connection.write({ v: PROFILE_VERSION, type: "error", ...(id ? { id } : {}), error: protocol.toPayload() });
 }
 
+function ownerPeerIdOf(config: GatewayConfig): string | undefined {
+	const owner = config.ownerTarget?.origin;
+	return owner && "peerId" in owner ? (owner as { peerId?: string }).peerId : undefined;
+}
+
+/**
+ * Whether `authorId` in an engagement or request params is the configured
+ * owner (`ownerTarget.origin.peerId`). No configured owner authorises nobody.
+ * Owner-only verbs (`/restart`, `/model`, `session.modelChoices`) require it.
+ */
+function ownerAuthored(config: GatewayConfig, carrier: unknown): boolean {
+	const owner = ownerPeerIdOf(config);
+	const authorId = (carrier as { authorId?: unknown } | undefined)?.authorId;
+	return owner !== undefined && authorId === owner;
+}
+
 /**
  * Command authorization is exactly ordinary engagement authorization: loopback,
  * DM policy, owner identity, allowlist, and group gates apply before `/new`,
  * `/reset`, or `/model` can mutate persistent session state.
  */
-function ownerPeerIdOf(config: GatewayConfig): string | undefined {
-	const owner = config.ownerTarget?.origin;
-	return owner && "peerId" in owner ? (owner as { peerId?: string }).peerId : undefined;
-}
 
 function commandAuthorised(
 	origin: Parameters<typeof decideEngagement>[0],

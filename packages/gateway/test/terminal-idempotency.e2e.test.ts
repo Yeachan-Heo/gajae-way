@@ -769,3 +769,44 @@ test("a genuinely in-flight stalled turn sends one cutoff notice and releases th
 		client.close();
 	}
 });
+
+test("a stalled turn that delivered a reply with stopReason stop does not post a failure notice", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
+	const clock = { now: Date.now() };
+	const { client } = await startGateway(port, () => clock.now);
+	const db = database;
+	if (!db) throw new Error("gateway database was not opened");
+	try {
+		sendChannelMessage(client, "stall-stop-reply", "ask for an answer that will complete properly");
+		await eventually(() => port.sends.length === 1, "persona turn was not sent");
+		const send = port.sends.at(0);
+		if (!send) throw new Error("persona send disappeared");
+		// Set up the transcript with a reply that ended with stopReason "stop"
+		port.appendAssistant(send.sessionId, "Here is my answer", clock.now, "stop");
+		port.emitAssistant(send.sessionId, "Here is my answer", "answer-frame", send.opRef);
+		await eventually(() => messages(client).length === 1, "assistant response was not delivered");
+		expect(messages(client).map((frame) => frame.payload.text)).toEqual(["Here is my answer"]);
+
+		// Simulate stall without emitting agent_end
+		port.setActivity(send.sessionId, "tool", clock.now);
+		const readsBeforeStall = port.statusReads.length;
+		port.emitStall(send.sessionId);
+		await eventually(() => port.statusReads.length > readsBeforeStall, "stall did not inspect operation status");
+		expect(db.inbox.turnRow(send.opRef)?.turn_state).toBe("accepted");
+
+		// Trigger stall cutoff
+		clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+		await eventually(() => db.inbox.turnRow(send.opRef)?.turn_state === "done", "stalled turn did not close");
+
+		// Verify that no failure notice was posted (only the original answer remains)
+		const replies = messages(client).map((frame) => frame.payload.text as string);
+		expect(replies).toHaveLength(1);
+		expect(replies[0]).toBe("Here is my answer");
+		expect(replies.filter((text) => text.startsWith("[turn failed]"))).toHaveLength(0);
+
+		// Verify session was closed
+		expect(port.closes.map((close) => close.sessionId)).toEqual([send.sessionId]);
+	} finally {
+		client.close();
+	}
+});

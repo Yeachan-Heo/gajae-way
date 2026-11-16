@@ -325,10 +325,7 @@ export function classifyRecoveryFailure(error: unknown): RecoveryFailureClass {
 	const code = (error as { code?: unknown } | null | undefined)?.code;
 	if (code === "invalid_params" || code === "payload_too_large") return "terminal-message";
 	const message = error instanceof Error ? error.message : String(error);
-	// Request timeouts indicate the message payload itself consistently fails the gateway;
-	// link outages and connection errors ('not connected', 'client closed') are retryable.
-	if (/request timed out/i.test(message)) return "terminal-message";
-	if (/not connected|connection closed|client closed/i.test(message)) return "retryable";
+	if (/request timed out|not connected|connection closed|client closed/i.test(message)) return "retryable";
 	return "write-path-unknown";
 }
 
@@ -450,6 +447,7 @@ export async function recoverConversation(
 	const limit = Math.min(RECOVERY_PAGE_LIMIT, Math.max(1, Math.floor(options.pageLimit ?? RECOVERY_PAGE_LIMIT)));
 	const maxPages = Math.max(1, Math.floor(options.maxPages ?? RECOVERY_MAX_PAGES));
 	const messages = new Map<string, SlackInboundMessage>();
+	const parentAuthors = new Map<string, string>();
 	let truncated = false;
 	let advancedTo: string | undefined;
 	let delivered = 0;
@@ -487,6 +485,7 @@ export async function recoverConversation(
 			const result = await fetchPage(cursor);
 			for (const raw of result.messages) {
 				if (typeof raw.ts !== "string" || !/^\d+\.\d+$/.test(raw.ts)) throw new SlackApiError(200, "invalid_response");
+				if (threadTs && raw.ts === threadTs && typeof raw.user === "string") parentAuthors.set(threadTs, raw.user);
 				if (raw.ts === threadTs || !tsIsAfter(raw.ts, oldest)) continue;
 				if (!threadTs && options.latest && !tsIsAfter(options.latest, raw.ts)) continue;
 				if (!threadTs) {
@@ -512,6 +511,7 @@ export async function recoverConversation(
 		for (const message of [...messages.values()]) {
 			const raw = message as SlackInboundMessage & { reply_count?: number };
 			if ((raw.reply_count ?? 0) > 0 || message.thread_ts === message.ts) {
+				if (message.user) parentAuthors.set(message.ts, message.user);
 				await collect((cursor) => port.replies(channel, message.ts, { oldest, cursor, limit }), message.ts);
 			}
 		}
@@ -526,7 +526,12 @@ export async function recoverConversation(
 	}
 	// Slack pages newest-first. Sort the entire bounded window before acknowledging anything;
 	// an incomplete window cannot advance a durable cursor past older, unfetched messages.
-	const ordered = [...messages.values()].sort((a, b) => (tsIsAfter(a.ts, b.ts) ? 1 : tsIsAfter(b.ts, a.ts) ? -1 : 0));
+	const ordered = [...messages.values()]
+		.map((message) => {
+			const parentAuthor = message.thread_ts && parentAuthors.get(message.thread_ts);
+			return parentAuthor && message.thread_ts !== message.ts ? { ...message, parent_user_id: parentAuthor } : message;
+		})
+		.sort((a, b) => (tsIsAfter(a.ts, b.ts) ? 1 : tsIsAfter(b.ts, a.ts) ? -1 : 0));
 	const stale = staleBackfillIds(ordered, options.botUserId, options.nowMs);
 	for (const message of ordered) {
 		let result: RecoveryDelivery;
@@ -580,13 +585,22 @@ export async function recoverThread(
 		failed,
 	});
 	try {
+		// The reply cursor may be newer than the root, so fetch the root separately.
+		const rootPage = await port.replies(channel, threadTs, { oldest: "0.0", limit: 1 });
+		const root = rootPage.messages.find((raw) => raw.ts === threadTs);
+		const parentAuthor = typeof root?.user === "string" ? root.user : undefined;
 		let cursor: string | undefined;
 		for (let page = 0; page < maxPages; page++) {
 			const result = await port.replies(channel, threadTs, { oldest, cursor, limit });
 			for (const raw of result.messages) {
 				if (typeof raw.ts !== "string" || !/^\d+\.\d+$/.test(raw.ts)) throw new SlackApiError(200, "invalid_response");
 				if (raw.ts === threadTs || !tsIsAfter(raw.ts, oldest)) continue;
-				messages.set(raw.ts, { ...raw, channel, thread_ts: threadTs } as SlackInboundMessage);
+				messages.set(raw.ts, {
+					...raw,
+					channel,
+					thread_ts: threadTs,
+					...(parentAuthor ? { parent_user_id: parentAuthor } : {}),
+				} as SlackInboundMessage);
 			}
 			if (!result.has_more && !result.next_cursor) break;
 			if (!result.next_cursor || page + 1 === maxPages) {

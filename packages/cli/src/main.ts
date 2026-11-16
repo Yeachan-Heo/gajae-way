@@ -7,13 +7,14 @@ import type {
 	MonitorEventRecord,
 	MonitorRecord,
 	MonitorScheduleProjection,
-	MonitorSpec,
+	MonitorUpdateParams,
 	OpsCycleParams,
 	OpsCycleResult,
 	OpsDeliveriesParams,
 	OpsDeliveriesResult,
 	OpsSloParams,
 	OpsSloResult,
+	WorkDirectiveResult,
 	WorkJobsParams,
 	WorkJobsResult,
 	WorkRetireResult,
@@ -34,6 +35,7 @@ import {
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 
+import type { GjcInstallRunner } from "./gjc-install";
 import {
 	columnNames,
 	type ListOptions,
@@ -55,7 +57,14 @@ import {
 	renderRestartReceipt,
 	runRestartStack,
 } from "./restart-stack";
-import { type InstallServicesOptions, installServices, type ServicePlatform, serviceUsage } from "./services";
+import {
+	type InstallServicesOptions,
+	installPinnedGjcForServices,
+	installServices,
+	type ServicePlatform,
+	servicePinManifest,
+	serviceUsage,
+} from "./services";
 import { type RunSetupOptions, runSetup } from "./setup";
 import { parseUpdateArgs, renderUpdate, runUpdate, type UpdateDeps } from "./update";
 
@@ -118,7 +127,9 @@ function gatewayHome(): string {
 }
 
 export interface MainOptions {
-	readonly services?: Pick<InstallServicesOptions, "loginPathRunner" | "writeFile">;
+	readonly services?: Pick<InstallServicesOptions, "loginPathRunner" | "writeFile"> & {
+		gjcInstallRunner?: GjcInstallRunner;
+	};
 	/** Test seams for `setup`: the platform fetch and the prompter. */
 	readonly setup?: Pick<RunSetupOptions, "fetch" | "prompter" | "env" | "binDir" | "runBrokerAgent">;
 	/** Test seams for `ops restart-stack`; the real path spawns the service manager. */
@@ -184,7 +195,7 @@ function parseMonitorUpdateArgs(args: readonly string[]): ParsedMonitorUpdateArg
 	const [monitorId, ...options] = args;
 	if (!monitorId || monitorId.startsWith("--") || options.length === 0) throw new Error(MONITOR_UPDATE_USAGE);
 
-	let jsonPatch: Partial<MonitorSpec> | undefined;
+	let jsonPatch: Omit<MonitorUpdateParams, "monitorId"> | undefined;
 	let schedule: string | undefined;
 	let enabled: boolean | undefined;
 	for (let i = 0; i < options.length; i++) {
@@ -200,7 +211,7 @@ function parseMonitorUpdateArgs(args: readonly string[]): ParsedMonitorUpdateArg
 				throw new Error(MONITOR_UPDATE_USAGE);
 			}
 			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error(MONITOR_UPDATE_USAGE);
-			jsonPatch = parsed as Partial<MonitorSpec>;
+			jsonPatch = parsed as Omit<MonitorUpdateParams, "monitorId">;
 		} else if (option === "--schedule") {
 			const value = options[++i];
 			if (schedule !== undefined || !value || value.startsWith("--")) throw new Error(MONITOR_UPDATE_USAGE);
@@ -395,6 +406,17 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 			lines.push(
 				`  ${failure.failedAt} ${failure.code} event=${failure.eventId} monitor=${failure.monitorId} type=${failure.eventType} stage=${failure.stage} detail=${failure.detail}`,
 			);
+	}
+	// A gateway that predates #688 omits the field; say so instead of implying no silence.
+	if ((cycle as Partial<OpsCycleResult>).silentOrigins === undefined)
+		lines.push("origin silence: not reported by the running gateway");
+	else if (cycle.silentOrigins.length === 0) lines.push("origin silence: none");
+	for (const silent of cycle.silentOrigins ?? []) {
+		let silentLine = `origin silent: ${silent.originKey} unanswered=${silent.unanswered} oldest=${Math.floor(silent.oldestPendingAgeMs / 60_000)}m reason=${silent.holdReason}${silent.blockingOpRef ? ` op=${silent.blockingOpRef}` : ""}`;
+		if (silent.pendingLaneReports && silent.pendingLaneReports > 0 && silent.oldestLaneReportAgeMs !== undefined) {
+			silentLine += ` laneReports=${silent.pendingLaneReports} oldestLaneReport=${Math.floor(silent.oldestLaneReportAgeMs / 60_000)}m`;
+		}
+		lines.push(silentLine);
 	}
 	if (cycle.monitorAuthoringLost.length > 0)
 		lines.push(
@@ -992,7 +1014,38 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			case "work": {
 				const [command, ...args] = parsed.rest;
 				const usage =
-					'usage: gajaeway work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] "<task text>"|status <name>|steer <name> <text>|retire <name>|jobs';
+					'usage: gajaeway work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] "<task text>"|status <name>|steer <name> <text>|retire <name>|jobs|directive add "<text>"|directive list|directive remove <id>';
+				if (command === "directive") {
+					const [action, ...rest] = args;
+					const text = rest.join(" ").trim();
+					if (
+						!(action === "add" && text && !rest.some((arg) => arg.startsWith("--"))) &&
+						!(action === "list" && rest.length === 0) &&
+						!(action === "remove" && rest.length === 1)
+					)
+						throw new Error(usage);
+					const client = await connectGatewaySocket(parsed.socket);
+					try {
+						const callerSessionId = process.env.GJC_SESSION_ID?.trim();
+						const result = await client.request<WorkDirectiveResult>("work.directive", {
+							action,
+							...(action === "add" ? { text } : {}),
+							...(action === "remove" ? { id: rest[0] } : {}),
+							...(callerSessionId ? { callerSessionId } : {}),
+						});
+						for (const lane of result.propagated ?? [])
+							console.log(
+								lane.steered ? `steered: ${lane.name}` : `not steered: ${lane.name} (${lane.reason ?? "unknown"})`,
+							);
+						for (const directive of result.directives)
+							console.log(
+								`${directive.id} scope=${directive.scope} at=${directive.createdAt} ${JSON.stringify(directive.text)}`,
+							);
+					} finally {
+						await client.close();
+					}
+					break;
+				}
 				if (command === "status" || command === "steer") {
 					const name = args[0];
 					const text = args.slice(1).join(" ").trim();
@@ -1170,6 +1223,12 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			}
 			case "services": {
 				const service = parseServicesArgs(parsed.rest);
+				const gjcVersion = await installPinnedGjcForServices({
+					home: gatewayHome(),
+					manifestPath: servicePinManifest(service.binDir),
+					...(options.services?.gjcInstallRunner === undefined ? {} : { runner: options.services.gjcInstallRunner }),
+				});
+				console.log(`installed pinned gjc ${gjcVersion}`);
 				const written = await installServices({
 					binDir: service.binDir,
 					...(service.launchAgentsDir === undefined ? {} : { launchAgentsDir: service.launchAgentsDir }),
