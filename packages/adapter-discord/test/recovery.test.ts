@@ -270,6 +270,32 @@ test("resetting acknowledged ids allows a restored database to replay them", asy
 	expect(await gate.join("message-1", async () => "acked")).toBe("acked");
 });
 
+test("an acknowledgement still in flight across a database restore cannot suppress replay", async () => {
+	const gate = new RecoveryGate();
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let attempts = 0;
+	const first = gate.join("message-1", async () => {
+		attempts++;
+		await held;
+		return "acked";
+	});
+	await Promise.resolve();
+	gate.resetAcknowledged();
+	const joined = gate.join("message-1", async () => {
+		attempts++;
+		return "acked";
+	});
+	release();
+	expect(await first).toBe("unavailable");
+	expect(await joined).toBe("unavailable");
+	expect(attempts).toBe(1);
+	expect(gate.acked("message-1")).toBe(false);
+	expect(await gate.join("message-1", async () => "acked")).toBe("acked");
+});
+
 test("gateway rejection is retried inside the pass and then persisted once", async () => {
 	const cursorPath = join(home, "retry", "recovery-cursor.json");
 	const inbound = message(snowflakeFromTimestamp(Date.now()));

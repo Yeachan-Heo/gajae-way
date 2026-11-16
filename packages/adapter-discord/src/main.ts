@@ -2557,7 +2557,7 @@ export class ReconnectingGateway {
 			// for the sorted history pass instead of overtaking older missed text. A
 			// failed load leaves it undefined and still replays every durable intent.
 			await this.ensureCursors();
-			await this.reconcileGatewayRestore();
+			if (!(await this.reconcileGatewayRestore())) return;
 			// The durable image consumer is independent of history recovery: an exact
 			// persisted request needs neither the cursor nor a history read, and a live
 			// image was admitted ahead of history in the first place.
@@ -2586,7 +2586,7 @@ export class ReconnectingGateway {
 			const queue = [
 				...configuredIds,
 				...Object.keys(this.#cursors.knownDms),
-				...(pendingImages ?? []).filter((entry) => !entry.completed && !entry.terminal).map((entry) => entry.channelId),
+				...(pendingImages ?? []).filter((entry) => !entry.completed).map((entry) => entry.channelId),
 			];
 			const seen = new Set<string>();
 			this.#recoverableIds = new Set(queue);
@@ -3024,39 +3024,41 @@ export class ReconnectingGateway {
 		);
 	}
 
-	private async reconcileGatewayRestore(observedIdentity?: string): Promise<void> {
+	private async reconcileGatewayRestore(observedIdentity?: string): Promise<boolean> {
 		const state = this.#cursors;
 		const client = this.#client;
-		if (!state || !client) return;
+		if (!state || !client) return true;
 		let identity = observedIdentity;
 		const legacyState = this.#legacyCursor;
 		if (identity === undefined) {
-			if (!legacyState && state.gatewayDbIdentity === undefined) return;
+			if (!legacyState && state.gatewayDbIdentity === undefined) return true;
 			try {
 				identity = (await client.request<GatewayStatusResult>("gateway.status"))?.database?.identity;
 			} catch {
-				return;
+				return true;
 			}
 		}
 		if (identity === undefined) {
-			return;
+			return true;
 		}
 		if (identity === state.gatewayDbIdentity) {
 			this.#legacyCursor = false;
-			return;
+			return true;
 		}
 		let next = state;
 		if (state.gatewayDbIdentity !== undefined || legacyState) {
 			this.#imageDone.clear();
 			this.#inbound.resetAcknowledged();
 			const completedDms = (await this.#imageOutbox.load()).filter((entry) => entry.dm).map((entry) => entry.channelId);
-			await this.#imageOutbox.invalidateCompleted();
 			const latest = this.#cursors ?? state;
+			const withDms = completedDms.reduce(
+				(current, channelId) =>
+					current.knownDms[channelId] ? current : rememberKnownDm(current, channelId, Date.now()),
+				latest,
+			);
 			const floor = snowflakeFromTimestamp(Date.now() - IMAGE_REPLAY_RETENTION_MS);
 			next = {
-				...latest,
-				knownDms: completedDms.reduce((state, channelId) => rememberKnownDm(state, channelId, Date.now()), latest)
-					.knownDms,
+				...withDms,
 				recoveredThrough: Object.fromEntries(
 					Object.entries(latest.recoveredThrough).map(([id, watermark]) => [
 						id,
@@ -3073,11 +3075,19 @@ export class ReconnectingGateway {
 					]),
 				),
 			};
+			// Persist the rewind and DM discovery while completion tombstones still
+			// exist. A crash or cursor write failure must not lose the only durable
+			// reference to a non-enumerable DM before the restore can replay it.
+			this.persist(next);
+			await this.cursorsFlushed;
+			if (this.#cursorSaveFault) return false;
+			await this.#imageOutbox.invalidateCompleted();
 			console.error(
 				"Discord gateway database was replaced; rewound recovery watermarks and invalidated image completion tombstones after the gateway socket identity changed.",
 			);
 		}
-		this.persist({ ...next, gatewayDbIdentity: identity });
+		this.persist({ ...(this.#cursors ?? next), gatewayDbIdentity: identity });
+		return true;
 	}
 
 	/** Serialized, fire-and-forget cursor-store write; a failed persist only widens the gap. */

@@ -122,6 +122,7 @@ export function recoveryCursorPath(home: string = adapterHome()): string {
 export class RecoveryGate {
 	readonly #pending = new Map<string, Promise<RecoveryGateResult>>();
 	readonly #acked = new Set<string>();
+	#generation = 0;
 
 	constructor(readonly limit = 10_000) {
 		if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("recovery gate limit must be a positive integer");
@@ -137,11 +138,13 @@ export class RecoveryGate {
 		const pending = this.#pending.get(messageId);
 		if (pending) return pending;
 		if (this.#acked.has(messageId)) return Promise.resolve("duplicate");
+		const generation = this.#generation;
 		const attemptPromise = Promise.resolve()
 			.then(attempt)
 			.then(
 				(verdict) => {
 					this.#pending.delete(messageId);
+					if (verdict === "acked" && generation !== this.#generation) return "unavailable";
 					if (verdict === "acked") {
 						this.#acked.add(messageId);
 						this.forgetBeyond(this.limit);
@@ -165,6 +168,7 @@ export class RecoveryGate {
 	/** Forget process-local acknowledgements after the gateway database is replaced. */
 	resetAcknowledged(): void {
 		this.#acked.clear();
+		this.#generation++;
 	}
 
 	/** Bounded memory: forget acked ids beyond the limit (least-recently added first). */

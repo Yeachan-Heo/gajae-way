@@ -1158,6 +1158,138 @@ test("completed DM tombstones are rebound into recovery targets before invalidat
 	}
 });
 
+test("a failed cursor checkpoint preserves completed DM evidence until restore can retry", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-restore-durable-dm-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const cursorTemp = `${cursorPath}.${process.pid}.tmp`;
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const row = { messageId: id, channelId: "lost-dm", dm: true, completed: true, completedAt: Date.now() };
+	try {
+		await saveRecoveryCursors(cursorPath, { ...emptyCursors(), gatewayDbIdentity: "old-db" });
+		await writeFile(outboxPath, JSON.stringify([row]));
+		await mkdir(cursorTemp);
+		const requests: Array<{ verb: string; params: any }> = [];
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			requests,
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "new-db" } } : { engaged: false, turnId: null },
+		);
+		await bounded(adapter.recoverMissedMessages());
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([row]);
+		expect((await loadRecoveryCursors(cursorPath)).knownDms["lost-dm"]).toBeUndefined();
+		expect(adapter.recoveryRetryPending).toBe(true);
+
+		await rm(cursorTemp, { recursive: true });
+		const restarted = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			requests,
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "new-db" } } : { engaged: false, turnId: null },
+		);
+		await bounded(restarted.recoverMissedMessages());
+		expect((await loadRecoveryCursors(cursorPath)).knownDms["lost-dm"]).toBeDefined();
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("audited terminal rows in unconfigured channels get a recovery watermark and are reclaimed", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-terminal-orphan-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "unconfigured-channel";
+	const id = snowflakeFromTimestamp(Date.now() - 8 * 24 * 60 * 60 * 1000);
+	const message = { ...dmMessage(id, channelId, true), channel: { id: channelId } };
+	let channelFetches = 0;
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 9 * 24 * 60 * 60 * 1000) },
+		});
+		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, terminal: true, audited: true }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => {
+				channelFetches++;
+				return {
+					messages: {
+						fetch: async ({ after }: { after?: string }) => (!after || BigInt(after) < BigInt(id) ? [message] : []),
+					},
+				};
+			},
+			requests,
+		);
+		await bounded(adapter.recoverMissedMessages());
+		expect(channelFetches).toBe(1);
+		expect(requests).toEqual([]);
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([]);
+		const cursors = await loadRecoveryCursors(cursorPath);
+		expect(cursors.recoveredThrough[channelId] ?? cursors.quarantined[channelId]?.watermark).toBe(id);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("an edited caption or replaced attachment is not mixed with refreshed image bytes", async () => {
+	for (const edit of ["caption", "attachment"] as const) {
+		const home = await mkdtemp(join(tmpdir(), "discord-image-refresh-snapshot-"));
+		const cleanupTimers = trackTimers();
+		const cursorPath = join(home, "recovery-cursor.json");
+		const channelId = "snapshot-dm";
+		const id = snowflakeFromTimestamp(Date.now() - 60_000);
+		const message = dmMessage(id, channelId, true);
+		const fresh =
+			edit === "caption"
+				? { ...message, content: "edited caption" }
+				: {
+						...message,
+						attachments: [
+							{ name: "replacement.png", contentType: "image/png", url: "https://cdn.discordapp.com/new.png" },
+						],
+					};
+		let preparations = 0;
+		const requests: Array<{ verb: string; params: any }> = [];
+		try {
+			await saveRecoveryCursors(cursorPath, emptyCursors());
+			const adapter = gateway(
+				cursorPath,
+				async () => ({ messages: { fetch: async () => fresh } }),
+				requests,
+				{},
+				undefined,
+				async () => {
+					preparations++;
+					if (preparations === 1) throw new DiscordImagePreparationError("retryable", undefined, true);
+					return { images: [image], notice: "" };
+				},
+			);
+			const engagement = decideInbound(message as never, bot, {});
+			expect(engagement).toBeDefined();
+			expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("skip");
+			expect(preparations).toBe(1);
+			expect(requests).toEqual([]);
+			expect(adapter.deadLetters.map((entry) => entry.summary)).toContain(
+				"image source changed after the message was edited",
+			);
+		} finally {
+			cleanupTimers();
+			await rm(home, { recursive: true, force: true });
+		}
+	}
+});
+
 test("completed rows outside every recovery target are reclaimed", async () => {
 	const home = await mkdtemp(join(tmpdir(), "discord-image-order-reclaim-"));
 	const cleanupTimers = trackTimers();
