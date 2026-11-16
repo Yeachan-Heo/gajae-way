@@ -1039,6 +1039,9 @@ test("a replaced gateway database invalidates completion tombstones", async () =
 		const cursors = await loadRecoveryCursors(cursorPath);
 		expect(cursors.gatewayDbIdentity).toBeDefined();
 		expect(cursors.gatewayDbIdentity).not.toBe("0:0");
+		const watermark = cursors.recoveredThrough[channelId] ?? cursors.quarantined[channelId]?.watermark;
+		expect(watermark).toBeDefined();
+		expect(BigInt(watermark!)).toBeLessThan(BigInt(snowflakeFromTimestamp(Date.now() - 29 * 24 * 60 * 60 * 1000)));
 		process.env.GAJAEWAY_HOME = previousHome;
 		if (previousHome === undefined) delete process.env.GAJAEWAY_HOME;
 	} finally {
