@@ -24,6 +24,12 @@ export type PendingImage = {
 	/** A restore turned this completed DM into a replay target; it is already queued. */
 	readonly restored?: boolean;
 	readonly dm?: boolean;
+	/**
+	 * Parked on shared image-budget backpressure: no bytes are prepared and no
+	 * authorization has been obtained, so it holds its own quota instead of the
+	 * pool authorized images compete for.
+	 */
+	readonly deferred?: boolean;
 };
 
 const SNOWFLAKE = /^\d{1,20}$/;
@@ -33,6 +39,15 @@ const MAX_UNRESOLVED_IMAGES = 1_000;
 const MAX_TERMINAL_IMAGES_PER_CHANNEL = 500;
 const MAX_TERMINAL_IMAGES = 10_000;
 const MAX_COMPLETED_IMAGES = 10_000;
+/**
+ * A row parked on shared-budget backpressure is not deliverable work: its bytes
+ * were never prepared and the gateway has not been asked about it. It therefore
+ * holds its own bound, so a member whose images are denied before authorization
+ * cannot fill the pool that authorized images compete for. Overflow refuses
+ * admission and dead-letters, which is the same contract as the work pool.
+ */
+const MAX_DEFERRED_IMAGES_PER_CHANNEL = 50;
+const MAX_DEFERRED_IMAGES = 250;
 /**
  * Declined sends keep dedupe evidence, not delivery evidence: they never gate
  * admission and never keep an authorized image out, so they carry their own
@@ -80,6 +95,7 @@ function validateEntry(value: unknown): asserts value is PendingImage {
 		("live" in value && typeof value.live !== "boolean") ||
 		("declined" in value && typeof value.declined !== "boolean") ||
 		("restored" in value && typeof value.restored !== "boolean") ||
+		("deferred" in value && typeof value.deferred !== "boolean") ||
 		("dm" in value && typeof value.dm !== "boolean") ||
 		(value.declined === true && value.completed !== true) ||
 		(value.terminal === true && value.completed === true)
@@ -288,14 +304,29 @@ export class ImageOutbox {
 			// Enforce the journal bounds on the write path too: a long-lived session
 			// must not grow until the next recovery load.
 			const pruned = pruneEntries(entries);
-			if (index === -1 && !entry.completed && !entry.terminal) {
-				const unresolved = pruned.filter((pending) => !pending.completed && !pending.terminal);
+			if (!entry.completed && !entry.terminal) {
+				const unresolved = pruned.filter(
+					(pending) => !pending.completed && !pending.terminal && pending.deferred !== true,
+				);
+				const deferred = pruned.filter(
+					(pending) => !pending.completed && !pending.terminal && pending.deferred === true,
+				);
+				// Parked rows keep their own bound. Re-marking an already parked row is a
+				// retry, not a new occupant, so only a row entering the pool is counted.
+				if (entry.deferred === true && existing?.deferred !== true) {
+					if (
+						deferred.filter((pending) => pending.channelId === entry.channelId).length >=
+							MAX_DEFERRED_IMAGES_PER_CHANNEL ||
+						deferred.length >= MAX_DEFERRED_IMAGES
+					)
+						throw new ImageOutboxCapacityError();
+				}
 				const terminal = pruned.filter((pending) => pending.terminal);
 				// Declined tombstones are reclaimable evidence, never delivery quota:
 				// one declined image must not be able to block a later authorized one.
 				const completed = pruned.filter((pending) => pending.completed && pending.declined !== true);
 				if (
-					unresolved.length >= MAX_UNRESOLVED_IMAGES ||
+					(index === -1 && unresolved.length >= MAX_UNRESOLVED_IMAGES) ||
 					terminal.filter((pending) => pending.channelId === entry.channelId).length >=
 						MAX_TERMINAL_IMAGES_PER_CHANNEL ||
 					terminal.length >= MAX_TERMINAL_IMAGES ||

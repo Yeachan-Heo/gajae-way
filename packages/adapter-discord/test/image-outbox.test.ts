@@ -3,7 +3,7 @@ import { Buffer } from "node:buffer";
 import { mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ImageOutbox, type PendingImage, syncOutboxDirectory } from "../src/image-outbox";
+import { ImageOutbox, ImageOutboxCapacityError, type PendingImage, syncOutboxDirectory } from "../src/image-outbox";
 
 describe("ImageOutbox", () => {
 	let directory: string;
@@ -105,6 +105,40 @@ describe("ImageOutbox", () => {
 		// Forward evidence still lands: a terminal row can become a completion tombstone.
 		await outbox.put({ ...terminal, terminal: false, completed: true, completedAt: 3 });
 		expect(await outbox.get(terminal.messageId)).toMatchObject({ completed: true, terminal: false });
+	});
+
+	test("parked budget-deferred rows hold their own quota and never consume the work pool", async () => {
+		const outbox = new ImageOutbox(path);
+		const parked: string[] = [];
+		let full = false;
+		// Fill the parked pool until it refuses. The bounds are deliberately not
+		// restated here so the assertion tracks the constants.
+		for (let channel = 0; channel < 8 && !full; channel++) {
+			for (let index = 0; index < 80 && !full; index++) {
+				const messageId = `1234567890${String(channel).padStart(2, "0")}${String(index).padStart(6, "0")}`;
+				try {
+					await outbox.put({ messageId, channelId: `channel-${channel}`, deferred: true });
+					parked.push(messageId);
+				} catch (error) {
+					if (!(error instanceof ImageOutboxCapacityError)) throw error;
+					// A refusal on this channel's first row means the global parked bound is
+					// reached; an earlier one only means this channel is full.
+					if (index === 0) full = true;
+					break;
+				}
+			}
+		}
+		expect(full).toBe(true);
+		expect(parked.length).toBeLessThanOrEqual(250);
+		// Authorized work is untouched by the parked backlog: its pool is separate.
+		await outbox.put({ messageId: "123456789012999000", channelId: "channel-work", request: { image: "work" } });
+		expect(await outbox.get("123456789012999000")).toMatchObject({ channelId: "channel-work" });
+		// Converting an existing row into the parked pool respects the same bound.
+		await expect(
+			outbox.put({ messageId: "123456789012999000", channelId: "channel-work", deferred: true }),
+		).rejects.toBeInstanceOf(ImageOutboxCapacityError);
+		// Re-marking an already parked row is a retry, not a new occupant.
+		await outbox.put({ messageId: parked[0] as string, channelId: "channel-0", deferred: true });
 	});
 
 	test("drops one corrupt record but keeps readable intents", async () => {

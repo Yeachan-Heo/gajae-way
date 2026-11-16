@@ -2071,6 +2071,17 @@ export class ReconnectingGateway {
 				}
 				if (error instanceof ImagePreparationBudgetError) {
 					this.#imageBudgetDeferred.add(entry.messageId);
+					// Park the intent on its own durable quota: local backpressure must never
+					// consume the pool that authorized images compete for.
+					try {
+						entry = { ...entry, deferred: true };
+						await this.#imageOutbox.put(entry);
+					} catch {
+						// The parked pool is full, so this backpressure cannot be absorbed. Refuse
+						// the intent rather than hold a slot it can never use.
+						this.#imageBudgetDeferred.delete(entry.messageId);
+						return this.terminateImage(entry, "image budget backlog exceeded");
+					}
 					return this.deferImageFailure(entry);
 				}
 				if (error instanceof DiscordImagePreparationError && error.disposition === "terminal") {
@@ -2148,7 +2159,10 @@ export class ReconnectingGateway {
 			...(firstVoiceMessage(message) ? { voice: true } : {}),
 			images: prepared.images,
 		};
-		entry = { ...entry, request, ...(origin.kind === "dm" ? { dm: true } : {}) };
+		// Prepared bytes mean the intent left the parked pool: drop the marker so it is
+		// charged against the work quota from here on.
+		const { deferred: _parked, ...progressed } = entry;
+		entry = { ...progressed, request, ...(origin.kind === "dm" ? { dm: true } : {}) };
 		await this.#imageOutbox.put(entry);
 		// Source diagnosis and preparation may proceed, but an independently
 		// recovered intent must not cross the history horizon at send time.
