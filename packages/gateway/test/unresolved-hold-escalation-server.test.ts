@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
-import { UNRESOLVED_HOLD_ESCALATED } from "../src/orchestrator/persona-session";
+import { linkOpenEscalatedHoldNotices, UNRESOLVED_HOLD_ESCALATED } from "../src/orchestrator/persona-session";
 import {
 	deterministicBindHoldDeliveryId,
 	escalationNoticeConfirmedInLedger,
@@ -470,6 +470,58 @@ test("outbox retention keeps a confirmed escalation notice while its hold is lin
 		db.core.metaDelete(`escalation-notice-delivery:${linked}`);
 		db.transaction((tx) => db.outbox.prune(tx, 7 * 86_400_000, later));
 		expect(db.outbox.get(linked)).toBeUndefined();
+	} finally {
+		db.close();
+	}
+});
+
+test("boot links the confirmed notice of every open legacy escalated hold before the first prune, and only those", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-escalation-backfill-"));
+	const db = await Store.open(join(home, "gateway.db"));
+	try {
+		const origin = (name: string) => ({
+			originKey: `discord/dm/${name}/peer=owner`,
+			originRefJson: JSON.stringify({ platform: "discord", kind: "dm", conversationId: name, peerId: "owner" }),
+		});
+		const sentAt = new Date(Date.now() - 8 * 86_400_000).toISOString();
+		// Two holds escalated by an older gateway, in two conversations: one still open, one already settled.
+		const hold = (name: string, messageId: string, opRef: string) => {
+			const { originKey, originRefJson } = origin(name);
+			db.transaction((tx) => {
+				db.inbox.enqueue(tx, { messageId, originKey, originRefJson, body: "held", receivedAt: sentAt });
+				db.inbox.bindTurn(tx, { messageId, originKey, epoch: 0, opRef, sessionId: "s-legacy", dispatchedAt: sentAt });
+				db.inbox.markSendAttempted(tx, opRef, [], sentAt);
+			});
+			db.core.metaSet(`escalated-hold:${opRef}`, "1");
+			const deliveryId = deterministicBindHoldDeliveryId(originKey, messageId, UNRESOLVED_HOLD_ESCALATED);
+			db.transaction((tx) => {
+				db.outbox.create(tx, { deliveryId, turnId: "t", originKey, payloadJson: "{}" }, Date.parse(sentAt));
+				db.outbox.confirm(tx, deliveryId);
+			});
+			return deliveryId;
+		};
+		const openId = hold("legacy-open", "m-open", "gw-p-open");
+		const settledId = hold("legacy-settled", "m-settled", "gw-p-settled");
+		db.transaction((tx) => db.inbox.turnComplete(tx, "gw-p-settled", "turn_failed"));
+		expect(db.core.metaKeysInRange("escalation-notice-delivery:", "escalation-notice-delivery:\uffff")).toHaveLength(0);
+
+		expect(linkOpenEscalatedHoldNotices(db)).toBe(1);
+		expect(db.core.metaGet(`escalation-notice-delivery:${openId}`)).toBe("gw-p-open");
+		expect(db.core.metaGet(`escalation-notice-delivery:${settledId}`)).toBeUndefined();
+		// Idempotent across restarts.
+		expect(linkOpenEscalatedHoldNotices(db)).toBe(0);
+
+		// The boot prune that follows (here, at a boot past the retention cutoff) keeps the open hold's proof and drops the settled one's.
+		db.transaction((tx) => db.outbox.prune(tx, 7 * 86_400_000, Date.now() + 30 * 86_400_000));
+		expect(db.outbox.get(openId)?.state).toBe("confirmed");
+		expect(db.outbox.get(settledId)).toBeUndefined();
+		const open = origin("legacy-open");
+		expect(
+			escalationNoticeConfirmedInLedger(db, open.originKey, {
+				message_id: "m-open",
+				origin_ref_json: open.originRefJson,
+			}),
+		).toBe(true);
 	} finally {
 		db.close();
 	}

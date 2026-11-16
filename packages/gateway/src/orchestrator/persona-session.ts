@@ -211,6 +211,35 @@ export function deterministicBindHoldDeliveryId(originKey: string, triggerMessag
 	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|${kind}`).digest("hex").slice(0, 32)}`;
 }
 
+/** A trigger whose turn is still open: the only kind whose escalation notice row must outlive retention. */
+function openHoldTrigger(trigger: InboundMessageRow): boolean {
+	return trigger.state === "pending" && (trigger.turn_state === "accepted" || trigger.turn_state === "bound");
+}
+
+/**
+ * Links the escalation notice of every open escalated hold to its delivery row,
+ * for holds escalated before the link existed. Runs at boot before the first
+ * outbox prune: persona recovery would link them too, but asynchronously, and a
+ * retention sweep that ran first would already have pruned a confirmed notice
+ * near the cutoff, leaving the hold without the proof it needs to ever close.
+ * Returns how many links were added. Already pruned rows are not inferred.
+ */
+export function linkOpenEscalatedHoldNotices(store: Store): number {
+	const prefix = escalatedHoldKey("");
+	let linked = 0;
+	for (const key of store.core.metaKeysInRange(prefix, `${prefix}\uffff`)) {
+		const trigger = store.inbox.turnRow(key.slice(prefix.length));
+		if (!trigger || !openHoldTrigger(trigger)) continue;
+		const linkKey = escalationNoticeDeliveryKey(
+			deterministicBindHoldDeliveryId(trigger.origin_key, trigger.message_id, UNRESOLVED_HOLD_ESCALATED),
+		);
+		if (store.core.metaGet(linkKey) !== undefined) continue;
+		store.core.metaSet(linkKey, trigger.turn_op_ref ?? "");
+		linked++;
+	}
+	return linked;
+}
+
 /** The not-live host a dead retired hold's abandonment window opened on. */
 interface DeadHostMark {
 	readonly at: number;
@@ -5158,7 +5187,7 @@ class OriginActor {
 				);
 			return false;
 		}
-		if (trigger.state !== "pending" || (trigger.turn_state !== "accepted" && trigger.turn_state !== "bound")) {
+		if (!openHoldTrigger(trigger)) {
 			this.#clearRetiredHoldDeadSince(opRef);
 			await this.#forgetClosed(bound);
 			return true;
@@ -5177,7 +5206,9 @@ class OriginActor {
 		return true;
 	}
 
+	/** Keeps the notice row of an open hold past retention; a settled trigger's retried notice is not linked (its proof is no longer needed). */
 	#linkEscalationNotice(trigger: InboundMessageRow): void {
+		if (!openHoldTrigger(trigger)) return;
 		const key = escalationNoticeDeliveryKey(
 			deterministicBindHoldDeliveryId(this.originKey, trigger.message_id, UNRESOLVED_HOLD_ESCALATED),
 		);

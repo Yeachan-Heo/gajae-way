@@ -1432,6 +1432,33 @@ test("a not-live read without an activity stamp never opens or closes the window
 	}
 });
 
+test("a notice retried after its hold settled is still posted but never relinks the settled trigger's delivery row", async () => {
+	const f = await heldOrigin("dead-hold-settled-retry", { heldForMs: 11 * MINUTE, live: false });
+	const links = () => f.db.core.metaKeysInRange("escalation-notice-delivery:", "escalation-notice-delivery:\uffff");
+	try {
+		// The adapter is offline at escalation: the durable intent stays, the hold is linked.
+		f.failNotices(1);
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		expect(f.notices).toHaveLength(0);
+		const intentKey = `escalation-notice:${f.originKey}#${f.heldOpRef}`;
+		expect(f.db.core.metaGet(intentKey)).toBe("1");
+		expect(links()).toHaveLength(1);
+		// The hold settles before the retry: completion drops its link.
+		f.db.transaction((tx) => f.db.inbox.turnComplete(tx, f.heldOpRef, "turn_failed"));
+		for (const key of links()) f.db.core.metaDelete(key);
+		// The next recovery scan (a restart) retries the notice before it looks at open turns: it posts
+		// once and clears the intent, without a new link that nothing would ever remove.
+		await f.manager.recover();
+		await until(() => f.notices.length === 1);
+		expect(f.notices[0]?.reason).toBe(UNRESOLVED_HOLD_ESCALATED);
+		expect(f.db.core.metaGet(intentKey)).toBeUndefined();
+		expect(links()).toHaveLength(0);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
 test("a reloaded sessions.retiredHoldAbandonMs applies to the live manager", async () => {
 	const f = await heldOrigin("dead-hold-reload", { heldForMs: 11 * MINUTE, live: false });
 	try {

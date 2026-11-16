@@ -16,6 +16,7 @@ import {
 	readPinnedGjcVersion,
 	waitForBroker,
 } from "./orchestrator/broker";
+import { linkOpenEscalatedHoldNotices } from "./orchestrator/persona-session";
 import { sanitizeDiagnostic } from "./orchestrator/rebind";
 import { BrokerSessionPort } from "./orchestrator/session-port";
 import { TailRunner } from "./orchestrator/tail-runner";
@@ -160,6 +161,10 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 			// deployment (seeded once; operator removals are never resurrected).
 			seedDefaultMonitors(new MonitorRegistry(database), database);
 			const ledger = new DeliveryService(database);
+			// Holds escalated by an older gateway have no retention link yet; link
+			// them before the first prune, or a confirmed notice near the cutoff is
+			// lost before persona recovery gets to it.
+			linkOpenEscalatedHoldNotices(database);
 			const pruned = ledger.prune(7 * 24 * 60 * 60 * 1000);
 			const pending = ledger.listUndelivered(24 * 60 * 60 * 1000).length;
 			// The process start, not this line: preflight and database open take
