@@ -95,6 +95,7 @@ import { ghCheckStatusClient } from "../orchestrator/gh-checks";
 import { LaneGovernor } from "../orchestrator/lane-governor";
 import {
 	deterministicBindHoldDeliveryId,
+	type EscalationNoticeReceipt,
 	PERSONA_RESTART_DRAIN_MAX_WAIT_MS,
 	PERSONA_RESTART_DRAIN_WAIT_MS,
 	type PersonaBindHoldInput,
@@ -1056,8 +1057,8 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		},
 		// A dead retired hold is abandoned only once its origin confirmed the
 		// escalation notice; a queued or expired notice is not proof the user was told.
-		escalationNoticeConfirmed: ({ originKey, trigger }) =>
-			escalationNoticeConfirmedInLedger(options.database, originKey, trigger),
+		escalationNoticeReceipt: ({ originKey, trigger }) =>
+			escalationNoticeReceiptInLedger(options.database, originKey, trigger),
 		onTurnStart: async (input) => await createInboundTurnLifecycle(input, options, runtime),
 		// A steer whose acceptance was learnt after its turn's lifecycle is gone
 		// (resolved at terminal or after a restart) is finalized exactly like a
@@ -4694,25 +4695,28 @@ function deterministicDeliveryExpiredNoticeId(deliveryId: string): string {
 
 /** One bind-hold notice per trigger, and one separate notice when that trigger's unresolved hold is escalated (#686). */
 /**
- * Whether the origin adapter confirmed the escalation notice of this trigger
- * (#686). Queued, in-flight, ambiguous or expired is not confirmed. A loopback
- * notice is only written to the gateway log, which the chat client never shows,
- * so it is never confirmed and a loopback hold is never abandoned.
+ * The delivery ledger's receipt for the escalation notice of this trigger
+ * (#686). Only a `confirmed` row is confirmed; queued, in-flight, ambiguous or
+ * expired is unconfirmed; no row at all is `missing` (pruned, or never queued).
+ * A loopback notice is only written to the gateway log, which the chat client
+ * never shows, so it is unconfirmed and a loopback hold is never abandoned.
  */
-export function escalationNoticeConfirmedInLedger(
+export function escalationNoticeReceiptInLedger(
 	database: Pick<Store, "outbox">,
 	originKey: string,
 	trigger: Pick<InboundMessageRow, "message_id" | "origin_ref_json">,
-): boolean {
+): EscalationNoticeReceipt {
 	let origin: OriginRef;
 	try {
 		origin = validateOriginRef(JSON.parse(trigger.origin_ref_json) as OriginRef);
 	} catch {
-		return false;
+		return "unconfirmed";
 	}
-	if (origin.platform === "loopback") return false;
+	if (origin.platform === "loopback") return "unconfirmed";
 	const deliveryId = deterministicBindHoldDeliveryId(originKey, trigger.message_id, UNRESOLVED_HOLD_ESCALATED);
-	return database.outbox.get(deliveryId)?.state === "confirmed";
+	const row = database.outbox.get(deliveryId);
+	if (!row) return "missing";
+	return row.state === "confirmed" ? "confirmed" : "unconfirmed";
 }
 
 export { deterministicBindHoldDeliveryId };

@@ -7,7 +7,7 @@ import type { GatewayConfig } from "../src/config";
 import { linkOpenEscalatedHoldNotices, UNRESOLVED_HOLD_ESCALATED } from "../src/orchestrator/persona-session";
 import {
 	deterministicBindHoldDeliveryId,
-	escalationNoticeConfirmedInLedger,
+	escalationNoticeReceiptInLedger,
 	type GatewayServer,
 	startUnixServer,
 } from "../src/server/server";
@@ -395,7 +395,7 @@ test("a queued message the held prompt carried as context is closed as its input
 	expect(f.port.sendAttempts.filter((send) => send.opRef === heldOpRef)).toHaveLength(1);
 }, 30_000);
 
-test("an escalation notice counts as confirmed only once its origin adapter confirmed the delivery", async () => {
+test("an escalation notice's receipt is confirmed only for a confirmed row, missing for no row, unconfirmed otherwise", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-escalation-confirmed-"));
 	const db = await Store.open(join(home, "gateway.db"));
 	try {
@@ -410,14 +410,17 @@ test("an escalation notice counts as confirmed only once its origin adapter conf
 			}),
 		};
 		const deliveryId = deterministicBindHoldDeliveryId(originKey, trigger.message_id, UNRESOLVED_HOLD_ESCALATED);
-		// No row yet, then queued, then in flight: none of these is proof the user saw it.
-		expect(escalationNoticeConfirmedInLedger(db, originKey, trigger)).toBe(false);
+		// No row at all is missing (never queued, or pruned); queued and in flight are unconfirmed.
+		expect(escalationNoticeReceiptInLedger(db, originKey, trigger)).toBe("missing");
 		db.transaction((tx) => db.outbox.create(tx, { deliveryId, turnId: "t", originKey, payloadJson: "{}" }));
-		expect(escalationNoticeConfirmedInLedger(db, originKey, trigger)).toBe(false);
+		expect(escalationNoticeReceiptInLedger(db, originKey, trigger)).toBe("unconfirmed");
 		db.transaction((tx) => db.outbox.markInflight(tx, deliveryId));
-		expect(escalationNoticeConfirmedInLedger(db, originKey, trigger)).toBe(false);
+		expect(escalationNoticeReceiptInLedger(db, originKey, trigger)).toBe("unconfirmed");
 		db.transaction((tx) => db.outbox.confirm(tx, deliveryId));
-		expect(escalationNoticeConfirmedInLedger(db, originKey, trigger)).toBe(true);
+		expect(escalationNoticeReceiptInLedger(db, originKey, trigger)).toBe("confirmed");
+		// Pruned after confirmation: missing again, never inferred as confirmed.
+		db.transaction((tx) => db.outbox.prune(tx, 0, Date.now() + 1_000));
+		expect(escalationNoticeReceiptInLedger(db, originKey, trigger)).toBe("missing");
 		// An expired notice (adapter offline past the outbox TTL) is never confirmed.
 		const expiredId = deterministicBindHoldDeliveryId(originKey, "m-expired", UNRESOLVED_HOLD_ESCALATED);
 		db.transaction((tx) =>
@@ -429,16 +432,16 @@ test("an escalation notice counts as confirmed only once its origin adapter conf
 		);
 		db.transaction((tx) => db.outbox.expireStale(tx, 86_400_000));
 		expect(db.outbox.get(expiredId)?.state).toBe("expired");
-		expect(escalationNoticeConfirmedInLedger(db, originKey, { ...trigger, message_id: "m-expired" })).toBe(false);
+		expect(escalationNoticeReceiptInLedger(db, originKey, { ...trigger, message_id: "m-expired" })).toBe("unconfirmed");
 		// A loopback notice only reaches the gateway log, never the chat client: never confirmed.
 		expect(
-			escalationNoticeConfirmedInLedger(db, "loopback/loopback/x", {
+			escalationNoticeReceiptInLedger(db, "loopback/loopback/x", {
 				message_id: "m",
 				origin_ref_json: JSON.stringify({ platform: "loopback", kind: "loopback", conversationId: "x" }),
 			}),
-		).toBe(false);
-		expect(escalationNoticeConfirmedInLedger(db, originKey, { message_id: "m", origin_ref_json: "not json" })).toBe(
-			false,
+		).toBe("unconfirmed");
+		expect(escalationNoticeReceiptInLedger(db, originKey, { message_id: "m", origin_ref_json: "not json" })).toBe(
+			"unconfirmed",
 		);
 	} finally {
 		db.close();
@@ -517,11 +520,11 @@ test("boot links the confirmed notice of every open legacy escalated hold before
 		expect(db.outbox.get(settledId)).toBeUndefined();
 		const open = origin("legacy-open");
 		expect(
-			escalationNoticeConfirmedInLedger(db, open.originKey, {
+			escalationNoticeReceiptInLedger(db, open.originKey, {
 				message_id: "m-open",
 				origin_ref_json: open.originRefJson,
 			}),
-		).toBe(true);
+		).toBe("confirmed");
 	} finally {
 		db.close();
 	}

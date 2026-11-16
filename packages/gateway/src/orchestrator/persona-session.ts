@@ -205,6 +205,22 @@ function escalationNoticeConfirmedKey(opRef: string): string {
 }
 
 /**
+ * Set when a hold's escalation notice was reissued because its delivery row was
+ * gone (pruned before the retention link existed). At most one reissue per hold:
+ * a second missing row is a ledger anomaly, not a reason to notify again.
+ */
+function escalationNoticeReissuedKey(opRef: string): string {
+	return `escalation-notice-reissued:${opRef}`;
+}
+
+/**
+ * What the delivery ledger knows about a hold's escalation notice. `missing`
+ * is a row that does not exist at all (never queued, or pruned); it is never
+ * read as confirmed.
+ */
+export type EscalationNoticeReceipt = "confirmed" | "unconfirmed" | "missing";
+
+/**
  * Links an escalation notice's delivery row to its open hold. Outbox retention
  * keeps a confirmed row while this key exists, so the proof that the user was
  * told outlives a gateway that stayed down past the confirmed-row retention.
@@ -423,6 +439,7 @@ function completeInboundTurn(
 	if (changed === 1) store.core.metaDelete(relayUnavailableTrackerKey(opRef));
 	if (changed === 1) store.core.metaDelete(retiredHoldDeadSinceKey(opRef));
 	if (changed === 1) store.core.metaDelete(escalationNoticeConfirmedKey(opRef));
+	if (changed === 1) store.core.metaDelete(escalationNoticeReissuedKey(opRef));
 	if (changed === 1 && trigger)
 		store.core.metaDelete(
 			escalationNoticeDeliveryKey(
@@ -817,7 +834,10 @@ export interface PersonaSessionManagerOptions {
 	 * A retired hold is abandoned only after it did. Unset means there is no
 	 * delivery ledger (the notice hook itself is final), which counts as confirmed.
 	 */
-	readonly escalationNoticeConfirmed?: (input: { originKey: string; trigger: InboundMessageRow }) => boolean;
+	readonly escalationNoticeReceipt?: (input: {
+		originKey: string;
+		trigger: InboundMessageRow;
+	}) => EscalationNoticeReceipt;
 	/** Called when a reverse request from the SDK host arrives. */
 	readonly onReverseRequest?: (input: {
 		originKey: string;
@@ -862,7 +882,7 @@ export class PersonaSessionManager {
 	readonly #heldSteerContextMessageId: PersonaSessionManagerOptions["heldSteerContextMessageId"];
 	readonly #brokerLiveness: BrokerLivenessProbe | undefined;
 	readonly #onBindHold: PersonaSessionManagerOptions["onBindHold"];
-	readonly #escalationNoticeConfirmed: PersonaSessionManagerOptions["escalationNoticeConfirmed"];
+	readonly #escalationNoticeReceipt: PersonaSessionManagerOptions["escalationNoticeReceipt"];
 	readonly #onReverseRequest: PersonaSessionManagerOptions["onReverseRequest"];
 	readonly #onSloEvent: PersonaSessionManagerOptions["onSloEvent"];
 	readonly #onBindFailure: PersonaSessionManagerOptions["onBindFailure"];
@@ -910,7 +930,7 @@ export class PersonaSessionManager {
 		this.#heldSteerContextMessageId = options.heldSteerContextMessageId;
 		this.#brokerLiveness = options.brokerLiveness;
 		this.#onBindHold = options.onBindHold;
-		this.#escalationNoticeConfirmed = options.escalationNoticeConfirmed;
+		this.#escalationNoticeReceipt = options.escalationNoticeReceipt;
 		this.#onReverseRequest = options.onReverseRequest;
 		this.#maxLiveHosts = positiveInteger(options.maxLiveHosts, DEFAULT_SESSIONS_MAX_LIVE_HOSTS, "maxLiveHosts");
 		this.#hostIdleRetireMs = positiveInteger(
@@ -1441,14 +1461,14 @@ export class PersonaSessionManager {
 		await this.#onHeldSteerAccepted?.(input);
 	}
 
-	/** Whether the origin confirmed this trigger's escalation notice; true without a delivery ledger. */
-	escalationNoticeConfirmed(originKey: string, trigger: InboundMessageRow): boolean {
-		if (!this.#escalationNoticeConfirmed) return true;
+	/** The ledger's receipt for this trigger's escalation notice; confirmed without a delivery ledger. */
+	escalationNoticeReceipt(originKey: string, trigger: InboundMessageRow): EscalationNoticeReceipt {
+		if (!this.#escalationNoticeReceipt) return "confirmed";
 		try {
-			return this.#escalationNoticeConfirmed({ originKey, trigger });
+			return this.#escalationNoticeReceipt({ originKey, trigger });
 		} catch (error) {
 			this.#log(`escalation_notice_confirm_failed origin=${originKey} detail=${safeDiagnostic(error)}`, "error");
-			return false;
+			return "unconfirmed";
 		}
 	}
 
@@ -2519,6 +2539,8 @@ class OriginActor {
 	readonly #holdSweeps = new Map<string, number>();
 	/** Logged recovery hold reasons to dedupe alternating reasons; keyed by "opRef:reason" (#772). */
 	readonly #loggedRecoveryHolds = new Set<string>();
+	/** Dead retired holds whose window closed while their producer process was still present, logged once. */
+	readonly #producerPresentLogged = new Set<string>();
 
 	/** Liveness of a binding from the raw broker envelope; the normalized inspect where the port has no raw read. */
 	async #bindingState(sessionId: string): Promise<{
@@ -5201,9 +5223,19 @@ class OriginActor {
 		this.#linkEscalationNotice(trigger);
 		const confirmedKey = escalationNoticeConfirmedKey(opRef);
 		if (database.core.metaGet(confirmedKey) === undefined) {
+			const receipt = this.#manager.escalationNoticeReceipt(this.originKey, trigger);
+			if (receipt === "missing") {
+				// No row at all: the notice of a hold escalated before the retention
+				// link existed was pruned, so nothing can ever prove the user was told.
+				// Post it once more under its deterministic id, so the ledger can
+				// confirm it; a missing row is never read as confirmed, and the
+				// held operation itself is never resent.
+				await this.#reissueEscalationNotice(opRef);
+				return false;
+			}
 			// Queued is not delivered: an adapter offline past the outbox TTL expires
 			// the notice, and closing then would leave the user told nothing.
-			if (!this.#manager.escalationNoticeConfirmed(this.originKey, trigger)) return false;
+			if (receipt !== "confirmed") return false;
 			database.core.metaSet(confirmedKey, "1");
 		}
 		const now = this.#manager.now();
@@ -5242,6 +5274,21 @@ class OriginActor {
 			await this.#forgetClosed(bound);
 			return true;
 		}
+		// Broker non-liveness is not producer exit: a detached host process can
+		// still be running the op (`session_not_live_but_process_live`). Close only
+		// on the port's identity-correlated process probe; absent or inconclusive
+		// evidence keeps the hold tracked, and the window, for the next sweep.
+		if (!(await this.#producerExited(bound))) {
+			if (!this.#producerPresentLogged.has(opRef)) {
+				this.#producerPresentLogged.add(opRef);
+				this.#manager.log(
+					`retired_hold_kept origin=${this.originKey} epoch=${bound.epoch} opRef=${opRef} session=${bound.sessionId} notLiveMs=${now - mark.at} host=${host.hostIncarnation} reason=producer_exit_unproven`,
+					"warn",
+				);
+			}
+			return false;
+		}
+		this.#producerPresentLogged.delete(opRef);
 		bound.tail?.setTurnRunning(false);
 		this.#flushStaleOutput(bound, "session_gone");
 		await bound.tail?.close();
@@ -5264,6 +5311,32 @@ class OriginActor {
 		);
 		const database = this.#manager.database;
 		if (database.core.metaGet(key) === undefined) database.core.metaSet(key, trigger.turn_op_ref ?? "");
+	}
+
+	/** True only on the port's positive process-exit evidence; no probe, a failed probe, or a present process is false. */
+	async #producerExited(bound: BoundTurn): Promise<boolean> {
+		const port = this.#manager.port;
+		if (port.hostExited === undefined) return false;
+		try {
+			return (await port.hostExited({ sessionId: bound.sessionId, repo: this.#manager.repo })) === true;
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			return false;
+		}
+	}
+
+	/** Posts a hold's escalation notice again, once, when its ledger row is gone; logged as an audit line. */
+	async #reissueEscalationNotice(opRef: string): Promise<void> {
+		const database = this.#manager.database;
+		const reissuedKey = escalationNoticeReissuedKey(opRef);
+		if (database.core.metaGet(reissuedKey) !== undefined) return;
+		database.core.metaSet(reissuedKey, new Date(this.#manager.now()).toISOString());
+		database.core.metaSet(escalationNoticeKey(this.originKey, opRef), "1");
+		this.#manager.log(
+			`escalation_notice_reissued origin=${this.originKey} opRef=${opRef} reason=receipt_missing`,
+			"warn",
+		);
+		await this.#emitEscalationNotices();
 	}
 
 	#clearRetiredHoldDeadSince(opRef: string): void {
