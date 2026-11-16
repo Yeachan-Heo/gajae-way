@@ -17,10 +17,11 @@ RUN bun run build
 # Runtime stage: minimal image with compiled binaries and gjc
 FROM oven/bun:1.4.0
 
-# Install system dependencies: curl (for gjc), procps (for healthcheck)
+# Install system dependencies: curl (for gjc), procps (for healthcheck), Python (for optional commons lookups)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     procps \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

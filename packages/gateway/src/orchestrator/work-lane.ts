@@ -191,16 +191,21 @@ async function appendCommonsRelated(text: string, config: WorkCommonsConfig | un
 		});
 		child = spawned;
 		const stdout = new Response(spawned.stdout).text();
-		spawned.stdin.write(taskExcerpt(text));
-		spawned.stdin.end();
-		const completed = Promise.all([child.exited, stdout]).then(([exitCode, output]) => ({
+		// Handle every pending stream promise immediately, including when a later
+		// synchronous stdin operation throws before Promise.all is constructed.
+		stdout.catch(() => undefined);
+		const timeout = new Promise<{ readonly kind: "timeout" }>((resolve) => {
+			timer = setTimeout(() => resolve({ kind: "timeout" }), COMMONS_RELATED_TIMEOUT_MS);
+		});
+		const written = Promise.resolve(spawned.stdin.write(taskExcerpt(text)));
+		written.catch(() => undefined);
+		const ended = Promise.resolve(spawned.stdin.end());
+		ended.catch(() => undefined);
+		const completed = Promise.all([child.exited, stdout, written, ended]).then(([exitCode, output]) => ({
 			kind: "complete" as const,
 			exitCode,
 			output,
 		}));
-		const timeout = new Promise<{ readonly kind: "timeout" }>((resolve) => {
-			timer = setTimeout(() => resolve({ kind: "timeout" }), COMMONS_RELATED_TIMEOUT_MS);
-		});
 		const result = await Promise.race([completed, timeout]);
 		clearTimeout(timer);
 		timer = undefined;
