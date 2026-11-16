@@ -1,6 +1,6 @@
 import { basename, dirname, join } from "node:path";
 import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
-import { ImagePreparationBudget } from "@gajae-gateway/images";
+import { ImagePreparationBudget, ImagePreparationBudgetError } from "@gajae-gateway/images";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import {
 	type ChannelEngagementPolicy,
@@ -1811,6 +1811,7 @@ export class ReconnectingGateway {
 	readonly #imageDone = new Set<string>();
 	readonly #imageUnsent = new Set<string>();
 	readonly #imageAdmissionFailures = new Map<string, number>();
+	readonly #imageBudgetDeferred = new Set<string>();
 	readonly #imageTurnOpen = new Set<string>();
 	readonly #blockedRecoveryChannels = new Set<string>();
 	readonly unnamedThreads = new UnnamedThreads();
@@ -1923,7 +1924,12 @@ export class ReconnectingGateway {
 		try {
 			if ((await initial) === "unavailable" && !this.#imageDone.has(message.id)) {
 				const current = await this.#imageOutbox.get(message.id).catch(() => undefined);
-				if (!current?.completed && !(current?.terminal && current.audited)) await settled;
+				if (
+					!current?.completed &&
+					!(current?.terminal && current.audited) &&
+					!this.#imageBudgetDeferred.has(message.id)
+				)
+					await settled;
 			}
 		} finally {
 			listeners.delete(release);
@@ -1950,6 +1956,8 @@ export class ReconnectingGateway {
 					messageId: message.id,
 					channelId,
 					createdAt: Date.now(),
+					sourceIdentity: imageSourceIdentity(message),
+					sourceText: typeof message.content === "string" ? message.content : "",
 					...(recovered ? {} : { live: true }),
 					...(sourceOrigin.kind === "dm" ? { dm: true } : {}),
 				};
@@ -1995,6 +2003,16 @@ export class ReconnectingGateway {
 			this.#imageAdmissionFailures.delete(message.id);
 			this.#imageUnsent.delete(message.id);
 		}
+		this.#imageBudgetDeferred.delete(message.id);
+		const admittedIdentity = entry.sourceIdentity ?? imageSourceIdentity(message);
+		const admittedText = entry.sourceText ?? (typeof message.content === "string" ? message.content : "");
+		if (
+			!entry.request &&
+			entry.sourceIdentity !== undefined &&
+			(admittedIdentity !== imageSourceIdentity(message) ||
+				admittedText !== (typeof message.content === "string" ? message.content : ""))
+		)
+			return this.terminateImage(entry, "image source changed after the message was edited");
 		// Best-effort: the durable outbox already makes this channel discoverable.
 		// A failing cursor store must not silence the DM's image while text flows.
 		//
@@ -2020,7 +2038,7 @@ export class ReconnectingGateway {
 		let prepared: { readonly images: PromptImage[]; readonly notice: string } | undefined;
 		let imageSource = message;
 		let refreshed = false;
-		const sourceIdentity = imageSourceIdentity(message);
+		const sourceIdentity = admittedIdentity;
 		for (let attempt = 1; attempt <= RECOVERY_MAX_ATTEMPTS; attempt++) {
 			try {
 				prepared = await this.prepareImages(imageSource);
@@ -2039,10 +2057,7 @@ export class ReconnectingGateway {
 						// edited it in the meantime, the new attachment is different bytes than the
 						// intent was recorded for; replaying it would answer an image the user
 						// replaced, and re-preparing forever would wedge the conversation.
-						if (
-							imageSourceIdentity(refreshedMessage) !== sourceIdentity ||
-							refreshedMessage.content !== message.content
-						)
+						if (imageSourceIdentity(refreshedMessage) !== sourceIdentity || refreshedMessage.content !== admittedText)
 							return this.terminateImage(entry, "image source changed after the message was edited");
 						imageSource = refreshedMessage;
 						refreshed = true;
@@ -2051,6 +2066,10 @@ export class ReconnectingGateway {
 					} catch {
 						return this.deferImageFailure(entry);
 					}
+				}
+				if (error instanceof ImagePreparationBudgetError) {
+					this.#imageBudgetDeferred.add(entry.messageId);
+					return this.deferImageFailure(entry);
 				}
 				if (error instanceof DiscordImagePreparationError && error.disposition === "terminal") {
 					return this.terminateImage(entry, "image input rejected");
@@ -2242,9 +2261,8 @@ export class ReconnectingGateway {
 			// sorted history pass delivers both. Without a horizon there is nothing to
 			// merge against, so replay directly.
 			const watermark = cursors?.recoveredThrough[entry.channelId] ?? cursors?.quarantined[entry.channelId]?.watermark;
-			const horizon =
-				watermark ?? (cursors ? snowflakeFromTimestamp(Date.now() - RECOVERY_BOOTSTRAP_LOOKBACK_MS) : undefined);
-			if (horizon !== undefined && snowflakeIsAfter(entry.messageId, horizon)) continue;
+			const horizon = watermark ?? snowflakeFromTimestamp(Date.now() - RECOVERY_BOOTSTRAP_LOOKBACK_MS);
+			if (snowflakeIsAfter(entry.messageId, horizon)) continue;
 			await this.retryPendingImage(entry);
 		}
 	}
@@ -2311,6 +2329,7 @@ export class ReconnectingGateway {
 	/** Drop every per-id structure after the intent can never need another attempt. */
 	private cleanupImageState(id: string): void {
 		this.#imageAdmissionFailures.delete(id);
+		this.#imageBudgetDeferred.delete(id);
 		const timer = this.#imageRetries.get(id);
 		if (timer) clearTimeout(timer);
 		this.#imageRetries.delete(id);
@@ -2554,7 +2573,7 @@ export class ReconnectingGateway {
 		try {
 			const options = {
 				clientName: "adapter-discord",
-				requiredCapabilities: ["chat.images"],
+				requiredCapabilities: ["chat.images", "gateway.status.databaseIdentity"],
 				onRetry: (attempt: number, delayMs: number, error: unknown) =>
 					console.warn(
 						`gateway_socket_waiting client=adapter-discord path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${error instanceof Error ? error.message : String(error)}`,

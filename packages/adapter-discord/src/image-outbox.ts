@@ -11,6 +11,10 @@ export type PendingImage = {
 	readonly completedAt?: number;
 	readonly createdAt?: number;
 	readonly origin?: OriginRef;
+	/** Attachment identity captured at admission, before preparation can fail. */
+	readonly sourceIdentity?: string;
+	/** Message text captured at admission, kept with sourceIdentity. */
+	readonly sourceText?: string;
 	readonly failureAt?: number;
 	readonly audited?: boolean;
 	/** The intent started as live ingress, so a retry may still select its destination. */
@@ -69,6 +73,8 @@ function validateEntry(value: unknown): asserts value is PendingImage {
 		("completedAt" in value && typeof value.completedAt !== "number") ||
 		("createdAt" in value && typeof value.createdAt !== "number") ||
 		("origin" in value && !isRecord(value.origin)) ||
+		("sourceIdentity" in value && typeof value.sourceIdentity !== "string") ||
+		("sourceText" in value && typeof value.sourceText !== "string") ||
 		("failureAt" in value && typeof value.failureAt !== "number") ||
 		("audited" in value && typeof value.audited !== "boolean") ||
 		("live" in value && typeof value.live !== "boolean") ||

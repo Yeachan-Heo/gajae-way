@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { prepareDiscordImages } from "../src/attachments";
+import { imageSourceIdentity } from "../src/attachments";
 import { type DiscordInboundMessage, decideInbound, ReconnectingGateway } from "../src/main";
 import { loadRecoveryCursors } from "../src/recovery";
 
@@ -100,6 +101,8 @@ test("a first-time DM image intent survives restart before preparation", async (
 				dm: true,
 				live: true,
 				createdAt: expect.any(Number),
+				sourceIdentity: imageSourceIdentity(message),
+				sourceText: message.content,
 				failureAt: expect.any(Number),
 			},
 		]);

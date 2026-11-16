@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { ImagePreparationBudgetError } from "@gajae-gateway/images";
 import { DiscordImagePreparationError } from "../src/attachments";
 import { decideInbound, ReconnectingGateway } from "../src/main";
 import { loadRecoveryCursors, saveRecoveryCursors, snowflakeFromTimestamp } from "../src/recovery";
@@ -1168,7 +1169,7 @@ test("a persisted image request replays even when the recovery cursor is unreada
 	const cleanupTimers = trackTimers();
 	const cursorPath = join(home, "recovery-cursor.json");
 	const channelId = "new-dm";
-	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const id = snowflakeFromTimestamp(Date.now() - 25 * 60 * 60 * 1000);
 	const requests: Array<{ verb: string; params: any }> = [];
 	try {
 		await mkdir(cursorPath);
@@ -1186,6 +1187,102 @@ test("a persisted image request replays even when the recovery cursor is unreada
 		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
 			{ messageId: id, channelId, completed: true, completedAt: expect.any(Number), declined: true, dm: true },
 		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a fresh durable image waits for history when the recovery cursor is unreadable", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-cursor-read-fresh-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "fresh-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await mkdir(cursorPath);
+		const request = {
+			messageId: id,
+			text: "look\n[image · photo.png]",
+			origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+			engagement: { mentioned: false, group: false, authorId: "human" },
+			images: [image],
+		};
+		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: id, channelId, request, dm: true }]));
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))[0].messageId).toBe(id);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an admitted source identity is retained across a restart before request persistence", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-source-retain-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "retained-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(
+			join(home, "image-outbox.json"),
+			JSON.stringify([
+				{ messageId: id, channelId, dm: true, sourceIdentity: "attachment-old", sourceText: "describe this" },
+			]),
+		);
+		const edited = dmMessage(id, channelId, true);
+		edited.content = "describe this differently";
+		const replacement: any = {
+			name: "photo.png",
+			contentType: "image/png",
+			url: "https://cdn.discordapp.com/photo.png",
+			id: "attachment-new",
+		};
+		edited.attachments = [replacement];
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		const engagement = decideInbound(edited as never, bot, {});
+		expect(engagement).toBeDefined();
+		expect(await bounded(adapter.processImage(edited as never, engagement!))).toBe("skip");
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))[0].terminal).toBe(true);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a budget-refused live image releases ingress while retrying", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-budget-release-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "budget-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, dm: true }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => message } }),
+			[],
+			{},
+			undefined,
+			async () => {
+				throw new ImagePreparationBudgetError();
+			},
+		);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		const first = adapter.processImage(message as never, engagement!);
+		const waiter = adapter.waitForImage(message as never, first);
+		await bounded(waiter, 1_500);
+		expect(await bounded(first)).toBe("unavailable");
 	} finally {
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });
