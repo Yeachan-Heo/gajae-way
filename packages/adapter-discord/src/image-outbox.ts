@@ -17,6 +17,8 @@ export type PendingImage = {
 	readonly live?: boolean;
 	/** The gateway explicitly declined this send: no work ran, so no quota-charged tombstone. */
 	readonly declined?: boolean;
+	/** A restore turned this completed DM into a replay target; it is already queued. */
+	readonly restored?: boolean;
 	readonly dm?: boolean;
 };
 
@@ -71,6 +73,7 @@ function validateEntry(value: unknown): asserts value is PendingImage {
 		("audited" in value && typeof value.audited !== "boolean") ||
 		("live" in value && typeof value.live !== "boolean") ||
 		("declined" in value && typeof value.declined !== "boolean") ||
+		("restored" in value && typeof value.restored !== "boolean") ||
 		("dm" in value && typeof value.dm !== "boolean") ||
 		(value.declined === true && value.completed !== true) ||
 		(value.terminal === true && value.completed === true)
@@ -227,12 +230,17 @@ export class ImageOutbox {
 		return this.#entries;
 	}
 
-	/** Drop completion tombstones after the gateway database was replaced. */
+	/** Retain non-enumerable DM targets as replay intents after a gateway restore. */
 	async invalidateCompleted(): Promise<void> {
 		return this.#serialize(async () => {
 			const entries = await this.#loadEntries();
-			const kept = entries.filter((entry) => !entry.completed);
-			if (kept.length === entries.length) return;
+			if (!entries.some((entry) => entry.completed)) return;
+			const kept: PendingImage[] = entries.flatMap((entry) => {
+				if (!entry.completed) return [entry];
+				return entry.dm
+					? [{ messageId: entry.messageId, channelId: entry.channelId, dm: true, restored: true }]
+					: [];
+			});
 			await writeEntries(this.#path, kept);
 			this.#entries = kept;
 			this.#index = new Map(kept.map((entry) => [entry.messageId, entry]));
