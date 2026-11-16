@@ -1886,3 +1886,58 @@ test("a restored DM replay never evicts a live known DM", async () => {
 		await rm(home, { recursive: true, force: true });
 	}
 }, 12_000);
+
+test("a request-bearing restored DM retry never evicts a live DM", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-restore-replay-retry-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const recent = new Date(Date.now() - 60_000).toISOString();
+	const completedAt = Date.now() - 60 * 60 * 1000;
+	const id = snowflakeFromTimestamp(completedAt);
+	const request = {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: "dm-a", peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			// The watermark is past the intent, so the request retry runs instead of
+			// deferring behind a history pass.
+			recoveredThrough: { "dm-a": snowflakeFromTimestamp(Date.now()) },
+			knownDms: Object.fromEntries(
+				Array.from({ length: 100 }, (_, index) => [`dm-${index}`, { lastSeenAt: recent, seq: index + 1 }]),
+			),
+			sequence: 100,
+			gatewayDbIdentity: "0:0",
+		});
+		// The state left after a restored replay prepared its message and the first send
+		// failed: the persisted request still carries the restore marker.
+		await writeFile(
+			outboxPath,
+			JSON.stringify([{ messageId: id, channelId: "dm-a", dm: true, restored: true, request, failureAt: Date.now() }]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			requests,
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "0:0" } } : { engaged: true, turnId: "turn-1" },
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		const cursors = await loadRecoveryCursors(cursorPath);
+		expect(Object.keys(cursors.knownDms)).toHaveLength(100);
+		expect(cursors.knownDms["dm-0"]).toBeDefined();
+		expect(cursors.knownDms["dm-a"]).toBeUndefined();
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([id]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 20_000);

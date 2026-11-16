@@ -2481,7 +2481,9 @@ export class ReconnectingGateway {
 					)
 						return this.deferImageFailure(current);
 					if (isReplayableImageRequest(current.request, current.messageId)) {
-						await this.rememberInboundDm(current.request.origin as OriginRef);
+						// A restored row is already a durable target: registering it here would
+						// give it the newest retention slot and evict a live DM at the cap.
+						if (!current.restored) await this.rememberInboundDm(current.request.origin as OriginRef);
 						return this.sendPendingImage(current);
 					}
 					return this.terminateImage(current, "persisted image request is invalid");
