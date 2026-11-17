@@ -722,9 +722,16 @@ test("a saturated CLI pool times out only the queued call and never marks the br
 	hold = true;
 	const commands = Array.from({ length: 4 }, () => value.cli(["sdk", "session", "list"], { timeoutMs: 500 }));
 	await eventually(() => active === 4);
-	await expect(value.cli(["sdk", "session", "list"], { timeoutMs: 5 })).rejects.toBeInstanceOf(
-		GjcCommandQueueTimeoutError,
-	);
+	const queued = value.cli(["sdk", "session", "list"], { timeoutMs: 5 }).catch((error: unknown) => error);
+	// Delay timer handling beyond its budget to distinguish actual waiting from the timeout setting.
+	const blockUntil = Date.now() + 40;
+	while (Date.now() < blockUntil) {}
+	const timeout = await queued;
+	expect(timeout).toBeInstanceOf(GjcCommandQueueTimeoutError);
+	if (!(timeout instanceof GjcCommandQueueTimeoutError)) throw new Error("expected queue timeout");
+	expect(timeout.timeoutMs).toBe(5);
+	expect(timeout.queueWaitMs).toBeGreaterThanOrEqual(40);
+	expect(timeout.message).toContain(`queueWaitMs=${timeout.queueWaitMs}`);
 	expect(value.isAvailable).toBe(true);
 	expect(outages).toEqual([]);
 	hold = false;

@@ -2870,6 +2870,9 @@ function sanitizeSdkFailure(error: unknown): Error {
 			stableErrorCode(error.code) ?? "sdk_error",
 			sanitizedDetails(error.details),
 		);
+	// Preserve GjcCommandQueueTimeoutError through sanitization so it can be
+	// properly classified as session_bind_failed during bind/configure phases (#748).
+	if (error instanceof GjcCommandQueueTimeoutError) return error;
 	if (error instanceof GjcCliError) {
 		const code = sdkErrorCode(error) ?? "sdk_error";
 		return new GjcCliError(
