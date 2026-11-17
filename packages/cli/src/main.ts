@@ -25,6 +25,7 @@ import type {
 	WorkSteerResult,
 } from "@gajae-gateway/protocol";
 import {
+	isWorkRefusalCause,
 	LOOPBACK_ORIGIN,
 	OPS_CYCLE_MAX_LIMIT,
 	originKey,
@@ -1279,7 +1280,26 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				throw new Error(CLI_USAGE);
 		}
 	} catch (error) {
-		console.error(error instanceof Error ? error.message : String(error));
+		// The SDK and CLI may load different physical copies of the protocol package.
+		const protocolError =
+			error instanceof Error && error.name === "ProtocolError" && "code" in error && error.code === "verb_failed";
+		const detail = protocolError && "detail" in error ? error.detail : undefined;
+		if (
+			parsed.command === "work" &&
+			(parsed.rest[0] === "run" || parsed.rest[0] === "start") &&
+			protocolError &&
+			typeof detail === "object" &&
+			detail !== null &&
+			!Array.isArray(detail) &&
+			"reasonCode" in detail &&
+			detail.reasonCode === "send_rejected"
+		) {
+			// Never print structured detail or a remote refusal message. Only these
+			// exact diagnostic tokens are safe; none implies automatic replay.
+			const cause = "cause" in detail ? detail.cause : undefined;
+			const safeCause = isWorkRefusalCause(cause);
+			console.error(`work send rejected${safeCause ? ` cause=${cause}` : ""}`);
+		} else console.error(error instanceof Error ? error.message : String(error));
 		process.exitCode = 1;
 	}
 }
