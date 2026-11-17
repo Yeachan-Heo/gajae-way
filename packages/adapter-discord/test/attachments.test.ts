@@ -117,9 +117,9 @@ test("unsupported images retain their URLs and captions beside ordinary attachme
 				downloads++;
 				return Uint8Array.of(1);
 			},
-			prepare: async () => ({ images: [], notice: "" }),
+			prepare: async () => ({ images: [] }),
 		}),
-	).toEqual({ images: [], notice: "" });
+	).toEqual({ images: [] });
 	expect(downloads).toBe(0);
 });
 
@@ -142,7 +142,7 @@ test("Discord image downloads preserve signed URLs and pass only the approved ho
 			},
 			prepare: async (sources) => {
 				preparedSources = sources;
-				return { images: [{ data: "AQ==", mimeType: "image/jpeg" }], notice: "resized" };
+				return { images: [{ data: "AQ==", mimeType: "image/jpeg" }] };
 			},
 		},
 	);
@@ -151,7 +151,7 @@ test("Discord image downloads preserve signed URLs and pass only the approved ho
 		{ url: mediaUrl, allowedHosts: DISCORD_IMAGE_ALLOWED_HOSTS },
 	]);
 	expect(preparedSources).toEqual([Uint8Array.of(1), Uint8Array.of(2)]);
-	expect(result).toEqual({ images: [{ data: "AQ==", mimeType: "image/jpeg" }], notice: "resized" });
+	expect(result).toEqual({ images: [{ data: "AQ==", mimeType: "image/jpeg" }] });
 });
 
 test("arbitrary image hosts are rejected before reaching the download helper", async () => {
@@ -173,7 +173,7 @@ test("arbitrary image hosts are rejected before reaching the download helper", a
 			},
 			{
 				download: downloadPromptImage,
-				prepare: async () => ({ images: [], notice: "" }),
+				prepare: async () => ({ images: [] }),
 				fetch: fetchImage,
 			},
 		),
@@ -185,7 +185,7 @@ test("permanent HTTP image failures are terminal while server failures stay retr
 	const message = {
 		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo" }],
 	};
-	const prepare = async () => ({ images: [], notice: "" });
+	const prepare = async () => ({ images: [] });
 	const unavailable: ImageFetch = async () => new Response("unavailable", { status: 503 });
 	const expired: ImageFetch = async () => new Response("expired", { status: 403 });
 	await expect(
@@ -220,7 +220,7 @@ test("more than four images are rejected before any download", async () => {
 					downloadCount++;
 					return Uint8Array.of(1);
 				},
-				prepare: async () => ({ images: [], notice: "" }),
+				prepare: async () => ({ images: [] }),
 			},
 		),
 	).rejects.toThrow("at most 4 images");
@@ -249,7 +249,7 @@ test("the shared budget bounds native preparations and holds a failed job until 
 		},
 		prepare: async () => {
 			prepared++;
-			return { images: [], notice: "" };
+			return { images: [] };
 		},
 	};
 	const message = (...paths: string[]) => ({
@@ -266,16 +266,16 @@ test("the shared budget bounds native preparations and holds a failed job until 
 		"https://cdn.discordapp.com/sibling",
 		"https://cdn.discordapp.com/other",
 	]);
-	await expect(prepareImages({}, ports)).resolves.toEqual({ images: [], notice: "" });
+	await expect(prepareImages({}, ports)).resolves.toEqual({ images: [] });
 	await expect(
 		prepareImages({ attachments: [{ contentType: "image/gif", url: "https://cdn.discordapp.com/gif" }] }, ports),
-	).resolves.toEqual({ images: [], notice: "" });
+	).resolves.toEqual({ images: [] });
 	await Promise.resolve();
 	await expect(prepareImages(message("still-blocked"), ports)).rejects.toThrow();
 	expect(downloads).toHaveLength(3);
 	releaseSibling(Uint8Array.of(2));
 	expect(await failed).toMatchObject({ disposition: "retryable" });
-	await expect(prepareImages(message("accepted"), ports)).resolves.toEqual({ images: [], notice: "" });
+	await expect(prepareImages(message("accepted"), ports)).resolves.toEqual({ images: [] });
 	releaseOther(Uint8Array.of(3));
 	await pending;
 	expect(prepared).toBe(2);
@@ -300,7 +300,7 @@ test("native decoding retains its budget slot until preparation finishes", async
 		prepare: async () => {
 			decoding();
 			await pendingDecode;
-			return { images: [], notice: "" };
+			return { images: [] };
 		},
 	};
 	const message = { attachments: [{ contentType: "image/jpeg", url: "https://cdn.discordapp.com/photo" }] };

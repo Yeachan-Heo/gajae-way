@@ -1086,7 +1086,22 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					const client = await connectGatewaySocket(parsed.socket);
 					try {
 						if (command === "status") {
-							console.log(JSON.stringify(await client.request<WorkStatusResult>("work.status", { name })));
+							try {
+								console.log(JSON.stringify(await client.request<WorkStatusResult>("work.status", { name })));
+							} catch (error) {
+								if (
+									error instanceof ProtocolError &&
+									typeof error.detail === "object" &&
+									error.detail !== null &&
+									"reasonCode" in error.detail &&
+									error.detail.reasonCode === "unknown_work_lane"
+								) {
+									throw new Error(
+										"unknown work lane; a previous start or run may still be admitted after a timeout or disconnect. Do not blindly retry, even with the same name; continue observing and reconcile the original request.",
+									);
+								}
+								throw error;
+							}
 						} else {
 							const result = await client.request<WorkSteerResult>("work.steer", { name, text });
 							console.log(result.steered ? `steered: ${result.clientRef}` : `not steered: ${result.reason}`);
@@ -1260,7 +1275,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					};
 				}
 				// This is a caller response-wait budget, never an attempt deadline.
-				// Timeout/disconnect leaves the attempt observable via work.status.
+				// Timeout/disconnect does not cancel admission or an accepted attempt.
 				const client = await connectGatewaySocket(parsed.socket, {
 					requestTimeoutMs: command === "run" ? 3_600_000 : 120_000,
 				});
