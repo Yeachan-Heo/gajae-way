@@ -348,10 +348,10 @@ export class ImageOutbox {
 			// must not grow until the next recovery load.
 			const pruned = pruneEntries(entries);
 			if (index === -1 && !entry.completed && !entry.terminal) {
-				const unresolved = pruned.filter((pending) => !pending.completed && !pending.terminal);
-				const terminal = pruned.filter((pending) => pending.terminal);
-				// Declined tombstones are reclaimable evidence, never delivery quota:
+				// Declined entries are reclaimable evidence, never delivery quota:
 				// one declined image must not be able to block a later authorized one.
+				const unresolved = pruned.filter((pending) => !pending.declined && !pending.completed && !pending.terminal);
+				const terminal = pruned.filter((pending) => !pending.declined && pending.terminal && !pending.completed);
 				const completed = pruned.filter((pending) => pending.completed && pending.declined !== true);
 				if (
 					unresolved.length >= MAX_UNRESOLVED_IMAGES ||

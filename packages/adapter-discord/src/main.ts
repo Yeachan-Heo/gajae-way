@@ -2064,8 +2064,9 @@ export class ReconnectingGateway {
 					// Mark as declined instead of unresolved to avoid exhausting admission capacity.
 					// Declined entries don't gate admission and are evicted oldest-first at their own
 					// limit, so they don't block later authorized images.
+					const declined = { ...entry, declined: true };
 					try {
-						await this.#imageOutbox.put({ ...entry, declined: true });
+						await this.#imageOutbox.put(declined);
 					} catch {
 						// If outbox write fails, return unavailable without persisting
 						return "unavailable";

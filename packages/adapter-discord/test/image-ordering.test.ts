@@ -357,14 +357,15 @@ test("an unreadable history channel still reaches a terminal image diagnosis", a
 		const adapter = gateway(cursorPath, async () => channel, requests);
 		await bounded(adapter.recoverMissedMessages());
 		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
-		// Permission failures (403) are now retryable per P2 fix, so the message is deferred, not dead-lettered immediately
-		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([]);
+		// Pre-expired entry (25 days ago) is dead-lettered; fresh 403 errors are retryable per P2 fix
+		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
 		const outbox = JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8")) as unknown[];
 		expect(outbox.length).toBe(1);
-		// The entry should be deferred with failureAt, not terminal
-		expect((outbox[0] as Record<string, unknown>).failureAt).toBeDefined();
-		expect((outbox[0] as Record<string, unknown>).terminal).toBeUndefined();
-		await bounded(adapter.waitForImage({ id } as never, Promise.resolve("unavailable")), 2_000);
+		// The entry should be marked terminal and audited after dead-lettering
+		expect((outbox[0] as Record<string, unknown>).terminal).toBe(true);
+		expect((outbox[0] as Record<string, unknown>).audited).toBe(true);
+		// Dead-lettered message should not wait (already terminal)
+		expect(await bounded(adapter.waitForImage({ id } as never, Promise.resolve("unavailable")), 100)).toBe(undefined);
 	} finally {
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });
