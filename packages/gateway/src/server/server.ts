@@ -94,6 +94,8 @@ import type { GlobalGjcClient } from "../orchestrator/broker";
 import { ghCheckStatusClient } from "../orchestrator/gh-checks";
 import { LaneGovernor } from "../orchestrator/lane-governor";
 import {
+	deterministicBindHoldDeliveryId,
+	type EscalationNoticeReceipt,
 	PERSONA_RESTART_DRAIN_MAX_WAIT_MS,
 	PERSONA_RESTART_DRAIN_WAIT_MS,
 	type PersonaBindHoldInput,
@@ -1025,6 +1027,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		hostIdleRetireMs: options.config.sessions?.idleRetireMs,
 		busyStallMs: options.config.sessions?.busyStallMs,
 		unresolvedHoldMs: options.config.sessions?.unresolvedHoldMs,
+		retiredHoldAbandonMs: options.config.sessions?.retiredHoldAbandonMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
 		brokerAvailable: () => options.broker?.isAvailable ?? true,
 		// biome-ignore lint/style/noNonNullAssertion: broker is non-null when lambda is called
@@ -1052,6 +1055,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			);
 			if (payload) broadcastDelivery(runtime, payload);
 		},
+		// A dead retired hold is abandoned only once its origin confirmed the
+		// escalation notice; a queued or expired notice is not proof the user was told.
+		escalationNoticeReceipt: ({ originKey, trigger }) =>
+			escalationNoticeReceiptInLedger(options.database, originKey, trigger),
 		onTurnStart: async (input) => await createInboundTurnLifecycle(input, options, runtime),
 		// A steer whose acceptance was learnt after its turn's lifecycle is gone
 		// (resolved at terminal or after a restart) is finalized exactly like a
@@ -4717,10 +4724,32 @@ function deterministicDeliveryExpiredNoticeId(deliveryId: string): string {
 }
 
 /** One bind-hold notice per trigger, and one separate notice when that trigger's unresolved hold is escalated (#686). */
-function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string, reason: string): string {
-	const kind = reason === UNRESOLVED_HOLD_ESCALATED ? UNRESOLVED_HOLD_ESCALATED : "bind_hold";
-	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|${kind}`).digest("hex").slice(0, 32)}`;
+/**
+ * The delivery ledger's receipt for the escalation notice of this trigger
+ * (#686). Only a `confirmed` row is confirmed; queued, in-flight, ambiguous or
+ * expired is unconfirmed; no row at all is `missing` (pruned, or never queued).
+ * A loopback notice is only written to the gateway log, which the chat client
+ * never shows, so it is unconfirmed and a loopback hold is never abandoned.
+ */
+export function escalationNoticeReceiptInLedger(
+	database: Pick<Store, "outbox">,
+	originKey: string,
+	trigger: Pick<InboundMessageRow, "message_id" | "origin_ref_json">,
+): EscalationNoticeReceipt {
+	let origin: OriginRef;
+	try {
+		origin = validateOriginRef(JSON.parse(trigger.origin_ref_json) as OriginRef);
+	} catch {
+		return "unconfirmed";
+	}
+	if (origin.platform === "loopback") return "unconfirmed";
+	const deliveryId = deterministicBindHoldDeliveryId(originKey, trigger.message_id, UNRESOLVED_HOLD_ESCALATED);
+	const row = database.outbox.get(deliveryId);
+	if (!row) return "missing";
+	return row.state === "confirmed" ? "confirmed" : "unconfirmed";
 }
+
+export { deterministicBindHoldDeliveryId };
 
 /** One deliverable part of a persona answer: here (optionally threaded) or posted to another conversation. */
 interface PlannedPart {
