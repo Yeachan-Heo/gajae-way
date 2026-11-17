@@ -113,9 +113,9 @@ export function createDiscordImagePreparer(budget: ImagePreparationBudget): type
 export async function prepareDiscordImages(
 	message: AttachmentCarrier,
 	ports: DiscordImagePreparationPorts = DEFAULT_IMAGE_PREPARATION_PORTS,
-): Promise<{ readonly images: PromptImage[]; readonly notice: string }> {
+): Promise<{ readonly images: PromptImage[] }> {
 	const attachments = selectNativeImageAttachments(message);
-	if (attachments.length === 0) return { images: [], notice: "" };
+	if (attachments.length === 0) return { images: [] };
 	if (attachments.length > 4)
 		throw new DiscordImagePreparationError("terminal", "Discord messages support at most 4 images.");
 	const urls = attachments.map((attachment) => {

@@ -228,11 +228,6 @@ test("reacts to an inbound message by the chat-scoped id its turn was keyed with
 			"900",
 			{ chats: {} },
 			{ save: async () => Promise.reject(new Error("a text message never carries an attachment")) },
-			{
-				sendMessage: async () => {
-					throw new Error("text input must not emit an image notice");
-				},
-			},
 		);
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		await adapter.handleUpdate(mockGateway(requests), {
@@ -327,11 +322,6 @@ test("a reply to a forum topic message carries the chat-scoped id the persona ca
 			"900",
 			{ chats: {} },
 			{ save: async () => Promise.reject(new Error("a text message never carries an attachment")) },
-			{
-				sendMessage: async () => {
-					throw new Error("text input must not emit an image notice");
-				},
-			},
 		);
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		await adapter.handleUpdate(mockGateway(requests), {
@@ -437,11 +427,6 @@ test("handleUpdate reports an inbound reaction as engagement and never as a turn
 			"900",
 			{ chats: { "-100123": { engagement: "open" } } },
 			{ save: async () => Promise.reject(new Error("a reaction never carries an attachment")) },
-			{
-				sendMessage: async () => {
-					throw new Error("reactions must not emit an image notice");
-				},
-			},
 		);
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		const accepted = await adapter.handleUpdate(mockGateway(requests), {
@@ -476,11 +461,6 @@ test("a rejected reaction is recorded durably and later reactions remain process
 					throw new Error("unexpected attachment");
 				},
 			},
-			{
-				sendMessage: async () => {
-					throw new Error("unexpected notice");
-				},
-			},
 		);
 		const first = { update_id: 5, message_reaction: reactionUpdate([], [{ type: "emoji", emoji: "👍" }]) };
 		const failure = new ProtocolError("invalid_params", "secret reaction text", { token: "secret-token" });
@@ -497,14 +477,7 @@ test("a rejected reaction is recorded durably and later reactions remain process
 		const reloaded = await TelegramAdapterState.load(home);
 		expect(reloaded.updateId).toBe(5);
 		expect(reloaded.lastRejection).toEqual({ updateId: 5, verb: "engagement.reaction", code: "invalid_params" });
-		const restarted = new TelegramAdapter(
-			reloaded,
-			"agent",
-			"900",
-			{ chats: {} },
-			adapter.attachments,
-			adapter.replyBot,
-		);
+		const restarted = new TelegramAdapter(reloaded, "agent", "900", { chats: {} }, adapter.attachments);
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		expect(await restarted.handleUpdate(mockGateway(requests), first)).toBe(false);
 		const second = { update_id: 6, message_reaction: reactionUpdate([], [{ type: "emoji", emoji: "🔥" }]) };

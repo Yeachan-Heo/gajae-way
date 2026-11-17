@@ -1,13 +1,12 @@
-import { basename, dirname, join } from "node:path";
+import { basename, join } from "node:path";
 import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gajae-gateway/home";
-import { ImagePreparationBudget, ImagePreparationBudgetError } from "@gajae-gateway/images";
+import { ImagePreparationBudget } from "@gajae-gateway/images";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import {
 	type ChannelEngagementPolicy,
 	type ChatMessagePayload,
 	type ChatProgressPayload,
 	type EngagementContext,
-	type GatewayStatusResult,
 	type OriginRef,
 	PRESENCE_ALL_MARKERS,
 	type PresenceState,
@@ -17,7 +16,6 @@ import {
 	presenceTransition,
 	type ReactionAction,
 	type SessionModelChoicesResult,
-	validateOriginRef,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import { AttachmentBuilder, Client, GatewayIntentBits, MessageFlags, Partials } from "discord.js";
@@ -28,7 +26,6 @@ import {
 	DiscordImagePreparationError,
 	describeInboundBody,
 	firstVoiceMessage,
-	imageSourceIdentity,
 	prepareDiscordImages,
 	selectNativeImageAttachments,
 } from "./attachments";
@@ -43,7 +40,6 @@ import {
 	type StatusReactionsMode,
 } from "./config";
 import { GatewayDownAlarm, lastLogLine } from "./down-alert";
-import { ImageOutbox, ImageOutboxCapacityError, type PendingImage } from "./image-outbox";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
 import { loadDiscordMedia, parseDiscordMedia } from "./outgoing-attachments";
 import {
@@ -58,13 +54,10 @@ import {
 	classifyRecoveryFailure,
 	clearAttempt,
 	recoveryCursorPath as defaultRecoveryCursorPath,
-	isDefinitiveDiscordNotFound,
 	isPermanentDiscordUnreadable,
 	loadRecoveryCursors,
 	pruneKnownDms,
 	RECOVERY_ATTEMPT_BACKOFF_MS,
-	RECOVERY_BOOTSTRAP_LOOKBACK_MS,
-	RECOVERY_KNOWN_DM_TTL_MS,
 	RECOVERY_MAX_ATTEMPTS,
 	RECOVERY_MAX_PAGES,
 	RECOVERY_RETRY_BASE_MS,
@@ -81,7 +74,6 @@ import {
 	rememberKnownDm,
 	retainRecoveryCursors,
 	saveRecoveryCursors,
-	snowflakeFromTimestamp,
 	snowflakeIsAfter,
 	summarizeRecoveryFailure,
 } from "./recovery";
@@ -382,8 +374,6 @@ export function describeMessageEdit(
  * without its own setting follows the adapter-wide default (true when unset).
  * The thread is named after the message; a bare mention leaves the fallback
  * name, and the thread is renamed from the first message that says something.
- * An ambiguous failure can adopt the thread Discord may have created through
- * `recoverAmbiguous`; a caller that cannot adopt falls back to the parent channel.
  */
 export async function maybeCreateThreadOnMention(
 	message: DiscordInboundMessage,
@@ -392,13 +382,10 @@ export async function maybeCreateThreadOnMention(
 	policy: DiscordChannelPolicy | undefined,
 	unnamed: UnnamedThreads,
 	defaultThreadOnMention = true,
-	options: { readonly recoverAmbiguous?: (messageId: string) => Promise<OriginRef | undefined> } = {},
 ): Promise<OriginRef> {
 	// Only thread channel mentions: not DMs, not already in a thread, and bot must be mentioned.
 	if (origin.kind !== "channel" || !engagement.mentioned) return origin;
 	if (!(policy?.threadOnMention ?? defaultThreadOnMention)) return origin;
-	// Partial or synthetic messages need not expose the thread API.
-	if (typeof (message as unknown as { startThread?: unknown }).startThread !== "function") return origin;
 
 	try {
 		const name = deriveThreadName(message.content);
@@ -421,18 +408,6 @@ export async function maybeCreateThreadOnMention(
 			threadVisibility: "public",
 		};
 	} catch (error) {
-		// A timeout or "already has a thread" may mean Discord created it. Recovered
-		// image intents must adopt that thread instead of creating a second one.
-		if (deliveryFailureIsAmbiguous(error) && options.recoverAmbiguous) {
-			const recovered = await options.recoverAmbiguous(message.id);
-			if (recovered) return recovered;
-			// The thread may exist but be unreadable; the parent channel still delivers,
-			// and the gateway's message-id dedupe absorbs any retry.
-			console.error(
-				`Discord thread adoption failed for message ${message.id} in channel ${origin.conversationId}; using channel.`,
-			);
-			return origin;
-		}
 		// Thread creation failed (permissions, rate limits, etc.); continue with channel origin.
 		console.error(
 			`Discord thread creation failed for message ${message.id} in channel ${origin.conversationId}: ${error instanceof Error ? error.message : String(error)}`,
@@ -976,16 +951,6 @@ async function sendFirstDiscordPart(
 	}
 }
 
-async function sendDiscordInboundNotice(message: DiscordInboundMessage, content: string): Promise<void> {
-	const channel = message.channel as typeof message.channel & { send?: DiscordTextChannelLike["send"] };
-	if (typeof channel.send !== "function") return;
-	try {
-		await sendFirstDiscordPart({ send: channel.send.bind(channel) }, { content }, message.id);
-	} catch {
-		console.error(`Discord inbound image notice failed message=${message.id}.`);
-	}
-}
-
 export async function settleDiscordDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	discord: DiscordClientLike,
@@ -1397,7 +1362,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 	// The gateway serializes turns per origin, but it serializes them in arrival
 	// order, so the ordering has to be preserved here, before it hands them over.
 	const ingress = new OrderedIngress();
-	const unnamedThreads = gateway.unnamedThreads;
+	const unnamedThreads = new UnnamedThreads();
 	discord.on("messageCreate", (message) => {
 		const engagement = decideInbound(message, discord.user, config.channels);
 		if (!engagement) return;
@@ -1410,25 +1375,18 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		const messageChannelId = origin.conversationId;
 		const receivedAt =
 			typeof message.createdTimestamp === "number" ? new Date(message.createdTimestamp).toISOString() : undefined;
-		if (selectNativeImageAttachments(message).length > 0) {
-			// Discord can redeliver the same message while its first delivery is
-			// still settling. Reserving another ordered turn would queue that turn
-			// behind the waiter it is supposed to release.
-			if (gateway.imageInFlight(message.id)) return;
-			let start!: () => void;
-			const turn = new Promise<void>((resolve) => {
-				start = resolve;
-			});
-			const image = gateway.processImage(message, engagement, unnamedThreads, turn);
-			ingress.run(origin.conversationId, async () => {
-				start();
-				await gateway.waitForImage(message, image);
-			});
-			return;
-		}
 		ingress.run(origin.conversationId, async () => {
-			// Non-image attachments (voice, unsupported formats) are rendered into
-			// the body; only native images travel through the durable image owner.
+			let preparedImages: { readonly images: PromptImage[] };
+			try {
+				preparedImages = await prepareImages(message);
+			} catch {
+				// The shared helper sanitizes its failure; omit its details here as a
+				// final guard against a signed CDN URL reaching logs. No text fallback.
+				console.error(`Discord image preparation failed message=${message.id}; no chat.send was issued.`);
+				return;
+			}
+			// Do not create a thread for an image that cannot be sent.
+			// Auto-create thread on mention in channel (Hermes-like contract).
 			void nameThreadFromMessage(message, origin, unnamedThreads);
 			origin = await maybeCreateThreadOnMention(
 				message,
@@ -1446,16 +1404,26 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			// spoken message is answered in voice and text both, without the
 			// persona having to ask for it.
 			const spoken = firstVoiceMessage(message) !== undefined;
-			gateway.sendInbound(message.id as string, origin, body, engagement, receivedAt, spoken, messageChannelId);
+			if (preparedImages.images.length === 0) {
+				gateway.sendInbound(message.id as string, origin, body, engagement, receivedAt, spoken, messageChannelId);
+				return;
+			}
+			await gateway.requestInbound(
+				message.id as string,
+				origin,
+				body,
+				engagement,
+				receivedAt,
+				spoken,
+				messageChannelId,
+				preparedImages.images,
+			);
 		});
 	});
 	// An edit is an update of a message the persona may already have read, not a
 	// new message: it goes out as chat.edit and reaches the session as a
 	// [MESSAGE POINTER] update. Partial (uncached) messages carry no author or
 	// content until fetched; fetching is what makes the edit describable.
-	discord.on("messageDelete", (message) => {
-		if (message?.id) void gateway.invalidateImageSource(message.id, "image source message was deleted");
-	});
 	discord.on("messageUpdate", (before, after) => {
 		void (async () => {
 			const message = after.partial ? await after.fetch().catch(() => undefined) : after;
@@ -1463,10 +1431,8 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			const imageEdit =
 				selectNativeImageAttachments(message).length > 0 || selectNativeImageAttachments(before).length > 0;
 			if (imageEdit) {
-				if (typeof message.editedTimestamp === "number" && decideInbound(message, discord.user, config.channels)) {
+				if (typeof message.editedTimestamp === "number" && decideInbound(message, discord.user, config.channels))
 					console.error(`Discord image edit rejected message=${message.id}; native image edits are unsupported.`);
-					void gateway.invalidateImageSource(message.id, "image source message was edited");
-				}
 				return;
 			}
 			const edit = describeMessageEdit(message, discord.user, config.channels, before);
@@ -1720,113 +1686,21 @@ export type RecoveredSendResult =
 	| { readonly verdict: "duplicate" }
 	| { readonly verdict: "unavailable"; readonly failure: RecoveryFailureClass; readonly summary: string };
 
-/** Outcome of one image delivery attempt. `unavailable` leaves the intent for retry. */
-export type ImageOutcome = "acked" | "skip" | "unavailable";
-
-/**
- * An image intent that has never been acknowledged for this long is dead-lettered.
- * This covers a signed CDN source past its lifetime, but also a deterministic
- * rejection that the classifier cannot prove is per-payload: the alternative is
- * an ingress chain and a recovery watermark wedged forever.
- */
-const IMAGE_INTENT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
-/** Gateway inbound dedupe retention; a replay older than this is never safe. */
-const IMAGE_REPLAY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
-/** Bounded pre-intent admission attempts before releasing ordered ingress. */
-const MAX_IMAGE_ADMISSION_FAILURES = 3;
-const RESOLVED_TURN: Promise<void> = Promise.resolve();
-
-/**
- * Validates the minimum request shape before replay. A request that cannot be
- * dereferenced after the gateway accepted it would retry forever without ever
- * writing its completion tombstone.
- */
-function isReplayableImageRequest(request: Readonly<Record<string, unknown>>, messageId: string): boolean {
-	try {
-		if (request.messageId !== messageId || typeof request.text !== "string") return false;
-		const origin = validateOriginRef(request.origin as OriginRef);
-		if (origin.platform !== "discord") return false;
-		const engagement = request.engagement as Record<string, unknown> | null;
-		if (
-			engagement === null ||
-			typeof engagement !== "object" ||
-			typeof engagement.mentioned !== "boolean" ||
-			typeof engagement.group !== "boolean" ||
-			typeof engagement.authorId !== "string"
-		)
-			return false;
-		const images = request.images;
-		return (
-			Array.isArray(images) &&
-			images.length > 0 &&
-			images.every((image) => {
-				if (image === null || typeof image !== "object" || Array.isArray(image)) return false;
-				const record = image as Record<string, unknown>;
-				return (
-					record.mimeType === "image/jpeg" &&
-					typeof record.data === "string" &&
-					record.data.length > 0 &&
-					record.data.length <= (96 * 1024 * 4) / 3 &&
-					/^[A-Za-z0-9+/]+={0,2}$/.test(record.data)
-				);
-			})
-		);
-	} catch {
-		return false;
-	}
-}
-
-function isImageIntentExpired(entry: PendingImage, now = Date.now()): boolean {
-	return entry.failureAt !== undefined && now - entry.failureAt >= IMAGE_INTENT_MAX_AGE_MS;
-}
-
-/** Discord snowflake creation time in epoch milliseconds; 0 for a malformed id. */
-function snowflakeTimestamp(messageId: string): number {
-	try {
-		return Number((BigInt(messageId) >> 22n) + 1_420_070_400_000n);
-	} catch {
-		return 0;
-	}
-}
-
-function isImageReplayBeyondDedupe(entry: PendingImage, now = Date.now()): boolean {
-	const sourceTime = snowflakeTimestamp(entry.messageId);
-	const createdAt = sourceTime > 0 ? sourceTime : entry.createdAt;
-	if (createdAt === undefined) return true;
-	return now - createdAt >= IMAGE_REPLAY_RETENTION_MS;
-}
-
 export class ReconnectingGateway {
 	#client: GajaewayClient | undefined;
 	#reconnecting = false;
-	#reconnectCount = 0;
 	#attempt = 0;
 	#deliveryOff: (() => void) | undefined;
 	#progressOff: (() => void) | undefined;
 	readonly #inbound = new RecoveryGate();
-	readonly #imageOutbox: ImageOutbox;
-	readonly #imageOwners = new Map<string, Promise<ImageOutcome>>();
-	readonly #imageRetries = new Map<string, ReturnType<typeof setTimeout>>();
-	readonly #imageRetryAttempts = new Map<string, number>();
-	readonly #imageSettled = new Map<string, Set<() => void>>();
-	readonly #imageDone = new Set<string>();
-	readonly #imageUnsent = new Set<string>();
-	readonly #imageAdmissionFailures = new Map<string, number>();
-	readonly #imageBudgetDeferred = new Set<string>();
-	readonly #imageTurnOpen = new Set<string>();
-	readonly #blockedRecoveryChannels = new Set<string>();
-	readonly unnamedThreads = new UnnamedThreads();
 	#cursors: RecoveryCursorState | undefined;
 	#cursorLoads: Promise<void> | undefined;
 	#cursorFault: string | undefined;
 	#cursorSaves: Promise<void> = Promise.resolve();
-	#cursorSaveFault = false;
 	#recovering = false;
 	#retryTimer: ReturnType<typeof setTimeout> | undefined;
 	#retryAttempt = 0;
 	readonly #unreadableRecoveryTargets = new Map<string, number>();
-	/** Consecutive passes where a configured parent's thread enumeration was partial. */
-	readonly #partialDiscovery = new Map<string, number>();
 	#recoverableIds = new Set<string>();
 
 	constructor(
@@ -1845,7 +1719,6 @@ export class ReconnectingGateway {
 		readonly prepareImages: typeof prepareDiscordImages = prepareDiscordImages,
 	) {
 		this.#client = initialClient;
-		this.#imageOutbox = new ImageOutbox(join(dirname(recoveryCursorPath), "image-outbox.json"));
 		void this.ensureCursors();
 	}
 
@@ -1855,810 +1728,6 @@ export class ReconnectingGateway {
 		this.#attempt = 0;
 		void this.downAlarm?.up();
 		void this.#flushEdits();
-		void this.ensureCursors().then(() => this.reconcileGatewayRestore());
-	}
-
-	/** True while a live/recovered image event already owns or awaits this message. */
-	imageInFlight(messageId: string): boolean {
-		return (
-			this.#imageOwners.has(messageId) ||
-			this.#imageDone.has(messageId) ||
-			this.#imageTurnOpen.has(messageId) ||
-			this.#imageSettled.has(messageId)
-		);
-	}
-
-	/** Owns an image from durable intent through acknowledgement, across live and history. */
-	processImage(
-		message: DiscordInboundMessage,
-		engagement: EngagementContext,
-		unnamed: UnnamedThreads = this.unnamedThreads,
-		turn: Promise<void> = RESOLVED_TURN,
-		recovered = false,
-		ordered = false,
-		retry = false,
-	): Promise<ImageOutcome> {
-		const existing = this.#imageOwners.get(message.id);
-		if (existing) {
-			if (!recovered && !ordered) return existing;
-			return existing.then((outcome) =>
-				outcome === "skip" && this.#imageUnsent.has(message.id) ? "unavailable" : outcome,
-			);
-		}
-		if (this.#imageUnsent.has(message.id) && !recovered && !ordered) return Promise.resolve("skip");
-		if (!this.#imageUnsent.has(message.id) && this.#imageDone.has(message.id)) return Promise.resolve("skip");
-		if (turn !== RESOLVED_TURN) {
-			// A live image may prepare while an earlier message in its conversation
-			// still holds the ingress slot; only delivery waits for the turn.
-			this.#imageTurnOpen.add(message.id);
-			void turn.then(() => this.#imageTurnOpen.delete(message.id));
-		}
-		return this.ownImage(
-			message.id,
-			discordMessageOrigin(message).conversationId,
-			() => this.processOwnedImage(message, engagement, unnamed, turn, recovered, ordered, retry),
-			async () => {
-				try {
-					const pending = await this.#imageOutbox.get(message.id);
-					if (pending) return this.retryPendingImage(pending, undefined, false, true);
-				} catch {
-					// Retry the original intent when the outbox itself is unavailable.
-				}
-				return this.processImage(message, engagement, unnamed, turn, false, false, true);
-			},
-		);
-	}
-
-	/**
-	 * Keep later live messages behind an unresolved image while retries run independently.
-	 * The owner releases this waiter on acknowledgement, duplicate, terminal rejection or a
-	 * dead-lettered retry budget, so a permanently unsendable intent cannot wedge the chain.
-	 */
-	async waitForImage(message: DiscordInboundMessage, initial: Promise<ImageOutcome>): Promise<void> {
-		let release!: () => void;
-		const settled = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		const listeners = this.#imageSettled.get(message.id) ?? new Set<() => void>();
-		listeners.add(release);
-		this.#imageSettled.set(message.id, listeners);
-		try {
-			if ((await initial) === "unavailable" && !this.#imageDone.has(message.id)) {
-				const current = await this.#imageOutbox.get(message.id).catch(() => undefined);
-				if (
-					!current?.completed &&
-					!(current?.terminal && current.audited) &&
-					!this.#imageBudgetDeferred.has(message.id)
-				)
-					await settled;
-			}
-		} finally {
-			listeners.delete(release);
-			if (listeners.size === 0) this.#imageSettled.delete(message.id);
-		}
-	}
-
-	private async processOwnedImage(
-		message: DiscordInboundMessage,
-		engagement: EngagementContext,
-		unnamed: UnnamedThreads,
-		turn: Promise<void> = RESOLVED_TURN,
-		recovered = false,
-		ordered = false,
-		retry = false,
-	): Promise<ImageOutcome> {
-		const sourceOrigin = discordMessageOrigin(message);
-		const channelId = sourceOrigin.conversationId;
-		let entry: PendingImage | undefined;
-		try {
-			entry = await this.#imageOutbox.get(message.id);
-			if (!entry) {
-				entry = {
-					messageId: message.id,
-					channelId,
-					createdAt: Date.now(),
-					sourceIdentity: imageSourceIdentity(message),
-					sourceText: typeof message.content === "string" ? message.content : "",
-					...(recovered ? {} : { live: true }),
-					...(sourceOrigin.kind === "dm" ? { dm: true } : {}),
-				};
-				await this.#imageOutbox.put(entry);
-				this.#imageAdmissionFailures.delete(message.id);
-				this.#imageUnsent.delete(message.id);
-			}
-		} catch (error) {
-			// The outbox is the authoritative intent once admitted, but a first-seen DM
-			// must stay discoverable even when admission never succeeds. Register the
-			// recovery target independently before the bounded admission refusal.
-			if (sourceOrigin.kind === "dm") {
-				await this.rememberInboundDm(sourceOrigin);
-				await this.cursorsFlushed;
-			}
-			// Capacity is retried like I/O: scheduleImageRetry runs a recovery pass
-			// before the next attempt, giving watermark-safe compaction a chance to
-			// reclaim completed evidence. Only a real live waiter is eventually
-			// released by the bounded dead letter.
-			const attempts = (this.#imageAdmissionFailures.get(message.id) ?? 0) + 1;
-			const refusal =
-				error instanceof ImageOutboxCapacityError || /admission bound/i.test(String(error))
-					? "image outbox admission bound reached"
-					: "image outbox unavailable";
-			this.#imageAdmissionFailures.set(message.id, attempts);
-			if (this.#imageAdmissionFailures.size > 10_000)
-				this.#imageAdmissionFailures.delete(this.#imageAdmissionFailures.keys().next().value as string);
-			if (attempts < MAX_IMAGE_ADMISSION_FAILURES || recovered || ordered || !this.#imageSettled.has(message.id)) {
-				console.error(
-					`Discord image outbox admission failed message=${message.id} attempt=${attempts} (${refusal}); retrying without sending.`,
-				);
-				throw error;
-			}
-			this.#imageAdmissionFailures.delete(message.id);
-			await this.rejectImageAdmission(
-				message.id,
-				channelId,
-				`image outbox unavailable after ${attempts} admission attempts`,
-			);
-			return "skip";
-		}
-		if (entry) {
-			this.#imageAdmissionFailures.delete(message.id);
-			this.#imageUnsent.delete(message.id);
-		}
-		this.#imageBudgetDeferred.delete(message.id);
-		const admittedIdentity = entry.sourceIdentity ?? imageSourceIdentity(message);
-		const admittedText = entry.sourceText ?? (typeof message.content === "string" ? message.content : "");
-		if (
-			entry.sourceIdentity !== undefined &&
-			(admittedIdentity !== imageSourceIdentity(message) ||
-				admittedText !== (typeof message.content === "string" ? message.content : ""))
-		)
-			return this.terminateImage(entry, "image source changed after the message was edited");
-		// Best-effort: the durable outbox already makes this channel discoverable.
-		// A failing cursor store must not silence the DM's image while text flows.
-		//
-		// A restored intent is already a durable replay target and may belong to a DM
-		// beyond the bounded known-DM set; registering it here would give it the newest
-		// retention slot and evict a genuinely live DM. The row itself keeps the channel
-		// discoverable until the replay completes.
-		if (!entry?.restored) {
-			await this.rememberInboundDm(sourceOrigin);
-			// Give the registration its write before the first send, so an unknown DM is
-			// in knownDms when a later restart has to find it. A broken store resolves
-			// this chain without throwing; the outbox remains the authoritative intent.
-			await this.cursorsFlushed;
-		}
-		if (entry.completed) return "skip";
-		if (entry.terminal) {
-			if (!entry.audited) await this.recordTerminalImage(entry, "image intent was previously rejected");
-			return "skip";
-		}
-		if (isImageIntentExpired(entry)) return this.terminateImage(entry, "image intent unresolved for 24 hours");
-		await turn;
-		if (entry.request) return this.sendPendingImage(entry);
-		let prepared: { readonly images: PromptImage[]; readonly notice: string } | undefined;
-		let imageSource = message;
-		let refreshed = false;
-		const sourceIdentity = admittedIdentity;
-		for (let attempt = 1; attempt <= RECOVERY_MAX_ATTEMPTS; attempt++) {
-			try {
-				prepared = await this.prepareImages(imageSource);
-				break;
-			} catch (error) {
-				if (error instanceof DiscordImagePreparationError && error.refreshSource && !refreshed) {
-					try {
-						const channel = await this.discord.channels.fetch(channelId);
-						if (!isRecoverableChannel(channel)) return this.deferImageFailure(entry);
-						// The refresh exists to replace expired signed urls; a cache hit would
-						// return the same expired urls, so the fetch is forced.
-						const fresh: unknown = await (
-							channel.messages as unknown as { fetch(options: { message: string; force: boolean }): Promise<unknown> }
-						).fetch({ message: message.id, force: true });
-						if (!fresh || typeof fresh !== "object" || !("author" in fresh)) return this.deferImageFailure(entry);
-						const refreshedMessage = fresh as DiscordInboundMessage;
-						// The message was refetched because its signed urls expired. If the author
-						// edited it in the meantime, the new attachment is different bytes than the
-						// intent was recorded for; replaying it would answer an image the user
-						// replaced, and re-preparing forever would wedge the conversation.
-						if (imageSourceIdentity(refreshedMessage) !== sourceIdentity || refreshedMessage.content !== admittedText)
-							return this.terminateImage(entry, "image source changed after the message was edited");
-						imageSource = refreshedMessage;
-						refreshed = true;
-						attempt--;
-						continue;
-					} catch {
-						return this.deferImageFailure(entry);
-					}
-				}
-				if (error instanceof ImagePreparationBudgetError) {
-					this.#imageBudgetDeferred.add(entry.messageId);
-					return this.deferImageFailure(entry);
-				}
-				if (error instanceof DiscordImagePreparationError && error.disposition === "terminal") {
-					return this.terminateImage(entry, "image input rejected");
-				}
-				if (attempt < RECOVERY_MAX_ATTEMPTS) await this.sleep(RECOVERY_ATTEMPT_BACKOFF_MS * 2 ** (attempt - 1));
-			}
-		}
-		if (!prepared) return this.deferImageFailure(entry);
-		// A refetched message can have been edited since the intent was recorded.
-		// Never downgrade a pending image to a text-only message; a source that can
-		// never carry the image again is a terminal intent, not a silent wedge.
-		if (prepared.images.length === 0) return this.terminateImage(entry, "image attachment no longer present");
-		// A delete or edit can invalidate the row while images were preparing. Re-read
-		// the authoritative row before persisting a request or creating a destination;
-		// the stale local entry must not resurrect a terminally invalidated intent.
-		// An unreadable store is never evidence that the intent is still live, so a
-		// failed read defers instead of preparing and sending blind.
-		let latest: PendingImage | undefined;
-		try {
-			latest = await this.#imageOutbox.get(message.id);
-		} catch {
-			return this.deferImageFailure(entry);
-		}
-		if (latest?.completed) return "skip";
-		if (latest?.terminal) {
-			if (!latest.audited) await this.recordTerminalImage(latest, "image intent was previously rejected");
-			return "skip";
-		}
-		// Identity from the Discord message id is stable across a restart; every live
-		// intent's destination (channel or thread) is persisted with it, so a retry
-		// answers where the first attempt already did. A history-discovered intent
-		// never creates a Discord thread.
-		let origin = entry.origin ?? discordMessageOrigin(message);
-		if (entry.origin === undefined && (!recovered || entry.live === true)) {
-			void nameThreadFromMessage(message, origin, unnamed);
-			origin = await maybeCreateThreadOnMention(
-				message,
-				engagement,
-				origin,
-				this.config.channels?.[origin.conversationId],
-				unnamed,
-				this.config.threadOnMention,
-				{
-					recoverAmbiguous: async (messageId) => {
-						const attached = (message as { thread?: unknown }).thread;
-						const existing = isRecoveryThread(attached, channelId)
-							? attached
-							: await this.discord.channels.fetch(messageId).catch(() => undefined);
-						if (!isRecoveryThread(existing, channelId) || existing.id !== messageId) return undefined;
-						return {
-							platform: "discord",
-							kind: "thread",
-							conversationId: existing.id,
-							parentId: channelId,
-							threadVisibility: "public",
-						};
-					},
-				},
-			);
-			if (origin !== entry.origin) {
-				entry = { ...entry, origin };
-				await this.#imageOutbox.put(entry);
-			}
-		}
-		const body = withTranscript(describeInboundBody(message), await transcribeIfVoice(message, this.config.voice));
-		const receivedAt =
-			typeof message.createdTimestamp === "number" ? new Date(message.createdTimestamp).toISOString() : undefined;
-		const request = {
-			origin,
-			text: body,
-			engagement,
-			messageId: message.id,
-			...(receivedAt ? { receivedAt } : {}),
-			...(firstVoiceMessage(message) ? { voice: true } : {}),
-			images: prepared.images,
-		};
-		entry = { ...entry, request, ...(origin.kind === "dm" ? { dm: true } : {}) };
-		await this.#imageOutbox.put(entry);
-		// Source diagnosis and preparation may proceed, but an independently
-		// recovered intent must not cross the history horizon at send time.
-		if ((recovered || retry) && !ordered && this.aheadOfImageHorizon(entry)) {
-			// A live retry may proceed only when no blocked history pass is known;
-			// recovered/offline intents always wait for the sorted history pass.
-			if (!retry || this.#blockedRecoveryChannels.has(entry.channelId)) return this.deferImageFailure(entry);
-		}
-		let notify = false;
-		const result = await this.sendPendingImage(entry, (response) => {
-			notify = response?.engaged === true && response.turnId != null;
-		});
-		if (result === "acked" && notify && prepared.notice)
-			await sendDiscordInboundNotice(message, `Image processing: ${prepared.notice}`);
-		return result;
-	}
-
-	/** The recovery horizon an independently retried image must not cross. */
-	private aheadOfImageHorizon(entry: PendingImage): boolean {
-		const cursors = this.#cursors;
-		if (!cursors) return false;
-		const watermark = cursors.recoveredThrough[entry.channelId] ?? cursors.quarantined[entry.channelId]?.watermark;
-		const horizon = watermark ?? snowflakeFromTimestamp(Date.now() - RECOVERY_BOOTSTRAP_LOOKBACK_MS);
-		return snowflakeIsAfter(entry.messageId, horizon);
-	}
-
-	/** Record a transient failure and enforce the 24h intent deadline on every retry. */
-	private async deferImageFailure(entry: PendingImage): Promise<ImageOutcome> {
-		const failed = await this.noteImageFailure(entry);
-		if (isImageIntentExpired(failed)) return this.terminateImage(failed, "image intent unresolved for 24 hours");
-		return "unavailable";
-	}
-
-	/** Persist the first unresolved failure so a restart cannot reset the 24h clock. */
-	private async noteImageFailure(entry: PendingImage): Promise<PendingImage> {
-		if (entry.failureAt !== undefined) return entry;
-		const next = { ...entry, failureAt: Date.now() };
-		await this.#imageOutbox.put(next);
-		return next;
-	}
-
-	private async terminateImage(entry: PendingImage, summary: string): Promise<"skip"> {
-		await this.recordTerminalImage(entry, summary);
-		this.#imageDone.add(entry.messageId);
-		if (this.#imageDone.size > 10_000) this.#imageDone.delete(this.#imageDone.values().next().value as string);
-		this.cleanupImageState(entry.messageId);
-		return "skip";
-	}
-
-	/**
-	 * Releases a message refused by admission before any intent existed. There is
-	 * no row to make terminal, so the dead letter is the durable diagnosis and the
-	 * waiter must be released here; otherwise the ordered ingress chain holds every
-	 * later message in the conversation forever.
-	 */
-	private async rejectImageAdmission(messageId: string, channelId: string, summary: string): Promise<void> {
-		await this.ensureCursors();
-		if (this.#cursors) {
-			this.deadLetter({
-				messageId,
-				conversationId: channelId,
-				classification: "terminal-message",
-				attempts: 1,
-				at: new Date().toISOString(),
-				summary: `${summary}; no intent was persisted`,
-			});
-			this.forgetAttempts(messageId);
-			await this.cursorsFlushed;
-		}
-		this.#imageDone.add(messageId);
-		if (this.#imageDone.size > 10_000) this.#imageDone.delete(this.#imageDone.values().next().value as string);
-		this.#imageUnsent.add(messageId);
-		if (this.#imageUnsent.size > 10_000) this.#imageUnsent.delete(this.#imageUnsent.values().next().value as string);
-		this.cleanupImageState(messageId);
-		console.error(
-			`Discord image rejected message=${messageId} channel=${channelId}: ${summary}; dead-lettered without persistence so ingress is released.`,
-		);
-	}
-
-	/**
-	 * Durably records a rejected image intent, then releases its waiters. The
-	 * dead-letter write is best-effort: the terminal outbox state is what stops the
-	 * resend, so an unusable cursor store must not pin the conversation forever.
-	 */
-	private async recordTerminalImage(entry: PendingImage, summary: string): Promise<void> {
-		await this.ensureCursors();
-		const attempts = this.#cursors?.attempts[entry.messageId]?.attempts ?? 1;
-		if (this.#cursors) {
-			this.deadLetter({
-				messageId: entry.messageId,
-				conversationId: entry.channelId,
-				classification: "terminal-message",
-				attempts,
-				at: new Date().toISOString(),
-				summary,
-			});
-			this.forgetAttempts(entry.messageId);
-			await this.cursorsFlushed;
-			if (this.#cursorSaveFault)
-				console.error(
-					`Discord image dead-letter for message ${entry.messageId} could not be persisted; keeping the terminal outbox state.`,
-				);
-		}
-		await this.#imageOutbox.put({
-			messageId: entry.messageId,
-			channelId: entry.channelId,
-			terminal: true,
-			audited: this.#cursors !== undefined && !this.#cursorSaveFault,
-			...(entry.dm ? { dm: true } : {}),
-		});
-		console.error(
-			`Discord image intent rejected message=${entry.messageId} channel=${entry.channelId} (${summary}); dead-lettered without chat.send.`,
-		);
-	}
-
-	/** Replay request-bearing and unaudited-terminal rows before any history gate. */
-	private async replayDurableImages(pending: readonly PendingImage[] | undefined): Promise<void> {
-		const cursors = this.#cursors;
-		for (const entry of pending ?? []) {
-			if (entry.completed) continue;
-			if (entry.terminal) {
-				if (!entry.audited) await this.retryPendingImage(entry);
-				continue;
-			}
-			if (!entry.request) continue;
-			// With a known horizon, an intent above it belongs to the upcoming history
-			// window. Sending it here would place it before older missed text; the
-			// sorted history pass delivers both. Without a horizon there is nothing to
-			// merge against, so replay directly.
-			const watermark = cursors?.recoveredThrough[entry.channelId] ?? cursors?.quarantined[entry.channelId]?.watermark;
-			const horizon = watermark ?? snowflakeFromTimestamp(Date.now() - RECOVERY_BOOTSTRAP_LOOKBACK_MS);
-			if (snowflakeIsAfter(entry.messageId, horizon)) continue;
-			await this.retryPendingImage(entry);
-		}
-	}
-
-	/** Drop terminal rows only after the recovery watermark has passed them. */
-	private async compactTerminalImages(): Promise<void> {
-		const cursors = this.#cursors;
-		if (!cursors) return;
-		try {
-			await this.#imageOutbox.compact((entry) => {
-				if (!entry.completed && !entry.terminal) return true;
-				// Read the live cursors per entry: a database-identity rewind may land while
-				// compaction is running, and comparing against the pre-rewind watermark would
-				// drop evidence the lowered floor still needs.
-				const live = this.#cursors ?? cursors;
-				const watermark = live.recoveredThrough[entry.channelId] ?? live.quarantined[entry.channelId]?.watermark;
-				if (watermark === undefined || snowflakeIsAfter(entry.messageId, watermark)) return true;
-				// Keep a short post-watermark grace so an in-flight settlement still
-				// observes the evidence before it is compacted below the watermark.
-				const age = Date.now() - (entry.completedAt ?? 0);
-				if (entry.completed) return age < IMAGE_REPLAY_RETENTION_MS;
-				const timestamp = Number((BigInt(entry.messageId) >> 22n) + 1_420_070_400_000n);
-				return Date.now() - timestamp < 7 * 24 * 60 * 60 * 1000;
-			});
-		} catch {
-			console.error("Discord image outbox terminal compaction failed; retaining rejected-image rows.");
-		}
-	}
-
-	/**
-	 * Completed rows in channels history never revisits cannot be compacted by a
-	 * watermark. Remove them after compaction so live-only traffic in an
-	 * unconfigured channel cannot occupy the completion quota indefinitely.
-	 */
-	private async reclaimUnreachableCompletedImages(): Promise<void> {
-		// Durable scope only: per-pass discovery is incomplete by definition (a thread
-		// fetch can fail or fall outside the discovery window), and reclaiming a target
-		// a later pass will read loses evidence the gateway's dedupe window no longer
-		// covers.
-		const cursors = this.#cursors;
-		const reachable = new Set([
-			...Object.keys(this.config.channels ?? {}),
-			...Object.keys(cursors?.knownDms ?? {}),
-			...Object.keys(cursors?.recoveredThrough ?? {}),
-			...Object.keys(cursors?.quarantined ?? {}),
-			// Rendered unreadable on this or an earlier pass: keep its evidence until the
-			// channel is readable again. Retain-only, so it cannot hide a live target.
-			...this.#unreadableRecoveryTargets.keys(),
-		]);
-		try {
-			const drop = new Set(
-				(await this.#imageOutbox.load())
-					.filter((entry) => entry.completed && !entry.dm && !reachable.has(entry.channelId))
-					.map((entry) => entry.messageId),
-			);
-			if (drop.size > 0) await this.#imageOutbox.compact((entry) => !drop.has(entry.messageId));
-		} catch (error) {
-			console.error(
-				`Discord unreachable completion reclamation failed: ${error instanceof Error ? error.message : String(error)}`,
-			);
-		}
-	}
-
-	/** Drop every per-id structure after the intent can never need another attempt. */
-	/** A deleted or edited Discord source invalidates a pending exact-request replay. */
-	async invalidateImageSource(messageId: string, summary: string): Promise<void> {
-		try {
-			const entry = await this.#imageOutbox.get(messageId);
-			if (entry && !entry.completed && !entry.terminal) await this.terminateImage(entry, summary);
-		} catch {
-			// A store failure is retried by recovery; never let the event handler reject.
-		}
-	}
-
-	private cleanupImageState(id: string): void {
-		this.#imageAdmissionFailures.delete(id);
-		this.#imageBudgetDeferred.delete(id);
-		const timer = this.#imageRetries.get(id);
-		if (timer) clearTimeout(timer);
-		this.#imageRetries.delete(id);
-		this.#imageRetryAttempts.delete(id);
-		this.#imageTurnOpen.delete(id);
-		for (const release of this.#imageSettled.get(id) ?? []) release();
-		this.#imageSettled.delete(id);
-	}
-
-	private ownImage(
-		id: string,
-		channelId: string,
-		work: () => Promise<ImageOutcome>,
-		retry: () => Promise<ImageOutcome>,
-	): Promise<ImageOutcome> {
-		const existing = this.#imageOwners.get(id);
-		if (existing) return existing;
-		const promise = work()
-			.catch((error: unknown) => {
-				console.error(
-					`Discord image owner failed message=${id}: ${summarizeRecoveryFailure(error)}; retrying with backoff.`,
-				);
-				return "unavailable" as const;
-			})
-			.then((result) => {
-				this.#imageOwners.delete(id);
-				if (result === "unavailable" && !this.#imageRetries.has(id)) {
-					this.scheduleImageRetry(id, channelId, retry);
-				} else if (result !== "unavailable") {
-					this.#imageDone.add(id);
-					if (this.#imageDone.size > 10_000) this.#imageDone.delete(this.#imageDone.values().next().value as string);
-					this.cleanupImageState(id);
-					void this.compactTerminalImages();
-				}
-				return result;
-			});
-		this.#imageOwners.set(id, promise);
-		return promise;
-	}
-
-	private scheduleImageRetry(id: string, channelId: string, retry: () => Promise<ImageOutcome>): void {
-		if (this.#imageRetries.has(id)) return;
-		const attempt = this.#imageRetryAttempts.get(id) ?? 0;
-		this.#imageRetryAttempts.set(id, attempt + 1);
-		const delay = Math.min(RECOVERY_RETRY_MAX_MS, RECOVERY_RETRY_BASE_MS * 2 ** Math.min(attempt, 6));
-		const timer = setTimeout(() => {
-			this.#imageRetries.delete(id);
-			void (async () => {
-				await this.recoverMissedMessages();
-				// Defer only while another recovery pass owns the adapter. A blocked
-				// channel is not a reason to skip the direct message fetch: that fetch is
-				// what reaches a permanent diagnosis and releases the waiter.
-				if (this.#recovering) {
-					// No owner ran, so this is the only re-arm; the timer map is empty here.
-					if (!this.#imageRetries.has(id)) this.scheduleImageRetry(id, channelId, retry);
-				} else await retry();
-			})();
-		}, delay);
-		timer.unref?.();
-		this.#imageRetries.set(id, timer);
-	}
-
-	private async sendPendingImage(
-		entry: PendingImage,
-		onResponse?: (response: { engaged?: boolean; turnId?: string | null } | undefined) => void,
-	): Promise<ImageOutcome> {
-		const request = entry.request;
-		if (!request || !isReplayableImageRequest(request, entry.messageId))
-			return this.terminateImage(entry, "persisted image request is invalid");
-		if (isImageReplayBeyondDedupe(entry)) {
-			return this.terminateImage(entry, "image replay exceeds gateway dedupe retention");
-		}
-		if (isImageIntentExpired(entry)) return this.terminateImage(entry, "image intent unresolved for 24 hours");
-		let declined = false;
-		const verdict = await this.#inbound.join(entry.messageId, async () => {
-			// A delete/edit can invalidate the row while preparation, thread creation, or
-			// this gate's wait is pending. Re-read the authoritative row before dispatch so
-			// a stale owner never sends content whose source was removed or replaced.
-			// A failed read is not proof of a live intent: refuse rather than fail open.
-			let latest: PendingImage | undefined;
-			try {
-				latest = await this.#imageOutbox.get(entry.messageId);
-			} catch {
-				return "unavailable";
-			}
-			if (latest?.terminal || latest?.completed) return "unavailable";
-			const client = this.#client;
-			if (!client) {
-				entry = await this.noteImageFailure(entry);
-				if (isImageIntentExpired(entry)) {
-					await this.terminateImage(entry, "image intent unresolved for 24 hours");
-					return "unavailable";
-				}
-				this.scheduleReconnect();
-				console.error(
-					`Discord image chat.send deferred message=${entry.messageId} channel=${entry.channelId}: gateway link unavailable.`,
-				);
-				return "unavailable";
-			}
-			try {
-				const response = await client.request<{ engaged?: boolean; turnId?: string | null }>("chat.send", request);
-				declined = response?.engaged === false;
-				onResponse?.(response);
-				if (response?.engaged && onResponse !== undefined) {
-					// Presence belongs to the live path only; a restart replay must not
-					// start typing or react to an old message.
-					const origin = request.origin as OriginRef;
-					this.status?.arm(
-						origin.conversationId,
-						entry.messageId,
-						request.engagement as EngagementContext,
-						entry.channelId,
-					);
-					this.typing?.begin(origin.conversationId);
-				}
-				return "acked";
-			} catch (error) {
-				const failure = classifyRecoveryFailure(error);
-				const summary = summarizeRecoveryFailure(error);
-				// Never silent (#176): without this line an operator cannot tell that a
-				// channel's image intent is stuck.
-				console.error(
-					`Discord image chat.send failed message=${entry.messageId} channel=${entry.channelId}: ${summary}; left for image recovery.`,
-				);
-				this.noteAttempt(entry.messageId, entry.channelId, failure, summary);
-				this.flushCursors();
-				if (failure !== "terminal-message") this.scheduleReconnect();
-				entry = await this.noteImageFailure(entry);
-				if (isImageIntentExpired(entry)) {
-					await this.terminateImage(entry, "image intent unresolved for 24 hours");
-					return "unavailable";
-				}
-				const terminalAttempts = this.#cursors?.attempts[entry.messageId]?.terminalAttempts ?? 0;
-				if (failure === "terminal-message" && terminalAttempts >= RECOVERY_MAX_ATTEMPTS) {
-					await this.terminateImage(entry, summary);
-					return "unavailable";
-				}
-				return "unavailable";
-			}
-		});
-		if (verdict === "unavailable") {
-			// The gate cannot carry "skip"; report it from the durable outcome so the
-			// owner does not arm a retry for an already dead-lettered intent.
-			const latest = await this.#imageOutbox.get(entry.messageId).catch(() => undefined);
-			if (latest?.completed) return "skip";
-			return latest?.terminal && latest.audited ? "skip" : "unavailable";
-		}
-		// Keep only a completion tombstone. Before this durable write, a crash
-		// replays the exact request; afterwards history skips the acknowledged id.
-		// An explicit decline still leaves a tombstone (so a later pass does not
-		// redownload the bytes) but marks it reclaimable: it must never count
-		// against the global completion quota.
-		this.forgetAttempts(entry.messageId);
-		await this.#imageOutbox.put({
-			messageId: entry.messageId,
-			channelId: entry.channelId,
-			completed: true,
-			completedAt: Date.now(),
-			...(declined ? { declined: true } : {}),
-			...(entry.dm ? { dm: true } : {}),
-		});
-		return "acked";
-	}
-
-	private async retryPendingImage(
-		entry: PendingImage,
-		source?: DiscordInboundMessage,
-		ordered = false,
-		liveRetry = false,
-	): Promise<ImageOutcome> {
-		// A live owner already owns delivery and waits for its ingress turn. Awaiting it
-		// from recovery would deadlock the recovery pass behind an earlier stuck image.
-		if (this.#imageTurnOpen.has(entry.messageId) || this.#imageOwners.has(entry.messageId)) return "unavailable";
-		return this.ownImage(
-			entry.messageId,
-			entry.channelId,
-			async () => {
-				const current = await this.#imageOutbox.get(entry.messageId);
-				if (!current || current.completed) return "skip";
-				if (current.terminal) {
-					if (!current.audited) await this.recordTerminalImage(current, "image intent was previously rejected");
-					return "skip";
-				}
-				if (current.request) {
-					if (
-						!ordered &&
-						this.aheadOfImageHorizon(current) &&
-						(!liveRetry || this.#blockedRecoveryChannels.has(current.channelId))
-					)
-						return this.deferImageFailure(current);
-					if (!isReplayableImageRequest(current.request, current.messageId))
-						return this.terminateImage(current, "persisted image request is invalid");
-					// A request can outlive its source: the adapter may persist it, crash before
-					// the first send, and stay offline while the message is deleted or edited.
-					// The live delete/edit handlers cannot see that event, so re-read the source
-					// before the first replay. Only definitive not-found or changed bytes are
-					// terminal; transient reads keep retrying.
-					const revalidated = await this.revalidateImageReplay(current, source);
-					if (!revalidated.ok)
-						return revalidated.terminal
-							? this.terminateImage(current, revalidated.summary)
-							: this.deferImageFailure(current);
-					// A restored row is already a durable target: registering it here would
-					// give it the newest retention slot and evict a live DM at the cap.
-					if (!current.restored) await this.rememberInboundDm(current.request.origin as OriginRef);
-					return this.sendPendingImage(current);
-				}
-				// Recovery usually holds the message that produced the intent, so use it
-				// instead of spending another API call on a fetch that may not be allowed.
-				let inbound = source?.id === current.messageId ? source : undefined;
-				if (!inbound) {
-					const fetched = await this.fetchImageSource(current.channelId, current.messageId);
-					if (!("message" in fetched))
-						return fetched.outcome === "gone"
-							? this.terminateImage(current, fetched.summary)
-							: this.deferImageFailure(current);
-					inbound = fetched.message;
-				}
-				const engagement = decideInbound(inbound, this.getBotUser(), this.config.channels);
-				if (!engagement) return this.terminateImage(current, "no engagement policy for recovered image");
-				return this.processOwnedImage(
-					inbound,
-					engagement,
-					this.unnamedThreads,
-					RESOLVED_TURN,
-					!liveRetry,
-					ordered,
-					liveRetry,
-				);
-			},
-			// A scheduled retry runs later than the walk that produced `source`, so that
-			// snapshot must not become evidence a replay verification trusts. Dropping it
-			// makes the retry re-read the source through the forced fetch.
-			() => this.retryPendingImage(entry, undefined, ordered, liveRetry),
-		);
-	}
-
-	/** Fetch the Discord message a persisted image intent was built from. */
-	private async fetchImageSource(
-		channelId: string,
-		messageId: string,
-		definitivelyGoneOnly = false,
-	): Promise<
-		{ readonly message: DiscordInboundMessage } | { readonly outcome: "gone" | "unavailable"; readonly summary: string }
-	> {
-		// Replay verification must not treat an operator-fixable permission failure as
-		// a deleted source: those keep retrying until the intent deadline.
-		const isGone = definitivelyGoneOnly ? isDefinitiveDiscordNotFound : isPermanentDiscordUnreadable;
-		let channel: unknown;
-		try {
-			channel = await this.discord.channels.fetch(channelId);
-		} catch (error) {
-			if (isGone(error)) return { outcome: "gone", summary: `channel unavailable: ${summarizeRecoveryFailure(error)}` };
-			return { outcome: "unavailable", summary: "channel fetch failed" };
-		}
-		if (!isRecoverableChannel(channel))
-			return { outcome: "gone", summary: "destination is no longer a recoverable channel" };
-		let message: unknown;
-		try {
-			// discord.js serves a cached non-partial message for a bare id, which would
-			// replay bytes from before a same-process delete or edit. Verification must
-			// read the API's current state, so the fetch is forced.
-			message = await (
-				channel.messages as unknown as {
-					fetch(options: { message: string; force: boolean }): Promise<unknown>;
-				}
-			).fetch({ message: messageId, force: true });
-		} catch (error) {
-			if (isGone(error)) return { outcome: "gone", summary: `message unavailable: ${summarizeRecoveryFailure(error)}` };
-			return { outcome: "unavailable", summary: "message fetch failed" };
-		}
-		if (!message || typeof message !== "object" || !("author" in message))
-			return { outcome: "unavailable", summary: "message fetch returned no message" };
-		return { message: message as DiscordInboundMessage };
-	}
-
-	/**
-	 * Revalidate a persisted exact request against its Discord source. A request can
-	 * outlive its message (deleted while offline) or point at replaced attachment
-	 * bytes (edited while offline); neither event can invalidate the row while the
-	 * adapter is disconnected.
-	 */
-	private async revalidateImageReplay(
-		current: PendingImage,
-		source?: DiscordInboundMessage,
-	): Promise<{ readonly ok: true } | { readonly ok: false; readonly terminal: boolean; readonly summary: string }> {
-		let inbound = source?.id === current.messageId ? source : undefined;
-		if (!inbound) {
-			const fetched = await this.fetchImageSource(current.channelId, current.messageId, true);
-			if (!("message" in fetched)) return { ok: false, terminal: fetched.outcome === "gone", summary: fetched.summary };
-			inbound = fetched.message;
-		}
-		if (current.sourceIdentity !== undefined && imageSourceIdentity(inbound) !== current.sourceIdentity)
-			return { ok: false, terminal: true, summary: "image source changed after the message was edited" };
-		if (
-			current.sourceText !== undefined &&
-			typeof inbound.content === "string" &&
-			inbound.content !== current.sourceText
-		)
-			return { ok: false, terminal: true, summary: "image source changed after the message was edited" };
-		return { ok: true };
 	}
 
 	async connect(): Promise<void> {
@@ -2673,7 +1742,7 @@ export class ReconnectingGateway {
 		try {
 			const options = {
 				clientName: "adapter-discord",
-				requiredCapabilities: ["chat.images", "gateway.status.databaseIdentity"],
+				requiredCapabilities: ["chat.images"],
 				onRetry: (attempt: number, delayMs: number, error: unknown) =>
 					console.warn(
 						`gateway_socket_waiting client=adapter-discord path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${error instanceof Error ? error.message : String(error)}`,
@@ -2720,17 +1789,6 @@ export class ReconnectingGateway {
 			this.scheduleRecoveryRetry();
 			return;
 		}
-		// A database-identity reconciliation must finish before this pass captures a
-		// watermark; otherwise its rewind would land mid-pass and the pass would
-		// re-advance the channel, losing the [floor, watermark) interval.
-		if (this.#restoreCheck) await this.#restoreCheck;
-		// The wait above yields, so another trigger may have started a pass in the
-		// meantime. Re-test the latch before claiming ownership; otherwise both would
-		// run, and the first finisher would clear #recovering under the survivor.
-		if (this.#recovering) {
-			this.scheduleRecoveryRetry();
-			return;
-		}
 		const botUser = this.getBotUser();
 		if (!this.#client || !botUser) {
 			// A fired retry that cannot proceed (no gateway link yet, Discord not ready) must
@@ -2742,90 +1800,32 @@ export class ReconnectingGateway {
 		// A pass counts as complete only when every non-quarantined target finished cleanly.
 		// Permission-dead targets are still probed on reconnect, but stop driving a 60s error loop.
 		let completed = false;
-		// Reclamation needs a pass that read every target; retry scheduling only needs
-		// the history read to finish, so a persistently undiscoverable parent cannot
-		// drive a full pass every 60s forever.
-		let reclaimSafe = true;
-		const blocked = new Set<string>();
 		try {
-			let pendingImages: readonly PendingImage[] | undefined;
-			try {
-				pendingImages = await this.#imageOutbox.load();
-			} catch {
-				console.error(
-					"Discord image outbox unavailable; image recovery is paused while unrelated text recovery continues.",
-				);
-			}
-			// Load the cursor state before replay so an above-horizon intent can wait
-			// for the sorted history pass instead of overtaking older missed text. A
-			// failed load leaves it undefined and still replays every durable intent.
 			await this.ensureCursors();
-			if (!(await this.reconcileGatewayRestore(true))) return;
-			// Restore reconciliation may replace completed DMs with durable replay
-			// intents, including DMs exceeding the bounded known-DM cursor set.
-			if (pendingImages) pendingImages = await this.#imageOutbox.load();
-			// The durable image consumer is independent of history recovery: an exact
-			// persisted request needs neither the cursor nor a history read, and a live
-			// image was admitted ahead of history in the first place.
-			await this.replayDurableImages(pendingImages);
 			if (!this.#cursors) {
 				console.error(
-					`Discord recovery refused: cursor store ${this.recoveryCursorPath} is unusable (${this.#cursorFault ?? "unknown error"}); durable image intents were replayed, retrying history with backoff.`,
+					`Discord recovery refused: cursor store ${this.recoveryCursorPath} is unusable (${this.#cursorFault ?? "unknown error"}); retrying with backoff.`,
 				);
 				return;
 			}
-			const now = Date.now();
-			const pruned = pruneKnownDms(this.#cursors, now);
+			const pruned = pruneKnownDms(this.#cursors, Date.now());
 			if (pruned !== this.#cursors) this.persist(pruned);
-			// Outbox rows repair a cursor store that was broken when the image landed.
-			// Only rows that still need delivery qualify: a completed or terminal row
-			// is historical evidence, and stamping it with `now` would promote an old,
-			// never-configured DM into the bounded retention set and evict a genuinely
-			// recent DM that still needs history recovery. Record each remaining row's
-			// own observation time, oldest first, so retention order matches recency.
-			const observed = new Map<string, number>();
-			for (const entry of pendingImages ?? []) {
-				// A restore already queued this DM as an exact replay target; remembering it
-				// here would assign it the newest retention slot and evict a live DM.
-				if (entry.restored || !entry.dm || entry.completed || entry.terminal || this.#cursors.knownDms[entry.channelId])
-					continue;
-				const at = entry.createdAt ?? entry.failureAt ?? snowflakeTimestamp(entry.messageId);
-				if (at <= 0 || now - at >= RECOVERY_KNOWN_DM_TTL_MS) continue;
-				observed.set(entry.channelId, Math.max(observed.get(entry.channelId) ?? 0, at));
-			}
-			let withDms: RecoveryCursorState = this.#cursors;
-			for (const [channelId, at] of [...observed].sort((a, b) => a[1] - b[1]))
-				withDms = rememberKnownDm(withDms, channelId, at);
-			withDms = pruneKnownDms(withDms, now);
-			if (withDms !== this.#cursors) {
-				this.#cursors = withDms;
-				this.persist(withDms);
-			}
 			const configuredIds = Object.keys(this.config.channels ?? {});
-			const queue = [
-				...configuredIds,
-				...Object.keys(this.#cursors.knownDms),
-				...(pendingImages ?? []).filter((entry) => !entry.completed).map((entry) => entry.channelId),
-			];
+			const queue = [...configuredIds, ...Object.keys(this.#cursors.knownDms)];
+			if (queue.length === 0) {
+				completed = true;
+				return;
+			}
 			const seen = new Set<string>();
 			this.#recoverableIds = new Set(queue);
-			let incomplete = pendingImages === undefined;
+			let incomplete = false;
 			for (let index = 0; index < queue.length; index++) {
 				const conversationId = queue[index] as string;
 				if (seen.has(conversationId)) continue;
 				seen.add(conversationId);
 				try {
 					const result = await this.recoverChannel(conversationId, botUser, configuredIds.includes(conversationId));
-					if (result.incomplete) {
-						incomplete = true;
-						blocked.add(conversationId);
-					}
-					if (result.discoveryComplete) this.#partialDiscovery.delete(conversationId);
-					else {
-						reclaimSafe = false;
-						if (this.notePartialDiscovery(conversationId)) incomplete = true;
-					}
-					if (this.#unreadableRecoveryTargets.has(conversationId)) blocked.add(conversationId);
+					if (result.incomplete) incomplete = true;
 					for (const threadId of result.threadIds) {
 						if (seen.has(threadId)) continue;
 						this.#recoverableIds.add(threadId);
@@ -2836,42 +1836,6 @@ export class ReconnectingGateway {
 						`Discord recovery aborted for conversation ${conversationId}: ${error instanceof Error ? error.message : String(error)}`,
 					);
 					incomplete = true;
-					blocked.add(conversationId);
-				}
-			}
-			for (const entry of pendingImages ?? []) {
-				if (entry.terminal && entry.request) {
-					this.cleanupImageState(entry.messageId);
-					await this.#imageOutbox.put({
-						messageId: entry.messageId,
-						channelId: entry.channelId,
-						completed: true,
-						completedAt: Date.now(),
-						...(entry.dm ? { dm: true } : {}),
-					});
-				} else if (entry.terminal) {
-					if (!entry.audited) await this.recordTerminalImage(entry, "image intent was previously rejected");
-				} else if (!entry.completed) {
-					// A request above the horizon waits for a later history pass when its
-					// channel was truncated or held; sending here would overtake older text.
-					if (entry.request && blocked.has(entry.channelId)) {
-						const watermark =
-							this.#cursors.recoveredThrough[entry.channelId] ?? this.#cursors.quarantined[entry.channelId]?.watermark;
-						if (watermark !== undefined && snowflakeIsAfter(entry.messageId, watermark)) {
-							// Defer behind history, but keep the same 24h clock: a channel that
-							// never converges must dead-letter instead of re-walking forever.
-							const failed = await this.noteImageFailure(entry);
-							if (isImageIntentExpired(failed))
-								await this.terminateImage(failed, "image intent unresolved for 24 hours");
-							else incomplete = true;
-							continue;
-						}
-					}
-					// Attempt directly even when the conversation's history is unreadable:
-					// a permanent message/channel error must reach its terminal diagnosis, and a
-					// persisted request re-reads only its own source each attempt so a deleted or
-					// replaced attachment is detected without a full history walk.
-					if ((await this.retryPendingImage(entry)) === "unavailable") incomplete = true;
 				}
 			}
 			this.persist(retainRecoveryCursors(this.#cursors, this.#recoverableIds));
@@ -2882,10 +1846,6 @@ export class ReconnectingGateway {
 			);
 		} finally {
 			this.#recovering = false;
-			// Image retries defer only for their own conversation: an unrelated
-			// unreadable channel must not starve a healthy repaired intent.
-			this.#blockedRecoveryChannels.clear();
-			for (const channelId of blocked) this.#blockedRecoveryChannels.add(channelId);
 			if (completed) {
 				this.#retryAttempt = 0;
 				if (this.#retryTimer) clearTimeout(this.#retryTimer);
@@ -2894,17 +1854,6 @@ export class ReconnectingGateway {
 			// A resolved pass means its progress is on disk. Persists stay fire-and-forget
 			// during the pass, then the pass joins the chain before reporting completion.
 			await this.cursorsFlushed;
-			// Compact only below the watermark that is now durable. Otherwise a crash
-			// could restore an older watermark after the terminal evidence is gone,
-			// resurrecting a rejected intent on the next rewalk.
-			if (!this.#cursorSaveFault) {
-				await this.compactTerminalImages();
-				// Only a pass that read every target can decide a channel is unreachable:
-				// a failed thread discovery would otherwise hide live targets for good.
-				// `completed` also excludes a thrown or incomplete pass; durable reachability
-				// is the safety property and these gates are extra caution.
-				if (completed && reclaimSafe) await this.reclaimUnreachableCompletedImages();
-			}
 		}
 	}
 
@@ -2933,25 +1882,12 @@ export class ReconnectingGateway {
 		return this.#retryTimer !== undefined;
 	}
 
-	/**
-	 * Test seam: how many reconnects THIS adapter instance armed. The reconnect log line
-	 * is process-global, so a leaked timer from another test's adapter cannot be told
-	 * apart from this one's; an instance counter can.
-	 */
-	get reconnectCount(): number {
-		return this.#reconnectCount;
-	}
-
 	/** Recovers one conversation and discovers child threads when this is a configured parent. */
 	private async recoverChannel(
 		channelId: string,
 		botUser: unknown,
 		discoverThreads: boolean,
-	): Promise<{
-		readonly incomplete: boolean;
-		readonly threadIds: readonly string[];
-		readonly discoveryComplete: boolean;
-	}> {
+	): Promise<{ readonly incomplete: boolean; readonly threadIds: readonly string[] }> {
 		let fetched: unknown;
 		try {
 			fetched = await this.discord.channels.fetch(channelId);
@@ -2960,7 +1896,7 @@ export class ReconnectingGateway {
 				console.error(
 					`Discord recovery could not fetch conversation ${channelId}: ${error instanceof Error ? error.message : String(error)}; cursor unchanged, retrying with backoff.`,
 				);
-				return { incomplete: true, threadIds: [], discoveryComplete: true };
+				return { incomplete: true, threadIds: [] };
 			}
 			return {
 				incomplete: this.noteUnreadableRecoveryTarget(
@@ -2968,46 +1904,20 @@ export class ReconnectingGateway {
 					error instanceof Error ? error.message : String(error),
 				),
 				threadIds: [],
-				discoveryComplete: true,
 			};
 		}
 		if (!isRecoverableChannel(fetched)) {
 			return {
 				incomplete: this.noteUnreadableRecoveryTarget(channelId, "deleted, no access, or not a text channel"),
 				threadIds: [],
-				discoveryComplete: true,
 			};
 		}
-		const discovery = discoverThreads
-			? await discoverRecoveryThreadIds(fetched, channelId, Date.now())
-			: { threadIds: [] as readonly string[], complete: true };
-		const threadIds = discovery.threadIds;
+		const threadIds = discoverThreads ? await discoverRecoveryThreadIds(fetched, channelId, Date.now()) : [];
 
 		const cursors = this.#cursors;
 		// A quarantined watermark (channel previously dropped from config) counts: resuming
 		// from it beats replaying the whole bootstrap window on re-add.
 		const before = cursors?.recoveredThrough[channelId] ?? cursors?.quarantined[channelId]?.watermark;
-		// Pending intents can predate the cursor, and therefore will not occur in
-		// the history page. Resolve them before delivering any newer history. On a
-		// first-time DM there is no watermark yet; use the same bootstrap floor that
-		// recovery itself applies so pre-window intents are not overtaken either.
-		const pending = await this.#imageOutbox.load().catch(() => undefined);
-		if (pending) {
-			const horizon = before ?? snowflakeFromTimestamp(Date.now() - RECOVERY_BOOTSTRAP_LOOKBACK_MS);
-			const older = pending
-				.filter(
-					(entry) =>
-						entry.channelId === channelId &&
-						!entry.completed &&
-						(!entry.terminal || !entry.audited) &&
-						!snowflakeIsAfter(entry.messageId, horizon),
-				)
-				.sort((a, b) => (snowflakeIsAfter(a.messageId, b.messageId) ? 1 : a.messageId === b.messageId ? 0 : -1));
-			for (const entry of older) {
-				if ((await this.retryPendingImage(entry)) === "unavailable")
-					return { incomplete: true, threadIds, discoveryComplete: discovery.complete };
-			}
-		}
 		const outcome = await recoverConversation(fetched, {
 			cursor: before,
 			nowMs: Date.now(),
@@ -3017,27 +1927,38 @@ export class ReconnectingGateway {
 			deliver: async (message) => {
 				// Same normalization as live messageCreate: one decision, one origin shape,
 				// one gateway verb — recovery never forks engagement semantics.
-				let pendingImage: PendingImage | undefined;
-				try {
-					pendingImage = await this.#imageOutbox.get(message.id);
-				} catch {
-					// An edited message may have had an image removed. Its original
-					// identity cannot be checked until the outbox is readable again.
-					if (selectNativeImageAttachments(message).length > 0 || message.editedTimestamp != null) return "unavailable";
-				}
-				if (pendingImage?.completed) return "skip";
-				if (pendingImage) return this.retryPendingImage(pendingImage, message, true);
 				const engagement = decideInbound(message, botUser, this.config.channels);
 				if (!engagement) return "skip";
-				if (selectNativeImageAttachments(message).length > 0)
-					return this.processImage(message, engagement, this.unnamedThreads, RESOLVED_TURN, true, true);
 				const text = describeInboundBody(message);
 				if (text === "") return "skip";
+				let preparedImages: { readonly images: PromptImage[] } | undefined;
+				let imageFailure: DiscordImagePreparationError | undefined;
+				let preparationDone = false;
 				const origin = discordMessageOrigin(message);
 				let failure: RecoveryFailureClass = "write-path-unknown";
 				let summary = "unclassified chat.send failure";
 				for (let attempt = 1; attempt <= RECOVERY_MAX_ATTEMPTS; attempt++) {
-					const result = await this.requestRecovered(message.id, origin, text, engagement);
+					if (!preparationDone && imageFailure?.disposition !== "terminal") {
+						try {
+							preparedImages = await this.prepareImages(message);
+							imageFailure = undefined;
+							preparationDone = true;
+						} catch (error) {
+							imageFailure =
+								error instanceof DiscordImagePreparationError ? error : new DiscordImagePreparationError("retryable");
+							console.error(
+								`Discord recovery image preparation ${imageFailure.disposition} failure message=${message.id}; no text-only send will be attempted.`,
+							);
+						}
+					}
+					const result = imageFailure
+						? {
+								verdict: "unavailable" as const,
+								failure:
+									imageFailure.disposition === "terminal" ? ("terminal-message" as const) : ("retryable" as const),
+								summary: imageFailure.disposition === "terminal" ? "image input rejected" : "image download failed",
+							}
+						: await this.requestRecovered(message.id, origin, text, engagement, preparedImages?.images);
 					if (result.verdict !== "unavailable") {
 						this.forgetAttempts(message.id);
 						return result.verdict;
@@ -3048,6 +1969,28 @@ export class ReconnectingGateway {
 					// failures still converges on its budget instead of blocking its channel.
 					this.noteAttempt(message.id, channelId, failure, summary);
 					if (attempt < RECOVERY_MAX_ATTEMPTS) await this.sleep(RECOVERY_ATTEMPT_BACKOFF_MS * 2 ** (attempt - 1));
+				}
+				if (
+					imageFailure?.disposition === "terminal" &&
+					(this.#cursors?.attempts[message.id]?.terminalAttempts ?? 0) >= RECOVERY_MAX_ATTEMPTS
+				) {
+					this.flushCursors();
+					const attempts = this.#cursors?.attempts[message.id]?.terminalAttempts ?? RECOVERY_MAX_ATTEMPTS;
+					this.deadLetter({
+						messageId: message.id,
+						conversationId: channelId,
+						classification: "terminal-message",
+						attempts,
+						at: new Date().toISOString(),
+						summary: "image input rejected",
+					});
+					this.forgetAttempts(message.id);
+					console.error(
+						`Discord recovery rejected image message ${message.id} in channel ${channelId} after ${attempts} terminal preparation failures; dead-lettered without chat.send.`,
+					);
+					// Unlike a gateway terminal rejection, no later successful send is
+					// needed to prove the write path: local image validation is decisive.
+					return "skip";
 				}
 				this.flushCursors();
 				const terminalAttempts = this.#cursors?.attempts[message.id]?.terminalAttempts ?? 0;
@@ -3098,15 +2041,11 @@ export class ReconnectingGateway {
 			// quarantine it under the same bound the channel-fetch path uses, so healthy
 			// conversations can complete and the dead one is probed again on reconnect.
 			if (outcome.fetchErrorPermanent)
-				return {
-					incomplete: this.noteUnreadableRecoveryTarget(channelId, outcome.fetchError),
-					threadIds,
-					discoveryComplete: discovery.complete,
-				};
+				return { incomplete: this.noteUnreadableRecoveryTarget(channelId, outcome.fetchError), threadIds };
 			console.error(
 				`Discord recovery could not read history for channel ${channelId}: ${outcome.fetchError}; other channels continue, retrying with backoff.`,
 			);
-			return { incomplete: true, threadIds, discoveryComplete: discovery.complete };
+			return { incomplete: true, threadIds };
 		}
 		if (outcome.failed) {
 			const reason =
@@ -3116,7 +2055,7 @@ export class ReconnectingGateway {
 			console.error(
 				`Discord recovery paused for channel ${channelId} at message ${outcome.advancedTo}; ${reason}, retrying with backoff.`,
 			);
-			return { incomplete: true, threadIds, discoveryComplete: discovery.complete };
+			return { incomplete: true, threadIds };
 		}
 		if (outcome.truncated) {
 			const progress =
@@ -3126,7 +2065,7 @@ export class ReconnectingGateway {
 			console.error(
 				`Discord recovery hit the ${RECOVERY_MAX_PAGES}-page bound for channel ${channelId} after ${outcome.delivered} fresh message(s), ${outcome.duplicates} duplicate(s), and ${outcome.skipped} skip(s); ${progress}.`,
 			);
-			return { incomplete: true, threadIds, discoveryComplete: discovery.complete };
+			return { incomplete: true, threadIds };
 		}
 		if (outcome.delivered > 0 || outcome.duplicates > 0 || outcome.skipped > 0 || outcome.discarded > 0) {
 			console.log(
@@ -3137,7 +2076,7 @@ export class ReconnectingGateway {
 		// quarantines an unreadable conversation has to survive a pass whose fetch or history
 		// read failed, or the bound would never be reached.
 		this.clearUnreadableRecoveryTarget(channelId);
-		return { incomplete: false, threadIds, discoveryComplete: discovery.complete };
+		return { incomplete: false, threadIds };
 	}
 
 	private noteUnreadableRecoveryTarget(conversationId: string, reason: string): boolean {
@@ -3154,22 +2093,6 @@ export class ReconnectingGateway {
 				`Discord recovery quarantined unreadable conversation ${conversationId} after ${attempts} attempts (${reason}); its watermark is retained and other conversations may complete. It will be probed again on reconnect.`,
 			);
 		}
-		return false;
-	}
-
-	/**
-	 * Bounds partial thread discovery the same way an unreadable channel is bounded: it
-	 * stays an incomplete pass (and so keeps reclamation off) while attempts are below the
-	 * bound, then stops driving the 60s retry loop. Re-enumeration resumes on reconnect.
-	 */
-	private notePartialDiscovery(conversationId: string): boolean {
-		const attempts = (this.#partialDiscovery.get(conversationId) ?? 0) + 1;
-		this.#partialDiscovery.set(conversationId, attempts);
-		if (attempts < RECOVERY_UNREADABLE_QUARANTINE_ATTEMPTS) return true;
-		if (attempts === RECOVERY_UNREADABLE_QUARANTINE_ATTEMPTS)
-			console.warn(
-				`Discord recovery quarantined partial thread discovery for ${conversationId} after ${attempts} attempts; history recovery continues and completed image reclamation stays disabled for this process until discovery succeeds.`,
-			);
 		return false;
 	}
 
@@ -3270,173 +2193,16 @@ export class ReconnectingGateway {
 		);
 	}
 
-	/** Single-flight guard: concurrent monitor ticks and recovery passes adopt one identity once. */
-	#restoreCheck: Promise<boolean> | undefined;
-
-	private reconcileGatewayRestore(fromRecovery = false): Promise<boolean> {
-		this.#restoreCheck ??= this.checkGatewayRestore(fromRecovery).finally(() => {
-			this.#restoreCheck = undefined;
-		});
-		return this.#restoreCheck;
-	}
-
-	/**
-	 * Adopts the gateway database identity the socket reports and reconciles the
-	 * cursors written under a different one.
-	 *
-	 * Cursor files predating identity tracking have watermarks but no baseline. If
-	 * an operator restored the database before that first baseline was recorded,
-	 * recovery would resume after messages the restored backup lacks. The first
-	 * identity is therefore only adopted as-is when the state carries no recovery
-	 * evidence; a populated legacy state is rewound to the replay floor and its
-	 * image completion tombstones are invalidated once, exactly like a detected
-	 * database replacement.
-	 */
-	private async checkGatewayRestore(fromRecovery = false): Promise<boolean> {
-		// A rewind must never land inside a running recovery pass: the pass captured the
-		// old watermark, so it would re-advance that channel after the rewind and the
-		// [floor, old watermark) interval would never be replayed. The pass reconciles
-		// itself before it reads cursors; every other caller waits for the next poll.
-		if (this.#recovering && !fromRecovery) return true;
-		const state = this.#cursors;
-		const client = this.#client;
-		if (!state || !client) return true;
-		let result: GatewayStatusResult | undefined;
-		try {
-			result = await client.request<GatewayStatusResult>("gateway.status");
-		} catch {
-			if (fromRecovery) {
-				console.error("Discord gateway database identity probe failed; holding recovery.");
-				return false;
-			}
-			return true;
-		}
-		const identity = result?.database?.identity;
-		if (identity === undefined) {
-			if (fromRecovery) {
-				console.error("Discord gateway database identity unavailable; holding recovery.");
-				return false;
-			}
-			return true;
-		}
-		if (identity === state.gatewayDbIdentity) return true;
-		const legacy = state.gatewayDbIdentity === undefined;
-		let next: RecoveryCursorState = this.#cursors ?? state;
-		if (!legacy || (await this.hasRecoveryEvidence(next))) {
-			let completedDms: Array<{ channelId: string; at: number }> = [];
-			try {
-				const observed = new Map<string, number>();
-				for (const entry of await this.#imageOutbox.load()) {
-					if (!entry.dm || !entry.completed) continue;
-					const at = entry.completedAt ?? snowflakeTimestamp(entry.messageId);
-					if (at <= 0) continue;
-					observed.set(entry.channelId, Math.max(observed.get(entry.channelId) ?? 0, at));
-				}
-				completedDms = [...observed].map(([channelId, at]) => ({ channelId, at }));
-			} catch {
-				// Rewinding watermarks without clearing completion evidence could leave an
-				// acknowledged image suppressed forever. Keep the old state and retry the
-				// adoption on the next status poll.
-				return false;
-			}
-			// The rewind invalidates completed tombstones; without this the post-rewind
-			// walk would still skip every image this process already delivered, and a
-			// completed DM whose tombstone was just cleared would drop out of history.
-			this.#imageDone.clear();
-			this.#inbound.resetAcknowledged();
-			const latest = this.#cursors ?? state;
-			const floor = snowflakeFromTimestamp(Date.now() - IMAGE_REPLAY_RETENTION_MS);
-			next = {
-				...latest,
-				recoveredThrough: Object.fromEntries(
-					Object.entries(latest.recoveredThrough).map(([id, watermark]) => [
-						id,
-						snowflakeIsAfter(watermark, floor) ? floor : watermark,
-					]),
-				),
-				quarantined: Object.fromEntries(
-					Object.entries(latest.quarantined).map(([id, entry]) => [
-						id,
-						{
-							...entry,
-							watermark: snowflakeIsAfter(entry.watermark, floor) ? floor : entry.watermark,
-						},
-					]),
-				),
-			};
-			// A restored completion is also a discovery target: give its DM the replay
-			// floor when it has no in-window watermark so history scans the full restore
-			// horizon instead of the 24h bootstrap window.
-			for (const dm of completedDms) {
-				const existing = next.recoveredThrough[dm.channelId];
-				if (existing === undefined || snowflakeIsAfter(existing, floor))
-					next = {
-						...next,
-						recoveredThrough: { ...next.recoveredThrough, [dm.channelId]: floor },
-					};
-			}
-			const now = Date.now();
-			const cutoff = now - RECOVERY_KNOWN_DM_TTL_MS;
-			// Rebind below every existing live slot: a completed DM that only needs a history
-			// target must never displace a genuinely recent live DM when the bounded set is
-			// full. `pruneKnownDms` keeps the highest seq, so newest-first ordering is what
-			// preserves the newest completions; lastSeenAt keeps their real observation time
-			// so TTL expires from the DM's own recency, not from the restore.
-			const known = { ...next.knownDms };
-			let seq = Math.min(...Object.values(known).map((entry) => entry.seq), next.sequence + 1);
-			for (const { channelId, at } of completedDms
-				.filter((entry) => entry.at >= cutoff && known[entry.channelId] === undefined)
-				.sort((a, b) => b.at - a.at)) {
-				known[channelId] = { lastSeenAt: new Date(Math.min(at, now)).toISOString(), seq: --seq };
-			}
-			next = { ...next, knownDms: pruneKnownDms({ ...next, knownDms: known }, now).knownDms };
-			// Persist the rewind and DM discovery while completion tombstones still
-			// exist. A crash or cursor write failure must not lose the only durable
-			// reference to a non-enumerable DM before the restore can replay it.
-			this.persist(next);
-			await this.cursorsFlushed;
-			if (this.#cursorSaveFault) return false;
-			try {
-				await this.#imageOutbox.invalidateCompleted();
-			} catch {
-				// Keep the identity unadopted so the next status poll retries the replay.
-				return false;
-			}
-			console.error(
-				legacy
-					? "Discord recovery cursors predate gateway database identity tracking; rewound their watermarks to the replay floor and invalidated image completion tombstones, so a database restore during the upgrade cannot hide messages."
-					: "Discord gateway database was replaced; rewound recovery watermarks and invalidated image completion tombstones after the gateway socket identity changed.",
-			);
-		}
-		this.persist({ ...(this.#cursors ?? next), gatewayDbIdentity: identity });
-		return true;
-	}
-
-	/** True when a cursor state recorded progress that a database restore could invalidate. */
-	private async hasRecoveryEvidence(state: RecoveryCursorState): Promise<boolean> {
-		// Only state that can suppress a message matters: a watermark past a gap and a
-		// completion tombstone that skips a replay. knownDms/attempts/dead letters say
-		// nothing about how far history was walked, so they must not force a rewind on a
-		// fresh install that merely handled live traffic before its first status poll.
-		if (Object.keys(state.recoveredThrough).length > 0 || Object.keys(state.quarantined).length > 0) return true;
-		const pending = await this.#imageOutbox.load().catch(() => undefined);
-		return pending === undefined ? true : pending.some((entry) => entry.completed === true);
-	}
-
 	/** Serialized, fire-and-forget cursor-store write; a failed persist only widens the gap. */
 	private persist(next: RecoveryCursorState): void {
 		this.#cursors = next;
 		this.#cursorSaves = this.#cursorSaves
-			.then(async () => {
-				await saveRecoveryCursors(this.recoveryCursorPath, next);
-				this.#cursorSaveFault = false;
-			})
-			.catch((error: unknown) => {
-				this.#cursorSaveFault = true;
+			.then(() => saveRecoveryCursors(this.recoveryCursorPath, next))
+			.catch((error: unknown) =>
 				console.error(
 					`Discord recovery cursor persist failed: ${error instanceof Error ? error.message : String(error)}`,
-				);
-			});
+				),
+			);
 	}
 
 	sendInbound(
@@ -3447,8 +2213,9 @@ export class ReconnectingGateway {
 		receivedAt?: string,
 		voice?: boolean,
 		messageChannelId?: string,
+		images?: readonly PromptImage[],
 	): void {
-		void this.requestInbound(messageId, origin, text, engagement, receivedAt, voice, messageChannelId);
+		void this.requestInbound(messageId, origin, text, engagement, receivedAt, voice, messageChannelId, images);
 	}
 
 	/**
@@ -3573,12 +2340,6 @@ export class ReconnectingGateway {
 	}
 
 	/** Like sendInbound but reports the gateway's engagement decision to the caller. */
-	private async rememberInboundDm(origin: OriginRef): Promise<void> {
-		if (origin.platform !== "discord" || origin.kind !== "dm") return;
-		await this.ensureCursors();
-		if (this.#cursors) this.persist(rememberKnownDm(this.#cursors, origin.conversationId, Date.now()));
-	}
-
 	async requestInbound(
 		messageId: string,
 		origin: OriginRef,
@@ -3593,8 +2354,12 @@ export class ReconnectingGateway {
 		 * thread, but its presence markers belong on the message in the parent.
 		 */
 		messageChannelId?: string,
+		images?: readonly PromptImage[],
 	): Promise<{ engaged?: boolean; turnId?: string | null } | undefined> {
-		await this.rememberInboundDm(origin);
+		if (origin.platform === "discord" && origin.kind === "dm") {
+			await this.ensureCursors();
+			if (this.#cursors) this.persist(rememberKnownDm(this.#cursors, origin.conversationId, Date.now()));
+		}
 		let result: { engaged?: boolean; turnId?: string | null } | undefined;
 		const verdict = await this.#inbound.join(messageId, async () => {
 			const client = this.#client;
@@ -3612,6 +2377,7 @@ export class ReconnectingGateway {
 					messageId,
 					...(receivedAt ? { receivedAt } : {}),
 					...(voice ? { voice: true } : {}),
+					...(images?.length ? { images } : {}),
 				});
 				// No recovery-watermark write here on purpose: a live message is no evidence that
 				// the older messages behind it were ever backfilled (issue #33).
@@ -3652,6 +2418,7 @@ export class ReconnectingGateway {
 		origin: OriginRef,
 		text: string,
 		engagement: EngagementContext,
+		images?: readonly PromptImage[],
 	): Promise<RecoveredSendResult> {
 		let failure: RecoveryFailureClass | undefined;
 		let summary: string | undefined;
@@ -3669,6 +2436,7 @@ export class ReconnectingGateway {
 					text,
 					engagement,
 					messageId,
+					...(images?.length ? { images } : {}),
 				});
 				return "acked";
 			} catch (error) {
@@ -3695,15 +2463,8 @@ export class ReconnectingGateway {
 		setTimeout(
 			() => {
 				if (this.#client !== client) return;
-				void client.request<GatewayStatusResult>("gateway.status").then(
-					(result) => {
-						const identity = result?.database?.identity;
-						// Includes the first observed identity: a populated legacy state must be
-						// reconciled before it is adopted as the baseline.
-						if (identity !== undefined && identity !== this.#cursors?.gatewayDbIdentity)
-							void this.reconcileGatewayRestore();
-						this.monitor(client, 0);
-					},
+				void client.request("gateway.status").then(
+					() => this.monitor(client, 0),
 					() => {
 						const next = monitorFailureDecision(strikes);
 						if (next.action === "reconnect") this.scheduleReconnect();
@@ -3718,7 +2479,6 @@ export class ReconnectingGateway {
 	private scheduleReconnect(): void {
 		if (this.#reconnecting) return;
 		this.#reconnecting = true;
-		this.#reconnectCount++;
 		this.#client = undefined;
 		this.#deliveryOff?.();
 		void this.downAlarm?.down();
@@ -3781,10 +2541,9 @@ async function discoverRecoveryThreadIds(
 	parent: RecoverableChannel,
 	parentId: string,
 	nowMs: number,
-): Promise<{ readonly threadIds: readonly string[]; readonly complete: boolean }> {
+): Promise<readonly string[]> {
 	const manager = (parent as { readonly threads?: Partial<RecoveryThreadManagerLike> }).threads;
-	if (!manager || typeof manager.fetchActive !== "function" || typeof manager.fetchArchived !== "function")
-		return { threadIds: [], complete: true };
+	if (!manager || typeof manager.fetchActive !== "function" || typeof manager.fetchArchived !== "function") return [];
 	const candidates: Array<{ readonly thread: RecoveryThreadLike; readonly archived: boolean }> = [];
 	let failed = false;
 	try {
@@ -3820,7 +2579,7 @@ async function discoverRecoveryThreadIds(
 		console.warn(
 			`Discord recovery thread discovery for channel ${parentId} was partial; ${ids.size} readable thread(s) remain eligible and other conversations continue.`,
 		);
-	return { threadIds: [...ids], complete: !failed };
+	return [...ids];
 }
 
 function isRecoveryThread(value: unknown, parentId: string): value is RecoveryThreadLike {

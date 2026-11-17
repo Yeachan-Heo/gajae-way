@@ -50,7 +50,7 @@ test("recovery does not send a text fallback when the shared image budget reject
 			downloads++;
 			return Uint8Array.of(1);
 		},
-		prepare: async () => ({ images: [{ data: "AQ==", mimeType: "image/jpeg" as const }], notice: "" }),
+		prepare: async () => ({ images: [{ data: "AQ==", mimeType: "image/jpeg" as const }] }),
 	};
 	const id = snowflakeFromTimestamp(Date.now() - 60_000);
 	const message = {
