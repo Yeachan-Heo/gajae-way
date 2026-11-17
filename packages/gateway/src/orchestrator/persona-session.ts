@@ -108,7 +108,9 @@ const STEER_REPLAY_ATTEMPTS = 2;
 /** Bind failures back off exponentially from DISPATCH_FAILURE_RETRY_MS up to this ceiling. */
 const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
 const LOCAL_PREFLIGHT_REJECTION_PREFIX = "persona-local-preflight-rejection:";
+const LOCAL_PREFLIGHT_MODEL_PREFIX = "persona-local-preflight-model:";
 const PROMPT_TOO_LARGE_CODE = "prompt_too_large";
+const MODEL_NOT_FOUND_REJECTION_CODE = "model_not_found";
 
 class SendTurnNoLongerBoundError extends Error {}
 
@@ -124,9 +126,13 @@ function localPreflightRejectionKey(opRef: string): string {
 	return `${LOCAL_PREFLIGHT_REJECTION_PREFIX}${opRef}`;
 }
 
+function localPreflightModelKey(opRef: string): string {
+	return `${LOCAL_PREFLIGHT_MODEL_PREFIX}${opRef}`;
+}
+
 function localPreflightRejection(store: Store, opRef: string): string | undefined {
 	const code = store.core.metaGet(localPreflightRejectionKey(opRef));
-	return code === PROMPT_TOO_LARGE_CODE ? code : undefined;
+	return code === PROMPT_TOO_LARGE_CODE || code === MODEL_NOT_FOUND_REJECTION_CODE ? code : undefined;
 }
 
 function freshTurnMetaKey(originKey: string, epoch: number, triggerMessageId: string): string {
@@ -1807,14 +1813,23 @@ class OriginActor {
 	}
 
 	async #settleLocalPreflightRejection(bound: BoundTurn, code: string): Promise<void> {
-		if (code !== PROMPT_TOO_LARGE_CODE) return;
+		if (code !== PROMPT_TOO_LARGE_CODE && code !== MODEL_NOT_FOUND_REJECTION_CODE) return;
 		const opRef = bound.turn.opRef;
 		const key = localPreflightRejectionKey(opRef);
 		if (localPreflightRejection(this.#manager.database, opRef) !== code) return;
-		const message = `the prompt exceeded the ${MAX_RELAY_REQUEST_FRAME_BYTES}-byte request limit before it was sent; reduce the text or number of images and send again`;
-		const error = new GjcRuntimeError(`${code}: ${message}`, { code, message });
+		const selectionKey = localPreflightModelKey(opRef);
+		const modelSelection =
+			code === MODEL_NOT_FOUND_REJECTION_CODE
+				? (this.#manager.database.core.metaGet(selectionKey) ?? describeModel(bound.lifecycle.effectiveModel))
+				: undefined;
+		const errorCode = code === MODEL_NOT_FOUND_REJECTION_CODE ? "invalid_input" : code;
+		const message =
+			code === PROMPT_TOO_LARGE_CODE
+				? `the prompt exceeded the ${MAX_RELAY_REQUEST_FRAME_BYTES}-byte request limit before it was sent; reduce the text or number of images and send again`
+				: `the selected model "${modelSelection}" was not found; choose a valid model with /model and send again`;
+		const error = new GjcRuntimeError(`${errorCode}: ${message}`, { code: errorCode, message });
 		this.#manager.log(
-			`persona_send_preflight_rejected origin=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} opRef=${opRef} reason=${code}`,
+			`persona_send_preflight_rejected origin=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} opRef=${opRef} reason=${code}${modelSelection ? ` selection=${modelSelection}` : ""}`,
 			"warn",
 		);
 		bound.tail?.setTurnRunning(false);
@@ -1854,6 +1869,8 @@ class OriginActor {
 				);
 			if (changed === 1 || this.#manager.database.inbox.turnRow(opRef)?.turn_state === "done")
 				this.#manager.database.core.metaDelete(key);
+			if (changed === 1 || this.#manager.database.inbox.turnRow(opRef)?.turn_state === "done")
+				this.#manager.database.core.metaDelete(selectionKey);
 			return changed;
 		});
 		await this.#notifySettled(bound);
@@ -2823,16 +2840,20 @@ class OriginActor {
 		// backoff instead.
 		const modelKey = describeModel(lifecycle.effectiveModel);
 		let modelReceipt: { readonly changed: boolean } | undefined;
+		let applyingModel = false;
 		try {
-			modelReceipt =
-				lifecycle.effectiveModel && this.#appliedModel.get(binding.sessionId) !== modelKey
-					? await this.#manager.port.setModel({
-							sessionId: binding.sessionId,
-							repo: this.#manager.repo,
-							selection: lifecycle.effectiveModel,
-							relay: tail,
-						})
-					: undefined;
+			if (lifecycle.effectiveModel && this.#appliedModel.get(binding.sessionId) !== modelKey) {
+				applyingModel = true;
+				modelReceipt = await this.#manager.port.setModel({
+					sessionId: binding.sessionId,
+					repo: this.#manager.repo,
+					selection: lifecycle.effectiveModel,
+					relay: tail,
+				});
+				applyingModel = false;
+			} else {
+				modelReceipt = undefined;
+			}
 			if (lifecycle.effectiveModel) this.#appliedModel.set(binding.sessionId, modelKey);
 			if (
 				lifecycle.effectiveServiceTier &&
@@ -2855,6 +2876,20 @@ class OriginActor {
 					`persona_service_tier origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} tier=${lifecycle.effectiveServiceTier} source=turn`,
 				);
 		} catch (error) {
+			if (applyingModel && typeof lifecycle.effectiveModel === "string" && isStructuredModelNotFoundFailure(error)) {
+				this.#manager.database.transaction(() => {
+					this.#manager.database.core.metaSet(localPreflightModelKey(opRef), lifecycle.effectiveModel as string);
+					this.#manager.database.core.metaSet(localPreflightRejectionKey(opRef), MODEL_NOT_FOUND_REJECTION_CODE);
+				});
+				this.#preSendFailures = 0;
+				this.#manager.recordPreSendFailure(this.originKey, safeDiagnostic(error));
+				this.#manager.log(
+					`persona_model_failed origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} message=${trigger.message_id} terminal=true selection=${modelKey} detail=${safeDiagnostic(error)}`,
+					"error",
+				);
+				await this.#settleLocalPreflightRejection(current, MODEL_NOT_FOUND_REJECTION_CODE);
+				return;
+			}
 			await tail.close();
 			const sessionGone = sdkStatusErrorCode(error) === "session_unavailable";
 			const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
@@ -5687,6 +5722,14 @@ function sdkStatusErrorCode(error: unknown): string | undefined {
 	if (raw) return raw;
 	const message = error instanceof Error ? error.message : "";
 	return /session_unavailable|endpoint_stale/.test(message) ? "session_unavailable" : undefined;
+}
+
+function isStructuredModelNotFoundFailure(error: unknown): boolean {
+	if (sdkStatusErrorCode(error) !== "invalid_input") return false;
+	const details = (error as { details?: unknown } | undefined)?.details;
+	const message =
+		typeof details === "object" && details !== null ? (details as { message?: unknown }).message : undefined;
+	return typeof message === "string" && /^Model .+ was not found\.$/.test(message);
 }
 
 /** Keeps raw platform identifiers in SQLite and derives a safe, fixed-length SDK client reference. */
