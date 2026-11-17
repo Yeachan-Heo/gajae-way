@@ -344,15 +344,13 @@ export class ImageOutbox {
 				return;
 			if (index === -1) entries.push(entry);
 			else entries[index] = entry;
-			// Enforce the journal bounds on the write path too: a long-lived session
-			// must not grow until the next recovery load.
-			const pruned = pruneEntries(entries);
+			// Check capacity before pruning to ensure rejections happen before eviction
 			if (index === -1 && !entry.completed && !entry.terminal) {
 				// Declined entries are reclaimable evidence, never delivery quota:
 				// one declined image must not be able to block a later authorized one.
-				const unresolved = pruned.filter((pending) => !pending.declined && !pending.completed && !pending.terminal);
-				const terminal = pruned.filter((pending) => !pending.declined && pending.terminal && !pending.completed);
-				const completed = pruned.filter((pending) => pending.completed && pending.declined !== true);
+				const unresolved = entries.filter((pending) => !pending.declined && !pending.completed && !pending.terminal);
+				const terminal = entries.filter((pending) => !pending.declined && pending.terminal && !pending.completed);
+				const completed = entries.filter((pending) => pending.completed && pending.declined !== true);
 				if (
 					unresolved.length >= MAX_UNRESOLVED_IMAGES ||
 					terminal.filter((pending) => pending.channelId === entry.channelId).length >=
@@ -362,6 +360,9 @@ export class ImageOutbox {
 				)
 					throw new ImageOutboxCapacityError();
 			}
+			// Enforce the journal bounds on the write path too: a long-lived session
+			// must not grow until the next recovery load.
+			const pruned = pruneEntries(entries);
 			await writeEntries(this.#path, pruned);
 			this.#entries = pruned;
 			this.#dropped = 0;

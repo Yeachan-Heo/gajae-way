@@ -347,7 +347,10 @@ test("an unreadable history channel still reaches a terminal image diagnosis", a
 		});
 		// Pre-expire the entry so it's dead-lettered instead of retried (403 errors are now retryable per P2 fix)
 		const expiredFailureTime = Date.now() - 25 * 24 * 60 * 60 * 1000; // 25 days ago
-		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: id, channelId, failureAt: expiredFailureTime }]));
+		await writeFile(
+			join(home, "image-outbox.json"),
+			JSON.stringify([{ messageId: id, channelId, failureAt: expiredFailureTime }]),
+		);
 		const denied = Object.assign(new Error("Missing Access"), { code: 50_001, status: 403 });
 		const channel = {
 			messages: {
