@@ -6,6 +6,7 @@
 - **gateway**: Pin GJC 0.20.0 (#786)
 
 ### Fixes
+- **gateway**: Park an escalated retired hold whose session host stays not live, with its process gone, for `sessions.retiredHoldAbandonMs` (default 24 hours) while its operation state stays unknown: it stays tracked and its late answer is still delivered, but it is probed hourly instead of every minute, so accumulated dead holds no longer saturate the CLI pool and stall live turns on `broker_unavailable`. A parked hold is never closed on that evidence, never resent, and gets no second notice.
 - **gateway**: Allow forced retire of idle open attempts as operator abandonment (#779)
 - **gateway**: Don't post failure notice when stall cutoff finds properly concluded reply (#769)
 - **gateway**: Keep an accepted authoring turn whose status is unknown (#746)

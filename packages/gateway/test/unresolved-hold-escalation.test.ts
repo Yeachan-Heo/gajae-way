@@ -3,11 +3,17 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_SESSIONS_BUSY_STALL_MS, DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS } from "../src/config";
 import {
+	DEFAULT_SESSIONS_BUSY_STALL_MS,
+	DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS,
+	DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
+} from "../src/config";
+import {
+	type EscalationNoticeReceipt,
 	type PersonaBindHoldInput,
 	PersonaSessionManager,
 	personaTurnOpRef,
+	RETIRED_HOLD_PARKED_PROBE_MS,
 	UNRESOLVED_HOLD_ESCALATED,
 } from "../src/orchestrator/persona-session";
 import { RelayClosedError } from "../src/orchestrator/tail-runner";
@@ -83,7 +89,17 @@ function endpointStale(): Error {
 
 async function heldOrigin(
 	name: string,
-	options: { heldForMs: number; live: boolean; reuseHome?: boolean; newerMessage?: boolean; clock?: VirtualClock },
+	options: {
+		heldForMs: number;
+		live: boolean;
+		reuseHome?: boolean;
+		newerMessage?: boolean;
+		clock?: VirtualClock;
+		retiredHoldAbandonMs?: number;
+		noticeReceipt?: () => EscalationNoticeReceipt;
+		/** Process-exit evidence for the held session's host (default: none). */
+		hostExited?: boolean;
+	},
 ) {
 	if (!options.reuseHome) home = await mkdtemp(join(tmpdir(), "gajaeway-unresolved-hold-"));
 	database = await Store.open(join(home, "gateway.db"));
@@ -116,6 +132,9 @@ async function heldOrigin(
 		expect(db.inbox.markSendAttempted(tx, heldOpRef, [], sentAt)).toBe(true);
 	});
 	port.setSessionState(binding.sessionId, { live: options.live });
+	port.setHostIncarnation(binding.sessionId, "linux:1001");
+	port.setActivity(binding.sessionId, "idle", 500);
+	port.setHostExited(binding.sessionId, options.hostExited ?? false);
 	if (options.newerMessage !== false) enqueue("m-next", "a newer message", new Date().toISOString());
 	const logs: string[] = [];
 	const notices: PersonaBindHoldInput[] = [];
@@ -128,6 +147,8 @@ async function heldOrigin(
 			instanceId: "hold-test",
 			repo,
 			unresolvedHoldMs: 10 * MINUTE,
+			...(options.retiredHoldAbandonMs ? { retiredHoldAbandonMs: options.retiredHoldAbandonMs } : {}),
+			...(options.noticeReceipt ? { escalationNoticeReceipt: options.noticeReceipt } : {}),
 			...(options.clock ? options.clock.managerOptions() : {}),
 			log: (line: string) => logs.push(line),
 			onBindHold: (input) => {
@@ -977,6 +998,792 @@ test("an escalated hold whose status is only transiently unreadable keeps holdin
 		expect(reads).toBeGreaterThanOrEqual(60);
 		expect(reads).toBeLessThanOrEqual(64);
 		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+/** Counts liveness reads of one session, the extra CLI spawn an abandonment check costs. */
+function countLiveness(port: HoldPort, sessionId: string): () => number {
+	let reads = 0;
+	const liveness = port.liveness.bind(port);
+	port.liveness = async (input) => {
+		if (input.sessionId === sessionId) reads++;
+		return await liveness(input);
+	};
+	return () => reads;
+}
+
+test("an escalated hold whose host stays not live past retiredHoldAbandonMs is parked once, never resent, re-noticed or closed, also across a restart", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-abandoned", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: true,
+		clock,
+		retiredHoldAbandonMs: 120 * MINUTE,
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		expect(f.notices).toHaveLength(1);
+		// The notice's delivery row was linked to the open hold until the first sweep read the ledger's
+		// confirmation and stored it durably; from then on the row is ordinary history.
+		const links = () => f.db.core.metaKeysInRange("escalation-notice-delivery:", "escalation-notice-delivery:\uffff");
+		expect(f.db.core.metaGet(`escalation-notice-confirmed:${f.heldOpRef}`)).toBe("1");
+		expect(links()).toHaveLength(0);
+		let statusReads = 0;
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			statusReads++;
+			throw endpointStale();
+		};
+		const livenessReads = countLiveness(f.port, f.binding.sessionId);
+		// Inside the window the hold keeps its #715 contract: open, durable, swept once a minute.
+		for (let minute = 0; minute < 60; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeDefined();
+		// The window, opened by the first sweep's read, costs no liveness read per sweep.
+		expect(livenessReads()).toBe(0);
+
+		// The dead-since mark is durable: a restart does not restart the window.
+		await f.manager.stop();
+		const restarted = f.startManager();
+		try {
+			await restarted.recover();
+			for (let minute = 0; minute < 61; minute++) {
+				await clock.advance(MINUTE);
+				await restarted.reconcile(f.originKey);
+			}
+			// Parked, never closed: the turn, its escalation marker, its window mark and its confirmation all stay.
+			expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+			expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBe("1");
+			expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeDefined();
+			expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeDefined();
+			expect(f.db.core.metaGet(`escalation-notice-confirmed:${f.heldOpRef}`)).toBe("1");
+			expect(links()).toHaveLength(0);
+			const parked = f.logs.filter((line) => line.startsWith("retired_hold_parked ") && line.includes(f.heldOpRef));
+			expect(parked).toHaveLength(1);
+			expect(parked[0]).toContain("reason=host_not_live");
+			// The user was told once, at escalation; the held request is never resent.
+			expect(f.notices).toHaveLength(1);
+			expect(f.port.sends.filter((send) => send.opRef === f.heldOpRef)).toHaveLength(0);
+
+			// Once parked, the sweep stops reading it every minute.
+			const readsAtPark = statusReads;
+			for (let minute = 0; minute < 30; minute++) {
+				await clock.advance(MINUTE);
+				await restarted.reconcile(f.originKey);
+			}
+			expect(statusReads - readsAtPark).toBeLessThanOrEqual(1);
+		} finally {
+			await restarted.stop();
+		}
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("an escalated hold whose host is seen live again restarts the abandonment window", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-revived", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: true,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			throw endpointStale();
+		};
+		await clock.advance(MINUTE);
+		await f.manager.reconcile(f.originKey);
+		const firstMark = f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`);
+		expect(firstMark).toBeDefined();
+		// The window closes with the host live: no proof the producer is gone.
+		f.port.setSessionState(f.binding.sessionId, { live: true });
+		for (let minute = 0; minute < 61; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeUndefined();
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeUndefined();
+		// Dead again: a fresh full window is required.
+		f.port.setSessionState(f.binding.sessionId, { live: false });
+		for (let minute = 0; minute < 30; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeUndefined();
+		for (let minute = 0; minute < 32; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeDefined();
+		expect(f.notices).toHaveLength(1);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("unanswerable liveness at the end of the abandonment window neither parks nor restarts it", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-unanswerable", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: true,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			throw endpointStale();
+		};
+		await clock.advance(MINUTE);
+		await f.manager.reconcile(f.originKey);
+		const mark = f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`);
+		expect(mark).toBeDefined();
+		// A saturated broker cannot answer liveness when the window closes.
+		const liveness = f.port.liveness.bind(f.port);
+		let unanswerable = true;
+		f.port.liveness = async (input) => {
+			if (unanswerable && input.sessionId === f.binding.sessionId) throw new Error("broker_unavailable: timed out");
+			return await liveness(input);
+		};
+		for (let minute = 0; minute < 90; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeUndefined();
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBe(mark);
+		// The first answerable read that still finds the host gone closes it.
+		unanswerable = false;
+		await clock.advance(MINUTE);
+		await f.manager.reconcile(f.originKey);
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeDefined();
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("an in-flight status read during the abandonment window restarts it, also when relay evidence keeps the hold (#772)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-in-flight-reset", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: true,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		let inFlight = false;
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			if (!inFlight) throw endpointStale();
+			// The reattached relay stays unresponsive; only the CLI status answers (#766).
+			if (input.relay) throw new RelayClosedError(f.binding.sessionId, "relay unavailable", false);
+			return { operationRef: input.opRef, status: { status: "in_flight" as const }, summaryCompleted: false };
+		};
+		await clock.advance(MINUTE);
+		await f.manager.reconcile(f.originKey);
+		const firstMark = f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`);
+		expect(firstMark).toBeDefined();
+		// Aged relay evidence routes an in-flight read through the hold branch (#766).
+		f.db.core.metaSet(`relay_unavailable:${f.heldOpRef}`, String(clock.managerOptions().now() - 20 * MINUTE));
+		await clock.advance(30 * MINUTE);
+		inFlight = true;
+		await f.manager.reconcile(f.originKey);
+		// The read did take the relay-evidence hold branch, not the readable-status path.
+		expect(f.db.core.metaGet(`relay_unavailable:${f.heldOpRef}`)).toBeDefined();
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeUndefined();
+		// Unknown again: the old mark has not come back, so a full new window is required.
+		inFlight = false;
+		for (let minute = 0; minute < 45; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeUndefined();
+		const secondMark = f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`);
+		expect(secondMark).toBeDefined();
+		expect(secondMark).not.toBe(firstMark);
+		for (let minute = 0; minute < 20; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeDefined();
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a disowned session id is not proof its host exited: the hold stays open past the window", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-disowned", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: true,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			throw endpointStale();
+		};
+		await clock.advance(MINUTE);
+		await f.manager.reconcile(f.originKey);
+		const mark = f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`);
+		expect(mark).toBeDefined();
+		// The broker stops serving the id; a detached host may still be running it.
+		const liveness = f.port.liveness.bind(f.port);
+		f.port.liveness = async (input) =>
+			input.sessionId === f.binding.sessionId ? { live: undefined, disowned: true } : await liveness(input);
+		for (let minute = 0; minute < 180; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeUndefined();
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBe(mark);
+		expect(f.logs.some((line) => line.startsWith("retired_hold_parked "))).toBe(false);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+/** Holds whose status stays endpoint_stale, so only the abandonment window can settle them. */
+function staleStatus(f: { port: HoldPort; heldOpRef: string }): void {
+	const status = f.port.status.bind(f.port);
+	f.port.status = async (input) => {
+		if (input.opRef !== f.heldOpRef) return await status(input);
+		throw endpointStale();
+	};
+}
+
+async function sweepMinutes(clock: VirtualClock, manager: PersonaSessionManager, originKey: string, minutes: number) {
+	for (let minute = 0; minute < minutes; minute++) {
+		await clock.advance(MINUTE);
+		await manager.reconcile(originKey);
+	}
+}
+
+test("a hold whose escalation notice the origin never confirmed is not parked; a later confirmation is kept durably", async () => {
+	const clock = new VirtualClock();
+	let confirmed = false;
+	let asks = 0;
+	const f = await heldOrigin("dead-hold-unconfirmed-notice", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: true,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+		noticeReceipt: () => {
+			asks++;
+			return confirmed ? "confirmed" : "unconfirmed";
+		},
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		staleStatus(f);
+		// Queued but unconfirmed (adapter offline past the outbox TTL): the hold keeps waiting.
+		await sweepMinutes(clock, f.manager, f.originKey, 180);
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeUndefined();
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeUndefined();
+		expect(asks).toBeGreaterThan(0);
+		// Confirmed once: recorded, so a ledger that later prunes the row cannot undo it.
+		confirmed = true;
+		await sweepMinutes(clock, f.manager, f.originKey, 1);
+		expect(f.db.core.metaGet(`escalation-notice-confirmed:${f.heldOpRef}`)).toBe("1");
+		confirmed = false;
+		await sweepMinutes(clock, f.manager, f.originKey, 61);
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeDefined();
+		// The parked hold keeps its durable confirmation.
+		expect(f.db.core.metaGet(`escalation-notice-confirmed:${f.heldOpRef}`)).toBe("1");
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a host that revived and died again inside the window is a new incarnation and restarts the window", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-new-incarnation", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: true,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		staleStatus(f);
+		await sweepMinutes(clock, f.manager, f.originKey, 1);
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toContain("linux:1001");
+		// Between the two reads a new host ran the session (and may have finished
+		// the op while status stayed unreadable), then exited; no read saw it live.
+		f.port.setHostIncarnation(f.binding.sessionId, "linux:2002");
+		await sweepMinutes(clock, f.manager, f.originKey, 61);
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeUndefined();
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toContain("linux:2002");
+		expect(f.logs.filter((line) => line.startsWith("retired_hold_window_restarted "))).toHaveLength(1);
+		// The same dead host for a full new window closes it.
+		await sweepMinutes(clock, f.manager, f.originKey, 61);
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeDefined();
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("an activity stamp that moved inside the window restarts it, even on the same host identity", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-activity-moved", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: true,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		f.port.setActivity(f.binding.sessionId, "idle", 1_000);
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		staleStatus(f);
+		await sweepMinutes(clock, f.manager, f.originKey, 1);
+		f.port.setActivity(f.binding.sessionId, "idle", 2_000);
+		await sweepMinutes(clock, f.manager, f.originKey, 61);
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeUndefined();
+		await sweepMinutes(clock, f.manager, f.originKey, 61);
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeDefined();
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a not-live read without a host identity never parks the hold", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-no-incarnation", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: true,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		// The broker reports the host gone but no identity for it.
+		const liveness = f.port.liveness.bind(f.port);
+		f.port.liveness = async (input) =>
+			input.sessionId === f.binding.sessionId ? { live: false, disowned: false } : await liveness(input);
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		staleStatus(f);
+		await sweepMinutes(clock, f.manager, f.originKey, 180);
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeUndefined();
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeUndefined();
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a not-live read without an activity stamp never opens or ends the window", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-no-activity", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: true,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		// Same incarnation throughout, but inspect may report no activity stamp.
+		const liveness = f.port.liveness.bind(f.port);
+		let stamp: number | undefined;
+		f.port.liveness = async (input) =>
+			input.sessionId === f.binding.sessionId
+				? {
+						live: false,
+						disowned: false,
+						hostIncarnation: "linux:1001",
+						...(stamp === undefined ? {} : { activity: { state: "idle", at: stamp } }),
+					}
+				: await liveness(input);
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		staleStatus(f);
+		await sweepMinutes(clock, f.manager, f.originKey, 120);
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeUndefined();
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeUndefined();
+		// A stamp seen only later is not the same activity at both ends: it opens a fresh window.
+		stamp = 7_000;
+		await sweepMinutes(clock, f.manager, f.originKey, 2);
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeUndefined();
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toContain('"activityAt":7000');
+		// The stamp vanishing at the window's end proves nothing either.
+		stamp = undefined;
+		await sweepMinutes(clock, f.manager, f.originKey, 70);
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeUndefined();
+		stamp = 7_000;
+		await sweepMinutes(clock, f.manager, f.originKey, 2);
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeDefined();
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a notice retried after its hold settled is still posted but never relinks the settled trigger's delivery row", async () => {
+	const f = await heldOrigin("dead-hold-settled-retry", { heldForMs: 11 * MINUTE, live: false });
+	const links = () => f.db.core.metaKeysInRange("escalation-notice-delivery:", "escalation-notice-delivery:\uffff");
+	try {
+		// The adapter is offline at escalation: the durable intent stays, the hold is linked.
+		f.failNotices(1);
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		expect(f.notices).toHaveLength(0);
+		const intentKey = `escalation-notice:${f.originKey}#${f.heldOpRef}`;
+		expect(f.db.core.metaGet(intentKey)).toBe("1");
+		expect(links()).toHaveLength(1);
+		// The hold settles before the retry: completion drops its link.
+		f.db.transaction((tx) => f.db.inbox.turnComplete(tx, f.heldOpRef, "turn_failed"));
+		for (const key of links()) f.db.core.metaDelete(key);
+		// The next recovery scan (a restart) retries the notice before it looks at open turns: it posts
+		// once and clears the intent, without a new link that nothing would ever remove.
+		await f.manager.recover();
+		await until(() => f.notices.length === 1);
+		expect(f.notices[0]?.reason).toBe(UNRESOLVED_HOLD_ESCALATED);
+		expect(f.db.core.metaGet(intentKey)).toBeUndefined();
+		expect(links()).toHaveLength(0);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+/** A hold told once at escalation whose ledger row is gone, with its reissue left unposted by an offline adapter. */
+async function unpostedReissue(name: string) {
+	const clock = new VirtualClock();
+	let receipt: EscalationNoticeReceipt = "unconfirmed";
+	const f = await heldOrigin(name, {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: true,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+		noticeReceipt: () => receipt,
+	});
+	await f.manager.recover();
+	await until(() => f.port.sends.length === 1);
+	expect(f.notices).toHaveLength(1);
+	const status = f.port.status.bind(f.port);
+	staleStatus(f);
+	// The row is pruned later, while the adapter is offline: the reissue is scheduled but not posted.
+	receipt = "missing";
+	f.failNotices(1);
+	await sweepMinutes(clock, f.manager, f.originKey, 2);
+	const intentKey = `escalation-notice:${f.originKey}#${f.heldOpRef}`;
+	expect(f.db.core.metaGet(intentKey)).toBe("reissue");
+	expect(f.db.core.metaGet(`escalation-notice-reissued:${f.heldOpRef}`)).toBeDefined();
+	expect(f.notices).toHaveLength(1);
+	f.port.status = status;
+	return { ...f, clock, intentKey };
+}
+
+test("a reissue left unposted by a failed retry is dropped when its hold completes with the late answer", async () => {
+	const f = await unpostedReissue("reissue-then-answer");
+	try {
+		f.port.setSessionState(f.binding.sessionId, { live: true });
+		f.port.seedAcceptedSend({ sessionId: f.binding.sessionId, repo: "", text: "", opRef: f.heldOpRef });
+		f.port.complete(f.heldOpRef, "late answer");
+		await f.manager.reconcile(f.originKey);
+		await until(() => f.db.inbox.turnRow(f.heldOpRef)?.turn_state === "done");
+		expect(f.db.core.metaGet(f.intentKey)).toBeUndefined();
+		await f.manager.stop();
+		// A restart retries pending notices first: there is nothing left to repeat after the answer.
+		const restarted = f.startManager();
+		try {
+			await restarted.recover();
+			expect(f.notices).toHaveLength(1);
+		} finally {
+			await restarted.stop();
+		}
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a reissue whose hold settled before its retry is discarded, not posted after the answer", async () => {
+	const f = await unpostedReissue("reissue-then-settled");
+	try {
+		// The raw row update, as a crash between the completion and its clean-up would leave it.
+		f.db.transaction((tx) => f.db.inbox.turnComplete(tx, f.heldOpRef, "turn_failed"));
+		await f.manager.recover();
+		expect(f.notices).toHaveLength(1);
+		expect(f.db.core.metaGet(f.intentKey)).toBeUndefined();
+		expect(
+			f.logs.filter((line) => line.startsWith("escalation_notice_discarded ") && line.includes(f.heldOpRef)),
+		).toHaveLength(1);
+		await f.manager.recover();
+		expect(f.notices).toHaveLength(1);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a dead hold whose host process is still present is never parked: broker non-liveness is not producer exit", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-process-present", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: false,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		staleStatus(f);
+		// Stable live=false, same incarnation and activity stamp, well past the window: still held.
+		await sweepMinutes(clock, f.manager, f.originKey, 180);
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeUndefined();
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBe("1");
+		const kept = f.logs.filter((line) => line.startsWith("retired_hold_kept ") && line.includes(f.heldOpRef));
+		expect(kept).toHaveLength(1);
+		expect(kept[0]).toContain("reason=producer_exit_unproven");
+		expect(f.logs.filter((line) => line.startsWith("retired_hold_parked "))).toHaveLength(0);
+		// The window stays open rather than restarting: once the process is gone, the next sweep closes the hold.
+		f.port.setHostExited(f.binding.sessionId, true);
+		await sweepMinutes(clock, f.manager, f.originKey, 1);
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeDefined();
+		expect(f.logs.filter((line) => line.startsWith("retired_hold_parked "))).toHaveLength(1);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a hold whose notice row was pruned is re-noticed once under the same delivery id, then parks on confirmation", async () => {
+	const clock = new VirtualClock();
+	let receipt: EscalationNoticeReceipt = "missing";
+	const f = await heldOrigin("dead-hold-pruned-receipt", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: true,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+		noticeReceipt: () => receipt,
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		staleStatus(f);
+		// The ledger has no row for the notice: it is posted once more, with an audit line, and the hold waits.
+		await until(() => f.notices.length === 2);
+		await sweepMinutes(clock, f.manager, f.originKey, 2);
+		expect(f.notices).toHaveLength(2);
+		expect(f.notices.map((notice) => notice.reason)).toEqual([UNRESOLVED_HOLD_ESCALATED, UNRESOLVED_HOLD_ESCALATED]);
+		expect(
+			f.logs.filter((line) => line.startsWith("escalation_notice_reissued ") && line.includes(f.heldOpRef)),
+		).toHaveLength(1);
+		expect(f.db.core.metaGet(`escalation-notice:${f.originKey}#${f.heldOpRef}`)).toBeUndefined();
+		expect(f.db.core.metaGet(`escalation-notice-reissued:${f.heldOpRef}`)).toBeDefined();
+		// A row still missing afterwards is a ledger anomaly: no third notice, no close.
+		await sweepMinutes(clock, f.manager, f.originKey, 120);
+		expect(f.notices).toHaveLength(2);
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeUndefined();
+		// The held operation itself is never resent.
+		expect(f.port.sends.filter((send) => send.opRef === f.heldOpRef)).toHaveLength(0);
+		// Once the reissued notice is confirmed, the ordinary window applies.
+		receipt = "confirmed";
+		await sweepMinutes(clock, f.manager, f.originKey, 62);
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeDefined();
+		// The reissue guard outlives the park, so a parked hold is never noticed a third time.
+		expect(f.db.core.metaGet(`escalation-notice-reissued:${f.heldOpRef}`)).toBeDefined();
+		expect(f.notices).toHaveLength(2);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a crash while scheduling a replacement escalation notice leaves a retryable hold (#785)", async () => {
+	const clock = new VirtualClock();
+	let receipt: EscalationNoticeReceipt = "unconfirmed";
+	const f = await heldOrigin("dead-hold-reissue-crash", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: true,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+		noticeReceipt: () => receipt,
+	});
+	const originalMetaSet = f.db.core.metaSet.bind(f.db.core);
+	let restarted: PersonaSessionManager | undefined;
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		expect(f.notices).toHaveLength(1);
+		staleStatus(f);
+		receipt = "missing";
+		const reissuedKey = `escalation-notice-reissued:${f.heldOpRef}`;
+		let crashed = false;
+		f.db.core.metaSet = (key, value) => {
+			originalMetaSet(key, value);
+			if (key === reissuedKey && !crashed) {
+				crashed = true;
+				throw new Error("simulated crash after reissue marker");
+			}
+		};
+		await expect(f.manager.reconcile(f.originKey)).rejects.toThrow("simulated crash after reissue marker");
+		expect(crashed).toBe(true);
+		f.db.core.metaSet = originalMetaSet;
+		// Neither half of the reissue intent may survive the interrupted transaction.
+		expect(f.db.core.metaGet(reissuedKey)).toBeUndefined();
+		expect(f.db.core.metaGet(`escalation-notice:${f.originKey}#${f.heldOpRef}`)).toBeUndefined();
+		await f.manager.stop();
+		restarted = f.startManager();
+		await restarted.recover();
+		await restarted.reconcile(f.originKey);
+		await until(() => f.notices.length === 2);
+		expect(f.notices[1]?.reason).toBe(UNRESOLVED_HOLD_ESCALATED);
+		expect(f.port.sends.filter((send) => send.opRef === f.heldOpRef)).toHaveLength(0);
+	} finally {
+		f.db.core.metaSet = originalMetaSet;
+		await restarted?.stop();
+		await f.manager.stop();
+	}
+});
+
+test("a parked dead hold stays tracked, probed hourly, unparked by evidence, cadence durable across a restart", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-parked", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: true,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		let statusReads = 0;
+		let inFlight = false;
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			statusReads++;
+			if (inFlight)
+				return { operationRef: input.opRef, status: { status: "in_flight" as const }, summaryCompleted: false };
+			throw endpointStale();
+		};
+		// With the window's evidence in, the hold is parked and keeps everything #718 kept.
+		await sweepMinutes(clock, f.manager, f.originKey, 61);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBe("1");
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeDefined();
+		const parked = f.logs.filter((line) => line.startsWith("retired_hold_parked ") && line.includes(f.heldOpRef));
+		expect(parked).toHaveLength(1);
+		expect(parked[0]).toContain("reason=host_not_live");
+		expect(parked[0]).toContain(`probeEveryMs=${RETIRED_HOLD_PARKED_PROBE_MS}`);
+		expect(f.notices).toHaveLength(1);
+		// Parked: three more hours cost three status reads, not 180.
+		const atPark = statusReads;
+		await sweepMinutes(clock, f.manager, f.originKey, 180);
+		expect(statusReads - atPark).toBeGreaterThanOrEqual(2);
+		expect(statusReads - atPark).toBeLessThanOrEqual(3);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+
+		// The probe stamp is durable: a restart does not resume per-sweep reads.
+		await f.manager.stop();
+		const restarted = f.startManager();
+		try {
+			await restarted.recover();
+			const atRestart = statusReads;
+			for (let minute = 0; minute < 30; minute++) {
+				await clock.advance(MINUTE);
+				await restarted.reconcile(f.originKey);
+			}
+			expect(statusReads - atRestart).toBeLessThanOrEqual(1);
+			expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeDefined();
+
+			// Readable evidence at the next hourly probe unparks the hold, and it is swept every minute again.
+			inFlight = true;
+			const beforeEvidence = statusReads;
+			for (let minute = 0; minute < 61 && statusReads === beforeEvidence; minute++) {
+				await clock.advance(MINUTE);
+				await restarted.reconcile(f.originKey);
+			}
+			expect(statusReads).toBe(beforeEvidence + 1);
+			expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeUndefined();
+			expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeUndefined();
+			expect(
+				f.logs.filter((line) => line.startsWith("retired_hold_unparked ") && line.includes(f.heldOpRef)),
+			).toHaveLength(1);
+			const afterUnpark = statusReads;
+			for (let minute = 0; minute < 5; minute++) {
+				await clock.advance(MINUTE);
+				await restarted.reconcile(f.originKey);
+			}
+			expect(statusReads - afterUnpark).toBe(5);
+			expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		} finally {
+			await restarted.stop();
+		}
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a reloaded sessions.retiredHoldAbandonMs applies to the live manager", async () => {
+	const f = await heldOrigin("dead-hold-reload", { heldForMs: 11 * MINUTE, live: false });
+	try {
+		expect(f.manager.retiredHoldAbandonMs).toBe(DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS);
+		f.manager.setHostLimits({ retiredHoldAbandonMs: 2 * 60 * MINUTE });
+		expect(f.manager.retiredHoldAbandonMs).toBe(2 * 60 * MINUTE);
+		f.manager.setHostLimits(undefined);
+		expect(f.manager.retiredHoldAbandonMs).toBe(DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("an escalated hold whose status reads in_flight is never abandoned, even with its host not live (#772)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("dead-hold-in-flight", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		hostExited: true,
+		clock,
+		retiredHoldAbandonMs: 60 * MINUTE,
+	});
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			return { operationRef: input.opRef, status: { status: "in_flight" as const }, summaryCompleted: false };
+		};
+		for (let minute = 0; minute < 180; minute++) {
+			await clock.advance(MINUTE);
+			await f.manager.reconcile(f.originKey);
+		}
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeUndefined();
+		expect(f.logs.some((line) => line.startsWith("retired_hold_parked "))).toBe(false);
 	} finally {
 		await f.manager.stop();
 	}

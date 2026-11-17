@@ -108,7 +108,6 @@ export interface TelegramAttachmentSaver {
 
 export type TelegramImagePreparation = {
 	readonly images: PromptImage[];
-	readonly notice: string;
 };
 
 /**
