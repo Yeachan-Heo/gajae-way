@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { readFile, unlink } from "node:fs/promises";
+import { readFile, stat, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { validatePromptImages } from "@gajae-gateway/images";
 import {
@@ -1411,6 +1411,20 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	return runtime;
 }
 /**
+ * Identity of the database file this gateway process opened. The supported offline
+ * restore swaps the file, so `dev:ino` changes; an in-place rewrite of the live file
+ * keeps its inode and is outside the supported restore path.
+ */
+async function databaseIdentity(path: string): Promise<string | undefined> {
+	try {
+		const info = await stat(path);
+		return `${info.dev}:${info.ino}`;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Monitor-batch settlement (issue #29 defect 2): the delivery ledger row for a
  * monitor batch carries turn_id === batch_id. When the adapter confirms that
  * delivery, every event of the batch that has already reached `authored`
@@ -1564,7 +1578,8 @@ async function handleRequest(
 ): Promise<void> {
 	const gatewayStartedAt = options.startedAt ?? new Date().toISOString();
 	switch (request.verb) {
-		case "gateway.status":
+		case "gateway.status": {
+			const dbIdentity = await databaseIdentity(options.config.dbPath);
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
@@ -1575,6 +1590,7 @@ async function handleRequest(
 					pid: process.pid,
 					startedAt: gatewayStartedAt,
 					schemaVersion: options.database.schemaVersion,
+					...(dbIdentity === undefined ? {} : { database: { identity: dbIdentity } }),
 					readiness: (() => {
 						const drainId = runtime.personaSessions.restartDrainId;
 						if (drainId !== undefined) {
@@ -1606,6 +1622,7 @@ async function handleRequest(
 				},
 			});
 			return;
+		}
 		case "gateway.shutdown":
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { stopping: true } });
 			await stop();

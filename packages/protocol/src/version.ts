@@ -22,6 +22,8 @@ export const CAPABILITIES = [
 	"chat.reactions",
 	/** Durable native image inputs on chat.send. */
 	"chat.images",
+	/** gateway.status reports the database generation identity for restore reconciliation. */
+	"gateway.status.databaseIdentity",
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];

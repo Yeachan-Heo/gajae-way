@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DeliveryService } from "../src/delivery/delivery";
 import { Store } from "../src/store";
-import { type Barrier, eventually, noticeOrigin, WorkFixture, writeFixtureJson } from "./fixtures/work-lane-server";
+import { type Barrier, eventually, WorkFixture, writeFixtureJson } from "./fixtures/work-lane-server";
 
 const fixtures: WorkFixture[] = [];
 afterEach(async () => {
