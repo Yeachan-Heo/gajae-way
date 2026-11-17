@@ -1490,9 +1490,8 @@ export class WorkLaneManager {
 				// A settled attempt whose host is gone has no live op to report.
 				if (successor || provenance || (job.state === "awaiting_operator" && attempt.endedAt === undefined))
 					opUnavailable = true;
-				else if (attempt.endedAt === undefined || !isSessionUnavailable(error))
+				else if (!isSessionUnavailable(error))
 					throw workError("work status unavailable", "status_unavailable", { ...attempt, jobId: job.jobId });
-				throw workError("work status unavailable", "status_unavailable", { ...attempt, jobId: job.jobId });
 			}
 			const current = this.#db.bindings.getSessionRecord(key);
 			if (current?.sessionId !== binding.sessionId || current.epoch !== binding.epoch) op = null;
