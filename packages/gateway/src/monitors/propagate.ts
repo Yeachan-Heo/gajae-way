@@ -1452,11 +1452,12 @@ export class MonitorPropagator {
 							const pendingCreate = this.#hasPendingCreateIntent(sessionOriginKey, boundEpoch);
 							const currentSession = this.#database.bindings.getSessionRecord(sessionOriginKey);
 							const sessionExists = currentSession?.epoch === boundEpoch && Boolean(currentSession.sessionId);
-							// A pending create can fail with an ordinary bind-frame Error in production;
-							// an existing binding can also fail inspection without timeout text. Count
-							// either scoped condition, while retaining timeout recovery for a missing
-							// binding with no pending create.
-							const countBindFailure = isBindTimeoutError(bindError) || pendingCreate || sessionExists;
+							// Issue #780 P2 #1: Only count bind failures that are timeouts or involve a
+							// pending create (which is not yet a valid session). Non-timeout errors on an
+							// existing valid session should not trigger rotation: they're transient inspection
+							// failures, not evidence of a poisoned key. Only timeout errors and unindexed
+							// session creates warrant rotation.
+							const countBindFailure = isBindTimeoutError(bindError) || pendingCreate;
 							if (countBindFailure) {
 								if (safety.bindTimeoutEpoch !== boundEpoch) {
 									safety.bindTimeoutFailures = 0;
@@ -1509,6 +1510,9 @@ export class MonitorPropagator {
 									this.#persistBindTimeoutCounter(sessionOriginKey, 0, boundEpoch);
 									safety.bindTimeoutFailures = 0;
 									safety.bindTimeoutEpoch = boundEpoch;
+									// Issue #780 P2 #2: Clear escalation streaks when epoch rotates to prevent
+									// cross-epoch escalation duplicates. Each new epoch starts with a fresh streak.
+									safety.escalatedForCurrentStreak = false;
 									this.#safety.set(sessionOriginKey, safety);
 									// A successful inline rebind is still a retry, not a first-attempt success.
 									if (

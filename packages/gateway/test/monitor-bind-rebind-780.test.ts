@@ -240,48 +240,30 @@ test("a stale pending session.create no longer blocks same-process rebind after 
 	}
 });
 
-test("an existing unverified session binding rotates after repeated inspect failures (#780 P2 #1)", async () => {
+test("an existing unverified session binding does not rotate on non-timeout inspection failures (#780 P2 #1 regression)", async () => {
+	// Issue #780 P2 #1: Non-timeout bind errors (like transient inspection failures)
+	// should not trigger epoch rotation when there's a valid existing session.
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-existing-binding-rebind-"));
 	try {
 		const database = await Store.open(join(home, "gateway.db"));
 		const registry = new MonitorRegistry(database);
 		const monitor = registry.add({
-			name: "existing-binding-rebind-test",
+			name: "existing-binding-no-rotate",
 			trigger: { kind: "cron", schedule: "* * * * *" },
-			eventTypes: ["test.existing_binding_rebind"],
+			eventTypes: ["test.existing_binding_no_rotate"],
 			burstPolicy: "serialize",
 		});
-		const originKey = `monitor/eventtype/test.existing_binding_rebind/parent=${monitor.monitorId}`;
+		const originKey = `monitor/eventtype/test.existing_binding_no_rotate/parent=${monitor.monitorId}`;
 		database.transaction((tx) => {
-			expect(database.bindings.bindAtEpoch(tx, originKey, "unverified-old-session", 0)).toBe(true);
+			expect(database.bindings.bindAtEpoch(tx, originKey, "valid-existing-session", 0)).toBe(true);
 		});
 
 		const attemptedEpochs: number[] = [];
-		const delivered: ChatMessagePayload[] = [];
-		let requestAttempts = 0;
-		const repo = join(home, "workspace");
 		const sessionPort: Partial<SessionPort> = {
 			bind: async (input) => {
 				attemptedEpochs.push(input.epoch);
-				if (input.epoch === 0) throw new Error("session inspect failed");
-				database.transaction((tx) => {
-					expect(database.bindings.bindAtEpoch(tx, originKey, `session-epoch-${input.epoch}`, input.epoch)).toBe(true);
-				});
-				return {
-					sessionId: `session-epoch-${input.epoch}`,
-					originKey: input.originKey,
-					epoch: input.epoch,
-					repo: input.repo,
-					startupModelApplied: false,
-				};
-			},
-			request: async (input) => {
-				requestAttempts++;
-				const eventId = input.text.match(/"eventId":"([^"]+)"/)?.[1];
-				return {
-					receipt: { sessionId: input.sessionId, operationRef: input.opRef },
-					assistant: { text: JSON.stringify([{ eventId, note: "A fresh session delivered the result." }]) },
-				} as never;
+				// Simulate transient inspection failure (non-timeout error)
+				throw new Error("session inspection failed temporarily");
 			},
 			runExclusive: async (_, fn) => fn(),
 		};
@@ -292,31 +274,20 @@ test("an existing unverified session binding rotates after repeated inspect fail
 			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
 			delivery: new DeliveryService(database),
 			emit: () => {},
-			ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "test-owner" } },
-			deliver: (payload) => delivered.push(payload),
-			repo,
-			model: undefined,
-			serviceTier: undefined,
 		});
 
-		const eventIds: string[] = [];
-		for (let i = 0; i < 3; i++) {
-			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.existing_binding_rebind", {});
-			eventIds.push(eventId);
-			for (let attempt = 0; attempt < 200; attempt++) {
-				const stage = database.monitors.eventGet(eventId)?.stage;
-				if (stage === "failed" || stage === "authored" || stage === "delivered") break;
-				await Bun.sleep(10);
-			}
+		// Submit 5 events - non-timeout errors should NOT trigger rotation
+		for (let i = 0; i < 5; i++) {
+			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.existing_binding_no_rotate", {});
+			expect(database.monitors.failure(eventId)?.code).toBe("session_bind_failed");
 		}
 
-		expect(attemptedEpochs).toEqual([0, 0, 0, 1]);
-		expect(database.bindings.getSessionRecord(originKey)).toEqual({ epoch: 1, sessionId: "session-epoch-1" });
-		const recoveredEventId = eventIds[2];
-		if (!recoveredEventId) throw new Error("existing-binding recovery event was not submitted");
-		expect(database.monitors.authoredOutput(recoveredEventId)).toBe("A fresh session delivered the result.");
-		expect(requestAttempts).toBe(1);
-		expect(delivered.some((payload) => payload.text.includes("A fresh session delivered"))).toBe(true);
+		// All 5 attempts should be on epoch 0 (no rotation)
+		expect(attemptedEpochs).toEqual([0, 0, 0, 0, 0]);
+		// Epoch should remain 0 because non-timeout errors don't trigger rotation
+		expect(database.bindings.getSessionRecord(originKey)).toEqual({ epoch: 0, sessionId: "valid-existing-session" });
+		// bindTimeoutFailures counter should stay 0 (non-timeouts don't count)
+		expect(pipeline.sessionSafetyState(originKey).bindTimeoutFailures).toBe(0);
 		database.close();
 	} finally {
 		await rm(home, { recursive: true, force: true });
@@ -1429,3 +1400,4 @@ test("local CLI queue timeouts do not rotate an existing monitor binding (#749, 
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
