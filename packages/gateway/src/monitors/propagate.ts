@@ -704,7 +704,7 @@ export class MonitorPropagator {
 				const hasMemory = this.#database.memory.coversEvent(row.event_id);
 				// A silent note is never delivered, so `authored` would wait forever for a
 				// confirmation that cannot come (#94): settle it as authored_no_delivery.
-				if (output && !hasMemory)
+				if (output && !hasMemory && row.stage !== "authored")
 					this.#author(row.event_id, output, row.stage === "authored_no_delivery" || isSilentOutput(output), row);
 				else if (output && row.stage === "authored" && isSilentOutput(output))
 					this.#database.transaction((tx) =>
