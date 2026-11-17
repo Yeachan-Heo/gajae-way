@@ -3,7 +3,7 @@
 ## [0.5.0] - 2026-11-11
 
 ### Deps
-- **gateway**: Pin GJC 0.20.0 (#786)
+- **gateway**: Pin GJC 0.21.0 (#835)
 
 ### Fixes
 - **gateway**: Park an escalated retired hold whose session host stays not live, with its process gone, for `sessions.retiredHoldAbandonMs` (default 24 hours) while its operation state stays unknown: it stays tracked and its late answer is still delivered, but it is probed hourly instead of every minute, so accumulated dead holds no longer saturate the CLI pool and stall live turns on `broker_unavailable`. A parked hold is never closed on that evidence, never resent, and gets no second notice.
