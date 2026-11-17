@@ -948,6 +948,19 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database.execute(
 				"CREATE INDEX IF NOT EXISTS broker_operations_pending_session_create_scope ON broker_operations(scope) WHERE operation = 'session.create' AND state = 'pending'",
 			);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(43, new Date().toISOString());
+		});
+	}
+	if (current < 44) {
+		host.withTransaction(() => {
+			const columns = new Set(
+				host.database
+					.statement<{ name: string }>("PRAGMA table_info(monitor_events)")
+					.all()
+					.map((row) => row.name),
+			);
 			if (!columns.has("escalation_epoch"))
 				host.database.execute("ALTER TABLE monitor_events ADD COLUMN escalation_epoch INTEGER NOT NULL DEFAULT 0");
 			host.database.execute(
