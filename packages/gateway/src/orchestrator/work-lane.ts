@@ -945,7 +945,14 @@ export class WorkLaneManager {
 		const caller = this.#resolveCaller(input, mode);
 		const parent = mode === "start" ? caller : null;
 		const context: StartContext = { parent, authorizationOwner: this.#callerAuthorizationOwner(caller), runCall };
-		if (this.#job(input.name)) return await this.#startAdmitted(input, mode, context);
+		const existing = this.#job(input.name);
+		if (existing?.reclaimedAt !== undefined)
+			throw new ProtocolError("invalid_params", "work lane worktree was reclaimed; use a new lane name", {
+				reasonCode: "lane_reclaimed",
+				name: input.name,
+				reclaimedAt: existing.reclaimedAt,
+			});
+		if (existing) return await this.#startAdmitted(input, mode, context);
 		const admitting = this.#admissions.get(input.name);
 		// Do not queue another admission behind an in-flight start of this name.
 		if (admitting && admitting.failedAt === undefined)
@@ -1464,6 +1471,12 @@ export class WorkLaneManager {
 				admission: { ...admission },
 			};
 		const job = this.#job(name, true)!;
+		if (job?.reclaimedAt !== undefined)
+			throw new ProtocolError("invalid_params", "work lane worktree was reclaimed; use a new lane name", {
+				reasonCode: "lane_reclaimed",
+				name,
+				reclaimedAt: job.reclaimedAt,
+			});
 		const key = workSessionKey(name);
 		const binding = this.#db.bindings.getSessionRecord(key);
 		const attempt = job.attempts.at(-1);
