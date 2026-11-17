@@ -357,10 +357,13 @@ test("an unreadable history channel still reaches a terminal image diagnosis", a
 		const adapter = gateway(cursorPath, async () => channel, requests);
 		await bounded(adapter.recoverMissedMessages());
 		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
-		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
-		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
-			{ messageId: id, channelId, terminal: true, audited: true },
-		]);
+		// Permission failures (403) are now retryable per P2 fix, so the message is deferred, not dead-lettered immediately
+		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([]);
+		const outbox = JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8")) as unknown[];
+		expect(outbox.length).toBe(1);
+		// The entry should be deferred with failureAt, not terminal
+		expect((outbox[0] as Record<string, unknown>).failureAt).toBeDefined();
+		expect((outbox[0] as Record<string, unknown>).terminal).toBeUndefined();
 		await bounded(adapter.waitForImage({ id } as never, Promise.resolve("unavailable")), 2_000);
 	} finally {
 		cleanupTimers();
@@ -2389,14 +2392,15 @@ test("audited terminal rows in unconfigured channels get a recovery watermark an
 	const cursorPath = join(home, "recovery-cursor.json");
 	const outboxPath = join(home, "image-outbox.json");
 	const channelId = "unconfigured-channel";
-	const id = snowflakeFromTimestamp(Date.now() - 8 * 24 * 60 * 60 * 1000);
+	// Use a message older than 30 days (IMAGE_REPLAY_RETENTION_MS) to verify compaction
+	const id = snowflakeFromTimestamp(Date.now() - 31 * 24 * 60 * 60 * 1000);
 	const message = { ...dmMessage(id, channelId, true), channel: { id: channelId } };
 	let channelFetches = 0;
 	const requests: Array<{ verb: string; params: any }> = [];
 	try {
 		await saveRecoveryCursors(cursorPath, {
 			...emptyCursors(),
-			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 9 * 24 * 60 * 60 * 1000) },
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 32 * 24 * 60 * 60 * 1000) },
 		});
 		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, terminal: true, audited: true }]));
 		const adapter = gateway(

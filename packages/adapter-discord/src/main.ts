@@ -976,16 +976,6 @@ async function sendFirstDiscordPart(
 	}
 }
 
-async function sendDiscordInboundNotice(message: DiscordInboundMessage, content: string): Promise<void> {
-	const channel = message.channel as typeof message.channel & { send?: DiscordTextChannelLike["send"] };
-	if (typeof channel.send !== "function") return;
-	try {
-		await sendFirstDiscordPart({ send: channel.send.bind(channel) }, { content }, message.id);
-	} catch {
-		console.error(`Discord inbound image notice failed message=${message.id}.`);
-	}
-}
-
 export async function settleDiscordDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	discord: DiscordClientLike,
@@ -2035,7 +2025,7 @@ export class ReconnectingGateway {
 		if (isImageIntentExpired(entry)) return this.terminateImage(entry, "image intent unresolved for 24 hours");
 		await turn;
 		if (entry.request) return this.sendPendingImage(entry);
-		let prepared: { readonly images: PromptImage[]; readonly notice: string } | undefined;
+		let prepared: { readonly images: PromptImage[] } | undefined;
 		let imageSource = message;
 		let refreshed = false;
 		const sourceIdentity = admittedIdentity;
@@ -2071,7 +2061,16 @@ export class ReconnectingGateway {
 				}
 				if (error instanceof ImagePreparationBudgetError) {
 					this.#imageBudgetDeferred.add(entry.messageId);
-					return this.deferImageFailure(entry);
+					// Mark as declined instead of unresolved to avoid exhausting admission capacity.
+					// Declined entries don't gate admission and are evicted oldest-first at their own
+					// limit, so they don't block later authorized images.
+					try {
+						await this.#imageOutbox.put({ ...entry, declined: true });
+					} catch {
+						// If outbox write fails, return unavailable without persisting
+						return "unavailable";
+					}
+					return "unavailable";
 				}
 				if (error instanceof DiscordImagePreparationError && error.disposition === "terminal") {
 					return this.terminateImage(entry, "image input rejected");
@@ -2157,12 +2156,7 @@ export class ReconnectingGateway {
 			// recovered/offline intents always wait for the sorted history pass.
 			if (!retry || this.#blockedRecoveryChannels.has(entry.channelId)) return this.deferImageFailure(entry);
 		}
-		let notify = false;
-		const result = await this.sendPendingImage(entry, (response) => {
-			notify = response?.engaged === true && response.turnId != null;
-		});
-		if (result === "acked" && notify && prepared.notice)
-			await sendDiscordInboundNotice(message, `Image processing: ${prepared.notice}`);
+		const result = await this.sendPendingImage(entry);
 		return result;
 	}
 
@@ -2303,7 +2297,9 @@ export class ReconnectingGateway {
 				const age = Date.now() - (entry.completedAt ?? 0);
 				if (entry.completed) return age < IMAGE_REPLAY_RETENTION_MS;
 				const timestamp = Number((BigInt(entry.messageId) >> 22n) + 1_420_070_400_000n);
-				return Date.now() - timestamp < 7 * 24 * 60 * 60 * 1000;
+				// Retain terminal evidence through the restore rewind horizon (30 days) to prevent
+				// gateway restore from rediscovering compacted terminal rows as fresh sends.
+				return Date.now() - timestamp < IMAGE_REPLAY_RETENTION_MS;
 			});
 		} catch {
 			console.error("Discord image outbox terminal compaction failed; retaining rejected-image rows.");
@@ -2567,9 +2563,11 @@ export class ReconnectingGateway {
 				}
 				// Recovery usually holds the message that produced the intent, so use it
 				// instead of spending another API call on a fetch that may not be allowed.
+				// Keep permission failures retryable until the intent deadline, treating only
+				// definitive not-found as terminal, to maintain parity with request-bearing replay.
 				let inbound = source?.id === current.messageId ? source : undefined;
 				if (!inbound) {
-					const fetched = await this.fetchImageSource(current.channelId, current.messageId);
+					const fetched = await this.fetchImageSource(current.channelId, current.messageId, true);
 					if (!("message" in fetched))
 						return fetched.outcome === "gone"
 							? this.terminateImage(current, fetched.summary)
