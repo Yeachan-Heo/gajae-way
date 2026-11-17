@@ -31,13 +31,26 @@ export type GjcModelSelection = string | { readonly preset: string };
 export const DEFAULT_WORK_MAX_LANES = 4;
 /** A bound worker lane quiet for this long is closed by the sweep and rebound on its next run. */
 export const DEFAULT_WORK_IDLE_RETIRE_MS = 6 * 60 * 60_000;
+/** Completed lane worktrees stay available for manual inspection for one day. */
+export const DEFAULT_WORK_DONE_RECLAIM_GRACE_MS = 24 * 60 * 60_000;
+/** Ended attempts stay resumable for seven days before safe, pushed worktrees can be reclaimed. */
+export const DEFAULT_WORK_ATTEMPT_ENDED_RECLAIM_AFTER_MS = 7 * 24 * 60 * 60_000;
+/** Warn when the lane filesystem has under 5 GiB or 10% free, whichever is reached first. */
+export const DEFAULT_WORK_LOW_DISK_FREE_BYTES = 5 * 1024 ** 3;
+export const DEFAULT_WORK_LOW_DISK_FREE_RATIO = 0.1;
 const WORK_IDLE_RETIRE_MIN_MS = 60_000;
 const WORK_IDLE_RETIRE_MAX_MS = 7 * 24 * 60 * 60_000;
+const WORK_RECLAIM_MIN_MS = 60_000;
+const WORK_RECLAIM_MAX_MS = 365 * 24 * 60 * 60_000;
 
 export interface WorkLaneConfig {
 	readonly maxLanes?: number;
 	readonly idleRetireMs?: number;
 	readonly allowNested?: boolean;
+	readonly doneReclaimGraceMs?: number;
+	readonly attemptEndedReclaimAfterMs?: number;
+	readonly lowDiskFreeBytes?: number;
+	readonly lowDiskFreeRatio?: number;
 }
 
 /**
@@ -599,8 +612,17 @@ function parseMonitorCatchUp(value: unknown): MonitorCatchUpConfig {
 
 function parseWork(value: unknown): WorkLaneConfig {
 	const input = requireObject(value, "work");
-	if (Object.keys(input).some((key) => key !== "maxLanes" && key !== "idleRetireMs" && key !== "allowNested"))
-		throw new ConfigError("config_invalid", "work may only contain maxLanes, idleRetireMs, and allowNested");
+	const keys = [
+		"maxLanes",
+		"idleRetireMs",
+		"allowNested",
+		"doneReclaimGraceMs",
+		"attemptEndedReclaimAfterMs",
+		"lowDiskFreeBytes",
+		"lowDiskFreeRatio",
+	] as const;
+	if (Object.keys(input).some((key) => !keys.includes(key as (typeof keys)[number])))
+		throw new ConfigError("config_invalid", `work may only contain ${keys.join(", ")}`);
 	if (
 		input.maxLanes !== undefined &&
 		(!Number.isInteger(input.maxLanes) || (input.maxLanes as number) < 1 || (input.maxLanes as number) > 256)
@@ -618,10 +640,40 @@ function parseWork(value: unknown): WorkLaneConfig {
 		);
 	if (input.allowNested !== undefined && typeof input.allowNested !== "boolean")
 		throw new ConfigError("config_invalid", "work.allowNested must be a boolean");
+	for (const field of ["doneReclaimGraceMs", "attemptEndedReclaimAfterMs"] as const)
+		if (
+			input[field] !== undefined &&
+			(!Number.isSafeInteger(input[field]) ||
+				(input[field] as number) < WORK_RECLAIM_MIN_MS ||
+				(input[field] as number) > WORK_RECLAIM_MAX_MS)
+		)
+			throw new ConfigError(
+				"config_invalid",
+				`work.${field} must be an integer between ${WORK_RECLAIM_MIN_MS} and ${WORK_RECLAIM_MAX_MS}`,
+			);
+	if (
+		input.lowDiskFreeBytes !== undefined &&
+		(!Number.isSafeInteger(input.lowDiskFreeBytes) || (input.lowDiskFreeBytes as number) < 1)
+	)
+		throw new ConfigError("config_invalid", "work.lowDiskFreeBytes must be a positive safe integer");
+	if (
+		input.lowDiskFreeRatio !== undefined &&
+		(typeof input.lowDiskFreeRatio !== "number" ||
+			!Number.isFinite(input.lowDiskFreeRatio) ||
+			input.lowDiskFreeRatio <= 0 ||
+			input.lowDiskFreeRatio > 1)
+	)
+		throw new ConfigError("config_invalid", "work.lowDiskFreeRatio must be greater than 0 and at most 1");
 	return {
 		...(input.maxLanes === undefined ? {} : { maxLanes: input.maxLanes as number }),
 		...(input.idleRetireMs === undefined ? {} : { idleRetireMs: input.idleRetireMs as number }),
 		...(input.allowNested === undefined ? {} : { allowNested: input.allowNested as boolean }),
+		...(input.doneReclaimGraceMs === undefined ? {} : { doneReclaimGraceMs: input.doneReclaimGraceMs as number }),
+		...(input.attemptEndedReclaimAfterMs === undefined
+			? {}
+			: { attemptEndedReclaimAfterMs: input.attemptEndedReclaimAfterMs as number }),
+		...(input.lowDiskFreeBytes === undefined ? {} : { lowDiskFreeBytes: input.lowDiskFreeBytes as number }),
+		...(input.lowDiskFreeRatio === undefined ? {} : { lowDiskFreeRatio: input.lowDiskFreeRatio as number }),
 	};
 }
 

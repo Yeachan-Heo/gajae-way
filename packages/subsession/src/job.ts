@@ -54,11 +54,12 @@ export class LaneJobError extends Error {
 
 /**
  * Wire/storage version of the persisted LaneJobRecord. Version 2 added the
- * optional repository identity; version 3 adds the managed repository path.
- * Version-1 and version-2 records remain readable without newer fields.
+ * optional repository identity; version 3 adds the managed repository path;
+ * version 4 records terminal-worktree reclamation. Earlier records remain
+ * readable without newer fields.
  */
-export const LANE_JOB_SCHEMA_VERSION = 3 as const;
-const READABLE_LANE_JOB_SCHEMA_VERSIONS: readonly unknown[] = [1, 2, LANE_JOB_SCHEMA_VERSION];
+export const LANE_JOB_SCHEMA_VERSION = 4 as const;
+const READABLE_LANE_JOB_SCHEMA_VERSIONS: readonly unknown[] = [1, 2, 3, LANE_JOB_SCHEMA_VERSION];
 
 /** Issue #9's exact evidence vocabulary. No synonyms. */
 export type WorkEvidenceClass = "work_committed_report_lost" | "work_in_progress_uncommitted" | "no_work_produced";
@@ -160,6 +161,8 @@ export type LaneJobRecord = {
 	 * checkpoints only ever record moves BEYOND this SHA.
 	 */
 	readonly baselineSha?: string;
+	/** Set only after the lane worktree has been removed; prevents resume from recreating it. */
+	readonly reclaimedAt?: string;
 	/**
 	 * Present while the job is in a PR-checks cycle: always in `awaiting_checks`,
 	 * and kept through a re-steered attempt so its retries carry over.
@@ -303,9 +306,17 @@ export function parseLaneJobRecord(raw: string): LaneJobRecord {
 	const stalledContinuations = parseCounter(record.stalledContinuations, "stalledContinuations");
 	const escalations = parseEscalations(record.escalations);
 	const awaitingChecks = record.awaitingChecks === undefined ? undefined : parseAwaitingChecks(record.awaitingChecks);
+	const reclaimedAt =
+		record.reclaimedAt === undefined ? undefined : assertRequiredTimestamp(record.reclaimedAt, "reclaimedAt");
 	if (record.state === "awaiting_checks" && awaitingChecks === undefined) {
 		throw new LaneJobError("awaiting_checks job is missing its awaitingChecks block");
 	}
+	if (
+		reclaimedAt !== undefined &&
+		((record.state !== "done" && record.state !== "attempt_ended") ||
+			attempts.some((attempt) => attempt.endedAt === undefined))
+	)
+		throw new LaneJobError("reclaimed lane must be a settled done or attempt_ended job");
 
 	return Object.freeze({
 		schemaVersion: LANE_JOB_SCHEMA_VERSION,
@@ -328,6 +339,7 @@ export function parseLaneJobRecord(raw: string): LaneJobRecord {
 		...(record.baselineSha === undefined
 			? {}
 			: { baselineSha: assertFullSha(asString(record.baselineSha), "baselineSha") }),
+		...(reclaimedAt === undefined ? {} : { reclaimedAt }),
 		escalations,
 		...(awaitingChecks === undefined ? {} : { awaitingChecks }),
 	});

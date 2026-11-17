@@ -879,8 +879,15 @@ export class WorkLaneManager {
 	}
 	async #start(input: WorkInput, mode: "start" | "run", runCall?: RunCall): Promise<WorkStartResult> {
 		this.#live();
+		const existing = this.#job(input.name);
+		if (existing?.reclaimedAt !== undefined)
+			throw new ProtocolError("invalid_params", "work lane worktree was reclaimed; use a new lane name", {
+				reasonCode: "lane_reclaimed",
+				name: input.name,
+				reclaimedAt: existing.reclaimedAt,
+			});
 		const parent = this.#resolveCaller(input, mode);
-		if (this.#job(input.name)) return await this.#startAdmitted(input, mode, { parent, runCall });
+		if (existing) return await this.#startAdmitted(input, mode, { parent, runCall });
 		const admitting = this.#admissions.get(input.name);
 		// A same-name retry (for example after a caller timeout) must not queue a
 		// second clone, bind or send behind the admission still in progress.
@@ -917,6 +924,12 @@ export class WorkLaneManager {
 		const sessionKey = workSessionKey(input.name);
 		let job = this.#job(input.name);
 		const { jobId } = laneJobIdentity(input.name);
+		if (job?.reclaimedAt !== undefined)
+			throw new ProtocolError("invalid_params", "work lane worktree was reclaimed; use a new lane name", {
+				reasonCode: "lane_reclaimed",
+				name: input.name,
+				reclaimedAt: job.reclaimedAt,
+			});
 		// A supplied repository identifies a repo-backed lane; otherwise an explicit
 		// cwd must match the durable worktree path. Omitting both resumes by lane name.
 		if (job && input.repo !== undefined && job.lane.repository !== input.repo)
@@ -1235,6 +1248,12 @@ export class WorkLaneManager {
 				admission: { ...admission },
 			};
 		const job = this.#job(name, true)!;
+		if (job.reclaimedAt !== undefined)
+			throw new ProtocolError("invalid_params", "work lane worktree was reclaimed; status is no longer available", {
+				reasonCode: "lane_reclaimed",
+				name,
+				reclaimedAt: job.reclaimedAt,
+			});
 		const key = workSessionKey(name);
 		const binding = this.#db.bindings.getSessionRecord(key);
 		const attempt = job.attempts.at(-1);

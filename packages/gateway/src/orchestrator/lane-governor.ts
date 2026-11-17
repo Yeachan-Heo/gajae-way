@@ -1,9 +1,17 @@
-import { existsSync, lstatSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync, rmSync, statfsSync } from "node:fs";
+import { lstat, readdir } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import type { LogLevel } from "@gajae-gateway/log";
 import { type LaneCapacityDetail, ProtocolError } from "@gajae-gateway/protocol";
 import { type LaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
-import { DEFAULT_WORK_IDLE_RETIRE_MS, DEFAULT_WORK_MAX_LANES } from "../config";
+import {
+	DEFAULT_WORK_ATTEMPT_ENDED_RECLAIM_AFTER_MS,
+	DEFAULT_WORK_DONE_RECLAIM_GRACE_MS,
+	DEFAULT_WORK_IDLE_RETIRE_MS,
+	DEFAULT_WORK_LOW_DISK_FREE_BYTES,
+	DEFAULT_WORK_LOW_DISK_FREE_RATIO,
+	DEFAULT_WORK_MAX_LANES,
+} from "../config";
 import type { Store } from "../store";
 import { runGit } from "./git-command";
 import { sanitizeDiagnostic } from "./rebind";
@@ -95,8 +103,25 @@ export interface LaneGovernorOptions {
 	readonly laneRoot?: string;
 	readonly maxLanes?: number;
 	readonly idleRetireMs?: number;
+	readonly doneReclaimGraceMs?: number;
+	readonly attemptEndedReclaimAfterMs?: number;
+	readonly lowDiskFreeBytes?: number;
+	readonly lowDiskFreeRatio?: number;
 	readonly now?: () => number;
 	readonly log?: (line: string, level?: LogLevel) => void;
+}
+
+export interface LaneDiskSnapshot {
+	readonly path: string;
+	/** Allocated bytes below `path/lanes`; null when the walk failed. */
+	readonly totalBytes: number | null;
+	/** Bytes still eligible for safe reclamation after the latest pass. */
+	readonly reclaimableBytes: number | null;
+	readonly filesystemFreeBytes: number | null;
+	readonly filesystemTotalBytes: number | null;
+	readonly dirtyAttemptEnded: number;
+	readonly unpushedAttemptEnded: number;
+	readonly lowFreeDisk: boolean;
 }
 
 /**
@@ -119,7 +144,13 @@ export class LaneGovernor {
 	#recoveryGate?: () => Promise<void>;
 	#forceRetireSettlement?: ForceRetireSettlement;
 	#stopped = false;
-	readonly #mutations = new Set<Promise<LaneRetireOutcome>>();
+	readonly #mutations = new Set<Promise<unknown>>();
+	readonly #doneReclaimGraceMs: number;
+	readonly #attemptEndedReclaimAfterMs: number;
+	readonly #lowDiskFreeBytes: number;
+	readonly #lowDiskFreeRatio: number;
+	#laneDiskSnapshot: LaneDiskSnapshot | null = null;
+	#reclaimPass: Promise<number> | undefined;
 
 	constructor(options: LaneGovernorOptions) {
 		this.#database = options.database;
@@ -127,8 +158,30 @@ export class LaneGovernor {
 		this.#laneRoot = options.laneRoot === undefined ? undefined : resolve(options.laneRoot);
 		this.maxLanes = positiveInteger(options.maxLanes, DEFAULT_WORK_MAX_LANES, "maxLanes");
 		this.idleRetireMs = positiveInteger(options.idleRetireMs, DEFAULT_WORK_IDLE_RETIRE_MS, "idleRetireMs");
+		this.#doneReclaimGraceMs = positiveInteger(
+			options.doneReclaimGraceMs,
+			DEFAULT_WORK_DONE_RECLAIM_GRACE_MS,
+			"doneReclaimGraceMs",
+		);
+		this.#attemptEndedReclaimAfterMs = positiveInteger(
+			options.attemptEndedReclaimAfterMs,
+			DEFAULT_WORK_ATTEMPT_ENDED_RECLAIM_AFTER_MS,
+			"attemptEndedReclaimAfterMs",
+		);
+		this.#lowDiskFreeBytes = positiveInteger(
+			options.lowDiskFreeBytes,
+			DEFAULT_WORK_LOW_DISK_FREE_BYTES,
+			"lowDiskFreeBytes",
+		);
+		this.#lowDiskFreeRatio = options.lowDiskFreeRatio ?? DEFAULT_WORK_LOW_DISK_FREE_RATIO;
+		if (!Number.isFinite(this.#lowDiskFreeRatio) || this.#lowDiskFreeRatio <= 0 || this.#lowDiskFreeRatio > 1)
+			throw new RangeError("lowDiskFreeRatio must be greater than 0 and at most 1");
 		this.#now = options.now ?? (() => Date.now());
 		this.#log = options.log ?? ((line, level) => console[level ?? "info"](line));
+	}
+
+	get laneDiskSnapshot(): LaneDiskSnapshot | null {
+		return this.#laneDiskSnapshot;
 	}
 
 	/** Installed by the sole attempt owner; recovery registration precedes retirement. */
@@ -373,6 +426,242 @@ export class LaneGovernor {
 			}
 		}
 		return retired;
+	}
+
+	/** Removes only stale, terminal, gateway-managed worktrees under the existing maintenance tick. */
+	reclaimTerminalWorktrees(now = this.#now()): Promise<number> {
+		if (this.#stopped || this.#laneRoot === undefined) return Promise.resolve(0);
+		if (this.#reclaimPass) return this.#reclaimPass;
+		const task = this.#reclaimTerminalWorktrees(now);
+		this.#reclaimPass = task;
+		this.#mutations.add(task);
+		void task.then(
+			() => {
+				this.#mutations.delete(task);
+				if (this.#reclaimPass === task) this.#reclaimPass = undefined;
+			},
+			() => {
+				this.#mutations.delete(task);
+				if (this.#reclaimPass === task) this.#reclaimPass = undefined;
+			},
+		);
+		return task;
+	}
+
+	async #reclaimTerminalWorktrees(now: number): Promise<number> {
+		const laneRoot = this.#laneRoot;
+		if (!laneRoot || this.#stopped) return 0;
+		const lanesPath = join(laneRoot, "lanes");
+		const eligiblePaths: string[] = [];
+		let dirtyAttemptEnded = 0;
+		let unpushedAttemptEnded = 0;
+		let reclaimed = 0;
+		for (const row of this.#database.work.laneJobRows()) {
+			if (!row.lane_key.startsWith("work-")) continue;
+			const name = row.lane_key.slice("work-".length);
+			if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) continue;
+			if (this.#stopped) break;
+			try {
+				const outcome = await this.#port.runExclusive(workSessionKey(name), async () => {
+					if (this.#stopped || this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
+						return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+					const record = this.#job(name);
+					if (!record || record === "corrupt" || record.reclaimedAt !== undefined)
+						return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+					const graceMs =
+						record.state === "done"
+							? this.#doneReclaimGraceMs
+							: record.state === "attempt_ended"
+								? this.#attemptEndedReclaimAfterMs
+								: undefined;
+					if (graceMs === undefined || now - Date.parse(record.updatedAt) < graceMs)
+						return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+					if (record.attempts.some((attempt) => attempt.endedAt === undefined)) {
+						this.#log(`lane_reclaim_skipped name=${name} reason=attempt_open`, "warn");
+						return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+					}
+					if (this.activeLanes().some((lane) => lane.name === name)) {
+						this.#log(`lane_reclaim_skipped name=${name} reason=live`, "info");
+						return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+					}
+					const repositoryPath = record.lane.repositoryPath;
+					const worktreePath = record.lane.worktreePath;
+					if (!repositoryPath || !this.#managedLanePaths(name, record)) {
+						this.#log(`lane_reclaim_skipped name=${name} reason=unmanaged_path`, "warn");
+						return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+					}
+					try {
+						assertManagedRepositoryPath(laneRoot, name, repositoryPath);
+						assertManagedWorktreeLocation(laneRoot, name, worktreePath);
+					} catch (error) {
+						this.#log(
+							`lane_reclaim_skipped name=${name} reason=path_validation detail=${sanitizeDiagnostic(diagnostic(error))}`,
+							"warn",
+						);
+						return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+					}
+					if (!existsSync(worktreePath)) {
+						try {
+							if (!(await worktreeIsUnregistered(repositoryPath, worktreePath))) {
+								this.#log(`lane_reclaim_failed name=${name} reason=missing_worktree_still_registered`, "error");
+								return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+							}
+						} catch (error) {
+							this.#log(
+								`lane_reclaim_failed name=${name} reason=git_worktree_verify_failed detail=${sanitizeDiagnostic(diagnostic(error))}`,
+								"error",
+							);
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+						}
+						if (!this.#markReclaimed(name, record, now)) {
+							this.#log(`lane_reclaim_failed name=${name} reason=job_changed_after_remove`, "error");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+						}
+						this.#log(
+							`lane_worktree_reclaimed name=${name} state=${record.state} reclaimed_at=${new Date(now).toISOString()}`,
+							"info",
+						);
+						return { reclaimed: true, eligible: true, bytes: 0, dirty: false, unpushed: false };
+					}
+					if (record.state === "attempt_ended") {
+						const status = await runGit(["status", "--porcelain", "--untracked-files=all"], {
+							cwd: worktreePath,
+						});
+						if (status.exitCode !== 0) {
+							this.#log(`lane_reclaim_skipped name=${name} reason=git_status_failed`, "warn");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+						}
+						if (status.stdout.length > 0) {
+							this.#log(`lane_reclaim_skipped name=${name} reason=dirty`, "warn");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: true, unpushed: false };
+						}
+						const head = await runGit(["rev-parse", "--verify", "HEAD^{commit}"], { cwd: worktreePath });
+						if (head.exitCode !== 0 || !/^[0-9a-f]{40}\s*$/.test(head.stdout)) {
+							this.#log(`lane_reclaim_skipped name=${name} reason=git_head_failed`, "warn");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+						}
+						const remote = await runGit(
+							["for-each-ref", `--contains=${head.stdout.trim()}`, "--format=%(refname)", "refs/remotes"],
+							{ cwd: repositoryPath },
+						);
+						if (remote.exitCode !== 0) {
+							this.#log(`lane_reclaim_skipped name=${name} reason=git_remote_refs_failed`, "warn");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+						}
+						if (!remote.stdout.trim()) {
+							this.#log(`lane_reclaim_skipped name=${name} reason=unpushed`, "warn");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: true };
+						}
+					}
+					if (existsSync(worktreePath)) {
+						const removed = await runGit(["worktree", "remove", "--", worktreePath], { cwd: repositoryPath });
+						if (removed.exitCode !== 0) {
+							this.#log(`lane_reclaim_failed name=${name} reason=git_worktree_remove_failed`, "error");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+						}
+					}
+					try {
+						if (existsSync(worktreePath) || !(await worktreeIsUnregistered(repositoryPath, worktreePath))) {
+							this.#log(`lane_reclaim_failed name=${name} reason=worktree_remains`, "error");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+						}
+					} catch (error) {
+						this.#log(
+							`lane_reclaim_failed name=${name} reason=git_worktree_verify_failed detail=${sanitizeDiagnostic(diagnostic(error))}`,
+							"error",
+						);
+						return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+					}
+					if (!this.#markReclaimed(name, record, now)) {
+						this.#log(`lane_reclaim_failed name=${name} reason=job_changed_after_remove`, "error");
+						return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+					}
+					const at = new Date(now).toISOString();
+					this.#log(`lane_worktree_reclaimed name=${name} state=${record.state} reclaimed_at=${at}`, "info");
+					return { reclaimed: true, eligible: true, bytes: 0, dirty: false, unpushed: false };
+				});
+				if (outcome.eligible) eligiblePaths.push(managedLaneWorktreePath(laneRoot, name));
+				if (outcome.reclaimed) {
+					reclaimed++;
+				}
+				if (outcome.dirty) dirtyAttemptEnded++;
+				if (outcome.unpushed) unpushedAttemptEnded++;
+			} catch (error) {
+				this.#log(`lane_reclaim_failed name=${name} reason=${sanitizeDiagnostic(diagnostic(error))}`, "error");
+			}
+		}
+		let tree: LaneTreeBytes | undefined;
+		try {
+			tree = await scanLaneTree(lanesPath);
+		} catch (error) {
+			this.#log(`lane_disk_scan_failed path=${lanesPath} reason=${sanitizeDiagnostic(diagnostic(error))}`, "warn");
+		}
+		let filesystemFreeBytes: number | null = null;
+		let filesystemTotalBytes: number | null = null;
+		try {
+			const stats = statfsSync(laneRoot);
+			filesystemFreeBytes = stats.bavail * stats.bsize;
+			filesystemTotalBytes = stats.blocks * stats.bsize;
+		} catch {
+			// Missing headroom evidence is exposed as low, never guessed healthy.
+		}
+		const lowFreeDisk =
+			filesystemFreeBytes === null ||
+			filesystemTotalBytes === null ||
+			filesystemFreeBytes < this.#lowDiskFreeBytes ||
+			filesystemFreeBytes < filesystemTotalBytes * this.#lowDiskFreeRatio;
+		this.#laneDiskSnapshot = {
+			path: lanesPath,
+			totalBytes: tree?.totalBytes ?? null,
+			reclaimableBytes:
+				tree === undefined
+					? null
+					: eligiblePaths.reduce((sum, path) => sum + (tree.worktrees.get(resolve(path)) ?? 0), 0),
+			filesystemFreeBytes,
+			filesystemTotalBytes,
+			dirtyAttemptEnded,
+			unpushedAttemptEnded,
+			lowFreeDisk,
+		};
+		return reclaimed;
+	}
+
+	#managedLanePaths(name: string, record: LaneJobRecord): boolean {
+		return (
+			this.#laneRoot !== undefined &&
+			resolve(record.lane.worktreePath) === managedLaneWorktreePath(this.#laneRoot, name) &&
+			record.lane.repositoryPath !== undefined &&
+			resolve(record.lane.repositoryPath) === managedLaneRepositoryPath(this.#laneRoot, name)
+		);
+	}
+
+	#markReclaimed(name: string, expected: LaneJobRecord, now: number): boolean {
+		const current = this.#job(name);
+		if (
+			!current ||
+			current === "corrupt" ||
+			current.reclaimedAt !== undefined ||
+			current.state !== expected.state ||
+			current.updatedAt !== expected.updatedAt ||
+			current.attempts.some((attempt) => attempt.endedAt === undefined) ||
+			this.activeLanes().some((lane) => lane.name === name)
+		)
+			return false;
+		const at = new Date(now).toISOString();
+		const reclaimedRecord: LaneJobRecord = { ...current, updatedAt: at, reclaimedAt: at };
+		const { laneKey } = laneJobIdentity(name);
+		this.#database.transaction((tx) =>
+			this.#database.work.putLaneJob(tx, {
+				jobId: reclaimedRecord.jobId,
+				laneKey,
+				state: reclaimedRecord.state,
+				createdAt: reclaimedRecord.createdAt,
+				updatedAt: reclaimedRecord.updatedAt,
+				lane: reclaimedRecord.lane,
+				json: JSON.stringify(reclaimedRecord),
+			}),
+		);
+		return true;
 	}
 
 	/**
@@ -775,6 +1064,84 @@ export class LaneGovernor {
 		} catch {
 			return "corrupt";
 		}
+	}
+}
+
+interface LaneTreeBytes {
+	readonly totalBytes: number;
+	readonly worktrees: ReadonlyMap<string, number>;
+}
+
+async function scanLaneTree(path: string): Promise<LaneTreeBytes> {
+	let rootStat: Awaited<ReturnType<typeof lstat>>;
+	try {
+		rootStat = await lstat(path);
+	} catch (error) {
+		if (isMissingPath(error)) return { totalBytes: 0, worktrees: new Map() };
+		throw error;
+	}
+	if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("lane root is not a real directory");
+	let totalBytes = allocatedBytes(rootStat);
+	const worktrees = new Map<string, number>();
+	for (const name of await readdir(path)) {
+		const entryPath = join(path, name);
+		const bytes = await pathAllocatedBytes(entryPath);
+		totalBytes += bytes;
+		worktrees.set(resolve(entryPath), bytes);
+	}
+	return { totalBytes, worktrees };
+}
+
+async function pathAllocatedBytes(path: string): Promise<number> {
+	const stat = await lstat(path);
+	let total = allocatedBytes(stat);
+	if (!stat.isDirectory() || stat.isSymbolicLink()) return total;
+	for (const name of await readdir(path)) total += await pathAllocatedBytes(join(path, name));
+	return total;
+}
+
+function allocatedBytes(stat: Awaited<ReturnType<typeof lstat>>): number {
+	const blocks = typeof stat.blocks === "bigint" ? Number(stat.blocks) : stat.blocks;
+	const size = typeof stat.size === "bigint" ? Number(stat.size) : stat.size;
+	return Number.isFinite(blocks) ? blocks * 512 : size;
+}
+
+function isMissingPath(error: unknown): boolean {
+	return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+async function worktreeIsUnregistered(repositoryPath: string, worktreePath: string): Promise<boolean> {
+	const result = await runGit(["worktree", "list", "--porcelain"], { cwd: repositoryPath });
+	if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "git worktree list failed");
+	const expected = canonicalPathIncludingMissing(worktreePath);
+	for (const line of result.stdout.split(/\r?\n/)) {
+		if (!line.startsWith("worktree ")) continue;
+		if (canonicalPathIncludingMissing(line.slice("worktree ".length)) === expected) return false;
+	}
+	return true;
+}
+
+function assertManagedWorktreeLocation(laneRoot: string, name: string, worktreePath: string): void {
+	if (resolve(worktreePath) !== managedLaneWorktreePath(laneRoot, name))
+		throw new Error("managed worktree path does not match its lane name");
+	const lanesRoot = join(laneRoot, "lanes");
+	const lanesStat = lstatSync(lanesRoot);
+	if (!lanesStat.isDirectory() || lanesStat.isSymbolicLink()) throw new Error("lane directory is not a real directory");
+	const canonicalLaneRoot = realpathSync(laneRoot);
+	const canonicalLanesRoot = realpathSync(lanesRoot);
+	const laneRootPrefix = canonicalLaneRoot.endsWith(sep) ? canonicalLaneRoot : `${canonicalLaneRoot}${sep}`;
+	const expectedCanonicalPath = join(canonicalLanesRoot, Buffer.from(name, "utf8").toString("hex"));
+	if (!canonicalLanesRoot.startsWith(laneRootPrefix)) throw new Error("lane directory escapes its configured root");
+	if (canonicalPathIncludingMissing(worktreePath) !== expectedCanonicalPath)
+		throw new Error("managed worktree path escapes its configured lane root");
+	try {
+		const worktreeStat = lstatSync(worktreePath);
+		if (!worktreeStat.isDirectory() || worktreeStat.isSymbolicLink())
+			throw new Error("managed worktree path is not a real directory");
+		if (realpathSync(worktreePath) !== expectedCanonicalPath)
+			throw new Error("managed worktree path resolves outside its lane identity");
+	} catch (error) {
+		if (!isMissingPath(error)) throw error;
 	}
 }
 

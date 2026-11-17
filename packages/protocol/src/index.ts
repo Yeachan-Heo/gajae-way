@@ -33,6 +33,7 @@ export {
 	isSilenceToken,
 	isSilentOutput,
 	type LaneCapacityDetail,
+	type LaneDiskView,
 	type MemoryAuditResult,
 	type MemoryAutolinkResult,
 	type MemoryOperationAccepted,

@@ -1183,6 +1183,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		laneRoot: options.config.home,
 		maxLanes: options.config.work?.maxLanes,
 		idleRetireMs: options.config.work?.idleRetireMs,
+		doneReclaimGraceMs: options.config.work?.doneReclaimGraceMs,
+		attemptEndedReclaimAfterMs: options.config.work?.attemptEndedReclaimAfterMs,
+		lowDiskFreeBytes: options.config.work?.lowDiskFreeBytes,
+		lowDiskFreeRatio: options.config.work?.lowDiskFreeRatio,
 	});
 	const work = new WorkLaneManager({
 		database: options.database,
@@ -1201,6 +1205,30 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		checkStatusClient: ghCheckStatusClient(),
 	});
 	const originSilent = new OriginSilentAlerter(options.database, () => runtime.config.ownerTarget?.origin);
+	let laneDiskWarningActive = false;
+	const alertLowLaneDisk = (): void => {
+		const disk = lanes.laneDiskSnapshot;
+		if (!disk) return;
+		if (!disk.lowFreeDisk) {
+			laneDiskWarningActive = false;
+			return;
+		}
+		if (laneDiskWarningActive) return;
+		laneDiskWarningActive = true;
+		const detail = `path=${disk.path} free_bytes=${disk.filesystemFreeBytes ?? "unknown"} filesystem_bytes=${disk.filesystemTotalBytes ?? "unknown"} lane_bytes=${disk.totalBytes ?? "unknown"} reclaimable_bytes=${disk.reclaimableBytes ?? "unknown"}`;
+		console.error(`lane_disk_low ${detail}`);
+		const ownerOrigin = runtime.config.ownerTarget?.origin;
+		if (!ownerOrigin) return;
+		const deliveryId = `lane-disk-low:${crypto.randomUUID()}`;
+		const ownerPayload = runtime.delivery.prepare(
+			crypto.randomUUID(),
+			ownerOrigin,
+			`[operator alert] low or unavailable free disk for work lanes: ${detail}`,
+			undefined,
+			deliveryId,
+		);
+		if (ownerPayload) broadcastDelivery(runtime, ownerPayload);
+	};
 	const reconcileTimer = setInterval(() => {
 		alertSilentOrigins(runtime, originSilent);
 		void monitors.reconcile();
@@ -1217,6 +1245,8 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				await lanes.sweep();
 				// Also release dead/disowned lanes via reconciliation
 				await lanes.retireAllDead();
+				await lanes.reclaimTerminalWorktrees();
+				alertLowLaneDisk();
 			})
 			.catch((error: unknown) => console.error(`lane recovery/sweep failed: ${diagnostic(error)}`));
 	}, 60_000);
@@ -1373,6 +1403,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		cycle: new RuntimeCycleProjector(options.database, memory, {
 			maxLanes: lanes.maxLanes,
 			agentDir: options.config.gjc.agentDir,
+			laneDisk: () => lanes.laneDiskSnapshot,
 			home: options.config.home,
 			memoryRoot: memoryRoot(options.config.home),
 			gjcVersion: () => options.broker?.gjcVersion,
@@ -1397,7 +1428,13 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	} catch (error) {
 		console.error(`restart notice recovery failed: ${diagnostic(error)}`);
 	}
-	void work.recover().catch((error: unknown) => console.error(`work startup recovery failed: ${diagnostic(error)}`));
+	void work
+		.recover()
+		.then(async () => {
+			await lanes.reclaimTerminalWorktrees();
+			alertLowLaneDisk();
+		})
+		.catch((error: unknown) => console.error(`work startup recovery failed: ${diagnostic(error)}`));
 	void personaSessions
 		.recover()
 		.catch((error: unknown) => console.error(`persona startup recovery failed: ${diagnostic(error)}`));

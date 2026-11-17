@@ -6,6 +6,7 @@ import {
 	type CycleGateReason,
 	type CyclePhase,
 	type CycleSessionView,
+	type LaneDiskView,
 	LOOPBACK_ORIGIN,
 	type MonitorFailureDiagnostic,
 	monitorSessionOrigin,
@@ -186,6 +187,7 @@ export interface RuntimeCycleSources {
 	readonly addressedSinceCutover: ReadonlySet<string>;
 	/** Headroom of the broker-bound GJC agent directory; null when none is bound. */
 	readonly agentDisk: AgentDiskView | null;
+	readonly laneDisk: LaneDiskView | null;
 	/** gjc version the broker client last observed; undefined before preflight or without a broker. */
 	readonly gjcVersion: string | undefined;
 	/** Newest settled monitor events that ended `failed_no_retry` or `contract_unmet` before any success. */
@@ -203,6 +205,7 @@ export class RuntimeCycleProjector {
 	readonly #memory: { readonly queueDepth: number };
 	readonly #maxLanes: number;
 	readonly #agentDir: string | undefined;
+	readonly #laneDisk: () => LaneDiskView | null;
 	readonly #memoryRoot: string | undefined;
 	readonly #gjcVersion: () => string | undefined;
 	readonly #brokerRespawnChurn: () => boolean;
@@ -214,6 +217,7 @@ export class RuntimeCycleProjector {
 		options: {
 			readonly maxLanes?: number;
 			readonly agentDir?: string;
+			readonly laneDisk?: () => LaneDiskView | null;
 			readonly home?: string;
 			readonly memoryRoot?: string;
 			readonly gjcVersion?: () => string | undefined;
@@ -224,6 +228,7 @@ export class RuntimeCycleProjector {
 		this.#memory = memory;
 		this.#maxLanes = options.maxLanes ?? DEFAULT_WORK_MAX_LANES;
 		this.#agentDir = options.agentDir;
+		this.#laneDisk = options.laneDisk ?? (() => null);
 		this.#home = options.home;
 		this.#memoryRoot = options.memoryRoot;
 		this.#gjcVersion = options.gjcVersion ?? (() => undefined);
@@ -304,6 +309,7 @@ export class RuntimeCycleProjector {
 			latestCutoverAt,
 			addressedSinceCutover: this.#addressedSinceCutover(latestCutoverAt),
 			agentDisk: this.#agentDir === undefined ? null : observeAgentDisk(this.#agentDir),
+			laneDisk: this.#laneDisk(),
 			gjcVersion: this.#gjcVersion(),
 			monitorTerminalStreak: this.#database.monitors.consecutiveTerminalFailures(),
 			brokerRespawnChurn: this.#brokerRespawnChurn(),
@@ -453,6 +459,7 @@ export function projectRuntimeCycle(
 	if (sources.oldestStarvedPendingMs !== null && sources.oldestStarvedPendingMs >= INBOUND_STARVATION_MS)
 		gates.add("inbound_starved");
 	if (sources.agentDisk && agentDiskLow(sources.agentDisk)) gates.add("agent_disk_headroom");
+	if (sources.laneDisk?.lowFreeDisk) gates.add("lane_disk_headroom");
 	// The gateway classifies gjc envelopes by the contract of the gjc it was verified
 	// against; a newer minor may have renamed the codes recovery depends on.
 	if (sources.gjcVersion !== undefined && !isVerifiedGjcVersion(sources.gjcVersion))
@@ -512,6 +519,7 @@ export function projectRuntimeCycle(
 		pendingInbound,
 		contextDiff: sources.contextDiff,
 		lanes: { active: sources.activeLanes, max: sources.maxLanes },
+		laneDisk: sources.laneDisk ?? null,
 		agentDisk: sources.agentDisk,
 		brokerAgent: sources.brokerAgent,
 		slo: sources.slo,

@@ -952,6 +952,7 @@ function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 			floorAt: null,
 		},
 		lanes: { active: 0, max: 8 },
+		laneDisk: null,
 		agentDisk: null,
 		brokerAgent: null,
 		slo: { days: [], windows: [], ok: false },
