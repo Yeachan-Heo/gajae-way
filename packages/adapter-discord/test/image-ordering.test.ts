@@ -553,9 +553,11 @@ test("an image refused by the admission bound releases the conversation chain", 
 	await writeFile(
 		outboxPath,
 		JSON.stringify(
-			Array.from({ length: 1_000 }, (_, index) => ({
+			Array.from({ length: 10_000 }, (_, index) => ({
 				messageId: String(base + BigInt(index)),
 				channelId,
+				completed: true,
+				completedAt: Date.now(),
 				dm: true,
 			})),
 		),
@@ -1463,9 +1465,11 @@ test("recovered admission failures never take the live terminal release", async 
 		await writeFile(
 			outboxPath,
 			JSON.stringify(
-				Array.from({ length: 1_000 }, (_, index) => ({
+				Array.from({ length: 10_000 }, (_, index) => ({
 					messageId: String(base + BigInt(index)),
 					channelId,
+					completed: true,
+					completedAt: Date.now(),
 				})),
 			),
 		);
@@ -1523,9 +1527,11 @@ test("a history join inherits a capacity hold from the live owner", async () => 
 		await writeFile(
 			outboxPath,
 			JSON.stringify(
-				Array.from({ length: 1_000 }, (_, index) => ({
+				Array.from({ length: 10_000 }, (_, index) => ({
 					messageId: String(base + BigInt(index)),
 					channelId,
+					completed: true,
+					completedAt: Date.now(),
 				})),
 			),
 		);
@@ -1799,7 +1805,7 @@ test("terminal image rows are compacted only after the watermark passes them", a
 	const cleanupTimers = trackTimers();
 	const cursorPath = join(home, "recovery-cursor.json");
 	const channelId = "channel-1";
-	const below = snowflakeFromTimestamp(Date.now() - 8 * 24 * 60 * 60 * 1000);
+	const below = snowflakeFromTimestamp(Date.now() - 31 * 24 * 60 * 60 * 1000);
 	const above = snowflakeFromTimestamp(Date.now() + 60_000);
 	try {
 		await saveRecoveryCursors(cursorPath, {

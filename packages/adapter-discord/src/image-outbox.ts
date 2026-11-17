@@ -344,24 +344,17 @@ export class ImageOutbox {
 				return;
 			if (index === -1) entries.push(entry);
 			else entries[index] = entry;
-			// Check capacity before pruning to ensure rejections happen before eviction
+			// Reject any new unresolved entry if completed evidence is at the hard bound. Completed
+			// entries never evict and consume durable space, so they gate all new unresolved admissions
+			// at the evidence cap. Unresolved and terminal entries are admitted through eviction by
+			// pruneEntries. Terminal entries are admitted through eviction. Completed entries reject.
 			if (index === -1 && !entry.completed && !entry.terminal) {
-				// Declined entries are reclaimable evidence, never delivery quota:
-				// one declined image must not be able to block a later authorized one.
-				const unresolved = entries.filter((pending) => !pending.declined && !pending.completed && !pending.terminal);
-				const terminal = entries.filter((pending) => !pending.declined && pending.terminal && !pending.completed);
 				const completed = entries.filter((pending) => pending.completed && pending.declined !== true);
-				if (
-					unresolved.length >= MAX_UNRESOLVED_IMAGES ||
-					terminal.filter((pending) => pending.channelId === entry.channelId).length >=
-						MAX_TERMINAL_IMAGES_PER_CHANNEL ||
-					terminal.length >= MAX_TERMINAL_IMAGES ||
-					completed.length >= MAX_COMPLETED_IMAGES
-				)
-					throw new ImageOutboxCapacityError();
+				if (completed.length >= MAX_COMPLETED_IMAGES) throw new ImageOutboxCapacityError();
 			}
 			// Enforce the journal bounds on the write path too: a long-lived session
-			// must not grow until the next recovery load.
+			// must not grow until the next recovery load. pruneEntries evicts excess entries
+			// and leaves room for new ones, so admission succeeds through eviction rather than rejection.
 			const pruned = pruneEntries(entries);
 			await writeEntries(this.#path, pruned);
 			this.#entries = pruned;
