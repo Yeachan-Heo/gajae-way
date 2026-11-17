@@ -872,6 +872,23 @@ test("status unknown, malformed and changed-binding edges never rewrite durable 
 	});
 });
 
+test("#836 status with open attempt and session unavailable returns ledger state instead of throwing", async () => {
+	const f = await fixture();
+	const result = await started(f);
+	// Simulate the host being gone with endpoint_stale error
+	f.port.status = async () => {
+		throw new GjcCliError("endpoint_stale", 1, "", { code: "endpoint_stale" });
+	};
+	// The attempt should still be open (endedAt undefined)
+	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+	// status() should not throw, but return with op: null
+	const status = await f.manager.status({ name: "a" });
+	expect(status).toMatchObject({
+		attempt: { opRef: result.opRef },
+		op: null,
+	});
+});
+
 test("steer distinguishes structured refusal from transport uncertainty without leaking text", async () => {
 	const f = await fixture();
 	await started(f);

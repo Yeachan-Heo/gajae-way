@@ -1254,7 +1254,9 @@ export class WorkLaneManager {
 				);
 			} catch (error) {
 				// A settled attempt whose host is gone has no live op to report.
-				if (attempt.endedAt === undefined || !isSessionUnavailable(error))
+				// Only throw if the error is NOT a session-unavailable error.
+				// If the host is gone (session unavailable), we report the ledger state with op: null.
+				if (!isSessionUnavailable(error))
 					throw workError("work status unavailable", "status_unavailable", { ...attempt, jobId: job.jobId });
 			}
 			const current = this.#db.bindings.getSessionRecord(key);
