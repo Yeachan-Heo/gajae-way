@@ -14,9 +14,13 @@ import type {
 	OpsDeliveriesResult,
 	OpsSloParams,
 	OpsSloResult,
+	SessionListParams,
+	SessionListResult,
 	WorkDirectiveResult,
 	WorkJobsParams,
 	WorkJobsResult,
+	WorkProgressParams,
+	WorkProgressResult,
 	WorkRetireResult,
 	WorkRunResult,
 	WorkStartParams,
@@ -24,7 +28,14 @@ import type {
 	WorkStatusResult,
 	WorkSteerResult,
 } from "@gajae-gateway/protocol";
-import { LOOPBACK_ORIGIN, OPS_CYCLE_MAX_LIMIT, originKey, WORK_JOBS_MAX_LIMIT } from "@gajae-gateway/protocol";
+import {
+	LOOPBACK_ORIGIN,
+	OPS_CYCLE_MAX_LIMIT,
+	originKey,
+	SESSION_LIST_MAX_LIMIT,
+	WORK_JOBS_MAX_LIMIT,
+	WORK_PROGRESS_MAX_LIMIT,
+} from "@gajae-gateway/protocol";
 
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
@@ -96,7 +107,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--limit N] [--offset N] [--json]|ops integrity|ops restart-stack [--status|--recover --confirm-service-manager-settled]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
+	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name> [--progress [--limit N] [--json]]|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--limit N] [--offset N] [--json]|ops integrity|ops restart-stack [--status|--recover --confirm-service-manager-settled]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -568,6 +579,68 @@ function parseWorkJobsArgs(args: readonly string[], usage: string): WorkJobsPara
 	return params;
 }
 
+/**
+ * `work status <name> [--progress [--limit N] [--json]]`. Undefined for the
+ * plain durable status; anything else after the name is a usage error.
+ */
+function parseWorkProgressArgs(args: readonly string[], usage: string): { limit?: number; json: boolean } | undefined {
+	if (args.length === 0) return undefined;
+	let progress = false;
+	let json = false;
+	let limit: number | undefined;
+	for (let index = 0; index < args.length; index++) {
+		const flag = args[index];
+		if (flag === "--progress" && !progress) progress = true;
+		else if (flag === "--json" && !json) json = true;
+		else if (flag === "--limit" && limit === undefined) {
+			const value = args[++index];
+			if (value === undefined || !/^\d+$/.test(value)) throw new Error(usage);
+			limit = Number(value);
+			if (!Number.isSafeInteger(limit) || limit < 1 || limit > WORK_PROGRESS_MAX_LIMIT) throw new Error(usage);
+		} else throw new Error(usage);
+	}
+	if (!progress) throw new Error(usage);
+	return { ...(limit === undefined ? {} : { limit }), json };
+}
+
+/** One line per item; the current state comes last so a tail-truncated shell still shows it. */
+export function renderWorkProgress(result: WorkProgressResult): string[] {
+	const oneLine = (text: string) =>
+		text
+			.replace(/\s+/g, " ")
+			.replace(/[\p{Cc}\p{Cf}]/gu, (char) => `\\u{${(char.codePointAt(0) ?? char.charCodeAt(0)).toString(16)}}`)
+			.trim();
+	const call = (tool: WorkProgressResult["toolCalls"][number]) =>
+		`${oneLine(tool.name)}${tool.intent ? ` ${JSON.stringify(oneLine(tool.intent))}` : ""}`;
+	const attempt = result.attempt
+		? ` attempt=${result.attempt.opRef} started=${result.attempt.startedAt}${result.attempt.endedAt ? ` ended=${result.attempt.endedAt} end=${result.attempt.endState ?? "-"}` : ""}`
+		: "";
+	const lines = [`lane ${result.name}: ${result.state} session=${result.sessionId || "-"}${attempt}`];
+	const transcript = result.transcript;
+	if (transcript.status === "unavailable") lines.push(`transcript: unavailable (${transcript.reason})`);
+	else
+		lines.push(
+			`transcript: ${transcript.bytes}B, read last ${transcript.scannedBytes}B${transcript.complete ? "" : " (scan limit reached)"}${transcript.skippedRows > 0 ? `, ${transcript.skippedRows} rows skipped` : ""}`,
+		);
+	if (result.toolCalls.length > 0) {
+		lines.push("tool calls (oldest first):");
+		for (const tool of result.toolCalls) lines.push(`  ${tool.at ?? "-"} ${tool.status} ${call(tool)}`);
+	}
+	if (result.assistantTexts.length > 0) {
+		lines.push("assistant (oldest first):");
+		for (const text of result.assistantTexts) lines.push(`  ${text.at ?? "-"} ${oneLine(text.text)}`);
+	}
+	lines.push(`turn started: ${result.turnStartedAt ?? "-"}`);
+	lines.push(
+		result.toolInFlight
+			? `now running: ${call(result.toolInFlight)} since ${result.toolInFlight.at ?? "-"}`
+			: result.toolCalls.some((tool) => tool.status === "unknown")
+				? "now running: unknown (skipped transcript rows)"
+				: "now running: no tool call",
+	);
+	return lines;
+}
+
 export function renderDeliveries(result: OpsDeliveriesResult): string[] {
 	if (result.rows.length === 0) return ["deliveries: none"];
 	return [
@@ -724,40 +797,60 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			// Flag validation happens before the socket connect so a bad
 			// `--fields`/`--limit` fails fast without a running gateway.
 			case "sessions": {
-				const listOptions =
-					parsed.rest[0] === "list" ? parseListOptions(parsed.rest.slice(1), SESSION_COLUMNS) : undefined;
+				const [command, selector] = parsed.rest;
+				const sessionsUsage = `usage: gajaeway sessions list [--json] [--fields ${columnNames(SESSION_COLUMNS).join(",")}] [--limit N] [--offset N]|inspect <originKey-or-index>`;
+				// The gateway pages and filters (#814): the unpaged list outgrew the
+				// 1 MiB frame, so a client-side --limit could never make it fit.
+				let listOptions: ListOptions | undefined;
+				let params: SessionListParams | undefined;
+				if (command === "list") {
+					listOptions = parseListOptions(parsed.rest.slice(1), SESSION_COLUMNS);
+					if (listOptions.limit !== undefined && (listOptions.limit < 1 || listOptions.limit > SESSION_LIST_MAX_LIMIT))
+						throw new Error(`--limit expects 1..${SESSION_LIST_MAX_LIMIT}\n${sessionsUsage}`);
+					if (listOptions.limit !== undefined || listOptions.offset !== 0)
+						params = {
+							...(listOptions.limit === undefined ? {} : { limit: listOptions.limit }),
+							...(listOptions.offset === 0 ? {} : { offset: listOptions.offset }),
+						};
+				} else if (command === "inspect" && selector && parsed.rest.length === 2) {
+					const index = Number(selector);
+					if (Number.isInteger(index) && index < 0) throw new Error(`Unknown session: ${selector}`);
+					params = Number.isInteger(index) ? { limit: 1, offset: index } : { limit: 1, originKey: selector };
+				} else throw new Error(sessionsUsage);
 				const client = await connectGatewaySocket(parsed.socket);
 				try {
-					const result = await client.request<{
-						sessions: Array<{
-							origin: Parameters<typeof originKey>[0];
-							epoch: number;
-							createdAt: string;
-							lastActivityAt: string | null;
-							bootstrap: {
-								epoch: number;
-								pending: boolean;
-								appliedAt: string | null;
-								includedSections: string[];
-								byteCount: number;
-								truncated: boolean;
-								diagnostics: string[];
-							};
-						}>;
-					}>("session.list");
-					const [command, selector] = parsed.rest;
+					const result = await client.request<SessionListResult>("session.list", params);
+					if (
+						!Number.isSafeInteger(result.total) ||
+						!Number.isSafeInteger(result.offset) ||
+						result.offset !== (params?.offset ?? 0) ||
+						!Array.isArray(result.sessions)
+					)
+						throw new Error(
+							"Gateway does not support session paging; restart the gateway before listing or inspecting sessions",
+						);
 					if (command === "list") {
-						const options = listOptions as ListOptions;
-						for (const line of renderList(SESSION_COLUMNS, result.sessions satisfies SessionListRow[], options, {
-							key: "sessions",
-							result,
-						}))
+						for (const line of renderList(
+							SESSION_COLUMNS,
+							result.sessions satisfies readonly SessionListRow[],
+							listOptions as ListOptions,
+							{ key: "sessions", result, serverPageOffset: result.offset },
+						))
 							console.log(line);
-					} else if (command === "inspect" && selector) {
-						const index = Number(selector);
-						const session = Number.isInteger(index)
-							? result.sessions[index]
-							: result.sessions.find((candidate) => originKey(candidate.origin) === selector);
+						const shownEnd = result.offset + result.sessions.length;
+						if (result.sessions.length === 0 && result.total > 0)
+							console.error(`sessions: none at offset ${result.offset} of ${result.total}`);
+						else if (result.offset > 0 || shownEnd < result.total)
+							console.error(
+								`sessions ${result.offset + 1}-${shownEnd} of ${result.total}${shownEnd < result.total ? ` (next: --offset ${shownEnd})` : ""}`,
+							);
+					} else {
+						const session = result.sessions[0];
+						if (
+							result.sessions.length > 1 ||
+							(params?.originKey && session && originKey(session.origin) !== params.originKey)
+						)
+							throw new Error("Gateway did not honor the session inspection filter; restart the gateway");
 						if (!session) throw new Error(`Unknown session: ${selector}`);
 						console.log(`origin: ${originKey(session.origin)}`);
 						console.log(`epoch: ${session.epoch}`);
@@ -770,10 +863,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						console.log(`bootstrapBytes: ${session.bootstrap.byteCount}`);
 						console.log(`bootstrapTruncated: ${session.bootstrap.truncated}`);
 						console.log(`bootstrapDiagnostics: ${session.bootstrap.diagnostics.join(", ") || "-"}`);
-					} else
-						throw new Error(
-							`usage: gajaeway sessions list [--json] [--fields ${columnNames(SESSION_COLUMNS).join(",")}] [--limit N] [--offset N]|inspect <originKey-or-index>`,
-						);
+					}
 				} finally {
 					await client.close();
 				}
@@ -1008,7 +1098,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			case "work": {
 				const [command, ...args] = parsed.rest;
 				const usage =
-					'usage: gajaeway work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] "<task text>"|status <name>|steer <name> <text>|retire <name>|jobs|directive add "<text>"|directive list|directive remove <id>';
+					'usage: gajaeway work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] "<task text>"|status <name> [--progress [--limit N] [--json]]|steer <name> <text>|retire <name>|jobs|directive add "<text>"|directive list|directive remove <id>';
 				if (command === "directive") {
 					const [action, ...rest] = args;
 					const text = rest.join(" ").trim();
@@ -1043,15 +1133,25 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				if (command === "status" || command === "steer") {
 					const name = args[0];
 					const text = args.slice(1).join(" ").trim();
+					// `status --progress` is the read-only question path (work.progress);
+					// `steer` is the only path that reaches the lane. They never share a verb.
+					const progress = command === "status" ? parseWorkProgressArgs(args.slice(1), usage) : undefined;
 					if (
 						!name ||
 						!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) ||
-						(command === "status" ? args.length !== 1 : !text || args.slice(1).some((arg) => arg.startsWith("--")))
+						(command === "steer" && (!text || args.slice(1).some((arg) => arg.startsWith("--"))))
 					)
 						throw new Error(usage);
 					const client = await connectGatewaySocket(parsed.socket);
 					try {
-						if (command === "status") {
+						if (progress) {
+							const result = await client.request<WorkProgressResult>("work.progress", {
+								name,
+								...(progress.limit === undefined ? {} : { limit: progress.limit }),
+							} satisfies WorkProgressParams);
+							if (progress.json) console.log(JSON.stringify(result));
+							else for (const line of renderWorkProgress(result)) console.log(line);
+						} else if (command === "status") {
 							console.log(JSON.stringify(await client.request<WorkStatusResult>("work.status", { name })));
 						} else {
 							const result = await client.request<WorkSteerResult>("work.steer", { name, text });

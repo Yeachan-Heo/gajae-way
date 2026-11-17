@@ -151,8 +151,8 @@ test("RT-SLACK-24 thread and channel isolate sessions and route replies", async 
 	await settle();
 	expect(
 		f.database.bindings
-			.sessionRows()
-			.map((row) => JSON.parse(row.origin_ref_json ?? "{}").conversationId)
+			.sessionPage({ limit: 500, offset: 0 })
+			.rows.map((row) => JSON.parse(row.origin_ref_json ?? "{}").conversationId)
 			.sort(),
 	).toEqual(["C1", "C1:1.0"]);
 	// The channel turn (root 1.0) and the thread turn (thread C1:1.0) both land in thread 1.0.

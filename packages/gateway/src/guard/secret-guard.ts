@@ -322,7 +322,8 @@ export class SecretGuard {
 	}
 }
 
-function redactionLine(event: string, counts: Readonly<Record<string, number>>): string {
+/** The audit line for redacted spans: kinds and counts, never a value. */
+export function redactionLine(event: string, counts: Readonly<Record<string, number>>): string {
 	const kinds = Object.entries(counts)
 		.map(([kind, count]) => `${kind}:${count}`)
 		.join(",");

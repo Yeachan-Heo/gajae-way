@@ -13,12 +13,13 @@
  * selection and open `<details>` all survive a refresh.
  */
 
-import type {
-	GatewayStatusResult,
-	MonitorEventRecord,
-	MonitorRecord,
-	MonitorScheduleProjection,
-	SessionListResult,
+import {
+	type GatewayStatusResult,
+	type MonitorEventRecord,
+	type MonitorRecord,
+	type MonitorScheduleProjection,
+	SESSION_LIST_MAX_LIMIT,
+	type SessionListResult,
 } from "@gajae-gateway/protocol";
 import {
 	ATTENTION_GAPS,
@@ -63,7 +64,7 @@ export type RowView = {
  * failure, `blocked` names the protocol gap that would unblock it, and `stale`
  * is applied by the client when the stream has gone quiet.
  */
-export type PanelState = "ready" | "empty" | "error" | "blocked";
+export type PanelState = "ready" | "partial" | "empty" | "error" | "blocked";
 
 export type Panel = {
 	readonly state: PanelState;
@@ -95,6 +96,57 @@ async function read<T>(request: GatewayRequest, method: string, params?: unknown
 	} catch (error) {
 		return { value: null, error: error instanceof Error ? error.message : String(error) };
 	}
+}
+
+const SESSION_SNAPSHOT_MAX_ROWS = 1000;
+const SESSION_SNAPSHOT_MAX_PAGES = 20;
+
+type SessionRead = ReadOutcome<SessionListResult> & { readonly partial: string | null };
+
+/** Follow byte-limited gateway pages, but bound each snapshot's memory and number of requests. */
+async function readSessions(request: GatewayRequest): Promise<SessionRead> {
+	const sessions: SessionListResult["sessions"][number][] = [];
+	let total = 0;
+	const partial = (reason: string): SessionRead => ({
+		value: { total, offset: 0, sessions },
+		error: null,
+		partial: `Session list incomplete: showing ${sessions.length} of ${total}. ${reason}`,
+	});
+	for (let pageNumber = 0; pageNumber < SESSION_SNAPSHOT_MAX_PAGES; pageNumber++) {
+		const offset = sessions.length;
+		const page = await read<SessionListResult>(request, "session.list", {
+			limit: Math.min(SESSION_LIST_MAX_LIMIT, SESSION_SNAPSHOT_MAX_ROWS - offset),
+			offset,
+		});
+		if (page.error) {
+			if (pageNumber === 0) return { value: null, error: page.error, partial: null };
+			return partial(`Could not read the next page: ${page.error}`);
+		}
+		if (!page.value || !Array.isArray(page.value.sessions)) {
+			if (pageNumber === 0) return { value: null, error: "Invalid session list response", partial: null };
+			return partial("The next page was invalid.");
+		}
+		// A legacy gateway returns the whole list and does not report paging metadata.
+		if (pageNumber === 0 && page.value.offset === undefined && page.value.total === undefined) {
+			total = page.value.sessions.length;
+			sessions.push(...page.value.sessions.slice(0, SESSION_SNAPSHOT_MAX_ROWS));
+			return sessions.length < total
+				? partial("The snapshot row limit was reached.")
+				: { value: { total, offset: 0, sessions }, error: null, partial: null };
+		}
+		if (!Number.isSafeInteger(page.value.total) || page.value.total < 0 || page.value.offset !== offset)
+			return partial("The gateway returned invalid paging metadata.");
+		if (pageNumber > 0 && page.value.total !== total) {
+			total = page.value.total;
+			return partial("The session count changed while paging; refresh to retry.");
+		}
+		total = page.value.total;
+		sessions.push(...page.value.sessions.slice(0, SESSION_SNAPSHOT_MAX_ROWS - offset));
+		if (sessions.length >= total) return { value: { total, offset: 0, sessions }, error: null, partial: null };
+		if (page.value.sessions.length === 0) return partial("The gateway returned an empty page.");
+		if (sessions.length >= SESSION_SNAPSHOT_MAX_ROWS) return partial("The snapshot row limit was reached.");
+	}
+	return partial("The snapshot page limit was reached.");
 }
 
 const LIVE_GAPS: readonly CoverageGap[] = [
@@ -422,7 +474,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<ConsoleSnapshot
 	const now = deps.now?.() ?? new Date();
 	const [status, sessions, monitors] = await Promise.all([
 		read<GatewayStatusResult>(deps.request, "gateway.status"),
-		read<SessionListResult>(deps.request, "session.list"),
+		readSessions(deps.request),
 		read<{
 			monitors: readonly MonitorRecord[];
 			schedules: Readonly<Record<string, MonitorScheduleProjection>>;
@@ -471,7 +523,12 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<ConsoleSnapshot
 		status: statusRow(
 			status.value,
 			status.error,
-			sessions.value === null ? null : sessionList.length,
+			// The aggregate retains the gateway's total even when a bound made it partial.
+			sessions.value === null
+				? null
+				: typeof sessions.value.total === "number"
+					? sessions.value.total
+					: sessionList.length,
 			deps.turns.activeCount,
 			attention,
 			now,
@@ -496,8 +553,14 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<ConsoleSnapshot
 		},
 		sessions: {
 			state:
-				(sessions.error ?? projectedSessions.error) ? "error" : projectedSessions.rows.length === 0 ? "empty" : "ready",
-			note: sessions.error ?? projectedSessions.error ?? "No session has been opened yet.",
+				(sessions.error ?? projectedSessions.error)
+					? "error"
+					: sessions.partial
+						? "partial"
+						: projectedSessions.rows.length === 0
+							? "empty"
+							: "ready",
+			note: sessions.error ?? projectedSessions.error ?? sessions.partial ?? "No session has been opened yet.",
 			rows: projectedSessions.rows,
 			gaps: SESSION_GAPS,
 		},

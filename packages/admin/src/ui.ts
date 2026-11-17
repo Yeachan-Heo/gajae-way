@@ -393,6 +393,7 @@ main{
   font-size: var(--text-sm); color: var(--ink-dim);
 }
 .panel[data-state="ready"] .panel__note{ display:none; }
+.panel[data-state="partial"] .panel__note{ color: var(--warn); }
 .panel[data-state="error"] .panel__note,
 .panel__note[data-state="blocked"]{ color: var(--danger); }
 .panel[data-state="loading"] .panel__note{ color: var(--ink-faint); }
