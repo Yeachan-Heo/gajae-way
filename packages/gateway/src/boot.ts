@@ -31,6 +31,8 @@ export interface BootGatewayOptions {
 	readonly broker?: Partial<Omit<GlobalGjcClientDependencies, "agentDir">>;
 	/** Explicit home is useful for isolated boot tests; normal startup uses GAJAEWAY_HOME. */
 	readonly home?: string;
+	/** The stdio console was redirected before a structured logger was installed. */
+	readonly stdioConsolePrepared?: boolean;
 
 	/** How long boot waits for an unavailable shared broker before exiting; see {@link waitForBroker}. */
 	readonly brokerWait?: BrokerWaitOptions;
@@ -61,12 +63,14 @@ export interface BootedGateway extends GatewayServer {
 	readonly broker: GlobalGjcClient;
 }
 
+/** Redirect raw console output before installing a logger so info retains its severity. */
+export function prepareStdioConsole(): void {
+	console.log = console.error;
+	console.info = console.error;
+}
+
 export async function bootGateway(options: BootGatewayOptions = {}): Promise<BootedGateway> {
-	if (options.stdio) {
-		// stdout carries protocol frames in stdio mode; every log line goes to stderr.
-		console.log = console.error;
-		console.info = console.error;
-	}
+	if (options.stdio && !options.stdioConsolePrepared) prepareStdioConsole();
 	const config = await loadConfig({ home: options.home, overrides: options.overrides });
 	await mkdir(config.home, { recursive: true, mode: 0o700 });
 	await chmod(config.home, 0o700);

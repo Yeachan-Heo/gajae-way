@@ -1,11 +1,11 @@
 import { Database } from "bun:sqlite";
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LOOPBACK_ORIGIN, originKey } from "@gajae-gateway/protocol";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { type DatabaseStartupError, LATEST_SCHEMA_VERSION, Store } from "../src/store";
+import { type DatabaseStartupError, LATEST_SCHEMA_VERSION, Store, StoreCore } from "../src/store";
 
 test("migrates the sessions foundation", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-"));
@@ -311,5 +311,198 @@ test("allows SQLite's intrinsic memory journal mode for an in-memory store", asy
 		expect(store.core.getJournalMode()).toBe("memory");
 	} finally {
 		store.close();
+	}
+});
+
+test("fresh database ends with auto_vacuum = 2 (INCREMENTAL)", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-auto-vacuum-"));
+	const path = join(directory, "gateway.db");
+	try {
+		const database = await Store.open(path);
+		database.close();
+		const raw = new Database(path);
+		const autoVacuum = raw.query<{ auto_vacuum: number }, []>("PRAGMA auto_vacuum").get()?.auto_vacuum ?? 0;
+		raw.close();
+		expect(autoVacuum).toBe(2);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("legacy database with auto_vacuum=0 is converted on open and gives its free pages back", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-legacy-vacuum-"));
+	const path = join(directory, "gateway.db");
+	try {
+		const seeded = await Store.open(path);
+		seeded.close();
+		const legacy = new Database(path);
+		// Model a pre-#678 file: no auto_vacuum, and a large table compacted away.
+		legacy.exec("PRAGMA auto_vacuum = NONE; VACUUM;");
+		legacy.exec("CREATE TABLE bloat (blob BLOB)");
+		const insert = legacy.prepare("INSERT INTO bloat VALUES (randomblob(4096))");
+		for (let index = 0; index < 2_000; index++) insert.run();
+		legacy.exec("DROP TABLE bloat");
+		const pragma = (name: string) => (legacy.query(`PRAGMA ${name}`).get() as Record<string, number>)[name]!;
+		expect(pragma("auto_vacuum")).toBe(0);
+		const pagesBefore = pragma("page_count");
+		expect(pragma("freelist_count")).toBeGreaterThan(1_900);
+		legacy.close();
+
+		const store = await Store.open(path);
+		expect(store.core.getFreelistCount()).toBe(0);
+		expect(store.core.getPageCount()).toBeLessThan(pagesBefore - 1_900);
+		store.close();
+		const raw = new Database(path);
+		expect((raw.query("PRAGMA auto_vacuum").get() as { auto_vacuum: number }).auto_vacuum).toBe(2);
+		raw.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("legacy context floors survive vacuum and future inserts after deleted high rowids", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-context-vacuum-"));
+	const path = join(directory, "gateway.db");
+	const origin = "loopback/loopback/one";
+	const emptyOrigin = "loopback/loopback/empty";
+	const floorAt = "2026-10-26T00:00:00.000Z";
+	try {
+		const seed = await Store.open(path);
+		seed.close();
+		const legacy = new Database(path);
+		legacy.exec(`
+			PRAGMA auto_vacuum = NONE; VACUUM;
+			DROP TABLE conversation_context;
+			CREATE TABLE conversation_context (message_id TEXT PRIMARY KEY, origin_key TEXT NOT NULL, author_id TEXT, author_name TEXT, body TEXT NOT NULL, received_at TEXT NOT NULL, consumed_at TEXT);
+			CREATE INDEX conversation_context_unread ON conversation_context (origin_key, consumed_at, received_at);
+			CREATE INDEX conversation_context_retention ON conversation_context (consumed_at, received_at);
+			DELETE FROM schema_migrations WHERE version >= 43;
+		`);
+		expect(
+			legacy.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_migrations").get()?.version,
+		).toBe(42);
+		legacy
+			.query(
+				"INSERT INTO conversation_context (rowid, message_id, origin_key, body, received_at) VALUES (?, ?, ?, ?, ?)",
+			)
+			.run(100, "before", origin, "old", floorAt);
+		legacy
+			.query(
+				"INSERT INTO conversation_context (rowid, message_id, origin_key, body, received_at) VALUES (?, ?, ?, ?, ?)",
+			)
+			.run(101, "after", origin, "new", floorAt);
+		legacy
+			.query("INSERT INTO conversation_context_state (origin_key, floor_at, floor_row_id) VALUES (?, ?, ?)")
+			.run(origin, floorAt, 100);
+		legacy
+			.query("INSERT INTO conversation_context_state (origin_key, floor_at, floor_row_id) VALUES (?, ?, ?)")
+			.run(emptyOrigin, floorAt, 200);
+		legacy.close();
+
+		const store = await Store.open(path);
+		try {
+			expect(store.schemaVersion).toBe(43);
+			expect(store.inbox.recentContext(origin, 10, floorAt).map((row) => row.id)).toEqual(["after"]);
+			const window = store.transaction((tx) => store.inbox.contextWindow(tx, origin, "trigger", new Date(floorAt)));
+			expect(window.selectedMessageIds).toEqual(["after"]);
+			store.transaction((tx) =>
+				store.inbox.contextRecord(tx, {
+					messageId: "after-empty",
+					originKey: emptyOrigin,
+					body: "new",
+					receivedAt: floorAt,
+				}),
+			);
+			expect(store.inbox.recentContext(emptyOrigin, 10, floorAt).map((row) => row.id)).toEqual(["after-empty"]);
+		} finally {
+			store.close();
+		}
+		const reopened = await Store.open(path);
+		try {
+			expect(reopened.inbox.recentContext(origin, 10, floorAt).map((row) => row.id)).toEqual(["after"]);
+			expect(reopened.inbox.recentContext(emptyOrigin, 10, floorAt).map((row) => row.id)).toEqual(["after-empty"]);
+		} finally {
+			reopened.close();
+		}
+		const migrated = new Database(path, { readonly: true });
+		try {
+			expect(
+				migrated
+					.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 43")
+					.get()?.count,
+			).toBe(1);
+			expect(
+				migrated.query<{ name: string; pk: number }, []>("PRAGMA table_info(conversation_context)").all(),
+			).toContainEqual(expect.objectContaining({ name: "context_row_id", pk: 1 }));
+		} finally {
+			migrated.close();
+		}
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("failed auto-vacuum conversion warns instead of claiming success", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-vacuum-readonly-"));
+	const path = join(directory, "gateway.db");
+	const raw = new Database(path);
+	raw.exec("CREATE TABLE data (value TEXT); INSERT INTO data VALUES ('legacy');");
+	raw.close();
+	const core = await StoreCore.openReadonly(path);
+	const info = spyOn(console, "info").mockImplementation(() => {});
+	const warn = spyOn(console, "warn").mockImplementation(() => {});
+	try {
+		core.enableAutoVacuum();
+		expect(warn.mock.calls.some(([line]) => String(line).includes("store_auto_vacuum_conversion_failed"))).toBe(true);
+		expect(info.mock.calls.some(([line]) => String(line).includes("store_auto_vacuum_enabled"))).toBe(false);
+	} finally {
+		info.mockRestore();
+		warn.mockRestore();
+		core.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+/** Leaves `freePages` pages on the freelist of an INCREMENTAL store, with `livePages` of data kept. */
+function fragment(store: Store, livePages: number, freePages: number): void {
+	store.core.metaSet("vacuum-test-live", "x".repeat(livePages * 4_000));
+	store.core.metaSet("vacuum-test-free", "x".repeat(freePages * 4_000));
+	store.core.metaDelete("vacuum-test-free");
+}
+
+test("maintain() reclaims at most 4096 free pages per call while the freelist is above 25%", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-maintain-"));
+	try {
+		const store = await Store.open(join(directory, "gateway.db"));
+		fragment(store, 0, 6_000);
+		const before = store.core.getFreelistCount();
+		expect(before).toBeGreaterThan(5_000);
+		expect(before / store.core.getPageCount()).toBeGreaterThan(0.25);
+		store.core.maintain();
+		// `optimize` in the same pass may move a page or two; the vacuum step itself is bounded.
+		const reclaimed = before - store.core.getFreelistCount();
+		expect(reclaimed).toBeGreaterThanOrEqual(4_090);
+		expect(reclaimed).toBeLessThanOrEqual(4_100);
+		store.core.maintain();
+		expect(store.core.getFreelistCount()).toBe(0);
+		store.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("maintain() leaves a freelist at or below 25% alone", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-maintain-no-op-"));
+	try {
+		const store = await Store.open(join(directory, "gateway.db"));
+		fragment(store, 4_000, 500);
+		const before = store.core.getFreelistCount();
+		expect(before).toBeGreaterThan(400);
+		expect(before / store.core.getPageCount()).toBeLessThanOrEqual(0.25);
+		store.core.maintain();
+		expect(Math.abs(store.core.getFreelistCount() - before)).toBeLessThanOrEqual(2);
+		store.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
 	}
 });

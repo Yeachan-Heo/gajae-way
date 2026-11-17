@@ -100,6 +100,7 @@ export class StoreCore {
 			if (options.canonicalAgentDir !== undefined) core.assertInitialAuthority(options.canonicalAgentDir);
 			core.migrate();
 			core.integrityCheck();
+			core.enableAutoVacuum();
 			return core;
 		} catch (error) {
 			core.close();
@@ -306,8 +307,65 @@ export class StoreCore {
 		return counts;
 	}
 
+	getPageCount(): number {
+		return this.#database.query<{ page_count: number }, []>("PRAGMA page_count").get()?.page_count ?? 0;
+	}
+
+	getFreelistCount(): number {
+		return this.#database.query<{ freelist_count: number }, []>("PRAGMA freelist_count").get()?.freelist_count ?? 0;
+	}
+
+	getPageSize(): number {
+		return this.#database.query<{ page_size: number }, []>("PRAGMA page_size").get()?.page_size ?? 4096;
+	}
+
+	enableAutoVacuum(): void {
+		const currentAutoVacuum =
+			this.#database.query<{ auto_vacuum: number }, []>("PRAGMA auto_vacuum").get()?.auto_vacuum ?? 0;
+
+		if (currentAutoVacuum === 2) return; // Already INCREMENTAL
+
+		const pagesBefore = this.getPageCount();
+		const startMs = Date.now();
+
+		try {
+			// Converting an existing file requires VACUUM after changing the pragma.
+			this.#database.exec("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;");
+			const mode = this.#database.query<{ auto_vacuum: number }, []>("PRAGMA auto_vacuum").get()?.auto_vacuum;
+			if (mode !== 2) throw new Error(`unexpected auto_vacuum mode: ${mode ?? "unknown"}`);
+			if (pagesBefore > 1) {
+				console.info(
+					JSON.stringify({
+						store_auto_vacuum_enabled: {
+							pages_before: pagesBefore,
+							pages_after: this.getPageCount(),
+							ms: Date.now() - startMs,
+						},
+					}),
+				);
+			}
+		} catch (error) {
+			console.warn(`store_auto_vacuum_conversion_failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
 	maintain(): void {
 		this.#database.exec("PRAGMA wal_checkpoint(PASSIVE); PRAGMA optimize;");
+
+		const pageCount = this.getPageCount();
+		const freelistCount = this.getFreelistCount();
+
+		if (pageCount > 0 && freelistCount / pageCount > 0.25) {
+			const pagesBeforeVacuum = freelistCount;
+			// Run incremental_vacuum with bounded N (e.g. 4096 pages)
+			this.#database.exec("PRAGMA incremental_vacuum(4096);");
+			const pagesAfterVacuum = this.getFreelistCount();
+			const freedPages = pagesBeforeVacuum - pagesAfterVacuum;
+
+			if (freedPages > 0) {
+				console.info(JSON.stringify({ store_incremental_vacuum: { freed_pages: freedPages } }));
+			}
+		}
 	}
 
 	collectOpenWork(scope: OpenWorkScope) {
