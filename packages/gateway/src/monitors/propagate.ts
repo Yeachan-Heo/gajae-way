@@ -3186,6 +3186,7 @@ export function failureDetail(error: unknown): string {
 		"AuthoringResultUnavailableError",
 		"BrokerAuthorityError",
 		"ModelNotSelectedError",
+		"SessionContractError",
 	]);
 	const allowedCodes = new Set([
 		"broker_unavailable",
@@ -3276,7 +3277,7 @@ export function failureDetail(error: unknown): string {
 	// A top-level message is recorded only for classes that build it from fixed
 	// text and numbers. Every other message can carry operation ids or remote
 	// text (SessionTerminalError, RelayRefusedError, plain Error).
-	const messageSourceClasses = new Set(["RelayHelloError", "ModelNotSelectedError"]);
+	const messageSourceClasses = new Set(["RelayHelloError", "ModelNotSelectedError", "SessionContractError"]);
 	const message =
 		causes
 			.slice()
