@@ -500,6 +500,19 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				? "1=1"
 				: "EXISTS (SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?)";
 		const leaseParams = leaseId === "" ? [] : [leaseId, new Date(now).toISOString()];
+		// Check current stage to prevent replacing an already-authored answer with a late SILENT
+		const currentRow = this.#db
+			.prepare("SELECT stage, event_id FROM monitor_events WHERE event_id = ?")
+			.get(eventId) as { stage: string; event_id: string } | null;
+		if (!currentRow) return false;
+		// If already authored and trying to author again (which would only happen with a late SILENT from wake-up),
+		// reject it unless we're updating TO authored_no_delivery (which is allowed from authored)
+		if (currentRow.stage === "authored" && !noDelivery) return false;
+		// If already in a terminal stage, don't update
+		if (
+			["delivered", "authored_no_delivery", "failed_no_retry", "skipped", "contract_unmet"].includes(currentRow.stage)
+		)
+			return false;
 		const changes = this.#db
 			.prepare(
 				`UPDATE monitor_events SET stage = ?, updated_at = ? WHERE event_id = ? AND stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet') AND ${leasePredicate}`,
