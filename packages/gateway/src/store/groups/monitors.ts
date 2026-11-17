@@ -131,6 +131,8 @@ export interface MonitorEventDbRow {
 	readonly skipped_by: string | null;
 	readonly updated_at: string;
 	readonly procedure_json: string | null;
+	/** Epoch of the origin's session binding at admission; 0 when the origin had no binding. */
+	readonly escalation_epoch: number;
 }
 
 const REPLAYABLE_MONITOR =
@@ -356,15 +358,19 @@ export class MonitorsGroup {
 			row.overlap === "skip"
 				? `(SELECT event_id FROM monitor_events WHERE monitor_id = ? AND stage IN (${IN_FLIGHT_MONITOR_STAGES}) AND ${REPLAYABLE_MONITOR} ORDER BY fired_at, rowid LIMIT 1)`
 				: "NULL";
+		// Event rows carry the epoch of their origin's session binding at admission
+		// time so the failure-streak count can be scoped to that epoch even after the
+		// binding rotates. COALESCE covers targetless events (no binding row) with 0.
 		const inserted = this.#db
 			.prepare(
-				`INSERT INTO monitor_events (event_id, monitor_id, event_type, session_origin_key, payload_json, fired_at, stage, batch_id, skipped_by, updated_at) SELECT ?, ?, ?, ?, ?, ?, CASE WHEN p.id IS NULL THEN 'admitted' ELSE 'skipped' END, NULL, p.id, ? FROM (SELECT ${predecessor} AS id) AS p RETURNING skipped_by`,
+				`INSERT INTO monitor_events (event_id, monitor_id, event_type, session_origin_key, escalation_epoch, payload_json, fired_at, stage, batch_id, skipped_by, updated_at) SELECT ?, ?, ?, ?, COALESCE((SELECT epoch FROM sessions WHERE origin_key = ?), 0), ?, ?, CASE WHEN p.id IS NULL THEN 'admitted' ELSE 'skipped' END, NULL, p.id, ? FROM (SELECT ${predecessor} AS id) AS p RETURNING skipped_by`,
 			)
 			.getWithWrite(
 				tx,
 				row.eventId,
 				row.monitorId,
 				row.eventType,
+				row.sessionOriginKey ?? null,
 				row.sessionOriginKey ?? null,
 				row.payloadJson,
 				row.firedAt,
@@ -824,18 +830,23 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			.all(...params) as MonitorEventDbRow[];
 	}
 
-	/** A later terminal success starts a new escalation streak, even in a mixed batch. */
-	successAfterEvent(monitorId: string, sessionOriginKey: string, eventId: string): boolean {
+	/**
+	 * Epoch-scoped variant: a success from a different epoch than `epoch` does NOT
+	 * reopen a streak for the marker minted in `epoch`, because a rotation is a
+	 * recovery boundary per issue #780 P2 #2.
+	 */
+	successAfterEventInEpoch(monitorId: string, sessionOriginKey: string, eventId: string, epoch: number): boolean {
 		return Boolean(
 			this.#db
 				.prepare(
 					`SELECT 1 FROM monitor_events WHERE monitor_id = ? AND session_origin_key = ?
 					 AND stage IN ('delivered', 'authored_no_delivery') AND ${REPLAYABLE_MONITOR}
+					 AND escalation_epoch = ?
 					 AND (fired_at > (SELECT fired_at FROM monitor_events WHERE event_id = ?)
 					 OR (fired_at = (SELECT fired_at FROM monitor_events WHERE event_id = ?)
 					 AND rowid > (SELECT rowid FROM monitor_events WHERE event_id = ?))) LIMIT 1`,
 				)
-				.get(monitorId, sessionOriginKey, eventId, eventId, eventId),
+				.get(monitorId, sessionOriginKey, epoch, eventId, eventId, eventId),
 		);
 	}
 

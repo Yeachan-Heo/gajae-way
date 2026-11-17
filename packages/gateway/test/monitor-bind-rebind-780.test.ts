@@ -4,13 +4,18 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatMessagePayload } from "@gajae-gateway/protocol";
+import { GjcCliError } from "@gajae-gateway/subsession";
 import { DeliveryService } from "../src/delivery/delivery";
-import { MonitorPropagator } from "../src/monitors/propagate";
+import {
+	MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD,
+	MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD,
+	MonitorPropagator,
+} from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { GjcCliUnavailableError, GjcCommandQueueTimeoutError } from "../src/orchestrator/broker";
 import type { SessionPort } from "../src/orchestrator/session-port";
 import { RelayHelloError } from "../src/orchestrator/tail-runner";
-import { Store } from "../src/store";
+import { BrokerAuthorityError, Store } from "../src/store";
 import { MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS } from "../src/store/groups/monitors";
 import { attachTestBrokerOwnership, initializeTestBrokerAuthority, sessionPortFromScript } from "./session-port.fake";
 
@@ -601,7 +606,7 @@ test("a successful dispatch after failures clears the failure streak (issue #780
 
 		const originKey = `monitor/eventtype/test.success_clear/parent=${monitor.monitorId}`;
 
-		const escalationKey = `monitor_escalation:${originKey}:${monitor.monitorId}`;
+		const escalationKey = `monitor_escalation:${originKey}:${monitor.monitorId}:epoch=0`;
 		const dispatchUntil = async (stage: string) => {
 			const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.success_clear", {});
 			for (let attempt = 0; attempt < 200; attempt++) {
@@ -1109,7 +1114,7 @@ test("bind recovery retires an existing session before rotating its epoch (#780 
 
 		const sessionPort: Partial<SessionPort> = {
 			bind: async (input) => {
-				if (input.epoch === 0) throw new Error("broker unavailable while inspecting existing session");
+				if (input.epoch === 0) throw new GjcCliUnavailableError("broker_unavailable: bind timed out after 40s");
 				const sessionId = `session-epoch-${input.epoch}`;
 				database.transaction((tx) => {
 					expect(database.bindings.bindAtEpoch(tx, input.originKey, sessionId, input.epoch)).toBe(true);
@@ -1409,6 +1414,199 @@ test("local CLI queue timeouts do not rotate an existing monitor binding (#749, 
 //   const countBindFailure = (isTimeout || isSessionGone || isPendingWithoutSession) && ...;
 // The SESSION_GONE_CODES set is defined in gjc-contract.ts and includes these exact codes.
 
+// P2 #2 epoch-scoped count: the failure-streak COUNT itself (not just the marker key)
+// is scoped to the epoch stamped on each event row at admission, so a rotation always
+// starts a fresh streak.
+
+test("a rotation starts a fresh escalation streak: N-1 failures in epoch E plus 1 in epoch E+1 do not escalate (issue #780 P2 #2)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-epoch-streak-"));
+	try {
+		const database = await Store.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "epoch-streak-test",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.epoch_streak"],
+			burstPolicy: "serialize",
+		});
+		const origin = `monitor/eventtype/test.epoch_streak/parent=${monitor.monitorId}`;
+		database.transaction((tx) => {
+			expect(database.bindings.bindAtEpoch(tx, origin, "session-e0", 0)).toBe(true);
+		});
+		const messages: ChatMessagePayload[] = [];
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: {} as SessionPort,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			deliver: (payload) => messages.push(payload),
+			ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "owner" } },
+		});
+		const now = Date.now();
+		// N-1 terminal failures admitted under epoch 0 (the epoch is captured from the
+		// binding at eventCreate time, so these rows carry escalation_epoch=0).
+		database.transaction((tx) => {
+			database.bindings.updateSessionEpoch(tx, origin, 0);
+			for (let i = 0; i < MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD - 1; i++) {
+				database.monitors.eventCreate(tx, {
+					eventId: `epoch0-failure-${i}`,
+					monitorId: monitor.monitorId,
+					eventType: "test.epoch_streak",
+					sessionOriginKey: origin,
+					payloadJson: "{}",
+					firedAt: new Date(now + i).toISOString(),
+				});
+				database.monitors.eventUpdate(tx, `epoch0-failure-${i}`, "failed_no_retry");
+			}
+		});
+		// Rotate the binding the way bind recovery does, then fail once more. The
+		// new event is admitted under epoch 1; the epoch-0 rows must not complete
+		// its streak even though they are still the most recent failures.
+		database.transaction((tx) => {
+			const epoch = database.bindings.rotateEpoch(tx, origin);
+			expect(epoch).toBe(1);
+			database.monitors.eventCreate(tx, {
+				eventId: "epoch1-failure-0",
+				monitorId: monitor.monitorId,
+				eventType: "test.epoch_streak",
+				sessionOriginKey: origin,
+				payloadJson: "{}",
+				firedAt: new Date(now + 100).toISOString(),
+			});
+			database.monitors.eventUpdate(tx, "epoch1-failure-0", "failed_no_retry");
+		});
+		pipeline.deliveryExpired(["epoch1-failure-0"]);
+		expect(messages.filter((payload) => payload.text.includes("[monitor escalation]"))).toHaveLength(0);
+		// The epoch-0 streak stays visible only through its own epoch key: a
+		// threshold-sized streak in epoch 1 escalates under the NEW epoch key.
+		expect(database.core.metaGet(`monitor_escalation:${origin}:${monitor.monitorId}:epoch=1`)).toBeUndefined();
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("a session-gone bind error on an existing session rotates after the threshold while broker and authority errors never rotate (issue #780 P2 #1)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-session-gone-"));
+	try {
+		const database = await Store.open(join(home, "gateway.db"));
+		const agentDir = join(home, "agent");
+		const authority = initializeTestBrokerAuthority(database, agentDir);
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "session-gone-test",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.session_gone"],
+			burstPolicy: "serialize",
+		});
+		const origin = `monitor/eventtype/test.session_gone/parent=${monitor.monitorId}`;
+		const sessionGonePort: Partial<SessionPort> = {
+			// An envelope-coded session-gone failure: the broker no longer serves this
+			// session id, so the binding is poison and must rotate at the threshold.
+			bind: async () => {
+				throw new GjcCliError("gjc sdk turn.bind reported failure", 0, "", { code: "endpoint_stale" });
+			},
+			resume: async (input) => ({
+				sessionId: input.sessionId,
+				originKey: input.originKey,
+				epoch: input.epoch,
+				repo: input.repo,
+			}),
+			runExclusive: async (_, fn) => fn(),
+		};
+		const ownedPort = attachTestBrokerOwnership(database, sessionGonePort as SessionPort, agentDir);
+		// Seed an owned epoch-0 binding through the same durable path bind uses.
+		const bound = database.transaction((tx) =>
+			database.bindings.recordOwnedBinding(tx, {
+				sessionId: "session-e0",
+				originKey: origin,
+				epoch: 0,
+				repo: join(home, "workspace"),
+				authority,
+			}),
+		);
+		expect(bound).toBe(true);
+		const gonePipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: ownedPort,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			repo: join(home, "workspace"),
+			model: undefined,
+			serviceTier: undefined,
+		});
+		for (let i = 0; i < MONITOR_BIND_TIMEOUT_REBIND_THRESHOLD; i++) {
+			const eventId = await gonePipeline.submitAwaitable(monitor.monitorId, "test.session_gone", {});
+			for (let attempt = 0; attempt < 200; attempt++) {
+				const stage = database.monitors.eventGet(eventId)?.stage;
+				if (stage === "failed" || stage === "failed_no_retry") break;
+				await Bun.sleep(10);
+			}
+		}
+		// Session-gone evidence counts: exactly one rotation to epoch 1, re-bound.
+		expect(database.bindings.getSessionRecord(origin)?.epoch).toBe(1);
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+for (const [label, makeError] of [
+	["broker_unavailable", () => new GjcCliUnavailableError("broker_unavailable: host restarting")] as const,
+	["BrokerAuthorityError", () => new BrokerAuthorityError("unowned_session")] as const,
+] as const) {
+	test(`${label} bind errors never rotate an existing monitor binding (issue #780 P2 #1)`, async () => {
+		const home = await mkdtemp(join(tmpdir(), `gajaeway-monitor-no-rotate-${label}-`));
+		try {
+			const database = await Store.open(join(home, "gateway.db"));
+			const registry = new MonitorRegistry(database);
+			const monitor = registry.add({
+				name: `no-rotate-${label}`,
+				trigger: { kind: "cron", schedule: "* * * * *" },
+				eventTypes: ["test.no_rotate"],
+				burstPolicy: "serialize",
+			});
+			const origin = `monitor/eventtype/test.no_rotate/parent=${monitor.monitorId}`;
+			database.transaction((tx) => {
+				expect(database.bindings.bindAtEpoch(tx, origin, "session-e0", 0)).toBe(true);
+			});
+			const attemptedEpochs: number[] = [];
+			const port: Partial<SessionPort> = {
+				bind: async (input) => {
+					attemptedEpochs.push(input.epoch);
+					throw makeError();
+				},
+				runExclusive: async (_, fn) => fn(),
+			};
+			const pipeline = new MonitorPropagator({
+				database,
+				registry,
+				sessionPort: port as SessionPort,
+				memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+				delivery: new DeliveryService(database),
+				emit: () => {},
+				repo: join(home, "workspace"),
+				model: undefined,
+				serviceTier: undefined,
+			});
+			for (let i = 0; i < 6; i++) {
+				await pipeline.submitAwaitable(monitor.monitorId, "test.no_rotate", {});
+			}
+			// Broker unavailability and authority refusals say nothing about the key:
+			// every attempt stays on epoch 0 and the counter never advances.
+			expect(attemptedEpochs).toEqual([0, 0, 0, 0, 0, 0]);
+			expect(database.bindings.getSessionRecord(origin)).toEqual({ sessionId: "session-e0", epoch: 0 });
+			expect(pipeline.sessionSafetyState(origin).bindTimeoutFailures).toBe(0);
+			database.close();
+		} finally {
+			await rm(home, { recursive: true, force: true });
+		}
+	});
+}
 
 // "a restart mid-streak does not send a second escalation (#780)" which proves:
 // 1. Escalation messages are persisted to the outbox before live delivery

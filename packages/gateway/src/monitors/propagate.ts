@@ -1464,10 +1464,15 @@ export class MonitorPropagator {
 							const isTimeout = isBindTimeoutError(bindError);
 							const isSessionGone = isSessionUnavailable(bindError);
 							const isPendingWithoutSession = pendingCreate && !sessionExists;
+							// A pending session.create whose outcome is unknown (broker_unavailable)
+							// is exactly the torn-create case bound recovery exists for: the create
+							// may have applied on the broker while the response was lost, so the
+							// binding must rotate instead of retrying a possibly-poisoned epoch.
+							const isTornPendingCreate = pendingCreate && isBrokerUnavailable(bindError);
 							const isPureBrokerUnavailable = !isTimeout && isBrokerUnavailable(bindError);
 							const countBindFailure =
-								(isTimeout || isSessionGone || isPendingWithoutSession) &&
-								!(bindError instanceof BrokerAuthorityError || isPureBrokerUnavailable);
+								(isTimeout || isSessionGone || isPendingWithoutSession || isTornPendingCreate) &&
+								!(bindError instanceof BrokerAuthorityError || (isPureBrokerUnavailable && !isTornPendingCreate));
 							if (countBindFailure) {
 								if (safety.bindTimeoutEpoch !== boundEpoch) {
 									safety.bindTimeoutFailures = 0;
@@ -2108,7 +2113,8 @@ export class MonitorPropagator {
 				}
 				if (hasContractUnmetFailure) {
 					// Track contract failures for potential escalation
-					this.#trackConsecutiveFailedEvent(sessionOriginKey, monitor.monitorId, boundSessionEpoch ?? 0);
+					const epoch = boundSessionEpoch ?? this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
+					this.#trackConsecutiveFailedEvent(sessionOriginKey, monitor.monitorId, epoch);
 				} else if (validDeliveryEntries.length === 0) {
 					// Dispatch succeeded with no failures and no contract_unmet: clear the failed event streak (issue #780)
 					this.#clearConsecutiveFailedEventCount(sessionOriginKey, monitor.monitorId);
@@ -2466,17 +2472,25 @@ export class MonitorPropagator {
 	 * Issue #6: bound the query with database parameters instead of selecting all rows.
 	 * Codex P2 #1: exclude overlap-skipped events from failure-streak boundaries.
 	 * Codex P2 #2: page through rows so interleaved other-origin events cannot hide a same-origin streak.
+	 * Issue #780 P2 #2 (snowykr): scope the streak itself to the epoch captured on each
+	 * event row at admission, not just the escalation marker key. A rotation therefore
+	 * starts a fresh streak: N-1 failures in epoch E plus 1 failure in epoch E+1 must
+	 * NOT escalate, because the rotation replaced the poisoned session and is a
+	 * recovery boundary.
 	 */
 	#countConsecutiveFailures(
 		monitorId: string,
 		sessionOriginKey: string,
+		epoch: number,
 	): { count: number; latestFailureEventId?: string } {
 		const monitor = this.#registry.get(monitorId);
 		if (!monitor?.enabled) return { count: 0 };
 
-		// Count consecutive recent failures on this monitor, filtered by session origin.
-		// Other origins' rows are skipped, so read newest-first in pages until the streak ends,
-		// reaches the threshold, or the history runs out: interleaved events never hide a streak.
+		// Count consecutive recent failures on this monitor, filtered by session origin
+		// AND the epoch live when each event was admitted. Other origins' and other
+		// epochs' rows are skipped, so read newest-first in pages until the streak ends,
+		// reaches the threshold, or the history runs out: interleaved events never hide
+		// a streak and a rotation always splits one.
 		const pageSize = MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD * 4;
 		let count = 0;
 		let latestFailureEventId: string | undefined;
@@ -2485,6 +2499,10 @@ export class MonitorPropagator {
 			for (const row of page) {
 				// Issue #3: only count failures for this specific session origin
 				if (row.session_origin_key !== sessionOriginKey) continue;
+				// Issue #780 P2 #2: only count failures admitted under this epoch. The epoch
+				// is stamped on the row at admission time, so a rotation splits the streak
+				// even when the failure rows themselves survive the rotation.
+				if (row.escalation_epoch !== epoch) continue;
 				// Codex P2 #1: overlap-skipped events are scheduling outcomes, not failures
 				if (row.stage === "skipped") continue;
 				if (row.stage === "failed_no_retry" || row.stage === "contract_unmet") {
@@ -2506,13 +2524,15 @@ export class MonitorPropagator {
 	 * Issue #780: when K consecutive events fail, escalate once per streak.
 	 */
 	/** Feed a terminal failure into the escalation streak; a removed monitor has no origin left to escalate. */
-	#trackTerminalFailure(row: Pick<MonitorEventDbRow, "monitor_id" | "session_origin_key">): boolean {
+	#trackTerminalFailure(
+		row: Pick<MonitorEventDbRow, "monitor_id" | "session_origin_key" | "escalation_epoch">,
+	): boolean {
 		const monitor = this.#registry.get(row.monitor_id);
 		if (!monitor || !row.session_origin_key) return true;
-		// Issue #780 P2 #2: Get the current epoch to scope escalation markers
-		const currentBinding = this.#database.bindings.getSessionRecord(row.session_origin_key);
-		const epoch = currentBinding?.epoch ?? 0;
-		return this.#trackConsecutiveFailedEvent(row.session_origin_key, row.monitor_id, epoch);
+		// Issue #780 P2 #2: use the epoch captured on the event row at admission, not
+		// the binding's current epoch — by the time a failure settles, the binding may
+		// already have rotated to a new epoch, and that failure belongs to the old one.
+		return this.#trackConsecutiveFailedEvent(row.session_origin_key, row.monitor_id, row.escalation_epoch);
 	}
 
 	#trackConsecutiveFailedEvent(sessionOriginKey: string, monitorId: string, epoch: number): boolean {
@@ -2520,6 +2540,7 @@ export class MonitorPropagator {
 		const { count: consecutiveCount, latestFailureEventId } = this.#countConsecutiveFailures(
 			monitorId,
 			sessionOriginKey,
+			epoch,
 		);
 
 		console.error(
@@ -2537,7 +2558,10 @@ export class MonitorPropagator {
 			} catch {
 				// A malformed marker remains conservative: do not duplicate an alert.
 			}
-			if (!priorEventId || !this.#database.monitors.successAfterEvent(monitorId, sessionOriginKey, priorEventId)) {
+			if (
+				!priorEventId ||
+				!this.#database.monitors.successAfterEventInEpoch(monitorId, sessionOriginKey, priorEventId, epoch)
+			) {
 				state.escalatedForCurrentStreak = true;
 				return true;
 			}
@@ -2646,7 +2670,7 @@ export class MonitorPropagator {
 		const state = this.#safetyState(sessionOriginKey);
 		const currentBinding = this.#database.bindings.getSessionRecord(sessionOriginKey);
 		const epoch = currentBinding?.epoch ?? 0;
-		const { count: consecutiveCount } = this.#countConsecutiveFailures(monitorId, sessionOriginKey);
+		const { count: consecutiveCount } = this.#countConsecutiveFailures(monitorId, sessionOriginKey, epoch);
 
 		if (consecutiveCount === 0) {
 			console.error(
@@ -3451,8 +3475,15 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase:
 	const message = error instanceof Error ? error.message : String(error);
 	if (message.includes("session send") || message.includes("SessionPort")) return "authoring_turn_failed";
 	if (message.includes("session bind")) return "session_bind_failed";
-	if (/timeout|timed out|tool failed|external tool|lock/i.test(message)) return "executor_failed";
+	// A bind-phase error with executor evidence in its message (the classifier's
+	// timeout/tool markers) stays an executor failure: #recordAuthoringFailure
+	// keeps feeding the executor bucket that deliberately never touches the
+	// session. Everything else bind/configure is a bind failure, not an opaque
+	// internal_error.
+	if (failureClass === "executor" && /timeout|timed out|tool failed|external tool|lock/i.test(message))
+		return "executor_failed";
 	if (step !== undefined) return "authoring_turn_failed";
+	if (phase === "bind" || phase === "configure") return "session_bind_failed";
 	return "internal_error";
 }
 

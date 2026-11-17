@@ -340,7 +340,8 @@ test("fix #4: escalation persistence ordering is correct (issue #780, codex find
 
 		const instruction = "Inspect the event and report new evidence.";
 		const originKey = `monitor/eventtype/test.escalation_persist/parent=${monitor.monitorId}`;
-		const escalationKey = `monitor_escalation:${originKey}:${monitor.monitorId}`;
+		// Issue #780 P2 #2: Escalation keys now include epoch to scope streaks per epoch
+		const escalationKey = `monitor_escalation:${originKey}:${monitor.monitorId}:epoch=0`;
 		const deliveredMessages: ChatMessagePayload[] = [];
 		let persistedBeforeDelivery = false;
 		let outboxStateBeforeDelivery: string | undefined;
@@ -582,7 +583,8 @@ test("failure streaks and delivery confirmation keep the event's admitted origin
 			burstPolicy: "serialize",
 		});
 		const clearOriginA = `monitor/eventtype/test.confirmed_A/parent=${clearMonitor.monitorId}`;
-		const clearEscalation = `monitor_escalation:${clearOriginA}:${clearMonitor.monitorId}`;
+		// Issue #780 P2 #2: Escalation keys now include epoch to scope streaks per epoch
+		const clearEscalation = `monitor_escalation:${clearOriginA}:${clearMonitor.monitorId}:epoch=0`;
 		response = "success";
 		const successfulEventId = await pipeline.submitAwaitable(clearMonitor.monitorId, "test.confirmed_A", {});
 		expect(database.monitors.eventGet(successfulEventId)?.stage).toBe("authored");
