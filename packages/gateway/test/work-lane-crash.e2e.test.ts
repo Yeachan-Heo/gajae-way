@@ -140,7 +140,6 @@ test("accepted start survives SIGKILL with same live unknown operation, then set
 
 for (const [live, reason] of [
 	["dead", "session_dead"],
-	["indeterminate", "recovery_indeterminate"],
 	["disowned", "session_disowned"],
 ] as const) {
 	test(`restart ${live} authority holds uncertainty without replacement`, async () => {
@@ -158,16 +157,55 @@ for (const [live, reason] of [
 		const held = await client.request("work.start", { name: "crash", text: "not a retry", cwd: f.home });
 		expect(held.result).toMatchObject({ started: false, held: true, state: "awaiting_operator" });
 		const retired = await client.request("work.retire", { name: "crash" });
-		expect(retired.result.retired).toBe(live !== "indeterminate");
+		expect(retired.result.retired).toBe(true);
 		const status = await client.request("work.status", { name: "crash" });
 		expect(status.result).toMatchObject({
 			state: "awaiting_operator",
-			sessionId: live === "indeterminate" ? receipt.sessionId : "",
+			sessionId: "",
 			attempt: { endState: "terminal_uncertain" },
 		});
 		singleEffect(f, receipt.opRef, receipt.sessionId);
 	}, 30_000);
 }
+
+test("restart indeterminate authority preserves accepted execution until same-operation evidence returns", async () => {
+	const f = await fixture();
+	const { receipt } = await start(f);
+	await f.kill();
+	await f.control(receipt.opRef, { live: "indeterminate", unknown: true });
+	await f.start();
+	const client = await f.connect();
+	const held = await eventually(
+		() => f.snapshot(),
+		(snapshot) => snapshot.jobs[0]?.state === "awaiting_operator",
+		"durable open execution hold",
+	);
+	expect(held.jobs[0].attempts[0].endedAt).toBeUndefined();
+	expect(held.runtimes[0]).toMatchObject({
+		terminal: null,
+		settledAt: null,
+		decision: "undecided",
+		output: { reads: 0 },
+	});
+	expect(held.deliveries).toHaveLength(0);
+	expect((await client.request("work.status", { name: "crash" })).result).toMatchObject({
+		sessionId: receipt.sessionId,
+		recoveryHold: "execution_end_unproven",
+		attempt: { opRef: receipt.opRef },
+	});
+	expect(
+		(await client.request("work.start", { name: "crash", text: "do not replay", resume: true })).error.detail
+			.reasonCode,
+	).toBe("attempt_open");
+	expect((await client.request("work.retire", { name: "crash" })).result.retired).toBe(false);
+	await f.control(receipt.opRef, { live: "live", unknown: false, terminal: true, text: "original evidence recovered" });
+	const completed = await settled(f);
+	expect(completed.jobs[0].attempts[0].endState).toBe("completed");
+	expect(completed.runtimes[0].terminal.reasonCode).toBe("end_turn");
+	expect(completed.deliveries).toHaveLength(1);
+	expect((await notice(client)).payload.text).toContain("original evidence recovered");
+	singleEffect(f, receipt.opRef, receipt.sessionId);
+}, 30_000);
 
 for (const point of ["prepared", "accepted-before-save"] as const) {
 	test(`SIGKILL at ${point} never blindly replays dispatch`, async () => {
@@ -351,11 +389,12 @@ for (const point of ["prepared", "accepted-before-save", "report-consume"] as co
 		const child = await start(f, "child", parent.receipt.sessionId);
 		await f.armBarrier(point);
 		await f.control(child.receipt.opRef, { terminal: true, text: "child report" });
-		await f.barrier(point);
+		const barrier = await f.barrier(point);
 		const before = f.snapshot();
 		const childReport = before.laneReports.find((row) => row.parent_name === "parent");
 		if (!childReport?.claim_ref) throw new Error("child lane report claim was not persisted");
 		const wakeOpRef = childReport.claim_ref;
+		if (point === "accepted-before-save") expect(barrier.opRef).toBe(wakeOpRef);
 		expect(childReport.state).toBe("claimed");
 		const beforeWakeCalls = f.calls("send").filter((call) => call.input.opRef === wakeOpRef).length;
 		expect(beforeWakeCalls).toBe(point === "prepared" ? 0 : 1);

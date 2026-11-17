@@ -3709,18 +3709,12 @@ test("a backlog left pending across an outage is answered on boot, never expired
 		const client = await connect(config.socketPath);
 		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 		await waitFor(client.frames, 1);
-		// Let the boot recovery turn own and finish before the live message. A live
-		// message sent into a running turn is a steer by design, and this responder
-		// fixture answers turns, not steers; racing the two made the test depend on
-		// whether the backlog turn was still bound.
-		for (let attempt = 0; attempt < 400 && turns.length < 1; attempt++) await Bun.sleep(10);
+		// Hello acknowledges the socket, not completion of the boot backlog.
+		// Fresh input during its turn can correctly steer rather than start the
+		// separate second turn this sequential recovery scenario exercises.
+		for (let attempt = 0; attempt < 400 && database.inbox.pendingCount(key) !== 0; attempt++) await Bun.sleep(10);
+		expect(database.inbox.pendingCount(key)).toBe(0);
 		expect(turns).toEqual([expect.stringContaining("from before the outage")]);
-		for (let attempt = 0; attempt < 400 && database.inbox.nonterminalTurns(key).length > 0; attempt++)
-			await Bun.sleep(10);
-		expect(database.inbox.nonterminalTurns(key)).toEqual([]);
-		// The actor settles the turn after its durable row completes; give that
-		// mailbox hand-off a beat so this message starts the next turn.
-		await Bun.sleep(200);
 		client.send({
 			v: "0.1",
 			type: "request",
@@ -3732,7 +3726,8 @@ test("a backlog left pending across an outage is answered on boot, never expired
 				engagement: { mentioned: false, group: false, authorId: "owner" },
 			},
 		});
-		for (let attempt = 0; attempt < 400 && turns.length < 2; attempt++) await Bun.sleep(10);
+		for (let attempt = 0; attempt < 400 && (turns.length < 2 || database.inbox.pendingCount(key) !== 0); attempt++)
+			await Bun.sleep(10);
 		expect(turns).toEqual([
 			expect.stringContaining("from before the outage"),
 			expect.stringContaining("fresh after the outage"),
