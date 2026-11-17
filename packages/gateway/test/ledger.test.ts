@@ -153,12 +153,15 @@ test("a failed attempt records an allowlisted last_error and the scheduled next_
 		const ledger = new DeliveryService(database);
 		ledger.createPending({ deliveryId: "retry", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" });
 		ledger.markInflight("retry");
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const inflight = ledger.get("retry")!;
 		// An unsettled row that never failed is due on the next sweep.
 		expect(inflight).toMatchObject({ lastError: null, nextRetryAt: inflight.updatedAt });
 		ledger.fail("retry", true, "timeout after dispatch token=secret-value");
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const failed = ledger.get("retry")!;
 		expect(failed).toMatchObject({ state: "failed_ambiguous", attempts: 1, lastError: "timeout" });
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(Date.parse(failed.nextRetryAt!)).toBe(Date.parse(failed.updatedAt) + 2_000);
 		expect(JSON.stringify(ledger.counts())).not.toContain("secret-value");
 		expect(ledger.counts().recentPending).toEqual([
@@ -181,6 +184,7 @@ test("a failed attempt records an allowlisted last_error and the scheduled next_
 		});
 		expect(ledger.counts().recentExpired[0]).toMatchObject({ deliveryId: "retry", lastError: "not_found" });
 		expect(ledger.requeueById("retry")).toEqual(["retry"]);
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const redriven = ledger.get("retry")!;
 		expect(redriven).toMatchObject({ state: "pending", lastError: "not_found", nextRetryAt: redriven.updatedAt });
 		ledger.confirm("retry");

@@ -50,7 +50,8 @@ class Host implements SessionRelayStream {
 		[Symbol.asyncIterator]: () => ({
 			next: async () => {
 				const line = this.queue.length
-					? this.queue.shift()!
+					? // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
+						this.queue.shift()!
 					: await new Promise<string | null>((resolve) => this.waiters.push(resolve));
 				return line === null ? { done: true, value: undefined } : { done: false, value: line };
 			},
@@ -279,6 +280,7 @@ for (const state of ["unknown", "accepted", "in_flight"] as const) {
 test("RT05 relay loss after interim settles original output once without replaying interim", async () => {
 	const f = await actor();
 	await f.enqueue("trigger");
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = f.port.sends[0]!;
 	f.port.emitAssistant(send.sessionId, "interim");
 	await until(() => f.speech.length === 1);
@@ -296,6 +298,7 @@ test("RT05 relay loss after interim settles original output once without replayi
 test("RT05b (#228) an idle broadcast on a reopened relay never settles the turn with its mid-work line as the answer", async () => {
 	const f = await actor();
 	await f.enqueue("trigger");
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = f.port.sends[0]!;
 	f.port.emitAssistant(send.sessionId, "Now canonicalizing.");
 	await until(() => f.speech.length === 1);
@@ -316,6 +319,7 @@ test("RT05b (#228) an idle broadcast on a reopened relay never settles the turn 
 test("RT05c an uncorrelated agent_end on the live owner relay never settles the turn with its mid-work line as the answer", async () => {
 	const f = await actor();
 	await f.enqueue("trigger");
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = f.port.sends[0]!;
 	f.port.emitAssistant(send.sessionId, "Now canonicalizing.");
 	await until(() => f.speech.length === 1);
@@ -340,6 +344,7 @@ test("RT05c an uncorrelated agent_end on the live owner relay never settles the 
 test("RT05d a correlated agent_end on the owner relay still settles from the tail without a status grace", async () => {
 	const f = await actor();
 	await f.enqueue("trigger");
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = f.port.sends[0]!;
 	f.port.complete(send.opRef, "final from tail");
 	await until(() => f.terminal.length === 1);
@@ -352,6 +357,7 @@ test("RT05d a correlated agent_end on the owner relay still settles from the tai
 test("RT05e an uncorrelated agent_failed on the owner relay fails the turn once, from status", async () => {
 	const f = await actor();
 	await f.enqueue("trigger");
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = f.port.sends[0]!;
 	f.port.emitAssistant(send.sessionId, "Checking the order.");
 	await until(() => f.speech.length === 1);
@@ -386,6 +392,7 @@ test("RT05f an uncorrelated agent_end whose status read fails settles on a later
 	};
 	const f = await actor(port);
 	await f.enqueue("trigger");
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = f.port.sends[0]!;
 	f.port.emitAssistant(send.sessionId, "Now canonicalizing.");
 	await until(() => f.speech.length === 1);
@@ -430,6 +437,7 @@ test("RT04 unknown bound operation survives repeated live-idle sweeps until its 
 	expect(statuses).toBe(1);
 	expect(f.released).toEqual([]);
 	expect(port.sendAttempts).toHaveLength(1);
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sendAttempts[0]!;
 	for (let sweep = 0; sweep < 3; sweep++) await f.manager.reconcile(key);
 	expect(statuses).toBeGreaterThanOrEqual(4);
@@ -716,6 +724,8 @@ test("work session activity survives loss of the submitting relay without claimi
 	// SDK publishContentFrames keeps the old invocation connectionId. A fresh
 	// connection only gets an uncorrelated copy if BOTH observer caps were offered.
 	now += 2_000;
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
+	// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 	const hello = hosts[1]?.written.find((frame) => frame.type === "hello")!;
 	const caps = hello.capabilities as string[];
 	if (caps.includes("turn_stream") && caps.includes("session_host_observer_v1"))

@@ -52,6 +52,7 @@ afterEach(async () => {
 
 async function connect(socketPath: string): Promise<{
 	send(value: unknown): void;
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	frames: any[];
 	wireLines: string[];
 	waitForFrame(id: string): Promise<void>;
@@ -59,6 +60,7 @@ async function connect(socketPath: string): Promise<{
 	closed: Promise<void>;
 	close(): void;
 }> {
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	const wireLines: string[] = [];
 	const frameWaiters = new Map<string, Array<() => void>>();
@@ -116,6 +118,7 @@ async function connect(socketPath: string): Promise<{
 	};
 }
 
+// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 async function waitFor(frames: any[], count: number): Promise<void> {
 	for (let attempt = 0; attempt < 400 && frames.length < count; attempt++) await Bun.sleep(5);
 	expect(frames.length).toBeGreaterThanOrEqual(count);
@@ -131,6 +134,7 @@ function bindWorkFixture(key: string, epoch: number, preferred?: string): string
 	return sessionId;
 }
 
+// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 async function waitFrame(frames: any[], id: string, timeoutMs: number = 15000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline && !frames.some((frame) => frame.id === id)) {
@@ -764,6 +768,8 @@ test("post-send disown ambiguity retains the original operation without degradin
 		await waitFrame(client.frames, "send-disowned-session");
 		for (let attempt = 0; attempt < 400 && !port?.statusReads.length; attempt++) await Bun.sleep(5);
 		expect(port?.statusReads.length).toBeGreaterThan(0);
+		// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const original = port?.sends[0]!;
 		expect(database.inbox.turnRow(original.opRef)).toMatchObject({
 			turn_state: "bound",
@@ -1773,7 +1779,9 @@ test("long turns broadcast throttled chat.progress liveness events", async () =>
 	expect(progress.length).toBeGreaterThanOrEqual(2);
 	expect(progress[0].payload.origin.conversationId).toBe("c1");
 	// The first frame may be a zero-state heartbeat; later frames carry stream data.
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const maxTools = Math.max(...progress.map((frame: any) => frame.payload.toolCalls));
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const maxTokens = Math.max(...progress.map((frame: any) => frame.payload.outputTokens));
 	expect(maxTools).toBeGreaterThanOrEqual(1);
 	expect(maxTokens).toBeGreaterThanOrEqual(100);
@@ -1849,6 +1857,7 @@ test("large memory.audit and concurrent progress remain independently parseable 
 	const opRef = (auditResponse?.result as { opRef: string }).opRef;
 
 	// Poll for the audit result via memory.status
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	let auditStatus: any;
 	for (let attempt = 0; attempt < 200; attempt++) {
 		client.send({ v: "0.1", type: "request", id: `status-${attempt}`, verb: "memory.status", params: { opRef } });
@@ -3446,6 +3455,7 @@ test("unengaged messages before a mention arrive as the unread diff with speaker
 	say("m3", "@bot do the thing", "owner", "bellman", true);
 	for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
 	expect(turns).toHaveLength(1);
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const turn = turns[0]!;
 	// The two earlier burst messages arrive as the unread diff, the newest as the trigger.
 	expect(turn.text).toContain("Unread messages in this conversation");
@@ -3781,6 +3791,7 @@ test("/restart is owner-only and triggers an ordered gateway stop after acknowle
 		params: { origin, text: "/restart", engagement: { mentioned: false, group: false, authorId: "stranger" } },
 	});
 	await waitFor(client.frames, 2);
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	expect(client.frames.find((f: any) => f.id === "r1")?.result).toEqual({ turnId: null, engaged: false });
 	expect(stops).toEqual([]);
 	// The owner gets an ack and the gateway stops shortly after.
@@ -3792,6 +3803,7 @@ test("/restart is owner-only and triggers an ordered gateway stop after acknowle
 		params: { origin, text: "/restart", engagement: { mentioned: false, group: false, authorId: "owner" } },
 	});
 	await waitFor(client.frames, 3);
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	expect(client.frames.find((f: any) => f.id === "r2")?.result.engaged).toBe(true);
 	for (let attempt = 0; attempt < 400 && stops.length === 0; attempt++) await Bun.sleep(10);
 	expect(stops).toEqual(["stopped"]);
@@ -4823,8 +4835,11 @@ test("control tokens never leak: a silence token inside a preamble silences, and
 	say("m2", "second");
 	await Bun.sleep(600);
 	const messages = client.frames
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		.filter((f: any) => f.type === "event" && f.event === "chat.message" && f.payload?.text)
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		.map((f: any) => f.payload);
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	expect(messages.map((m: any) => m.text)).toEqual(["This is a real bug report. 알겠고 인정"]);
 	expect(messages[0].replyToMessageId).toBe("1544704223634260038");
 });
@@ -5009,6 +5024,7 @@ test("stdio stop detaches work.run before runtime request drain in an actual chi
 		stdout: "pipe",
 		stderr: "pipe",
 	});
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffer = "";
 	const reading = (async () => {
@@ -5064,6 +5080,7 @@ test("stdio stop detaches work.run before runtime request drain in an actual chi
 		try {
 			expect(reopened.work.workAttemptOpen()).toHaveLength(1);
 			expect(
+				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				parseLaneJobRecord(reopened.work.laneJobJson(reopened.work.workAttemptOpen()[0]?.jobId)!).attempts[0]?.endedAt,
 			).toBeUndefined();
 		} finally {

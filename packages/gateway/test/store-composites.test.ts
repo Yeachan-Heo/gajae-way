@@ -61,6 +61,7 @@ function settleWorkAttempt(
 		...(messageId !== undefined ? { personaMessageExists: database.inbox.messageExists(messageId) } : {}),
 	});
 	if (!result) return undefined;
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	touchWorkSession(database, tx, result.runtime, result.runtime.settledAt!);
 	if (result.runtime.decision === "reported" && admission.kind === "persona") {
 		if (
@@ -69,6 +70,7 @@ function settleWorkAttempt(
 				originKey: admission.row.originKey,
 				originRefJson: admission.row.originRefJson,
 				body: admission.row.body,
+				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				receivedAt: result.runtime.settledAt!,
 				source: "lane_report",
 			})
@@ -78,6 +80,7 @@ function settleWorkAttempt(
 	for (const payload of [result.fallbackPayload, result.childFallback]) {
 		if (!payload) continue;
 		database.outbox.enqueue(tx, {
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			deliveryId: payload.deliveryId!,
 			turnId: payload.turnId,
 			originKey: originKey(payload.origin),
@@ -315,6 +318,7 @@ test("settling a persona work attempt and admitting inbound output roll back acr
 			decision: "report",
 			settledAt,
 		};
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const payload = buildDeliveryPayload(
 			opRef,
 			LOOPBACK_ORIGIN,

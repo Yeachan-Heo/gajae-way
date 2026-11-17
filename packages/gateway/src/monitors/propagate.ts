@@ -1368,8 +1368,10 @@ export class MonitorPropagator {
 							model: modelKey,
 						};
 						await this.#sessionPort.setModel({ sessionId, repo: this.#repo, selection: effectiveModel });
+						// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 						this.#appliedModels.set(sessionId, modelKey!);
 					} else if (effectiveModel && binding.startupModelApplied) {
+						// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 						this.#appliedModels.set(sessionId, modelKey!);
 					}
 					if (effectiveServiceTier && this.#appliedServiceTiers.get(sessionId) !== effectiveServiceTier) {
@@ -2394,6 +2396,7 @@ export class MonitorPropagator {
 				} catch {
 					return [];
 				}
+				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				return [{ key, raw: raw!, record, sessionOriginKey: recordOriginKey }];
 			});
 			records.sort(

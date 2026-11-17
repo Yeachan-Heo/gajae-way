@@ -62,7 +62,9 @@ test("monitors sharing an event type each own a separate session and failure dom
 		await pipeline.submitAwaitable(other.monitorId, "backlog.watch", {});
 		// (a) two distinct session origins and gjc sessions.
 		expect([...sessionByOrigin.keys()].sort()).toEqual([wayKey, otherKey].sort());
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const waySession = sessionByOrigin.get(wayKey)!;
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const otherSession = sessionByOrigin.get(otherKey)!;
 		expect(waySession).not.toBe(otherSession);
 		// (b) neither session ever sees the other monitor's instruction.

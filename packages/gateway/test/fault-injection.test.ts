@@ -226,6 +226,7 @@ test("host death mid-turn: past the hold bound the origin answers new messages, 
 	f.enqueue("m-1", "held request");
 	try {
 		await f.manager.recover();
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const held = port.sendAttempts[0]!;
 		// The host is killed while the turn runs: no longer live, its operation unreadable.
 		port.setSessionState(held.sessionId, { live: false });
@@ -391,6 +392,7 @@ test("host death during busy-wait: the real busy loop keeps the refusal and the 
 	);
 	try {
 		await manager.recover();
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const refused = prompts[0]!;
 		// The retry never reached the host, so the journal still proved non-admission
 		// when the actor read it (the refusal is released with the requeued attempt).
@@ -407,6 +409,7 @@ test("host death during busy-wait: the real busy loop keeps the refusal and the 
 		await until(() => prompts.length === 2);
 		expect(prompts[1]).not.toBe(refused);
 		// The resubmitted turn answers and ends on the relay that submitted it.
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const host = relay.streams.at(-1)!;
 		host.host({
 			type: "event",
@@ -422,6 +425,7 @@ test("host death during busy-wait: the real busy loop keeps the refusal and the 
 			time.fireUntil(deadline);
 			await new Promise((resolve) => setTimeout(resolve, 5));
 		}
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(answers).toEqual([{ opRef: prompts[1]!, text: "the answer" }]);
 		expect(time.now()).toBeLessThanOrEqual(deadline);
 		expect(new Set(prompts).size).toBe(2);
@@ -489,6 +493,7 @@ for (const outcome of ["host_finishes", "host_dies"] as const) {
 		f.enqueue("m-1", "request during compaction");
 		try {
 			await f.manager.recover();
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const ambiguous = port.sendAttempts[0]!;
 			expect(f.db.inbox.turnRow(ambiguous.opRef)?.turn_state).not.toBe("done");
 			if (outcome === "host_finishes") {

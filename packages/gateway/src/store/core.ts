@@ -398,6 +398,7 @@ export class StoreCore {
 				this.#database.query("SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = ?").get(job.jobId);
 			}
 			for (const row of this.#work.workAttemptRows()) {
+				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				const runtime = this.#work.workAttemptGet(row.op_ref)!;
 				if (runtime.settledAt === null)
 					this.#database

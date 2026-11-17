@@ -82,6 +82,7 @@ async function harness(
 		sessionPort: port,
 		onStop: () => database.close(),
 	});
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffer = "";
 	const socket = await Bun.connect({
@@ -99,6 +100,7 @@ async function harness(
 		},
 	});
 	closeClient = () => socket.end();
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	async function wait(predicate: (frame: any) => boolean) {
 		for (let i = 0; i < 400 && !frames.some(predicate); i++) await Bun.sleep(5);
 		const frame = frames.find(predicate);
@@ -159,6 +161,7 @@ test("R2 retire refuses an open live turn without waiting for it to finish", asy
 	const running = h.run("busy");
 	await started.promise;
 	const retiring = h.request("work.retire", { name: "busy" });
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	let outcome: any;
 	try {
 		outcome = await Promise.race([retiring, Bun.sleep(100).then(() => ({ timedOut: true }))]);
@@ -175,6 +178,7 @@ test("R2 retire refuses an open live turn without waiting for it to finish", asy
 test("R3 retirement advances epoch and rerun never references the old session", async () => {
 	const h = await harness();
 	await h.run("recycled");
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const before = h.database.bindings.getSessionRecord("work/task/recycled")!;
 	expect(h.database.bindings.referencedSessionIds()).toContain(before.sessionId);
 	expect((await h.request("work.retire", { name: "recycled" })).result).toMatchObject({
@@ -184,6 +188,7 @@ test("R3 retirement advances epoch and rerun never references the old session", 
 	});
 	expect(h.database.bindings.referencedSessionIds()).not.toContain(before.sessionId);
 	await h.run("recycled");
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const after = h.database.bindings.getSessionRecord("work/task/recycled")!;
 	expect(after.epoch).toBe(before.epoch + 1);
 	expect(after.sessionId).not.toBe(before.sessionId);
@@ -216,8 +221,10 @@ test("R5 capacity details include every candidate sorted idlest first", async ()
 	expect(result.error?.code).toBe("lane_capacity");
 	const detail = result.error.detail;
 	expect(detail).toMatchObject({ active: 3, maxLanes: 3 });
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	expect(detail.candidates.map((candidate: any) => candidate.name)).toEqual(["old", "middle", "fresh"]);
 	for (let i = 0; i < 2; i++) expect(detail.candidates[i].idleMs).toBeGreaterThan(detail.candidates[i + 1].idleMs);
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	expect(detail.candidates.every((candidate: any) => typeof candidate.state === "string")).toBe(true);
 	expect((await h.run("old")).type).toBe("response");
 });
@@ -374,6 +381,7 @@ test("G3 ambiguous close retains identity until broker explicitly disowns sessio
 		attachTestBrokerOwnership(database, port, join(import.meta.dir, "canonical-agent"));
 		await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
 		const governor = new LaneGovernor({ database, sessionPort: port });
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const before = database.bindings.getSessionRecord("work/task/a")!;
 		expect(await governor.retire("a", "operator")).toMatchObject({
 			retired: false,
@@ -398,6 +406,7 @@ test("G4 sweep snapshot cannot retire a replacement bound before lock acquisitio
 	let rebinding: Promise<void> | undefined;
 	try {
 		await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const before = database.bindings.getSessionRecord("work/task/a")!;
 		rebinding = port.runExclusive("work/task/a", async () => {
 			await release.promise;
@@ -463,6 +472,8 @@ test("G6 idle retirement interval starts at turn end, including the exact bounda
 	});
 	expect((await h.run("a")).result.text).toBe("done");
 	const governor = new LaneGovernor({ database: h.database, sessionPort: h.port, idleRetireMs });
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
+	// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 	const activityAt = Date.parse(governor.activeLanes()[0]?.lastActivityAt!);
 	expect(completedAt - startedAt).toBeGreaterThanOrEqual(idleRetireMs);
 	expect(activityAt).toBeGreaterThanOrEqual(completedAt);
@@ -520,6 +531,7 @@ test("H1 failed ledger retires when broker proves terminal_ok", async () => {
 		const { opRef } = seedJob(database, "a", "failed", sessionId);
 		port.seedOperation(opRef, sessionId, "terminal_ok", "finished");
 		port.setSessionState(sessionId, { live: true });
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const before = database.bindings.getSessionRecord("work/task/a")!;
 		const governor = new LaneGovernor({ database, sessionPort: port });
 		expect(await governor.retire("a", "operator")).toMatchObject({ retired: true, sessionId, closed: true });
@@ -539,6 +551,7 @@ test("H2 failed ledger with unknown broker operation needs a dead session", asyn
 			const { sessionId } = await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
 			seedJob(database, "a", "failed", sessionId);
 			port.setSessionState(sessionId, { live });
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const before = database.bindings.getSessionRecord("work/task/a")!;
 			const governor = new LaneGovernor({ database, sessionPort: port });
 			expect(await governor.retire("a", "operator")).toMatchObject(
@@ -601,6 +614,7 @@ test("H4 sweep refuses rebound even when the replacement job is also done", asyn
 	try {
 		await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
 		seedJob(database, "a", "done", "0000aaaa-0000-4000-8000-00000000a001");
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const before = database.bindings.getSessionRecord("work/task/a")!;
 		updating = port.runExclusive("work/task/a", async () => {
 			await release.promise;
@@ -679,6 +693,7 @@ test("H6 operator socket retirement of an idle done job needs no sweep nominatio
 		},
 	);
 	seedJob(h.database, "a", "done", "0000aaaa-0000-4000-8000-00000000a003");
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const before = h.database.bindings.getSessionRecord("work/task/a")!;
 	const governor = new LaneGovernor({ database: h.database, sessionPort: h.port });
 	expect(governor.activeLanes()[0]).toMatchObject({ state: "done", idleMs: Number.POSITIVE_INFINITY });
@@ -697,6 +712,7 @@ test("H7 concurrent sweeps close once and bump the epoch exactly once", async ()
 		const port = new ScriptedSessionPort({ onBind: sessionIdsByEpoch() });
 		attachTestBrokerOwnership(database, port, join(import.meta.dir, "canonical-agent"));
 		await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const before = database.bindings.getSessionRecord("work/task/a")!;
 		const governor = new LaneGovernor({ database, sessionPort: port, idleRetireMs: 1 });
 		expect((await Promise.all([governor.sweep(), governor.sweep()])).sort()).toEqual([0, 1]);

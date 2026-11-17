@@ -122,6 +122,7 @@ describe("scratch dist-tag selection", () => {
 			"gajae-pending-1-2-3-aaaa0001": "0.9.1",
 		};
 		const suffixes = ["aaaa0001", "aaaa0002"];
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(scratchTag("1.2.3", tags, () => suffixes.shift()!)).toBe("gajae-pending-1-2-3-aaaa0002");
 	});
 

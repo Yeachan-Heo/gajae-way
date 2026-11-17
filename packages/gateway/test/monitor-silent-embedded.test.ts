@@ -88,6 +88,7 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use the clos
 			await Bun.sleep(10);
 		await propagator.drain();
 		expect(db?.monitors.authoredOutput(eventId)).toBe("Nothing new since last sweep.\n\n[SILENT]");
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(stage(db!, eventId)).toBe("authored_no_delivery");
 		expect(db?.outbox.rows()).toHaveLength(0);
 		expect(readinessSuccesses).toHaveLength(1);
@@ -106,9 +107,11 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use the clos
 			{ onReadinessSuccess: (input) => readinessSuccesses.push(input) },
 		);
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		for (let attempt = 0; attempt < 100 && stage(db!, eventId) !== "authored_no_delivery"; attempt++)
 			await Bun.sleep(10);
 
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(stage(db!, eventId)).toBe("authored_no_delivery");
 		expect(readinessSuccesses).toHaveLength(1);
 		expect(Number.isFinite(readinessSuccesses[0]?.at)).toBe(true);
@@ -134,6 +137,7 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use the clos
 			await Bun.sleep(10);
 		await propagator.drain();
 		expect(db?.monitors.authoredOutput(eventId)).toBe("Please see [SILENT] in docs for details");
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(stage(db!, eventId)).not.toBe("authored_no_delivery");
 		expect(db?.outbox.rows()).toHaveLength(1);
 	});
@@ -152,6 +156,7 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use the clos
 			await Bun.sleep(10);
 		await propagator.drain();
 		expect(db?.monitors.authoredOutput(eventId)).toBe("[SILENT]");
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(stage(db!, eventId)).toBe("authored_no_delivery");
 		expect(db?.outbox.rows()).toHaveLength(0);
 	});

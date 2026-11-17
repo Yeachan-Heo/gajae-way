@@ -37,10 +37,12 @@ afterEach(async () => {
 
 interface Client {
 	send(value: unknown): void;
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	frames: any[];
 }
 
 async function connect(socketPath: string): Promise<Client> {
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = "";
 	const socket = await Bun.connect({

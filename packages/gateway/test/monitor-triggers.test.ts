@@ -286,6 +286,7 @@ test("default memory monitors seed per-name and respect operator removals", asyn
 
 	// Legacy boot seeded both old defaults; the operator has since removed memory-audit.
 	const { DEFAULT_MEMORY_MONITORS } = await import("../src/monitors/defaults");
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	registry2.add(DEFAULT_MEMORY_MONITORS[0]!);
 
 	// Only the new default arrives; the removed legacy default stays removed.
@@ -304,6 +305,7 @@ test("default memory monitors seed per-name and respect operator removals", asyn
 	const dir3 = await mkTemp(joinPath(tmp(), "gajaeway-seed-existing-"));
 	const database3 = await Db.open(joinPath(dir3, "gateway.db"));
 	const registry3 = new Registry(database3);
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	registry3.add(DEFAULT_MEMORY_MONITORS[2]!);
 	expect(seedDefaultMonitors(registry3, database3)).toBe(2);
 	registry3.remove(registry3.list().find((monitor) => monitor.name === "memory-debloat")?.monitorId);

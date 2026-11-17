@@ -35,7 +35,9 @@ async function config(): Promise<GatewayConfig> {
 	};
 }
 
+// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 async function connect(socketPath: string): Promise<{ send(value: unknown): void; frames: any[]; close(): void }> {
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = "";
 	const socket = await Bun.connect({
@@ -577,6 +579,7 @@ test("issue #409: /new carries the messages of turns that failed after the last 
 	send(client, "msg3", "message three - after reset");
 	await waitUntil(() => texts.length === 3);
 
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const unread = unreadBlock(texts[2]!);
 	expect(unread).toContain("message two - will fail");
 	expect(unread).not.toContain("message one - answered");
@@ -604,6 +607,7 @@ test("issue #409: /new after every turn was answered carries nothing", async () 
 	send(client, "msg2", "message two - after reset");
 	await waitUntil(() => texts.length === 2);
 
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(unreadBlock(texts[1]!)).toBe("");
 	client.close();
 });

@@ -307,7 +307,9 @@ test("C1c: three turns recover their own results exactly once despite foreign an
 			await eventually(() => fixture.port.sends.length === index + 1, `turn ${index + 1} was not sent`);
 			const send = required(fixture.port.sends[index], `turn ${index + 1} send missing`);
 			if (previousOpRef !== undefined)
+				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				fixture.port.emitAssistant(send.sessionId, answers[index - 1]!, `foreign-${index}`, previousOpRef);
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			fixture.port.completeWithoutAnswerFrame(send.opRef, answers[index]!);
 			await eventually(() => fixture.terminals.length === index + 1, `turn ${index + 1} did not deliver`);
 			previousOpRef = send.opRef;
@@ -659,15 +661,19 @@ test("C4: a three-hour-old durable inbound row survives a manager restart and is
 });
 
 type SocketClient = {
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	readonly frames: any[];
 	send(value: unknown): void;
 	sendMany(values: readonly unknown[]): void;
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	frame(id: string): any | undefined;
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	response(id: string): any | undefined;
 	close(): void;
 };
 
 async function connect(socketPath: string): Promise<SocketClient> {
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = "";
 	const socket = await Bun.connect({
@@ -1021,6 +1027,7 @@ test("C6b: broker-disowned liveness holds an accepted operation until its origin
 		enqueue(fixture, "after-close", "a new question");
 		await recovered.notifyInbound(DIRECT_ORIGIN_KEY);
 		await eventually(() => port.sends.length === 2, "new message was not sent after native settlement");
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const next = port.sends[1]!;
 		expect(next.sessionId).toBe(first.sessionId);
 		expect(next.opRef).not.toBe(first.opRef);

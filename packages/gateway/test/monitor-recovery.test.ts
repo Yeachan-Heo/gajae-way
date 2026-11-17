@@ -1280,6 +1280,7 @@ describe("monitor crash-boundary state machine", () => {
 		const authorizingTurnKey = `monitor_authoring_turn:${eventId}`;
 		const savedPointer = db.core.metaGet(authorizingTurnKey);
 		expect(savedPointer).toBeDefined();
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const pointer = JSON.parse(savedPointer!);
 		expect(pointer.sessionId).toBe("s1");
 		expect(pointer.eventIds).toContain(eventId);

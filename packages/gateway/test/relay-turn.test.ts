@@ -243,6 +243,7 @@ test("attach exchanges hello and stamps every request with the host's connection
 	expect(relay.written[0]).toMatchObject({ type: "hello", protocolVersion: 3, capabilities: ["tool_activity_v2"] });
 	const pending = handle.query("turn.result", { kind: "prompt", clientRef: "op-1" });
 	await Bun.sleep(0);
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const request = relay.lastRequest("query_request")!;
 	expect(request).toMatchObject({
 		query: "turn.result",
@@ -647,6 +648,8 @@ test("a relay that ends mid-turn reports the loss, fails pending requests, and r
 	// The reopened relay is usable for commands again.
 	const after = handle.query("turn.result", { kind: "prompt", clientRef: "op-1" });
 	await Bun.sleep(0);
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
+	// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 	const request = relays[1]?.lastRequest("query_request")!;
 	expect(request.connectionId).toBe("connection:2");
 	relays[1]?.host({ type: "query_response", id: request.id, ok: true, result: { status: "terminal_ok" } });
@@ -879,6 +882,7 @@ test("an observer remains capacity-evictable while an autonomous run is active",
 			return relay;
 		},
 	});
+	// biome-ignore lint/style/useConst: ignored using `--suppress`
 	let handle: Awaited<ReturnType<typeof tail.attach>>;
 	handle = await tail.attach({
 		sessionId: "observed",

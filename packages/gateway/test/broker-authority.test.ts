@@ -319,6 +319,7 @@ describe("durable single broker authority", () => {
 			),
 		).toThrow("old_work_open");
 		const id = cutover(database);
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const snapshot = JSON.parse(database.bindings.cutoverSnapshot(id)!);
 		expect(Object.keys(snapshot)).toEqual(["sessions"]);
 		expect(snapshot.sessions[0].gjc_session_id).toBe(SESSION);

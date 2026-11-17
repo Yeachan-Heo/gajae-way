@@ -1577,6 +1577,7 @@ describe("work operator commands", () => {
 
 	for (const option of successorOptions.slice(0, 3)) {
 		test(`work start rejects missing ${option[0]} value before connecting`, async () => {
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const output = await run(["start", "replacement", "task", option[0]!], {});
 			expect(output.requests).toEqual([]);
 			expect(output.connections).toBe(0);
@@ -1628,19 +1629,18 @@ describe("work operator commands", () => {
 					option,
 				] as const,
 		),
-		...successorOptions
-			.slice(0, 3)
-			.map(
-				(option, index) =>
-					[
-						`blank ${option[0]}`,
-						"start",
-						"replacement",
-						["--repo", ".", "--base", successorBase],
-						successorOptions.flatMap((entry, entryIndex) => (entryIndex === index ? [entry[0]!, " "] : entry)),
-						[],
-					] as const,
-			),
+		...successorOptions.slice(0, 3).map(
+			(option, index) =>
+				[
+					`blank ${option[0]}`,
+					"start",
+					"replacement",
+					["--repo", ".", "--base", successorBase],
+					// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
+					successorOptions.flatMap((entry, entryIndex) => (entryIndex === index ? [entry[0]!, " "] : entry)),
+					[],
+				] as const,
+		),
 	] as const) {
 		test(`work successor rejects ${label} before connecting`, async () => {
 			const output = await run([command, name, ...repositoryFlags, ...recoveryFlags, ...extraFlags, "task"], {});

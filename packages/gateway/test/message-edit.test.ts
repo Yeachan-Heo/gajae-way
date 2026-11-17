@@ -33,6 +33,7 @@ const ORIGIN_KEY = "discord/dm/d1/peer=owner";
 const ENGAGEMENT = { mentioned: false, group: false, authorId: "owner", authorName: "bellman" };
 
 async function connect(socketPath: string) {
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = "";
 	const socket = await Bun.connect({
@@ -150,6 +151,8 @@ test("an edit during the running turn is steered into it as a [MESSAGE POINTER] 
 		expect(client.response("e1")?.result.turnId).toBeString();
 		// The edit is attributed to the running turn, and the context ledger now
 		// carries the new body under the original message id.
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
+		// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 		const turn = database?.inbox.nonterminalTurns(ORIGIN_KEY)[0]!;
 		expect(database?.inbox.turnRows(turn.opRef).map((row) => [row.message_id, row.turn_role])).toEqual([
 			["m-1", "trigger"],
@@ -439,7 +442,8 @@ test("a crash between steer acceptance and the lifecycle hook cannot leave the m
 		// transaction as the acceptance, before the crash.
 		// (m-1 is the running turn's own trigger; it is committed at that turn's terminal.)
 		expect(
-			database?.transaction((tx) => database?.inbox.contextWindow(tx, ORIGIN_KEY, "probe"))
+			database
+				?.transaction((tx) => database?.inbox.contextWindow(tx, ORIGIN_KEY, "probe"))
 				.rows.map((r) => r.message_id),
 		).toEqual(["m-1"]);
 	} finally {

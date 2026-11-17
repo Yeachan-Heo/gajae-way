@@ -354,6 +354,7 @@ test("a terminal result does not make a signaled host reusable before its proces
 	const h = await harness({ maxLiveHosts: 1, now: () => clock });
 	await h.send("a", "a1");
 	await eventually(() => h.sent("a1") !== undefined, "a1 was not dispatched");
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = h.port.sends.find((send) => send.text === "a1")!;
 	await h.send("b", "b1");
 	await eventually(() => h.manager.admissionHold(origin("b").key) === "host_capacity", "b1 was not held at capacity");
@@ -407,9 +408,11 @@ for (const protection of ["jobs", "active_run", "pending_notice"] as const)
 			const kind = protection === "active_run" ? "agent_start" : "agent_end";
 			if (protection === "pending_notice")
 				h.port
-					.tailsOf(sessionId)[0]?.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
+					.tailsOf(sessionId)[0]
+					?.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
 			h.port
-				.tailsOf(sessionId)[0]?.emit({ kind, rawKind: kind, payload: {}, idle: kind === "agent_end", steerEcho: false });
+				.tailsOf(sessionId)[0]
+				?.emit({ kind, rawKind: kind, payload: {}, idle: kind === "agent_end", steerEcho: false });
 			await Bun.sleep(10);
 		}
 		await h.send("b", "b1");

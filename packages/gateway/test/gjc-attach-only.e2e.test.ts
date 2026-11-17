@@ -155,7 +155,9 @@ function versionAtLeast(actual: string, minimum: string): boolean {
 	const actualParts = parts(actual);
 	const minimumParts = parts(minimum);
 	for (let index = 0; index < 3; index++) {
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		if (actualParts[index]! > minimumParts[index]!) return true;
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		if (actualParts[index]! < minimumParts[index]!) return false;
 	}
 	return true;
@@ -378,8 +380,10 @@ function makeClient(
 	} finally {
 		restore();
 	}
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	fixture.clients.push(client!);
 	return {
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		client: client!,
 		commands,
 		armBarrier(next) {

@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eventTypeOrigin, monitorSessionOrigin, type OriginRef, originKey } from "@gajae-gateway/protocol";
@@ -9,7 +9,7 @@ import { discordMessageOrigin } from "../../adapter-discord/src/origin";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
-import { resolveLaneReportOrigin, } from "../src/store/groups/work";
+import { resolveLaneReportOrigin } from "../src/store/groups/work";
 import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 const rootOrigin: OriginRef = { platform: "discord", kind: "channel", conversationId: "parent-channel" };
@@ -39,6 +39,7 @@ async function eventually<T>(read: () => T | Promise<T>, accept: (value: T) => b
 }
 
 async function connect(socketPath: string) {
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = Buffer.alloc(0);
 	const socket = await Bun.connect({
@@ -57,17 +58,21 @@ async function connect(socketPath: string) {
 		},
 	});
 	const client: {
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		frames: any[];
 		send(frame: unknown): void;
 		close(): void;
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		request(verb: string, params: unknown): Promise<any>;
 	} = {
 		frames,
 		send: (frame: unknown) => socket.write(`${JSON.stringify(frame)}\n`),
 		close: () => socket.end(),
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		async request(verb: string, params: unknown): Promise<any> {
 			const id = crypto.randomUUID();
 			client.send({ v: "0.1", type: "request", id, verb, params });
+			// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 			return await eventually<any>(() => frames.find((frame) => frame.id === id), Boolean, `${verb} response`);
 		},
 	};
@@ -159,6 +164,7 @@ async function startPersonaTurn(
 		(items) => items.length > before,
 		"persona send",
 	);
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	return sends.at(-1)!;
 }
 
@@ -287,6 +293,7 @@ test("AC-C idle persona is woken with one send carrying the internal lane report
 		(items) => items.some((send) => send.text.includes("[Internal report from another Gajae session")),
 		"persona wake send",
 	);
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const reportSend = sends.find((send) => send.text.includes("[Internal report from another Gajae session"))!;
 	expect(reportSend.text).toContain("[lane idle-worker] completed: idle report");
 	expect(reportSend.sessionId).toBe(personaSessionId);
@@ -319,6 +326,7 @@ test("a lane-report turn can [POST:] its result line to another configured chann
 		(items) => items.some((send) => send.text.includes("[Internal report from another Gajae session")),
 		"persona wake send",
 	);
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const reportSend = sends.find((send) => send.text.includes("[Internal report from another Gajae session"))!;
 	f.port.complete(
 		reportSend.opRef,
@@ -346,6 +354,7 @@ for (const [label, callerSessionId] of [
 		await bindPersonaSession(f, rootKey, personaSessionId);
 		const lane = await startLane(f, `owner-${label.replaceAll(" ", "-")}`, callerSessionId);
 		await settleLane(f, lane.result.opRef, "owner report");
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const runtime = f.database.work.workAttemptGet(lane.result.opRef)!;
 		expect(runtime.parent).toMatchObject({ kind: "persona", originKey: rootKey });
 		const report = await eventually(
@@ -353,6 +362,7 @@ for (const [label, callerSessionId] of [
 			(sends) => Boolean(sends.find((send) => send.text.includes("[Internal report from another Gajae session"))),
 			"owner-target report turn",
 		);
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const reportSend = report.find((send) => send.text.includes("[Internal report from another Gajae session"))!;
 		expect(reportSend.sessionId).toBe(personaSessionId);
 		expect(chatMessages(f)).toHaveLength(0);
@@ -364,6 +374,7 @@ test("AC-D no ownerTarget settles durably as no_target without inbound row or po
 	const f = await fixture({ ownerTarget: false });
 	const lane = await startLane(f, "status-only");
 	await settleLane(f, lane.result.opRef, "no destination");
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.database.work.workAttemptGet(lane.result.opRef)!;
 	expect(runtime).toMatchObject({ parent: null, decision: "no_target" });
 	expect(f.database.work.laneReportsByParent("status-only")).toEqual([]);
@@ -429,6 +440,7 @@ test("a lane started from a monitor turn reports to the monitor's channel target
 		`work_parent_resolved verb=start name=monitor-fix source=monitor kind=persona monitor=${monitor.monitorId}`,
 	]);
 	await settleLane(f, lane.result.opRef, "monitor fix done");
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.database.work.workAttemptGet(lane.result.opRef)!;
 	expect(runtime.parent).toEqual({ kind: "persona", originKey: targetKey, origin: monitorTargetOrigin });
 	const sends = await eventually(
@@ -436,6 +448,7 @@ test("a lane started from a monitor turn reports to the monitor's channel target
 		(items) => items.some((send) => send.text.includes("[Internal report from another Gajae session")),
 		"monitor target report turn",
 	);
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const reportSend = sends.find((send) => send.text.includes("[Internal report from another Gajae session"))!;
 	expect(reportSend.text).toContain("[lane monitor-fix] completed: monitor fix done");
 	expect(reportSend.sessionId).toBe(targetSessionId);
@@ -595,6 +608,7 @@ test("AC-E allowed nested work.run remains response-only", async () => {
 		(sends) => sends.length === 2,
 		"nested run send",
 	);
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const run = f.port.sends[1]!;
 	f.port.complete(run.opRef, "response result");
 	const response = await responsePromise;
@@ -610,6 +624,7 @@ test("AC-F no sessions row falls back with one ledger row and one chat.message",
 	const f = await fixture();
 	const lane = await startLane(f, "fallback-worker");
 	await settleLane(f, lane.result.opRef, "fallback body");
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.database.work.workAttemptGet(lane.result.opRef)!;
 	expect(runtime.decision).toBe("fallback");
 	expect(f.database.outbox.rows()).toHaveLength(1);
@@ -630,6 +645,7 @@ test("AC-F conflicting inbound id selects fallback atomically", async () => {
 	const f = await fixture();
 	await bindPersonaSession(f, rootKey);
 	const lane = await startLane(f, "conflict-worker");
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.database.work.workAttemptGet(lane.result.opRef)!;
 	expect(
 		f.database.transaction((tx) =>
@@ -715,6 +731,7 @@ for (const reset of ["/new", "rebindEpoch"] as const) {
 		} else {
 			f.database.transaction((tx) => f.database.bindings.rotateEpoch(tx, rootKey));
 		}
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const afterReset = f.database.bindings.getSessionRecord(rootKey)!;
 		expect(afterReset.sessionId).toBe("");
 		await settleLane(f, lane.result.opRef, "follows origin");
@@ -724,6 +741,7 @@ for (const reset of ["/new", "rebindEpoch"] as const) {
 			(sends) => Boolean(sends.find((send) => send.text.includes("[Internal report from another Gajae session"))),
 			"report was not sent to the rebound persona session",
 		);
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const reportSend = internalSend.find((send) => send.text.includes("[Internal report from another Gajae session"))!;
 		expect(reportSend.sessionId).not.toBe(persona.sessionId);
 		expect(f.database.bindings.getSessionRecord(rootKey)?.epoch).toBe(afterReset.epoch);
@@ -751,6 +769,7 @@ test("AC-J closed channel admits an internal report without engagement", async (
 		(items) => items.some((send) => send.text.includes("[Internal report from another Gajae session")),
 		"closed channel did not admit internal report",
 	);
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const reportSend = sends.find((send) => send.text.includes("[Internal report from another Gajae session"))!;
 	expect(f.database.inbox.turnRows(reportSend.opRef)).toMatchObject([
 		expect.objectContaining({ message_id: reportId, source: "lane_report", origin_key: key }),
@@ -778,6 +797,7 @@ test("AC-J mention-open internal report does not alter botAudience state", async
 		"mention-open channel did not admit internal report",
 	);
 	expect(f.database.core.metaGet(stateKey)).toBe(before);
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const reportSend = sends.find((send) => send.text.includes("[Internal report from another Gajae session"))!;
 	await silencePersona(f, reportSend.opRef);
 });
@@ -821,6 +841,7 @@ test("A03 callerSessionId is an untrusted routing hint on the owner-trusted sock
 	);
 	const lane = await startLane(f, "spoofed-route", sessionId);
 	await settleLane(f, lane.result.opRef, "untrusted hint result");
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.database.work.workAttemptGet(lane.result.opRef)!;
 	expect(runtime.parent).toMatchObject({ kind: "persona", originKey: rootKey });
 	expect(runtime.decision).toBe("reported");
@@ -832,6 +853,7 @@ test("A03 callerSessionId is an untrusted routing hint on the owner-trusted sock
 			),
 		"known presented caller id did not route to its persona origin",
 	);
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const internalReport = sends.find(
 		(send) => send.sessionId === sessionId && send.text.includes("[Internal report from another Gajae session"),
 	)!;
@@ -856,6 +878,7 @@ test("AC-435 Slack channel root trigger routes lane report to thread", async () 
 		(rows) => rows.some((row) => row.source === "lane_report" && row.message_id === reportId),
 		"lane report row for AC-435 slack",
 	);
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const laneReportRow = reportRows.find((row) => row.source === "lane_report" && row.message_id === reportId)!;
 	const laneReportOrigin = JSON.parse(laneReportRow.origin_ref_json) as OriginRef;
 	expect(laneReportOrigin.kind).toBe("thread");
@@ -883,6 +906,7 @@ test("AC-435 Discord channel root trigger keeps the lane report at the channel r
 		(rows) => rows.some((row) => row.source === "lane_report" && row.message_id === reportId),
 		"lane report row for AC-435 discord",
 	);
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const laneReportRow = reportRows.find((row) => row.source === "lane_report" && row.message_id === reportId)!;
 	const laneReportOrigin = JSON.parse(laneReportRow.origin_ref_json) as OriginRef;
 	expect(laneReportOrigin).toEqual(discordChannelOrigin);
@@ -916,7 +940,9 @@ test("Discord channel report wakes an idle persona and posts its reply at the ch
 		(items) => items.some((send) => send.text.includes("[Internal report from another Gajae session")),
 		"idle persona report send",
 	);
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const reportSend = sends.find((send) => send.text.includes("[Internal report from another Gajae session"))!;
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const reportRow = f.database.inbox.turnRows(reportSend.opRef).find((row) => row.message_id === reportId)!;
 	expect(JSON.parse(reportRow.origin_ref_json)).toEqual(rootOrigin);
 	f.port.complete(reportSend.opRef, "channel ack");
@@ -997,6 +1023,7 @@ for (const source of ["public", "private", "unknown", "auto-created"] as const) 
 			if (state === "idle-at-start") await silencePersona(f, persona.opRef);
 			const lane = await startLane(f, "thread-worker", persona.sessionId);
 			expect(lane.error).toBeUndefined();
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const runtime = f.database.work.workAttemptGet(lane.result.opRef)!;
 			expect(runtime.parent).toEqual({
 				kind: "persona",
@@ -1013,6 +1040,7 @@ for (const source of ["public", "private", "unknown", "auto-created"] as const) 
 					(items) => items.some((send) => send.text.includes("[Internal report from another Gajae session")),
 					"thread persona wake",
 				);
+				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				const reportSend = sends.find((send) => send.text.includes("[Internal report from another Gajae session"))!;
 				expect(reportSend.sessionId).toBe(persona.sessionId);
 				replyOpRef = reportSend.opRef;
@@ -1022,6 +1050,7 @@ for (const source of ["public", "private", "unknown", "auto-created"] as const) 
 				(items) => items.some((row) => row.message_id === runtime.reportId),
 				"thread report inbox row",
 			);
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const reportRow = rows.find((row) => row.message_id === runtime.reportId)!;
 			expect(reportRow.origin_key).toBe(originKey(origin));
 			expect(JSON.parse(reportRow.origin_ref_json)).toEqual(origin);
@@ -1085,8 +1114,10 @@ for (const ownerTarget of [false, rootOrigin] as const) {
 				(items) => items.some((send) => send.text.includes("[Internal report from another Gajae session")),
 				"Slack report wake",
 			);
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const report = sends.find((send) => send.text.includes("[Internal report from another Gajae session"))!;
 			expect(report.sessionId).toBe(persona.sessionId);
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const reportRow = f.database.inbox.turnRow(report.opRef)!;
 			expect(JSON.parse(reportRow.origin_ref_json)).toMatchObject({ kind: "thread", parentId: "C_followup" });
 			if (state === "idle") await silencePersona(f, report.opRef);
@@ -1119,6 +1150,7 @@ for (const type of [12, undefined] as const) {
 		const persona = await startPersonaTurn(f, origin, "thread-trigger");
 		const lane = await startLane(f, "thread-fallback", persona.sessionId);
 		await silencePersona(f, persona.opRef);
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const runtime = f.database.work.workAttemptGet(lane.result.opRef)!;
 		// An occupied inbound id refuses report admission and exercises direct fallback delivery.
 		f.database.transaction((tx) =>

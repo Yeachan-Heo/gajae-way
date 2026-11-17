@@ -102,6 +102,7 @@ test("a missing draft verdict reads as a response, never as narration", () => {
 	expect(draftScore([0.1, 0.2])).toBeCloseTo(0.15);
 });
 
+// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 async function openChannel(reply: string): Promise<{ send(text: string, engagement: object): Promise<any[]> }> {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-speech-gate-"));
 	const config: GatewayConfig = {
@@ -122,6 +123,7 @@ async function openChannel(reply: string): Promise<{ send(text: string, engageme
 	});
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = "";
 	const socket = await Bun.connect({
@@ -161,6 +163,7 @@ async function openChannel(reply: string): Promise<{ send(text: string, engageme
 	};
 }
 
+// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 const messages = (frames: any[]) =>
 	frames.filter((frame) => frame.type === "event" && frame.event === "chat.message").map((frame) => frame.payload.text);
 

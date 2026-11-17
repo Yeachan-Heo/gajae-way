@@ -22,7 +22,9 @@ test("a poisoned session-create key advances one epoch without retrying the old 
 	const run: CliRunner = async (args) => {
 		if (args.includes("session.create")) {
 			creates++;
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			keys.push(args[args.indexOf("--idempotency-key") + 1]!);
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			inputs.push(JSON.parse(args[args.indexOf("--json-input") + 1]!) as Record<string, unknown>);
 			if (creates === 1)
 				return {
@@ -151,12 +153,14 @@ test("generic and malformed create failures do not mint a new idempotency key or
 			},
 		},
 	];
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	let activeFailure = failures[0]!;
 	let createCalls = 0;
 	const idempotencyKeys: string[] = [];
 	const run: CliRunner = async (args) => {
 		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
 		createCalls++;
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		idempotencyKeys.push(args[args.indexOf("--idempotency-key") + 1]!);
 		return activeFailure.result;
 	};
@@ -216,6 +220,7 @@ test("direct thrown create transport failures preserve the error, epoch, and ide
 	const idempotencyKeys: string[] = [];
 	const run: CliRunner = async (args) => {
 		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		idempotencyKeys.push(args[args.indexOf("--idempotency-key") + 1]!);
 		throw activeError;
 	};
@@ -237,6 +242,7 @@ test("direct thrown create transport failures preserve the error, epoch, and ide
 			// The first attempt's intent is still pending, so the retry replays its key.
 			expect(idempotencyKeys).toHaveLength(2);
 			expect(idempotencyKeys[0]).toMatch(/^gw-bind-[0-9a-f-]{36}$/);
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(idempotencyKeys[1]).toBe(idempotencyKeys[0]!);
 			expect(database.bindings.getSessionRecord(failure.originKey)).toBeUndefined();
 			expect(database.core.metaGet(`create_rotation:${failure.originKey}`)).toBeUndefined();
@@ -289,6 +295,7 @@ test("gjc 0.18 operation_failed naming the sent create key as undecidable rotate
 	const idempotencyKeys: string[] = [];
 	const run: CliRunner = async (args) => {
 		if (args.includes("session.create")) {
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const key = args[args.indexOf("--idempotency-key") + 1]!;
 			idempotencyKeys.push(key);
 			poisonedKey ??= key;
@@ -313,7 +320,9 @@ test("gjc 0.18 operation_failed naming the sent create key as undecidable rotate
 	try {
 		const binding = await port.bind({ originKey, epoch: 0, repo });
 		expect(idempotencyKeys).toHaveLength(2);
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(idempotencyKeys[0]).toBe(poisonedKey!);
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(idempotencyKeys[1]).not.toBe(poisonedKey!);
 		expect(binding).toMatchObject({ sessionId: "fresh-session", epoch: 1 });
 		expect(database.bindings.getSessionRecord(originKey)).toMatchObject({ epoch: 1, sessionId: "fresh-session" });
@@ -334,6 +343,7 @@ test("gjc 0.18 operation_failed naming a different key is not proof about the se
 	const idempotencyKeys: string[] = [];
 	const run: CliRunner = async (args) => {
 		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		idempotencyKeys.push(args[args.indexOf("--idempotency-key") + 1]!);
 		return publicUndecidableCreate("gw-bind-00000000000000000000000000000000");
 	};

@@ -144,6 +144,7 @@ test("maxPerTurn 2, minGapMs 0: 5 interim texts + final → assert 2 interim + 1
 	});
 
 	// Connect client to the gateway's Unix socket
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = "";
 	const socket = await Bun.connect({
@@ -187,6 +188,7 @@ test("maxPerTurn 2, minGapMs 0: 5 interim texts + final → assert 2 interim + 1
 	}
 	expect(sessionPort.sends).toHaveLength(1);
 
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = sessionPort.sends[0]!;
 
 	// Emit 5 interim assistant messages
@@ -200,6 +202,7 @@ test("maxPerTurn 2, minGapMs 0: 5 interim texts + final → assert 2 interim + 1
 
 	// Wait for messages to reach the client
 	for (let attempt = 0; attempt < 200; attempt++) {
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		const messages = frames.filter((f: any) => f.type === "event" && f.event === "chat.message");
 		if (messages.length >= 3) break; // 2 interim + 1 terminal
 		await Bun.sleep(10);
@@ -207,17 +210,21 @@ test("maxPerTurn 2, minGapMs 0: 5 interim texts + final → assert 2 interim + 1
 
 	socket.end();
 
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const messages = frames.filter((f: any) => f.type === "event" && f.event === "chat.message");
 
 	// Should have exactly 2 interim deliveries + 1 terminal = 3 messages
 	expect(messages.length).toBe(3);
 
 	// The last message should be the final answer (terminal)
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const lastMessage = messages[messages.length - 1]!;
 	expect(lastMessage.payload.text).toBe("final-answer");
 
 	// The first two messages should be interim texts
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const interim1 = messages[0]!;
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const interim2 = messages[1]!;
 	expect(interim1.payload.text).toBe("interim-text-1");
 	expect(interim2.payload.text).toBe("interim-text-2");
@@ -247,6 +254,7 @@ test("maxPerTurn 0: 5 interim + final → assert 0 interim + 1 terminal delivery
 	});
 
 	// Connect client to the gateway's Unix socket
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = "";
 	const socket = await Bun.connect({
@@ -290,6 +298,7 @@ test("maxPerTurn 0: 5 interim + final → assert 0 interim + 1 terminal delivery
 	}
 	expect(sessionPort.sends).toHaveLength(1);
 
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = sessionPort.sends[0]!;
 
 	// Emit 5 interim assistant messages
@@ -303,6 +312,7 @@ test("maxPerTurn 0: 5 interim + final → assert 0 interim + 1 terminal delivery
 
 	// Wait for messages to reach the client
 	for (let attempt = 0; attempt < 200; attempt++) {
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		const messages = frames.filter((f: any) => f.type === "event" && f.event === "chat.message");
 		if (messages.length >= 1) break; // 1 terminal only
 		await Bun.sleep(10);
@@ -310,6 +320,7 @@ test("maxPerTurn 0: 5 interim + final → assert 0 interim + 1 terminal delivery
 
 	socket.end();
 
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const messages = frames.filter((f: any) => f.type === "event" && f.event === "chat.message");
 
 	// With maxPerTurn: 0, should have exactly 1 message: the final answer (terminal)
@@ -354,6 +365,7 @@ test("boot path: config.json with interimSpeech {maxPerTurn:0} starts via boot.t
 	});
 
 	// Connect client to the gateway's Unix socket
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = "";
 	const socket = await Bun.connect({
@@ -397,6 +409,7 @@ test("boot path: config.json with interimSpeech {maxPerTurn:0} starts via boot.t
 	}
 	expect(sessionPort.sends).toHaveLength(1);
 
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = sessionPort.sends[0]!;
 
 	// Emit 5 interim assistant messages
@@ -410,6 +423,7 @@ test("boot path: config.json with interimSpeech {maxPerTurn:0} starts via boot.t
 
 	// Wait for messages to reach the client
 	for (let attempt = 0; attempt < 200; attempt++) {
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		const messages = frames.filter((f: any) => f.type === "event" && f.event === "chat.message");
 		if (messages.length >= 1) break; // 1 terminal only
 		await Bun.sleep(10);
@@ -417,6 +431,7 @@ test("boot path: config.json with interimSpeech {maxPerTurn:0} starts via boot.t
 
 	socket.end();
 
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const messages = frames.filter((f: any) => f.type === "event" && f.event === "chat.message");
 
 	// With config-based maxPerTurn: 0, should have exactly 1 message: the final answer (terminal)

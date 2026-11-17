@@ -103,6 +103,7 @@ async function fixture() {
 		decision: "report",
 		settledAt: END,
 	};
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const payload = buildDeliveryPayload(
 		runtime.opRef,
 		LOOPBACK_ORIGIN,
@@ -189,6 +190,7 @@ function settleAttempt(
 	};
 	const result = database.work.workAttemptSettle(tx, opRef, expectedVersion, record, patch, admission, checks);
 	if (!result) return undefined;
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	touchWorkSession(database, tx, result.runtime, result.runtime.settledAt!);
 	if (result.runtime.decision === "reported" && admission?.kind === "persona") {
 		if (
@@ -197,6 +199,7 @@ function settleAttempt(
 				originKey: admission.row.originKey,
 				originRefJson: resolveLaneReportOrigin(result.runtime.parent, admission.row.originRefJson),
 				body: admission.row.body,
+				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				receivedAt: result.runtime.settledAt!,
 				source: "lane_report",
 			})
@@ -206,6 +209,7 @@ function settleAttempt(
 	for (const payload of [result.fallbackPayload, result.childFallback]) {
 		if (!payload) continue;
 		database.outbox.enqueue(tx, {
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			deliveryId: payload.deliveryId!,
 			turnId: payload.turnId,
 			originKey: originKey(payload.origin),
@@ -423,6 +427,7 @@ describe("work attempt durable transactions", () => {
 		expect(f.database.work.workAttemptGet(f.runtime.opRef)).toEqual(before);
 		expect(before).toMatchObject({ settledAt: null, terminal: null, decision: "undecided" });
 		expect(before?.turnEndObservedAt).toBeUndefined();
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(parseLaneJobRecord(f.database.work.laneJobJson(f.runtime.jobId)!).attempts[0]?.endedAt).toBeUndefined();
 	});
 
@@ -525,6 +530,7 @@ describe("work attempt durable transactions", () => {
 			version: 2,
 		});
 		expect(f.database.work.workAttemptGet(f.runtime.opRef)?.turnEndObservedAt).toBeUndefined();
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(parseLaneJobRecord(f.database.work.laneJobJson(f.runtime.jobId)!).attempts[0]?.endedAt).toBeUndefined();
 		expect(f.database.work.workAttemptGet(successor.runtime.opRef)?.successorOf).toEqual(successor.runtime.successorOf);
 		f.database.transaction((tx) => {
@@ -555,6 +561,7 @@ describe("work attempt durable transactions", () => {
 			f.database.transaction((tx) =>
 				updateAttempt(f.database, tx, successor.runtime.opRef, 1, {
 					output: successor.runtime.output,
+					// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 					successorOf: { ...successor.runtime.successorOf!, baseSha: "b".repeat(40) },
 				} as WorkAttemptPatch),
 			),
@@ -576,12 +583,19 @@ describe("work attempt durable transactions", () => {
 		});
 		const successor = successorAttempt(f);
 		for (const source of [
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			{ ...successor.runtime.successorOf!, name: "wrong" },
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			{ ...successor.runtime.successorOf!, name: "bad/name" },
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			{ ...successor.runtime.successorOf!, sessionId: "c7360739-d04c-4177-a379-ab6b98f73a40" },
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			{ ...successor.runtime.successorOf!, sessionId: "not-a-uuid" },
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			{ ...successor.runtime.successorOf!, opRef: "gw-missing-source" },
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			{ ...successor.runtime.successorOf!, baseSha: "not-a-sha" },
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			{ ...successor.runtime.successorOf!, authorizedAt: "not-a-timestamp" },
 		]) {
 			expect(() =>
@@ -621,6 +635,7 @@ describe("work attempt durable transactions", () => {
 				});
 			});
 			const successor = successorAttempt(f);
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const before = f.database.work.workAttemptGet(f.runtime.opRef)!;
 			expect(before).toMatchObject({ sendPhase: "accepted", settledAt: null, decision: "undecided" });
 			expect(before.turnEndObservedAt).toBeUndefined();
@@ -641,6 +656,7 @@ describe("work attempt durable transactions", () => {
 				});
 				expect(f.database.work.workAttemptGet(successor.runtime.opRef)?.parent).toEqual(before.parent);
 			}
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(parseLaneJobRecord(f.database.work.laneJobJson(f.runtime.jobId)!).attempts[0]?.endedAt).toBeUndefined();
 			expect(f.database.outbox.rows()).toHaveLength(0);
 		}
@@ -705,6 +721,7 @@ describe("work attempt durable transactions", () => {
 		const first = successorAttempt(f);
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, first.runtime, first.record));
 		const reportAdmission = (runtime: WorkAttemptRuntime): WorkAttemptAdmission => {
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const payload = buildDeliveryPayload(runtime.opRef, LOOPBACK_ORIGIN, "completed", runtime.deliveryId)!;
 			return {
 				kind: "persona",
@@ -739,6 +756,7 @@ describe("work attempt durable transactions", () => {
 		};
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, nextSuccessor, nextRecord));
 		let record = f.record;
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		let current = f.database.work.workAttemptGet(f.runtime.opRef)!;
 		for (let i = 1; i <= 24; i++) {
 			const closed = closeAttempt({ record, opRef: current.opRef, endState: "completed", endedAt: END });
@@ -813,6 +831,7 @@ describe("work attempt durable transactions", () => {
 					...(cause === "provider" ? { providerCode: "server_is_overloaded" } : {}),
 				},
 			};
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const terminal = terminalEvidence(status, END)!;
 			f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 0, { terminal }));
 			expect(f.database.work.workAttemptGet(f.runtime.opRef)?.terminal).toEqual(terminal);
@@ -963,6 +982,7 @@ describe("work attempt durable transactions", () => {
 				),
 			).toThrow();
 			expect(f.database.work.workAttemptGet(f.runtime.opRef)).toEqual(f.runtime);
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(parseLaneJobRecord(f.database.work.laneJobJson(f.runtime.jobId)!).attempts[0]?.endedAt).toBeUndefined();
 			expect(f.database.bindings.workLaneRows()[0]?.last_activity_at).toBe(START);
 			expect(f.database.outbox.rows()).toHaveLength(0);
@@ -1023,6 +1043,7 @@ describe("work attempt durable transactions", () => {
 			opRef,
 			deliveryId: workAttemptDeliveryId(f.database.instanceId, f.runtime.jobId, opRef),
 		};
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const record = { ...f.record, attempts: [{ ...f.record.attempts[0]!, opRef }] };
 		expect(() => f.database.transaction((tx) => prepareAttempt(f.database, tx, other, record))).toThrow();
 		expect(f.database.work.workAttemptOpen()).toEqual([f.runtime]);
@@ -1113,10 +1134,12 @@ describe("work attempt durable transactions", () => {
 	test("output claims persist three-read budget; stale/wrong proof and oversized excerpt fail closed", async () => {
 		const f = await fixture();
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		let runtime = f.database.transaction((tx) =>
 			updateAttempt(f.database, tx, f.runtime.opRef, 0, { terminal: f.settlement.terminal }),
 		)!;
 		for (let reads = 1; reads <= 3; reads++)
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			runtime = f.database.transaction((tx) =>
 				updateAttempt(f.database, tx, runtime.opRef, runtime.version, {
 					output: { ...runtime.output, reads, nextReadAt: END },
@@ -1179,6 +1202,7 @@ describe("work attempt durable transactions", () => {
 			const f = await fixture();
 			f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
 			const terminal = { kind: "local" as const, observedAt: END, reasonCode: "send_rejected", refusalCode };
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const staged = f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 0, { terminal }))!;
 			expect(f.database.work.workAttemptGet(staged.opRef)?.terminal).toEqual(terminal);
 			const closed = closeAttempt({
@@ -1204,6 +1228,7 @@ describe("work attempt durable transactions", () => {
 			const reopened = await Store.open(f.path);
 			handles.push(reopened);
 			expect(reopened.work.workAttemptGet(staged.opRef)?.terminal).toEqual(terminal);
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(parseLaneJobRecord(reopened.work.laneJobJson(staged.jobId)!).attempts[0]?.endState).toBe("failed");
 		});
 	}
@@ -1232,6 +1257,7 @@ describe("work attempt durable transactions", () => {
 		const f = await fixture();
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
 		const terminal = { kind: "local" as const, observedAt: END, reasonCode: "send_rejected", refusalCode: "busy" };
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const staged = f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 0, { terminal }))!;
 		for (const refusalCode of ["steer_refused", "sdk_refused", undefined]) {
 			expect(() =>
@@ -1263,6 +1289,7 @@ describe("work attempt durable transactions", () => {
 			reasonCode: "end_turn",
 			status: { ...missing.status, receiptState: "present" as const },
 		};
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const runtime = f.database.transaction((tx) =>
 			updateAttempt(f.database, tx, f.runtime.opRef, 0, { terminal: missing }),
 		)!;
@@ -1296,6 +1323,7 @@ describe("work attempt durable transactions", () => {
 				}),
 			),
 		).toThrow();
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const upgraded = f.database.transaction((tx) =>
 			updateAttempt(f.database, tx, runtime.opRef, runtime.version, {
 				terminal: present,
@@ -1399,6 +1427,7 @@ describe("work attempt durable transactions", () => {
 			const runtime = { ...f.runtime, parent: null, wakeReportId: linkedId };
 			f.database.transaction((tx) => prepareAttempt(f.database, tx, runtime, f.record));
 			const terminal = { kind: "local" as const, observedAt: END, reasonCode };
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const staged = f.database.transaction((tx) =>
 				updateAttempt(f.database, tx, runtime.opRef, 0, {
 					terminal,
@@ -1425,6 +1454,7 @@ describe("work attempt durable transactions", () => {
 			expect(f.database.inbox.turnRow(runtime.opRef)).toBeUndefined();
 			expect(f.raw.query("SELECT 1 FROM lane_reports WHERE child_op_ref = ?").get(runtime.opRef)).toBeNull();
 			expect(f.database.outbox.rows().some((row) => row.delivery_id === runtime.deliveryId)).toBe(false);
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const child = f.database.work.laneReportGet(linkedId)!;
 			expect(child.state).toBe(expectedState);
 			if (expectedState === "fallback") {
@@ -1463,6 +1493,7 @@ describe("work attempt durable transactions", () => {
 		).toBe(true);
 		const runtime = { ...f.runtime, wakeReportId: linkedId };
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, runtime, f.record));
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const accepted = f.database.transaction((tx) =>
 			updateAttempt(f.database, tx, runtime.opRef, 0, {
 				sendPhase: "accepted",
@@ -1470,6 +1501,7 @@ describe("work attempt durable transactions", () => {
 			}),
 		)!;
 		expect(f.database.work.laneReportGet(linkedId)?.state).toBe("consumed");
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const result = f.database.transaction((tx) =>
 			settleAttempt(f.database, tx, accepted.opRef, accepted.version, f.closed, f.settlement, f.admission),
 		)!;
@@ -1518,6 +1550,7 @@ describe("work attempt durable transactions", () => {
 			excerpt: "proven wake output",
 			proof,
 		};
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const accepted = f.database.transaction((tx) =>
 			updateAttempt(f.database, tx, runtime.opRef, 0, { output: provenOutput }),
 		)!;
@@ -1528,6 +1561,7 @@ describe("work attempt durable transactions", () => {
 			output: { ...provenOutput, disposition: "unavailable" as const, excerpt: null },
 			decision: "report" as const,
 		};
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const result = f.database.transaction((tx) =>
 			settleAttempt(f.database, tx, accepted.opRef, accepted.version, f.closed, patch, f.admission),
 		)!;
@@ -1559,6 +1593,7 @@ describe("work attempt durable transactions", () => {
 	test("v24 migration rewrites a quarantined v23 runtime and restores quarantine triggers", async () => {
 		const f = await fixture();
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const settled = f.database.transaction((tx) =>
 			settleAttempt(f.database, tx, f.runtime.opRef, 0, f.closed, f.settlement, f.admission),
 		)!;
@@ -1575,6 +1610,7 @@ describe("work attempt durable transactions", () => {
 				disposition: "quarantine",
 			}),
 		);
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const current = f.database.work.workAttemptGet(f.runtime.opRef)!;
 		const legacy: Record<string, unknown> = {
 			...current,
@@ -1765,6 +1801,7 @@ DELETE FROM schema_migrations WHERE version >= 21;
 
 		// Attempt a no-op patch (all fields already set to same values)
 		const patched = f.database.transaction((tx) => {
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const current = f.database.work.workAttemptGet(f.runtime.opRef)!;
 			const patch: WorkAttemptPatch = {
 				sendPhase: current.sendPhase,
@@ -1795,6 +1832,7 @@ DELETE FROM schema_migrations WHERE version >= 21;
 
 		// Attempt an actual update (changing a field)
 		const patched = f.database.transaction((tx) => {
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const current = f.database.work.workAttemptGet(f.runtime.opRef)!;
 			const patch: WorkAttemptPatch = {
 				sendPhase: "accepted",
@@ -1825,6 +1863,7 @@ DELETE FROM schema_migrations WHERE version >= 21;
 
 		// First, bump the version with a real update
 		f.database.transaction((tx) => {
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const current = f.database.work.workAttemptGet(f.runtime.opRef)!;
 			const patch: WorkAttemptPatch = {
 				sendPhase: "accepted",
@@ -1835,6 +1874,7 @@ DELETE FROM schema_migrations WHERE version >= 21;
 
 		// Now try a no-op update with the stale version (0, but current is 1)
 		const patched = f.database.transaction((tx) => {
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const current = f.database.work.workAttemptGet(f.runtime.opRef)!;
 			const patch: WorkAttemptPatch = {
 				sendPhase: current.sendPhase,
@@ -1853,11 +1893,13 @@ DELETE FROM schema_migrations WHERE version >= 21;
 
 		// Do some mixed updates: real changes and no-ops
 		f.database.transaction((tx) => {
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			let current = f.database.work.workAttemptGet(f.runtime.opRef)!;
 			const realPatch: WorkAttemptPatch = {
 				sendPhase: "accepted",
 				sendEvidence: { source: "status", observedAt: START },
 			};
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			current = updateAttempt(f.database, tx, f.runtime.opRef, current.version, realPatch)!;
 
 			// No-op update (should not journal)
@@ -1874,6 +1916,7 @@ DELETE FROM schema_migrations WHERE version >= 21;
 		});
 
 		// Store the runtime before wiping
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const beforeWipe = f.database.work.workAttemptGet(f.runtime.opRef)!;
 
 		// Wipe the runtime table and replay from journal
@@ -1882,6 +1925,7 @@ DELETE FROM schema_migrations WHERE version >= 21;
 		expect(replayResult.attempts).toBe(1);
 
 		// Verify replayed state matches what we had before
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const afterReplay = f.database.work.workAttemptGet(f.runtime.opRef)!;
 		expect(afterReplay.version).toBe(beforeWipe.version);
 		expect(afterReplay.sendPhase).toBe(beforeWipe.sendPhase);

@@ -2206,6 +2206,7 @@ test("typing indicator is idempotent: multiple begin calls on same conversation 
 				};
 			},
 		},
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	} as any);
 	// Multiple begin calls on same conversation should be idempotent
 	typing.begin("conv-1");
@@ -2234,7 +2235,9 @@ test("DM messages stay flat with no thread creation", () => {
 		mentions: { has: () => true },
 		content: "hello bot",
 	};
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const engagement = engagementForMessage(dmMessage as any, botUser);
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const origin = discordMessageOrigin(dmMessage as any);
 	// DM should stay kind="dm" even with mention, no threading
 	expect(origin.kind).toBe("dm");
@@ -2251,7 +2254,9 @@ test("channel mention should set mentioned flag for thread creation logic", () =
 		mentions: { has: () => true },
 		content: "<@bot-1> hello",
 	};
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const engagement = engagementForMessage(channelMessage as any, botUser);
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const origin = discordMessageOrigin(channelMessage as any);
 	// Channel mention should be marked as mentioned and group
 	expect(origin.kind).toBe("channel");
@@ -2272,6 +2277,7 @@ test("thread reply message stays in thread", () => {
 		mentions: { has: () => false },
 		content: "reply in thread",
 	};
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const origin = discordMessageOrigin(threadMessage as any);
 	// Thread message should preserve thread origin
 	expect(origin.kind).toBe("thread");
@@ -2287,14 +2293,18 @@ test("channel mention with default policy (unset threadOnMention) creates thread
 		channel: { id: "channel-1", type: 0 },
 		mentions: { has: () => true },
 		content: "<@bot-1> hello",
+		// biome-ignore lint/correctness/noUnusedFunctionParameters: ignored using `--suppress`
 		startThread: async ({ name }: { name: string; autoArchiveDuration: number }) => ({
 			id: "thread-new-1",
 		}),
 	};
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const engagement = engagementForMessage(channelMessage as any, botUser);
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const origin = discordMessageOrigin(channelMessage as any);
 	// With default policy (threadOnMention unset/undefined), should create thread
 	const result = await maybeCreateThreadOnMention(
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		channelMessage as any,
 		engagement,
 		origin,
@@ -2315,15 +2325,19 @@ test("channel mention with threadOnMention: true creates thread", async () => {
 		channel: { id: "channel-2", type: 0 },
 		mentions: { has: () => true },
 		content: "<@bot-1> hello",
+		// biome-ignore lint/correctness/noUnusedFunctionParameters: ignored using `--suppress`
 		startThread: async ({ name }: { name: string; autoArchiveDuration: number }) => ({
 			id: "thread-new-2",
 		}),
 	};
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const engagement = engagementForMessage(channelMessage as any, botUser);
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const origin = discordMessageOrigin(channelMessage as any);
 	// With threadOnMention explicitly set to true, should create thread
 	const policy = { threadOnMention: true };
 	const result = await maybeCreateThreadOnMention(
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		channelMessage as any,
 		engagement,
 		origin,
@@ -2345,16 +2359,20 @@ test("channel mention with threadOnMention: false skips thread creation", async 
 		channel: { id: "channel-3", type: 0 },
 		mentions: { has: () => true },
 		content: "<@bot-1> hello",
+		// biome-ignore lint/correctness/noUnusedFunctionParameters: ignored using `--suppress`
 		startThread: async ({ name }: { name: string; autoArchiveDuration: number }) => {
 			threadCreated = true;
 			return { id: "thread-new-3" };
 		},
 	};
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const engagement = engagementForMessage(channelMessage as any, botUser);
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const origin = discordMessageOrigin(channelMessage as any);
 	// With threadOnMention set to false, should NOT create thread
 	const policy = { threadOnMention: false };
 	const result = await maybeCreateThreadOnMention(
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		channelMessage as any,
 		engagement,
 		origin,
@@ -2379,9 +2397,12 @@ test("adapter-wide threadOnMention: false skips threads unless the channel overr
 			return { id: "thread-new-5" };
 		},
 	};
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const engagement = engagementForMessage(channelMessage as any, botUser);
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const origin = discordMessageOrigin(channelMessage as any);
 	const flat = await maybeCreateThreadOnMention(
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		channelMessage as any,
 		engagement,
 		origin,
@@ -2392,6 +2413,7 @@ test("adapter-wide threadOnMention: false skips threads unless the channel overr
 	expect(flat).toEqual(origin);
 	expect(threadsCreated).toBe(0);
 	const overridden = await maybeCreateThreadOnMention(
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		channelMessage as any,
 		engagement,
 		origin,
@@ -2412,10 +2434,13 @@ test("non-channel or non-mentioned message ignores threadOnMention policy", asyn
 		mentions: { has: () => true },
 		content: "hello",
 	};
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const engagement = engagementForMessage(dmMessage as any, botUser);
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const origin = discordMessageOrigin(dmMessage as any);
 	// DMs should never thread regardless of policy
 	const policy = { threadOnMention: true };
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const result = await maybeCreateThreadOnMention(dmMessage as any, engagement, origin, policy, new UnnamedThreads());
 	expect(result.kind).toBe("dm");
 });
@@ -2508,10 +2533,13 @@ test("a mention opens a thread named after the message and needs no rename", asy
 	const started: string[] = [];
 	const message = threadingMessage("<@111> 스레드 이름 좀 바꿔줘", started);
 	const unnamed = new UnnamedThreads();
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const engagement = engagementForMessage(message as any, { id: "111" });
 	await maybeCreateThreadOnMention(
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		message as any,
 		engagement,
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		discordMessageOrigin(message as any),
 		undefined,
 		unnamed,
@@ -2524,10 +2552,13 @@ test("a bare mention opens a fallback-named thread, renamed once from the first 
 	const started: string[] = [];
 	const unnamed = new UnnamedThreads();
 	const trigger = threadingMessage("<@111>", started);
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const engagement = engagementForMessage(trigger as any, { id: "111" });
 	const origin = await maybeCreateThreadOnMention(
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		trigger as any,
 		engagement,
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		discordMessageOrigin(trigger as any),
 		undefined,
 		unnamed,
@@ -2539,9 +2570,12 @@ test("a bare mention opens a fallback-named thread, renamed once from the first 
 		channel: { setName: async (name: string) => void renamed.push(name) },
 	});
 	// A message with nothing nameable does not use up the rename.
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	await nameThreadFromMessage(inThread("<@111>") as any, origin, unnamed);
 	expect(renamed).toEqual([]);
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	await nameThreadFromMessage(inThread("디코 플랫 대화 옵션") as any, origin, unnamed);
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	await nameThreadFromMessage(inThread("그리고 하나 더") as any, origin, unnamed);
 	expect(renamed).toEqual(["디코 플랫 대화 옵션"]);
 });
@@ -2550,6 +2584,7 @@ test("threads the adapter did not open are never renamed", async () => {
 	const renamed: string[] = [];
 	const origin = { platform: "discord", kind: "thread", conversationId: "human-thread", parentId: "c" } as const;
 	await nameThreadFromMessage(
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		{ content: "hello there", channel: { setName: async (name: string) => void renamed.push(name) } } as any,
 		origin,
 		new UnnamedThreads(),
@@ -2570,6 +2605,7 @@ test("a failed thread rename is logged and does not throw", async () => {
 			},
 		},
 	};
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	await nameThreadFromMessage(failing as any, origin, unnamed, { error: (line: string) => void errors.push(line) });
 	expect(errors).toEqual(["Discord thread thread-1 rename failed: Missing Permissions"]);
 });

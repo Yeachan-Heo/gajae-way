@@ -394,6 +394,7 @@ export async function eventually<T>(
 }
 
 export async function wire(socketPath: string) {
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = Buffer.alloc(0);
 	const socket = await Bun.connect({

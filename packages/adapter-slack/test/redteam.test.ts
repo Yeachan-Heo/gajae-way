@@ -68,6 +68,7 @@ class Socket implements WebSocketLike {
 	}
 }
 class Client implements GatewayClientLike {
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	calls: Array<{ verb: string; params: any }> = [];
 	failure?: Error;
 	engaged = false;
@@ -227,6 +228,7 @@ test("RT-SLACK-01 throwing handlers ack first, retries dedupe, malformed frames 
 	);
 	cleanups.push(() => mode.stop());
 	await mode.start();
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const socket = sockets[0]!;
 	socket.frame({ type: "events_api", envelope_id: "one", payload: { event: {} } });
 	socket.frame({ type: "events_api", envelope_id: "one", retry_attempt: 1, payload: { event: {} } });
@@ -608,6 +610,7 @@ test("RT-SLACK-19 credential prefixes fail without secrets, relative files resol
 		["app", "xapp-good"],
 	]) {
 		const secret = "wrong-prefix-sensitive-token";
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		await Bun.write(join(home, file!), secret);
 		let error: unknown;
 		try {
@@ -617,6 +620,7 @@ test("RT-SLACK-19 credential prefixes fail without secrets, relative files resol
 		}
 		expect(error).toBeInstanceOf(Error);
 		expect(String(error)).not.toContain(secret);
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		await Bun.write(join(home, file!), good!);
 	}
 	await Bun.write(
@@ -953,6 +957,7 @@ test("RT-SLACK-48 concurrent delivery queue drains before cosmetic without starv
 	await flush();
 	while (timers.length) {
 		timers.sort((a, b) => a.at - b.at);
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const timer = timers.shift()!;
 		now = timer.at;
 		timer.resolve();
@@ -1200,6 +1205,7 @@ test("RT-SLACK-57 persona allowlist is disjoint and thumbs up leaves presence al
 	const { REACTION_ALLOWLIST } = await import("@gajae-gateway/protocol");
 	const { SLACK_REACTION_NAMES } = await import("../src/reactions");
 	const { isPresenceReaction } = await import("../src/status");
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	for (const { name } of REACTION_ALLOWLIST) expect(isPresenceReaction(SLACK_REACTION_NAMES[name]!)).toBe(false);
 	const api = new Api();
 	const status = new WorkingStatus(api);
@@ -1239,6 +1245,7 @@ for (const cosmetics of [1, 20])
 			}),
 		);
 		while (timers.length) {
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const timer = timers.shift()!;
 			now += timer.ms;
 			timer.resolve();

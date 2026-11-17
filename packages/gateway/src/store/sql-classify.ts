@@ -16,6 +16,7 @@ function isIdentifierPart(char: string): boolean {
 function tokenize(sql: string): Token[] | undefined {
 	const tokens: Token[] = [];
 	for (let index = 0; index < sql.length; ) {
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const char = sql[index]!;
 		if (/\s/.test(char)) {
 			index++;
@@ -65,6 +66,7 @@ function tokenize(sql: string): Token[] | undefined {
 		}
 		if (isIdentifierStart(char)) {
 			const start = index++;
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			while (index < sql.length && isIdentifierPart(sql[index]!)) index++;
 			tokens.push({ value: sql.slice(start, index), kind: "word" });
 			continue;

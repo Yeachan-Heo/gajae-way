@@ -122,6 +122,7 @@ liveTest(
 			expect(kinds).toContain("tool_execution_start");
 			expect(kinds).toContain("tool_execution_end");
 			expect(kinds.at(-1)).toBe("agent_end");
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const toolStart = frames.find((frame) => frame.rawKind === "tool_execution_start")!;
 			expect(toolStart.payload.toolName).toBe("bash");
 			expect(kinds.indexOf("tool_execution_start")).toBeGreaterThan(

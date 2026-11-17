@@ -30,6 +30,7 @@ async function harness(
 	);
 	const run: CliRunner = async (args) => {
 		if (args.includes("inspect")) {
+			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const sessionId = args[args.indexOf("inspect") + 1]!;
 			const pid = pidFor(sessionId);
 			if (inspectErrorCode)

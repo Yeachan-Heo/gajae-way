@@ -478,6 +478,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 			params: { origin, messageId: "m-1", text: "first" },
 		});
 		await waitFor(() => port.sends.length === 1, "first persistent turn did not start");
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
 		expect(port.serviceTiers).toEqual([
 			{ sessionId: first.sessionId, repo: join(home, "workspace"), tier: "priority" },
@@ -523,6 +524,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 			params: { origin, messageId: "m-2", text: "second" },
 		});
 		await waitFor(() => port.sends.length === 2, "next persistent turn did not start");
+		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const second = port.sends[1]!;
 		expect(second.sessionId).toBe(first.sessionId);
 		expect(second.model).toBeUndefined();

@@ -47,6 +47,7 @@ async function start(): Promise<string> {
 	throw new Error("daemon never started listening");
 }
 async function client(socketPath: string) {
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = "";
 	const socket = await Bun.connect({
@@ -64,6 +65,7 @@ async function client(socketPath: string) {
 	send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	return { frames, send, close: () => socket.end() };
 }
+// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 async function waitFor(frames: any[], predicate: (frame: any) => boolean) {
 	for (let i = 0; i < 200; i++) {
 		const frame = frames.find(predicate);

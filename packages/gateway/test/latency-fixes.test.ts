@@ -53,7 +53,9 @@ test("turn_count survives increments and resets on epoch bump", async () => {
 	}
 });
 
+// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 async function connect(socketPath: string): Promise<{ send(value: unknown): void; frames: any[]; close(): void }> {
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = "";
 	const socket = await Bun.connect({
@@ -113,13 +115,16 @@ test("tail frames deliver an assistant finding before the persistent operation r
 	const { client } = await startGateway({ sessionPort });
 	sendChannelMessage(client, "c1", "hey, dig into this");
 	for (let attempt = 0; attempt < 100 && sessionPort.sends.length === 0; attempt++) await Bun.sleep(5);
+	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = sessionPort.sends[0]!;
 	sessionPort.emitTool(send.sessionId);
 	sessionPort.emitAssistant(send.sessionId, "the 500s hit every 3 minutes, not randomly");
 	for (let attempt = 0; attempt < 100; attempt++) {
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		if (client.frames.some((frame: any) => frame.type === "event" && frame.event === "chat.message")) break;
 		await Bun.sleep(5);
 	}
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const midTurn = client.frames.filter((frame: any) => frame.type === "event" && frame.event === "chat.message");
 	expect(midTurn).toHaveLength(1);
 	expect(midTurn[0].payload.text).toContain("every 3 minutes");
@@ -127,10 +132,12 @@ test("tail frames deliver an assistant finding before the persistent operation r
 	expect(midTurn[0].payload.final).toBe(false);
 	sessionPort.complete(send.opRef, "done: found the culprit");
 	for (let attempt = 0; attempt < 100; attempt++) {
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		const count = client.frames.filter((frame: any) => frame.type === "event" && frame.event === "chat.message").length;
 		if (count >= 2) break;
 		await Bun.sleep(5);
 	}
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const messages = client.frames.filter((frame: any) => frame.type === "event" && frame.event === "chat.message");
 	expect(messages).toHaveLength(2);
 	expect(messages[1].payload.text).toContain("found the culprit");
@@ -138,10 +145,12 @@ test("tail frames deliver an assistant finding before the persistent operation r
 	// streamed part; the turn's end is the unconditional final progress tick,
 	// emitted once the terminal path ran - that is what tears the status down.
 	for (let attempt = 0; attempt < 100; attempt++) {
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		if (client.frames.some((frame: any) => frame.event === "chat.progress" && frame.payload.final === true)) break;
 		await Bun.sleep(5);
 	}
 	const finalTick = client.frames.findIndex(
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		(frame: any) => frame.event === "chat.progress" && frame.payload.final === true,
 	);
 	expect(finalTick).toBeGreaterThan(client.frames.indexOf(messages[0]));
@@ -201,9 +210,11 @@ test("a prose-only stale session failure surfaces visibly without a prose-driven
 	const { client } = await startGateway({ sessionPort });
 	sendChannelMessage(client, "r1", "are you alive?");
 	for (let attempt = 0; attempt < 200; attempt++) {
+		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		if (client.frames.some((frame: any) => frame.type === "event" && frame.event === "chat.message")) break;
 		await Bun.sleep(5);
 	}
+	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const message = client.frames.find((frame: any) => frame.type === "event" && frame.event === "chat.message");
 	expect(calls).toBe(1);
 	expect(message.payload.text).toContain("[turn failed]");
