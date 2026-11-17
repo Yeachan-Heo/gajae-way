@@ -21,6 +21,7 @@ import { isBrokerUnavailable, isCliQueueTimeout } from "../orchestrator/broker";
 import { sanitizeDiagnostic, sanitizeDiagnosticDetail } from "../orchestrator/rebind";
 import {
 	isSessionBusy,
+	isSessionUnavailable,
 	LastAssistantUnreadableError,
 	type SessionBinding,
 	type SessionPort,
@@ -1452,12 +1453,21 @@ export class MonitorPropagator {
 							const pendingCreate = this.#hasPendingCreateIntent(sessionOriginKey, boundEpoch);
 							const currentSession = this.#database.bindings.getSessionRecord(sessionOriginKey);
 							const sessionExists = currentSession?.epoch === boundEpoch && Boolean(currentSession.sessionId);
-							// Issue #780 P2 #1: Only count bind failures that are timeouts or involve a
-							// pending create (which is not yet a valid session). Non-timeout errors on an
-							// existing valid session should not trigger rotation: they're transient inspection
-							// failures, not evidence of a poisoned key. Only timeout errors and unindexed
-							// session creates warrant rotation.
-							const countBindFailure = isBindTimeoutError(bindError) || pendingCreate;
+							// Issue #780 P2 #1: Only count bind failures that are:
+							// 1. Timeout errors (poison key detection)
+							// 2. Session-gone codes (endpoint_stale, session_unavailable, not_found)
+							// 3. Pending creates without an existing session
+							// Non-timeout errors on an existing valid session should not trigger rotation:
+							// they're transient inspection failures, not evidence of a poisoned key.
+							// Broker-unavailable and authority/ownership errors must NOT count, except timeouts
+							// which may come wrapped as GjcCliUnavailableError with a timeout message.
+							const isTimeout = isBindTimeoutError(bindError);
+							const isSessionGone = isSessionUnavailable(bindError);
+							const isPendingWithoutSession = pendingCreate && !sessionExists;
+							const isPureBrokerUnavailable = !isTimeout && isBrokerUnavailable(bindError);
+							const countBindFailure =
+								(isTimeout || isSessionGone || isPendingWithoutSession) &&
+								!(bindError instanceof BrokerAuthorityError || isPureBrokerUnavailable);
 							if (countBindFailure) {
 								if (safety.bindTimeoutEpoch !== boundEpoch) {
 									safety.bindTimeoutFailures = 0;
@@ -2499,10 +2509,13 @@ export class MonitorPropagator {
 	#trackTerminalFailure(row: Pick<MonitorEventDbRow, "monitor_id" | "session_origin_key">): boolean {
 		const monitor = this.#registry.get(row.monitor_id);
 		if (!monitor || !row.session_origin_key) return true;
-		return this.#trackConsecutiveFailedEvent(row.session_origin_key, row.monitor_id);
+		// Issue #780 P2 #2: Get the current epoch to scope escalation markers
+		const currentBinding = this.#database.bindings.getSessionRecord(row.session_origin_key);
+		const epoch = currentBinding?.epoch ?? 0;
+		return this.#trackConsecutiveFailedEvent(row.session_origin_key, row.monitor_id, epoch);
 	}
 
-	#trackConsecutiveFailedEvent(sessionOriginKey: string, monitorId: string): boolean {
+	#trackConsecutiveFailedEvent(sessionOriginKey: string, monitorId: string, epoch: number): boolean {
 		const state = this.#safetyState(sessionOriginKey);
 		const { count: consecutiveCount, latestFailureEventId } = this.#countConsecutiveFailures(
 			monitorId,
@@ -2514,7 +2527,7 @@ export class MonitorPropagator {
 		);
 
 		if (consecutiveCount < MONITOR_FAILED_EVENT_ESCALATION_THRESHOLD || !latestFailureEventId) return true;
-		const escalationKey = monitorEscalationKey(sessionOriginKey, monitorId);
+		const escalationKey = monitorEscalationKey(sessionOriginKey, monitorId, epoch);
 		const prior = this.#database.core.metaGet(escalationKey);
 		if (prior !== undefined) {
 			let priorEventId: string | undefined;
@@ -2627,9 +2640,12 @@ export class MonitorPropagator {
 	/**
 	 * Reset the failed event counter when a successful dispatch happens.
 	 * Issue #780: a success clears the failure streak and the escalation flag.
+	 * Issue #780 P2 #2: use epoch-scoped escalation keys so clearing only affects the current epoch.
 	 */
 	#clearConsecutiveFailedEventCount(sessionOriginKey: string, monitorId: string): void {
 		const state = this.#safetyState(sessionOriginKey);
+		const currentBinding = this.#database.bindings.getSessionRecord(sessionOriginKey);
+		const epoch = currentBinding?.epoch ?? 0;
 		const { count: consecutiveCount } = this.#countConsecutiveFailures(monitorId, sessionOriginKey);
 
 		if (consecutiveCount === 0) {
@@ -2637,7 +2653,7 @@ export class MonitorPropagator {
 				`monitor failure streak cleared for ${sessionOriginKey} (monitor ${monitorId}): previous failures now recovered`,
 			);
 			// Clear durable escalation flag when streak is cleared
-			const escalationKey = monitorEscalationKey(sessionOriginKey, monitorId);
+			const escalationKey = monitorEscalationKey(sessionOriginKey, monitorId, epoch);
 			this.#database.core.metaDelete(escalationKey);
 			state.escalatedForCurrentStreak = false;
 		}
@@ -3571,8 +3587,9 @@ function monitorContextBudgetArmKey(sessionOriginKey: string): string {
 	return `monitor_context_budget_arm:${sessionOriginKey}`;
 }
 
-function monitorEscalationKey(sessionOriginKey: string, monitorId: string): string {
-	return `monitor_escalation:${sessionOriginKey}:${monitorId}`;
+function monitorEscalationKey(sessionOriginKey: string, monitorId: string, epoch: number): string {
+	// Issue #780 P2 #2: Scope escalation marker to session epoch so streaks don't cross epoch boundaries
+	return `monitor_escalation:${sessionOriginKey}:${monitorId}:epoch=${epoch}`;
 }
 
 interface RetiredSession {
