@@ -52,6 +52,8 @@ export class MonitorRegistry {
 					: spec.trigger;
 		const instruction = spec.instruction?.trim() || undefined;
 		const procedureFiles = spec.procedureFiles?.length ? spec.procedureFiles.map((file) => file.trim()) : undefined;
+		// Default reportTo to delivery channel if not explicitly provided
+		const reportTo = spec.reportTo !== undefined ? spec.reportTo : (spec.channelTarget?.origin ?? undefined);
 		const record: MonitorRecord = {
 			...spec,
 			trigger,
@@ -61,6 +63,7 @@ export class MonitorRegistry {
 			enabled: spec.enabled ?? true,
 			instruction,
 			procedureFiles,
+			reportTo,
 			createdAt: new Date().toISOString(),
 		};
 		this.#database.transaction((tx) => {
@@ -140,7 +143,35 @@ export class MonitorRegistry {
 			const contextRollTokens = Object.hasOwn(patch, "contextRollTokens")
 				? (patch.contextRollTokens ?? undefined)
 				: current.contextRollTokens;
-			const updated: MonitorRecord = { ...current, ...patch, trigger, instruction, procedureFiles, contextRollTokens };
+			let reportTo = current.reportTo;
+			if (Object.hasOwn(patch, "reportTo")) {
+				reportTo = patch.reportTo === undefined ? undefined : patch.reportTo;
+			} else if (Object.hasOwn(patch, "channelTarget")) {
+				// When channelTarget changes without an explicit reportTo update:
+				// If current reportTo matches the current channelTarget origin (suggesting it was defaulted),
+				// update it to match the new channelTarget origin
+				const currentChannelOriginKey = JSON.stringify(current.channelTarget?.origin);
+				const currentReportToKey = JSON.stringify(current.reportTo);
+				const wasDefaulted = current.reportTo !== undefined && currentChannelOriginKey === currentReportToKey;
+
+				const newTarget = patch.channelTarget as MonitorChannelTarget | null | undefined;
+				if (wasDefaulted || current.reportTo === undefined) {
+					if (newTarget?.origin) {
+						reportTo = newTarget.origin;
+					} else {
+						reportTo = undefined;
+					}
+				}
+			}
+			const updated: MonitorRecord = {
+				...current,
+				...patch,
+				trigger,
+				instruction,
+				procedureFiles,
+				contextRollTokens,
+				reportTo,
+			};
 			if (typeof updated.enabled !== "boolean") throw new Error("monitor enabled must be a boolean");
 			validateSpec(updated);
 			const persisted = this.#database.monitors.update(tx, {
