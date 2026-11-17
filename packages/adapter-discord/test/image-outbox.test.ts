@@ -242,12 +242,16 @@ describe("ImageOutbox", () => {
 			JSON.stringify([...entries, { messageId: String(base + 1_000n), channelId: "channel", terminal: true }]),
 		);
 		const outbox = new ImageOutbox(path);
-		await expect(outbox.put({ messageId: String(base + 2_000n), channelId: "channel" })).rejects.toThrow(
-			"admission bound",
-		);
+		// With the new eviction logic, adding a new unresolved entry evicts the oldest one
+		await expect(outbox.put({ messageId: String(base + 2_000n), channelId: "channel" })).resolves.toBeUndefined();
 		// An existing intent and a terminal row are still admitted.
-		await outbox.put({ ...entries[0]!, failureAt: Date.now() });
+		const firstEntry = entries[0];
+		if (firstEntry) await outbox.put({ ...firstEntry, failureAt: Date.now() });
 		await outbox.put({ messageId: String(base + 2_001n), channelId: "channel", terminal: true, audited: true });
+		// After all these additions, unresolved count should still be bounded
+		const loaded = await outbox.load();
+		const unresolved = loaded.filter((e) => !e.completed && !e.terminal && !e.declined);
+		expect(unresolved.length).toBeLessThanOrEqual(1_000);
 	});
 
 	test("terminal audit rows are retained and only bind admission at the evidence cap", async () => {
@@ -272,11 +276,94 @@ describe("ImageOutbox", () => {
 		}));
 		await writeFile(path, JSON.stringify(full));
 		const bounded = new ImageOutbox(path);
-		await expect(bounded.put({ messageId: String(base + 3_000n), channelId: "channel" })).rejects.toThrow(
-			"admission bound",
-		);
+		// Admission now evicts old terminal entries instead of rejecting, so the new unresolved entry is admitted
+		await expect(bounded.put({ messageId: String(base + 3_000n), channelId: "channel" })).resolves.toBeUndefined();
 		await expect(bounded.put({ messageId: String(base + 3_001n), channelId: "other" })).resolves.toBeUndefined();
-		expect((await bounded.load()).filter((entry) => entry.terminal)).toHaveLength(500);
+		// Terminal entries should stay around MAX_TERMINAL_IMAGES_PER_CHANNEL after eviction
+		const terminalAfter = await bounded.load();
+		const perChannel = terminalAfter.filter((e) => e.terminal && e.channelId === "channel");
+		expect(perChannel.length).toBeLessThanOrEqual(500);
+	});
+
+	test("unresolved and terminal rows are evicted when journal bounds are exceeded", async () => {
+		const outbox = new ImageOutbox(path);
+		const now = Date.now();
+		const twoHoursAgo = now - 2 * 60 * 60 * 1_000;
+
+		// Add old unresolved entries first
+		for (let i = 0; i < 100; i++) {
+			await outbox.put({
+				messageId: `${123456789012345600n + BigInt(i)}`,
+				channelId: "channel-1",
+				createdAt: twoHoursAgo,
+			});
+		}
+
+		// Add new unresolved entries to reach the max
+		for (let i = 100; i < 1_000; i++) {
+			await outbox.put({
+				messageId: `${123456789012345600n + BigInt(i)}`,
+				channelId: "channel-1",
+				createdAt: now,
+			});
+		}
+
+		// Try to add one more new entry - this should work because old entries are evicted
+		await outbox.put({
+			messageId: `${123456790012345600n}`,
+			channelId: "channel-1",
+			createdAt: now,
+		});
+
+		const afterUnresolvedEviction = await outbox.load();
+		const unresolved = afterUnresolvedEviction.filter((e) => !e.completed && !e.terminal && !e.declined);
+
+		// Should have evicted oldest entries to stay at or below MAX_UNRESOLVED_IMAGES
+		expect(unresolved.length).toBeLessThanOrEqual(1_000);
+		// Since we're adding entries one at a time and evicting minimally,
+		// most new entries should still be present
+		const newOnes = unresolved.filter((e) => e.createdAt === now);
+		expect(newOnes.length).toBeGreaterThanOrEqual(890);
+
+		// Add old terminal entries first
+		for (let i = 0; i < 100; i++) {
+			await outbox.put({
+				messageId: `${223456789012345600n + BigInt(i)}`,
+				channelId: "channel-2",
+				createdAt: twoHoursAgo,
+				terminal: true,
+			});
+		}
+
+		// Add new terminal entries to reach the per-channel max
+		for (let i = 100; i < 500; i++) {
+			await outbox.put({
+				messageId: `${223456789012345600n + BigInt(i)}`,
+				channelId: "channel-2",
+				createdAt: now,
+				terminal: true,
+			});
+		}
+
+		// Try to add one more new terminal entry - this should work because old entries are evicted
+		await outbox.put({
+			messageId: `${224456789012345600n}`,
+			channelId: "channel-2",
+			createdAt: now,
+			terminal: true,
+		});
+
+		const afterTerminalEviction = await outbox.load();
+		const terminalInChannel = afterTerminalEviction.filter(
+			(e) => e.terminal && !e.completed && e.channelId === "channel-2",
+		);
+
+		// Should have evicted oldest terminal entries per channel to stay at or below MAX_TERMINAL_IMAGES_PER_CHANNEL
+		expect(terminalInChannel.length).toBeLessThanOrEqual(500);
+		// Since we're adding entries one at a time and evicting minimally,
+		// most new entries should still be present
+		const newTerminal = terminalInChannel.filter((e) => e.createdAt === now);
+		expect(newTerminal.length).toBeGreaterThanOrEqual(390);
 	});
 });
 

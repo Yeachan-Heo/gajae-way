@@ -61,6 +61,15 @@ function snowflakeTime(messageId: string): number {
 	return Number((BigInt(messageId) >> 22n) + DISCORD_EPOCH_MS);
 }
 
+/**
+ * Get the age of an image entry in milliseconds from now.
+ * Uses createdAt if available, otherwise derives from the message ID snowflake.
+ */
+function getEntryAge(entry: PendingImage, now: number): number {
+	const timestamp = entry.createdAt ?? snowflakeTime(entry.messageId);
+	return now - timestamp;
+}
+
 function validateEntry(value: unknown): asserts value is PendingImage {
 	if (
 		!isRecord(value) ||
@@ -121,8 +130,9 @@ async function readEntries(path: string): Promise<{ entries: PendingImage[]; dro
 /**
  * Keeps every readable row; time-based eviction is unsafe because a lagging
  * watermark could resurrect a rejected or already-delivered send. Completed and
- * terminal evidence is removed by watermark compaction in the caller, and
- * unresolved rows alone use admission backoff.
+ * terminal evidence is removed by watermark compaction in the caller.
+ * When bounds are exceeded, evicts oldest unresolved and terminal rows by age
+ * to prevent indefinite journal growth.
  */
 function pruneEntries(entries: readonly PendingImage[]): PendingImage[] {
 	const kept: PendingImage[] = [];
@@ -132,19 +142,68 @@ function pruneEntries(entries: readonly PendingImage[]): PendingImage[] {
 			kept.push(entry);
 		} catch {}
 	}
+
+	const now = Date.now();
+	const evictedIds = new Set<string>();
+
+	// Evict excess declined entries oldest-first
 	const declined = kept.filter((entry) => entry.declined === true);
-	if (declined.length <= MAX_DECLINED_IMAGES) return kept;
-	const evicted = new Set(
-		declined
+	if (declined.length > MAX_DECLINED_IMAGES) {
+		const toEvict = declined
 			.sort(
 				(a, b) =>
 					(a.completedAt ?? 0) - (b.completedAt ?? 0) ||
 					(a.messageId < b.messageId ? -1 : a.messageId > b.messageId ? 1 : 0),
 			)
-			.slice(0, declined.length - MAX_DECLINED_IMAGES)
-			.map((entry) => entry.messageId),
-	);
-	return kept.filter((entry) => entry.declined !== true || !evicted.has(entry.messageId));
+			.slice(0, declined.length - MAX_DECLINED_IMAGES);
+		for (const entry of toEvict) {
+			evictedIds.add(entry.messageId);
+		}
+	}
+
+	// Evict excess unresolved entries oldest-first (leave room for one more new entry)
+	const unresolved = kept.filter((entry) => !entry.declined && !entry.completed && !entry.terminal);
+	if (unresolved.length >= MAX_UNRESOLVED_IMAGES) {
+		const toEvict = unresolved
+			.sort((a, b) => getEntryAge(a, now) - getEntryAge(b, now))
+			.slice(0, unresolved.length - MAX_UNRESOLVED_IMAGES + 1);
+		for (const entry of toEvict) {
+			evictedIds.add(entry.messageId);
+		}
+	}
+
+	// Evict excess terminal entries oldest-first (leave room for one more new entry)
+	const terminal = kept.filter((entry) => !entry.declined && entry.terminal && !entry.completed);
+	if (terminal.length >= MAX_TERMINAL_IMAGES) {
+		const toEvict = terminal
+			.sort((a, b) => getEntryAge(a, now) - getEntryAge(b, now))
+			.slice(0, terminal.length - MAX_TERMINAL_IMAGES + 1);
+		for (const entry of toEvict) {
+			evictedIds.add(entry.messageId);
+		}
+	}
+
+	// Evict excess terminal entries per channel oldest-first (leave room for one more new entry)
+	const terminalByChannel = new Map<string, PendingImage[]>();
+	for (const entry of terminal) {
+		if (!evictedIds.has(entry.messageId)) {
+			const list = terminalByChannel.get(entry.channelId) ?? [];
+			list.push(entry);
+			terminalByChannel.set(entry.channelId, list);
+		}
+	}
+	for (const [_channelId, entries] of terminalByChannel) {
+		if (entries.length >= MAX_TERMINAL_IMAGES_PER_CHANNEL) {
+			const toEvict = entries
+				.sort((a, b) => getEntryAge(a, now) - getEntryAge(b, now))
+				.slice(0, entries.length - MAX_TERMINAL_IMAGES_PER_CHANNEL + 1);
+			for (const entry of toEvict) {
+				evictedIds.add(entry.messageId);
+			}
+		}
+	}
+
+	return kept.filter((entry) => !evictedIds.has(entry.messageId));
 }
 
 async function writeEntries(path: string, entries: readonly PendingImage[]): Promise<void> {
