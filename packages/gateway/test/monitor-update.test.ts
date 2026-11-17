@@ -130,7 +130,7 @@ test("monitor.update RPC returns the stable ID and monitor.inspect reads the cha
 		});
 		const listed = await request("list", "monitor.list", {});
 		expect(listed).toMatchObject({
-			result: { monitors: [{ monitorId: monitor.monitorId, contextRollTokens: 100_000 }] },
+			result: { monitors: [{ monitorId: monitor.monitorId, contextRollTokens: 100_000 }], invalid: [] },
 		});
 		const cleared = await request("clear-budget", "monitor.update", {
 			monitorId: monitor.monitorId,
@@ -168,6 +168,7 @@ test("contextRollTokens validates bounds and round-trips set, omitted and cleare
 				"monitor contextRollTokens is invalid",
 			);
 		const monitor = registry.add({ ...spec, contextRollTokens: 10_000 });
+		expect(registry.get(monitor.monitorId)).toEqual(registry.list().find((row) => row.monitorId === monitor.monitorId));
 		expect(registry.get(monitor.monitorId)?.contextRollTokens).toBe(10_000);
 		expect(database.monitors.rows()[0]?.context_roll_tokens).toBe(10_000);
 		for (const contextRollTokens of [0, 9999, 1.5, 2_000_001, "10000"])
