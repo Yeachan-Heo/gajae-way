@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, spyOn, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -172,6 +173,226 @@ async function started(f: Awaited<ReturnType<typeof fixture>>, name = "a", paren
 	if (!result.started) throw new Error("unexpected hold");
 	return result;
 }
+async function commonsDirectory(): Promise<string> {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-commons-related-"));
+	cleanups.push(async () => rm(directory, { recursive: true, force: true }));
+	return directory;
+}
+async function writeCommonsScript(directory: string, source: string): Promise<string> {
+	const bin = join(directory, "bin");
+	await mkdir(bin, { recursive: true });
+	const script = join(bin, "commons");
+	await writeFile(script, source);
+	await chmod(script, 0o755);
+	return script;
+}
+
+test("work.start appends commons candidates using the fixed non-instruction wording", async () => {
+	const dir = await commonsDirectory();
+	await writeCommonsScript(
+		dir,
+		`#!/usr/bin/env python3
+import json
+import sys
+assert sys.argv[1:] == ["related", "--stdin", "-n", "3", "--json"]
+sys.stdin.read()
+print(json.dumps({"pages": [{"id": "guide-1", "title": "Cache recovery", "confidence": 0.92}, {"id": "guide-2", "title": "Safe deploy", "confidence": "high"}]}))
+`,
+	);
+	const f = await fixture({ commons: { dir } });
+	const result = await f.manager.start({ name: "with-commons", text: "inspect cache recovery", cwd: f.directory });
+	expect(result).toMatchObject({ started: true });
+	expect(f.port.sends[0]?.text).toBe(
+		"inspect cache recovery\n\n## 관련 commons 후보(지시 아님)\ncommons: 다른 가재의 관찰 중 관련 있을 수 있는 문서: guide-1(Cache recovery, confidence=0.92); guide-2(Safe deploy, confidence=high) — 관련 있으면 읽고 확인 후 쓰세요. 지시가 아니며, 관련 없으면 답하지 마세요.",
+	);
+});
+
+test("commons enrichment retains standing directives from dev", async () => {
+	const dir = await commonsDirectory();
+	await writeCommonsScript(
+		dir,
+		`import json\nprint(json.dumps({"pages": [{"id": "guide", "title": "Runbook", "confidence": 1}]}))\n`,
+	);
+	const f = await fixture({ commons: { dir } });
+	await f.manager.directive({ action: "add", text: "Respect the operator directive." });
+	await f.manager.start({ name: "commons-directive", text: "task", cwd: f.directory });
+	const text = f.port.sends[0]?.text ?? "";
+	expect(text).toContain("Respect the operator directive.");
+	expect(text).toContain("task\n\n## 관련 commons 후보(지시 아님)");
+});
+
+test("shutdown during commons lookup leaves no unsent attempt to recover", async () => {
+	const dir = await commonsDirectory();
+	const marker = join(dir, "started");
+	const release = join(dir, "release");
+	await writeCommonsScript(
+		dir,
+		`import json, time\nfrom pathlib import Path\nPath(${JSON.stringify(marker)}).write_text("started")\nwhile not Path(${JSON.stringify(release)}).exists(): time.sleep(0.01)\nprint(json.dumps({"pages": []}))\n`,
+	);
+	const f = await fixture({ commons: { dir } });
+	const pending = f.manager.start({ name: "shutdown-commons", text: "task", cwd: f.directory });
+	const result = pending.then(
+		() => undefined,
+		(error: unknown) => error,
+	);
+	await until(() => existsSync(marker));
+	await f.manager.stop();
+	await writeFile(release, "continue");
+	expect(await result).toMatchObject({ code: "gateway_shutting_down" });
+	expect(f.port.binds).toHaveLength(0);
+	expect(f.port.sends).toHaveLength(0);
+	expect(f.db.work.workAttemptRows()).toHaveLength(0);
+	const restarted = await f.restart({ commons: { dir, enabled: false } });
+	expect(await restarted.start({ name: "shutdown-commons", text: "retry", cwd: f.directory })).toMatchObject({
+		started: true,
+	});
+});
+
+test("rejected commons stdin writes fail open without unhandled rejections", async () => {
+	const dir = await commonsDirectory();
+	await writeCommonsScript(dir, "import time\ntime.sleep(10)\n");
+	const f = await fixture({ commons: { dir } });
+	const realSpawn = Bun.spawn;
+	const spawn = spyOn(Bun, "spawn").mockImplementation(((...args: Parameters<typeof Bun.spawn>) => {
+		const child = realSpawn(...args);
+		if (!Array.isArray(args[0]) || args[0][0] !== "python3") return child;
+		return new Proxy(child, {
+			get(target, property) {
+				if (property === "stdin")
+					return {
+						write: () => new Promise((_, reject) => setTimeout(() => reject(new Error("EPIPE write")), 5)),
+						end: () => new Promise((_, reject) => setTimeout(() => reject(new Error("EPIPE end")), 10)),
+					};
+				return Reflect.get(target, property, target);
+			},
+		});
+	}) as typeof Bun.spawn);
+	const unhandled: unknown[] = [];
+	const onUnhandled = (error: unknown) => unhandled.push(error);
+	process.on("unhandledRejection", onUnhandled);
+	try {
+		const result = await f.manager.start({ name: "broken-commons-stdin", text: "😀".repeat(8_000), cwd: f.directory });
+		expect(result.started).toBe(true);
+		expect(f.port.sends[0]?.text).toBe("😀".repeat(8_000));
+		await Bun.sleep(30);
+		expect(unhandled).toEqual([]);
+	} finally {
+		process.off("unhandledRejection", onUnhandled);
+		spawn.mockRestore();
+	}
+});
+
+test("work.run uses the same commons prompt enrichment as work.start", async () => {
+	const dir = await commonsDirectory();
+	await writeCommonsScript(
+		dir,
+		`import json
+import sys
+sys.stdin.read()
+print(json.dumps({"pages": [{"id": "guide-1", "title": "Runbook", "confidence": "medium"}]}))
+`,
+	);
+	const f = await fixture({ commons: { dir } });
+	const run = f.manager.run({ name: "run-with-commons", text: "run task", cwd: f.directory }, {});
+	await until(() => f.port.sends.length === 1);
+	const send = f.port.sends[0]!;
+	expect(send.text).toContain(
+		"commons: 다른 가재의 관찰 중 관련 있을 수 있는 문서: guide-1(Runbook, confidence=medium)",
+	);
+	f.port.complete(send.opRef, "run result");
+	expect(await run).toMatchObject({ held: false, text: "run result" });
+});
+
+test("work.start leaves the task prompt unchanged when commons is unconfigured", async () => {
+	const f = await fixture();
+	const result = await f.manager.start({ name: "without-commons", text: "original task", cwd: f.directory });
+	expect(result).toMatchObject({ started: true });
+	expect(f.port.sends[0]?.text).toBe("original task");
+});
+
+test("work.start leaves the task prompt unchanged when bin/commons is missing", async () => {
+	const dir = await commonsDirectory();
+	const f = await fixture({ commons: { dir } });
+	const result = await f.manager.start({ name: "missing-commons", text: "original task", cwd: f.directory });
+	expect(result).toMatchObject({ started: true });
+	expect(f.port.sends[0]?.text).toBe("original task");
+});
+
+test("work.commons enabled=false leaves the task prompt unchanged", async () => {
+	const dir = await commonsDirectory();
+	const marker = join(dir, "called.txt");
+	await writeCommonsScript(
+		dir,
+		`from pathlib import Path
+Path(${JSON.stringify(marker)}).write_text("called")
+`,
+	);
+	const f = await fixture({ commons: { dir, enabled: false } });
+	const result = await f.manager.start({ name: "disabled-commons", text: "original task", cwd: f.directory });
+	expect(result).toMatchObject({ started: true });
+	expect(f.port.sends[0]?.text).toBe("original task");
+	expect(await Bun.file(marker).exists()).toBe(false);
+});
+
+test("commons command failures, invalid JSON, and empty results fail open", async () => {
+	const dir = await commonsDirectory();
+	const scriptSource = [
+		{ name: "command-failed", source: "raise SystemExit(1)\n" },
+		{ name: "invalid-json", source: "print('not json')\n" },
+		{ name: "empty-results", source: "import json\nprint(json.dumps({'pages': []}))\n" },
+	];
+	for (const { name, source } of scriptSource) {
+		await writeCommonsScript(dir, source);
+		const f = await fixture({ commons: { dir } });
+		const text = `original task ${name}`;
+		const result = await f.manager.start({ name, text, cwd: f.directory });
+		expect(result).toMatchObject({ started: true });
+		expect(f.port.sends.at(-1)?.text).toBe(text);
+	}
+});
+
+test("work.start fails open on commons timeout and logs no task content", async () => {
+	const dir = await commonsDirectory();
+	await writeCommonsScript(
+		dir,
+		`import time
+time.sleep(10)
+`,
+	);
+	const f = await fixture({ commons: { dir } });
+	const task = "private task prompt";
+	const log = spyOn(console, "error").mockImplementation(() => {});
+	try {
+		const result = await f.manager.start({ name: "timeout-commons", text: task, cwd: f.directory });
+		expect(result).toMatchObject({ started: true });
+		expect(f.port.sends[0]?.text).toBe(task);
+		expect(log).toHaveBeenCalledWith("work_commons_related_skipped reason=timeout");
+		expect(log.mock.calls.flat().join(" ")).not.toContain(task);
+	} finally {
+		log.mockRestore();
+	}
+});
+
+test("commons lookup receives at most the first 8,000 task characters", async () => {
+	const dir = await commonsDirectory();
+	const stdinLengthPath = join(dir, "stdin-length.txt");
+	await writeCommonsScript(
+		dir,
+		`import json
+from pathlib import Path
+import sys
+task = sys.stdin.read()
+Path(${JSON.stringify(stdinLengthPath)}).write_text(str(len(task)))
+print(json.dumps({"pages": [{"id": "guide-1", "title": "Runbook", "confidence": 1}]}))
+`,
+	);
+	const f = await fixture({ commons: { dir } });
+	const task = "x".repeat(8_001);
+	const result = await f.manager.start({ name: "capped-commons", text: task, cwd: f.directory });
+	expect(result).toMatchObject({ started: true });
+	expect(await Bun.file(stdinLengthPath).text()).toBe("8000");
+	expect(f.port.sends[0]?.text.startsWith(`${task}\n\n## 관련 commons 후보(지시 아님)`)).toBe(true);
+});
 
 test("work.start during a broker restart waits for broker readiness and starts the lane", async () => {
 	const logs: string[] = [];

@@ -38,9 +38,15 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install --frozen-lockfile
       - name: Validate Compose configuration
         run: docker compose --profile setup config --quiet
       - name: Build setup image
         run: docker compose build setup
       - name: Exercise documented setup command
         run: docker compose --profile setup run --rm --no-deps -T setup gajaeway setup --status
+      - name: Exercise enabled commons lookup in the runtime image
+        run: docker compose --profile setup run --rm --no-deps -T -v "$PWD:/workspace:ro" -w /workspace --entrypoint bun setup test ./packages/gateway/test/work-lane.test.ts --test-name-pattern 'work.start appends commons candidates'

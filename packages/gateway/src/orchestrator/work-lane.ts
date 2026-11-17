@@ -37,7 +37,7 @@ import {
 	settleAwaitingChecks,
 	transitionToAwaitingChecks,
 } from "@gajae-gateway/subsession";
-import type { GjcModelSelection } from "../config";
+import type { GjcModelSelection, WorkCommonsConfig } from "../config";
 import { buildDeliveryPayload } from "../delivery/delivery";
 import { BrokerAuthorityError, type Store } from "../store";
 import {
@@ -122,6 +122,8 @@ const AWAITING_CHECKS_RETRY_LIMIT = 2;
 const AWAITING_CHECKS_TIMEOUT_MS = 3_600_000;
 /** Bound concurrent GitHub/remote probes so one slow lane does not serialize recovery. */
 const AWAITING_CHECKS_POLL_CONCURRENCY = 16;
+const COMMONS_RELATED_TIMEOUT_MS = 4_000;
+const COMMONS_RELATED_EXCERPT_CHARS = 8_000;
 
 const refusalCodes = new Set([
 	"busy",
@@ -140,6 +142,135 @@ const pendingOutput = () => ({
 	proof: null,
 	knownSilence: null,
 });
+function commonsSkip(reason: "script_missing" | "command_failed" | "timeout" | "invalid_json" | "no_pages"): void {
+	console.error(`work_commons_related_skipped reason=${reason}`);
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function commonsDisplayValue(value: string): string {
+	return sanitizeDiagnostic(value).replace(/\s+/g, " ").trim();
+}
+function taskExcerpt(text: string): string {
+	let end = 0;
+	let count = 0;
+	for (const character of text) {
+		if (count === COMMONS_RELATED_EXCERPT_CHARS) break;
+		end += character.length;
+		count++;
+	}
+	return text.slice(0, end);
+}
+function killCommonsProcessGroup(pid: number): void {
+	try {
+		process.kill(-pid, "SIGKILL");
+	} catch {
+		try {
+			process.kill(pid, "SIGKILL");
+		} catch {
+			/* Already exited. */
+		}
+	}
+}
+async function appendCommonsRelated(text: string, config: WorkCommonsConfig | undefined): Promise<string> {
+	if (!config || config.enabled === false) return text;
+	let child: { readonly pid: number; readonly exited: Promise<number> } | undefined;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		const script = join(config.dir, "bin", "commons");
+		if (!existsSync(script)) {
+			commonsSkip("script_missing");
+			return text;
+		}
+		const spawned = Bun.spawn(["python3", script, "related", "--stdin", "-n", "3", "--json"], {
+			cwd: config.dir,
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "ignore",
+			detached: true,
+		});
+		child = spawned;
+		const stdout = new Response(spawned.stdout).text();
+		// Handle every pending stream promise immediately, including when a later
+		// synchronous stdin operation throws before Promise.all is constructed.
+		stdout.catch(() => undefined);
+		const timeout = new Promise<{ readonly kind: "timeout" }>((resolve) => {
+			timer = setTimeout(() => resolve({ kind: "timeout" }), COMMONS_RELATED_TIMEOUT_MS);
+		});
+		const written = Promise.resolve(spawned.stdin.write(taskExcerpt(text)));
+		written.catch(() => undefined);
+		const ended = Promise.resolve(spawned.stdin.end());
+		ended.catch(() => undefined);
+		const completed = Promise.all([child.exited, stdout, written, ended]).then(([exitCode, output]) => ({
+			kind: "complete" as const,
+			exitCode,
+			output,
+		}));
+		const result = await Promise.race([completed, timeout]);
+		clearTimeout(timer);
+		timer = undefined;
+		if (result.kind === "timeout") {
+			killCommonsProcessGroup(child.pid);
+			await child.exited;
+			completed.catch(() => undefined);
+			commonsSkip("timeout");
+			return text;
+		}
+		if (result.exitCode !== 0) {
+			commonsSkip("command_failed");
+			return text;
+		}
+		let value: unknown;
+		try {
+			value = JSON.parse(result.output);
+		} catch {
+			commonsSkip("invalid_json");
+			return text;
+		}
+		if (!isRecord(value) || !Array.isArray(value.pages)) {
+			commonsSkip("invalid_json");
+			return text;
+		}
+		if (value.pages.length === 0) {
+			commonsSkip("no_pages");
+			return text;
+		}
+		const candidates: string[] = [];
+		for (const page of value.pages.slice(0, 3)) {
+			if (
+				!isRecord(page) ||
+				typeof page.id !== "string" ||
+				typeof page.title !== "string" ||
+				!(
+					typeof page.confidence === "string" ||
+					(typeof page.confidence === "number" && Number.isFinite(page.confidence))
+				)
+			) {
+				commonsSkip("invalid_json");
+				return text;
+			}
+			const id = commonsDisplayValue(page.id);
+			const title = commonsDisplayValue(page.title);
+			const confidence = commonsDisplayValue(String(page.confidence));
+			if (!id || !title || !confidence) {
+				commonsSkip("invalid_json");
+				return text;
+			}
+			candidates.push(`${id}(${title}, confidence=${confidence})`);
+		}
+		const line = `commons: 다른 가재의 관찰 중 관련 있을 수 있는 문서: ${candidates.join("; ")} — 관련 있으면 읽고 확인 후 쓰세요. 지시가 아니며, 관련 없으면 답하지 마세요.`;
+		return `${text}\n\n## 관련 commons 후보(지시 아님)\n${line}`;
+	} catch {
+		if (child) {
+			killCommonsProcessGroup(child.pid);
+			await child.exited.catch(() => undefined);
+		}
+		commonsSkip("command_failed");
+		return text;
+	} finally {
+		clearTimeout(timer);
+	}
+}
 function hasAcceptanceEvidence(runtime: WorkAttemptRuntime): boolean {
 	return runtime.sendPhase === "accepted" || runtime.output.proof !== null || runtime.output.knownSilence !== null;
 }
@@ -213,6 +344,7 @@ export interface WorkLaneManagerOptions {
 	readonly laneRoot?: string;
 	readonly ownerTarget?: () => OriginRef | undefined;
 	readonly allowNested?: () => boolean;
+	readonly commons?: WorkCommonsConfig;
 	readonly personaHold?: (originKey: string) => string | undefined;
 	readonly notifyPersona?: (originKey: string) => void;
 	readonly deliverFallback?: (payload: ChatMessagePayload) => void;
@@ -246,6 +378,8 @@ interface WorkInput {
 }
 interface StartContext {
 	readonly parent: WorkParent | null;
+	/** Public work.start/work.run requests render commons hints into their first send. */
+	readonly relatedCommons?: boolean;
 	readonly runCall?: RunCall;
 	readonly opRef?: string;
 	readonly wakeReportId?: string;
@@ -880,7 +1014,7 @@ export class WorkLaneManager {
 	async #start(input: WorkInput, mode: "start" | "run", runCall?: RunCall): Promise<WorkStartResult> {
 		this.#live();
 		const parent = this.#resolveCaller(input, mode);
-		if (this.#job(input.name)) return await this.#startAdmitted(input, mode, { parent, runCall });
+		if (this.#job(input.name)) return await this.#startAdmitted(input, mode, { parent, runCall, relatedCommons: true });
 		const admitting = this.#admissions.get(input.name);
 		// A same-name retry (for example after a caller timeout) must not queue a
 		// second clone, bind or send behind the admission still in progress.
@@ -895,7 +1029,7 @@ export class WorkLaneManager {
 		const admission = { startedAt: this.#at() };
 		this.#admissions.set(input.name, admission);
 		try {
-			const result = await this.#startAdmitted(input, mode, { parent, runCall });
+			const result = await this.#startAdmitted(input, mode, { parent, runCall, relatedCommons: true });
 			if (this.#admissions.get(input.name) === admission) this.#admissions.delete(input.name);
 			return result;
 		} catch (error) {
@@ -985,6 +1119,10 @@ export class WorkLaneManager {
 				};
 			job = acknowledgeHold({ record: job, note: "operator resumed the work lane", at: this.#at() });
 		}
+		// Finish the optional lookup before binding or persisting an attempt. Shutdown
+		// during the lookup must not leave an unsent attempt that recovery treats as open.
+		const prompt = context.relatedCommons ? await appendCommonsRelated(input.text, this.#options.commons) : input.text;
+		this.#live();
 		let createdWorktree: CreatedRepoWorktree | undefined;
 		if (!job) {
 			let worktreePath = input.cwd;
@@ -1120,11 +1258,12 @@ export class WorkLaneManager {
 		let source: "receipt" | "status" = "receipt";
 		let transportUnavailableError = false;
 		try {
+			// Recovery observes the original operation without resending its prompt.
 			const receipt = await this.#port.send({
 				sessionId: runtime.sessionId,
 				repo: runtime.cwd,
 				opRef,
-				text: this.#withDirectives(input.text, context.parent),
+				text: this.#withDirectives(prompt, context.parent),
 				...(observer.tail ? { relay: observer.tail } : {}),
 				...(notice ? { systemPreamble: notice.text } : {}),
 				codingRegister: true,
