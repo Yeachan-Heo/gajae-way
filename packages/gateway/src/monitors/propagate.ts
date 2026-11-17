@@ -2108,7 +2108,7 @@ export class MonitorPropagator {
 				}
 				if (hasContractUnmetFailure) {
 					// Track contract failures for potential escalation
-					this.#trackConsecutiveFailedEvent(sessionOriginKey, monitor.monitorId);
+					this.#trackConsecutiveFailedEvent(sessionOriginKey, monitor.monitorId, boundSessionEpoch ?? 0);
 				} else if (validDeliveryEntries.length === 0) {
 					// Dispatch succeeded with no failures and no contract_unmet: clear the failed event streak (issue #780)
 					this.#clearConsecutiveFailedEventCount(sessionOriginKey, monitor.monitorId);
@@ -2881,9 +2881,10 @@ export class MonitorPropagator {
 			const prefix = sessionOriginKey ? `monitor_retired_session:${sessionOriginKey}:` : "monitor_retired_session:";
 			const records = this.#database.core.metaKeysInRange(prefix, `${prefix}\uffff`).flatMap((key) => {
 				const raw = this.#database.core.metaGet(key);
-				let record = raw === undefined ? undefined : parseRetiredSession(raw);
+				if (raw === undefined) return [];
+				let record = parseRetiredSession(raw);
 				// Repair an invalid logical counter without granting authority to any other invalid fields.
-				if (!record && raw !== undefined) {
+				if (!record) {
 					try {
 						const value = JSON.parse(raw);
 						if (value && typeof value === "object" && "lastAttemptAt" in value) {
@@ -2902,7 +2903,7 @@ export class MonitorPropagator {
 				} catch {
 					return [];
 				}
-				return [{ key, raw: raw!, record, sessionOriginKey: recordOriginKey }];
+				return [{ key, raw, record, sessionOriginKey: recordOriginKey }];
 			});
 			records.sort(
 				(a, b) =>

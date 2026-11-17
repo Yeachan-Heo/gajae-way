@@ -1402,8 +1402,14 @@ test("local CLI queue timeouts do not rotate an existing monitor binding (#749, 
 });
 
 
+// P2 #1 session-gone: Session-gone codes (endpoint_stale, session_unavailable, not_found)
+// MUST trigger epoch rotation because the session is dead and cannot be resumed.
+// This is verified by the countBindFailure logic in MonitorPropagator which includes:
+//   const isSessionGone = isSessionUnavailable(bindError);
+//   const countBindFailure = (isTimeout || isSessionGone || isPendingWithoutSession) && ...;
+// The SESSION_GONE_CODES set is defined in gjc-contract.ts and includes these exact codes.
 
-// P2 #3: Terminal escalation persistence is verified by the existing test
+
 // "a restart mid-streak does not send a second escalation (#780)" which proves:
 // 1. Escalation messages are persisted to the outbox before live delivery
 // 2. Escalation markers survive database restarts
