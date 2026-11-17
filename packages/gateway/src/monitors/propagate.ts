@@ -706,6 +706,9 @@ export class MonitorPropagator {
 				// confirmation that cannot come (#94): settle it as authored_no_delivery.
 				if (output && !hasMemory && row.stage !== "authored")
 					this.#author(row.event_id, output, row.stage === "authored_no_delivery" || isSilentOutput(output), row);
+				else if (output && !hasMemory && row.stage === "authored" && !isSilentOutput(output))
+					// Idempotent re-authoring for memory repair: already-authored non-silent events
+					this.#author(row.event_id, output, false, row);
 				else if (output && row.stage === "authored" && isSilentOutput(output))
 					this.#database.transaction((tx) =>
 						this.#database.monitors.eventUpdate(tx, row.event_id, "authored_no_delivery"),
@@ -2729,9 +2732,10 @@ export class MonitorPropagator {
 		const monitor = this.#registry.get(eventRow.monitor_id);
 		const reportable = Boolean(monitor?.reportTo && this.#isReportableResult(monitor, eventRow, note));
 		const intentId = `monitor-event-intent:${eventId}`;
-		const authored = this.#database.transaction((tx) => {
+		const result = this.#database.transaction((tx) => {
 			const updated = this.#database.monitors.authorFenced(tx, eventId, "", note, noDelivery);
-			if (!updated) return false;
+			// Decouple memory-intent repair from permission to replace the answer.
+			// Always ensure memory intent exists if it doesn't, even if the row update failed.
 			if (!this.#database.memory.get(intentId))
 				this.#database.memory.createIntent(tx, {
 					id: intentId,
@@ -2745,13 +2749,13 @@ export class MonitorPropagator {
 					}),
 				});
 			if (reportable && monitor) this.#enqueueMonitorReport(tx, monitor, eventRow, note);
-			return true;
+			return updated;
 		});
-		if (!authored) return;
-		// Wake the closure queue for the intent admitted above.
+		// Wake the closure queue for the intent (always, even if row update failed).
 		this.#memory.enqueueExistingId(intentId);
 		if (reportable && monitor?.reportTo) this.#notifyMonitorReport(monitor.reportTo);
-		this.#emitStage(eventRow, noDelivery ? "authored_no_delivery" : "authored");
+		// Only emit stage if the row was actually updated.
+		if (result) this.#emitStage(eventRow, noDelivery ? "authored_no_delivery" : "authored");
 	}
 	#recordReadinessSuccess(originKey: string): void {
 		try {
