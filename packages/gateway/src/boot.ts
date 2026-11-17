@@ -187,6 +187,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Boo
 				cli: broker.cli,
 				tailRunner,
 				authority,
+				brokerGeneration: () => supervisor.generation,
 			});
 			const close = async () => {
 				try {

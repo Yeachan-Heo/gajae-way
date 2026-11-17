@@ -48,6 +48,16 @@ import {
 	type TerminateHostOutcome,
 } from "./session-port";
 import {
+	currentSweep,
+	outsideSweep,
+	SWEEP_MAILBOX_WAIT_MS,
+	SWEEP_UNIT_SLOW_MS,
+	SweepLimiter,
+	type SweepTurn,
+	SweepTurns,
+	sweepControl,
+} from "./sweep-limiter";
+import {
 	deterministicInterimDeliveryId,
 	isRelayTransportFailure,
 	MAX_RELAY_REQUEST_FRAME_BYTES,
@@ -804,6 +814,8 @@ export interface PersonaSessionManagerOptions {
 	readonly now?: () => number;
 	readonly setTimeout?: (work: () => void, delayMs: number) => unknown;
 	readonly clearTimeout?: (timer: unknown) => void;
+	/** Process-wide sweep admission shared with the other sweep drivers; a private one when omitted. */
+	readonly sweep?: SweepLimiter;
 	/** Pause before the single re-send of a turn that failed in its submission phase. */
 	readonly submissionRetryDelayMs?: number;
 	/** Builds the server delivery/bootstrap lifecycle before an accepted SDK send. */
@@ -924,6 +936,10 @@ export class PersonaSessionManager {
 	readonly #now: () => number;
 	readonly #setTimeout: (work: () => void, delayMs: number) => unknown;
 	readonly #clearTimeout: (timer: unknown) => void;
+	readonly #sweep: SweepLimiter;
+	readonly #sweepTurns = new SweepTurns();
+	/** The one in-flight recovery sweep; a second caller joins it instead of fanning out again. */
+	#recovering: Promise<void> | undefined;
 	readonly #submissionRetryDelayMs: number;
 	readonly #onTurnStart: PersonaSessionManagerOptions["onTurnStart"];
 	readonly #onInboundDiscard: PersonaSessionManagerOptions["onInboundDiscard"];
@@ -972,6 +988,7 @@ export class PersonaSessionManager {
 		this.#setTimeout = options.setTimeout ?? ((work: () => void, delayMs: number) => setTimeout(work, delayMs));
 		this.#clearTimeout =
 			options.clearTimeout ?? ((timer: unknown) => clearTimeout(timer as ReturnType<typeof setTimeout>));
+		this.#sweep = options.sweep ?? new SweepLimiter();
 		this.#submissionRetryDelayMs = options.submissionRetryDelayMs ?? SUBMISSION_RETRY_DELAY_MS;
 		this.#onTurnStart = options.onTurnStart;
 		this.#onInboundDiscard = options.onInboundDiscard;
@@ -1040,6 +1057,10 @@ export class PersonaSessionManager {
 		return this.#stopped;
 	}
 
+	get sweepLimiter(): SweepLimiter {
+		return this.#sweep;
+	}
+
 	get draining(): boolean {
 		return this.#draining;
 	}
@@ -1061,7 +1082,109 @@ export class PersonaSessionManager {
 		if (this.#stopped) return Promise.resolve();
 		this.#port.checkStalls(this.#now());
 		const actors = originKey ? [this.#actor(originKey)] : [...this.#actors.values()];
-		return Promise.all(actors.map((actor) => actor.enqueue(async () => await actor.tick()))).then(() => undefined);
+		return this.#sweepActors("tick", actors, async (actor) => await actor.tick()).then(() => undefined);
+	}
+
+	/**
+	 * Runs one sweep unit per actor, one origin at a time: each unit holds the
+	 * driver's sweep turn (taken outside the mailboxes), so the next origin
+	 * starts only when the current unit finished or is inside a control
+	 * operation. A unit whose busy mailbox does not start it within
+	 * SWEEP_MAILBOX_WAIT_MS is deferred: it reads and applies nothing, and the
+	 * next sweep visits the origin again. Resolves with the actors whose unit
+	 * ran once every started unit finished; rejects like the former fan-out
+	 * when a unit fails.
+	 */
+	async #sweepActors(
+		driver: string,
+		actors: readonly OriginActor[],
+		work: (actor: OriginActor) => Promise<void>,
+	): Promise<OriginActor[]> {
+		const startedAt = this.#now();
+		const turns: SweepTurn[] = [];
+		let deferred = 0;
+		const started: Array<Promise<OriginActor>> = [];
+		for (const actor of actors) {
+			if (this.#stopped) {
+				break;
+			}
+			const turn = this.#sweepTurns.tryTake() ?? (await this.#sweepTurns.take());
+			turns.push(turn);
+			// An idle mailbox starts the unit on its next turn; only a busy one can defer it.
+			const unit = actor.mailboxBusy
+				? await this.#startBusySweepUnit(driver, actor, turn, work)
+				: {
+						done: actor.enqueueSweep(
+							turn,
+							() => true,
+							async () => await work(actor),
+						),
+					};
+			if (!unit) {
+				deferred++;
+				continue;
+			}
+			const finished = unit.done.then(() => actor);
+			// Observed by Promise.all below; the loop keeps starting other units meanwhile.
+			finished.catch(() => {});
+			started.push(finished);
+		}
+		try {
+			const results = await Promise.allSettled(started);
+			const failure = results.find((result) => result.status === "rejected");
+			if (failure?.status === "rejected") throw failure.reason;
+			return results.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []));
+		} finally {
+			if (actors.length > 0)
+				this.#log(
+					`persona_recovery_sweep driver=${driver} origins=${actors.length} started=${started.length} deferred=${deferred} probes=${turns.reduce((sum, turn) => sum + turn.readCount, 0)} handed_on=${turns.filter((turn) => turn.handedOn).length} duration_ms=${this.#now() - startedAt}`,
+				);
+		}
+	}
+
+	/**
+	 * A busy mailbox gets SWEEP_MAILBOX_WAIT_MS to reach the unit; otherwise the
+	 * origin is deferred and the turn goes to the next origin. Returns the
+	 * started unit (wrapped: awaiting it must not wait for the unit to finish),
+	 * or undefined when deferred.
+	 */
+	async #startBusySweepUnit(
+		driver: string,
+		actor: OriginActor,
+		turn: SweepTurn,
+		work: (actor: OriginActor) => Promise<void>,
+	): Promise<{ readonly done: Promise<unknown> } | undefined> {
+		let abandoned = false;
+		let started = false;
+		let signal!: () => void;
+		const decided = new Promise<void>((resolve) => {
+			signal = resolve;
+		});
+		const timer = this.#setTimeout(signal, SWEEP_MAILBOX_WAIT_MS);
+		const unit = actor.enqueueSweep(
+			turn,
+			() => {
+				if (abandoned) return false;
+				started = true;
+				signal();
+				return true;
+			},
+			async () => await work(actor),
+		);
+		// A stopped actor never runs the task: its settled promise decides too.
+		void unit.then(signal, signal);
+		await decided;
+		this.#clearTimeout(timer);
+		if (started) return { done: unit };
+		abandoned = true;
+		turn.release();
+		if (!this.#stopped && !actor.stopped)
+			this.#log(
+				`sweep_origin_deferred origin=${actor.originKey} driver=${driver} reason=mailbox_busy wait_ms=${SWEEP_MAILBOX_WAIT_MS}`,
+				"warn",
+			);
+		void unit.catch(() => {});
+		return undefined;
 	}
 
 	setStallTimeoutMs(timeoutMs: number | undefined): void {
@@ -1122,7 +1245,12 @@ export class PersonaSessionManager {
 	 * caller holds its trigger instead of spawning a process the machine
 	 * cannot afford.
 	 */
-	async admitHost(requester: OriginActor): Promise<HostAdmission> {
+	admitHost(requester: OriginActor): Promise<HostAdmission> {
+		// Retiring a candidate waits on another origin's mailbox: never with a sweep slot held.
+		return sweepControl(() => this.#admitHost(requester));
+	}
+
+	async #admitHost(requester: OriginActor): Promise<HostAdmission> {
 		const reservation = this.#hostAdmissionReservations.get(requester);
 		if (reservation === "free") return { admitted: true };
 		const live = [...this.#actors.values()].filter((actor) => actor !== requester && actor.hostLive);
@@ -1187,14 +1315,15 @@ export class PersonaSessionManager {
 	/** Ends hosts that have sat idle past `hostIdleRetireMs`; returns how many were ended. */
 	async sweepIdleHosts(now = this.#now()): Promise<number> {
 		if (this.#stopped) return 0;
-		for (const actor of this.#actors.values()) await actor.enqueue(async () => await actor.sweepObserver(now));
+		await this.#sweepActors("observer", [...this.#actors.values()], async (actor) => await actor.sweepObserver(now));
 		const stale = [...this.#actors.values()].filter(
 			(actor) => actor.hostIdle && now - actor.hostLastActiveAt >= this.#hostIdleRetireMs,
 		);
+		// Idle retirement reads the host's running jobs before ending it: sweep reads too.
 		let retired = 0;
-		for (const actor of stale) {
-			if (await actor.enqueue(async () => await actor.retireIdleHost("host_idle"))) retired++;
-		}
+		await this.#sweepActors("host_idle", stale, async (actor) => {
+			if (await actor.retireIdleHost("host_idle")) retired++;
+		});
 		return retired;
 	}
 
@@ -1205,7 +1334,10 @@ export class PersonaSessionManager {
 	 */
 	reset(originKey: string, originRefJson: string, floorAt = new Date(this.#now()).toISOString()): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
-		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).reset(originRefJson, floorAt));
+		const sweep = currentSweep();
+		return this.#actor(originKey).enqueue(
+			async () => await this.#actor(originKey).reset(originRefJson, floorAt, sweep),
+		);
 	}
 
 	/**
@@ -1226,6 +1358,15 @@ export class PersonaSessionManager {
 	 */
 	recover(): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
+		if (this.#recovering) return this.#recovering;
+		const recovery = this.#recoverOrigins().finally(() => {
+			if (this.#recovering === recovery) this.#recovering = undefined;
+		});
+		this.#recovering = recovery;
+		return recovery;
+	}
+
+	async #recoverOrigins(): Promise<void> {
 		const origins = new Set<string>([
 			...escalationNoticeOrigins(this.#database),
 			...this.#database.inbox.nonterminalOrigins(),
@@ -1242,18 +1383,18 @@ export class PersonaSessionManager {
 				)
 				.map((row) => row.origin_key),
 		]);
-		return Promise.all(
-			[...origins].map((originKey) =>
-				this.#actor(originKey).enqueue(async () => {
-					await this.#actor(originKey).recover();
-					await this.#actor(originKey).reconcile();
-					await this.#actor(originKey).recoverObserver();
-					// Pending rows outside a turn (released before the restart, or
-					// arrived while down) are dispatched now; nothing is expired.
-					await this.#actor(originKey).admit();
-				}),
-			),
-		).then(() => undefined);
+		await this.#sweepActors(
+			"recover",
+			[...origins].map((originKey) => this.#actor(originKey)),
+			async (actor) => {
+				await actor.recover();
+				await actor.reconcile();
+				await actor.recoverObserver();
+				// Admission is ordinary mailbox work and must proceed even if another origin fails.
+				await sweepControl(async () => await actor.admit());
+			},
+		);
+		// Deferred origins are admitted by their next inbound message or the next sweep.
 	}
 
 	/** Tail gaps and broker replacements reconcile status; tail is never terminal authority. */
@@ -1264,9 +1405,14 @@ export class PersonaSessionManager {
 
 	onBrokerGeneration(generation: number): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
-		return Promise.all(
-			[...this.#actors.values()].map((actor) => actor.enqueue(async () => await actor.onBrokerGeneration(generation))),
-		).then(() => undefined);
+		const actors = [...this.#actors.values()];
+		// The fence is local (no CLI child) and never deferred; only the status
+		// reconciliation that follows it takes the sweep slot. A deferred origin's
+		// fenced turns are reconciled by the next recovery sweep.
+		const fences = actors.map((actor) => actor.enqueue(async () => await actor.fenceBrokerGeneration(generation)));
+		return this.#sweepActors("broker_generation", actors, async (actor) => await actor.reconcileFenced(generation))
+			.then(async () => await Promise.all(fences))
+			.then(() => undefined);
 	}
 
 	state(originKey: string): PersonaActorState {
@@ -1856,15 +2002,60 @@ class OriginActor {
 		}
 	}
 
+	/**
+	 * Mailbox work never inherits a sweep scope: a task a sweep unit merely
+	 * schedules (a timer, a tail callback, a later admit) is ordinary work.
+	 */
 	enqueue<T>(work: () => Promise<T>): Promise<T | undefined> {
+		return this.#enqueueTask(() => outsideSweep(work));
+	}
+
+	/**
+	 * One sweep unit: `begin` runs when the mailbox reaches the task and returns
+	 * false when the driver already gave up (the unit then reads and applies
+	 * nothing). Otherwise `work` runs in sweep scope holding the driver's turn,
+	 * which is released when it ends.
+	 */
+	enqueueSweep(turn: SweepTurn, begin: () => boolean, work: () => Promise<void>): Promise<unknown> {
+		const unit = this.#enqueueTask(async () => {
+			if (!begin() || !turn.held) {
+				this.#manager.log(`sweep_closure_abandoned origin=${this.originKey}`, "warn");
+				return;
+			}
+			const startedAt = this.#manager.now();
+			await this.#manager.sweepLimiter.runTurn(turn, work);
+			const heldMs = this.#manager.now() - startedAt;
+			if (heldMs >= SWEEP_UNIT_SLOW_MS)
+				this.#manager.log(`sweep_unit_slow origin=${this.originKey} held_ms=${heldMs}`, "warn");
+		});
+		// A unit that never runs (a stopped actor or manager) must not keep the turn.
+		return unit.finally(() => turn.release());
+	}
+
+	get stopped(): boolean {
+		return this.#stopped || this.#manager.stopped;
+	}
+
+	/** True while earlier mailbox tasks are queued or running. */
+	get mailboxBusy(): boolean {
+		return this.#queuedTasks > 0;
+	}
+
+	#queuedTasks = 0;
+
+	#enqueueTask<T>(work: () => Promise<T>): Promise<T | undefined> {
 		if (this.#stopped || this.#manager.stopped) return Promise.resolve(undefined);
+		this.#queuedTasks++;
 		const task = this.#queue.then(() => {
 			if (this.#stopped || this.#manager.stopped) return undefined;
 			return work();
 		});
 		this.#queue = task.then(
-			() => undefined,
+			() => {
+				this.#queuedTasks--;
+			},
 			(error) => {
+				this.#queuedTasks--;
 				this.#manager.log(`persona actor ${this.originKey} failed: ${safeDiagnostic(error)}`, "error");
 			},
 		);
@@ -1894,7 +2085,7 @@ class OriginActor {
 		for (const retired of [...this.#retired.values()]) await this.#reconcileBound(retired);
 	}
 
-	async reset(originRefJson: string, floorAt: string): Promise<void> {
+	async reset(originRefJson: string, floorAt: string, sweep?: SweepLimiter): Promise<void> {
 		await this.#closeObserver("reset");
 		const previous = this.#current;
 		// The binding being rotated away from. Read before bumpEpoch clears it: if
@@ -1940,7 +2131,11 @@ class OriginActor {
 		// With a retired turn still pending, its reconcile ends the host once the
 		// answer is settled; #terminateRetiredSession sees it in #retired and waits.
 		// With nothing in flight, this is the only place that will ever do it.
-		if (previousSessionId) await this.#terminateRetiredSession(previousSessionId, "reset");
+		if (previousSessionId) {
+			const terminate = async () => await this.#terminateRetiredSession(previousSessionId, "reset");
+			if (sweep) await sweep.run(terminate);
+			else await terminate();
+		}
 		await this.#dispatchNext();
 	}
 
@@ -2662,7 +2857,13 @@ class OriginActor {
 		}
 	}
 
-	async onBrokerGeneration(generation: number): Promise<void> {
+	/**
+	 * Local half of a broker replacement: closes the observer and every relay of
+	 * an older generation and marks those turns detached. It spawns no CLI child
+	 * and never waits for the sweep slot. `bound.brokerGeneration` is left as is:
+	 * it changes only on reattach, and the settlement gates rely on that.
+	 */
+	async fenceBrokerGeneration(generation: number): Promise<void> {
 		await this.#closeObserver("broker_generation");
 		this.#recoveryScanned = false;
 		for (const bound of [this.#current, ...this.#retired.values()]) {
@@ -2674,6 +2875,14 @@ class OriginActor {
 				`broker_generation_fenced originKey=${this.originKey} epoch=${bound.epoch} oldGeneration=${bound.brokerGeneration} generation=${generation}`,
 				"warn",
 			);
+		}
+	}
+
+	/** Status reconciliation of the turns a broker replacement fenced and nothing has reattached yet. */
+	async reconcileFenced(generation: number): Promise<void> {
+		for (const bound of [this.#current, ...this.#retired.values()]) {
+			if (!bound || bound.brokerGeneration === generation || !bound.detached) continue;
+			if (this.#stopped || this.#manager.stopped) return;
 			await this.#reconcileBound(bound);
 		}
 	}

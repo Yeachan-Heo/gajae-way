@@ -30,6 +30,7 @@ import {
 	SessionRequestTimeoutError,
 	SessionTerminalError,
 } from "../src/orchestrator/session-port";
+import { currentSweep, inSweep, SweepLimiter } from "../src/orchestrator/sweep-limiter";
 import { RelayHelloError, TailRunner } from "../src/orchestrator/tail-runner";
 import { Store } from "../src/store";
 import { BROKER_PROMPT_BUSY_REFUSAL } from "../src/store/groups/bindings";
@@ -719,6 +720,82 @@ for (const restart of [false, true]) {
 		}
 	});
 }
+
+test("periodic retired-session probes share the sweep slot while close remains interactive", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-sweep-"));
+	const f = await retirementHarness(directory);
+	const sweep = new SweepLimiter();
+	const active = new MonitorPropagator({
+		database: f.database,
+		registry: f.registry,
+		sessionPort: f.sessionPort,
+		sweep,
+		memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+		delivery: new DeliveryService(f.database),
+		emit: () => {},
+	});
+	const release = Promise.withResolvers<void>();
+	const held = Promise.withResolvers<void>();
+	const waiting = Promise.withResolvers<void>();
+	const scopes: string[] = [];
+	let probeRan = false;
+	const turnRunning = f.sessionPort.turnRunning.bind(f.sessionPort);
+	f.sessionPort.turnRunning = async (input) => {
+		const current = currentSweep();
+		scopes.push(`turn:${inSweep()}`);
+		waiting.resolve();
+		const read = async () => {
+			probeRan = true;
+			return await turnRunning(input);
+		};
+		return current ? await current.read(read) : await read();
+	};
+	const queueEmpty = f.sessionPort.queueEmpty.bind(f.sessionPort);
+	f.sessionPort.queueEmpty = async (input) => {
+		scopes.push(`queue:${inSweep()}`);
+		return await queueEmpty(input);
+	};
+	const runningJobs = f.sessionPort.runningJobs.bind(f.sessionPort);
+	f.sessionPort.runningJobs = async (input) => {
+		scopes.push(`jobs:${inSweep()}`);
+		return await runningJobs(input);
+	};
+	const close = f.sessionPort.close.bind(f.sessionPort);
+	f.sessionPort.close = async (input) => {
+		scopes.push(`close:${inSweep()}`);
+		return await close(input);
+	};
+	f.sessionPort.setSessionState("event-session-e0", { live: true });
+	f.database.core.metaSet(
+		f.retiredKey,
+		JSON.stringify({ sessionId: "event-session-e0", epoch: 0, retiredAt: Date.now() }),
+	);
+	const competing = sweep.run(
+		async () =>
+			await sweep.read(async () => {
+				held.resolve();
+				await release.promise;
+			}),
+	);
+	try {
+		await held.promise;
+		await active.reconcile();
+		await waiting.promise;
+		expect(probeRan).toBe(false);
+		release.resolve();
+		await active.retiredSessionSweepSettled();
+		expect(scopes).toEqual(["turn:true", "queue:true", "jobs:true", "close:false"]);
+		expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+	} finally {
+		release.resolve();
+		await competing;
+		await active.retiredSessionSweepSettled();
+		active.dispose();
+		f.pipeline.dispose();
+		f.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
 
 test("reconcile holds a removed monitor's retired host while its saved authoring pointer survives", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-reconcile-pointer-"));
