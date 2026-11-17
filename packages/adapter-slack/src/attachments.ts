@@ -39,9 +39,9 @@ export async function prepareSlackImages(
 	files: readonly SlackFileLike[] | null | undefined,
 	botToken: string,
 	fetchImpl?: ImageFetch,
-): Promise<{ readonly images: PromptImage[]; readonly notice: string }> {
+): Promise<{ readonly images: PromptImage[] }> {
 	const images = (files ?? []).filter(isSlackNativeImage);
-	if (images.length === 0) return { images: [], notice: "" };
+	if (images.length === 0) return { images: [] };
 	if (images.length > SLACK_IMAGE_LIMIT) throw new Error("Slack messages can include at most four images");
 	const urls = images.map((file) => {
 		const url = nonBlank(file.url_private);

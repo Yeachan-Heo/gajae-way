@@ -83,7 +83,7 @@ test("renders the caption on its own line and the attachment after it", () => {
 	expect(describeInboundBody("plain text", undefined, undefined)).toBe("plain text");
 });
 
-test("prepares only bytes read from the stored local image path and returns its notice", async () => {
+test("prepares only bytes read from the stored local image path", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-telegram-image-"));
 	try {
 		const path = join(home, "fresh.jpg");
@@ -92,17 +92,14 @@ test("prepares only bytes read from the stored local image path and returns its 
 		let received: number[][] = [];
 		const prepared = await prepareTelegramImage({ path }, async (sources) => {
 			received = sources.map((bytes) => [...bytes]);
-			return { images: [{ data: "prepared-data", mimeType: "image/jpeg" }], notice: "resized and compressed" };
+			return { images: [{ data: "prepared-data", mimeType: "image/jpeg" }] };
 		});
 		expect(received).toEqual([[0xff, 0xd8, 0xff]]);
 		expect(prepared).toEqual({
 			images: [{ data: "prepared-data", mimeType: "image/jpeg" }],
-			notice: "resized and compressed",
 		});
 		await writeFile(path, new Uint8Array([0x52, 0x49, 0x46, 0x46]));
-		await expect(prepareTelegramImage({ path }, async () => ({ images: [], notice: "" }))).rejects.toThrow(
-			"must be PNG or JPEG",
-		);
+		await expect(prepareTelegramImage({ path }, async () => ({ images: [] }))).rejects.toThrow("must be PNG or JPEG");
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
@@ -117,7 +114,7 @@ test("rejects unavailable and oversized stored images before preparation", async
 		let called = false;
 		const prepare = async () => {
 			called = true;
-			return { images: [], notice: "" };
+			return { images: [] };
 		};
 		await expect(prepareTelegramImage({ unavailable: "download failed" }, prepare)).rejects.toThrow(
 			"image attachment is unavailable",
