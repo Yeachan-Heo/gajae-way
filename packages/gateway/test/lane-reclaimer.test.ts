@@ -342,15 +342,101 @@ test("reclaimed work status and resume return an explicit error instead of recre
 					lowDiskFreeBytes: 1024,
 					lowDiskFreeRatio: 0.25,
 				},
-			}).work,
-		).toEqual({
-			doneReclaimGraceMs: DAY,
-			attemptEndedReclaimAfterMs: DAY * 7,
-			lowDiskFreeBytes: 1024,
-			lowDiskFreeRatio: 0.25,
-		});
+		}).work,
+	).toEqual({
+		doneReclaimGraceMs: DAY,
+		attemptEndedReclaimAfterMs: DAY * 7,
+		lowDiskFreeBytes: 1024,
+		lowDiskFreeRatio: 0.25,
+	});
 	} finally {
 		await manager?.stop();
+		await f.close();
+	}
+});
+
+test("regression: stale git worktree registration after external deletion is pruned before reclaim", async () => {
+	const f = await fixture();
+	try {
+		const paths = await managedWorktree(f, "stale-registration");
+		persistJob(f.database, "stale-registration", paths, "done", NOW - DAY - 1);
+		// Simulate external deletion of the worktree directory
+		await rm(paths.worktreePath, { recursive: true });
+		// Verify it's still registered in git
+		const listBefore = Bun.spawnSync(["git", "worktree", "list", "--porcelain"], {
+			cwd: paths.repositoryPath,
+			stdout: "pipe",
+		}).stdout.toString();
+		expect(listBefore).toContain(paths.worktreePath);
+		// Reclaim should handle the stale registration by pruning
+		const reclaimed = await f.governor.reclaimTerminalWorktrees(NOW);
+		expect(reclaimed).toBe(1);
+		expect(existsSync(paths.worktreePath)).toBe(false);
+		// Verify the registration is gone after reclaim
+		const listAfter = Bun.spawnSync(["git", "worktree", "list", "--porcelain"], {
+			cwd: paths.repositoryPath,
+			stdout: "pipe",
+		}).stdout.toString();
+		expect(listAfter).not.toContain(paths.worktreePath);
+		const job = savedJob(f.database, "stale-registration");
+		expect(job).toMatchObject({ state: "done", reclaimedAt: expect.any(String) });
+	} finally {
+		await f.close();
+	}
+});
+
+test("regression: reclaim requires remote reachability to verify pushed HEAD", async () => {
+	const f = await fixture();
+	try {
+		const paths = await managedWorktree(f, "remote-unreachable");
+		// Create and push a commit
+		await addCommit(paths.worktreePath, "test commit");
+		await pushHead(paths);
+		// Delete the upstream to simulate remote being unavailable
+		const upstreamFile = Bun.spawnSync(
+			["git", "config", "remote.origin.url"],
+			{ cwd: paths.repositoryPath, stdout: "pipe" },
+		).stdout.toString().trim();
+		await rm(upstreamFile, { recursive: true });
+		persistJob(f.database, "remote-unreachable", paths, "attempt_ended", NOW - DAY * 7);
+		// Reclaim should fail when remote is unreachable, fail closed
+		const reclaimed = await f.governor.reclaimTerminalWorktrees(NOW);
+		expect(reclaimed).toBe(0);
+		expect(existsSync(paths.worktreePath)).toBe(true);
+		expect(f.logs).toContain("lane_reclaim_skipped name=remote-unreachable reason=remote_unreachable");
+	} finally {
+		await f.close();
+	}
+});
+
+test("regression: reclaim detects when HEAD was not pushed to current remote state", async () => {
+	const f = await fixture();
+	try {
+		const paths = await managedWorktree(f, "stale-ref");
+		// Create and push a commit on the lane branch
+		await addCommit(paths.worktreePath, "test commit");
+		await pushHead(paths);
+		const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], {
+			cwd: paths.worktreePath,
+			stdout: "pipe",
+		}).stdout.toString().trim();
+		// Now delete the upstream branch to simulate it being force-deleted or moved
+		const upstreamPath = Bun.spawnSync(
+			["git", "config", "remote.origin.url"],
+			{ cwd: paths.repositoryPath, stdout: "pipe" },
+		).stdout.toString().trim();
+		// Delete the branch from upstream
+		Bun.spawnSync(
+			["git", "-C", upstreamPath, "update-ref", "-d", `refs/heads/${paths.branch}`],
+			{ stdout: "pipe" },
+		);
+		persistJob(f.database, "stale-ref", paths, "attempt_ended", NOW - DAY * 7);
+		// Reclaim should fail because HEAD is not in current remote
+		const reclaimed = await f.governor.reclaimTerminalWorktrees(NOW);
+		expect(reclaimed).toBe(0);
+		expect(existsSync(paths.worktreePath)).toBe(true);
+		expect(f.logs).toContain("lane_reclaim_skipped name=stale-ref reason=head_not_in_remote");
+	} finally {
 		await f.close();
 	}
 });

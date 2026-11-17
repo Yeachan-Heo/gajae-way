@@ -1163,6 +1163,32 @@ describe("cycle rendering", () => {
 		expect(cycleExitCode(cycleResult({ gates: ["agent_disk_headroom"] }))).toBe(1);
 	});
 
+	test("lane-disk renders observed state, unobservable, or unsupported (older gateway)", () => {
+		const path = "/var/gajaeway/lanes";
+		const observed = renderCycle(
+			cycleResult({
+				laneDisk: {
+					path,
+					totalBytes: 500 * 1024 ** 3,
+					reclaimableBytes: 100 * 1024 ** 3,
+					filesystemFreeBytes: 400 * 1024 ** 3,
+					filesystemTotalBytes: 1000 * 1024 ** 3,
+					dirtyAttemptEnded: 2,
+					unpushedAttemptEnded: 1,
+					lowFreeDisk: false,
+				},
+			}),
+		).join("\n");
+		expect(observed).toContain(`lane_disk: path=${path}`);
+		expect(observed).toContain("dirty_attempt_ended=2");
+		expect(observed).toContain("unpushed_attempt_ended=1");
+		// Not observed: gateway could not snapshot
+		expect(renderCycle(cycleResult({ laneDisk: null }))).toContain("lane_disk: not observed");
+		// Unsupported: older gateway during staged update (Finding 1 regression)
+		const olderGateway = { ...cycleResult(), laneDisk: undefined } as unknown as OpsCycleResult;
+		expect(renderCycle(olderGateway)).toContain("lane_disk: unsupported (restart gateway to upgrade)");
+	});
+
 	test("exit-code contract: gates force exit 1, healthy is exit 0", () => {
 		expect(cycleExitCode(cycleResult())).toBe(0);
 		for (const gate of [

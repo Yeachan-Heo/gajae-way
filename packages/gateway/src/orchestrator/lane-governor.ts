@@ -502,9 +502,26 @@ export class LaneGovernor {
 					}
 					if (!existsSync(worktreePath)) {
 						try {
-							if (!(await worktreeIsUnregistered(repositoryPath, worktreePath))) {
-								this.#log(`lane_reclaim_failed name=${name} reason=missing_worktree_still_registered`, "error");
-								return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+							let stillRegistered = !(await worktreeIsUnregistered(repositoryPath, worktreePath));
+							// If stale registration remains after external deletion (interrupted git worktree remove),
+							// prune it and verify it was unregistered.
+							if (stillRegistered) {
+								const pruneResult = await runGit(["worktree", "prune"], { cwd: repositoryPath });
+								if (pruneResult.exitCode !== 0) {
+									this.#log(
+										`lane_reclaim_failed name=${name} reason=git_worktree_prune_failed detail=${sanitizeDiagnostic(pruneResult.stderr.trim() || "unknown error")}`,
+										"error",
+									);
+									return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+								}
+								stillRegistered = !(await worktreeIsUnregistered(repositoryPath, worktreePath));
+								if (stillRegistered) {
+									this.#log(
+										`lane_reclaim_failed name=${name} reason=missing_worktree_still_registered_after_prune`,
+										"error",
+									);
+									return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+								}
 							}
 						} catch (error) {
 							this.#log(
@@ -551,6 +568,27 @@ export class LaneGovernor {
 						if (!remote.stdout.trim()) {
 							this.#log(`lane_reclaim_skipped name=${name} reason=unpushed`, "warn");
 							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: true };
+						}
+						// Verify remote is reachable and ref is current; fail closed if unable to establish freshness
+						const origin = await runGit(["config", "remote.origin.url"], { cwd: repositoryPath });
+						if (origin.exitCode !== 0 || !origin.stdout.trim()) {
+							this.#log(`lane_reclaim_skipped name=${name} reason=remote_url_failed`, "warn");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+						}
+						const lsRemote = await runGit(["ls-remote", origin.stdout.trim()], { cwd: repositoryPath });
+						if (lsRemote.exitCode !== 0) {
+							// Remote is unreachable; fail closed: cannot verify current state
+							this.#log(`lane_reclaim_skipped name=${name} reason=remote_unreachable`, "warn");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+						}
+						// Verify that HEAD commit exists in the actual remote (not just stale local tracking refs)
+						const headInRemote = lsRemote.stdout.split(/\r?\n/).some((line) => {
+							const [sha] = line.split(/\s+/);
+							return sha === head.stdout.trim();
+						});
+						if (!headInRemote) {
+							this.#log(`lane_reclaim_skipped name=${name} reason=head_not_in_remote`, "warn");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
 						}
 					}
 					if (existsSync(worktreePath)) {
