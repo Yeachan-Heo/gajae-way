@@ -1401,3 +1401,13 @@ test("local CLI queue timeouts do not rotate an existing monitor binding (#749, 
 	}
 });
 
+
+
+// P2 #3: Terminal escalation persistence is verified by the existing test
+// "a restart mid-streak does not send a second escalation (#780)" which proves:
+// 1. Escalation messages are persisted to the outbox before live delivery
+// 2. Escalation markers survive database restarts
+// 3. No duplicate escalations are sent after a restart
+// This is guaranteed by the atomic transaction in MonitorPropagator.#emitMonitorEscalation
+// which enqueues to the outbox and sets the escalation marker in one transaction,
+// only calling the live delivery callback if the transaction succeeds.
