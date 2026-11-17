@@ -1,212 +1,194 @@
-import { afterEach, expect, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type OriginRef, originKey } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
+import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
-import { sessionPortFromResponder } from "./session-port.fake";
+import { sessionPortFromScript } from "./session-port.fake";
 
 const target: OriginRef = { platform: "discord", kind: "channel", conversationId: "report-room" };
 
-let directory = "";
-let server: GatewayServer | undefined;
-let database: Store | undefined;
-let propagator: MonitorPropagator | undefined;
+function eventsFromPrompt(text: string): Array<{ eventId: string; eventType: string; payload?: unknown }> {
+	const match = text.match(/\[.*\]$/s);
+	if (!match) throw new Error("prompt has no event array");
+	return JSON.parse(match[0]) as Array<{ eventId: string; eventType: string; payload?: unknown }>;
+}
 
-afterEach(async () => {
-	await server?.stop();
-	server = undefined;
-	database?.close();
-	database = undefined;
-	if (directory) await rm(directory, { recursive: true, force: true });
-	directory = "";
-	propagator = undefined;
-});
+async function openTestStore() {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-author-rejected-"));
+	const database = await Store.open(join(home, "gateway.db"));
+	return { home, database };
+}
 
-test("REGRESSION: authorFenced rejects on authored row, and no report is enqueued by the calling code", async () => {
-	directory = await mkdtemp(join(tmpdir(), "gajaeway-author-rejected-authored-"));
-	const config: GatewayConfig = {
-		schemaVersion: 1,
-		home: directory,
-		gjc: { agentDir: join(directory, "agent") },
-		configPath: join(directory, "config.json"),
-		socketPath: join(directory, "gateway.sock"),
-		dbPath: join(directory, "gateway.db"),
-		logVerbosity: "info",
-	};
-	database = await Store.open(config.dbPath);
-	if (!database) throw new Error("Failed to open database");
-
-	const sessionPort = sessionPortFromResponder({
-		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
-		respond: async () => "real answer",
-	});
-	server = await startUnixServer({
-		config,
-		database,
-		sessionPort,
-		onStop: () => database?.close(),
-	});
-	if (!database) throw new Error("Database lost");
-
-	const eventId = `event-${crypto.randomUUID()}`;
-	const eventType = "test.event";
-
-	// Create monitor with reportTo
-	const { MonitorRegistry: MonitorRegistryClass } = await import("../src/monitors/registry");
-	const monitors = new MonitorRegistryClass(database as Store);
-	const monitor = monitors.add({
-		name: "test-monitor",
-		trigger: { kind: "cron", schedule: "30 6 * * *" },
-		eventTypes: [eventType],
-		reportTo: target,
-		enabled: true,
-	});
-	const actualMonitorId = monitor.monitorId;
-
-	// Create an event
-	(database as Store).transaction((tx) => {
-		(database as Store).monitors.eventCreate(tx, {
-			eventId,
-			monitorId: actualMonitorId,
-			eventType,
-			payloadJson: "{}",
-			firedAt: new Date().toISOString(),
-		});
-	});
-
+test("REGRESSION: MonitorPropagator rejects late non-silent on authored row via reconcile, and no report is enqueued", async () => {
+	const { home, database } = await openTestStore();
+	let propagator: MonitorPropagator | undefined;
 	try {
-		// First turn: author with a real, non-silent answer
-		const firstAuthored = (database as Store).transaction((tx) =>
-			(database as Store).monitors.authorFenced(tx, eventId, "", "real answer", false),
-		);
-		expect(firstAuthored).toBe(true);
-
-		// Verify the stage is 'authored' and answer is stored
-		let event = (database as Store).monitors.eventGet(eventId);
-		expect(event?.stage).toBe("authored");
-		let answer = (database as Store).monitors.authoredOutput(eventId);
-		expect(answer).toBe("real answer");
-
-		// Count initial outbox reports
-		const initialReportCount = (database as Store).outbox.rows().length;
-
-		// Try to author on the authored row - authorFenced should return false
-		const updateResult = (database as Store).transaction((tx) => {
-			return (database as Store).monitors.authorFenced(tx, eventId, "", "new rejected answer", false);
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "author-watch",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["author.test"],
+			reportTo: target,
 		});
 
-		// authorFenced should return false because the row is already in authored state
-		expect(updateResult).toBe(false);
+		const eventId = crypto.randomUUID();
+		const eventType = "author.test";
 
-		// Verify that the stage is still authored
-		expect((database as Store).monitors.eventGet(eventId)?.stage).toBe("authored");
+		// Manually set up: create an event in authored state with stored output, but no memory intent
+		database.transaction((tx) => {
+			database.monitors.eventCreate(tx, {
+				eventId,
+				monitorId: monitor.monitorId,
+				eventType,
+				payloadJson: "{}",
+				firedAt: new Date().toISOString(),
+			});
+			// Author the event - this sets the stage to authored
+			const result = database.monitors.authorFenced(tx, eventId, "", "original answer", false);
+			expect(result).toBe(true);
+			// Store the output
+			database.monitors.authoredOutputCreate(tx, eventId, "original answer");
+		});
 
-		// Verify that the stored output is unchanged
-		expect((database as Store).monitors.authoredOutput(eventId)).toBe("real answer");
+		expect(database.monitors.eventGet(eventId)?.stage).toBe("authored");
+		expect(database.monitors.authoredOutput(eventId)).toBe("original answer");
+		expect(!database.memory.coversEvent(eventId)).toBe(true); // No memory for this event
 
-		// Most importantly: no report should be enqueued when authorFenced returns false
-		const finalReportCount = (database as Store).outbox.rows().length;
+		// Count initial reports in inbox
+		const initialReports = database.inbox.pendingByOrigin();
+		const initialReportCount = initialReports.find((r) => r.origin_key === originKey(target))?.n ?? 0;
+
+		// Now create propagator with a session that returns a different answer
+		const notifications: string[] = [];
+		const sessionPort = sessionPortFromScript({
+			bind: async () => ({ sessionId: "monitor-session" }),
+			respond: async (_sessionId, text) => {
+				const events = eventsFromPrompt(text);
+				return JSON.stringify(
+					events.map(({ eventId }) => ({
+						eventId,
+						note: "different late answer",
+					})),
+				);
+			},
+		});
+		propagator = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			notifyInbound: async (key) => {
+				notifications.push(key);
+			},
+		});
+
+		// Call reconcile - this will find the event with output but no memory
+		// Since stage === "authored" && output is not silent && !hasMemory,
+		// it will call #author (line 711 in reconcile)
+		// When #author calls authorFenced, it will return false (already authored)
+		// The fix ensures #notifyMonitorReport is not called in this case
+		await propagator.reconcile();
+
+		// Verify the event is still authored
+		expect(database.monitors.eventGet(eventId)?.stage).toBe("authored");
+
+		// Verify no extra reports were enqueued
+		const finalReports = database.inbox.pendingByOrigin();
+		const finalReportCount = finalReports.find((r) => r.origin_key === originKey(target))?.n ?? 0;
 		expect(finalReportCount).toBe(initialReportCount);
+
+		// Verify no notification was sent
+		expect(notifications).toEqual([]);
 	} finally {
-		propagator = undefined;
+		await propagator?.drain();
+		database.close();
+		await rm(home, { recursive: true, force: true });
 	}
 });
 
-test("REGRESSION: authorFenced rejects on delivered row, and no report is enqueued by the calling code", async () => {
-	directory = await mkdtemp(join(tmpdir(), "gajaeway-author-rejected-delivered-"));
-	const config: GatewayConfig = {
-		schemaVersion: 1,
-		home: directory,
-		gjc: { agentDir: join(directory, "agent") },
-		configPath: join(directory, "config.json"),
-		socketPath: join(directory, "gateway.sock"),
-		dbPath: join(directory, "gateway.db"),
-		logVerbosity: "info",
-	};
-	database = await Store.open(config.dbPath);
-	if (!database) throw new Error("Failed to open database");
-
-	const sessionPort = sessionPortFromResponder({
-		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
-		respond: async () => "real answer",
-	});
-	server = await startUnixServer({
-		config,
-		database,
-		sessionPort,
-		onStop: () => database?.close(),
-	});
-	if (!database) throw new Error("Database lost");
-
-	const eventId = `event-${crypto.randomUUID()}`;
-	const eventType = "test.event";
-
-	// Create monitor with reportTo
-	const { MonitorRegistry: MonitorRegistryClass } = await import("../src/monitors/registry");
-	const monitors = new MonitorRegistryClass(database as Store);
-	const monitor = monitors.add({
-		name: "test-monitor",
-		trigger: { kind: "cron", schedule: "30 6 * * *" },
-		eventTypes: [eventType],
-		reportTo: target,
-		enabled: true,
-	});
-	const actualMonitorId = monitor.monitorId;
-
-	// Create an event
-	(database as Store).transaction((tx) => {
-		(database as Store).monitors.eventCreate(tx, {
-			eventId,
-			monitorId: actualMonitorId,
-			eventType,
-			payloadJson: "{}",
-			firedAt: new Date().toISOString(),
-		});
-	});
-
+test("REGRESSION: MonitorPropagator rejects late SILENT on authored row via reconcile, stage changes but no report is enqueued", async () => {
+	const { home, database } = await openTestStore();
+	let propagator: MonitorPropagator | undefined;
 	try {
-		const registry = new MonitorRegistry(database as Store);
-
-		// First turn: author with a real, non-silent answer
-		const firstAuthored = (database as Store).transaction((tx) =>
-			(database as Store).monitors.authorFenced(tx, eventId, "", "real answer", false),
-		);
-		expect(firstAuthored).toBe(true);
-
-		// Move to delivered state
-		(database as Store).transaction((tx) => {
-			(database as Store).monitors.eventUpdate(tx, eventId, "delivered");
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "silent-watch",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["silent.test"],
+			reportTo: target,
 		});
 
-		// Verify the stage is 'delivered' and answer is stored
-		let event = (database as Store).monitors.eventGet(eventId);
-		expect(event?.stage).toBe("delivered");
-		let answer = (database as Store).monitors.authoredOutput(eventId);
-		expect(answer).toBe("real answer");
+		const eventId = crypto.randomUUID();
+		const eventType = "silent.test";
 
-		// Count initial outbox reports
-		const initialReportCount = (database as Store).outbox.rows().length;
-
-		// Try to author on the delivered row - authorFenced should return false
-		const updateResult = (database as Store).transaction((tx) => {
-			return (database as Store).monitors.authorFenced(tx, eventId, "", "new rejected answer", false);
+		// Manually set up: create an event in authored state with silent output, but no memory intent
+		database.transaction((tx) => {
+			database.monitors.eventCreate(tx, {
+				eventId,
+				monitorId: monitor.monitorId,
+				eventType,
+				payloadJson: "{}",
+				firedAt: new Date().toISOString(),
+			});
+			// Author the event with SILENT
+			const result = database.monitors.authorFenced(tx, eventId, "", "[SILENT]", false);
+			expect(result).toBe(true);
+			// Store the output
+			database.monitors.authoredOutputCreate(tx, eventId, "[SILENT]");
 		});
 
-		// authorFenced should return false because the row is in delivered state
-		expect(updateResult).toBe(false);
+		expect(database.monitors.eventGet(eventId)?.stage).toBe("authored");
+		expect(database.monitors.authoredOutput(eventId)).toBe("[SILENT]");
+		expect(!database.memory.coversEvent(eventId)).toBe(true); // No memory for this event
 
-		// Verify that the stored output is unchanged
-		expect((database as Store).monitors.authoredOutput(eventId)).toBe("real answer");
+		// Count initial reports
+		const initialReports = database.inbox.pendingByOrigin();
+		const initialReportCount = initialReports.find((r) => r.origin_key === originKey(target))?.n ?? 0;
 
-		// Most importantly: no report should be enqueued when authorFenced returns false
-		const finalReportCount = (database as Store).outbox.rows().length;
+		// Now create propagator
+		const notifications: string[] = [];
+		const sessionPort = sessionPortFromScript({
+			bind: async () => ({ sessionId: "monitor-session" }),
+			respond: async () => JSON.stringify([]),
+		});
+		propagator = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			notifyInbound: async (key) => {
+				notifications.push(key);
+			},
+		});
+
+		// Call reconcile - this will find the event with SILENT output and no memory
+		// Since stage === "authored" && output IS silent && !hasMemory,
+		// it will NOT call #author but will update stage to authored_no_delivery (line 712-714 in reconcile)
+		// No report should be enqueued in this case
+		await propagator.reconcile();
+
+		// Verify the event stage changed to authored_no_delivery
+		expect(database.monitors.eventGet(eventId)?.stage).toBe("authored_no_delivery");
+
+		// Verify no extra reports were enqueued
+		const finalReports = database.inbox.pendingByOrigin();
+		const finalReportCount = finalReports.find((r) => r.origin_key === originKey(target))?.n ?? 0;
 		expect(finalReportCount).toBe(initialReportCount);
+
+		// Verify no notification was sent
+		expect(notifications).toEqual([]);
 	} finally {
-		propagator = undefined;
+		await propagator?.drain();
+		database.close();
+		await rm(home, { recursive: true, force: true });
 	}
 });
