@@ -331,6 +331,7 @@ test("a bound turn whose operation is unknown stays held and is never resent", a
 			sessionId: binding.sessionId,
 		}),
 	);
+	database!.transaction((tx) => database!.inbox.markSendAttempted(tx, opRef));
 	manager = makeManager(port, logs);
 	await manager.recover();
 	expect(port.sendAttempts).toEqual([]);
@@ -528,6 +529,7 @@ test("a bound turn on an unreadable session retains its original identity across
 			sessionId: "pre-cutover-session",
 		}),
 	);
+	database!.transaction((tx) => database!.inbox.markSendAttempted(tx, opRef));
 	port.setSessionState("pre-cutover-session", { repo: join(home, "workspace"), live: true });
 	port.seedAcceptedSend({
 		sessionId: "pre-cutover-session",
@@ -653,6 +655,7 @@ test("a bound turn whose id the Router disowns retains its original identity acr
 			sessionId: staleId,
 		}),
 	);
+	database!.transaction((tx) => database!.inbox.markSendAttempted(tx, opRef));
 	// Lost Router ownership is not native producer-exit evidence.
 	port.seedAcceptedSend({ sessionId: staleId, repo: join(home, "workspace"), opRef, text: "hello" });
 	port.failResume(staleId, "session_unavailable");

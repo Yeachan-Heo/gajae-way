@@ -1,9 +1,10 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readlink, rm, writeFile } from "node:fs/promises";
 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { OpsCycleResult, OpsSloResult } from "@gajae-gateway/protocol";
+import { ProtocolError } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 
@@ -702,6 +703,95 @@ describe("service installation", () => {
 		}
 	});
 
+	test("services repair installs the target release manifest's GJC pin before writing definitions, and fails when it cannot", async () => {
+		const home = await mkdtemp(join(tmpdir(), "gajaeway-services-pin-"));
+		const saved = { HOME: process.env.HOME, GAJAEWAY_HOME: process.env.GAJAEWAY_HOME };
+		const originalLog = console.log;
+		const originalError = console.error;
+		const previousExitCode = process.exitCode ?? 0;
+		try {
+			process.env.HOME = home;
+			process.env.GAJAEWAY_HOME = home;
+			console.log = () => {};
+			console.error = () => {};
+			await writeFile(join(home, "config.json"), JSON.stringify({ schemaVersion: 1 }));
+			const binDir = join(home, "bin");
+			await mkdir(binDir);
+			for (const spec of serviceSpecs()) await writeFile(join(binDir, spec.binary), "stub");
+			const releaseManifest = join(binDir, "package.json");
+			await writeFile(releaseManifest, JSON.stringify({ name: "gajaeway", gjc: { version: "0.19.3" } }));
+			const args = [
+				"services",
+				"repair",
+				"--bin-dir",
+				binDir,
+				"--platform",
+				"darwin",
+				"--launch-agents-dir",
+				join(home, "LaunchAgents"),
+			];
+			const writes: string[] = [];
+			const writeServiceFile = async (path: string): Promise<void> => {
+				writes.push(path);
+			};
+			const installs: string[] = [];
+			const gjcInstallRunner = async (command: readonly string[], cwd: string) => {
+				if (command[0] === "bun") {
+					const version = (
+						JSON.parse(await readFile(join(cwd, "package.json"), "utf8")) as {
+							dependencies: { "gajae-code": string };
+						}
+					).dependencies["gajae-code"];
+					installs.push(version);
+					await mkdir(join(cwd, "node_modules", ".bin"), { recursive: true });
+					await writeFile(join(cwd, "node_modules", ".bin", "gjc"), version);
+					return { exitCode: 0, stdout: "", stderr: "" };
+				}
+				return { exitCode: 0, stdout: `gjc/${await readFile(command[0] as string, "utf8")}`, stderr: "" };
+			};
+			await main(args, {
+				services: { loginPathRunner: async () => "/usr/bin", writeFile: writeServiceFile, gjcInstallRunner },
+			});
+			expect(installs).toEqual(["0.19.3"]);
+			expect(await readlink(join(home, "gjc", "current"))).toBe("0.19.3");
+			expect(writes).toHaveLength(serviceSpecs().length);
+
+			// A bin dir that cannot supply its own pin is refused before any definition is
+			// written: the CLI checkout's pin is not installable for a target it does not describe.
+			writes.length = 0;
+			installs.length = 0;
+			await rm(join(home, "gjc"), { recursive: true, force: true });
+			await rm(releaseManifest);
+			await main(args, {
+				services: { loginPathRunner: async () => "/usr/bin", writeFile: writeServiceFile, gjcInstallRunner },
+			});
+			expect(process.exitCode).toBe(1);
+			expect(installs).toEqual([]);
+			expect(writes).toHaveLength(0);
+
+			writes.length = 0;
+			process.exitCode = previousExitCode;
+			await writeFile(releaseManifest, JSON.stringify({ name: "gajaeway", gjc: { version: "0.19.3" } }));
+			await main(args, {
+				services: {
+					loginPathRunner: async () => "/usr/bin",
+					writeFile: writeServiceFile,
+					gjcInstallRunner: async () => ({ exitCode: 1, stdout: "", stderr: "registry unavailable" }),
+				},
+			});
+			expect(process.exitCode).toBe(1);
+			expect(writes).toHaveLength(0);
+		} finally {
+			console.log = originalLog;
+			console.error = originalError;
+			process.exitCode = previousExitCode;
+			for (const [key, value] of Object.entries(saved))
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			await rm(home, { recursive: true, force: true });
+		}
+	});
+
 	test("invalid service selection fails before any plist write", async () => {
 		const writes: string[] = [];
 		const errors: string[] = [];
@@ -804,6 +894,16 @@ describe("monitor update", () => {
 		expect(result.connections).toBe(4);
 	});
 
+	test("sends a null contextRollTokens update over JSON to clear the threshold", async () => {
+		const result = await run([["monitor-42", "--json", '{"contextRollTokens":null}']]);
+		expect(result.requests).toEqual([
+			{ verb: "monitor.update", params: { monitorId: "monitor-42", contextRollTokens: null } },
+		]);
+		expect(result.lines).toEqual(['{"monitorId":"monitor-42"}']);
+		expect(result.errors).toEqual([]);
+		expect(result.connections).toBe(1);
+	});
+
 	const invalidCases: Array<[string, string[]]> = [
 		["missing id", ["--enabled", "true"]],
 		["missing patch", ["monitor-42"]],
@@ -840,6 +940,7 @@ function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 		monitorEvents: [],
 		monitorFailures: [],
 		monitorAuthoringLost: [],
+		silentOrigins: [],
 		deliveries: { pending: 0, inflight: 0, confirmed: 0, failedAmbiguous: 0, expired: 0 },
 		inFlightInbound: 0,
 		pendingInbound: 0,
@@ -1000,6 +1101,41 @@ describe("cycle rendering", () => {
 			'2026-10-15T12:30:00.000Z authoring_turn_failed event=event-1 monitor=monitor-1 type=memory.audit stage=failed detail={"causeCode":"sdk_prompt_terminal_failed","message":"The model is temporarily unavailable"}',
 		);
 		expect(renderCycle(cycleResult())).toContain("monitor failures: none");
+	});
+
+	test("cycle renderer lists each silent origin with its age, hold reason and blocking op-ref (#688)", () => {
+		const lines = renderCycle(
+			cycleResult({
+				gates: ["origin_silent"],
+				phase: "degraded",
+				silentOrigins: [
+					{
+						originKey: "discord/channel/1508659103637966858",
+						oldestMessageId: "m-1",
+						oldestPendingAgeMs: 41 * 60_000 + 5_000,
+						unanswered: 18,
+						blockingOpRef: "gw-p-held",
+						holdReason: "operation_state_unknown",
+					},
+					{
+						originKey: "discord/channel/queued",
+						oldestMessageId: "q-1",
+						oldestPendingAgeMs: 16 * 60_000,
+						unanswered: 1,
+						blockingOpRef: null,
+						holdReason: "dispatch_pending",
+					},
+				],
+			}),
+		);
+		expect(lines).toContain("gates: origin_silent");
+		expect(lines).toContain(
+			"origin silent: discord/channel/1508659103637966858 unanswered=18 oldest=41m reason=operation_state_unknown op=gw-p-held",
+		);
+		expect(lines).toContain("origin silent: discord/channel/queued unanswered=1 oldest=16m reason=dispatch_pending");
+		expect(renderCycle(cycleResult())).toContain("origin silence: none");
+		const older = { ...cycleResult(), silentOrigins: undefined } as unknown as OpsCycleResult;
+		expect(renderCycle(older)).toContain("origin silence: not reported by the running gateway");
 	});
 
 	test("cycle renderer explicitly rejects gateways without monitor failure diagnostics", () => {
@@ -1302,6 +1438,27 @@ describe("work operator commands", () => {
 			expect(output.closed).toBe(true);
 		});
 	}
+
+	test("unknown work status warns that a disconnected start may still be admitted", async () => {
+		const output = await run(
+			["status", "fix"],
+			new ProtocolError("invalid_params", "unknown work lane", { reasonCode: "unknown_work_lane", name: "fix" }),
+		);
+		expect(output.errors).toEqual([
+			"unknown work lane; a previous start or run may still be admitted after a timeout or disconnect. Do not blindly retry, even with the same name; continue observing and reconcile the original request.",
+		]);
+		expect(output.requests).toHaveLength(1);
+		expect(output.exitCode).toBe(1);
+		expect(output.closed).toBe(true);
+	});
+
+	test("unrelated work status errors are not rewritten as unknown admission", async () => {
+		const output = await run(
+			["status", "fix"],
+			new ProtocolError("invalid_params", "other failure", { reasonCode: "other" }),
+		);
+		expect(output.errors).toEqual(["other failure"]);
+	});
 
 	for (const closed of [true, false]) {
 		test(`work retire prints a successful retirement with closed=${closed}`, async () => {

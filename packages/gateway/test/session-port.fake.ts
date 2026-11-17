@@ -7,14 +7,14 @@ import {
 	type StatusReport,
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../src/config";
-import type { SessionRelayStream } from "../src/orchestrator/broker";
+import { RelayStreamUnwrittenError, type SessionRelayStream } from "../src/orchestrator/broker";
 import type { FailedTurnEvidence } from "../src/orchestrator/failed-turn-evidence";
 import type {
 	RunningHostJob,
 	SessionActivity,
 	SessionBindInput,
 	SessionBinding,
-	SessionCompactionStatus,
+	SessionCompactionResult,
 	SessionLiveness,
 	SessionPort,
 	SessionRequestInput,
@@ -145,9 +145,12 @@ export class ScriptedSessionPort implements SessionPort {
 	readonly models: Array<{ sessionId: string; repo: string; selection: GjcModelSelection }> = [];
 	readonly serviceTiers: Array<{ sessionId: string; repo: string; tier: GjcServiceTier }> = [];
 	readonly closes: Array<{ sessionId: string; repo: string }> = [];
+	/** Per-session close attempts: errors preserve the live host; undefined succeeds. */
+	readonly closeOutcomes = new Map<string, Array<Error | undefined>>();
 	readonly statusReads: Array<{ sessionId: string; repo: string; opRef: string; relayUsed: boolean }> = [];
 	readonly #sessions = new Map<string, string>();
 	readonly #sessionStates = new Map<string, BrokerSession>();
+	readonly #exitedHosts = new Set<string>();
 	readonly #resumeFailures = new Map<string, Error>();
 	readonly #operations = new Map<string, Operation>();
 	readonly #transcripts = new Map<string, string[]>();
@@ -214,12 +217,17 @@ export class ScriptedSessionPort implements SessionPort {
 
 	async close(input: { sessionId: string; repo: string }): Promise<void> {
 		this.closes.push(input);
+		const outcome = this.closeOutcomes.get(input.sessionId)?.shift();
+		if (outcome) throw outcome;
 		const state = this.#sessionStates.get(input.sessionId);
 		if (state) this.#sessionStates.set(input.sessionId, { ...state, live: false });
 	}
 
 	/** Background jobs each scripted host reports as running; an Error makes the read fail. */
 	readonly hostJobs = new Map<string, readonly RunningHostJob[] | Error>();
+	/** Explicit undefined models incomplete context evidence, rather than the default idle state. */
+	readonly hostTurnRunning = new Map<string, boolean | undefined | Error>();
+	readonly hostQueueEmpty = new Map<string, boolean | Error>();
 	/** Injects tail activity while a caller is awaiting the running-job probe. */
 	beforeRunningJobs?: (input: { sessionId: string; repo: string }) => void | Promise<void>;
 	/** Injects operation changes while a caller is awaiting host inspection. */
@@ -227,9 +235,27 @@ export class ScriptedSessionPort implements SessionPort {
 
 	async runningJobs(input: { sessionId: string; repo: string }): Promise<readonly RunningHostJob[]> {
 		await this.beforeRunningJobs?.(input);
+		if (this.#sessionStates.get(input.sessionId)?.live !== true) throw new Error("scripted host unavailable");
 		const jobs = this.hostJobs.get(input.sessionId) ?? [];
 		if (jobs instanceof Error) throw jobs;
 		return jobs;
+	}
+
+	async turnRunning(input: { sessionId: string; repo: string; relay?: TailHandle }): Promise<boolean | undefined> {
+		if (this.#sessionStates.get(input.sessionId)?.live !== true) throw new Error("scripted host unavailable");
+		if (this.hostTurnRunning.has(input.sessionId)) {
+			const running = this.hostTurnRunning.get(input.sessionId);
+			if (running instanceof Error) throw running;
+			return running;
+		}
+		return [...this.#operations.values()].some((op) => op.sessionId === input.sessionId && op.state === "in_flight");
+	}
+
+	async queueEmpty(input: { sessionId: string; repo: string; relay?: TailHandle }): Promise<boolean> {
+		if (this.#sessionStates.get(input.sessionId)?.live !== true) throw new Error("scripted host unavailable");
+		const empty = this.hostQueueEmpty.get(input.sessionId) ?? true;
+		if (empty instanceof Error) throw empty;
+		return empty;
 	}
 
 	/** Ends the host of a retired session; a live seeded session is "terminated", anything else "already_gone". */
@@ -259,12 +285,35 @@ export class ScriptedSessionPort implements SessionPort {
 		this.#activity.set(sessionId, { state, at });
 	}
 
+	readonly #hostIncarnations = new Map<string, string>();
+
+	/** The host process identity `session inspect` reports; a revived host gets a new one. */
+	setHostIncarnation(sessionId: string, hostIncarnation: string): void {
+		this.#hostIncarnations.set(sessionId, hostIncarnation);
+	}
+
 	/** Broker liveness from the scripted state table; an unseeded id is disowned, like an id the broker never indexed. */
 	async liveness(input: { sessionId: string; repo: string }): Promise<SessionLiveness> {
 		const state = this.#sessionStates.get(input.sessionId);
 		if (!state) return { live: undefined, disowned: true };
 		const activity = this.#activity.get(input.sessionId);
-		return { live: state.live, disowned: false, ...(activity ? { activity } : {}) };
+		const hostIncarnation = this.#hostIncarnations.get(input.sessionId);
+		return {
+			live: state.live,
+			disowned: false,
+			...(activity ? { activity } : {}),
+			...(hostIncarnation ? { hostIncarnation } : {}),
+		};
+	}
+
+	async hostExited(input: { sessionId: string; repo: string }): Promise<boolean> {
+		return this.#exitedHosts.has(input.sessionId);
+	}
+
+	/** Explicit process-exit evidence, independent of broker liveness. */
+	setHostExited(sessionId: string, exited: boolean): void {
+		if (exited) this.#exitedHosts.add(sessionId);
+		else this.#exitedHosts.delete(sessionId);
 	}
 
 	async resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding> {
@@ -280,6 +329,7 @@ export class ScriptedSessionPort implements SessionPort {
 
 	async send(input: SessionSendInput): Promise<SendReceipt> {
 		this.sendAttempts.push(input);
+		input.beforeWrite?.();
 		if (this.#operations.has(input.opRef))
 			throw new OpRefRejectedError(input.opRef, "client_ref_conflict", { code: "client_ref_conflict" });
 		this.sends.push(input);
@@ -488,12 +538,12 @@ export class ScriptedSessionPort implements SessionPort {
 		);
 	}
 
-	readonly #assistantRows = new Map<string, Array<{ text: string; at: number }>>();
+	readonly #assistantRows = new Map<string, Array<{ text: string; at: number; stopReason?: string }>>();
 
 	/** Scripts a transcript assistant row; a session with scripted rows answers fetchAssistantSince from them only. */
-	appendAssistant(sessionId: string, text: string, at: number = Date.now()): void {
+	appendAssistant(sessionId: string, text: string, at: number = Date.now(), stopReason?: string): void {
 		const rows = this.#assistantRows.get(sessionId) ?? [];
-		rows.push({ text, at });
+		rows.push({ text, at, stopReason });
 		this.#assistantRows.set(sessionId, rows);
 	}
 
@@ -504,7 +554,7 @@ export class ScriptedSessionPort implements SessionPort {
 			const eligible = rows.filter((row) => row.at + 2_000 >= input.notBeforeMs);
 			const chosen =
 				(input.preferSpoken ? eligible.filter((row) => !isSilentReply(row.text)).at(-1) : undefined) ?? eligible.at(-1);
-			return chosen ? { text: chosen.text, pages: 1, complete: true } : undefined;
+			return chosen ? { text: chosen.text, pages: 1, complete: true, stopReason: chosen.stopReason } : undefined;
 		}
 		const operation = [...this.#operations.values()]
 			.reverse()
@@ -530,11 +580,16 @@ export class ScriptedSessionPort implements SessionPort {
 		return handle;
 	}
 
+	/** Test-only accessor to get tail handles for a session. */
+	getTailHandles(sessionId: string): ReadonlySet<ScriptedTailHandle> {
+		return this.#tails.get(sessionId) ?? new Set();
+	}
+
 	async runCompaction(_input: {
 		sessionId: string;
 		repo: string;
 		originKey: string;
-	}): Promise<{ readonly status: SessionCompactionStatus }> {
+	}): Promise<SessionCompactionResult> {
 		return { status: "unavailable" };
 	}
 
@@ -785,7 +840,10 @@ export class ScriptedSessionPort implements SessionPort {
 	}
 
 	/** Patches a bound session's state, or seeds one the port never bound (a session left on disk by an earlier runtime). */
-	setSessionState(sessionId: string, patch: Partial<Pick<BrokerSession, "repo" | "live" | "deleted">>): void {
+	setSessionState(
+		sessionId: string,
+		patch: Partial<Pick<BrokerSession, "repo" | "live" | "deleted" | "activityState">>,
+	): void {
 		const current = this.#sessionStates.get(sessionId) ?? { sessionId, repo: "", live: false, deleted: false };
 		this.#sessionStates.set(sessionId, { ...current, ...patch });
 	}
@@ -806,8 +864,14 @@ export class ScriptedSessionPort implements SessionPort {
 		});
 	}
 
+	/** The host lost the operation (killed, or its record gone): status reads `unknown` from now on. */
+	forgetOperation(opRef: string): void {
+		this.#operations.delete(opRef);
+	}
+
 	seedAcceptedSend(input: SessionSendInput, state: Operation["state"] = "in_flight", text = ""): void {
 		this.sendAttempts.push(input);
+		input.beforeWrite?.();
 		this.sends.push(input);
 		const now = Date.now();
 		this.#operations.set(input.opRef, {
@@ -1016,11 +1080,11 @@ export class ScriptedTailHandle implements TailHandle {
 		_input: Record<string, unknown>,
 		_options?: RelayRequestOptions,
 	): Promise<RelayResponse> {
-		throw new RelayClosedError(this.sessionId, "scripted relays carry no raw controls; use the port methods");
+		throw new RelayClosedError(this.sessionId, "scripted relays carry no raw controls; use the port methods", false);
 	}
 
 	async query(_name: string, _input: Record<string, unknown>, _options?: RelayRequestOptions): Promise<RelayResponse> {
-		throw new RelayClosedError(this.sessionId, "scripted relays carry no raw queries; use the port methods");
+		throw new RelayClosedError(this.sessionId, "scripted relays carry no raw queries; use the port methods", false);
 	}
 
 	beginTurn(opRef: string, correlation: TurnCorrelation = {}): void {
@@ -1138,7 +1202,7 @@ export class ScriptedTailHandle implements TailHandle {
 		result?: unknown;
 		error?: { code: string; message: string };
 	}): Promise<void> {
-		if (this.#closed) throw new RelayClosedError(this.sessionId, "handle closed");
+		if (this.#closed) throw new RelayClosedError(this.sessionId, "handle closed", false);
 		// Scripted handles do not send reverse responses
 	}
 
@@ -1225,7 +1289,7 @@ export class ScriptedRelayStream implements SessionRelayStream {
 	}
 
 	write(line: string): void {
-		if (this.closed) throw new Error("relay closed");
+		if (this.closed) throw new RelayStreamUnwrittenError("relay closed");
 		const frame = JSON.parse(line) as Record<string, unknown>;
 		this.written.push(frame);
 		if (frame.type === "hello") {

@@ -20,6 +20,8 @@ export const CAPABILITIES = [
 	"chat.loopback",
 	/** Emoji reactions in both directions: chat.react + engagement.reaction. */
 	"chat.reactions",
+	/** Durable native image inputs on chat.send. */
+	"chat.images",
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];

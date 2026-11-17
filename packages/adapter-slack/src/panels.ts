@@ -1,4 +1,5 @@
 import type { ChatMessagePayload } from "@gajae-gateway/protocol";
+import { panelAction } from "./interactions";
 
 /** Slack Block Kit block definition */
 type Block = Record<string, unknown>;
@@ -20,7 +21,7 @@ export function askUserPanelBlocks(message: ChatMessagePayload): Block[] {
 			type: "section",
 			text: {
 				type: "mrkdwn",
-				text: panel.question,
+				text: `${message.duplicateWarning ? "[recovered - may be a duplicate] " : ""}${panel.question}`,
 			},
 		},
 	];
@@ -51,8 +52,7 @@ export function askUserPanelBlocks(message: ChatMessagePayload): Block[] {
 					text: option.label,
 					emoji: true,
 				},
-				action_id: `ask_user_${panel.panelId}_${option.id}`,
-				value: option.id,
+				...panelAction("ask_user", panel.panelId, option.id, message.origin, "option_selected"),
 			});
 		}
 
@@ -87,7 +87,7 @@ export function approvalPanelBlocks(message: ChatMessagePayload): Block[] {
 			type: "section",
 			text: {
 				type: "mrkdwn",
-				text: panel.message,
+				text: `${message.duplicateWarning ? "[recovered - may be a duplicate] " : ""}${panel.message}`,
 			},
 		},
 	];
@@ -125,8 +125,7 @@ export function approvalPanelBlocks(message: ChatMessagePayload): Block[] {
 						emoji: true,
 					},
 					style,
-					action_id: `approval_${panel.panelId}_${option.optionId}`,
-					value: option.optionId,
+					...panelAction("approval", panel.panelId, option.optionId, message.origin, "option_selected"),
 				});
 			}
 		} else {
@@ -140,8 +139,7 @@ export function approvalPanelBlocks(message: ChatMessagePayload): Block[] {
 						emoji: true,
 					},
 					style: "primary",
-					action_id: `approval_${panel.panelId}_allow`,
-					value: "allow",
+					...panelAction("approval", panel.panelId, "allow", message.origin, "approved"),
 				},
 				{
 					type: "button",
@@ -151,8 +149,7 @@ export function approvalPanelBlocks(message: ChatMessagePayload): Block[] {
 						emoji: true,
 					},
 					style: "danger",
-					action_id: `approval_${panel.panelId}_deny`,
-					value: "deny",
+					...panelAction("approval", panel.panelId, "deny", message.origin, "denied"),
 				},
 			);
 		}
@@ -181,7 +178,7 @@ export function askUserPanelFallback(message: ChatMessagePayload): string | null
 	const expiresAt = new Date(panel.expiresAt).getTime();
 	const isExpired = now >= expiresAt;
 
-	let text = `${panel.question}\n`;
+	let text = `${message.duplicateWarning ? "[recovered - may be a duplicate] " : ""}${panel.question}\n`;
 	text += panel.options.map((opt) => `• ${opt.label}`).join("\n");
 
 	if (isExpired) {
@@ -202,7 +199,7 @@ export function approvalPanelFallback(message: ChatMessagePayload): string | nul
 	const expiresAt = new Date(panel.expiresAt).getTime();
 	const isExpired = now >= expiresAt;
 
-	let text = `${panel.message}\n`;
+	let text = `${message.duplicateWarning ? "[recovered - may be a duplicate] " : ""}${panel.message}\n`;
 	if (isExpired) {
 		text += "_(This approval request has expired.)_";
 	} else if (panel.options && panel.options.length > 0) {

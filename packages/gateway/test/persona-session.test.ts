@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { PromptImage } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import {
 	AGENT_RUN_GRACE_MS,
@@ -19,14 +20,25 @@ import {
 } from "../src/orchestrator/persona-session";
 import { formatFailureNotice } from "../src/orchestrator/rebind";
 import {
+	BrokerSessionPort,
 	ModelNotSelectedError,
+	type SessionCompactionInput,
+	type SessionCompactionResult,
 	type SessionCompactionStatus,
 	type SessionContextUsage,
 } from "../src/orchestrator/session-port";
-import type { TailAttachInput, TailFrame } from "../src/orchestrator/tail-runner";
+import {
+	MAX_RELAY_REQUEST_FRAME_BYTES,
+	RelayPayloadTooLargeError,
+	serializeRelayRequestFrame,
+	type TailAttachInput,
+	type TailFrame,
+	type TailHandle,
+	TailRunner,
+} from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, Store } from "../src/store";
 import { BROKER_PROMPT_BUSY_REFUSAL } from "../src/store/groups/bindings";
-import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort, scriptedRelay, steerRefused } from "./session-port.fake";
 
 let home = "";
 let database: Store | undefined;
@@ -112,6 +124,8 @@ async function harness(
 		failure?: (message: string, forceFailureNotice?: boolean) => void;
 		failureError?: (error: Error) => void;
 		modelRefusal?: (input: PersonaFailureInput) => void;
+		effectiveModel?: string;
+		imagesFor?: (triggerMessageId: string) => readonly PromptImage[] | undefined;
 		onFrame?: (frame: TailFrame) => boolean | void;
 		contextMessageIds?: readonly string[];
 	} = {},
@@ -142,8 +156,11 @@ async function harness(
 		...extra,
 		onTurnStart: ({ trigger, turn }) => {
 			latestOpRef = turn.opRef;
+			const images = hooks.imagesFor?.(trigger.message_id);
 			return {
 				text: trigger.body,
+				...(hooks.effectiveModel ? { effectiveModel: hooks.effectiveModel } : {}),
+				...(images ? { images } : {}),
 				...(hooks.contextMessageIds ? { contextMessageIds: new Set(hooks.contextMessageIds) } : {}),
 				...(hooks.onFrame ? { onFrame: (input) => hooks.onFrame?.(input.frame) } : {}),
 				onTerminal: ({ text, alreadyPosted }) => hooks.terminal?.(text, alreadyPosted),
@@ -323,6 +340,7 @@ test("ambiguous busy send retains its identity and proof despite an unobserved t
 
 		override async send(input: Parameters<ScriptedSessionPort["send"]>[0]): ReturnType<ScriptedSessionPort["send"]> {
 			this.sendAttempts.push(input);
+			input.beforeWrite?.();
 			seedPersonaPrompt(input);
 			throw new GjcCliError("busy", 0, "", { code: "busy", message: "busy" });
 		}
@@ -453,6 +471,398 @@ test("actor immediately dispatches durable inbound with one deterministic caller
 	await eventually(() => terminal.length === 2, "reused session turn did not complete");
 	expect(port.sends).toHaveLength(2);
 	expect(sessionCreateSuccesses).toHaveLength(2);
+});
+
+test("oversized text plus images is a local terminal failure and does not hold an unknown-status live host", async () => {
+	class PayloadLimitSessionPort extends ScriptedSessionPort {
+		readonly oversizedAttempts: Array<Parameters<ScriptedSessionPort["send"]>[0]> = [];
+
+		override async send(input: Parameters<ScriptedSessionPort["send"]>[0]) {
+			try {
+				serializeRelayRequestFrame(input.sessionId, {
+					type: "control_request",
+					id: "",
+					connectionId: "",
+					operation: "turn.prompt",
+					input: {
+						text: input.text,
+						clientRef: input.opRef,
+						...(input.images?.length ? { images: input.images } : {}),
+					},
+					confirm: false,
+				});
+			} catch (error) {
+				if (error instanceof RelayPayloadTooLargeError) {
+					this.oversizedAttempts.push(input);
+					input.onPayloadTooLarge?.();
+				}
+				throw error;
+			}
+			return await super.send(input);
+		}
+	}
+	const port = new PayloadLimitSessionPort();
+	const notices: string[] = [];
+	const logs: string[] = [];
+	await harness(
+		port,
+		{
+			failureError: (error) => notices.push(formatFailureNotice(error)),
+			imagesFor: (messageId) =>
+				messageId === "oversized" ? [{ data: "AQ==".repeat(20_000), mimeType: "image/jpeg" }] : undefined,
+		},
+		(line) => logs.push(line),
+	);
+	enqueue("oversized", "x".repeat(220_000));
+	enqueue("after-oversized", "next pending message");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "the pending message after the local rejection did not dispatch");
+	const rejected = port.oversizedAttempts[0]!;
+	const rejectedOpRef = rejected.opRef;
+	expect(rejected.text).toBe("x".repeat(220_000));
+	expect(rejected.images?.length).toBe(1);
+	expect((await port.liveness({ sessionId: rejected.sessionId, repo: rejected.repo })).live).toBe(true);
+	expect(port.statusReads).toEqual([]);
+	expect(port.sends.map((send) => send.text)).toEqual(["next pending message"]);
+	expect(port.sends.map((send) => send.opRef)).not.toContain(rejectedOpRef);
+	expect(database!.inbox.turnRow(rejectedOpRef)).toMatchObject({
+		state: "done",
+		turn_state: "done",
+		terminal_delivery_id: JSON.stringify({ none: "turn_failed" }),
+	});
+	expect(database!.core.metaGet(`persona-local-preflight-rejection:${rejectedOpRef}`)).toBeUndefined();
+	expect(notices).toHaveLength(1);
+	expect(notices[0]).toContain("prompt_too_large");
+	expect(notices[0]).toContain("before it was sent");
+	expect(notices[0]).toContain("reduce the text or number of images");
+	expect(logs.some((line) => line.includes(`persona_send_preflight_rejected`) && line.includes(rejectedOpRef))).toBe(
+		true,
+	);
+	port.complete(port.sends[0]!.opRef, "next reply");
+	await manager!.tick(KEY);
+});
+
+test("model-not-found settles the turn and a transient model.set failure still retries", async () => {
+	const selection = "google-antigravity/gemini-4-hydrogen-xhigh";
+	class ModelSetFailurePort extends ScriptedSessionPort {
+		modelAttempts = 0;
+
+		constructor() {
+			super({
+				onBind: (input) => `model-session-${input.epoch}`,
+				onSend: (input, scripted) => scripted.complete(input.opRef, "model recovered"),
+			});
+		}
+
+		override async setModel(input: Parameters<ScriptedSessionPort["setModel"]>[0]) {
+			this.modelAttempts++;
+			if (this.modelAttempts === 1) {
+				const message = `Model "${selection}" was not found.`;
+				throw new GjcCliError(
+					`gjc sdk model.set reported failure: ${JSON.stringify({ code: "invalid_input", message })}`,
+					0,
+					"",
+					{ code: "invalid_input", message },
+				);
+			}
+			if (this.modelAttempts === 2)
+				throw new GjcCliError("gjc sdk model.set reported failure: timeout", 0, "", {
+					code: "timeout",
+					message: "SDK session Router startup timed out.",
+				});
+			return await super.setModel(input);
+		}
+	}
+
+	const port = new ModelSetFailurePort();
+	const notices: string[] = [];
+	const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
+	await harness(
+		port,
+		{
+			effectiveModel: selection,
+			failureError: (error) => notices.push(formatFailureNotice(error)),
+		},
+		undefined,
+		{
+			setTimeout: (work, delayMs) => {
+				const timer = { work, delayMs };
+				timers.push(timer);
+				return timer;
+			},
+			clearTimeout: () => {},
+		},
+	);
+
+	enqueue("model-not-found", "fail before send");
+	await manager!.notifyInbound(KEY);
+	const failedOpRef = latestOpRef;
+	await eventually(
+		() => database!.inbox.turnRow(failedOpRef)?.turn_state === "done",
+		"the model-not-found turn did not settle",
+	);
+	expect(database!.inbox.turnRow(failedOpRef)).toMatchObject({
+		state: "done",
+		turn_state: "done",
+		terminal_delivery_id: JSON.stringify({ none: "turn_failed" }),
+	});
+	expect(port.modelAttempts).toBe(1);
+	expect(timers).toEqual([]);
+	expect(notices).toHaveLength(1);
+	expect(notices[0]).toContain(selection);
+	expect(notices[0]).toContain("/model");
+
+	enqueue("model-after-not-found", "send after the failure");
+	await manager!.notifyInbound(KEY);
+	await eventually(
+		() => port.modelAttempts === 2 && timers.length === 1,
+		"transient model.set failure was not retried",
+	);
+	expect(port.sends).toEqual([]);
+	expect(timers.map((timer) => timer.delayMs)).toEqual([2_000]);
+
+	timers[0]!.work();
+	await eventually(() => port.sends.length === 1, "model.set retry did not dispatch the later message");
+	expect(port.modelAttempts).toBe(3);
+	expect(port.sends.map((send) => send.text)).toEqual(["send after the failure"]);
+	expect(notices).toHaveLength(1);
+	await eventually(
+		() => database!.inbox.turnRow(port.sends[0]!.opRef)?.turn_state === "done",
+		"the later message did not finish after the transient retry",
+	);
+});
+
+test("actual relay envelope rejection is durable before actor error handling and survives restart", async () => {
+	const relay = scriptedRelay(() => ({ ok: true, result: {} }));
+	let broker: BrokerSessionPort;
+	let runner: TailRunner;
+	let originalTail: TailHandle | undefined;
+	let realTransport = true;
+	let rejected = false;
+	let markerAtDecision: string | undefined;
+	let fencedAtDecision: boolean | undefined;
+	let pendingRequestAtDecision: string | undefined;
+	class CrashBeforeActorCatchPort extends ScriptedSessionPort {
+		override async attachTail(input: TailAttachInput) {
+			if (!realTransport) return await super.attachTail(input);
+			originalTail = await runner.attach(input);
+			return originalTail;
+		}
+
+		override async send(input: Parameters<ScriptedSessionPort["send"]>[0]) {
+			if (!realTransport) return await super.send(input);
+			try {
+				return await broker.send({
+					...input,
+					onPayloadTooLarge: () => {
+						input.onPayloadTooLarge?.();
+						markerAtDecision = database!.core.metaGet(`persona-local-preflight-rejection:${input.opRef}`);
+						fencedAtDecision = database!.inbox.sendAttempted(input.opRef);
+						pendingRequestAtDecision = database!.bindings.brokerOperation(
+							database!.bindings.authority!,
+							"turn.prompt",
+							JSON.stringify([input.sessionId, input.opRef]),
+						)?.requestJson;
+					},
+				});
+			} catch (error) {
+				if (!(error instanceof RelayPayloadTooLargeError)) throw error;
+				rejected = true;
+				// The process disappears before its actor sees the rejected promise.
+				return await new Promise<never>(() => {});
+			}
+		}
+	}
+	const port = new CrashBeforeActorCatchPort();
+	await harness(port);
+	runner = new TailRunner({ stream: relay.spawn, repo: join(home, "workspace") });
+	broker = new BrokerSessionPort({
+		authority: database!.bindings.authority!,
+		database: database!,
+		cli: async () => {
+			throw new Error("unexpected CLI call");
+		},
+		tailRunner: runner,
+	});
+	const opRef = personaTurnOpRef("instance-test", KEY, 0, "near-limit");
+	const emptyFrame = {
+		type: "control_request",
+		id: "",
+		connectionId: "",
+		operation: "turn.prompt",
+		input: { text: "", clientRef: opRef },
+		confirm: false,
+	};
+	const text = "x".repeat(MAX_RELAY_REQUEST_FRAME_BYTES - Buffer.byteLength(JSON.stringify(emptyFrame)) - 5);
+	expect(
+		Buffer.byteLength(serializeRelayRequestFrame("session-1", { ...emptyFrame, input: { text, clientRef: opRef } })),
+	).toBe(MAX_RELAY_REQUEST_FRAME_BYTES - 5);
+	enqueue("near-limit", text);
+	enqueue("after-crash", "continue after rejection");
+	void manager!.notifyInbound(KEY);
+	await eventually(() => rejected, "actual relay envelope did not reject the near-limit prompt");
+	expect(latestOpRef).toBe(opRef);
+	expect(markerAtDecision).toBe("prompt_too_large");
+	expect(fencedAtDecision).toBe(false);
+	expect(pendingRequestAtDecision).toBeDefined();
+	expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toEqual([]);
+	expect(database!.core.metaGet(`persona-local-preflight-rejection:${opRef}`)).toBe("prompt_too_large");
+
+	// Restore the journal state captured inside the callback, before the port's
+	// unwritten-request cleanup, to model a crash at that exact boundary.
+	const scope = JSON.stringify(["session-1", opRef]);
+	database!.transaction((tx) =>
+		database!.bindings.beginBrokerOperation(tx, database!.bindings.authority!, {
+			operation: "turn.prompt",
+			scope,
+			operationRef: opRef,
+			requestJson: pendingRequestAtDecision!,
+		}),
+	);
+	await originalTail!.close();
+	database!.close();
+	database = await Store.open(join(home, "gateway.db"));
+	realTransport = false;
+	registerFixtureBindings(port);
+	const notices: string[] = [];
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onFailure: ({ error }) => {
+				notices.push(formatFailureNotice(error));
+			},
+		}),
+	});
+	await manager.recover();
+	await eventually(
+		() => port.sends.some((send) => send.text === "continue after rejection"),
+		"later message did not dispatch",
+	);
+	expect(notices).toHaveLength(1);
+	expect(notices[0]).toContain("prompt_too_large");
+	expect(port.statusReads.filter((read) => read.opRef === opRef)).toEqual([]);
+	expect(port.sends.some((send) => send.opRef === opRef)).toBe(false);
+	expect(database.inbox.turnRow(opRef)).toMatchObject({ state: "done", turn_state: "done" });
+	expect(database.core.metaGet(`persona-local-preflight-rejection:${opRef}`)).toBeUndefined();
+	expect(database.bindings.brokerOperation(database.bindings.authority!, "turn.prompt", scope)).toBeUndefined();
+});
+
+test("a fitting real relay request commits its send fence before the write", async () => {
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	await establishStoredSession(port, "fence-fixture");
+	const binding = database!.bindings.getSessionRecord(KEY)!;
+	enqueue("fence-write", "fits");
+	database!.transaction((tx) =>
+		database!.inbox.bindTurn(tx, {
+			messageId: "fence-write",
+			originKey: KEY,
+			epoch: binding.epoch,
+			opRef: "gw-real-fence",
+			sessionId: binding.sessionId,
+		}),
+	);
+	let fenceAtWrite = false;
+	const relay = scriptedRelay(() => {
+		fenceAtWrite = database!.inbox.sendAttempted("gw-real-fence");
+		return { ok: true, result: {} };
+	});
+	const runner = new TailRunner({ stream: relay.spawn, repo: join(home, "workspace") });
+	const broker = new BrokerSessionPort({
+		authority: database!.bindings.authority!,
+		database: database!,
+		cli: async () => {
+			throw new Error("unexpected CLI call");
+		},
+		tailRunner: runner,
+	});
+	const tail = await runner.attach({
+		sessionId: binding.sessionId,
+		repo: join(home, "workspace"),
+		brokerGeneration: 1,
+	});
+	let fenced = false;
+	try {
+		await broker.send({
+			sessionId: binding.sessionId,
+			repo: join(home, "workspace"),
+			text: "fits",
+			opRef: "gw-real-fence",
+			relay: tail,
+			beforeWrite: () => {
+				expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toEqual([]);
+				expect(database!.transaction((tx) => database!.inbox.markSendAttempted(tx, "gw-real-fence"))).toBe(true);
+				fenced = true;
+			},
+		});
+		expect(fenced).toBe(true);
+		expect(fenceAtWrite).toBe(true);
+		expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+	} finally {
+		await tail.close();
+	}
+});
+
+test("dispatch settles a locally rejected unfenced turn even after recovery was already scanned", async () => {
+	const port = new ScriptedSessionPort();
+	const notices: string[] = [];
+	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) });
+	const stored = await establishStoredSession(port, "dispatch-rejection-fixture");
+	const opRef = personaTurnOpRef("instance-test", KEY, 0, "dispatch-rejection");
+	enqueue("dispatch-rejection", "rejected before write");
+	database!.transaction((tx) => {
+		database!.inbox.bindTurn(tx, {
+			messageId: "dispatch-rejection",
+			originKey: KEY,
+			epoch: 0,
+			opRef,
+			sessionId: stored.sessionId,
+		});
+		database!.core.metaSet(`persona-local-preflight-rejection:${opRef}`, "prompt_too_large");
+	});
+	enqueue("dispatch-after-rejection", "later message");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.some((send) => send.text === "later message"), "later message did not dispatch");
+	expect(notices).toHaveLength(1);
+	expect(notices[0]).toContain("prompt_too_large");
+	expect(port.sends.some((send) => send.opRef === opRef)).toBe(false);
+	expect(port.statusReads.filter((read) => read.opRef === opRef)).toEqual([]);
+	expect(database!.inbox.turnRow(opRef)).toMatchObject({ state: "done", turn_state: "done" });
+	expect(database!.core.metaGet(`persona-local-preflight-rejection:${opRef}`)).toBeUndefined();
+});
+
+test("a size-shaped error after acceptance remains ambiguous without local rejection evidence", async () => {
+	class PostWriteSizeErrorPort extends ScriptedSessionPort {
+		override async send(input: Parameters<ScriptedSessionPort["send"]>[0]): Promise<never> {
+			await super.send(input);
+			throw new RelayPayloadTooLargeError(input.sessionId, MAX_RELAY_REQUEST_FRAME_BYTES + 1);
+		}
+	}
+	const port = new PostWriteSizeErrorPort();
+	const notices: string[] = [];
+	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) });
+	enqueue("post-write-size-error", "accepted before error");
+	await manager!.notifyInbound(KEY);
+	const sent = port.sends[0]!;
+	expect(database!.inbox.sendAttempted(sent.opRef)).toBe(true);
+	expect(database!.core.metaGet(`persona-local-preflight-rejection:${sent.opRef}`)).toBeUndefined();
+	expect(notices).toEqual([]);
+	await manager!.stop();
+	manager = new PersonaSessionManager({
+		database: database!,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+	});
+	await manager.recover();
+	expect(port.sends).toHaveLength(1);
+	expect(port.statusReads.some((read) => read.opRef === sent.opRef)).toBe(true);
+	expect(database!.inbox.turnRow(sent.opRef)?.turn_state).not.toBe("done");
 });
 
 for (const outcome of ["complete", "incomplete", "in_flight"] as const)
@@ -1681,7 +2091,10 @@ for (const acceptedBeforeError of [false, true] as const)
 			override async send(input: Parameters<ScriptedSessionPort["send"]>[0]) {
 				if (this.rejectStructuredNotFound && input.text === "possibly accepted") {
 					if (acceptedBeforeError) await super.send(input);
-					else this.sendAttempts.push(input);
+					else {
+						this.sendAttempts.push(input);
+						input.beforeWrite?.();
+					}
 					throw sessionNotFound();
 				}
 				return await super.send(input);
@@ -1797,7 +2210,15 @@ for (const behavior of ["no_probe", "live", "unknown", "failed_probe", "attach_a
 
 		if (behavior === "attach_authority" || behavior === "probe_authority")
 			expect(failure).toBeInstanceOf(BrokerAuthorityError);
-		else expect(failure).toMatchObject({ message: "host hello did not arrive" });
+		else {
+			// No prompt was sent (#675): the trigger returns to pending for a backoff retry.
+			expect(failure).toBeUndefined();
+			expect(database!.inbox.pendingOldest(KEY)).toMatchObject({
+				message_id: `unproven-retry-${behavior}`,
+				turn_state: null,
+			});
+			expect(logs.some((line) => line.startsWith("send_pre_send_requeue stage=attach"))).toBe(true);
+		}
 		expect(port.sends).toHaveLength(1);
 		expect(port.binds).toHaveLength(1);
 		expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
@@ -1811,6 +2232,7 @@ test("session_not_found text without the broker error code remains ambiguous and
 		override async send(input: Parameters<ScriptedSessionPort["send"]>[0]) {
 			if (!this.rejectAmbiguous) return await super.send(input);
 			this.sendAttempts.push(input);
+			input.beforeWrite?.();
 			throw new GjcCliError("turn.prompt failed: session_not_found", 0, "", { code: "timeout" });
 		}
 	}
@@ -2632,19 +3054,14 @@ async function caseB(port: WedgedSessionPort) {
 	return fixture;
 }
 
-test("case B: terminal_ok with pending output holds despite spoken and silent transcript rows, then uses exact output", async () => {
+test("case B: terminal_ok with pending output uses a late exact output inside the recovery window", async () => {
 	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
 	const { clock, logs, terminal, failures, first } = await caseB(port);
 	port.appendAssistant(first.sessionId, "the real answer");
-	port.appendAssistant(first.sessionId, "[SILENT]");
 
-	clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS - MINUTE;
+	clock.offsetMs = 30_000;
 	await manager!.tick(KEY);
 	expect(logs.some((line) => line.startsWith("wedged_turn_released"))).toBe(false);
-	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
-
-	clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
-	await manager!.tick(KEY);
 	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
 		state: "pending",
 		turn_state: "accepted",
@@ -2653,7 +3070,7 @@ test("case B: terminal_ok with pending output holds despite spoken and silent tr
 	});
 	expect(terminal).toEqual([]);
 	expect(failures).toEqual([]);
-	// A healthy host is not killed and the binding is kept.
+	// A healthy host is not killed and the binding is kept while the receipt may still arrive.
 	expect(port.closes).toHaveLength(0);
 	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	expect(logs.some((line) => line.startsWith("accepted_turn_closed"))).toBe(false);
@@ -2665,19 +3082,16 @@ test("case B: terminal_ok with pending output holds despite spoken and silent tr
 	expect(port.sends).toHaveLength(1);
 });
 
-test("case B with only [SILENT] in the transcript remains held without a silent receipt", async () => {
+test("case B with only [SILENT] in the transcript never substitutes it for the missing receipt", async () => {
 	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
 	const { clock, logs, terminal, failures, first } = await caseB(port);
 	port.appendAssistant(first.sessionId, "[SILENT]");
 	clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
 	await manager!.tick(KEY);
-	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
-		state: "pending",
-		turn_state: "accepted",
-		turn_op_ref: first.opRef,
-		bound_session_id: first.sessionId,
-	});
-	expect(terminal).toEqual([]);
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+	expect(terminal).toHaveLength(1);
+	expect(terminal[0]).toContain("[turn completed]");
+	expect(terminal[0]).not.toContain("[SILENT]");
 	expect(failures).toEqual([]);
 	expect(logs.some((line) => line.startsWith("accepted_turn_closed"))).toBe(false);
 	expect(port.closes).toHaveLength(0);
@@ -2698,34 +3112,123 @@ test("an unrelated confirmed delivery cannot settle a terminal operation with pe
 	});
 	clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
 	await manager!.tick(KEY);
-	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
-		state: "pending",
-		turn_state: "accepted",
-		turn_op_ref: first.opRef,
-		bound_session_id: first.sessionId,
-	});
-	expect(terminal).toEqual([]);
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+	expect(terminal).toHaveLength(1);
+	expect(terminal[0]).toContain("[turn completed]");
+	expect(terminal[0]).not.toContain("already posted");
 	expect(recorded).toEqual([]);
 	expect(failures).toEqual([]);
 	expect(logs.some((line) => line.startsWith("accepted_turn_closed"))).toBe(false);
 });
 
-test("case B with no transcript remains held instead of inferring output failure from elapsed time", async () => {
+test("case B with no transcript settles with one notice after the recovery window", async () => {
 	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
 	const { clock, logs, terminal, failures, first } = await caseB(port);
 	clock.offsetMs = OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
 	await manager!.tick(KEY);
-	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
-		state: "pending",
-		turn_state: "accepted",
-		turn_op_ref: first.opRef,
-		bound_session_id: first.sessionId,
-	});
-	expect(terminal).toEqual([]);
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+	expect(terminal).toHaveLength(1);
+	expect(terminal[0]).toContain("[turn completed]");
 	expect(failures).toEqual([]);
 	expect(logs.some((line) => line.startsWith("accepted_turn_closed"))).toBe(false);
 	expect(port.closes).toHaveLength(0);
 	expect(port.sends).toHaveLength(1);
+});
+
+test("terminal text recovery is bounded by attempts and rechecks, then stops", async () => {
+	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const { terminal, first } = await caseB(port);
+	const reads = () => port.workerOutputReads.filter((read) => read.opRef === first.opRef).length;
+	for (let attempt = 0; attempt < 12 && terminal.length === 0; attempt++) await manager!.tick(KEY);
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+	expect(terminal).toHaveLength(1);
+	expect(terminal[0]).toContain("[turn completed]");
+	const settledReads = reads();
+	expect(settledReads).toBeLessThanOrEqual(12);
+	await manager!.tick(KEY);
+	expect(reads()).toBe(settledReads);
+	expect(terminal).toHaveLength(1);
+});
+
+test("terminal text recovery window survives a gateway restart instead of restarting", async () => {
+	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const clock = { offsetMs: 0 };
+	const logs: string[] = [];
+	const terminal: string[] = [];
+	const failures: string[] = [];
+	const timing = { now: () => Date.now() + clock.offsetMs };
+	await harness(
+		port,
+		{
+			terminal: (text) => terminal.push(text),
+			failure: (message) => failures.push(message),
+		},
+		(line) => logs.push(line),
+		timing,
+	);
+	enqueue("m-1", "question");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	const first = port.sends[0]!;
+	port.pending.add(first.opRef);
+	port.seedOperation(first.opRef, first.sessionId, "terminal_ok", "");
+	port.setActivity(first.sessionId, "idle");
+	await manager!.tick(KEY);
+	await eventually(
+		() => logs.some((line) => line.includes("reason=no_assistant_text_for_terminal") && line.includes(first.opRef)),
+		"terminal_ok with pending output was not held",
+	);
+	const missKey = `terminal_text_miss:${first.opRef}`;
+	const firstMissAt = database!.core.metaGet(missKey);
+	expect(firstMissAt).toBeDefined();
+
+	// Restart three quarters of the way through the window. The first miss is durable, so
+	// the recovered actor continues the same window; a deadline restarted on boot would
+	// still be held here and would not expire until a full window after the restart.
+	clock.offsetMs = 45_000;
+	await manager!.stop();
+	database!.close();
+	database = await Store.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		submissionRetryDelayMs: 1,
+		log: (line) => logs.push(line),
+		...timing,
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onTerminal: ({ text }) => {
+				terminal.push(text);
+			},
+			onFailure: ({ error }) => {
+				failures.push(error.message);
+			},
+		}),
+	});
+	await manager.recover();
+	expect(database.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
+	expect(terminal).toEqual([]);
+
+	// Recovery reads the status itself, so the baseline is taken after it: the tick below
+	// must re-check on its own, and the restart and that miss leave the deadline untouched.
+	const readsAfterRecover = port.statusReads.length;
+	await manager.tick(KEY);
+	await eventually(() => port.statusReads.length > readsAfterRecover, "recovered turn did not re-check its status");
+	expect(database.core.metaGet(missKey)).toBe(firstMissAt);
+	expect(database.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
+	expect(terminal).toEqual([]);
+
+	// Past the original deadline, not merely a full window after the restart.
+	clock.offsetMs = MINUTE + 1_000;
+	await manager.tick(KEY);
+	await eventually(() => database!.inbox.turnRow(first.opRef)?.turn_state === "done", "window did not expire");
+	expect(terminal).toHaveLength(1);
+	expect(terminal[0]).toContain("[turn completed]");
+	expect(failures).toEqual([]);
+	expect(database.core.metaGet(missKey)).toBeUndefined();
 });
 
 test("a live session that is busy (not idle) past the bound is never released", async () => {
@@ -3519,6 +4022,172 @@ test("resumed activity clears an unknown-status recovery hold before a later sta
 	expect(database!.inbox.pendingCount(KEY)).toBe(2);
 });
 
+test("a stalled turn with a reply ending in stopReason stop does not post a failure notice (#768)", async () => {
+	const port = new ScriptedSessionPort();
+	const clock = { now: Date.now() };
+	let failureNoticePosted = false;
+	await harness(
+		port,
+		{
+			failure: (_message, forceFailureNotice) => {
+				failureNoticePosted = forceFailureNotice ?? false;
+			},
+		},
+		undefined,
+		{ now: () => clock.now },
+	);
+	enqueue("stall-stop-reply", "answer with a proper conclusion");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const send = port.sends[0]!;
+	// Set up the transcript with a reply that ended with stopReason "stop"
+	port.appendAssistant(send.sessionId, "Here is my answer", clock.now, "stop");
+	port.emitAssistant(send.sessionId, "Here is my answer", "answer-frame", send.opRef);
+	await manager!.tick(KEY);
+
+	// Trigger stall without emitting agent_end
+	port.setActivity(send.sessionId, "tool", clock.now);
+	const statusReads = port.statusReads.length;
+	port.emitStall(send.sessionId);
+	await eventually(() => port.statusReads.length > statusReads, "stall did not check operation status");
+
+	// Advance time to trigger stall cutoff
+	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+	await manager!.tick(KEY);
+
+	// Verify no failure notice was posted
+	expect(failureNoticePosted).toBe(false);
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
+});
+
+test("a steered turn whose host ends it uncorrelated is cut off as answered while its transcript is still readable", async () => {
+	// Production shape (yun-gajae 2026-11-11 08:52Z / 2026-11-12 01:02Z): a steer
+	// lands mid-turn, the final reply reaches the owned relay, then the host
+	// publishes the run's agent_end WITHOUT correlation and never terminalizes the
+	// prompt (turn.result stays in_flight). Per #733 that end is not terminal
+	// evidence, so the stall cutoff stops the host. The stopReason "stop" proof
+	// (#769) must be read before that: a stopped host answers no transcript read.
+	class StoppedHostHidesTranscript extends ScriptedSessionPort {
+		override async fetchAssistantSince(input: Parameters<ScriptedSessionPort["fetchAssistantSince"]>[0]) {
+			if (this.closes.some((closed) => closed.sessionId === input.sessionId))
+				throw new Error("gjc sdk session raw reported failure: endpoint_stale");
+			return await super.fetchAssistantSince(input);
+		}
+	}
+	const port = new StoppedHostHidesTranscript();
+	const clock = { now: Date.now() };
+	const failures: Array<boolean | undefined> = [];
+	const logs: string[] = [];
+	await harness(
+		port,
+		{ failure: (_message, forceFailureNotice) => failures.push(forceFailureNotice) },
+		(line) => logs.push(line),
+		{ now: () => clock.now },
+	);
+	enqueue("steered-root-trigger", "summarize the contract");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const send = port.sends[0]!;
+	enqueue("steered-root-edit", "edited: also list the owners");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.steers.length === 1, "mid-turn message was not steered");
+
+	port.appendAssistant(send.sessionId, "Here is the summary with owners", clock.now, "stop");
+	port.emitAssistant(send.sessionId, "Here is the summary with owners", "steered-answer", send.opRef);
+	const readsBeforeEnd = port.statusReads.length;
+	for (const tail of port.tailsOf(send.sessionId))
+		tail.emit({ kind: "agent_end", rawKind: "agent_end", payload: {}, steerEcho: false, idle: true });
+	await eventually(() => port.statusReads.length > readsBeforeEnd, "uncorrelated end did not wake a status reconcile");
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("accepted");
+
+	port.setActivity(send.sessionId, "idle", clock.now);
+	const statusReads = port.statusReads.length;
+	port.emitStall(send.sessionId);
+	await eventually(() => port.statusReads.length > statusReads, "stall did not check operation status");
+	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+	await manager!.tick(KEY);
+
+	await eventually(() => database!.inbox.turnRow(send.opRef)?.turn_state === "done", "stalled turn was not closed");
+	expect(port.closes.map((closed) => closed.sessionId)).toContain(send.sessionId);
+	expect(failures).toEqual([false]);
+	expect(logs.some((line) => line.startsWith("stall_turn_answered_properly "))).toBe(true);
+});
+
+test("a stalled turn with interim speech still posts a failure notice", async () => {
+	const port = new ScriptedSessionPort();
+	const clock = { now: Date.now() };
+	let failureNoticePosted = false;
+	await harness(
+		port,
+		{
+			failure: (_message, forceFailureNotice) => {
+				failureNoticePosted = forceFailureNotice ?? false;
+			},
+		},
+		undefined,
+		{ now: () => clock.now },
+	);
+	enqueue("stall-interim-speech", "start working with interim updates");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const send = port.sends[0]!;
+	// Emit interim speech without final answer (no stopReason)
+	port.emitAssistant(send.sessionId, "Still thinking...", "interim-1", send.opRef);
+	await manager!.tick(KEY);
+
+	// Trigger stall without emitting agent_end
+	port.setActivity(send.sessionId, "tool", clock.now);
+	const statusReads = port.statusReads.length;
+	port.emitStall(send.sessionId);
+	await eventually(() => port.statusReads.length > statusReads, "stall did not check operation status");
+
+	// Advance time to trigger stall cutoff
+	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+	await manager!.tick(KEY);
+
+	// Verify failure notice was posted (interim speech did not answer the question)
+	expect(failureNoticePosted).toBe(true);
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
+});
+
+test("a stalled turn with a reply ending in stopReason error still posts a failure notice", async () => {
+	const port = new ScriptedSessionPort();
+	const clock = { now: Date.now() };
+	let failureNoticePosted = false;
+	await harness(
+		port,
+		{
+			failure: (_message, forceFailureNotice) => {
+				failureNoticePosted = forceFailureNotice ?? false;
+			},
+		},
+		undefined,
+		{ now: () => clock.now },
+	);
+	enqueue("stall-error-reply", "fail with an error");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "persona turn did not start");
+	const send = port.sends[0]!;
+	// Set up the transcript with a reply that ended with stopReason "error"
+	port.appendAssistant(send.sessionId, "An error occurred", clock.now, "error");
+	port.emitAssistant(send.sessionId, "An error occurred", "error-frame", send.opRef);
+	await manager!.tick(KEY);
+
+	// Trigger stall without emitting agent_end
+	port.setActivity(send.sessionId, "tool", clock.now);
+	const statusReads = port.statusReads.length;
+	port.emitStall(send.sessionId);
+	await eventually(() => port.statusReads.length > statusReads, "stall did not check operation status");
+
+	// Advance time to trigger stall cutoff
+	clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+	await manager!.tick(KEY);
+
+	// Verify failure notice was posted (error stopReason is not "stop")
+	expect(failureNoticePosted).toBe(true);
+	expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
+});
+
 test("an uncorrelated idle broadcast does not retire a turn with stalled-status polling", async () => {
 	class UnknownStatusPort extends ScriptedSessionPort {
 		unknown = false;
@@ -3584,34 +4253,20 @@ test("an unanswerable liveness probe is not wedge evidence: the turn stays held"
 	expect(port.closes).toHaveLength(0);
 });
 
-test("a throwing liveness probe on a terminal_ok turn with pending output keeps it held", async () => {
+test("a throwing liveness probe on a terminal_ok turn with pending output still posts one notice", async () => {
 	const port = new WedgedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
-	const { clock, logs, terminal, first } = await caseB(port);
+	const { clock, logs, failures, terminal, first } = await caseB(port);
 	port.appendAssistant(first.sessionId, "the real answer");
 	port.livenessFails = true;
 	clock.offsetMs = 3 * OLD_IDLE_REGISTRY_AGE_MS;
 	await manager!.tick(KEY);
 	expect(logs.some((line) => line.startsWith("wedged_turn_released"))).toBe(false);
-	expect(database?.inbox.turnRow(first.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
-	expect(terminal).toEqual([]);
-	// A recovered liveness probe still cannot supply the operation's output.
-	port.livenessFails = false;
-	clock.offsetMs = 3 * OLD_IDLE_REGISTRY_AGE_MS + MINUTE;
-	await manager!.tick(KEY);
-	expect(database!.inbox.turnRow(first.opRef)).toMatchObject({
-		state: "pending",
-		turn_state: "accepted",
-		turn_op_ref: first.opRef,
-	});
-	expect(terminal).toEqual([]);
-	port.pending.delete(first.opRef);
-	port.seedOperation(first.opRef, first.sessionId, "terminal_ok", "original output restored");
-	await manager!.tick(KEY);
-	await eventually(
-		() => database!.inbox.turnRow(first.opRef)?.turn_state === "done",
-		"restored original output did not settle",
-	);
-	expect(terminal).toEqual(["original output restored"]);
+	expect(database!.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
+	expect(terminal).toHaveLength(1);
+	expect(terminal[0]).toContain("[turn completed]");
+	expect(terminal[0]).not.toContain("the real answer");
+	// A completed operation is not relabelled as a failed one by the recovery notice.
+	expect(failures).toEqual([]);
 });
 
 test("a retired stalled turn terminates its producer and summarizes discarded frames", async () => {
@@ -3802,6 +4457,7 @@ class GhostSendPort extends ScriptedSessionPort {
 			this.ghostOpRef = input.opRef;
 			this.ghostSessionId = input.sessionId;
 			this.sendAttempts.push(input);
+			input.beforeWrite?.();
 			throw new GjcCliError("gjc sdk session send reported failure", 0, "", {
 				code: "timeout",
 				message: "SDK session Router startup timed out.",
@@ -3864,6 +4520,7 @@ class UnprovenModelNotSelectedPort extends ScriptedSessionPort {
 
 	override async send(input: Parameters<ScriptedSessionPort["send"]>[0]): Promise<never> {
 		this.sendAttempts.push(input);
+		input.beforeWrite?.();
 		throw this.error;
 	}
 }
@@ -4323,6 +4980,7 @@ test("startup recovery preserves a bound operation whose running status is known
 	database?.transaction((tx) =>
 		database?.inbox.bindTurn(tx, { messageId: "m-1", originKey: KEY, epoch: 0, opRef, sessionId: orphan.sessionId }),
 	);
+	database!.transaction((tx) => database!.inbox.markSendAttempted(tx, opRef));
 	expect(database?.inbox.turnRow(opRef)).toMatchObject({ turn_state: "bound" });
 
 	const logs: string[] = [];
@@ -4438,7 +5096,9 @@ test("a tail attach that fails before any send releases the lifecycle it created
 	expect(port.failures).toBe(1);
 	expect(port.sends).toEqual([]);
 	expect(released).toEqual([latestOpRef]);
-	expect(database?.inbox.turnRow(latestOpRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+	// Nothing was sent (#675): the trigger is plain pending again, not stranded bound.
+	expect(database?.inbox.turnRow(latestOpRef)).toBeUndefined();
+	expect(database?.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "hello-lost", turn_state: null });
 });
 
 /**
@@ -4523,33 +5183,29 @@ test("가8: the first message after the host closed itself resumes the same sess
 	expect(terminal).toEqual(["earlier answer", "이어서 답"]);
 });
 
-test("가8: ambiguous bound recovery after a closed host preserves identity rather than resending", async () => {
+test("가8: an attach failure after a closed host requeues the trigger without resending or resuming", async () => {
 	const { port, logs, terminal, sessionId } = await idleClosedHarness();
 	port.staleLive = true;
 	enqueue("after-idle", "작업다됨?");
 	await manager!.notifyInbound(KEY).catch(() => undefined);
 	expect(port.sends).toHaveLength(1);
 	const opRef = latestOpRef;
-	expect(database!.inbox.turnRow(opRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+	expect(database!.inbox.turnRow(opRef)).toBeUndefined();
 
 	await manager!.recover();
 	await manager!.tick(KEY);
 	expect(port.sends).toHaveLength(1);
 	expect(port.resumeCalls).toBe(0);
-	expect(database!.inbox.turnRow(opRef)).toMatchObject({
-		state: "pending",
-		turn_state: "bound",
-		turn_op_ref: opRef,
-		bound_session_id: sessionId,
-		turn_epoch: 0,
-	});
+	// No prompt was sent (#675): the trigger is back to plain pending, never bound forever.
+	expect(database!.inbox.turnRow(opRef)).toBeUndefined();
+	expect(database!.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "after-idle", turn_state: null });
 	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	expect(logs.some((line) => line.startsWith("recovery_requeue_unaccepted"))).toBe(false);
 	expect(terminal).toEqual(["earlier answer"]);
 	expect(database!.inbox.pendingCount(KEY)).toBe(1);
 });
 
-test("가8: a failed resume cannot authorize replay of an ambiguous bound prompt", async () => {
+test("가8: a failed resume cannot authorize a resend or a resume", async () => {
 	const { port, logs, sessionId } = await idleClosedHarness();
 	port.staleLive = true;
 	port.failResume(sessionId);
@@ -4562,13 +5218,9 @@ test("가8: a failed resume cannot authorize replay of an ambiguous bound prompt
 	expect(port.resumeCalls).toBe(0);
 	expect(logs.some((line) => line.startsWith("recovery_requeue_unaccepted"))).toBe(false);
 	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
-	expect(database!.inbox.turnRow(opRef)).toMatchObject({
-		state: "pending",
-		turn_state: "bound",
-		turn_op_ref: opRef,
-		bound_session_id: sessionId,
-		turn_epoch: 0,
-	});
+	// No prompt was sent (#675): the trigger is back to plain pending, never bound forever.
+	expect(database!.inbox.turnRow(opRef)).toBeUndefined();
+	expect(database!.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "after-idle", turn_state: null });
 });
 
 test("가8: a deleted saved session is never resumed", async () => {
@@ -4583,13 +5235,9 @@ test("가8: a deleted saved session is never resumed", async () => {
 	expect(port.sends).toHaveLength(1);
 	expect(port.resumeCalls).toBe(0);
 	expect(database!.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
-	expect(database!.inbox.turnRow(opRef)).toMatchObject({
-		state: "pending",
-		turn_state: "bound",
-		turn_op_ref: opRef,
-		bound_session_id: sessionId,
-		turn_epoch: 0,
-	});
+	// No prompt was sent (#675): the trigger is back to plain pending, never bound forever.
+	expect(database!.inbox.turnRow(opRef)).toBeUndefined();
+	expect(database!.inbox.pendingOldest(KEY)).toMatchObject({ message_id: "after-idle", turn_state: null });
 });
 
 test("가8: a deleted closed binding is not resumed before the send either", async () => {
@@ -4983,6 +5631,10 @@ class ContextUsagePort extends ScriptedSessionPort {
 	readonly failing = new Set<string>();
 	autoComplete = true;
 	compactionStatus: SessionCompactionStatus = "succeeded";
+	/** Replies for the next compactions, in order, e.g. an unknown outcome; then `compactionStatus`. */
+	readonly nextCompactions: SessionCompactionResult[] = [];
+	/** Outcomes for the next context reads, in order: a thrown read or an unreadable (undefined) usage. */
+	readonly nextUsageReads: Array<"throw" | "undefined" | "real"> = [];
 	/** How many sends had been made when each compaction ran. */
 	readonly compactedAfterSends: number[] = [];
 
@@ -4996,13 +5648,23 @@ class ContextUsagePort extends ScriptedSessionPort {
 	}
 
 	async contextUsage(): Promise<SessionContextUsage | undefined> {
+		const scripted = this.nextUsageReads.shift();
+		if (scripted === "throw") throw new Error("context read failed");
+		if (scripted === "undefined") return undefined;
 		return this.percent === undefined ? undefined : { percent: this.percent, tokens: this.percent * 10_000 };
 	}
 
-	override async runCompaction(): Promise<{ readonly status: SessionCompactionStatus }> {
+	/** Whether each compaction was sent on the session's relay. */
+	readonly compactedOnRelay: boolean[] = [];
+
+	override async runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult> {
 		this.compactedAfterSends.push(this.sends.length);
+		this.compactedOnRelay.push(input.relay?.sessionId === input.sessionId);
+		const scripted = this.nextCompactions.shift();
+		if (scripted) return scripted;
 		if (this.compactionStatus === "succeeded") this.percent = undefined;
-		return { status: this.compactionStatus };
+		// The host's dispatcher answered, as a relay run reports.
+		return { status: this.compactionStatus, answered: true };
 	}
 }
 
@@ -5012,6 +5674,7 @@ async function preambleHarness(
 	port: ScriptedSessionPort,
 	lifecycle: { persona: () => string; bootstrap?: () => string | undefined },
 	log?: (line: string) => void,
+	timers?: Pick<ConstructorParameters<typeof PersonaSessionManager>[0], "setTimeout" | "clearTimeout">,
 ): Promise<void> {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-preamble-"));
 	database = await Store.open(join(home, "gateway.db"));
@@ -5022,6 +5685,7 @@ async function preambleHarness(
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
 		...(log ? { log } : {}),
+		...timers,
 		onTurnStart: ({ trigger }) => {
 			const bootstrap = lifecycle.bootstrap?.();
 			return {
@@ -5166,6 +5830,8 @@ test("a session at the compaction line is compacted before the send, which carri
 	port.percent = COMPACTION_PERCENT;
 	expect(await sendTurn(port, "at the line")).toBe(PERSONA);
 	expect(port.compactedAfterSends).toEqual([2]);
+	// On the session's own relay, so the host's ordered reply comes back unaltered.
+	expect(port.compactedOnRelay).toEqual([true]);
 	expect(
 		logs.some(
 			(line) =>
@@ -5203,14 +5869,226 @@ test("a compaction that does not succeed still sends the turn on the same sessio
 	).toEqual(["status=failed", "status=unavailable"]);
 });
 
+test("a compaction that gjc answered with a failure logs its code and the turn is still sent", async () => {
+	const port = new ContextUsagePort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line));
+	port.percent = COMPACTION_PERCENT + 5;
+	// gjc reports a finished compaction failure (e.g. nothing to compact) as operation_failed.
+	port.nextCompactions.push({ status: "failed", code: "operation_failed" });
+	await sendTurn(port, "after a failed compaction");
+	expect(
+		logs
+			.filter((line) => line.startsWith("persona_compaction "))
+			.map((line) => line.match(/status=\w+( code=\w+)?/)?.[0]),
+	).toEqual(["status=failed code=operation_failed"]);
+});
+
+/** Shortens the pre-send retry backoff (2 s, 4 s, ...) so held turns retry within a test. */
+const FAST_RETRY = {
+	setTimeout: (work: () => void, delayMs: number) => setTimeout(work, Math.min(delayMs, 20)),
+	clearTimeout: (timer: unknown) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+};
+
+async function heldByUnresolvedCompaction(
+	port: ContextUsagePort,
+	logs: string[],
+	body: string,
+	...replies: SessionCompactionResult[]
+): Promise<void> {
+	port.nextCompactions.push(...replies);
+	port.percent = COMPACTION_PERCENT + 5;
+	enqueue(`m-${body}`, body);
+	await manager!.notifyInbound(KEY);
+	await eventually(
+		() => logs.some((line) => line.startsWith("send_pre_send_requeue stage=prepare_context")),
+		"an unresolved compaction did not return the turn to pending",
+	);
+}
+
+for (const reply of [
+	{ status: "failed", code: "timeout", outcomeUnknown: true },
+	{ status: "failed", outcomeUnknown: true },
+] as const satisfies readonly SessionCompactionResult[]) {
+	test(`a compaction that may still be running (${reply.code ?? "no gjc answer"}) holds the send until its context lands below the line`, async () => {
+		const port = new ContextUsagePort();
+		const logs: string[] = [];
+		await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line));
+		port.percent = 5;
+		expect(await sendTurn(port, "first")).toBe(PERSONA);
+		// Stays held while the host is still compacting: no send, no steer.
+		await heldByUnresolvedCompaction(port, logs, "held", reply);
+		expect(port.sends.map((send) => send.text)).toEqual(["first"]);
+		expect(port.steers).toHaveLength(0);
+		expect(logs.some((line) => line.startsWith("persona_compaction ") && line.includes("outcome=unknown"))).toBe(true);
+
+		// The run lands; the retry reads the smaller context and sends once,
+		// with the persona again and without a second compaction.
+		port.percent = 3;
+		const retried = () => port.sends.length === 2 && manager!.state(KEY) === "idle";
+		for (let attempt = 0; attempt < 100 && !retried(); attempt++) await Bun.sleep(50);
+		expect(retried(), "held turn was not sent after its compaction landed").toBe(true);
+		expect(port.sends[1]).toMatchObject({ text: "held", systemPreamble: PERSONA });
+		expect(port.compactedAfterSends).toEqual([1]);
+		expect(logs.some((line) => line.startsWith("persona_compaction_resolved "))).toBe(true);
+	});
+}
+
+for (const read of ["throw", "undefined", "above"] as const) {
+	test(`an unresolved compaction with a ${read === "above" ? "context still above the line" : read === "throw" ? "failed context read" : "unreadable context"} sends only after a second compaction answers`, async () => {
+		let releaseBarrier!: () => void;
+		const barrier = new Promise<void>((resolve) => {
+			releaseBarrier = resolve;
+		});
+		class BarrierPort extends ContextUsagePort {
+			override async runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult> {
+				const first = this.compactedAfterSends.length === 0;
+				const result = await super.runCompaction(input);
+				// gjc orders the second run behind the first; it answers once both are done.
+				if (!first) await barrier;
+				return result;
+			}
+		}
+		const port = new BarrierPort();
+		const logs: string[] = [];
+		await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
+		// The first read sees the large context; the retry's read is the case under test.
+		if (read !== "above") port.nextUsageReads.push("real", read);
+		await heldByUnresolvedCompaction(port, logs, "held", { status: "failed", code: "timeout", outcomeUnknown: true });
+		await eventually(() => port.compactedAfterSends.length === 2, "no second compaction was run");
+		// An unreadable or still-large context is not evidence the first run is over.
+		await Bun.sleep(30);
+		expect(port.sends).toHaveLength(0);
+		expect(port.steers).toHaveLength(0);
+
+		releaseBarrier();
+		await eventually(() => port.sends.length === 1 && manager!.state(KEY) === "idle", "held turn was not sent");
+		expect(port.sends[0]).toMatchObject({ text: "held", systemPreamble: PERSONA });
+		expect(port.compactedAfterSends).toEqual([0, 0]);
+		expect(logs.some((line) => line.startsWith("persona_compaction ") && line.includes("after=unresolved"))).toBe(true);
+	});
+}
+
+test("behind an unresolved compaction, refused or unanswered runs keep holding and a host answer releases the send with the persona", async () => {
+	const port = new ContextUsagePort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	// None of these prove the first run ended: another unanswered run, a frame
+	// never written, and a refusal before the host's ordered dispatch. The
+	// dispatcher's own failure (e.g. already compacted) does, and the earlier run
+	// may have compacted, so the persona goes back in.
+	await heldByUnresolvedCompaction(
+		port,
+		logs,
+		"held",
+		{ status: "failed", code: "timeout", outcomeUnknown: true },
+		{ status: "failed", outcomeUnknown: true },
+		{ status: "failed", code: "relay_unwritten" },
+		{ status: "failed", code: "session_quiescing" },
+		{ status: "failed", code: "internal", answered: true },
+	);
+	await eventually(() => port.sends.length === 2 && manager!.state(KEY) === "idle", "held turn was not sent");
+	expect(port.sends[1]).toMatchObject({ text: "held", systemPreamble: PERSONA });
+	expect(port.compactedAfterSends).toEqual([1, 1, 1, 1, 1]);
+	expect(logs.filter((line) => line.startsWith("send_pre_send_requeue stage=prepare_context"))).toHaveLength(4);
+	expect(
+		logs
+			.filter((line) => line.startsWith("persona_compaction "))
+			.map((line) => line.match(/status=\w+( code=\w+)?/)?.[0]),
+	).toEqual([
+		"status=failed code=timeout",
+		"status=failed",
+		"status=failed code=relay_unwritten",
+		"status=failed code=session_quiescing",
+		"status=failed code=internal",
+	]);
+});
+
+test("an unresolved compaction keeps holding the send after a gateway restart until the host answers", async () => {
+	let releaseBarrier!: () => void;
+	const barrier = new Promise<void>((resolve) => {
+		releaseBarrier = resolve;
+	});
+	class BarrierPort extends ContextUsagePort {
+		override async runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult> {
+			const first = this.compactedAfterSends.length === 0;
+			const result = await super.runCompaction(input);
+			if (!first) await barrier;
+			return result;
+		}
+	}
+	const port = new BarrierPort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line));
+	await heldByUnresolvedCompaction(port, logs, "held", { status: "failed", code: "timeout", outcomeUnknown: true });
+
+	// Restart while the host may still be compacting; the recovered actor cannot read the context.
+	await manager!.stop();
+	database!.close();
+	database = await Store.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		log: (line) => logs.push(line),
+		onTurnStart: ({ trigger }) => ({ text: trigger.body, systemPreamble: PERSONA }),
+	});
+	port.nextUsageReads.push("undefined", "undefined");
+	// Recovery dispatches the pending turn itself and then waits in the barrier run.
+	const recovered = manager.recover();
+	await eventually(() => port.compactedAfterSends.length === 2, "the recovered actor did not run a barrier compaction");
+	await Bun.sleep(30);
+	expect(port.sends).toHaveLength(0);
+	expect(port.steers).toHaveLength(0);
+
+	releaseBarrier();
+	await recovered;
+	await eventually(() => port.sends.length === 1 && manager!.state(KEY) === "idle", "held turn was not sent");
+	expect(port.sends[0]).toMatchObject({ text: "held", systemPreamble: PERSONA });
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeUndefined();
+});
+
+test("the unresolved-compaction hold is stored before the first run, so a gateway stopped mid-run comes back holding", async () => {
+	let releaseCompaction!: () => void;
+	const gate = new Promise<void>((resolve) => {
+		releaseCompaction = resolve;
+	});
+	class GatedPort extends ContextUsagePort {
+		override async runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult> {
+			const result = super.runCompaction(input);
+			await gate;
+			return await result;
+		}
+	}
+	const port = new GatedPort();
+	await preambleHarness(port, { persona: () => PERSONA });
+	port.percent = COMPACTION_PERCENT + 1;
+	enqueue("m-full", "lands after compaction");
+	void manager!.notifyInbound(KEY);
+	await eventually(() => port.compactedAfterSends.length === 1, "compaction did not start");
+	// While the host is compacting, the durable hold already names the session;
+	// a restarted gateway reads it (see the restart test) instead of sending.
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBe(
+		database!.bindings.getSessionRecord(KEY)?.sessionId,
+	);
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeDefined();
+	releaseCompaction();
+	await eventually(() => port.sends.length === 1 && manager!.state(KEY) === "idle", "compacted send did not follow");
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeUndefined();
+});
+
 test("messages arriving while the actor compacts wait for the compacted send instead of reaching the session", async () => {
 	let releaseCompaction!: () => void;
 	const compactionGate = new Promise<void>((resolve) => {
 		releaseCompaction = resolve;
 	});
 	class GatedCompactionPort extends ContextUsagePort {
-		override async runCompaction(): Promise<{ readonly status: SessionCompactionStatus }> {
-			const result = super.runCompaction();
+		override async runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult> {
+			const result = super.runCompaction(input);
 			await compactionGate;
 			return await result;
 		}

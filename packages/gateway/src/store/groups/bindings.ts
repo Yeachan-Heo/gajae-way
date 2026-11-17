@@ -1039,6 +1039,17 @@ export class BindingsGroup {
 			.get(brokerAuthorityKey(authority), operation, scope) as BrokerOperationRow | null;
 		return row ? brokerOperationRecord(row) : undefined;
 	}
+
+	/** Observation only (#688): whether any authority holds a durable `busy` refusal for this prompt op-ref. */
+	promptBusyRefused(operationRef: string): boolean {
+		return (
+			this.#db
+				.prepare(
+					"SELECT 1 FROM broker_operations WHERE operation = 'turn.prompt' AND operation_ref = ? AND state = 'complete' AND result_json = ? LIMIT 1",
+				)
+				.get(operationRef, JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL)) !== null
+		);
+	}
 }
 
 export type BrokerOperationKind = "session.create" | "turn.prompt" | "session.close";

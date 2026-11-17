@@ -484,3 +484,49 @@ test("AGENTS.md baseline survives a gateway and database reload", async () => {
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+test("an AGENTS.md update survives a pre-send retry in the same epoch (#676 review)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-agents-presend-retry-"));
+	const agentsPath = join(home, "workspace", "AGENTS.md");
+	const seen: string[] = [];
+	let gateway: Awaited<ReturnType<typeof startAgentsGateway>> | undefined;
+	let client: Awaited<ReturnType<typeof connectLoopbackClient>> | undefined;
+	try {
+		await mkdir(join(home, "workspace"), { recursive: true });
+		await writeFile(agentsPath, "session-start instructions");
+		gateway = await startAgentsGateway(home, seen);
+		client = await connectLoopbackClient(gateway.config);
+		await client.sendTurn("before-edit", "first turn");
+		const baseline = createHash("sha256").update("session-start instructions").digest("hex");
+
+		// The update's first attempt dies before anything is sent: the pre-send
+		// compaction fails transiently, so the trigger is requeued in the same epoch.
+		const port = gateway.sessionPort as TestSessionPort & {
+			contextUsage?: () => Promise<{ percent: number; tokens: number }>;
+		};
+		let failures = 1;
+		port.contextUsage = async () => ({ percent: 95, tokens: 250_000 });
+		port.runCompaction = async () => {
+			if (failures-- > 0) throw new Error("broker_unavailable (client stopped or broker unavailable)");
+			return { status: "succeeded" as const };
+		};
+		await writeFile(agentsPath, "updated instructions");
+		await client.sendTurn("after-edit", "second turn");
+		expect(failures).toBeLessThan(0);
+
+		// The retried prompt still carries the update, exactly once.
+		expect(seen).toHaveLength(2);
+		expect(agentsSectionCount(preambleAt(seen, 1))).toBe(1);
+		expect(seen[1]).toContain(`${UPDATED_AGENTS_MD_HEADING}\nupdated instructions`);
+		expect(gateway.database.bindings.getSessionBootstrap(originKey(LOOPBACK_ORIGIN))?.agentsMdDigest).not.toBe(
+			baseline,
+		);
+
+		await client.sendTurn("edit-still-current", "third turn");
+		expect(agentsSectionCount(preambleAt(seen, 2))).toBe(0);
+	} finally {
+		client?.close();
+		await gateway?.server.stop();
+		await rm(home, { recursive: true, force: true });
+	}
+});

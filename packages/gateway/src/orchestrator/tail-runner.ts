@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { LogLevel } from "@gajae-gateway/log";
-import type { SessionRelayStream } from "./broker";
+import { RelayStreamUnwrittenError, type SessionRelayStream } from "./broker";
 import { isSessionGoneCode } from "./gjc-contract";
 import { runtimeErrorOfLine, sanitizeDiagnostic } from "./rebind";
 
@@ -140,6 +140,10 @@ export interface RelayRequestOptions {
 	readonly timeoutMs?: number;
 	/** Continuation cursor of a paged query, sent as the top-level `cursor` of `query_request` (as gjc's CLI does). */
 	readonly cursor?: string;
+	/** Called synchronously after exact-envelope validation and before the stream write. */
+	readonly beforeWrite?: () => void;
+	/** Called synchronously when exact-envelope validation proves the request was not written. */
+	readonly onPayloadTooLarge?: (error: RelayPayloadTooLargeError) => void;
 }
 
 export type RelayResponse = {
@@ -208,6 +212,16 @@ const HELLO_TIMEOUT_MS = 15_000;
 const STREAM_REOPEN_GIVE_UP = 6;
 const REOPEN_BASE_BACKOFF_MS = 250;
 const UNKNOWN_KIND_DIAGNOSTIC_CAP = 20;
+export const MAX_RELAY_REQUEST_FRAME_BYTES = 262_144;
+
+/** Serializes one SDK request and rejects it before any stream write if it exceeds the wire limit. */
+export function serializeRelayRequestFrame(sessionId: string, frame: Record<string, unknown>): string {
+	const serialized = JSON.stringify(frame);
+	const frameBytes = Buffer.byteLength(serialized, "utf8");
+	if (frameBytes > MAX_RELAY_REQUEST_FRAME_BYTES)
+		throw new RelayPayloadTooLargeError(sessionId, frameBytes, MAX_RELAY_REQUEST_FRAME_BYTES);
+	return serialized;
+}
 
 export class TailCapacityError extends Error {
 	constructor() {
@@ -218,10 +232,35 @@ export class TailCapacityError extends Error {
 
 export class RelayClosedError extends Error {
 	readonly code = "relay_closed";
-	constructor(sessionId: string, detail: string) {
+	/** False only when the request frame provably never reached the stream: nothing was submitted. */
+	readonly requestWritten: boolean;
+	constructor(sessionId: string, detail: string, requestWritten: boolean) {
 		super(`relay for ${sessionId} closed before the host answered: ${detail}`);
 		this.name = "RelayClosedError";
+		this.requestWritten = requestWritten;
 	}
+}
+
+/** A request exceeded the frame limit and was conclusively never submitted. */
+export class RelayPayloadTooLargeError extends Error {
+	readonly code = "prompt_too_large";
+	constructor(
+		readonly sessionId: string,
+		readonly frameBytes: number,
+		readonly maxBytes = MAX_RELAY_REQUEST_FRAME_BYTES,
+	) {
+		super(`relay request frame is ${frameBytes} bytes; limit is ${maxBytes}`);
+		this.name = "RelayPayloadTooLargeError";
+	}
+}
+
+/** The relay failed before the request frame was written, so the host never saw it. */
+export function isUnwrittenRelayRequest(error: unknown): boolean {
+	return (
+		error instanceof RelayPayloadTooLargeError ||
+		(error instanceof RelayClosedError && !error.requestWritten) ||
+		error instanceof RelayHelloError
+	);
 }
 
 /** A relay never completed its hello handshake before a prompt could be sent. */
@@ -608,10 +647,10 @@ class ManagedTailHandle implements TailHandle {
 		result?: unknown;
 		error?: { code: string; message: string };
 	}): Promise<void> {
-		if (this.#closed) throw new RelayClosedError(this.sessionId, "handle closed");
+		if (this.#closed) throw new RelayClosedError(this.sessionId, "handle closed", false);
 		await this.ready;
 		const stream = this.#stream;
-		if (!stream) throw new RelayClosedError(this.sessionId, "relay not open");
+		if (!stream) throw new RelayClosedError(this.sessionId, "relay not open", false);
 		const frame: Record<string, unknown> = {
 			type: "reverse_response",
 			id: input.id,
@@ -630,7 +669,11 @@ class ManagedTailHandle implements TailHandle {
 		try {
 			stream.write(JSON.stringify(frame));
 		} catch (error) {
-			throw new RelayClosedError(this.sessionId, sanitizeDiagnostic(messageOf(error)) || "write_failed");
+			throw new RelayClosedError(
+				this.sessionId,
+				sanitizeDiagnostic(messageOf(error)) || "write_failed",
+				!(error instanceof RelayStreamUnwrittenError),
+			);
 		}
 	}
 
@@ -640,12 +683,20 @@ class ManagedTailHandle implements TailHandle {
 		body: Record<string, unknown>,
 		options?: RelayRequestOptions,
 	): Promise<RelayResponse> {
-		if (this.#closed) throw new RelayClosedError(this.sessionId, "handle closed");
+		if (this.#closed) throw new RelayClosedError(this.sessionId, "handle closed", false);
 		await this.ready;
 		const stream = this.#stream;
 		const connectionId = this.#connectionId;
-		if (!stream || !connectionId) throw new RelayClosedError(this.sessionId, "relay not open");
+		if (!stream || !connectionId) throw new RelayClosedError(this.sessionId, "relay not open", false);
 		const id = `gw-${this.brokerGeneration}-${++this.#requestSeq}`;
+		let serialized: string;
+		try {
+			serialized = serializeRelayRequestFrame(this.sessionId, { type, id, connectionId, ...body });
+		} catch (error) {
+			if (error instanceof RelayPayloadTooLargeError) options?.onPayloadTooLarge?.(error);
+			throw error;
+		}
+		options?.beforeWrite?.();
 		const timeoutMs = options?.timeoutMs ?? this.#runner.requestTimeoutMs;
 		return await new Promise<RelayResponse>((resolve, reject) => {
 			const timer = setTimeout(() => {
@@ -654,11 +705,19 @@ class ManagedTailHandle implements TailHandle {
 			}, timeoutMs);
 			this.#pending.set(id, { kind: responseType, resolve, reject, timer });
 			try {
-				stream.write(JSON.stringify({ type, id, connectionId, ...body }));
+				stream.write(serialized);
 			} catch (error) {
 				clearTimeout(timer);
 				this.#pending.delete(id);
-				reject(new RelayClosedError(this.sessionId, sanitizeDiagnostic(messageOf(error)) || "write_failed"));
+				// Only the stream's own pre-write refusal proves the host never saw the
+				// frame; a throw after stdin.write (e.g. its flush) may follow delivery.
+				reject(
+					new RelayClosedError(
+						this.sessionId,
+						sanitizeDiagnostic(messageOf(error)) || "write_failed",
+						!(error instanceof RelayStreamUnwrittenError),
+					),
+				);
 			}
 		});
 	}
@@ -667,7 +726,7 @@ class ManagedTailHandle implements TailHandle {
 		for (const [id, pending] of this.#pending) {
 			clearTimeout(pending.timer);
 			this.#pending.delete(id);
-			pending.reject(new RelayClosedError(this.sessionId, detail));
+			pending.reject(new RelayClosedError(this.sessionId, detail, true));
 		}
 	}
 

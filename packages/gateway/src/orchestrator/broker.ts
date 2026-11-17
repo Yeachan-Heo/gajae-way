@@ -4,10 +4,14 @@ import type { CliResult, CliRunner } from "@gajae-gateway/subsession";
 import {
 	type BrokerDiscovery,
 	type BrokerLivenessVerdict,
+	BrokerStartupFailureTracker,
 	judgeBrokerLiveness,
 	type PidAliveProbe,
 	readBrokerDiscovery,
+	readBrokerStartupExitRecordSync,
+	validateStartupExitRecord,
 } from "./broker-liveness";
+import { isEmbeddedModuleDir } from "./embedded-module";
 import { isVerifiedGjcVersion, MIN_GJC_VERSION, VERIFIED_GJC_THROUGH } from "./gjc-contract";
 import { extractRuntimeError, sanitizeDiagnostic } from "./rebind";
 
@@ -15,37 +19,88 @@ export {
 	BROKER_HEARTBEAT_TTL_MS,
 	type BrokerDiscovery,
 	type BrokerLivenessVerdict,
+	BrokerStartupFailureTracker,
 	describeBindHold,
 	judgeBrokerLiveness,
 	type PidAliveProbe,
 	readBrokerDiscovery,
+	readBrokerStartupExitRecordSync,
+	validateStartupExitRecord,
 } from "./broker-liveness";
 export const GJC_ATTACH_ONLY_ENV = "GJC_SDK_BROKER_AUTOSTART";
 
 /**
  * Candidate locations for the pinned GJC version, in priority order.
  *
- * A compiled binary keeps the *build-time* source path in `__filename`, so the
- * checkout candidate only resolves on the machine that built it. An installed
- * binary carries the pin beside itself instead; without that second candidate a
- * binary shipped to another host exits at boot naming a path from the build
- * machine, which no operator can act on (found deploying dev to jip-gajae).
+ * The manifest beside the running binary is authoritative: it is the release the operator
+ * installed and the one `gajaeway services install` reads, so the runtime must not resolve a
+ * different pin for the same install.
+ *
+ * The checkout manifest is a source-run candidate only. `bun` is the executable of a source
+ * run and ships no release manifest, so the checkout's own gateway manifest is the pin and
+ * `modulePath` names it on disk. A `bun build --compile` binary reports Bun's virtual root
+ * from `import.meta.path` (its `__filename` still names the build-time source path, which is
+ * why the delivery mode can never be read from `__filename`), so it has no checkout to
+ * consult: the release manifest beside the executable is its only pin source, and a release
+ * that lost that manifest is a broken install that fails closed as one.
  */
-export function pinnedGjcCandidatePaths(execPath: string = process.execPath): readonly string[] {
-	return [join(dirname(dirname(dirname(__filename))), "package.json"), join(dirname(execPath), "package.json")];
+export function pinnedGjcCandidatePaths(
+	execPath: string = process.execPath,
+	modulePath: string = import.meta.path,
+): readonly string[] {
+	const release = join(dirname(execPath), "package.json");
+	if (isCompiledRelease(modulePath)) return [release];
+	return [release, join(dirname(dirname(dirname(modulePath))), "package.json")];
 }
 
-/** Read the pinned GJC version this build runs against, or throw naming every candidate tried. */
-export function readPinnedGjcVersion(candidates: readonly string[] = pinnedGjcCandidatePaths()): string {
+/**
+ * True when this process is a `bun build --compile` release rather than a source checkout
+ * run: a compiled binary embeds its modules under Bun's virtual root, a source run executes
+ * them from disk.
+ */
+export function isCompiledRelease(modulePath: string = import.meta.path): boolean {
+	return isEmbeddedModuleDir(dirname(modulePath));
+}
+
+/**
+ * Read the pinned GJC version this build runs against: the first candidate that carries a
+ * `gjc.version` wins, so a readable target manifest cannot be overridden by a later fallback.
+ *
+ * A compiled release fails closed. `modulePath` decides that the candidates come from that
+ * mode, and with no checkout candidate an executable whose release manifest is missing,
+ * unreadable, malformed, or pin-less has no pin of its own — enforcing another manifest's
+ * pin is how the broker comes to refuse its own release. A source run keeps the checkout
+ * fallback.
+ */
+export function readPinnedGjcVersion(
+	candidates: readonly string[] = pinnedGjcCandidatePaths(),
+	modulePath: string = import.meta.path,
+): string {
+	const failures: string[] = [];
 	for (const path of candidates) {
 		try {
 			const version = (JSON.parse(readFileSync(path, "utf-8")) as { gjc?: { version?: unknown } }).gjc?.version;
 			if (typeof version === "string" && version.length > 0) return version;
-		} catch {
-			// A missing or malformed candidate is not fatal: a later one may carry the pin.
+			failures.push(`${path} declares no gjc.version`);
+		} catch (error) {
+			// A missing or unusable candidate is not fatal while a later one may carry the pin;
+			// a compiled release has a single candidate, so the loop ends and the throw below
+			// refuses the boot instead of borrowing another manifest's pin.
+			failures.push(
+				(error as NodeJS.ErrnoException | undefined)?.code === "ENOENT"
+					? `${path} is missing`
+					: `${path} is unreadable or malformed`,
+			);
 		}
 	}
-	throw new Error(`Failed to read pinned GJC version from any of ${candidates.join(", ")}`);
+	const tried = failures.join("; ");
+	if (candidates.length > 0 && isCompiledRelease(modulePath)) {
+		const target = dirname(candidates[0]!);
+		throw new Error(
+			`gjc release pin unavailable: ${tried}. This binary is a compiled release: restore its manifest with 'gajaeway update --force --bin-dir ${target}'`,
+		);
+	}
+	throw new Error(`Failed to read pinned GJC version: ${tried}`);
 }
 export const HEALTH_PROBE_SESSION_ID = "00000000-0000-4000-8000-000000000000";
 const COMMAND_TIMEOUT_MS = 30_000;
@@ -96,6 +151,12 @@ export interface GlobalGjcClientOptions {
 	readonly reconnectBackoff?: { readonly initialMs?: number; readonly maxMs?: number };
 	readonly log?: (line: string) => void;
 	/**
+	 * Concurrent `gjc sdk` CLI children. Boot sizes it from sessions.maxLiveHosts
+	 * so persona hosts do not starve each other; clamped to [4, 16] because every
+	 * child costs about a second of CPU.
+	 */
+	readonly maxPoolSize?: number;
+	/**
 	 * Minimum client runtime version for this build. The independently supervised
 	 * production broker host enforces the package pin exactly before spawning.
 	 */
@@ -115,14 +176,31 @@ export interface GlobalGjcClientOptions {
 	/** Broker-unavailable refusals are counted by the gateway SLO journal. */
 	readonly onUnavailable?: (at: number) => void;
 }
+/** One broker startup wedge: K distinct startup-exit records sharing a reason (#800). */
+export interface BrokerStartupWedge {
+	readonly reason: string;
+	readonly blockingPath?: string;
+}
 export type GlobalGjcClientDependencies = Omit<GlobalGjcClientOptions, "cwd">;
 
 /** A resident bidirectional JSONL relay to one SDK session host. */
 export interface SessionRelayStream {
 	readonly lines: AsyncIterable<string>;
-	/** Writes one JSONL frame to the host; throws once the relay is closed. */
+	/**
+	 * Writes one JSONL frame to the host. Throws RelayStreamUnwrittenError only
+	 * when no byte of the frame reached the pipe; any other throw may follow a
+	 * partial or complete write and proves nothing about delivery.
+	 */
 	write(line: string): void;
 	close(): void;
+}
+
+/** The relay refused a frame before handing any of it to the host's pipe. */
+export class RelayStreamUnwrittenError extends Error {
+	constructor(detail: string) {
+		super(detail);
+		this.name = "RelayStreamUnwrittenError";
+	}
 }
 export class GjcCliUnavailableError extends Error {
 	readonly code = "broker_unavailable";
@@ -381,6 +459,17 @@ export function parseListModelsOutput(stdout: string): string[] {
 }
 
 /** A client of the broker host's pinned GJC runtime; it does not own broker lifecycle. */
+const MIN_CLI_POOL = 4;
+const MAX_CLI_POOL = 16;
+
+/** The local CLI pool stayed full for the whole call budget; the broker was never asked. */
+export class GjcCommandQueueTimeoutError extends Error {
+	constructor(readonly timeoutMs: number) {
+		super(`gjc command queue timed out after ${timeoutMs}ms (local CLI pool saturated)`);
+		this.name = "GjcCommandQueueTimeoutError";
+	}
+}
+
 export class GlobalGjcClient {
 	readonly executable: string;
 	readonly agentDir: string;
@@ -420,12 +509,16 @@ export class GlobalGjcClient {
 	/** Start of the current run of failures against a broker discovery calls live. */
 	#liveOutageSince: number | undefined;
 	readonly #liveOutageLimit: number;
+	#maxPoolSize: number;
 	#timer: ReturnType<typeof setTimeout> | undefined;
 	#starting: Promise<void> | undefined;
 	#gjcVersion: string | undefined;
 	/** Observation times of incarnation changes after the first; bounded by the churn window. */
 	#respawns: number[] = [];
 	#churnAlerted = false;
+	/** Tracks consecutive broker startup failures with the same reason. */
+	#startupFailureTracker = new BrokerStartupFailureTracker();
+	#onStartupWedge: ((wedge: BrokerStartupWedge) => void) | undefined;
 
 	constructor(options: GlobalGjcClientOptions) {
 		this.#options = options;
@@ -448,6 +541,7 @@ export class GlobalGjcClient {
 		this.#initialBackoff = integer(options.reconnectBackoff?.initialMs, 250, 1);
 		this.#maxBackoff = integer(options.reconnectBackoff?.maxMs, 10_000, this.#initialBackoff);
 		this.#liveOutageLimit = integer(options.liveOutageLimitMs, 180_000, 1);
+		this.#maxPoolSize = clampPoolSize(options.maxPoolSize);
 		integer(options.readinessAttempts, 20, 1);
 		integer(options.readinessDelayMs, 100, 0);
 		this.cli = (args, commandOptions) =>
@@ -491,9 +585,15 @@ export class GlobalGjcClient {
 	judgeLiveness(): Promise<BrokerLivenessVerdict> {
 		return judgeBrokerLiveness(this.discoveryPath, this.#options.isPidAlive ?? defaultPidAlive);
 	}
+
 	onGeneration(listener: BrokerGenerationListener): () => void {
 		this.#listeners.add(listener);
 		return () => this.#listeners.delete(listener);
+	}
+
+	/** The runtime installs the owner alert after the client exists, like onGeneration. */
+	setOnStartupWedgeAlert(listener: (wedge: BrokerStartupWedge) => void): void {
+		this.#onStartupWedge = listener;
 	}
 	async preflight(): Promise<void> {
 		const result = await preflightGjcRuntime(
@@ -717,6 +817,8 @@ export class GlobalGjcClient {
 					}
 				}
 			}
+			// Reset startup failure tracker when broker is confirmed live
+			this.#startupFailureTracker.reset();
 			return true;
 		} catch (error) {
 			if (epoch === this.#epoch && !this.#stopped) {
@@ -792,6 +894,21 @@ export class GlobalGjcClient {
 					this.#outageSince = undefined;
 					this.#liveOutageSince = undefined;
 				} else if (epoch === this.#epoch && !this.#stopped) {
+					// Check for startup-exit record and track failures
+					const startupRecord = readBrokerStartupExitRecordSync(this.agentDir);
+					const validatedRecord = startupRecord ? validateStartupExitRecord(startupRecord) : undefined;
+					if (validatedRecord) {
+						const shouldAlert = this.#startupFailureTracker.recordFailure(validatedRecord, now);
+						if (shouldAlert) {
+							const recordCount = this.#startupFailureTracker.recentRecordCount();
+							const logLine = `broker_startup_wedge reason=${validatedRecord.reason}${validatedRecord.blockingLockPath ? ` blockingLockPath=${validatedRecord.blockingLockPath}` : ""} records=${recordCount}`;
+							this.#log(logLine);
+							this.#onStartupWedge?.({
+								reason: validatedRecord.reason,
+								blockingPath: validatedRecord.blockingLockPath,
+							});
+						}
+					}
 					this.#log(
 						new GjcCliUnavailableError(
 							`global broker unavailable; observing without repair: ${this.#unavailableReason}`,
@@ -844,33 +961,32 @@ export class GlobalGjcClient {
 		this.#assertAgentDirIdentity(true);
 		const timeout = integer(requestedTimeout, COMMAND_TIMEOUT_MS, 1);
 		const deadline = Date.now() + timeout;
-		// Interactive waiters always have headroom. Background can max 2 in flight, interactive can max 2.
+		// Interactive callers may use the whole pool; background commands at most half of it.
+		const maxBackground = Math.ceil(this.#maxPoolSize / 2);
 		const canProceed = (): boolean => {
 			if (priority === "interactive") {
-				return this.#inflight < 4;
+				return this.#inflight < this.#maxPoolSize;
 			}
-			// Background: must be under 4 total AND under 2 background concurrent
-			return this.#inflight < 4 && this.#backgroundInFlight < 2;
+			return this.#inflight < this.#maxPoolSize && this.#backgroundInFlight < maxBackground;
 		};
 		while (!canProceed()) {
-			let resolve: (() => void) | undefined;
 			const entry = { resolve: () => {}, priority };
+			let timer: ReturnType<typeof setTimeout> | undefined;
 			try {
-				await bounded(
-					new Promise<void>((r) => {
-						resolve = r;
-						entry.resolve = r;
-						this.#queue.push(entry);
-					}),
-					Math.max(1, deadline - Date.now()),
-				);
+				await new Promise<void>((resolve) => {
+					entry.resolve = resolve;
+					this.#queue.push(entry);
+					timer = setTimeout(resolve, Math.max(1, deadline - Date.now()));
+				});
 			} finally {
-				if (resolve) {
-					const i = this.#queue.findIndex((e) => e.resolve === resolve);
-					if (i >= 0) this.#queue.splice(i, 1);
-				}
+				clearTimeout(timer);
+				const i = this.#queue.indexOf(entry);
+				if (i >= 0) this.#queue.splice(i, 1);
 			}
-			if (Date.now() >= deadline) this.#unavailable("command queue timed out");
+			// Local pool congestion is a per-call failure, never broker evidence:
+			// reporting it as an outage failed every other caller while the broker
+			// itself was healthy (#675).
+			if (Date.now() >= deadline) throw new GjcCommandQueueTimeoutError(timeout);
 		}
 		this.#assertAgentDirIdentity(true);
 		if (this.#stopped || (this.#started && !this.#available)) this.#unavailable("client stopped or broker unavailable");
@@ -894,6 +1010,17 @@ export class GlobalGjcClient {
 			}
 		}
 	}
+	/** Live `sessions.maxLiveHosts` reload: a larger pool admits queued commands now; a smaller one drains naturally. */
+	setMaxPoolSize(maxPoolSize: number | undefined): void {
+		this.#maxPoolSize = clampPoolSize(maxPoolSize);
+		// Waiters re-check capacity when woken and re-queue if still over the limit.
+		for (const waiter of this.#queue.splice(0)) waiter.resolve();
+	}
+
+	get maxPoolSize(): number {
+		return this.#maxPoolSize;
+	}
+
 	#checkUnavailable(result: CliResult): CliResult {
 		const detail = extractRuntimeError(`${result.stdout}\n${result.stderr}`);
 		if (detail?.code === "broker_unavailable")
@@ -1015,9 +1142,9 @@ export class GlobalGjcClient {
 			}
 		})();
 		const write = (line: string): void => {
-			if (closed) throw new Error("relay closed");
+			if (closed) throw new RelayStreamUnwrittenError("relay closed");
 			const stdin = child.stdin;
-			if (!stdin || typeof stdin === "number") throw new Error("relay stdin unavailable");
+			if (!stdin || typeof stdin === "number") throw new RelayStreamUnwrittenError("relay stdin unavailable");
 			stdin.write(`${line}\n`);
 			// FileSink.flush is synchronous unless the pipe is backpressured, in
 			// which case it returns a promise that rejects on EPIPE once the child
@@ -1029,6 +1156,10 @@ export class GlobalGjcClient {
 		return { lines, write, close };
 	}
 }
+function clampPoolSize(requested: number | undefined): number {
+	return Math.min(MAX_CLI_POOL, Math.max(MIN_CLI_POOL, integer(requested, MIN_CLI_POOL, 1)));
+}
+
 function bindAgentDir(args: readonly string[], agentDir: string): readonly string[] {
 	if (args[0] !== "sdk") throw new Error("Global GJC client accepts only sdk commands");
 	if (args.some((arg) => /^(--agent-dir|--cwd|--config-dir|--executable)(=|$)/.test(arg))) {
