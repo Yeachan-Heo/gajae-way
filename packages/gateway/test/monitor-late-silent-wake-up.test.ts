@@ -74,10 +74,9 @@ test("a late [SILENT] from async-result wake-up does not replace already-authore
 	});
 
 	// First turn authorizes with a real answer
-	let authored: boolean = false;
-	(database as Store).transaction((tx) => {
-		authored = (database as Store).monitors.authorFenced(tx, eventId, "", "real answer", false);
-	});
+	const authored = (database as Store).transaction((tx) =>
+		(database as Store).monitors.authorFenced(tx, eventId, "", "real answer", false),
+	);
 	if (!authored) throw new Error("First author failed");
 	expect(authored).toBe(true);
 
@@ -86,10 +85,9 @@ test("a late [SILENT] from async-result wake-up does not replace already-authore
 
 	// Later, async-result wake-up turn tries to replace with [SILENT]
 	// This should NOT replace the already-authored answer
-	let replaced: boolean = false;
-	(database as Store).transaction((tx) => {
-		replaced = (database as Store).monitors.authorFenced(tx, eventId, "", "[SILENT]", false);
-	});
+	const replaced = (database as Store).transaction((tx) =>
+		(database as Store).monitors.authorFenced(tx, eventId, "", "[SILENT]", false),
+	);
 
 	// The replace attempt should fail because the event is already in 'authored' stage
 	if (replaced) throw new Error("Second author should have failed");
