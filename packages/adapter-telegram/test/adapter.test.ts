@@ -35,12 +35,6 @@ const topicMessage = {
 	text: "hello @agent",
 };
 
-const noImageNotice = {
-	sendMessage: async () => {
-		throw new Error("non-image input must not emit an image notice");
-	},
-};
-
 const testImage = Buffer.from(
 	"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGP4z8DAAMIM/4EAAB/uBfsL2WiLAAAAAElFTkSuQmCC",
 	"base64",
@@ -112,7 +106,7 @@ test("deduplicates update ids durably after successfully sending an inbound turn
 	const home = await temporaryHome();
 	try {
 		const state = await TelegramAdapterState.load(home);
-		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} }, noAttachments, noImageNotice);
+		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} }, noAttachments);
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		const gateway = mockGateway(requests);
 		const update: TelegramUpdate = { update_id: 81, message: topicMessage };
@@ -125,7 +119,6 @@ test("deduplicates update ids durably after successfully sending an inbound turn
 			"900",
 			{ chats: {} },
 			noAttachments,
-			noImageNotice,
 		);
 		expect(await restarted.handleUpdate(gateway, update)).toBe(false);
 		expect(requests).toHaveLength(1);
@@ -153,14 +146,7 @@ test.each([
 		const path = join(home, "input-image");
 		await writeFile(path, bytes);
 		const state = await TelegramAdapterState.load(home);
-		const adapter = new TelegramAdapter(
-			state,
-			"agent",
-			"900",
-			{ chats: {} },
-			{ save: async () => ({ path }) },
-			noImageNotice,
-		);
+		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} }, { save: async () => ({ path }) });
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		const gateway = mockGateway(requests);
 		gateway.request = async <T>(verb: string, params?: unknown) => {
@@ -191,7 +177,7 @@ test.each([
 		const reloaded = await TelegramAdapterState.load(home);
 		expect(reloaded.updateId).toBe(81);
 		expect(reloaded.lastRejection).toEqual({ updateId: 81, verb: "chat.send", code: "invalid_params" });
-		const restarted = new TelegramAdapter(reloaded, "agent", "900", { chats: {} }, noAttachments, noImageNotice);
+		const restarted = new TelegramAdapter(reloaded, "agent", "900", { chats: {} }, noAttachments);
 		expect(await restarted.handleUpdate(gateway, update)).toBe(false);
 		expect(
 			await restarted.handleUpdate(gateway, {
@@ -213,7 +199,7 @@ test("transient and unknown gateway errors do not advance the persisted cursor",
 	try {
 		const state = await TelegramAdapterState.load(home);
 		await state.acceptUpdate(80);
-		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} }, noAttachments, noImageNotice);
+		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} }, noAttachments);
 		const update: TelegramUpdate = {
 			update_id: 81,
 			message: { message_id: 1, chat: { id: 22, type: "private" }, from: { id: 44 }, text: "hello" },
@@ -251,7 +237,7 @@ test("a rejection is not accepted in memory when its durable state write fails",
 	try {
 		const state = await TelegramAdapterState.load(home);
 		await state.acceptUpdate(80);
-		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} }, noAttachments, noImageNotice);
+		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} }, noAttachments);
 		const save = state.save.bind(state);
 		let saves = 0;
 		state.save = async () => {
@@ -294,13 +280,12 @@ test("a rejection is not accepted in memory when its durable state write fails",
 	}
 });
 
-test("forwards a captioned photo natively without exposing its local path or token url", async () => {
+test("forwards a captioned photo natively without posting or exposing its local path or token url", async () => {
 	const home = await temporaryHome();
 	try {
 		const state = await TelegramAdapterState.load(home);
 		const image = testImage;
 		const fetched: string[] = [];
-		const notices: Array<{ chatId: string; text: string; thread?: number }> = [];
 		const bot = new TelegramBotApi("secret-token", async (url, init) => {
 			fetched.push(String(url));
 			if (String(url).endsWith("/getFile")) {
@@ -316,17 +301,11 @@ test("forwards a captioned photo natively without exposing its local path or tok
 			"900",
 			{ chats: {} },
 			new TelegramAttachmentStore(directory, bot),
-			{
-				sendMessage: async (chatId, text, thread) => {
-					notices.push({ chatId, text, thread });
-				},
-			},
 		);
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		const gateway = mockGateway(requests);
 		gateway.request = async <T>(verb: string, params?: unknown) => {
 			requests.push({ verb, params });
-			expect(notices).toHaveLength(0);
 			return { engaged: true, turnId: "turn-native-image" } as T;
 		};
 		await adapter.handleUpdate(gateway, {
@@ -343,6 +322,7 @@ test("forwards a captioned photo natively without exposing its local path or tok
 			},
 		});
 		const path = join(directory, "-20", "31-u-big.jpg");
+		// Even an engaged image turn makes no Telegram API calls beyond downloading the attachment.
 		expect(fetched).toEqual([
 			"https://api.telegram.org/botsecret-token/getFile",
 			"https://api.telegram.org/file/botsecret-token/photos/file_3.jpg",
@@ -356,14 +336,10 @@ test("forwards a captioned photo natively without exposing its local path or tok
 			messageId: "-20:31",
 		});
 		expect(params.text).toBe("what is this @agent\n[image · 122.1 KB]");
-		expect(params.text).not.toContain("Image processing:");
 		expect(params.text).not.toContain(path);
 		expect(params.images).toHaveLength(1);
 		expect(params.images![0]!.mimeType).toBe("image/jpeg");
 		expect(Buffer.from(params.images![0]!.data, "base64").subarray(0, 2)).toEqual(Buffer.from([0xff, 0xd8]));
-		expect(notices).toHaveLength(1);
-		expect(notices[0]?.chatId).toBe("-20");
-		expect(notices[0]?.text).toMatch(/compress/i);
 		expect(JSON.stringify(requests)).not.toContain("secret-token");
 		expect(await readFile(path)).toEqual(image);
 		expect((await stat(path)).mode & 0o777).toBe(0o600);
@@ -372,24 +348,13 @@ test("forwards a captioned photo natively without exposing its local path or tok
 	}
 });
 
-test("a declined image-only turn never posts a processing notice", async () => {
+test("a declined image-only turn still advances the update cursor", async () => {
 	const home = await temporaryHome();
 	try {
 		const path = join(home, "image.png");
 		await writeFile(path, testImage);
-		const notices: string[] = [];
-		const adapter = new TelegramAdapter(
-			await TelegramAdapterState.load(home),
-			"agent",
-			"900",
-			{ chats: {} },
-			{ save: async () => ({ path }) },
-			{
-				sendMessage: async (_chatId, text) => {
-					notices.push(text);
-				},
-			},
-		);
+		const state = await TelegramAdapterState.load(home);
+		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} }, { save: async () => ({ path }) });
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		const gateway = mockGateway(requests);
 		gateway.request = async <T>(verb: string, params?: unknown) => {
@@ -407,7 +372,7 @@ test("a declined image-only turn never posts a processing notice", async () => {
 		});
 		expect(requests).toHaveLength(1);
 		expect((requests[0]?.params as ChatSendParams).images).toHaveLength(1);
-		expect(notices).toEqual([]);
+		expect(state.updateId).toBe(12);
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
@@ -424,7 +389,6 @@ test("failed image download cannot dispatch a text-only turn or unauthorized not
 			{
 				save: async () => ({ unavailable: "download failed" }),
 			},
-			noImageNotice,
 		);
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		await adapter.handleUpdate(mockGateway(requests), {
@@ -473,7 +437,6 @@ test("retries a transient image download after restart without advancing Telegra
 			"900",
 			{ chats: {} },
 			new TelegramAttachmentStore(attachmentDirectory, bot, { error: () => {} }),
-			noImageNotice,
 		);
 		await expect(failedAdapter.handleUpdate(mockGateway([]), update)).rejects.toBeInstanceOf(
 			TelegramAttachmentRetryableError,
@@ -490,7 +453,6 @@ test("retries a transient image download after restart without advancing Telegra
 			"900",
 			{ chats: {} },
 			new TelegramAttachmentStore(attachmentDirectory, bot, { error: () => {} }),
-			noImageNotice,
 		);
 		expect(await restartedAdapter.handleUpdate(mockGateway(requests), update)).toBe(true);
 		expect(restartedState.updateId).toBe(41);
@@ -505,7 +467,7 @@ test("does not accept messages or reactions whose gateway processing fails", asy
 	const home = await temporaryHome();
 	try {
 		const state = await TelegramAdapterState.load(home);
-		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} }, noAttachments, noImageNotice);
+		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} }, noAttachments);
 		const gateway: GatewayClientLike = {
 			request: async () => {
 				throw new Error("gateway unavailable");
@@ -537,20 +499,13 @@ test("does not accept messages or reactions whose gateway processing fails", asy
 	}
 });
 
-test("suppresses image notices when chat.send returns a null turn id", async () => {
+test("an image update with a null turn id still advances the update cursor", async () => {
 	const home = await temporaryHome();
 	try {
 		const path = join(home, "image.png");
 		await writeFile(path, testImage);
-		const notices: string[] = [];
-		const adapter = new TelegramAdapter(
-			await TelegramAdapterState.load(home),
-			"agent",
-			"900",
-			{ chats: {} },
-			{ save: async () => ({ path }) },
-			{ sendMessage: async (_chatId, text) => void notices.push(text) },
-		);
+		const state = await TelegramAdapterState.load(home);
+		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} }, { save: async () => ({ path }) });
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		const gateway = mockGateway(requests);
 		gateway.request = async <T>(verb: string, params?: unknown) => {
@@ -567,7 +522,8 @@ test("suppresses image notices when chat.send returns a null turn id", async () 
 			},
 		});
 		expect(requests.map(({ verb }) => verb)).toEqual(["chat.send"]);
-		expect(notices).toEqual([]);
+		expect((requests[0]?.params as ChatSendParams).images).toHaveLength(1);
+		expect(state.updateId).toBe(63);
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
