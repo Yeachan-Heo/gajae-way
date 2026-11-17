@@ -1492,7 +1492,7 @@ export class WorkLaneManager {
 					opUnavailable = true;
 				else if (attempt.endedAt === undefined || !isSessionUnavailable(error))
 					throw workError("work status unavailable", "status_unavailable", { ...attempt, jobId: job.jobId });
-					throw workError("work status unavailable", "status_unavailable", { ...attempt, jobId: job.jobId });
+				throw workError("work status unavailable", "status_unavailable", { ...attempt, jobId: job.jobId });
 			}
 			const current = this.#db.bindings.getSessionRecord(key);
 			if (current?.sessionId !== binding.sessionId || current.epoch !== binding.epoch) op = null;
