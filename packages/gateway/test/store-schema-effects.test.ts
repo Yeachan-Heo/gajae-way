@@ -27,7 +27,6 @@ function splitTriggerBody(sql: string): string[] {
 	let start = 0;
 	let quote = "";
 	for (let index = 0; index < body.length; index++) {
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const char = body[index]!;
 		if (quote) {
 			if (char === quote) {

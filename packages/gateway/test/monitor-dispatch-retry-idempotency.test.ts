@@ -319,7 +319,6 @@ test("terminalizing one shared-batch event retains its sibling pointer and busy 
 	const state = await fixture({ brokerOwnership: true, eventCount: 2 });
 	const marker = busyMarker(state);
 	state.sessionPort.seedOperation(OP_REF, SESSION_ID, "failed");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const siblingId = state.eventIds[1]!;
 	state.store.transaction((tx) => state.store.monitors.eventUpdate(tx, siblingId, "failed_no_retry"));
 
@@ -403,7 +402,6 @@ test("successful authoring clears the captured pointer and its busy marker atomi
 test("terminal abandonment uses the old owned epoch rather than the replacement binding", async () => {
 	const state = await fixture({ brokerOwnership: true });
 	const marker = busyMarker(state);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const authority = state.authority!;
 	state.store.transaction((tx) => {
 		const epoch = state.store.bindings.rotateEpoch(tx, state.sessionOriginKey);
@@ -430,7 +428,6 @@ test("terminal abandonment uses the old owned epoch rather than the replacement 
 test("terminal abandonment uses the old owned repo rather than the current monitor repo", async () => {
 	const state = await fixture({ brokerOwnership: true, oldOwnedRepo: true });
 	const marker = busyMarker(state);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const authority = state.authority!;
 	state.store.transaction((tx) => {
 		const epoch = state.store.bindings.rotateEpoch(tx, state.sessionOriginKey);
@@ -486,11 +483,8 @@ for (const retainSibling of [false, true]) {
 		// Dispatch claims database order (newest first), not burst admission order.
 		const claimedIds = state.store.monitors.eventsByIds(submitted).map((row) => row.event_id);
 		expect(claimedIds).toHaveLength(3);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = claimedIds[0]!;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const second = claimedIds[1]!;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const third = claimedIds[2]!;
 		const prior = JSON.stringify({
 			sessionId: SESSION_ID,
@@ -539,9 +533,7 @@ test("pending pointer rewrite preserves busy proof for the same session and oper
 	const submitted = [1, 2].map((index) => state.pipeline.submit(state.monitor.monitorId, "test.retry", { index }));
 	const claimedIds = state.store.monitors.eventsByIds(submitted).map((row) => row.event_id);
 	expect(claimedIds).toHaveLength(2);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = claimedIds[0]!;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const second = claimedIds[1]!;
 	const prior = JSON.stringify({ sessionId: SESSION_ID, opRef: OP_REF, eventIds: [first, second] });
 	const differentEncoding = JSON.stringify({ eventIds: [second], opRef: OP_REF, sessionId: SESSION_ID });

@@ -125,7 +125,6 @@ test("a monitor's instruction reaches the authoring prompt and survives a store 
 		pipeline.submit(monitor.monitorId, "deploy.blocked", { release: "r-1" });
 		await Bun.sleep(250);
 		expect(prompts).toHaveLength(1);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const prompt = prompts[0]!;
 		expect(prompt).toContain(instruction);
 		// The instruction is the task to execute, directly after the execute-first
@@ -183,7 +182,6 @@ test("an instruction is prepended to the built-in maintenance guidance, not repl
 		});
 		pipeline.submit(monitor.monitorId, "memory.canonicalize", {});
 		await Bun.sleep(250);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const prompt = prompts[0]!;
 		expect(prompt).toContain(instruction);
 		// Both present, instruction first.
@@ -267,7 +265,6 @@ test("#180/#369: typed targets survive restart and echoed instructions retain ap
 		// Gateway restart: a fresh database handle and registry over the same file.
 		const database = await Store.open(join(directory, "gateway.db"));
 		const registry = new MonitorRegistry(database);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const restored = registry.get(monitorId)!;
 		expect(restored.instruction).toBe(instruction);
 		expect(restored.eventTypes).toEqual(["gajaeway.runtime-feedback.daily"]);

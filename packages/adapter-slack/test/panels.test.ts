@@ -26,7 +26,6 @@ describe("askUserPanelBlocks", () => {
 		expect(blocks.length).toBeGreaterThan(0);
 		expect(blocks[0].type).toBe("section");
 		// Should have buttons in actions blocks
-		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		const actionBlocks = blocks.filter((b: any) => b.type === "actions");
 		expect(actionBlocks.length).toBeGreaterThan(0);
 	});
@@ -51,11 +50,9 @@ describe("askUserPanelBlocks", () => {
 		};
 
 		const blocks = askUserPanelBlocks(message);
-		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		const actionBlocks = blocks.filter((b: any) => b.type === "actions");
 		expect(actionBlocks.length).toBe(0); // No action blocks for expired panels
 		// Should have a section indicating expiration
-		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		const expiredText = blocks.some((b: any) => b.text?.text?.includes("expired"));
 		expect(expiredText).toBe(true);
 	});
@@ -94,10 +91,8 @@ describe("approvalPanelBlocks", () => {
 		expect(blocks.length).toBeGreaterThan(0);
 		expect(blocks[0].type).toBe("section");
 		// Should have allow/deny buttons
-		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		const actionBlocks = blocks.filter((b: any) => b.type === "actions");
 		expect(actionBlocks.length).toBe(1);
-		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		const buttons = actionBlocks[0].elements as any[];
 		expect(buttons.length).toBe(2);
 		expect(buttons[0].text.text).toBe("Allow");
@@ -125,15 +120,11 @@ describe("approvalPanelBlocks", () => {
 
 		const blocks = approvalPanelBlocks(message);
 		expect(blocks.length).toBeGreaterThan(0);
-		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		const actionBlocks = blocks.filter((b: any) => b.type === "actions");
 		expect(actionBlocks.length).toBeGreaterThan(0);
-		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		const buttons = actionBlocks[0].elements as any[];
 		expect(buttons.length).toBe(2);
-		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		expect(buttons.map((b: any) => b.text.text)).toContain("Allow once");
-		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		expect(buttons.map((b: any) => b.text.text)).toContain("Reject once");
 	});
 
@@ -153,7 +144,6 @@ describe("approvalPanelBlocks", () => {
 		};
 
 		const blocks = approvalPanelBlocks(message);
-		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		const actionBlocks = blocks.filter((b: any) => b.type === "actions");
 		expect(actionBlocks.length).toBe(0); // No action blocks for expired panels
 	});

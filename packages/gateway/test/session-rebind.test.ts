@@ -236,7 +236,6 @@ for (const stage of ["start_turn", "attach"] as const) {
 			expect(db.bindings.getSession(originKey)).toBe(binding.sessionId);
 			const retry = timers.find((timer) => timer.delay > 0);
 			expect(retry).toBeDefined();
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			timers.splice(timers.indexOf(retry!), 1);
 			retry?.work();
 			await until(() => port.sendAttempts.length === 1);

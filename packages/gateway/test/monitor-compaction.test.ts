@@ -101,7 +101,6 @@ async function realBrokerMonitorHarness(directory: string) {
 	let creates = 0;
 	const cli: CliRunner = async (args) => {
 		if (args.includes("turn.result")) {
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const opRef = JSON.parse(args[args.indexOf("--json-input") + 1]!).clientRef as string;
 			const text = output.get(opRef) ?? "";
 			return {
@@ -128,7 +127,6 @@ async function realBrokerMonitorHarness(directory: string) {
 			};
 		}
 		if (args.includes("status")) {
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const opRef = args[args.indexOf("status") + 2]!;
 			return {
 				exitCode: 0,
@@ -352,7 +350,6 @@ async function retirementHarness(
 		contextUsage: (sessionId) => (sessionId.endsWith("-e0") ? { percent: 60, tokens: 12_000 } : undefined),
 		sessionIdForBind: (key, epoch) => {
 			if (!origins.has(key)) origins.set(key, origins.size);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const index = origins.get(key)!;
 			return `event-session${index === 0 ? "" : `-${index}`}-e${epoch}`;
 		},
@@ -408,7 +405,6 @@ for (const restart of [false, true]) {
 				epoch: 1,
 				sessionId: "event-session-e1",
 			});
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).toEqual({
 				sessionId: "event-session-e0",
 				epoch: 0,
@@ -458,7 +454,6 @@ test("a size-rolled host waits for its tagged pointer to be harvested before ret
 		await f.dispatch();
 		await f.dispatch();
 		const pointerKey = `monitor_authoring_turn:${savedEvent}`;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(JSON.parse(f.database.core.metaGet(pointerKey)!)).toMatchObject({
 			sessionId: "event-session-e0",
 			sizeRolled: true,
@@ -543,7 +538,6 @@ for (const code of [
 			]);
 			await f.dispatch();
 			expect(f.close).toHaveBeenCalledTimes(1);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).toMatchObject({
 				phase: "closing",
 				closeStartedAt: expect.any(Number),
@@ -741,7 +735,6 @@ test("reconcile holds a removed monitor's retired host while its saved authoring
 		await f.dispatch();
 		const pointerKey = `monitor_authoring_turn:${savedEvent}`;
 		const pointer = f.database.core.metaGet(pointerKey);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(JSON.parse(pointer!)).toMatchObject({ sessionId: "event-session-e0", sizeRolled: true });
 		const binding = f.database.bindings.getSessionRecord(f.sessionKey);
 		expect(f.registry.remove(f.monitor.monitorId)).toBe(true);
@@ -861,7 +854,6 @@ test("a gated retirement probe permits its own saved-event recovery and later ot
 		const failedA = await f.dispatch();
 		unreadable.mockRestore();
 		expect(f.database.monitors.eventGet(failedA)?.stage).toBe("failed");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(JSON.parse(f.database.core.metaGet(`monitor_authoring_turn:${failedA}`)!)).toMatchObject({
 			sessionId: "event-session-e1",
 		});
@@ -1139,7 +1131,6 @@ for (const backgroundFirst of [true, false]) {
 			release();
 			const event = await dispatch;
 			await f.pipeline.retiredSessionSweepSettled();
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(f.database.monitors.authoredOutput(event!)).toBe(`note for ${event}`);
 			expect(f.turns).toHaveLength(3);
 			expect(order).toEqual(["turn", "queue", "jobs"]);
@@ -1199,7 +1190,6 @@ test("reconcile keeps failed closes after removal and retries only with fresh id
 		await f.pipeline.reconcile();
 		await f.pipeline.retiredSessionSweepSettled();
 		expect(f.close).toHaveBeenCalledTimes(1);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).toHaveProperty("phase", "closing");
 		f.sessionPort.hostTurnRunning.set("event-session-e0", undefined);
 		await f.pipeline.reconcile();
@@ -1225,7 +1215,6 @@ test("reconcile ignores malformed retirement keys without blocking valid removed
 		await f.dispatch();
 		await f.dispatch();
 		f.registry.remove(f.monitor.monitorId);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const raw = f.database.core.metaGet(f.retiredKey)!;
 		const invalidKeys = ["monitor_retired_session:invalid:event-session-e0", `${f.retiredKey}:wrong-session`];
 		for (const key of invalidKeys) f.database.core.metaSet(key, raw);
@@ -1326,7 +1315,6 @@ for (const evidence of ["undefined", "throws", "missing"] as const) {
 			expect(f.database.monitors.authoredOutput(event)).toBe(`note for ${event}`);
 			expect(f.terminate).not.toHaveBeenCalled();
 			expect(f.close).not.toHaveBeenCalled();
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).not.toHaveProperty("phase");
 		} finally {
 			f.pipeline.dispose();
@@ -1375,7 +1363,6 @@ for (const change of ["remove", "replace_record", "saved_pointer", "live_binding
 			f.sessionPort.beforeRunningJobs = () => {
 				if (change === "remove") f.registry.remove(f.monitor.monitorId);
 				if (change === "replace_record") {
-					// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 					const record = JSON.parse(f.database.core.metaGet(f.retiredKey)!);
 					f.database.core.metaSet(f.retiredKey, JSON.stringify({ ...record, retiredAt: record.retiredAt + 1 }));
 				}
@@ -1399,7 +1386,6 @@ for (const change of ["remove", "replace_record", "saved_pointer", "live_binding
 			} else {
 				expect(f.close).not.toHaveBeenCalled();
 				expect(f.sessionPort.closes).toEqual([]);
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).not.toHaveProperty("phase");
 			}
 		} finally {
@@ -1423,7 +1409,6 @@ for (const probe of ["turnRunning", "queueEmpty", "runningJobs"] as const) {
 					new GjcCliError("close failed", 0, "", { code: "operation_failed" }),
 				]);
 				await f.dispatch();
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).toHaveProperty("phase", "closing");
 				Object.defineProperty(f.sessionPort, probe, {
 					value:
@@ -1456,7 +1441,6 @@ test("a successful close does not delete a retirement record changed while close
 		let changed: string | undefined;
 		f.close.mockImplementation(async () => {
 			await Promise.resolve();
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const record = JSON.parse(f.database.core.metaGet(f.retiredKey)!);
 			changed = JSON.stringify({ ...record, retiredAt: record.retiredAt + 1 });
 			f.database.core.metaSet(f.retiredKey, changed);
@@ -1505,7 +1489,6 @@ for (const busy of ["turn", "queue", "jobs", "pointer", "binding"] as const) {
 				spyOn(f.database.bindings, "getSessionRecord").mockReturnValue({ sessionId: "event-session-e0", epoch: 0 });
 			await f.dispatch();
 			expect(f.close).toHaveBeenCalledTimes(1);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).toHaveProperty("phase", "closing");
 		} finally {
 			f.pipeline.dispose();
@@ -1527,7 +1510,6 @@ test("reopened retirement requires fresh idle evidence before invoking close (pr
 			new GjcCliError("close uncertain", 0, "", { code: "terminal_uncertain" }),
 		]);
 		await f.dispatch();
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).toHaveProperty("phase", "closing");
 		active.dispose();
 		database.close();
@@ -1595,7 +1577,6 @@ test("an independently dead retired host holds without non-signaling process-dea
 		await f.dispatch();
 		expect(f.terminate).not.toHaveBeenCalled();
 		expect(f.sessionPort.closes).toEqual([]);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(JSON.parse(f.database.core.metaGet(f.retiredKey)!)).not.toHaveProperty("phase");
 	} finally {
 		f.pipeline.dispose();
@@ -1649,7 +1630,6 @@ test("retirement sweeps at most two records fairly and still authors every dispa
 			}
 			expect(f.terminate).not.toHaveBeenCalled();
 			for (const sessionId of sessions) {
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				expect(JSON.parse(f.database.core.metaGet(`${prefix}${sessionId}`)!)).toHaveProperty("lastAttemptAt");
 				f.sessionPort.hostJobs.set(sessionId, []);
 			}
@@ -1754,7 +1734,6 @@ for (const lastAttemptAt of [Number.MAX_SAFE_INTEGER + 1, Number.MAX_SAFE_INTEGE
 			for (let attempt = 0; attempt < 2; attempt++) await f.dispatch();
 			expect(new Set(f.jobs.mock.calls.map(([input]) => input.sessionId))).toEqual(new Set(sessions));
 			for (const sessionId of sessions) {
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				const repaired = JSON.parse(f.database.core.metaGet(`${prefix}${sessionId}`)!).lastAttemptAt;
 				expect(Number.isSafeInteger(repaired)).toBe(true);
 				expect(repaired).toBeLessThanOrEqual(Number.MAX_SAFE_INTEGER);
@@ -1972,7 +1951,6 @@ for (const tokens of [10_000, 12_000]) {
 				lastContextTokens: tokens,
 				turns: 1,
 			});
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(JSON.parse(database.core.metaGet(`monitor_context_budget_arm:${sessionKey}`)!)).toEqual({
 				epoch: 0,
 				tokens,
@@ -2044,7 +2022,6 @@ for (const restart of [false, true]) {
 				sessionPort.fetchLastAssistant = fetchLastAssistant;
 				expect(sideEffects).toBe(1);
 				const pointerKey = `monitor_authoring_turn:${eventA}`;
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				const saved = JSON.parse(database.core.metaGet(pointerKey)!) as { sessionId: string; opRef: string };
 				expect((await sessionPort.status({ ...saved, repo: directory })).status.status).toBe(
 					lateFailure ? "terminal_ok" : "failed",
@@ -2056,7 +2033,6 @@ for (const restart of [false, true]) {
 				await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
 				expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
 				const tagged = database.core.metaGet(pointerKey);
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				expect(JSON.parse(tagged!)).toEqual({ ...saved, sizeRolled: true });
 				const status = sessionPort.status.bind(sessionPort);
 				if (lateFailure)
@@ -2171,7 +2147,6 @@ for (const evidence of [
 				const event = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
 				sessionPort.fetchLastAssistant = fetchLastAssistant;
 				const key = `monitor_authoring_turn:${event}`;
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				const saved = JSON.parse(database.core.metaGet(key)!) as { sessionId: string; opRef: string };
 				expect(pipeline.settle(event).done).toBe(true);
 				tokens = 12_000;
@@ -2179,7 +2154,6 @@ for (const evidence of [
 				tokens = undefined;
 				await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
 				const tagged = database.core.metaGet(key);
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				expect(JSON.parse(tagged!)).toMatchObject({ sizeRolled: true });
 				const result: Record<string, unknown> = {
 					kind: "prompt",
@@ -2320,7 +2294,6 @@ for (const restart of [false, true]) {
 			await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
 			expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
 			expect(database.core.metaGet(key)).toBe(pointer);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(JSON.parse(pointer!)).not.toHaveProperty("sizeRolled");
 			let active = pipeline;
 			if (restart) {
@@ -2394,7 +2367,6 @@ for (const accepted of [false, true]) {
 			} else {
 				const pointer = database.core.metaGet(key);
 				expect(pointer).toBeDefined();
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				expect(JSON.parse(pointer!)).not.toHaveProperty("sizeRolled");
 				expect(sessionPort.sends).toHaveLength(0);
 				sessionPort.request = request;
@@ -2444,7 +2416,6 @@ for (const reason of [
 			const eventA = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
 			sessionPort.fetchLastAssistant = fetchLastAssistant;
 			const pointerKey = `monitor_authoring_turn:${eventA}`;
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const pointer = database.core.metaGet(pointerKey)!;
 			const saved = JSON.parse(pointer);
 			tokens = 12_000;
@@ -2466,7 +2437,6 @@ for (const reason of [
 			const attempts = reason === "session_busy_stalled" || reason === "session_prior_run_busy_stalled" ? 2 : 1;
 			for (let i = 0; i < attempts; i++) await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
 			expect(pipeline.sessionSafetyState(sessionKey).pendingRoll).toBe(reason);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(JSON.parse(database.core.metaGet(pointerKey)!)).not.toHaveProperty("sizeRolled");
 			sessionPort.request = request;
 			const terminate = spyOn(sessionPort, "terminateHost");
@@ -2554,13 +2524,11 @@ for (const restart of [false, true]) {
 				f.port.fetchLastAssistant = fetchLastAssistant;
 				f.control.tokens = 12_000;
 				await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				expect(JSON.parse(f.database.core.metaGet(armKey)!)).toEqual({ epoch: 0, tokens: 12_000 });
 				f.control.goneSession = "real-session-0";
 				f.control.tokens = highSample ? 15_000 : undefined;
 				await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
 				expect(f.database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				expect(JSON.parse(f.database.core.metaGet(armKey)!)).toEqual({
 					epoch: highSample ? 1 : 0,
 					tokens: highSample ? 15_000 : 12_000,
@@ -2864,7 +2832,6 @@ for (const restart of [false, true]) {
 				expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
 				expect(turns.at(-1)?.sessionId).toBe("event-session-e1");
 				expect(turns.at(-1)?.prompt).toContain("Context compaction");
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				const taggedPointer = JSON.stringify({ ...JSON.parse(pointer!), sizeRolled: true });
 				expect(database.core.metaGet(pointerKey)).toBe(taggedPointer);
 				if (restart) {
@@ -2879,7 +2846,6 @@ for (const restart of [false, true]) {
 					});
 				}
 				expect(database.monitors.eventGet(eventA)?.stage).toBe("failed_no_retry");
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				const saved = JSON.parse(pointer!) as { sessionId: string; opRef: string };
 				const handoffKey = `monitor_roll_handoff:${sessionKey}`;
 				expect(database.core.metaGet(handoffKey)).toBeUndefined();
@@ -2922,7 +2888,6 @@ for (const restart of [false, true]) {
 						return status(input);
 					};
 				if (result === "pending journal" || result === "exact busy refusal") {
-					// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 					const authority = database.bindings.brokerAuthority()!;
 					const scope = JSON.stringify([saved.sessionId, saved.opRef]);
 					database.transaction((tx) => {
@@ -3016,7 +2981,6 @@ test("a given-up saved turn does not defer a size roll and its late result is ha
 		sessionPort.fetchLastAssistant = fetchLastAssistant;
 		const pointerKey = `monitor_authoring_turn:${eventA}`;
 		const pointer = database.core.metaGet(pointerKey);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const saved = JSON.parse(pointer!) as { sessionId: string; opRef: string };
 		const fetchWorkerOutput = sessionPort.fetchWorkerOutput.bind(sessionPort);
 		sessionPort.fetchWorkerOutput = async (input) =>
@@ -3036,7 +3000,6 @@ test("a given-up saved turn does not defer a size roll and its late result is ha
 		await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
 		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
 		expect(turns.at(-1)?.prompt).toContain("Context compaction");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(database.core.metaGet(pointerKey)).toBe(JSON.stringify({ ...JSON.parse(pointer!), sizeRolled: true }));
 		sessionPort.fetchWorkerOutput = fetchWorkerOutput;
 		const requests = spyOn(sessionPort, "request");
@@ -3089,7 +3052,6 @@ test("operator retry harvests its old session while a rolled epoch has no bound 
 		const eventA = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
 		sessionPort.fetchLastAssistant = fetchLastAssistant;
 		const pointerKey = `monitor_authoring_turn:${eventA}`;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const saved = JSON.parse(database.core.metaGet(pointerKey)!) as { sessionId: string; opRef: string };
 		expect(pipeline.settle(eventA).done).toBe(true);
 		observeUsage = true;
@@ -3103,7 +3065,6 @@ test("operator retry harvests its old session while a rolled epoch has no bound 
 		expect(database.monitors.failure(failed)?.code).toBe("session_bind_failed");
 		expect(database.bindings.getSessionRecord(sessionKey)).toMatchObject({ epoch: 1, sessionId: "" });
 		const handoff = database.core.metaGet(handoffKey);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(JSON.parse(handoff!)).toEqual({ epoch: 1, reason: "context_budget" });
 		expect(pipeline.settle(failed).done).toBe(true);
 		const requests = spyOn(sessionPort, "request");
@@ -3163,7 +3124,6 @@ for (const allTerminal of [false, true]) {
 			expect(database.monitors.eventGet(second)?.stage).toBe("failed");
 			sessionPort.fetchLastAssistant = fetchLastAssistant;
 			const pointer = database.core.metaGet(`monitor_authoring_turn:${first}`);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(JSON.parse(pointer!).eventIds.toSorted()).toEqual([first, second].toSorted());
 			expect(database.core.metaGet(`monitor_authoring_turn:${second}`)).toBe(pointer);
 			expect(pipeline.settle(first).done).toBe(true);
@@ -3173,7 +3133,6 @@ for (const allTerminal of [false, true]) {
 			await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", { event: "B" });
 			observeUsage = false;
 			await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", { event: "C" });
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const expectedPointer = allTerminal ? JSON.stringify({ ...JSON.parse(pointer!), sizeRolled: true }) : pointer;
 			expect(database.core.metaGet(`monitor_authoring_turn:${first}`)).toBe(expectedPointer);
 			expect(database.core.metaGet(`monitor_authoring_turn:${second}`)).toBe(expectedPointer);
@@ -3244,7 +3203,6 @@ for (const scenario of ["retry", "fresh dispatch before retry", "restart"] as co
 			const pointerKey = `monitor_authoring_turn:${eventA}`;
 			const pointer = database.core.metaGet(pointerKey);
 			expect(pointer).toBeDefined();
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const saved = JSON.parse(pointer!) as { sessionId: string; opRef: string };
 			expect(
 				(await sessionPort.status({ sessionId: saved.sessionId, repo: "", opRef: saved.opRef })).status.status,
@@ -3256,7 +3214,6 @@ for (const scenario of ["retry", "fresh dispatch before retry", "restart"] as co
 			observeUsage = false;
 			expect(pipeline.sessionSafetyState(sessionKey).pendingRoll).toBe("context_budget");
 			const arm = database.core.metaGet(armKey);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(JSON.parse(arm!)).toEqual({ epoch: 0, tokens: 12_000 });
 			let active = pipeline;
 			if (scenario === "restart") {
@@ -3351,7 +3308,6 @@ for (const scenario of [
 			expect(pointer).toBeDefined();
 			tokens = 12_000;
 			await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", { event: "B" });
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(JSON.parse(database.core.metaGet(armKey)!)).toEqual({ epoch: 0, tokens: 12_000 });
 			tokens = scenario.tokens;
 			const eventC = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", { event: "C" });
@@ -3363,7 +3319,6 @@ for (const scenario of [
 				pendingRoll: "context_budget",
 				lastContextTokens: scenario.tokens,
 			});
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(JSON.parse(database.core.metaGet(armKey)!)).toEqual({ epoch: 0, tokens: scenario.tokens });
 			tokens = undefined;
 			registry.update({ monitorId: monitor.monitorId, contextRollTokens: scenario.threshold });
@@ -3421,7 +3376,6 @@ for (const scenario of ["unchanged", "raised", "cleared", "operator epoch bump"]
 			const armKey = `monitor_context_budget_arm:${sessionKey}`;
 			const first = await pipeline.submitAwaitable(monitor.monitorId, "budget.tick", {});
 			expect(pipeline.sessionSafetyState(sessionKey).pendingRoll).toBe("context_budget");
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(JSON.parse(database.core.metaGet(armKey)!)).toEqual({ epoch: 0, tokens: 12_000 });
 			observeUsage = false;
 			pipeline.dispose();
@@ -3596,7 +3550,6 @@ for (const reason of ["context_budget", "context_failures_native_compaction_unav
 					failure === "request failure" ? "authoring_turn_failed" : "session_bind_failed",
 				);
 				expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				expect(JSON.parse(database.core.metaGet(handoffKey)!)).toEqual({ epoch: 1, reason });
 				expect(database.core.metaGet(`monitor_context_budget_arm:${sessionKey}`)).toBeUndefined();
 				registry.update({ monitorId: monitor.monitorId, instruction: "Check the updated deploy queue." });
@@ -3656,7 +3609,6 @@ test("an unanswered roll handoff survives an operator epoch bump until a live-ep
 			throw new Error("session bind failed once");
 		};
 		await pipeline.submitAwaitable(monitor.monitorId, "handoff.tick", {});
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(JSON.parse(database.core.metaGet(handoffKey)!)).toEqual({ epoch: 1, reason: "context_budget" });
 		database.transaction((tx) => database.bindings.rotateEpoch(tx, sessionKey));
 		sessionPort.bind = bind;
@@ -3727,7 +3679,6 @@ test("a stale authoring answer cannot consume an unanswered handoff after an ope
 		const eventId = await pipeline.submitAwaitable(monitor.monitorId, "handoff.tick", {});
 		sessionPort.request = request;
 		expect(database.monitors.authoredOutput(eventId)).toBe(`note for ${eventId}`);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(JSON.parse(database.core.metaGet(handoffKey)!)).toEqual({ epoch: 1, reason: "context_budget" });
 		await pipeline.submitAwaitable(monitor.monitorId, "handoff.tick", {});
 		expect(turns.at(-1)?.sessionId).toBe("event-session-e2");
@@ -3836,7 +3787,6 @@ test("a roll digest survives real BrokerSessionPort poisoned-create epoch recove
 		expect(database.monitors.failure(failed)?.code).toBe("session_bind_failed");
 		expect(creates).toBe(3);
 		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(2);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(JSON.parse(database.core.metaGet(handoffKey)!)).toEqual({ epoch: 1, reason: "context_budget" });
 		poison = false;
 		clock += 6 * 60 * 60_000;
@@ -4156,7 +4106,6 @@ test("consecutive context failures with native compaction unavailable roll, and 
 		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(0);
 		empty = false;
 		await pipeline.submitAwaitable(monitor.monitorId, "digest.tick", { tick: 200 });
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const rolled = turns.at(-1)!;
 		expect(rolled.sessionId).toBe("event-session-e1");
 		expect(database.bindings.getSessionRecord(sessionKey)?.epoch).toBe(1);
@@ -4166,8 +4115,6 @@ test("consecutive context failures with native compaction unavailable roll, and 
 		for (const eventId of healthyIds) expect(rolled.prompt).toContain(`note for ${eventId}`);
 		// The response contract is still the last thing in the prompt.
 		expect(rolled.prompt).toContain('Respond ONLY with a JSON array containing exactly one {"eventId","note"}');
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-		// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 		const rolledEventId = rolled.prompt.match(/"eventId":"([^"]+)"/)?.[1]!;
 		expect(database.monitors.authoredOutput(rolledEventId)).toBe(`note for ${rolledEventId}`);
 		// Armed state consumed exactly once: the next healthy turn does not roll again.
@@ -4379,7 +4326,6 @@ test("a monitor with no instruction has no task segment, and rolls with a digest
 		await pipeline.submitAwaitable(monitor.monitorId, "plain.tick", { tick: 1 });
 		empty = false;
 		await pipeline.submitAwaitable(monitor.monitorId, "plain.tick", { tick: 2 });
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const rolled = turns.at(-1)!;
 		expect(rolled.prompt).toContain("Context compaction");
 		expect(rolled.prompt).not.toContain("Standing instruction");

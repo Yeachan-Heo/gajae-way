@@ -92,14 +92,12 @@ describe("durable SLO evidence", () => {
 				[OCT_9, gapStart],
 				[gapStart + gap, OCT_9 + DAY_MS],
 			]);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const day = evaluateSlo(store.core, 1, OCT_10_NOON).days[0]!;
 			expect(day.complete).toBe(complete);
 			expect(day.maxUncoveredGapMs).toBe(gap);
 		}
 
 		setAlive(store, "2026-10-09", [[OCT_9, OCT_9 + DAY_MS - 60 * 60_000]]);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const tail = evaluateSlo(store.core, 1, OCT_10_NOON).days[0]!;
 		expect(tail.complete).toBe(true);
 		expect(tail.maxUncoveredGapMs).toBe(60 * 60_000);
@@ -115,7 +113,6 @@ describe("durable SLO evidence", () => {
 		await first.tick(t0);
 		await second.tick(t0 + 5 * 60_000);
 		await second.tick(t0 + 12 * 60_000);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const intervals = JSON.parse(store.core.metaGet("slo:2026-10-09:alive")!) as number[][];
 		expect(intervals).toEqual([
 			[Date.parse("2026-10-09T00:00:00.000Z"), t0 + 5 * 60_000],
@@ -132,11 +129,9 @@ describe("durable SLO evidence", () => {
 		now = Date.parse("2026-10-09T00:03:00.000Z");
 		await recorder.tick();
 		await recorder.stop();
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(JSON.parse(store.core.metaGet("slo:2026-10-08:alive")!)).toEqual([
 			[Date.parse("2026-10-08T23:58:00.000Z"), Date.parse("2026-10-09T00:00:00.000Z")],
 		]);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(JSON.parse(store.core.metaGet("slo:2026-10-09:alive")!)).toEqual([
 			[Date.parse("2026-10-09T00:00:00.000Z"), Date.parse("2026-10-09T00:03:00.000Z")],
 		]);
@@ -146,19 +141,16 @@ describe("durable SLO evidence", () => {
 		const { store } = await fixture();
 		setAlive(store, "2026-10-09", [[OCT_9, OCT_9 + DAY_MS]]);
 		setMeta(store, "slo:window:broken", "not json");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		let day = evaluateSlo(store.core, 1, OCT_10_NOON).days[0]!;
 		expect(day.complete).toBe(true);
 		expect(day.status).toBe("insufficient");
 
 		store.transaction((tx) => store.core.metaDeleteRange(tx, "slo:window:", "slo:window;"));
 		setMeta(store, "slo:2026-10-09:broker_unavailable:ts", "not json");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		day = evaluateSlo(store.core, 1, OCT_10_NOON).days[0]!;
 		expect(day.status).toBe("insufficient");
 
 		setMeta(store, "slo:2026-10-09:alive", JSON.stringify([[OCT_9, OCT_9 + 2 * DAY_MS]]));
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		day = evaluateSlo(store.core, 1, OCT_10_NOON).days[0]!;
 		expect(day.aliveMs).toBe(0);
 		expect(day.status).toBe("insufficient");
@@ -175,7 +167,6 @@ describe("durable SLO evidence", () => {
 			"broker_unavailable",
 			at,
 		);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(JSON.parse(store.core.metaGet("slo:2026-10-09:broker_unavailable:ts")!)).toEqual([
 			[at, "gateway-a", 1],
 			[at, "gateway-b", 1],
@@ -187,10 +178,8 @@ describe("durable SLO evidence", () => {
 
 		const overflow = new SloRecorder(store.core, { home, bootId: "overflow", log: () => {} });
 		for (let index = 0; index < SLO_MAX_EVENTS_PER_DAY + 1; index++) overflow.note("persona_bind_failed", at);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const events = JSON.parse(store.core.metaGet("slo:2026-10-09:persona_bind_failed:ts")!) as unknown[];
 		expect(events).toHaveLength(SLO_MAX_EVENTS_PER_DAY - 2);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(JSON.parse(store.core.metaGet("slo:2026-10-09:broker_unavailable:ts")!)).toHaveLength(2);
 		expect(events.length + 2).toBe(SLO_MAX_EVENTS_PER_DAY);
 		expect(store.core.metaGet("slo:2026-10-09:overflow")).toBe("1");
@@ -203,7 +192,6 @@ describe("durable SLO evidence", () => {
 		const running = receipt({ id: "receipt-a", requestedAt: "2026-10-09T10:00:00.000Z", state: "running" });
 		await writeReceipt(home, running);
 		expect(await recorder.refreshWindow()).toBe(true);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(JSON.parse(store.core.metaGet("slo:window:receipt-a")!)).toEqual({
 			trigger: "update",
 			state: "running",
@@ -221,11 +209,9 @@ describe("durable SLO evidence", () => {
 			}),
 		);
 		expect(await recorder.refreshWindow()).toBe(true);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(JSON.parse(store.core.metaGet("slo:window:receipt-a")!).state).toBe("ok");
 		await writeFile(join(home, "restart-stack.json"), "not json");
 		expect(await recorder.refreshWindow()).toBe(false);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(JSON.parse(store.core.metaGet("slo:window:receipt-a")!).state).toBe("ok");
 	});
 
@@ -247,12 +233,10 @@ describe("durable SLO evidence", () => {
 			for (const offset of [28 * 60_000 + 59_000, 29 * 60_000, 30 * 60_000, 30 * 60_000 + 1_000])
 				recorder.note("broker_unavailable", requestedAt + offset);
 			const result = evaluateSlo(store.core, 1, OCT_10_NOON);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const day = result.days[0]!;
 			expect(day.status).toBe("failed");
 			expect(day.broker_unavailable).toBe(durationMinutes === 29 ? 2 : 1);
 			expect(day.excluded).toBe(durationMinutes === 29 ? 2 : 3);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const window = result.windows[0]!;
 			expect(window.verified).toBe(true);
 			expect(window.eligibleStart).toBe(new Date(requestedAt).toISOString());
@@ -282,7 +266,6 @@ describe("durable SLO evidence", () => {
 			[finishedAt, OCT_9 + DAY_MS],
 		]);
 
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const day = evaluateSlo(store.core, 1, OCT_10_NOON).days[0]!;
 		expect(day.persona_bind_failed).toBe(2);
 		expect(day.excluded).toBe(2);
@@ -301,7 +284,6 @@ describe("durable SLO evidence", () => {
 			{ id: "empty-steps", trigger: "update" as const, state: "ok" as const, stepResults: [] as const },
 		];
 		for (let index = 0; index < fixtures.length; index++) {
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const item = fixtures[index]!;
 			const requestedAt = Date.parse(`2026-10-09T${String(2 + index * 5).padStart(2, "0")}:00:00.000Z`);
 			await writeReceipt(
@@ -435,7 +417,6 @@ describe("durable SLO evidence", () => {
 					),
 				);
 			});
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const evaluated = evaluateSlo(store.core, 1, OCT_10_NOON).days[0]!;
 			const inDate = events.filter((event) => event.atMs >= OCT_9 && event.atMs < OCT_9 + DAY_MS);
 			const expectedCounted = classifySloEvents(inDate, windows).counted.length;
@@ -451,7 +432,6 @@ describe("durable SLO evidence", () => {
 		const at = Date.parse("2026-10-09T12:00:00.000Z");
 		new SloRecorder(store.core, { home, bootId: "process-one", log: () => {} }).note("broker_unavailable", at);
 		new SloRecorder(store.core, { home, bootId: "process-two", log: () => {} }).note("broker_unavailable", at);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const events = JSON.parse(store.core.metaGet("slo:2026-10-09:broker_unavailable:ts")!) as unknown[][];
 		expect(events.map((event) => event.slice(1))).toEqual([
 			["process-one", 1],

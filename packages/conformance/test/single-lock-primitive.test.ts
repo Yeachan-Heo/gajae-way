@@ -66,7 +66,6 @@ const RULES: readonly Rule[] = [
 		description: "elections and link/mkdir CAS",
 		pattern: /\.reclaim\.d|\blinkNoReplace\b|\.candidate["'`]|\bmkdir\([^)\n]*\.lock\b/,
 		allowed: [],
-		// biome-ignore lint/suspicious/noTemplateCurlyInString: ignored using `--suppress`
 		positive: "const election = `${path}.reclaim.d`;",
 	},
 	{

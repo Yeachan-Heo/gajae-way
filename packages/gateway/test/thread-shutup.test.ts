@@ -36,9 +36,7 @@ afterEach(async () => {
 
 type Client = Awaited<ReturnType<typeof connect>>;
 
-// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 async function connect(socketPath: string): Promise<{ send(value: unknown): void; frames: any[]; close(): void }> {
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = "";
 	const socket = await Bun.connect({
@@ -168,7 +166,6 @@ async function send(
 		authorIsBot?: boolean;
 		replyTo?: { messageId: string; fromSelf: boolean };
 	},
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 ): Promise<any> {
 	client.send({
 		v: "0.1",

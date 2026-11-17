@@ -95,7 +95,6 @@ export function readPinnedGjcVersion(
 	}
 	const tried = failures.join("; ");
 	if (candidates.length > 0 && isCompiledRelease(modulePath)) {
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const target = dirname(candidates[0]!);
 		throw new Error(
 			`gjc release pin unavailable: ${tried}. This binary is a compiled release: restore its manifest with 'gajaeway update --force --bin-dir ${target}'`,
@@ -1175,7 +1174,6 @@ function bindAgentDir(args: readonly string[], agentDir: string): readonly strin
 		// Skip option payloads so a literal --json value is not an output flag.
 		let jsonFlags = 0;
 		for (let i = 2; i < bound.length; i++) {
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const arg = bound[i]!;
 			if (arg === "--") throw new Error("Global GJC client rejects session option delimiters");
 			if (SESSION_VALUE_OPTIONS.has(arg)) {
@@ -1231,7 +1229,6 @@ function trustedEnvironment(cwd: string): Record<string, string> {
 				throw error;
 			}
 			for (const match of text.matchAll(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/gm)) {
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				const key = process.platform === "win32" ? match[1]?.toUpperCase() : match[1]!;
 				if (sensitive.has(key) && env[key])
 					throw new Error(`Cannot trust project-declared ${key}; launch from a clean service directory`);

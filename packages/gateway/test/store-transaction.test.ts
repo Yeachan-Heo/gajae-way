@@ -81,9 +81,7 @@ test("rejects escaped and foreign transaction capabilities", async () => {
 				escaped = tx;
 				first.assertActive(tx);
 			});
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expectTransactionError(() => first.assertActive(escaped!), "inactive_tx");
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expectTransactionError(() => second.assertActive(escaped!), "foreign_store");
 		}),
 	);
@@ -99,7 +97,6 @@ test("OpenWorkExported is tied to the transaction that minted it", async () => {
 			assertOpenWorkExported(tx, exported);
 		});
 		core.transaction((nextTx) => {
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expectTransactionError(() => assertOpenWorkExported(nextTx, exported!), "inactive_tx");
 		});
 		expect(mintedBy).toBeDefined();

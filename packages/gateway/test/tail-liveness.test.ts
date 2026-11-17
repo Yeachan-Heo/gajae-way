@@ -86,9 +86,7 @@ test("persona state stays running until a terminal tail event is injected", asyn
 		).toBe(true);
 		await manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 1, "persistent send did not start");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const send = port.sends[0]!;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const batch = database.inbox.nonterminalTurns(ORIGIN_KEY)[0]!;
 
 		// Status can become terminal before a tail arrives, but that fact alone is
@@ -241,7 +239,6 @@ test("chat.progress is emitted only from observed tail activity and preserves ta
 		onStop: () => database.close(),
 	});
 	let socket: Awaited<ReturnType<typeof Bun.connect>> | undefined;
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	try {
 		let buffered = "";
@@ -276,7 +273,6 @@ test("chat.progress is emitted only from observed tail activity and preserves ta
 			),
 		).toEqual([]);
 
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const send = port.sends[0]!;
 		for (let call = 0; call < 3; call++) port.emitTool(send.sessionId, { toolName: "read" });
 		port.emitAssistant(send.sessionId, "x".repeat(308));

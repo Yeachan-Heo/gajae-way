@@ -40,7 +40,6 @@ test("chat.progress emits periodically from turn start even before tail frames, 
 		onStop: () => database.close(),
 	});
 	let socket: Awaited<ReturnType<typeof Bun.connect>> | undefined;
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	try {
 		let buffered = "";
@@ -80,7 +79,6 @@ test("chat.progress emits periodically from turn start even before tail frames, 
 			"initial heartbeat with 0,0 counters not emitted",
 		);
 
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const send = port.sends[0]!;
 		port.emitActivity(send.sessionId, { toolCalls: 2, outputTokens: 42 });
 		await eventually(
@@ -145,7 +143,6 @@ test("chat.progress without tail frames for >90s still yields periodic progress 
 		onStop: () => database.close(),
 	});
 	let socket: Awaited<ReturnType<typeof Bun.connect>> | undefined;
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	try {
 		let buffered = "";
@@ -192,7 +189,6 @@ test("chat.progress without tail frames for >90s still yields periodic progress 
 			expect(frame.payload.outputTokens).toBe(0);
 		}
 		// Now send final to clean up
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const send = port.sends[0]!;
 		port.complete(send.opRef, "done");
 		await eventually(
@@ -268,7 +264,6 @@ test("red-team G1: chat.progress runs on tail frames only; a turn never issues t
 		onStop: () => database.close(),
 	});
 	let socket: Awaited<ReturnType<typeof Bun.connect>> | undefined;
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	try {
 		let buffered = "";
@@ -295,7 +290,6 @@ test("red-team G1: chat.progress runs on tail frames only; a turn never issues t
 			})}\n`,
 		);
 		await eventually(() => port.sends.length === 1, "turn was not sent");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const send = port.sends[0]!;
 		port.emitActivity(send.sessionId, { toolCalls: 1, outputTokens: 10 });
 		await eventually(
@@ -338,7 +332,6 @@ test("a turn that never announced progress still emits exactly one final chat.pr
 		onStop: () => database.close(),
 	});
 	let socket: Awaited<ReturnType<typeof Bun.connect>> | undefined;
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	try {
 		let buffered = "";
@@ -404,7 +397,6 @@ test("a turn retired by /new emits its final chat.progress and stops heartbeatin
 		onStop: () => database.close(),
 	});
 	let socket: Awaited<ReturnType<typeof Bun.connect>> | undefined;
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	try {
 		let buffered = "";
@@ -426,7 +418,6 @@ test("a turn retired by /new emits its final chat.progress and stops heartbeatin
 			`${JSON.stringify({ v: "0.1", type: "request", id: "turn", verb: "chat.send", params: { origin, text: "long job" } })}\n`,
 		);
 		await eventually(() => port.sends.length === 1, "turn was not sent");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const send = port.sends[0]!;
 		port.emitActivity(send.sessionId, { toolCalls: 1, outputTokens: 10 });
 		const progressOf = (turnId: string) =>
@@ -509,7 +500,6 @@ test("real Slack turn deliveries share the progress turn and fold into a live re
 		live,
 	);
 	let socket: Awaited<ReturnType<typeof Bun.connect>> | undefined;
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	try {
 		let buffered = "";
@@ -542,7 +532,6 @@ test("real Slack turn deliveries share the progress turn and fold into a live re
 			})}\n`,
 		);
 		await eventually(() => port.sends.length === 1, "turn was not sent");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const send = port.sends[0]!;
 		port.emitTool(send.sessionId);
 		port.emitAssistant(send.sessionId, "The first finding is a timeout", "finding", send.opRef);

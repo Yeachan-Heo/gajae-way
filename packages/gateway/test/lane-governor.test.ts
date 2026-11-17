@@ -600,7 +600,6 @@ test("#340: per-lane error handling continues sweep for remaining lanes", async 
 	persistJob("b", "done");
 
 	class FailingLockPort extends ScriptedSessionPort {
-		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		override async runExclusive(key: string, work: () => Promise<any>): Promise<any> {
 			if (key === "work/task/a") {
 				throw new Error("lock acquisition failed");
@@ -648,7 +647,6 @@ test("#340: per-lane error handling continues sweep when retire() throws", async
 	persistJob("b", "done");
 
 	class FailingLockPort extends ScriptedSessionPort {
-		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		override async runExclusive(key: string, work: () => Promise<any>): Promise<any> {
 			if (key === "work/task/a") {
 				throw new Error("lock acquisition failed");
@@ -708,7 +706,6 @@ test("#360: session_unavailable status error is treated like unknown: settled wh
 	);
 
 	class SessionUnavailablePort extends ScriptedSessionPort {
-		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		override async status(): Promise<any> {
 			throw new Error('gjc sdk session status reported failure: {"code":"session_unavailable"}');
 		}
@@ -755,7 +752,6 @@ test("#360: session_unavailable with live session does not settle", async () => 
 	);
 
 	class SessionUnavailablePort2 extends ScriptedSessionPort {
-		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		override async status(): Promise<any> {
 			throw new Error('gjc sdk session status reported failure: {"code":"session_unavailable"}');
 		}

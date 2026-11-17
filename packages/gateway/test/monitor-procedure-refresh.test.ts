@@ -83,13 +83,9 @@ test("a procedure edit reaches the very next firing of a long-lived event-type s
 		// Each authored event records the procedure version that produced it.
 		const [second, first] = database.monitors.eventRows(monitor.monitorId);
 		expect(first?.stage).toBe("authored_no_delivery");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-		// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 		expect(JSON.parse(first?.procedure_json!)).toEqual([
 			expect.objectContaining({ path: "memory/ops/gajaeway-feedback.md", status: "ok", sha256: sha256(before) }),
 		]);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-		// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 		expect(JSON.parse(second?.procedure_json!)).toEqual([
 			expect.objectContaining({ status: "ok", sha256: sha256(after) }),
 		]);
@@ -118,8 +114,6 @@ test("procedure files are confined to the workspace and report their state inste
 		expect(prompts[0]).not.toContain("secret doctrine");
 		const [row] = database.monitors.eventRows(monitor.monitorId);
 		expect(row?.stage).toBe("authored_no_delivery");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-		// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 		expect(JSON.parse(row?.procedure_json!).map((entry: { status: string }) => entry.status)).toEqual([
 			"outside_root",
 			"missing",

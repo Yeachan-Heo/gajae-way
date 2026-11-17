@@ -263,7 +263,6 @@ test("poisoned-create rotation counts survive replacement SessionPort instances"
 	expect(fixture.database.core.metaGet(`create_rotation:${originKey}`)).toBe("2");
 
 	const afterRestart = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		authority: fixture.database.inspectBrokerAuthority().authority!,
 		database: fixture.database,
 		cli: run,
@@ -504,9 +503,7 @@ test("AC-K rendered SDK prompt is notice + blank line + task; broker SessionPort
 	expect(calls[0]).toEqual(
 		expect.arrayContaining(["sdk", "session", "raw", "global", "--op", "session.create", "--idempotency-key"]),
 	);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const create = calls.find((args) => args.includes("session.create"))!;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const createInput = JSON.parse(create[create.indexOf("--json-input") + 1]!) as Record<string, unknown>;
 	expect(createInput).toMatchObject({ cwd: "/tmp/repo", modelPreset: "gpt-heavy" });
 	expect(binding.startupModelApplied).toBe(true);
@@ -579,16 +576,13 @@ test("model thinking suffix is applied on create and explicit model changes", as
 		}),
 	).resolves.toEqual({ changed: true });
 
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const create = calls.find((args) => args.includes("session.create"))!;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const createInput = JSON.parse(create[create.indexOf("--json-input") + 1]!) as Record<string, unknown>;
 	expect(createInput).toMatchObject({ cwd: repo, modelId: "anthropic/claude-opus-5-5" });
 	const controlInputs = calls
 		.filter((args) => args.includes("--op") && args.includes("--json-input") && !args.includes("session.create"))
 		.map((args) => ({
 			operation: args[args.indexOf("--op") + 1],
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			input: JSON.parse(args[args.indexOf("--json-input") + 1]!) as Record<string, unknown>,
 		}));
 	expect(controlInputs).toEqual([
@@ -841,7 +835,6 @@ test("가8: resume is the global lifecycle op with the saved transcript, the bin
 	});
 	await expect(h.port.resume(h.target)).resolves.toEqual(h.target);
 	expect(h.resumeCalls()).toHaveLength(1);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const args = h.resumeCalls()[0]!;
 	expect(args.slice(0, 8)).toEqual([
 		"sdk",
@@ -854,7 +847,6 @@ test("가8: resume is the global lifecycle op with the saved transcript, the bin
 		"gw-resume-saved-1-3-darwin:1790891855:142007",
 	]);
 	expect(args[8]).toBe("--json-input");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(JSON.parse(args[9]!)).toEqual({
 		sessionId: "saved-1",
 		sessionPath: h.transcript,
@@ -909,7 +901,6 @@ test("가8: no unique saved transcript means no resume request at all", async ()
 test("가8: broker SessionPort resumes a gjc >= 0.16 session whose locator has only cwd, and refuses deleted or foreign ones", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await Store.open(join(home, "gateway.db"));
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const authority = initializeTestBrokerAuthority(database!, join(home, "agent"));
 	const repo = join(home, "workspace");
 	await mkdir(join(home, "agent", "sessions", "v2-scope"), { recursive: true });
@@ -944,12 +935,10 @@ test("가8: broker SessionPort resumes a gjc >= 0.16 session whose locator has o
 	};
 	const port = new BrokerSessionPort({
 		authority,
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		cli: run,
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, {
 		sessionId: "saved-1",
 		repo,
@@ -1012,7 +1001,6 @@ test("broker SessionPort does not retry a terminal-uncertain lifecycle create", 
 	const sleeps: number[] = [];
 	const run: CliRunner = async (args) => {
 		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		createKeys.push(args[args.indexOf("--idempotency-key") + 1]!);
 		createCalls++;
 		return {
@@ -1260,10 +1248,8 @@ test("fetchAssistantSince with preferSpoken skips a trailing silent row for the 
 test("liveness carries the host's activity {state, at} from session inspect, and omits a malformed one", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-activity-"));
 	database = await Store.open(join(home, "gateway.db"));
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const authority = initializeTestBrokerAuthority(database!, join(home, "agent"));
 	const repo = join(home, "workspace");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, { sessionId: "owned", originKey: "origin", epoch: 0, repo });
 	let session: Record<string, unknown> = {};
 	let exitCode = 0;
@@ -1273,7 +1259,6 @@ test("liveness carries the host's activity {state, at} from session inspect, and
 		return { exitCode, stdout: JSON.stringify({ ok, result: { session } }), stderr: "" };
 	};
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli: run,
@@ -1337,12 +1322,10 @@ test("close uses the global lifecycle route: the per-session control route prohi
 	});
 	await port.close({ sessionId: "sdk-1", repo: "/tmp/repo" });
 	expect(calls).toHaveLength(1);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const args = calls[0]!;
 	expect(args.slice(0, 4)).toEqual(["sdk", "session", "raw", "global"]);
 	expect(args).toContain("session.close");
 	expect(args[args.indexOf("--idempotency-key") + 1]).toMatch(/^gw-close-[0-9a-f-]{36}$/);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(JSON.parse(args[args.indexOf("--json-input") + 1]!)).toEqual({ sessionId: "sdk-1" });
 });
 
@@ -1407,7 +1390,6 @@ test("legacy private bindings cannot initialize a global port or be resumed and 
 	expect(
 		() =>
 			new BrokerSessionPort({
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				database: database!,
 				authority,
 				cli: run,
@@ -1429,7 +1411,6 @@ test("bind rejects an unowned persisted ID before inspect and without epoch rota
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const repo = join(home, "workspace");
 	await createOwnedSessionFixture(database, authority, { sessionId: "owned", originKey: "origin", epoch: 0, repo });
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const record = database.bindings.getSessionRecord("origin")!;
 	// Corrupt the read boundary deliberately: no production adoption API is used.
 	const getSessionRecord = database?.bindings.getSessionRecord.bind(database?.bindings);
@@ -1902,7 +1883,6 @@ test("a busy host whose activity stamp and transcript never move is reported sta
 		return { ok: false, error: { code: "busy", message: "busy" } };
 	});
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli: wedgedInspect,
@@ -1935,7 +1915,6 @@ test("a busy host whose transcript keeps growing is waited out, not reported sta
 		return { ok: true, result: { commandId: "c", turnId: "t", accepted: true } };
 	});
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli: wedgedInspect,
@@ -1968,7 +1947,6 @@ async function busyRefusalOutcome(
 	let clock = 0;
 	const relay = scriptedRelay(() => ({ ok: false, error: { code: "busy", message: "busy" } }));
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli: options.cli,
@@ -2229,10 +2207,8 @@ test("splitThinkingSuffix separates a trailing thinking level and leaves other c
 test("contextUsage reads context.get usage from the relay's query page", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await Store.open(join(home, "gateway.db"));
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const authority = initializeTestBrokerAuthority(database!, join(home, "agent"));
 	const repo = join(home, "workspace");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, {
 		sessionId: "sdk-1",
 		repo,
@@ -2256,7 +2232,6 @@ test("contextUsage reads context.get usage from the relay's query page", async (
 		return reply as ReturnType<Parameters<typeof scriptedRelay>[0]>;
 	});
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli: run,
@@ -2283,10 +2258,8 @@ test("contextUsage reads context.get usage from the relay's query page", async (
 test("turnRunning requires a complete live idle snapshot with empty queues, over CLI and relay", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await Store.open(join(home, "gateway.db"));
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const authority = initializeTestBrokerAuthority(database!, join(home, "agent"));
 	const repo = join(home, "workspace");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, {
 		sessionId: "sdk-1",
 		repo,
@@ -2307,7 +2280,6 @@ test("turnRunning requires a complete live idle snapshot with empty queues, over
 		return reply as ReturnType<Parameters<typeof scriptedRelay>[0]>;
 	});
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli: run,
@@ -2358,10 +2330,8 @@ test("turnRunning requires a complete live idle snapshot with empty queues, over
 test("runCompaction waits minutes for gjc to finish compacting and maps its receipt", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await Store.open(join(home, "gateway.db"));
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const authority = initializeTestBrokerAuthority(database!, join(home, "agent"));
 	const repo = join(home, "workspace");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "compact", epoch: 0 });
 	const calls: { args: string[]; timeoutMs: number | undefined }[] = [];
 	let reply: Record<string, unknown> = { ok: true, result: { started: true } };
@@ -2370,7 +2340,6 @@ test("runCompaction waits minutes for gjc to finish compacting and maps its rece
 		return { exitCode: 0, stdout: JSON.stringify(reply), stderr: "" };
 	};
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli: run,
@@ -2392,10 +2361,8 @@ test("runCompaction waits minutes for gjc to finish compacting and maps its rece
 test("runCompaction gives gjc's own request the compaction budget and reports a run that may still be compacting", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await Store.open(join(home, "gateway.db"));
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const authority = initializeTestBrokerAuthority(database!, join(home, "agent"));
 	const repo = join(home, "workspace");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "compact", epoch: 0 });
 	const calls: { args: string[]; timeoutMs: number | undefined }[] = [];
 	// gjc's public command-error envelope; `timeout` is what its session router
@@ -2419,7 +2386,6 @@ test("runCompaction gives gjc's own request the compaction budget and reports a 
 		return await respond();
 	};
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli: run,
@@ -2437,8 +2403,6 @@ test("runCompaction gives gjc's own request the compaction budget and reports a 
 	// is the whole budget, and gjc's request ends a little earlier so its reply is read.
 	expect(calls[0]?.timeoutMs).toBe(300_000);
 	expect(requestBudgetMs).toBeGreaterThan(40_000);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-	// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 	expect(requestBudgetMs).toBeLessThan(calls[0]?.timeoutMs!);
 
 	// gjc's request timeout settles only the client; the host may still be compacting.
@@ -2475,14 +2439,11 @@ test("runCompaction gives gjc's own request the compaction budget and reports a 
 test("runCompaction on the relay reports whether the host's ordered dispatcher answered", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await Store.open(join(home, "gateway.db"));
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const authority = initializeTestBrokerAuthority(database!, join(home, "agent"));
 	const repo = join(home, "workspace");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "compact", epoch: 0 });
 	const cliCalls: string[][] = [];
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli: async (args) => {

@@ -33,9 +33,7 @@ async function makeConfig(): Promise<GatewayConfig> {
 	};
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 async function connect(socketPath: string): Promise<{ send(value: unknown): void; frames: any[]; close(): void }> {
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = "";
 	const socket = await Bun.connect({
@@ -52,7 +50,6 @@ async function connect(socketPath: string): Promise<{ send(value: unknown): void
 	return { send: (value) => socket.write(`${JSON.stringify(value)}\n`), frames, close: () => socket.end() };
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 async function waitFor(frames: any[], count: number): Promise<void> {
 	for (let attempt = 0; attempt < 200 && frames.length < count; attempt++) await Bun.sleep(5);
 	expect(frames.length).toBeGreaterThanOrEqual(count);
@@ -62,7 +59,6 @@ function chatSend(id: string, messageId: string, text: string): unknown {
 	return { v: "0.1", type: "request", id, verb: "chat.send", params: { origin: ORIGIN, text, messageId } };
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 async function negotiated(socketPath: string): Promise<{ send(value: unknown): void; frames: any[]; close(): void }> {
 	const client = await connect(socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });

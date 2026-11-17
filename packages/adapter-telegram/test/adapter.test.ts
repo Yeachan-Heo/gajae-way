@@ -445,7 +445,6 @@ test("retries a transient image download after restart without advancing Telegra
 
 		const restartedState = await TelegramAdapterState.load(home);
 		expect(restartedState.updateId).toBe(40);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(restartedState.updateId! + 1).toBe(update.update_id);
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		const restartedAdapter = new TelegramAdapter(

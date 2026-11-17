@@ -338,7 +338,6 @@ liveTest(
 			close = async () => lifecycle("session.close", `close-${randomUUID()}`, { sessionId, cwd: repo });
 			const inspect = async () =>
 				parseEnvelope<{ session: InspectedSession }>(
-					// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 					await activeClient.cli(["sdk", "session", "inspect", sessionId!]),
 					"session inspect",
 				).session;

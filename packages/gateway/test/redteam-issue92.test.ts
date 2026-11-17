@@ -590,7 +590,6 @@ test("red-team: an unknown unaccepted send preserves its operation and epoch thr
 			() => target.logs.some((line) => line.startsWith(`recovery_client_ref_conflict origin=${ORIGIN_KEY}`)),
 			"client_ref_conflict was not reconciled",
 		);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = target.database.inbox.nonterminalTurns(ORIGIN_KEY)[0]!;
 		expect(target.database.inbox.turnRows(first.opRef)).toEqual(
 			expect.arrayContaining([expect.objectContaining({ message_id: "conflict-trigger", turn_state: "bound" })]),
@@ -630,7 +629,6 @@ test("red-team: a post-dispatch transcript timestamp cannot settle or release an
 			() => target.logs.some((line) => line.startsWith(`recovery_client_ref_conflict origin=${ORIGIN_KEY}`)),
 			"client_ref_conflict was not reconciled",
 		);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = target.database.inbox.nonterminalTurns(ORIGIN_KEY)[0]!;
 		// Even a recent answer could belong to a different invocation.
 		port.answer = { text: "written while you were not looking", atMs: Date.now() + 1 };
@@ -655,7 +653,6 @@ test("red-team: a pre-dispatch transcript row cannot prove an unknown native ope
 			() => target.logs.some((line) => line.startsWith(`recovery_client_ref_conflict origin=${ORIGIN_KEY}`)),
 			"client_ref_conflict was not reconciled",
 		);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = target.database.inbox.nonterminalTurns(ORIGIN_KEY)[0]!;
 		for (let sweep = 0; sweep < 3; sweep++) await target.manager.tick(ORIGIN_KEY);
 		assertUnknownOperationHeld(target, first);

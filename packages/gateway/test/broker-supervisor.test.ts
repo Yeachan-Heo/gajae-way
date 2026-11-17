@@ -81,7 +81,6 @@ test("the stdio relay binds its agent directory through the environment, never a
 	const relay = value.openStream("owned-session");
 	try {
 		expect(spawned).toHaveLength(1);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const { cmd, env } = spawned[0]!;
 		expect(cmd.slice(1)).toEqual(["sdk", "serve", "--stdio", "--session", "owned-session"]);
 		expect(cmd.some((arg) => arg.startsWith("--agent-dir"))).toBe(false);

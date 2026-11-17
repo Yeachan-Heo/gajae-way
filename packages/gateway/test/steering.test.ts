@@ -94,9 +94,7 @@ test("a mid-turn message issues one steer, keeps one send, and is attributed in 
 	enqueue("trigger", "draft the release note");
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(() => port.sends.length === 1, "initial send did not become accepted");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const running = port.sends[0]!;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const batch = database.inbox.nonterminalTurns(ORIGIN_KEY)[0]!;
 
 	enqueue("correction", "mention the rollback caveat");
@@ -163,7 +161,6 @@ test("an image-bearing message stays pending while busy and is sent with its ima
 	enqueue("trigger", "first request");
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(() => port.sends.length === 1, "initial turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const running = port.sends[0]!;
 
 	enqueue("photo-request", "describe this image", undefined, JSON.stringify(PROMPT_IMAGES));
@@ -181,7 +178,6 @@ test("an image-bearing message stays pending while busy and is sent with its ima
 
 	port.complete(running.opRef, "first answer");
 	await eventually(() => port.sends.length === 2, "pending image message did not start as the next turn");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const next = port.sends[1]!;
 	expect(next).toMatchObject({
 		sessionId: running.sessionId,
@@ -219,7 +215,6 @@ test("an image-bearing row already in context is not closed as consumed input", 
 	enqueue("trigger", "first request");
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(() => port.sends.length === 1, "initial turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const running = port.sends[0]!;
 
 	enqueue("photo-in-context", "describe this image", undefined, JSON.stringify(PROMPT_IMAGES));
@@ -237,7 +232,6 @@ test("an image-bearing row already in context is not closed as consumed input", 
 
 	port.complete(running.opRef, "first answer");
 	await eventually(() => port.sends.length === 2, "image in context was not dispatched as the next turn");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const next = port.sends[1]!;
 	expect(next).toMatchObject({ text: "describe this image", images: PROMPT_IMAGES });
 	port.complete(next.opRef, "image description");
@@ -386,7 +380,6 @@ test("a steered message is answered in its own mid-work reply, which closes the 
 	enqueue("first", "first request");
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(() => port.sends.length === 1, "first turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 
 	enqueue("second", "second request");
@@ -434,7 +427,6 @@ test("a message arriving after a consumer-visible reply waits for the next turn 
 	enqueue("first", "first request");
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(() => port.sends.length === 1, "first turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	port.emitAssistant(first.sessionId, "first visible reply", "visible-first", first.opRef);
 	await eventually(() => visible.length === 1, "reply did not become consumer-visible");
@@ -582,7 +574,6 @@ test("a held steer survives the old turn's terminal and a restart: it is never d
 	const logs: string[] = [];
 	const make = () =>
 		new PersonaSessionManager({
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			database: database!,
 			port,
 			instanceId: "steering-test",
@@ -712,7 +703,6 @@ for (const outcome of ["accepted", "refused"] as const) {
 		attachTestBrokerOwnership(database, port, join(home, "agent"));
 		const make = () =>
 			new PersonaSessionManager({
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				database: database!,
 				port,
 				instanceId: "held-only-recovery-test",
@@ -724,7 +714,6 @@ for (const outcome of ["accepted", "refused"] as const) {
 		enqueue("trigger", "first");
 		await manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 1, "initial send missing");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const running = port.sends[0]!;
 		enqueue("held-only", "second");
 		await manager.notifyInbound(ORIGIN_KEY);
@@ -742,7 +731,6 @@ for (const outcome of ["accepted", "refused"] as const) {
 		expect(database.inbox.pendingOrigins()).toEqual([]);
 		expect(database.inbox.heldSteerOrigins()).toEqual([ORIGIN_KEY]);
 		const attemptsBeforeRecovery = port.attempts.length;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const originalAttempt = port.attempts[0]!;
 		port.decidable = true;
 		manager = make();
@@ -752,7 +740,6 @@ for (const outcome of ["accepted", "refused"] as const) {
 		// The replay carries the SAME clientRef/session/text; only the transport
 		// differs (the original rode the turn's relay, recovery has none).
 		const { relay: _originalRelay, ...originalRequest } = originalAttempt;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const { relay: _replayRelay, ...replayRequest } = port.attempts.at(-1)!;
 		expect(replayRequest).toEqual(originalRequest);
 		expect(originalAttempt.sessionId).toBe(running.sessionId);
@@ -812,7 +799,6 @@ test("a torn steer whose replay returns a definitive refusal waits for terminal 
 	enqueue("trigger", "first");
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(() => port.sends.length === 1, "initial send missing");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const running = port.sends[0]!;
 	enqueue("refused", "second");
 	await manager.notifyInbound(ORIGIN_KEY);

@@ -3756,7 +3756,6 @@ class OriginActor {
 			const active = live.activity?.state !== undefined && live.activity.state !== "idle";
 			if (!jobs && !active) return;
 			this.#armObserver(binding.sessionId, binding.epoch, undefined, "recover");
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			if (active) this.#observer!.active = true;
 			await this.sweepObserver(this.#manager.now());
 		} catch (error) {
@@ -4075,7 +4074,6 @@ class OriginActor {
 			onReverseRequest: async (input) => {
 				await this.enqueue(async () => {
 					if (!owns(this.#findBound(sessionId, epoch, generation)) && this.#observer?.tail !== self) return;
-					// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 					await this.#onReverseRequest(sessionId, epoch, generation, retired, input, self!);
 				}).catch((error: unknown) =>
 					this.#manager.log(

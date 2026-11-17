@@ -953,7 +953,6 @@ export class BrokerSessionPort implements SessionPort {
 			if (!current || current.operationRef !== intent.operationRef || current.requestJson !== intent.requestJson)
 				throw new OpRefError("prompt journal identity changed before completion");
 			if (current.state === "complete") {
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				const cached = recordOf(JSON.parse(current.resultJson!));
 				const nativeIdentityConflict =
 					(cached?.commandId !== undefined &&
@@ -1451,7 +1450,6 @@ export class BrokerSessionPort implements SessionPort {
 		if (intent.requestJson !== requestJson)
 			throw new OpRefError(`op ref ${input.opRef} was already used for a different prompt`);
 		if (intent.state === "complete" && !isBrokerPromptBusyRefusal(intent))
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			return JSON.parse(intent.resultJson!) as SendReceipt;
 		let relay: TailHandle;
 		try {
@@ -1538,7 +1536,6 @@ export class BrokerSessionPort implements SessionPort {
 				submission = this.#database.transaction((tx) =>
 					this.#database.bindings.rearmBrokerPromptOperation(tx, this.#authority, submission),
 				);
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				if (submission.state === "complete") return JSON.parse(submission.resultJson!) as SendReceipt;
 				if (submission.resumed) return await this.#acceptedPrompt(input, relay);
 			}

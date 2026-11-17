@@ -72,12 +72,10 @@ test("rapid fragments are never coalesced: the first is sent at once and every l
 	enqueue("m-3", "Cy", "third fragment", new Date(base + 100).toISOString());
 	await manager.notifyInbound(ORIGIN_KEY);
 
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = port.sends[0]!;
 	expect(send.text).toBe("[speaker:Ari message:m-1] first fragment");
 	expect(port.sends).toHaveLength(1);
 	expect(port.steers.map((steer) => steer.text.split("\n").at(-1))).toEqual(["second fragment", "third fragment"]);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const turn = database.inbox.nonterminalTurns(ORIGIN_KEY)[0]!;
 	expect(turn.triggerMessageId).toBe("m-1");
 	expect(database.inbox.turnRows(turn.opRef).map((row) => [row.message_id, row.turn_role, row.turn_state])).toEqual([

@@ -71,7 +71,6 @@ test("PR701 actual CLI response-only successor preserves null route and immutabl
 		(s) => s.runtimes.some((r) => r.mode === "run" && r.sendPhase === "accepted"),
 		"CLI run accepted",
 	);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const source = accepted.runtimes.find((r) => r.mode === "run")!;
 	expect(source.parent).toBeNull();
 	running.child.kill("SIGKILL");
@@ -102,7 +101,6 @@ test("PR701 actual CLI response-only successor preserves null route and immutabl
 	expect(started.code).toBe(0);
 	expect(started.stderr).toBe("");
 	const linked = f.snapshot();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const successor = linked.runtimes.find((r) => r.successorOf?.opRef === source.opRef)!;
 	expect(successor).toBeDefined();
 	expect(successor.parent).toBeNull();
@@ -122,7 +120,6 @@ test("PR701 actual CLI response-only successor preserves null route and immutabl
 		["response-source", "successor"],
 		["response-successor", "successorOf"],
 	] as const) {
-		// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 		const status = await client.request<any>("work.status", { name });
 		expect(status.opUnavailable).toBe(true);
 		expect(status[link].opRef).toBe(link === "successor" ? successor.opRef : source.opRef);
@@ -145,13 +142,11 @@ test("PR701 actual CLI response-only successor preserves null route and immutabl
 test("PR701 SDK rootless child report remains inspectable for accepted open held parent across SIGKILL", async () => {
 	const f = await fixture({ allowNested: true, rootless: true });
 	const client = await sdk(f);
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const parent = await client.request<any>("work.start", {
 		name: "rootless-parent",
 		cwd: f.home,
 		text: "original parent",
 	});
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const child = await client.request<any>("work.start", {
 		name: "rootless-child",
 		cwd: f.home,
@@ -192,7 +187,6 @@ test("PR701 SDK rootless child report remains inspectable for accepted open held
 	await f.control(parent.opRef, { statusUnavailable: true, live: "indeterminate" });
 	await f.start();
 	const recovered = await sdk(f);
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const status = await recovered.request<any>("work.status", { name: "rootless-parent" });
 	expect(status.attempt.opRef).toBe(parent.opRef);
 	expect(status.attempt.endedAt).toBeUndefined();
@@ -214,13 +208,11 @@ test("PR701 SDK rootless child report remains inspectable for accepted open held
 test("PR701 SDK undelivered rootless report survives SIGKILL with content and no fallback", async () => {
 	const f = await fixture({ allowNested: true, rootless: true });
 	const client = await sdk(f);
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const parent = await client.request<any>("work.start", {
 		name: "pending-parent",
 		cwd: f.home,
 		text: "original parent",
 	});
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const child = await client.request<any>("work.start", {
 		name: "pending-child",
 		cwd: f.home,
@@ -239,7 +231,6 @@ test("PR701 SDK undelivered rootless report survives SIGKILL with content and no
 		(s) => s.laneReports[0]?.state === "pending",
 		"held parent report retained pending",
 	);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const row = pending.laneReports[0]!;
 	expect(row.body).toContain("private undelivered child body");
 	expect(row.root_json).toBeNull();

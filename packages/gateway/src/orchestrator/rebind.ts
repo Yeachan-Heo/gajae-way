@@ -541,11 +541,9 @@ export class StreamingDiagnosticTail {
 	}
 
 	#scanBracket(text: string, from: number): number {
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const state = this.#bracket!;
 		let index = from;
 		while (index < text.length) {
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const character = text[index]!;
 			if (state.quote !== null) {
 				if (character === "\\") index++;

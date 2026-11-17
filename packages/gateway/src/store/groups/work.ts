@@ -172,9 +172,7 @@ export function terminalEvidence(
 	else if (status.receiptState === "present" && status.outcome?.reason === "end_turn") reasonCode = "end_turn";
 	else
 		reasonCode = ["cancelled", "max_tokens", "max_turn_requests", "refusal"].includes(status.outcome?.reason ?? "")
-			? // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-				// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
-				status.outcome?.reason!
+			? status.outcome?.reason!
 			: "stopped_incomplete";
 	return { kind: "broker", observedAt, reasonCode, status };
 }
@@ -723,7 +721,6 @@ export class WorkGroup {
 			)
 			.all(afterOpRef, limit) as Array<{ op_ref: string; job_id: string }>;
 
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		if (!onInvalid) return rows.map((row) => this.workAttemptGet(row.op_ref)!);
 		const attempts: WorkAttemptRuntime[] = [];
 		for (const row of rows) {
@@ -988,7 +985,6 @@ export class WorkGroup {
 								admission.fallbackPayload.text === report.body,
 						);
 					decision = checks.laneParentAvailable ? "reported" : report.root ? "fallback" : "no_target";
-					// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 					if (decision === "fallback") fallbackPayload = admission.fallbackPayload!;
 				}
 			} else {
@@ -1008,7 +1004,6 @@ export class WorkGroup {
 		this.#workPutHistory(tx, next, record);
 		if (next.wakeReportId !== null && workAccepted(next)) this.#consumeWakeReport(tx, next);
 		if (next.decision === "reported" && admission?.kind === "lane")
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			this.#putLaneReport(tx, admission.report, next.settledAt!);
 		if (fallbackPayload) {
 			const expectedOrigin =

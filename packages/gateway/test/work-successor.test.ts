@@ -117,7 +117,6 @@ async function fixture(
 	});
 	const callerSessionId = options.callerOriginKey ? crypto.randomUUID() : undefined;
 	if (callerSessionId && options.callerOriginKey)
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		db.transaction((tx) => db.bindings.bind(tx, options.callerOriginKey!, callerSessionId));
 	const initial = {
 		name: "predecessor",
@@ -135,7 +134,6 @@ async function fixture(
 			await run;
 		});
 		await until(() => port.sends.length === 1);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const send = port.sends[0]!;
 		first = { started: true, opRef: send.opRef, sessionId: send.sessionId };
 		await until(() => db.work.workAttemptGet(first.opRef)?.sendPhase === "accepted");
@@ -145,9 +143,7 @@ async function fixture(
 		first = started;
 	}
 	if (!first.started) throw new Error("unexpected hold");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const initialState = parseLaneJobRecord(db.work.laneJobJson(laneJobIdentity("predecessor").jobId)!).state;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = db.work.workAttemptGet(first.opRef)!;
 	const status = port.status.bind(port);
 	port.status = async (input) =>
@@ -168,7 +164,6 @@ async function fixture(
 					summaryCompleted: true,
 				};
 	await until(() => probes > 1);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const job = (name = "predecessor") => parseLaneJobRecord(db.work.laneJobJson(laneJobIdentity(name).jobId)!);
 	const request = (name = "authorized-successor") => ({
 		name,
@@ -228,7 +223,6 @@ test("missing execution end holds the predecessor and an authorized isolated suc
 	if (!result.started) throw new Error("unexpected successor hold");
 	expect(f.job().state).toBe("awaiting_operator");
 	expect(await f.manager.status({ name: "predecessor" })).toMatchObject({ recoveryHold: "execution_end_unproven" });
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const next = f.db.work.workAttemptGet(result.opRef)!;
 	expect(next.cwd).not.toBe(f.runtime.cwd);
 	expect(git(next.cwd, "rev-parse", "--git-common-dir")).not.toBe(git(f.runtime.cwd, "rev-parse", "--git-common-dir"));
@@ -346,7 +340,6 @@ test("a stored missing-receipt failure retains its cause without proving the sou
 	const terminal = terminalEvidence(status.status, new Date().toISOString());
 	expect(terminal).toMatchObject({ reasonCode: "prompt_deadline_exceeded", status: { receiptState: "missing" } });
 	f.db.transaction((tx) => {
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const current = f.db.work.workAttemptGet(f.first.opRef)!;
 		expect(f.db.work.workAttemptUpdate(tx, current.opRef, current.version, { terminal })).toBeDefined();
 	});
@@ -411,7 +404,6 @@ test("rootless child report survives a held parent's end evidence until late rec
 		release();
 		await until(() => f.db.work.workAttemptGet(f.first.opRef)?.settledAt != null);
 		await until(() => f.db.work.laneReportsByParent("predecessor")[0]?.state === "consumed");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const delivered = f.db.work.laneReportsByParent("predecessor")[0]!;
 		expect(delivered).toMatchObject({ state: "consumed", claim_kind: "wake" });
 		expect(f.port.sends.at(-1)?.text).toContain("child result retained");
@@ -486,7 +478,6 @@ test("a child report drained after the parent's hold lands is retained instead o
 	try {
 		await until(() => f.job("steady").state === "awaiting_operator");
 		// The hold is durable without any proof that the native execution ended.
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const parked = f.db.work.workAttemptGet(parent.opRef)!;
 		expect(parked.terminal).toBeNull();
 		expect(parked.turnEndObservedAt).toBeUndefined();
@@ -521,7 +512,6 @@ for (const initialMode of ["start", "run"] as const) {
 			const before = f.port.sends.length;
 			calls.push(f.manager.run(params, {}, abort.signal).catch(() => undefined));
 			await until(() => f.port.sends.length > before);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			return f.port.sends.at(-1)!;
 		};
 		const finish = async (attempt: { opRef: string }) => {
@@ -538,7 +528,6 @@ for (const initialMode of ["start", "run"] as const) {
 				callerSessionId: firstParent.sessionId,
 			});
 			if (!child.started) throw new Error("child held");
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const childRuntime = f.db.work.workAttemptGet(child.opRef)!;
 			expect(childRuntime.authorizationOwner).toEqual({
 				kind: "lane",
@@ -648,7 +637,6 @@ test("linked recovery remains inspectable during a transport gap and never repla
 		detail: { reasonCode: "send_acceptance_uncertain" },
 	});
 	expect(successorOp).toBeDefined();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const op = successorOp!;
 	expect(f.db.work.workAttemptGet(f.first.opRef)?.successor?.opRef).toBe(op);
 	expect(await f.manager.status({ name: "authorized-successor" })).toMatchObject({
@@ -714,7 +702,6 @@ test("a prepared linked successor stays open when submission and both reconstruc
 		throw new Error("inspect unavailable");
 	};
 	await f.restart();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	for (const opRef of [f.first.opRef, successorOp!]) {
 		expect(f.db.work.workAttemptGet(opRef)).toMatchObject({
 			terminal: null,
@@ -839,7 +826,6 @@ test("new definitive terminal evidence fences a stale missing-status successor q
 	try {
 		await until(() => queryHeld);
 		await until(() => outputHeld);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const staged = f.db.work.workAttemptGet(f.first.opRef)!;
 		expect(staged.terminal).not.toBeNull();
 		expect(staged.settledAt).toBeNull();
@@ -924,7 +910,6 @@ test("response-only predecessor authorizes only its captured owner and retains a
 
 test("response-only caller session owns successor authorization independently of owner target", async () => {
 	const f = await fixture(8, undefined, { runPredecessor: true, callerOriginKey: "discord/channel/caller-owner" });
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const callerSessionId = f.callerSessionId!;
 	const otherSessionId = crypto.randomUUID();
 	f.db.transaction((tx) => f.db.bindings.bind(tx, "discord/channel/other-caller", otherSessionId));
@@ -939,7 +924,6 @@ test("response-only caller session owns successor authorization independently of
 	}
 	const successor = await f.manager.start({ ...f.request(), callerSessionId });
 	if (!successor.started) throw new Error("unexpected successor hold");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.db.work.workAttemptGet(successor.opRef)!;
 	expect(runtime.parent).toBeNull();
 	expect(runtime.authorizationOwner).toEqual(f.runtime.authorizationOwner);
@@ -973,7 +957,6 @@ test("response-only successor replacement preserves its original owner and null 
 	f.db.transaction((tx) => f.db.bindings.bind(tx, "discord/channel/other-caller", other));
 	const successor = await f.manager.start({ ...f.request(), callerSessionId: f.callerSessionId });
 	if (!successor.started) throw new Error("successor held");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const initial = f.db.work.workAttemptGet(successor.opRef)!;
 	git(initial.cwd, "push", "-u", "origin", git(initial.cwd, "branch", "--show-current"));
 	f.port.complete(successor.opRef, "first response-only answer");
@@ -1011,7 +994,6 @@ for (const changedField of ["text", "model", "omitted model"] as const) {
 		const request = { ...f.request(), model: { preset: "review-model" } };
 		const successor = await f.manager.start(request);
 		if (!successor.started) throw new Error("successor held");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const runtime = f.db.work.workAttemptGet(successor.opRef)!;
 		const changed =
 			changedField === "text"
@@ -1230,7 +1212,6 @@ async function successorAwaitingChecks() {
 	const f = await fixture(8, undefined, { checkStatusClient: checks });
 	const successor = await f.manager.start(f.request());
 	if (!successor.started) throw new Error("unexpected successor hold");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const initial = f.db.work.workAttemptGet(successor.opRef)!;
 	const branch = git(initial.cwd, "branch", "--show-current");
 	git(initial.cwd, "push", "-u", "origin", branch);
@@ -1255,7 +1236,6 @@ for (const restart of [false, true]) {
 			await Bun.sleep(5);
 		}
 		expect(f.port.sends).toHaveLength(3);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const continuation = f.port.sends[2]!;
 		expect(continuation.text).toContain("checks failed");
 		expect(continuation.opRef).not.toBe(successor.opRef);
@@ -1310,7 +1290,6 @@ test("source forward link survives definitive completion, check repair, restart 
 		await Bun.sleep(5);
 	}
 	expect(f.port.sends).toHaveLength(3);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const continuation = f.port.sends[2]!;
 	expect(continuation.text).toContain("checks failed");
 	expect(f.db.work.workAttemptGet(continuation.opRef)?.successor).toBeUndefined();
@@ -1343,7 +1322,6 @@ test("check repair derives a missing legacy authorization owner from its report 
 		await Bun.sleep(5);
 	}
 	expect(f.port.sends).toHaveLength(3);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const repair = f.db.work.workAttemptGet(f.port.sends[2]?.opRef)!;
 	expect(repair.parent).toEqual(initial.parent);
 	expect(repair.authorizationOwner).toEqual(initial.authorizationOwner);
@@ -1366,7 +1344,6 @@ test("automatic successor check repair preserves a response-only replacement nul
 	);
 	try {
 		await until(() => f.port.sends.length === 3);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const replacement = f.port.sends[2]!;
 		f.port.complete(replacement.opRef, "private response-only output");
 		expect(await run).toMatchObject({ text: "private response-only output" });
@@ -1377,7 +1354,6 @@ test("automatic successor check repair preserves a response-only replacement nul
 			await Bun.sleep(5);
 		}
 		expect(f.port.sends).toHaveLength(4);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const repair = f.db.work.workAttemptGet(f.port.sends[3]?.opRef)!;
 		expect(repair.parent).toBeNull();
 		expect(repair.authorizationOwner).toEqual(initial.authorizationOwner);
@@ -1399,7 +1375,6 @@ test("automatic successor child-report wake preserves a response-only replacemen
 	const f = await fixture(8, undefined, { allowNested: true });
 	const successor = await f.manager.start(f.request());
 	if (!successor.started) throw new Error("successor held");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const initial = f.db.work.workAttemptGet(successor.opRef)!;
 	f.port.complete(successor.opRef, "first routed output");
 	await until(() => f.db.work.workAttemptGet(successor.opRef)?.settledAt != null);
@@ -1415,7 +1390,6 @@ test("automatic successor child-report wake preserves a response-only replacemen
 	);
 	try {
 		await until(() => f.port.sends.length === 3);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const replacement = f.port.sends[2]!;
 		f.port.complete(replacement.opRef, "private response-only output");
 		await run;
@@ -1428,9 +1402,7 @@ test("automatic successor child-report wake preserves a response-only replacemen
 		if (!child.started) throw new Error("child held");
 		f.port.complete(child.opRef, "private child report");
 		await until(() => f.db.work.laneReportsByParent("authorized-successor")[0]?.state === "consumed");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const report = f.db.work.laneReportsByParent("authorized-successor")[0]!;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const wake = f.db.work.workAttemptGet(report.consumed_op_ref!)!;
 		expect(report.claim_kind).toBe("wake");
 		expect(wake.parent).toBeNull();
@@ -1453,7 +1425,6 @@ test("child report wake derives a missing legacy authorization owner from its re
 	const f = await fixture(8, undefined, { allowNested: true });
 	const parent = await f.manager.start({ name: "wake-parent", text: "parent task", cwd: f.dir });
 	if (!parent.started) throw new Error("parent held");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const initial = f.db.work.workAttemptGet(parent.opRef)!;
 	f.port.complete(parent.opRef, "parent first answer");
 	await until(() => f.db.work.workAttemptGet(parent.opRef)?.settledAt != null);
@@ -1467,9 +1438,7 @@ test("child report wake derives a missing legacy authorization owner from its re
 	if (!child.started) throw new Error("child held");
 	f.port.complete(child.opRef, "child report");
 	await until(() => f.db.work.laneReportsByParent("wake-parent")[0]?.state === "consumed");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const report = f.db.work.laneReportsByParent("wake-parent")[0]!;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const wake = f.db.work.workAttemptGet(report.consumed_op_ref!)!;
 	expect(report.claim_kind).toBe("wake");
 	expect(wake.parent).toEqual(initial.parent);
@@ -1552,7 +1521,6 @@ test("response-only replacement session receives successor safety warning withou
 	);
 	try {
 		await until(() => f.port.sends.length === 3);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const replacement = f.port.sends[2]!;
 		expect(replacement.sessionId).not.toBe(successor.sessionId);
 		expect(replacement.systemPreamble).toContain(f.first.opRef);

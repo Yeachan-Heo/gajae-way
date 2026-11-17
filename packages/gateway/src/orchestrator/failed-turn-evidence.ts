@@ -83,7 +83,6 @@ function reason(message: Row): FailedTurnEvidence["reason"] | undefined {
 	if (codes.some((code) => code !== undefined && code !== "error" && !knownCodes.includes(String(code))))
 		return undefined;
 	// Diagnostics after the first line are private and never participate in classification.
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const firstLine = typeof message.errorMessage === "string" ? message.errorMessage.split(/\r?\n/, 1)[0]! : "";
 	let contextText = firstLine;
 	let contextEnvelope = false;
@@ -144,7 +143,6 @@ export async function locateSavedTranscript(
 			}
 		}
 		if (candidates.length !== 1) return undefined;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const path = candidates[0]!;
 		return (await realpath(path)) === path ? path : undefined;
 	} catch {
@@ -276,14 +274,11 @@ async function readFailedAssistantMessage(
 				entry.messageTime <= input.startedAtMs + 2000,
 		);
 		if (!prompts.length) return undefined;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const prompt = prompts[0]!;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		if (prompt.time > failed.time || prompt.messageTime! > failed.messageTime) return undefined;
 		const current = ancestry.slice(ancestry.indexOf(prompt));
 		if (
 			current.some(
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				(entry) => entry.time > input.terminalAtMs || (entry.message && entry.messageTime! > input.terminalAtMs),
 			)
 		)

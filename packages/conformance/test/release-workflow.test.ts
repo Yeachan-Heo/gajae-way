@@ -215,7 +215,6 @@ describe("release workflow wiring", () => {
 		// An untagged branch dispatch still falls back to a per-run key, so it has no
 		// second pending slot that a later dispatch could displace.
 		expect(group.endsWith("|| github.run_id) }}")).toBe(true);
-		// biome-ignore lint/suspicious/noTemplateCurlyInString: ignored using `--suppress`
 		expect(group).not.toBe("release-publish-${{ github.ref }}");
 	});
 
@@ -261,7 +260,6 @@ describe("release workflow wiring", () => {
 		// normalize it, so the same gate has to reject a divergent spelling before the
 		// publish job enters a group.
 		expect(body).toContain("require a canonical npm dist-tag");
-		// biome-ignore lint/suspicious/noTemplateCurlyInString: ignored using `--suppress`
 		expect(body).toContain("NPM_TAG_INPUT: ${{ inputs.npm_tag }}");
 		// The gate has to use the scripts' predicates: an ASCII whitespace class would let
 		// NBSP or a BOM through, and a trim-only check would let an interior newline split

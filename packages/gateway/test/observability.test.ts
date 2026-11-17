@@ -75,7 +75,6 @@ test("persistent-session control-plane logs use grep-stable fields", async () =>
 		).toBe(true);
 		await manager.notifyInbound(originKey);
 		await eventually(() => port.sends.length === 1, "initial persistent operation was not sent");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
 		expect(
 			database?.transaction((tx) =>

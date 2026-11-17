@@ -237,11 +237,9 @@ export function testOnlyBrokerDependencies(options: { reply?: (prompt: string) =
 			if (!sessionId || !repositories.has(sessionId)) return failure("session_unavailable");
 			const items = [...operations.values()]
 				.filter((operation) => operation.sessionId === sessionId && operation.state === "terminal_ok")
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				.sort((left, right) => left.terminalAt! - right.terminalAt!)
 				.map((operation) => ({
 					role: "assistant",
-					// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 					ts: new Date(operation.terminalAt!).toISOString(),
 					body: operation.reply,
 				}));
@@ -300,7 +298,6 @@ export function testOnlyBrokerDependencies(options: { reply?: (prompt: string) =
 					live: true,
 					deleted: false,
 					locator: { cwd: repo },
-					// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 					activity: { state: activeRuns.has(sessionId!) ? "working" : "idle", at: Date.now() },
 				},
 			});
@@ -419,7 +416,6 @@ function withoutAgentDir(args: readonly string[]): string[] {
 			index++;
 			continue;
 		}
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		stripped.push(args[index]!);
 	}
 	return stripped;

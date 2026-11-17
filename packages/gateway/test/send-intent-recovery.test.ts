@@ -155,7 +155,6 @@ for (const stage of [
 		try {
 			await restarted.recover();
 			await until(() => f.port.sendAttempts.length === 1);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const sent = f.port.sendAttempts[0]!;
 			expect(sent.text).toContain("answer me exactly once");
 			expect(sent.opRef).not.toBe(bound[0]?.opRef);
@@ -545,7 +544,6 @@ test("a busy-stalled host still terminating is dispatched exactly once after its
 			await new Promise((resolve) => setTimeout(resolve, 50));
 		expect(f.logs.some((line) => line.startsWith("persona_host_exit_confirmed"))).toBe(true);
 		expect(f.port.sendAttempts).toHaveLength(2);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const answered = f.port.sendAttempts[1]!;
 		await until(() => f.db.inbox.turnRow(answered.opRef)?.turn_state === "done");
 		await manager.tick();

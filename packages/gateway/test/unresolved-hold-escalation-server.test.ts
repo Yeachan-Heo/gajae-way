@@ -255,7 +255,6 @@ for (const state of ["bound", "accepted"] as const) {
 			onStop: () => opened.close(),
 		});
 		await until(() => f.port.sends.some((send) => send.sessionId === "session-1"));
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const fresh = f.port.sends.find((send) => send.sessionId === "session-1")!;
 		const unread = fresh.text.slice(fresh.text.indexOf("[Unread messages"));
 		expect(unread).toContain("AFTER-UPGRADE");

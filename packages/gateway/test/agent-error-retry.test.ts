@@ -64,7 +64,6 @@ test("provider_transport error retries successfully", async () => {
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port,
 		instanceId: "instance-test",
@@ -109,7 +108,6 @@ test("agent_runtime post_start failures are not replayed", async () => {
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port,
 		instanceId: "instance-test",
@@ -145,7 +143,6 @@ test("agent_error quota failures are classified without retry", async () => {
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port,
 		instanceId: "instance-test",
@@ -183,7 +180,6 @@ test("a provider refusal reported as provider_transport is delivered once, never
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port,
 		instanceId: "instance-test",
@@ -221,7 +217,6 @@ test("non-retryable errors fail immediately without retry", async () => {
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port,
 		instanceId: "instance-test",
@@ -260,7 +255,6 @@ test("provider failure after visible assistant output is not replayed", async ()
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port,
 		instanceId: "instance-test",
@@ -295,7 +289,6 @@ test("provider failure after completed tool activity is not replayed", async () 
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port,
 		instanceId: "instance-test",
@@ -331,7 +324,6 @@ test("provider failure after an accepted steer is not replayed", async () => {
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port,
 		instanceId: "instance-test",
@@ -370,7 +362,6 @@ test("provider quota evidence suppresses transport retry", async () => {
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port,
 		instanceId: "instance-test",
@@ -534,7 +525,6 @@ test("tool stalled/hung error is NOT retried", async () => {
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port,
 		instanceId: "instance-test",
@@ -573,7 +563,6 @@ test("when both retries fail, failure message posted exactly once", async () => 
 
 	await setupHarness(port);
 	manager = new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port,
 		instanceId: "instance-test",

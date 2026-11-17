@@ -143,7 +143,6 @@ test("coverage audit: a refused steer waits for terminal and is sent once on the
 		enqueue(fixtureState.database, "steer-trigger", "first");
 		await fixtureState.manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 1, "trigger did not start");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
 		enqueue(fixtureState.database, "steer-failure", "must not disappear");
 		await fixtureState.manager.notifyInbound(ORIGIN_KEY);
@@ -155,7 +154,6 @@ test("coverage audit: a refused steer waits for terminal and is sent once on the
 		expect(fixtureState.database.inbox.pendingOldest(ORIGIN_KEY)).toMatchObject({ message_id: "steer-failure" });
 		port.complete(first.opRef, "first done");
 		await eventually(() => port.sends.length === 2, "refused steer was not sent after terminal");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const second = port.sends[1]!;
 		expect(second.text).toBe("must not disappear");
 		expect(second.sessionId).toBe(first.sessionId);
@@ -179,7 +177,6 @@ test("coverage audit preserves attribution when a broker generation changes mid-
 		enqueue(fixtureState.database, "restart-trigger", "in-flight before broker restart");
 		await fixtureState.manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => fixtureState.port.sends.length === 1, "trigger did not start");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const running = fixtureState.port.sends[0]!;
 
 		generation = 2;

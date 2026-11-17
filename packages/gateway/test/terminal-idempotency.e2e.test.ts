@@ -31,7 +31,6 @@ afterEach(async () => {
 });
 
 async function connect(path: string) {
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = "";
 	const socket = await Bun.connect({
@@ -91,9 +90,7 @@ function sendChannelMessage(client: { send(value: unknown): void }, id: string, 
 	});
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 function messages(client: { frames: any[] }): any[] {
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	return client.frames.filter((frame: any) => frame.type === "event" && frame.event === "chat.message");
 }
 
@@ -143,7 +140,6 @@ test("a batch whose tail was fenced and then reconciled from status invokes onTe
 		).toBe(true);
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 1, "turn was not sent");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const send = port.sends[0]!;
 		// The fence closes the tail BEFORE the terminal frame arrives, exactly as
 		// broker_generation_fenced did live; status then reports terminal_ok and the
@@ -172,7 +168,6 @@ test("red-team B2: the answer ships on the tail, the gateway restarts, status re
 	const { client } = await startGateway(port);
 	sendChannelMessage(client, "r1", "재시작 전에 답해");
 	await eventually(() => port.sends.length === 1, "turn was not sent");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = port.sends[0]!;
 	// Finalized answer arrives as a tail transcript row after a tool call and
 	// passes the interim gate: it is delivered NOW under the trigger identity.
@@ -218,7 +213,6 @@ test("red-team I2/I5: [BREAK] parts own per-part terminal slots; a regenerated D
 	const { client } = await startGateway(port);
 	sendChannelMessage(client, "b1", "세 조각으로");
 	await eventually(() => port.sends.length === 1, "turn was not sent");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = port.sends[0]!;
 	port.complete(send.opRef, "하나\n[BREAK]\n둘\n[BREAK]\n셋");
 	await eventually(() => messages(client).length === 3, "three parts were not delivered");
@@ -293,7 +287,6 @@ test("red-team G2-B3: a message that arrived mid-turn and dispatched later never
 		// with NO assistant row of its own.
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 2, "backlog turn was not sent");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const second = port.sends[1]!;
 		port.seedOperation(second.opRef, second.sessionId, "terminal_ok", "");
 		await manager.reconcile("discord/channel/chan-1");
@@ -335,7 +328,6 @@ test("red-team I4: two different id-less interim texts get distinct ids; the sam
 	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);
 	sendChannelMessage(client, "i1", "중간 보고 두 개");
 	await eventually(() => port.sends.length === 1, "turn was not sent");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = port.sends[0]!;
 	port.emitTool(send.sessionId);
 	// gjc 0.16 synthesizes ids the runner treats as absent; model that with none.
@@ -402,7 +394,6 @@ test("a tail-less reconcile never reposts a previous turn's answer as the curren
 		enqueue("m-a2", "둘째 질문");
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 2, "second turn was not sent");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const second = port.sends[1]!;
 		// The second op completes with NO assistant row of its own (tool-only
 		// turn); the tail never shows terminal, so status reconcile completes it.
@@ -435,7 +426,6 @@ test("red-team G3-B1: new input after a recovered failure cannot inherit the fai
 	const logs: string[] = [];
 	const make = () =>
 		new PersonaSessionManager({
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			database: database!,
 			port,
 			instanceId: "requeue",
@@ -466,9 +456,7 @@ test("red-team G3-B1: new input after a recovered failure cannot inherit the fai
 		).toBe(true);
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 1, "first attempt was not sent");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const firstBatch = database.inbox.nonterminalTurns("discord/channel/chan-1")[0]!;
 		const firstFloor = database.inbox.turnDispatchedAt(firstBatch.opRef);
 		expect(firstFloor).toBeDefined();
@@ -502,14 +490,11 @@ test("red-team G3-B1: new input after a recovered failure cannot inherit the fai
 		).toBe(true);
 		await recovered.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 2, "new input was not sent");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const second = port.sends[1]!;
 		expect(second.opRef).not.toBe(first.opRef);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const secondBatch = database.inbox.nonterminalTurns("discord/channel/chan-1")[0]!;
 		const secondFloor = database.inbox.turnDispatchedAt(secondBatch.opRef);
 		expect(secondFloor).toBeDefined();
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(Date.parse(secondFloor!)).toBeGreaterThan(Date.parse(firstFloor!));
 		// New input has its own dispatch floor: the failed attempt's stale row
 		// must not become this turn's answer.
@@ -562,9 +547,7 @@ test("red-team G3-B2: a batch bound before the upgrade, on a runtime without sta
 		).toBe(true);
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 1, "turn was not sent");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const send = port.sends[0]!;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const batch = database.inbox.nonterminalTurns("discord/channel/chan-1")[0]!;
 		await manager.stop();
 		// Model a row whose dispatch floor was lost (hand-edited / corrupt): no
@@ -643,7 +626,6 @@ test("a foreign turn's answer cannot replace the current turn's result-only term
 		enqueue("m-o1", "야");
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 1, "first turn was not sent");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
 		port.complete(first.opRef, "처리돼서 새 빌드로 올라왔습니다");
 		await eventually(() => terminals.length === 1, "first reply missing");
@@ -651,7 +633,6 @@ test("a foreign turn's answer cannot replace the current turn's result-only term
 		enqueue("m-o2", "오ㅠ이제 그럼 실전이냐");
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 2, "second turn was not sent");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const second = port.sends[1]!;
 		expect(second.sessionId).toBe(first.sessionId);
 		// A completed operation on the same session cannot contribute content to this turn.

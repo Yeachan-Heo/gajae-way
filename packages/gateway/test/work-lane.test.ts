@@ -132,7 +132,6 @@ async function fixture(
 		db.close();
 		await rm(directory, { recursive: true, force: true });
 	});
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const job = (name = "a") => parseLaneJobRecord(db.work.laneJobJson(laneJobIdentity(name).jobId)!);
 	return {
 		db,
@@ -581,7 +580,6 @@ for (const model of ["startup-model", { preset: "startup-preset" }]) {
 		if (!first.started) throw new Error("unexpected hold");
 		expect(f.port.binds[0]?.model).toEqual(model);
 		expect(f.port.sends).toHaveLength(1);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(Object.hasOwn(f.port.sends[0]!, "model")).toBe(false);
 		f.port.complete(first.opRef, "done");
 		await until(() => f.db.work.workAttemptGet(first.opRef)?.settledAt !== null);
@@ -630,7 +628,6 @@ test("failed send after proven startup model remains uncertain without retry or 
 	await f.manager.recover();
 	await f.restart();
 	expect(attempts).toBe(1);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(Object.hasOwn(f.port.sendAttempts[0]!, "model")).toBe(false);
 	expect(f.port.binds).toHaveLength(1);
 	expect(f.port.resumes).toHaveLength(0);
@@ -667,13 +664,11 @@ test("#790 transport_unavailable during send with unknown status marks attempt a
 	});
 	const sessionId = f.job().attempts[0]?.sessionId;
 	const opRef = f.job().attempts[0]?.opRef;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.db.work.workAttemptGet(opRef)!;
 	expect(runtime.sendPhase).toBe("uncertain");
 	expect(runtime.terminal).toMatchObject({ reasonCode: "send_undelivered" });
 	// Wait for observer to close the attempt in the job record
 	await until(() => f.job().attempts[0]?.endedAt !== undefined);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const attempt = f.job().attempts[0]!;
 	expect(attempt.endedAt).toBeDefined();
 	expect(attempt.endState).toBe("attempt_ended");
@@ -712,7 +707,6 @@ test("#790 transport_unavailable with unknown status AND idle activity AND no ac
 		detail: { reasonCode: "send_undelivered" },
 	});
 	const opRef = f.job().attempts[0]?.opRef;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.db.work.workAttemptGet(opRef)!;
 	expect(runtime.sendPhase).toBe("uncertain");
 	expect(runtime.terminal).toMatchObject({ reasonCode: "send_undelivered" });
@@ -747,7 +741,6 @@ test("#790 transport_unavailable with unknown status but busy activity does NOT 
 		detail: { reasonCode: "send_acceptance_uncertain" },
 	});
 	const opRef = f.job("b").attempts[0]?.opRef;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.db.work.workAttemptGet(opRef)!;
 	expect(runtime.sendPhase).toBe("uncertain");
 	// Should NOT have send_undelivered terminal
@@ -781,7 +774,6 @@ test("#790 transport_unavailable with unknown status and unreported activity doe
 		detail: { reasonCode: "send_acceptance_uncertain" },
 	});
 	const opRef = f.job("c").attempts[0]?.opRef;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.db.work.workAttemptGet(opRef)!;
 	expect(runtime.sendPhase).toBe("uncertain");
 	// Should NOT have send_undelivered terminal
@@ -809,8 +801,6 @@ test("start acknowledges before terminal, one observer survives caller-free comp
 	f.port.complete(result.opRef, "done");
 	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
 	expect(f.job().attempts[0]?.endState).toBe("completed");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-	// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 	expect(f.db.bindings.workLaneRows()[0]?.last_activity_at! > activity!).toBe(true);
 	expect(f.notices).toHaveLength(1);
 	expect(f.notices[0]).toMatchObject({ turnId: result.opRef, origin, text: "[lane a] completed: done" });
@@ -827,7 +817,6 @@ test("simultaneous cap admission and same-name resume refuse without overlapping
 	const rejected = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
 	expect(rejected.reason).toMatchObject({ code: "lane_capacity", detail: { active: 2, maxLanes: 2 } });
 	// Repo facts are read asynchronously before admission, so which two win is not fixed.
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const admitted = names[results.findIndex((r) => r.status === "fulfilled")]!;
 	for (const resume of [false, true])
 		await expect(f.manager.start({ name: admitted, text: "again", cwd: f.directory, resume })).rejects.toMatchObject({
@@ -1103,7 +1092,6 @@ for (const [label, text] of [
 		const result = await started(f, "a", origin);
 		f.port.complete(result.opRef, text);
 		await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const runtime = f.db.work.workAttemptGet(result.opRef)!;
 		expect(runtime.output.disposition).toBe("silent");
 		expect(runtime.output.knownSilence).toMatchObject({
@@ -1135,7 +1123,6 @@ for (const [label, text] of [
 		const opRef = f.port.sends[0]?.opRef;
 		f.port.complete(opRef, text);
 		expect(await run).toMatchObject({ held: false, text, opRef });
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const runtime = f.db.work.workAttemptGet(opRef)!;
 		expect(runtime.mode).toBe("run");
 		expect(runtime.parent).toBeNull();
@@ -1541,7 +1528,6 @@ for (const localTerminal of [false, true]) {
 	test(`aged busy proof survives prune and reopen with ${localTerminal ? "local terminal but unsettled" : "unresolved"} runtime`, async () => {
 		const f = await interruptedBusyWorkFixture();
 		if (localTerminal) {
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const runtime = f.db.work.workAttemptGet(f.input.opRef)!;
 			expect(
 				f.db.transaction((tx) =>
@@ -1552,7 +1538,6 @@ for (const localTerminal of [false, true]) {
 			).toBeDefined();
 		}
 		ageBusyJournal(f);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const proof = f.journal()!;
 		expect(f.db.transaction((tx) => f.db.bindings.pruneBrokerOperations(tx, busyRetentionCutoff))).toBe(0);
 		const reopened = await Store.open(join(f.directory, "gateway.db"));
@@ -1573,7 +1558,6 @@ test("settled busy proof obeys completed cutoff, rolls back atomically and prune
 	const f = await interruptedBusyWorkFixture();
 	await settleBusyWork(f);
 	const runtime = f.db.work.workAttemptGet(f.input.opRef);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const proof = f.journal()!;
 	const outbox = f.db.outbox.rows();
 	expect(f.db.transaction((tx) => f.db.bindings.pruneBrokerOperations(tx, busyRetentionCutoff))).toBe(0);
@@ -1635,7 +1619,6 @@ for (const mismatch of [
 		const f = await interruptedBusyWorkFixture();
 		await settleBusyWork(f);
 		ageBusyJournal(f);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const runtime = f.db.work.workAttemptGet(f.input.opRef)!;
 		const sql = new Database(join(f.directory, "gateway.db"));
 		try {
@@ -1696,7 +1679,6 @@ for (const mismatch of [
 test("aged rearmed lost-ACK prompt remains pending even with a durably settled runtime", async () => {
 	const f = await interruptedBusyWorkFixture();
 	await settleBusyWork(f);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const refusal = f.journal()!;
 	f.db.transaction((tx) => f.db.bindings.rearmBrokerPromptOperation(tx, f.authority, refusal));
 	ageBusyJournal(f);
@@ -1741,7 +1723,6 @@ test("rearmed pending prompt with native unknown remains open after WorkLane res
 
 test("saved acceptance prevents a stale busy journal from ending an attempt on unknown restart", async () => {
 	const f = await interruptedBusyWorkFixture();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.db.work.workAttemptGet(f.input.opRef)!;
 	expect(
 		f.db.transaction((tx) =>
@@ -1832,7 +1813,6 @@ test("restart refusal recovery waits for a same-ref retry owner to rearm and acc
 				await releaseRetry.promise;
 				const receipt = await f.realPort.send({ ...f.input, relay: retryTail });
 				expect(receipt).toMatchObject({ operationRef: f.input.opRef, commandId: "cmd-retry" });
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				const latest = f.db.work.workAttemptGet(f.input.opRef)!;
 				expect(
 					f.db.transaction((tx) =>
@@ -1931,7 +1911,6 @@ test("force retirement releases a pending work.run waiter promptly", async () =>
 	);
 	await until(() => f.port.sends.length === 1);
 	await Bun.sleep(10);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const { sessionId } = f.port.sends[0]!;
 	f.port.setSessionState(sessionId, { live: false });
 
@@ -1968,7 +1947,6 @@ test("force retirement of a never-read output records a pending receipt for the 
 	expect(f.db.work.workAttemptGet(result.opRef)?.output).toMatchObject({ disposition: "pending" });
 
 	expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: true });
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.db.work.workAttemptGet(result.opRef)!;
 	expect(runtime).toMatchObject({ decision: "fallback", output: { disposition: "unavailable" } });
 	const report = f.notices.at(-1);
@@ -1992,10 +1970,8 @@ test("force retirement of a nested child leaves a pending lane report for its pa
 	if (!child.started) throw new Error("child did not start");
 	f.port.setSessionState(child.sessionId, { live: false });
 	expect(await f.lanes.forceRetire("child")).toMatchObject({ retired: true });
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.db.work.workAttemptGet(child.opRef)!;
 	expect(runtime).toMatchObject({ decision: "reported", output: { disposition: "unavailable" } });
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const report = f.db.work.laneReportsByParent("parent")[0]!;
 	expect(report).toMatchObject({ child_op_ref: child.opRef });
 	expect(report.body).toContain("final_response_pending");
@@ -2069,7 +2045,6 @@ test("one inconsistent runtime is logged with its opRef and does not block other
 	expect(errorLogged).toBe(true);
 
 	// Verify that the attempt is quarantined: it should not be queried in recovery
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const isQuarantined = f.db.bindings.isQuarantined("work", f.db.work.workAttemptJobId(bad.opRef)!);
 	expect(isQuarantined).toBe(true);
 	f.port.complete(good.opRef, "recovered other lane");
@@ -2116,7 +2091,6 @@ test("an inconsistent runtime is quarantined and not re-logged on subsequent rec
 	});
 	expect(errorLogged).toBe(true);
 
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const badJobId = f.db.work.workAttemptJobId(bad.opRef)!;
 	// Verify that the attempt's job was quarantined
 	expect(f.db.bindings.isQuarantined("work", badJobId)).toBe(true);
@@ -2387,7 +2361,6 @@ for (const boundary of ["attachment", "ready"] as const) {
 			const terminate = spyOn(f.port, "terminateHost");
 			const result = await started(f, "a", origin);
 			await f.manager.stop();
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const before = f.db.work.workAttemptGet(result.opRef)!;
 			const releaseAttachment = deferred<void>();
 			const releaseReady = deferred<void>();
@@ -2493,7 +2466,6 @@ for (const revoke of ["stop", "generation", "binding"] as const) {
 			.catch((error: unknown) => error);
 		try {
 			await until(() => acquired !== undefined);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const before = f.db.work.workAttemptOpen()[0]!;
 			if (revoke === "generation") {
 				// Session content touches binding activity, not the attempt version.
@@ -2534,7 +2506,6 @@ for (const revoke of ["stop", "generation", "binding"] as const) {
 					summaryCompleted: false,
 				},
 			);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const checkpoint = f.db.work.workAttemptGet(before.opRef)!;
 			expect(checkpoint.terminal).toMatchObject({ kind: "local", reasonCode: "send_rejected" });
 			expect(checkpoint.terminal?.status).toBeUndefined();
@@ -2593,7 +2564,6 @@ for (const evidence of ["acceptance", "terminal"] as const) {
 			.catch((error: unknown) => error);
 		try {
 			await until(() => acquired);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const prepared = f.db.work.workAttemptOpen()[0]!;
 			const observedAt = new Date().toISOString();
 			// Model a concurrent durable writer, not a fabricated SDK completion.
@@ -2679,7 +2649,6 @@ test("late output from an obsolete generation cannot settle or fan out", async (
 	const result = await started(f, "a", origin);
 	f.port.complete(result.opRef, "answer");
 	await until(() => reading);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const before = f.db.work.workAttemptGet(result.opRef)!;
 	generation++;
 	const recovery = f.manager.onBrokerGeneration();
@@ -2702,7 +2671,6 @@ test("binding epoch fences an already-running output read", async () => {
 	const result = await started(f, "a", origin);
 	f.port.complete(result.opRef, "answer");
 	await until(() => reading);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const before = f.db.work.workAttemptGet(result.opRef)!;
 	f.db.transaction((tx) => f.db.bindings.rotateEpoch(tx, result.sessionKey));
 	gate.resolve({ status: "unavailable", code: "output_unavailable" });
@@ -2763,7 +2731,6 @@ for (const revoke of ["stop", "generation", "binding"] as const) {
 		f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
 		f.port.fail(result.opRef, "fixture failure", { code: "sdk_failed" });
 		await until(() => entered);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const before = f.db.work.workAttemptGet(result.opRef)!;
 		const jobBefore = f.db.work.laneJobJson(laneJobIdentity("a").jobId);
 		// Readoption may legitimately settle saved terminal proof. Isolate the old
@@ -3128,7 +3095,6 @@ test("run from a lane with nesting allowed remains response-only", async () => {
 	const opRef = f.port.sends[1]?.opRef;
 	f.port.complete(opRef, "response only");
 	expect(await run).toMatchObject({ held: false, text: "response only", opRef });
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.db.work.workAttemptGet(opRef)!;
 	expect(runtime).toMatchObject({ mode: "run", parent: null, decision: "no_target" });
 	expect(f.db.work.laneReportsByParent("parent")).toEqual([]);
@@ -3169,7 +3135,6 @@ for (const failure of ["provider", "deadline"] as const) {
 				return binding;
 			};
 			const result = await started(f, "a", origin);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const runtime = f.db.work.workAttemptGet(result.opRef)!;
 			await createOwnedSessionFixture(f.db, authority, {
 				sessionId: result.sessionId,
@@ -3265,7 +3230,6 @@ for (const failure of ["provider", "deadline"] as const) {
 			expect(outputReads).toBe(0);
 			foreign = false;
 			await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const saved = f.db.work.workAttemptGet(result.opRef)!;
 			const reason = failure === "provider" ? "provider_transport" : "prompt_deadline_exceeded";
 			expect(saved.terminal).toMatchObject({
@@ -3331,7 +3295,6 @@ test("#696 confirmed host death ends execution without replacing an observed pro
 	const now = Date.now();
 	const f = await fixture({ now: () => now, hostLostGraceMs: 0 });
 	const result = await started(f, "a", origin);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.db.work.workAttemptGet(result.opRef)!;
 	let running: boolean | undefined = true;
 	let probes = 0;
@@ -3454,7 +3417,6 @@ for (const receiptState of ["missing", "unknown", "absent", undefined] as const)
 			await until(() => queries > 0);
 			f.port.emitTurnEnd(result.sessionId, result.opRef, "agent_failed");
 			await until(() => reads === 1);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const before = f.db.work.workAttemptGet(result.opRef)!;
 			expect(before.terminal?.reasonCode).toBe("provider_transport");
 			expect(before.terminal?.status?.receiptState).toBe(receiptState);
@@ -3462,7 +3424,6 @@ for (const receiptState of ["missing", "unknown", "absent", undefined] as const)
 			await f.restart();
 			now += 1000;
 			await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const after = f.db.work.workAttemptGet(result.opRef)!;
 			expect(after.terminal?.status?.receiptState).toBe("present");
 			expect(after.terminal?.observedAt).toBe(before.terminal?.observedAt);
@@ -3601,7 +3562,6 @@ for (const endEvidence of ["idle", "dead", "receipt", "cancelled"] as const) {
 		const f = await fixture({ now: () => now, hostLostGraceMs: 100, brokerGeneration: () => generation });
 		const result = await started(f, "a", origin);
 		await f.manager.stop();
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const runtime = f.db.work.workAttemptGet(result.opRef)!;
 		const status = {
 			status: "failed" as const,
@@ -4334,7 +4294,6 @@ test("a dead activity observer is readopted without replay before idle reconcili
 	});
 	f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
 	await until(() => f.port.tailsOf(result.sessionId).some((tail) => tail.running));
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const old = f.port.tailsOf(result.sessionId)[0]!;
 	old.die();
 	await until(() => f.port.tailsOf(result.sessionId).some((tail) => tail !== old && tail.running));
@@ -4725,7 +4684,6 @@ test("torn send accepts only same-op status evidence; unknown remains open with 
 		message: "work send acceptance uncertain",
 		detail: { reasonCode: "send_acceptance_uncertain" },
 	});
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const pending = f.job("b").attempts[0]!;
 	expect(f.db.work.workAttemptGet(pending.opRef)?.sendPhase).toBe("uncertain");
 	await f.manager.recover();
@@ -4759,7 +4717,6 @@ test("unknown SDK rejection codes are redacted in durable evidence, errors and r
 		detail: { reasonCode: "send_rejected", cause: "sdk_refused" },
 	});
 	await until(() => f.db.work.workAttemptOpen().length === 0);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const attempt = f.job().attempts[0]!;
 	expect(f.db.work.workAttemptGet(attempt.opRef)?.terminal).toMatchObject({ refusalCode: "sdk_refused" });
 	expect(f.notices[0]?.text).toBe("[lane a] failed: send_rejected: output_unavailable cause=sdk_refused");
@@ -4782,7 +4739,6 @@ test("client-ref conflict retains its safe cause without asserting that logical 
 		detail: { reasonCode: "send_rejected", cause: "client_ref_conflict" },
 	});
 	await until(() => f.db.work.workAttemptOpen().length === 0);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const attempt = f.job().attempts[0]!;
 	expect(f.db.work.workAttemptGet(attempt.opRef)?.terminal).toMatchObject({ refusalCode: "client_ref_conflict" });
 	expect(f.notices[0]?.text).toBe("[lane a] failed: send_rejected: output_unavailable cause=client_ref_conflict");
@@ -4953,7 +4909,6 @@ for (const status of ["terminal_ok", "failed"] as const) {
 				if (receiptState === "missing" || (status === "failed" && receiptState !== "present"))
 					f.port.emitTurnEnd(f.job().attempts[0]?.sessionId, opRef, status === "failed" ? "agent_failed" : "agent_end");
 				await until(() => f.db.work.workAttemptGet(opRef)?.settledAt != null);
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				const runtime = f.db.work.workAttemptGet(opRef)!;
 				expect(runtime.sendPhase).toBe(receiptState === "present" ? "accepted" : "uncertain");
 				if (receiptState === "present") expect(runtime.sendEvidence?.source).toBe("status");
@@ -5003,7 +4958,6 @@ test("report and fallback text stay within 2048 UTF-8 bytes including the lane h
 	const result = await started(f, name, origin);
 	f.port.complete(result.opRef, "界".repeat(1000));
 	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt != null);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.db.work.workAttemptGet(result.opRef)!;
 	expect(f.notices[0]?.text).toBe(reportText(name, "completed", "end_turn", result.opRef, runtime.output));
 	expect(Buffer.byteLength(f.notices[0]?.text, "utf8")).toBeLessThanOrEqual(2048);
@@ -5100,7 +5054,6 @@ test("AC-K first accepted send per epoch carries notice; same-epoch same-parent 
 	const first = await started(f);
 	const firstNotice = f.port.sends[0]?.systemPreamble;
 	expect(firstNotice).toContain(`persona conversation ${originKey(origin)}`);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(JSON.parse(f.db.core.metaGet(`lane-notice:${workSessionKey("a")}`)!).hash).toBe(
 		f.db.work.workAttemptGet(first.opRef)?.noticeHash,
 	);
@@ -5148,7 +5101,6 @@ test("AC-K uncertain send acceptance re-prepends on the next send", async () => 
 	await expect(f.manager.start({ name: "a", text: "first", cwd: f.directory })).rejects.toMatchObject({
 		detail: { reasonCode: "send_acceptance_uncertain" },
 	});
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = f.job().attempts[0]!;
 	f.port.setSessionState(first.sessionId, { live: false });
 	await f.restart();
@@ -5164,7 +5116,6 @@ test("personaHold broker_wedged selects fallback inside the settlement transacti
 	const result = await started(f);
 	f.port.complete(result.opRef, "held persona result");
 	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.db.work.workAttemptGet(result.opRef)!;
 	expect(runtime.decision).toBe("fallback");
 	expect(f.db.outbox.rows()).toHaveLength(1);
@@ -5198,12 +5149,10 @@ test("lane inbox steers an open nested parent and consumes only after acceptance
 	expect(f.port.sends[1]?.systemPreamble).toContain("Nested work.start and work.run are allowed");
 	f.port.complete(child.opRef, "child result");
 	await until(() => f.db.work.laneReportsByParent("parent")[0]?.state === "consumed");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const report = f.db.work.laneReportsByParent("parent")[0]!;
 	expect(report).toMatchObject({ state: "consumed", claim_kind: "steer", consumed_op_ref: report.claim_ref });
 	expect(report.body).toBe("[lane child] completed: child result");
 	expect(f.port.steers).toHaveLength(1);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(f.port.steers[0]?.clientRef).toBe(report.claim_ref!);
 	expect(f.port.steers[0]?.text).toContain("Report from child work lane child; not from a human.");
 	expect(f.port.sendAttempts).toHaveLength(2);
@@ -5308,7 +5257,6 @@ test("torn nested steer replays with the same clientRef after restart and consum
 	if (!child.started) throw new Error("child did not start");
 	f.port.complete(child.opRef, "child result");
 	await until(() => refs.length === 1);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const claimed = f.db.work.laneReportsByParent("parent")[0]!;
 	expect(claimed).toMatchObject({ state: "claimed", claim_kind: "steer" });
 	torn = false;
@@ -5381,14 +5329,11 @@ test("idle lane parent wake completes without lock re-entry", async () => {
 	} finally {
 		if (timer) clearTimeout(timer);
 	}
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const report = f.db.work.laneReportsByParent("parent")[0]!;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const wake = f.db.work.workAttemptGet(report.consumed_op_ref!)!;
 	expect(wake).toMatchObject({ wakeReportId: report.report_id, parent: { kind: "persona" } });
 	expect(report).toMatchObject({ state: "consumed", claim_kind: "wake", consumed_op_ref: report.claim_ref });
 	expect(f.port.sendAttempts).toHaveLength(3);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(f.port.sendAttempts[2]?.opRef).toBe(report.claim_ref!);
 	expect(f.port.sendAttempts[2]?.text).toContain("Report from child work lane child; not from a human.");
 });
@@ -5421,9 +5366,7 @@ test("rejected nested wake settles wake_unaccepted and falls back the child exac
 	if (!child.started) throw new Error("child did not start");
 	f.port.complete(child.opRef, "child result");
 	await until(() => f.db.work.laneReportsByParent("parent")[0]?.state === "fallback");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const report = f.db.work.laneReportsByParent("parent")[0]!;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const wake = f.db.work.workAttemptGet(report.claim_ref!)!;
 	expect(wake.decision).toBe("wake_unaccepted");
 	expect(report.state).toBe("fallback");
@@ -5466,9 +5409,7 @@ test("uncertain nested wake keeps its claim and consumes after status acceptance
 	if (!child.started) throw new Error("child did not start");
 	f.port.complete(child.opRef, "child result");
 	await until(() => f.db.work.laneReportsByParent("parent")[0]?.state === "claimed");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const claimed = f.db.work.laneReportsByParent("parent")[0]!;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const wakeOpRef = claimed.claim_ref!;
 	f.port.status = async (input) => ({
 		operationRef: input.opRef,
@@ -5503,9 +5444,7 @@ test("recovered terminal status with receipt present proves wake acceptance with
 	if (!child.started) throw new Error("child did not start");
 	f.port.complete(child.opRef, "child result");
 	await until(() => f.db.work.laneReportsByParent("parent")[0]?.state === "claimed");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const claimed = f.db.work.laneReportsByParent("parent")[0]!;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const wakeOpRef = claimed.claim_ref!;
 	f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "identity_mismatch" });
 	f.port.status = async (input) => ({
@@ -5520,7 +5459,6 @@ test("recovered terminal status with receipt present proves wake acceptance with
 	});
 	await f.restart();
 	await until(() => f.db.work.workAttemptGet(wakeOpRef)?.settledAt != null);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const wake = f.db.work.workAttemptGet(wakeOpRef)!;
 	expect(wake.sendPhase).toBe("accepted");
 	expect(wake.decision).not.toBe("wake_unaccepted");
@@ -5805,7 +5743,6 @@ for (const stage of ["status", "inspect"] as const) {
 			const f = await fixture({ now: () => now, hostLostGraceMs: 100 });
 			const result = await started(f, "a", origin);
 			await f.manager.stop();
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const runtime = f.db.work.workAttemptGet(result.opRef)!;
 			const terminal = {
 				kind: "broker" as const,
@@ -5922,8 +5859,6 @@ test("#308 streamed turn frames advance lane activity past the attempt start", a
 	let now = Date.now();
 	const f = await fixture({ now: () => now });
 	const result = await started(f);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-	// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 	const startedAt = f.db.bindings.workLaneRows()[0]?.last_activity_at!;
 	expect(startedAt).toBe(f.db.work.workAttemptGet(result.opRef)?.startedAt);
 	now += 5_000;
@@ -6074,7 +6009,6 @@ test("#481 repo-backed bare clones detect pushed branches without remote-trackin
 		const job = f.job(name);
 		const branch = managedLaneBranchName(name);
 		const trackingRef = Bun.spawnSync(
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			["git", "-C", job.lane.repositoryPath!, "show-ref", "--verify", `refs/remotes/origin/${branch}`],
 			{ stdout: "pipe", stderr: "pipe" },
 		);
@@ -6996,7 +6930,6 @@ test("#481 awaiting_checks: red checks re-steer the lane session with the failin
 	expect(steer.text).toContain("PR #490 checks failed");
 	expect(steer.text).toContain("unit-test, lint-check");
 	expect(steer.text).toContain("Failed log tail:\nFAILED unit-test: expected 2, received 1");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const job = parseLaneJobRecord(f.db.work.laneJobJson(laneJobIdentity("a").jobId)!);
 	expect(job.awaitingChecks?.retries).toBe(1);
 	expect(job.state).toBe("running");
@@ -7080,11 +7013,9 @@ for (const retirement of ["automatic", "force"] as const) {
 		const { head, sessionId } = await awaitingLane(f, `fix/${retirement}-retire-checks-report`);
 		await until(() => f.notices.length === 1);
 		const opRef = f.job().attempts.at(-1)?.opRef;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const savedRuntime = f.db.work.workAttemptGet(opRef)!;
 		expect(savedRuntime).toMatchObject({ terminal: { reasonCode: "end_turn" } });
 		expect(savedRuntime.settledAt).not.toBeNull();
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const originalRow = f.db.outbox.rows()[0]!;
 		expect(originalRow.delivery_id).toBe(savedRuntime.deliveryId);
 		expect(f.notices[0]?.text).toContain("checks=pending");
@@ -7131,7 +7062,6 @@ test("ended checks retirement admits a distinct report to the bound persona inbo
 	f.db.transaction((tx) => f.db.bindings.bind(tx, originKey(origin), crypto.randomUUID()));
 	const { sessionId } = await awaitingLane(f, "fix/retire-checks-persona");
 	await until(() => nudges.length === 1);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.db.work.workAttemptGet(f.job().attempts.at(-1)?.opRef)!;
 	expect(f.db.inbox.pendingOldest(originKey(origin))?.message_id).toBe(runtime.reportId);
 	f.port.setSessionState(sessionId, { live: false });
@@ -7164,9 +7094,7 @@ test("ended checks retirement routes a distinct conclusion through the nested la
 		() =>
 			f.job("child").state === "awaiting_checks" && f.db.work.laneReportsByParent("parent")[0]?.state === "consumed",
 	);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const runtime = f.db.work.workAttemptGet(child.opRef)!;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = f.db.work.laneReportsByParent("parent")[0]!;
 	await f.manager.recover();
 	// Recovery is already registered; isolate callback lock ordering from recovery's parent drain.
@@ -7198,7 +7126,6 @@ test("ended checks retirement routes a distinct conclusion through the nested la
 	}
 	await until(() => f.db.work.laneReportsByParent("parent").filter((row) => row.state === "consumed").length === 2);
 	const reports = f.db.work.laneReportsByParent("parent");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const conclusion = reports.find((row) => row.report_id !== first.report_id)!;
 	expect(conclusion.child_op_ref).not.toBe(child.opRef);
 	expect(conclusion.body).toContain("lane force-retired before checks settled");
@@ -7221,12 +7148,10 @@ for (const mode of ["run", "no-target", "silent"] as const) {
 			if (mode === "run") run = f.manager.run({ name: "a", text: "work", cwd: f.directory }, {});
 			else await f.manager.start({ name: "a", text: "work", cwd: f.directory });
 			await until(() => f.port.sends.length === 1);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const { opRef, sessionId } = f.port.sends[0]!;
 			f.port.complete(opRef, mode === "silent" ? "[SILENT]" : "done");
 			if (run) await run;
 			await until(() => f.job().state === "awaiting_checks");
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const runtime = f.db.work.workAttemptGet(opRef)!;
 			if (mode === "silent") expect(runtime.output.knownSilence).not.toBeNull();
 			else expect(runtime.parent).toBeNull();
@@ -7769,7 +7694,6 @@ test("work.start with special characters in lane name uses hex-encoded branch na
 		if (!result.started) throw new Error("work did not start");
 		const job = f.job(name);
 		const branchResult = Bun.spawnSync(
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			["git", "-C", job.lane.repositoryPath!, "show-ref", "--verify", `refs/heads/${managedLaneBranchName(name)}`],
 			{ stdout: "pipe", stderr: "pipe" },
 		);
@@ -8352,7 +8276,6 @@ test("issue #480: operator retire cleans up worktree and branch", async () => {
 
 		const job = f.job("retire-test");
 		const worktreePath = job.lane.worktreePath;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const repositoryPath = job.lane.repositoryPath!;
 		expect(worktreePath).toBeDefined();
 		const branchBefore = Bun.spawnSync(
@@ -8453,7 +8376,6 @@ test("issue #480: operator retire refuses a persisted repository path outside it
 		const name = "corrupt-repository-path";
 		const result = await f.manager.start({ name, text: "work", repo: bareRepo });
 		if (!result.started) throw new Error("work did not start");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const managedRepositoryPath = f.job(name).lane.repositoryPath!;
 		const unrelatedDirectory = join(f.directory, "unrelated-repository");
 		await mkdir(unrelatedDirectory);
@@ -8495,7 +8417,6 @@ test("issue #480: operator retire tolerates an externally removed worktree", asy
 		const result = await f.manager.start({ name, text: "work", cwd: f.directory, repo: bareRepo });
 		if (!result.started) throw new Error("work did not start");
 		const job = f.job(name);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const repositoryPath = job.lane.repositoryPath!;
 
 		f.port.complete(result.opRef, "test complete");
@@ -8562,7 +8483,6 @@ test("issue #480: force retire preserves worktree and branch for resume", async 
 		if (!result.started) throw new Error("work did not start");
 		const job = f.job("force-retire-test");
 		const worktreePath = job.lane.worktreePath;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const repositoryPath = job.lane.repositoryPath!;
 		const unpushedCommit = Bun.spawnSync(
 			[
@@ -8713,7 +8633,6 @@ test("issue #480: all-dead retirement preserves the worktree", async () => {
 		if (!result.started) throw new Error("work did not start");
 		const job = f.job("all-dead-test");
 		const worktreePath = job.lane.worktreePath;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const repositoryPath = job.lane.repositoryPath!;
 
 		// Verify worktree exists before force retire
@@ -8949,7 +8868,6 @@ test("#604: an operator directive reaches a running lane before its next step an
 	expect(f.port.steers[0]?.text).toContain(`- (${directive?.id}) Do not render video or run TTS on this host.`);
 	// A lane started afterwards carries it ahead of its task.
 	await started(f, "later");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const laterSend = f.port.sends.at(-1)!;
 	expect(laterSend.text.startsWith("[Standing directives from your operator.")).toBe(true);
 	expect(laterSend.text).toContain(`- (${directive?.id}) Do not render video or run TTS on this host.`);

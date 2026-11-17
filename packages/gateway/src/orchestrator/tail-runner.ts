@@ -919,7 +919,6 @@ class ManagedTailHandle implements TailHandle {
 			const pending = id ? this.#pending.get(id) : undefined;
 			if (!pending) return;
 			clearTimeout(pending.timer);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			this.#pending.delete(id!);
 			pending.resolve(decodeResponse(frame));
 			return;

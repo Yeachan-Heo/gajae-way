@@ -129,10 +129,8 @@ test("session.create interrupted after the broker applied it: the restarted gate
 	gateway = await openGateway(path, authority, broker);
 	const binding = await gateway.port.bind({ originKey: "lane/a", epoch: 0, repo });
 
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(broker.createKeys).toEqual([broker.createKeys[0]!, broker.createKeys[0]!]);
 	expect(broker.sessions.size).toBe(1);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(binding.sessionId).toBe(broker.sessions.get(broker.createKeys[0]!)!);
 	expect(gateway.database.bindings.getSessionRecord("lane/a")).toMatchObject({
 		sessionId: binding.sessionId,
@@ -162,7 +160,6 @@ test("session.create success without an ID retains its key so retry recovers the
 		throw new Error(`unexpected command ${args.join(" ")}`);
 	};
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli,
@@ -212,7 +209,6 @@ for (const retry of ["same request", "changed repository", "changed model"] as c
 			};
 		};
 		const port = new BrokerSessionPort({
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			database: database!,
 			authority,
 			cli,
@@ -338,13 +334,11 @@ test("a changed startup preset is created with the new preset after retiring the
 
 test("a pending create outlives the intent age cutoff: a bind after a >24h outage replays its key, not a new session", async () => {
 	const { path, authority, repo } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/c", epoch: 0 });
 	const broker = new FakeBroker();
 	let gateway = await openGateway(path, authority, broker);
 	broker.dieAfterApply = true;
 	await expect(gateway.port.bind({ originKey: "lane/a", epoch: 0, repo })).rejects.toThrow("broker_unavailable");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const key = broker.createKeys[0]!;
 
 	// The gateway returns 25h later; its first broker operation prunes the journal.
@@ -367,13 +361,11 @@ test("a pending create outlives the intent age cutoff: a bind after a >24h outag
 	const binding = await gateway.port.bind({ originKey: "lane/a", epoch: 0, repo });
 	expect(broker.createKeys).toEqual([key, key]);
 	expect(broker.sessions.size).toBe(1);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(binding.sessionId).toBe(broker.sessions.get(key)!);
 });
 
 test("bind of a persisted binding surfaces an unavailable broker instead of reusing the session unchecked", async () => {
 	const { authority, repo } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/a", epoch: 0 });
 	const calls: string[] = [];
 	const down: CliRunner = async (args) => {
@@ -386,7 +378,6 @@ test("bind of a persisted binding surfaces an unavailable broker instead of reus
 		};
 	};
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli: down,
@@ -406,7 +397,6 @@ test("bind preserves thrown and enveloped broker outages from saved-session resu
 		["lane/throw", "sdk-throw"],
 		["lane/envelope", "sdk-envelope"],
 	] as const) {
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		await createOwnedSessionFixture(database!, authority, { sessionId, repo, originKey, epoch: 0 });
 	}
 	const calls: string[] = [];
@@ -426,7 +416,6 @@ test("bind preserves thrown and enveloped broker outages from saved-session resu
 		};
 	};
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli,
@@ -479,7 +468,6 @@ test("cold-create readiness keeps the create intent until Router indexing catche
 		throw new Error(`unexpected command ${args.join(" ")}`);
 	};
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli,
@@ -541,7 +529,6 @@ test("a changed startup model retires a pending cold binding before rotating its
 		throw new Error(`unexpected command ${args.join(" ")}`);
 	};
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli,
@@ -554,7 +541,6 @@ test("a changed startup model retires a pending cold binding before rotating its
 	await expect(
 		port.bind({ originKey: "lane/cold-model", epoch: 0, repo, model: originalModel }),
 	).rejects.toBeInstanceOf(GjcCliUnavailableError);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const originalSessionId = required(sessions.get(createKeys[0]!), "original cold session id");
 	const binding = await port.bind({
 		originKey: "lane/cold-model",
@@ -564,7 +550,6 @@ test("a changed startup model retires a pending cold binding before rotating its
 	});
 
 	expect(binding).toMatchObject({ epoch: 1 });
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(binding.sessionId).toBe(required(sessions.get(createKeys[1]!), "replacement cold session id"));
 	expect(binding.repo).toBe(changedRepo);
 	expect(createKeys).toHaveLength(2);
@@ -591,7 +576,6 @@ test("resuming a session invalidates pending and completed closes before a later
 	const closeAttempts = new Map<string, number>();
 	const closeKeys = new Map<string, string[]>();
 	for (const { sessionId, originKey } of cases) {
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		await createOwnedSessionFixture(database!, authority, { sessionId, repo, originKey, epoch: 0 });
 		await writeFile(join(transcriptDir, `2026-10-01T00-00-00-000Z_${sessionId}.jsonl`), "{}\n");
 		live.set(sessionId, true);
@@ -630,7 +614,6 @@ test("resuming a session invalidates pending and completed closes before a later
 		throw new Error(`unexpected command ${args.join(" ")}`);
 	};
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli,
@@ -657,7 +640,6 @@ test("resume removes a close intent before a broker-side resume can lose its rep
 	const { authority, repo } = await setup();
 	const sessionId = "sdk-resume-reply-lost";
 	const originKey = "lane/resume-reply-lost";
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, { sessionId, repo, originKey, epoch: 0 });
 	const transcriptDir = join(home, "agent", "sessions", "v2-scope");
 	await mkdir(transcriptDir, { recursive: true });
@@ -706,7 +688,6 @@ test("resume removes a close intent before a broker-side resume can lose its rep
 		throw new Error(`unexpected command ${args.join(" ")}`);
 	};
 	const options = {
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli,
@@ -729,7 +710,6 @@ test("bind clears a stale pending close when inspection confirms a resumed host 
 	const { authority, repo } = await setup();
 	const sessionId = "sdk-live-after-resume";
 	const originKey = "lane/live-after-resume";
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, { sessionId, repo, originKey, epoch: 0 });
 	database?.transaction((tx) =>
 		database?.bindings.beginBrokerOperation(tx, authority, {
@@ -750,7 +730,6 @@ test("bind clears a stale pending close when inspection confirms a resumed host 
 		throw new Error(`unexpected command ${args.join(" ")}`);
 	};
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli,
@@ -786,7 +765,6 @@ test("a finished create is never served to a later bind after the lane's session
 
 test("turn.prompt accepted by the broker before the relay died is reconciled, not resent, and answers the same receipt", async () => {
 	const { path, authority, repo } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/p", epoch: 0 });
 	const accepted = new Map<string, { commandId: string; turnId: string }>();
 	let dieOnPrompt = true;
@@ -840,7 +818,6 @@ test("turn.prompt accepted by the broker before the relay died is reconciled, no
 
 test("a fresh prompt intent is released when relay attachment fails before submission", async () => {
 	const { authority, repo } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, {
 		sessionId: "sdk-1",
 		repo,
@@ -861,7 +838,6 @@ test("a fresh prompt intent is released when relay attachment fails before submi
 		return relay.spawn(sessionId);
 	};
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli: async (args) => {
@@ -882,7 +858,6 @@ test("a fresh prompt intent is released when relay attachment fails before submi
 
 test("a fresh prompt intent is released when model selection fails before submission", async () => {
 	const { authority, repo } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, {
 		sessionId: "sdk-1",
 		repo,
@@ -909,7 +884,6 @@ test("a fresh prompt intent is released when model selection fails before submis
 		return { ok: false, error: { code: "unsupported_operation" } };
 	});
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli,
@@ -936,7 +910,6 @@ test("a fresh prompt intent is released when model selection fails before submis
 
 test("audit: restart after definitive busy refusal preserves safe prompt retry", async () => {
 	const { path, authority, repo } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/busy", epoch: 0 });
 	let busy = true;
 	let accepted = 0;
@@ -959,7 +932,6 @@ test("audit: restart after definitive busy refusal preserves safe prompt retry",
 	});
 	const broker = new FakeBroker();
 	const first = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli: broker.cli,
@@ -991,7 +963,6 @@ test("audit: restart after definitive busy refusal preserves safe prompt retry",
 
 test("busy-refused prompt fingerprint conflicts retain safe proof and the original request can retry", async () => {
 	const { path, authority, repo } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/busy", epoch: 0 });
 	let prompts = 0;
 	const relay = scriptedRelay((request) => {
@@ -1004,7 +975,6 @@ test("busy-refused prompt fingerprint conflicts retain safe proof and the origin
 	});
 	const broker = new FakeBroker();
 	const first = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli: broker.cli,
@@ -1040,7 +1010,6 @@ test("busy-refused prompt fingerprint conflicts retain safe proof and the origin
 for (const preflight of ["attachment", "model"] as const) {
 	test(`busy proof survives interrupted ${preflight} preflight and the original fingerprint retries safely`, async () => {
 		const { path, authority, repo } = await setup();
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		await createOwnedSessionFixture(database!, authority, {
 			sessionId: "sdk-1",
 			repo,
@@ -1080,7 +1049,6 @@ for (const preflight of ["attachment", "model"] as const) {
 			throw new Error(`unexpected CLI command ${args.join(" ")}`);
 		};
 		const first = new BrokerSessionPort({
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			database: database!,
 			authority,
 			cli,
@@ -1124,7 +1092,6 @@ for (const preflight of ["attachment", "model"] as const) {
 
 test("busy refusal at an exhausted deadline persists safe proof without sleeping and can retry after restart", async () => {
 	const { path, authority, repo } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/busy", epoch: 0 });
 	let prompts = 0;
 	let sleeps = 0;
@@ -1138,7 +1105,6 @@ test("busy refusal at an exhausted deadline persists safe proof without sleeping
 	});
 	const broker = new FakeBroker();
 	const first = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli: broker.cli,
@@ -1164,7 +1130,6 @@ test("busy refusal at an exhausted deadline persists safe proof without sleeping
 for (const status of ["unknown", "in_flight"] as const) {
 	test(`busy refusal re-arm with lost ACK stays pending and reconciles ${status} without resending`, async () => {
 		const { path, authority, repo } = await setup();
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		await createOwnedSessionFixture(database!, authority, {
 			sessionId: "sdk-1",
 			repo,
@@ -1202,7 +1167,6 @@ for (const status of ["unknown", "in_flight"] as const) {
 		});
 		const broker = new FakeBroker();
 		const first = new BrokerSessionPort({
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			database: database!,
 			authority,
 			cli: broker.cli,
@@ -1239,7 +1203,6 @@ for (const status of ["unknown", "in_flight"] as const) {
 
 test("a second caller accepts while the busy waiter sleeps and both return the identical cached receipt", async () => {
 	const { authority, repo } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/busy", epoch: 0 });
 	let prompts = 0;
 	let accepted = 0;
@@ -1262,7 +1225,6 @@ test("a second caller accepts while the busy waiter sleeps and both return the i
 	});
 	const broker = new FakeBroker();
 	const first = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli: broker.cli,
@@ -1274,7 +1236,6 @@ test("a second caller accepts while the busy waiter sleeps and both return the i
 		},
 	});
 	const second = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli: broker.cli,
@@ -1315,7 +1276,6 @@ test("a second caller accepts while the busy waiter sleeps and both return the i
 for (const observed of ["unknown", "in_flight", "identity_conflict"] as const) {
 	test(`busy waiter with ${observed} status and delayed competing ACK never issues a third prompt`, async () => {
 		const { authority, repo } = await setup();
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		await createOwnedSessionFixture(database!, authority, {
 			sessionId: "sdk-1",
 			repo,
@@ -1373,7 +1333,6 @@ for (const observed of ["unknown", "in_flight", "identity_conflict"] as const) {
 		});
 		const broker = new FakeBroker();
 		const first = new BrokerSessionPort({
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			database: database!,
 			authority,
 			cli: broker.cli,
@@ -1384,7 +1343,6 @@ for (const observed of ["unknown", "in_flight", "identity_conflict"] as const) {
 			},
 		});
 		const second = new BrokerSessionPort({
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			database: database!,
 			authority,
 			cli: broker.cli,
@@ -1489,7 +1447,6 @@ for (const order of ["status first", "ACK first"] as const) {
 		test(`canonical accepted receipt: ${order}, ${scenario.name}`, async () => {
 			const { authority, repo } = await setup();
 			const send = { sessionId: "sdk-overlap", repo, text: "same fingerprint", opRef: "gw-canonical-overlap" };
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			await createOwnedSessionFixture(database!, authority, {
 				sessionId: send.sessionId,
 				repo,
@@ -1526,7 +1483,6 @@ for (const order of ["status first", "ACK first"] as const) {
 			});
 			const broker = new FakeBroker();
 			const statusCaller = new BrokerSessionPort({
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				database: database!,
 				authority,
 				cli: broker.cli,
@@ -1537,7 +1493,6 @@ for (const order of ["status first", "ACK first"] as const) {
 				},
 			});
 			const ackCaller = new BrokerSessionPort({
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				database: database!,
 				authority,
 				cli: broker.cli,
@@ -1609,12 +1564,10 @@ for (const order of ["status first", "ACK first"] as const) {
 
 test("failure to persist a busy refusal prevents sleep and retry and leaves the intent pending", async () => {
 	const { path, authority, repo } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/busy", epoch: 0 });
 	const relay = scriptedRelay(() => ({ ok: false, error: { code: "busy" } }));
 	let sleeps = 0;
 	const port = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		authority,
 		cli: new FakeBroker().cli,
@@ -1648,7 +1601,6 @@ test("failure to persist a busy refusal prevents sleep and retry and leaves the 
 
 test("an aged pending turn.prompt with unknown status stays uncertain and is never resent", async () => {
 	const { path, authority, repo } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/q", epoch: 0 });
 	let promptEffects = 0;
 	const relay = scriptedRelay((request) => {
@@ -1686,7 +1638,6 @@ test("an aged pending turn.prompt with unknown status stays uncertain and is nev
 
 test("session.close interrupted after the broker applied it replays its key once, then answers from the journal", async () => {
 	const { path, authority, repo } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/c", epoch: 0 });
 	const broker = new FakeBroker();
 	let gateway = await openGateway(path, authority, broker);
@@ -1695,7 +1646,6 @@ test("session.close interrupted after the broker applied it replays its key once
 
 	gateway = await openGateway(path, authority, broker);
 	await gateway.port.close({ sessionId: "sdk-1", repo });
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(broker.closeKeys).toEqual([broker.closeKeys[0]!, broker.closeKeys[0]!]);
 	expect(broker.closes.size).toBe(1);
 
@@ -1724,7 +1674,6 @@ function journalRows(path: string): Array<{ operation: string; scope: string; st
 
 test("beginBrokerOperation records the intent once and hands every later begin the original row", async () => {
 	const { authority } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const store = database!;
 	const first = store.transaction((tx) =>
 		store.bindings.beginBrokerOperation(tx, authority, {
@@ -1778,7 +1727,6 @@ test("beginBrokerOperation records the intent once and hands every later begin t
 
 test("begin preserves busy proof and rearmBrokerPromptOperation atomically re-arms only the matching prompt", async () => {
 	const { authority } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const store = database!;
 	const input = {
 		operation: "turn.prompt",
@@ -1846,7 +1794,6 @@ test("begin preserves busy proof and rearmBrokerPromptOperation atomically re-ar
 
 test("completeBrokerOperation accepts only an identical completed prompt answer and never overwrites it", async () => {
 	const { authority } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const store = database!;
 	const input = {
 		operation: "turn.prompt",
@@ -1876,7 +1823,6 @@ test("completeBrokerOperation accepts only an identical completed prompt answer 
 async function abandonedBusyFixture(originKey = "discord/channel/abandoned") {
 	const { path, authority, repo } = await setup();
 	const owner = { sessionId: "abandoned-sdk", opRef: "abandoned-prompt", originKey, epoch: 0, repo };
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(database!, authority, owner);
 	const intent = {
 		operation: "turn.prompt" as const,
@@ -1900,7 +1846,6 @@ async function abandonedBusyFixture(originKey = "discord/channel/abandoned") {
 
 test("explicit abandoned busy owner release rolls back and survives restart without deleting another prompt", async () => {
 	const { path, authority, owner, intent } = await abandonedBusyFixture();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const store = database!;
 	const proof = store.bindings.brokerOperation(authority, "turn.prompt", intent.scope);
 	expect(proof).toBeDefined();
@@ -1941,7 +1886,6 @@ for (const mismatch of [
 		const { path, authority, owner, intent } = await abandonedBusyFixture(
 			mismatch === "work" ? "work/task/a" : undefined,
 		);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const store = database!;
 		const requested = { ...owner };
 		if (mismatch === "session") requested.sessionId = "another-session";
@@ -2003,7 +1947,6 @@ for (const mismatch of [
 
 test("abandoned busy release retains a live persona owner until its durable requeue", async () => {
 	const { authority, owner, intent } = await abandonedBusyFixture();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const store = database!;
 	store.transaction((tx) => {
 		store.inbox.enqueue(tx, {
@@ -2033,7 +1976,6 @@ test("abandoned busy release retains a live persona owner until its durable requ
 
 test("aged known busy refusals survive pruning and reconstruction with their retry fingerprint intact", async () => {
 	const { path, authority } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	let store = database!;
 	const input = {
 		operation: "turn.prompt",
@@ -2084,7 +2026,6 @@ test("aged known busy refusals survive pruning and reconstruction with their ret
 
 test("completeBrokerOperation stores the result only for the pending row of the same ref", async () => {
 	const { authority } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const store = database!;
 	const begin = () =>
 		store.transaction((tx) =>
@@ -2125,7 +2066,6 @@ test("completeBrokerOperation stores the result only for the pending row of the 
 
 test("releaseBrokerOperation drops only the row of the exact ref, pending or complete", async () => {
 	const { authority } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const store = database!;
 	for (const [operation, scope, ref] of [
 		["session.create", "c/1", "gw-bind-1"],
@@ -2158,7 +2098,6 @@ test("releaseBrokerOperation drops only the row of the exact ref, pending or com
 
 test("pruneBrokerOperations honors each cutoff and retains pending creates and prompts at any age", async () => {
 	const { path, authority } = await setup();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const store = database!;
 	const begin = (operation: "session.create" | "turn.prompt" | "session.close", scope: string) =>
 		store.transaction((tx) =>

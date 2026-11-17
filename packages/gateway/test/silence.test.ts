@@ -17,9 +17,7 @@ afterEach(async () => {
 	directory = "";
 });
 
-// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 async function connect(socketPath: string): Promise<{ send(value: unknown): void; frames: any[]; close(): void }> {
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = "";
 	const socket = await Bun.connect({
@@ -41,7 +39,6 @@ async function settle(): Promise<void> {
 }
 
 /** An open channel: the adapter promotes human messages here, so every one reaches a turn. */
-// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 async function openChannelGateway(reply: string): Promise<{ frames: any[]; database: Store }> {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-silence-"));
 	const config: GatewayConfig = {

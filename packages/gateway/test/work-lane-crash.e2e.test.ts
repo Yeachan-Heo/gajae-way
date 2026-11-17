@@ -412,7 +412,6 @@ for (const point of ["prepared", "accepted-before-save", "report-consume"] as co
 			},
 			"lane parent wake did not reach its proof-backed state",
 		);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const finalRow = after.laneReports.find((row) => row.report_id === childReport.report_id)!;
 		if (point === "prepared") {
 			expect(finalRow).toMatchObject({ state: "held", hold_reason: "wake_acceptance_uncertain" });

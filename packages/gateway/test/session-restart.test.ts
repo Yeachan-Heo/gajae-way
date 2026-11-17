@@ -26,7 +26,6 @@ function registerFixtureBindings(port: ScriptedSessionPort): void {
 	fixtureBindings.set(port, original);
 	port.bind = original.bind;
 	port.resume = original.resume;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	attachTestBrokerOwnership(database!, port, join(home, "canonical-agent"));
 }
 
@@ -61,7 +60,6 @@ function makeManager(
 	failures: string[] = [],
 ): PersonaSessionManager {
 	return new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port,
 		instanceId: "restart-test",
@@ -108,10 +106,7 @@ async function startAccepted(port: ScriptedSessionPort, logs: string[]): Promise
 	enqueue("m-1", "restart me");
 	await manager.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "initial turn did not reach an accepted send");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = port.sends[0]!;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-	// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 	const turn = database?.inbox.nonterminalTurns(KEY)[0]!;
 	expect(turn).toMatchObject({ state: "accepted", opRef: send.opRef, sessionId: send.sessionId });
 	return { opRef: send.opRef, sessionId: send.sessionId };
@@ -302,7 +297,6 @@ test("client_ref_conflict reconciles the same deterministic op-ref without a sec
 		() => logs.includes(`recovery_client_ref_conflict origin=${KEY} epoch=0 opRef=${opRef}`),
 		"client_ref_conflict was not reconciled through status",
 	);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const turn = database.inbox.nonterminalTurns(KEY)[0]!;
 	expect(turn).toMatchObject({ opRef, state: "accepted", sessionId: "session-1" });
 	await manager.stop();
@@ -457,7 +451,6 @@ test("a retired hold reattaches after restart and does not block the new epoch",
 	enqueue("m-new", "new epoch work");
 	await manager.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 2, "retired hold blocked new-epoch send");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const newSend = port.sends[1]!;
 	port.complete(newSend.opRef, "new epoch reply");
 	port.complete(accepted.opRef, "retired reply");
@@ -489,7 +482,6 @@ test("a recovered failed operation settles without replay and accepts genuinely 
 	enqueue("new-input", "new work after the failed turn");
 	await manager.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 2, "new user input did not dispatch");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const next = port.sends[1]!;
 	expect(next.opRef).not.toBe(accepted.opRef);
 	expect(next.text).toBe("new work after the failed turn");

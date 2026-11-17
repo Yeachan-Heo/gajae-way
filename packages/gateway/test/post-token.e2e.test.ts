@@ -36,7 +36,6 @@ afterEach(async () => {
 });
 
 async function connect(path: string) {
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = "";
 	const socket = await Bun.connect({
@@ -102,9 +101,7 @@ function sendChannelMessage(client: { send(value: unknown): void }, id: string, 
 	});
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 function messages(client: { frames: any[] }): any[] {
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	return client.frames.filter((frame: any) => frame.type === "event" && frame.event === "chat.message");
 }
 
@@ -123,7 +120,6 @@ async function eventually(predicate: () => boolean, message: string, attempts = 
 async function startTurn(port: ScriptedSessionPort, client: Awaited<ReturnType<typeof startGateway>>, id: string) {
 	sendChannelMessage(client, id, "끝나면 업무보고에 올려");
 	await eventually(() => port.sends.length >= 1, "turn was not sent");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	return port.sends.at(-1)!;
 }
 

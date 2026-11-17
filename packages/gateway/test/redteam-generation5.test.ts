@@ -668,7 +668,6 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 			["ride-trigger", "trigger", "bound"],
 			["ride-member", "steer", "bound"],
 		]);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(upgraded?.transaction((tx) => retryInboundTurn(upgraded!, tx, "gw-p-ride"))).toBe(1);
 		expect(upgraded.inbox.nonterminalTurns("migration/ride")).toEqual([]);
 		expect(upgraded.inbox.pendingOldest("migration/ride")).toMatchObject({

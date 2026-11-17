@@ -342,7 +342,6 @@ test("an ambiguous send-stage relay close does not roll the session", async () =
 		initializeAuthority: true,
 	});
 	expect(authority).toBeDefined();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	await createOwnedSessionFixture(db, authority!, {
 		sessionId: "s1",
 		originKey: sessionOriginKey,
@@ -351,7 +350,6 @@ test("an ambiguous send-stage relay close does not roll the session", async () =
 	});
 	const brokerPort = new BrokerSessionPort({
 		database: db,
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		authority: authority!,
 		cli: (async () => ({ exitCode: 0, stdout: "", stderr: "" })) as CliRunner,
 		tailRunner: new TailRunner({ stream: noRelay, repo: process.cwd() }),

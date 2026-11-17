@@ -386,7 +386,6 @@ liveTest(
 				}
 				await Bun.sleep(Math.min(500, Math.max(0, deadline - Date.now())));
 			}
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const runtime = database.work.workAttemptGet(started.opRef)!;
 			expect(runtime.settledAt).not.toBeNull();
 			expect(runtime.terminal?.reasonCode).toBe("end_turn");

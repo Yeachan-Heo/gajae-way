@@ -90,7 +90,6 @@ test("malformed rendered action metadata is rejected instead of guessing origin 
 		},
 	};
 	const event = click(message);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	event.actions[0]!.value = "opt_a";
 	expect(describePanelResponse(event)).toBeNull();
 });

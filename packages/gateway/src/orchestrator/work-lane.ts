@@ -1,7 +1,7 @@
 import { execSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, } from "node:path";
 import {
 	type ChatMessagePayload,
 	isSilentOutput,
@@ -407,7 +407,6 @@ export class WorkLaneManager {
 			const bindingMatches = binding?.sessionId === runtime.sessionId && binding.epoch === runtime.epoch;
 			this.#db.work.workAttemptPrepare(tx, runtime, record, runtime.mode === "historical" || bindingMatches);
 			if (runtime.successorOf) {
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				const source = this.#job(runtime.successorOf.name, true)!;
 				this.#putJob(
 					runtime.successorOf.name,
@@ -469,7 +468,6 @@ export class WorkLaneManager {
 			};
 			const settled = this.#db.work.workAttemptSettle(tx, opRef, expectedVersion, record, patch, admission, checks);
 			if (!settled) return undefined;
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			this.#refreshWorkSession(tx, settled.runtime, settled.runtime.settledAt!);
 			if (settled.runtime.decision === "reported" && admission?.kind === "persona") {
 				workAssert(
@@ -478,7 +476,6 @@ export class WorkLaneManager {
 						originKey: admission.row.originKey,
 						originRefJson: resolveLaneReportOrigin(settled.runtime.parent, admission.row.originRefJson),
 						body: admission.row.body,
-						// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 						receivedAt: settled.runtime.settledAt!,
 						source: "lane_report",
 					}),
@@ -926,7 +923,6 @@ export class WorkLaneManager {
 				return held;
 			}
 			await this.#wait(started.opRef, owner, signal);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const runtime = this.#db.work.workAttemptGet(started.opRef)!;
 			const reason = runtime.terminal?.reasonCode ?? "terminal_uncertain";
 			if (reason !== "end_turn") throw workError("work attempt did not complete", reason, runtime);
@@ -992,7 +988,6 @@ export class WorkLaneManager {
 		}
 		const target = this.#job(input.name);
 		if (target && (!prepared || target.attempts.length > 0)) refuse("successor_name_already_bound");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const source = this.#job(expected.name, true)!;
 		const attempt = source.attempts.at(-1);
 		const runtime = this.#db.work.workAttemptGet(expected.opRef);
@@ -1054,7 +1049,6 @@ export class WorkLaneManager {
 			) {
 				const link = source.successor;
 				const existing = this.#db.work.workAttemptGet(link.opRef);
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				const job = this.#job(link.name, true)!;
 				if (
 					link.name !== input.name ||
@@ -1291,7 +1285,6 @@ export class WorkLaneManager {
 					name: input.successorOf?.name,
 					opRef: predecessor.opRef,
 					sessionId: predecessor.sessionId,
-					// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 					baseSha: input.base!,
 					authorizedAt: this.#at(),
 				}
@@ -1383,7 +1376,6 @@ export class WorkLaneManager {
 			this.#live();
 			throw workError("work send acceptance uncertain", "send_acceptance_uncertain", runtime);
 		}
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		let latest = this.#db.work.workAttemptGet(opRef)!;
 		let statusFromQuery: PromptStatusBody | undefined;
 		if (!accepted && !rejected) {
@@ -1471,7 +1463,6 @@ export class WorkLaneManager {
 				op: null,
 				admission: { ...admission },
 			};
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const job = this.#job(name, true)!;
 		const key = workSessionKey(name);
 		const binding = this.#db.bindings.getSessionRecord(key);
@@ -1638,7 +1629,6 @@ export class WorkLaneManager {
 		const text = (params as { text?: unknown }).text;
 		if (typeof text !== "string" || !text) invalid("text");
 		this.#live();
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const job = this.#job(name, true)!;
 		const captured = job.attempts.find((attempt) => attempt.endedAt === undefined);
 		if (!captured)
@@ -1650,7 +1640,6 @@ export class WorkLaneManager {
 		this.#live();
 		return this.#port.runExclusive(workSessionKey(name), async (): Promise<WorkSteerResult> => {
 			this.#live();
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const current = this.#job(name, true)!;
 			const open = current.attempts.at(-1);
 			if (open?.opRef !== captured.opRef || open.endedAt !== undefined)
@@ -2047,7 +2036,6 @@ export class WorkLaneManager {
 	#holdOpenExecution(observer: Observer): void {
 		if (!this.#writeCurrent(observer)) return;
 		const name = observer.runtime.sessionKey.slice("work/task/".length);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const source = this.#job(name, true)!;
 		if (source.state !== "running") return;
 		this.#putJob(name, {
@@ -2062,7 +2050,6 @@ export class WorkLaneManager {
 	}
 	async #tick(observer: Observer): Promise<void> {
 		if (!this.#writeCurrent(observer)) return;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		let runtime = this.#db.work.workAttemptGet(observer.runtime.opRef)!;
 		if (runtime.settledAt) return;
 		const unresolvedReceipt = unresolvedTerminalReceipt(runtime.terminal) && runtime.turnEndObservedAt === undefined;
@@ -2130,7 +2117,6 @@ export class WorkLaneManager {
 				const activityVersion = observer.activityVersion;
 				const proofTail = observer.tail;
 				const proofConnectionEpoch = proofTail?.connectionEpoch;
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				const idle = await this.#observeIdleTurnEnd(observer, runtime, status!).catch((error: unknown) => {
 					if (error instanceof BrokerAuthorityError) throw error;
 					return undefined;
@@ -2138,7 +2124,6 @@ export class WorkLaneManager {
 				if (idle !== undefined) observer.receiptDeadSince = undefined;
 				if (idle === false) return;
 				if (idle === undefined) {
-					// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 					if (!(await this.#missingReceiptHostDead(observer, runtime, status!))) return;
 					hostDeathProved = true;
 					// Host death proves execution ended; it cannot replace an SDK failure cause.
@@ -2245,7 +2230,6 @@ export class WorkLaneManager {
 						attribution: "operation_ref" as const,
 					};
 					const silent = isSilentOutput(result.text);
-					// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 					const terminal = runtime.terminal!;
 					// A proven original same-op body resolves receipt uncertainty, not
 					// execution by inference. Re-derive its actual terminal outcome.
@@ -2339,7 +2323,6 @@ export class WorkLaneManager {
 			if (!this.#writeCurrent(observer)) return;
 			const endState = workAttemptEndState(reason);
 			let job = closeAttempt({
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				record: this.#job(name, true)!,
 				opRef: runtime.opRef,
 				endState,
@@ -2419,7 +2402,6 @@ export class WorkLaneManager {
 			} else {
 				decision = "report";
 				if (runtime.parent.kind === "persona") {
-					// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 					const fallbackPayload = buildDeliveryPayload(runtime.opRef, runtime.parent.origin, text, runtime.deliveryId)!;
 					const holdReason = this.#options.personaHold?.(runtime.parent.originKey);
 					admission = {
@@ -2483,7 +2465,6 @@ export class WorkLaneManager {
 			if (settled.parent?.kind === "lane" && settled.decision === "no_target")
 				console.error(`lane_report_undeliverable id=${settled.reportId} parent=${settled.parent.name}`);
 			if (settled.decision === "wake_unaccepted") {
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				const child = this.#db.work.laneReportGet(settled.wakeReportId!)!;
 				const outcome = ["fallback", "undeliverable", "pending"].includes(child.state) ? "refused" : "ambiguous";
 				console.error(
@@ -2586,7 +2567,6 @@ export class WorkLaneManager {
 				});
 				this.#putJob(name, job);
 			}
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const activeCycle = job.awaitingChecks!;
 			const outcome = checksOutcome(activeCycle, facts, this.#now());
 			if (outcome.kind === "wait") return undefined;
@@ -2635,7 +2615,6 @@ export class WorkLaneManager {
 		failingChecks: readonly string[],
 		failureLogTail?: string,
 	): Promise<void> {
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const cycle = job.awaitingChecks!;
 		if (cycle.prNumber === null) throw new Error("cannot re-steer before discovering the open PR");
 		const counted = recordChecksRetry(job, this.#at());
@@ -2666,7 +2645,6 @@ export class WorkLaneManager {
 		facts: Awaited<ReturnType<typeof collectRepoFacts>>,
 		at = this.#at(),
 	): ChecksReportEffects {
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const cycle = job.awaitingChecks!;
 		const settled = settleAwaitingChecks(job, at, outcome);
 		const last = job.attempts.at(-1);
@@ -2730,7 +2708,6 @@ export class WorkLaneManager {
 		text: string,
 		deliveryId: string,
 	): ChatMessagePayload {
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const payload = buildDeliveryPayload(turnId, origin, text, deliveryId)!;
 		this.#db.outbox.enqueue(tx, {
 			deliveryId,
@@ -2775,7 +2752,6 @@ export class WorkLaneManager {
 						if (
 							runtime &&
 							hasAcceptanceEvidence(runtime) &&
-							// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 							this.#reportMutation((tx) => this.#db.work.laneReportConsume(tx, row.report_id, row.claim_ref!))
 						)
 							this.#logLaneReportTransition(row, "held", "consumed", "wake_acceptance_proven");
@@ -2788,19 +2764,15 @@ export class WorkLaneManager {
 					if (this.#attemptByOpRef(row.claim_ref)) continue;
 					const open = job.attempts.find((attempt) => attempt.endedAt === undefined);
 					if (open) {
-						// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 						if (!this.#reportMutation((tx) => this.#db.work.laneReportRequeue(tx, row.report_id, row.claim_ref!)))
 							continue;
 						this.#logLaneReportTransition(row, "claimed", "pending", "wake_unprepared_parent_open");
-						// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 						row = this.#db.work.laneReportGet(row.report_id)!;
 					} else if (job.state === "awaiting_checks" || job.state === "done") {
-						// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 						if (!this.#reportMutation((tx) => this.#db.work.laneReportRequeue(tx, row.report_id, row.claim_ref!)))
 							continue;
 						this.#logLaneReportTransition(row, "claimed", "pending", "wake_parent_parked");
 						this.#fallbackLaneReport(
-							// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 							this.#db.work.laneReportGet(row.report_id)!,
 							job.state === "done" ? "parent_done" : "parent_awaiting_checks",
 						);
@@ -2930,7 +2902,6 @@ export class WorkLaneManager {
 				if (
 					runtime &&
 					hasAcceptanceEvidence(runtime) &&
-					// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 					this.#reportMutation((tx) => this.#db.work.laneReportConsume(tx, row.report_id, row.claim_ref!))
 				)
 					this.#logLaneReportTransition(row, "held", "consumed", "wake_acceptance_proven");
@@ -2939,10 +2910,8 @@ export class WorkLaneManager {
 		}
 		if (row.state !== "claimed") return;
 		if (row.claim_kind === "wake" && !this.#attemptByOpRef(row.claim_ref)) {
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			if (!this.#reportMutation((tx) => this.#db.work.laneReportRequeue(tx, row.report_id, row.claim_ref!))) return;
 			this.#logLaneReportTransition(row, "claimed", "pending", "wake_unprepared_parent_quarantined");
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			this.#fallbackLaneReport(this.#db.work.laneReportGet(row.report_id)!, "parent_quarantined");
 			return;
 		}
@@ -2996,7 +2965,6 @@ export class WorkLaneManager {
 	}
 
 	async #sendLaneSteer(row: LaneReportRow, job: LaneJobRecord, runtime: WorkAttemptRuntime): Promise<void> {
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const clientRef = row.claim_ref!;
 		try {
 			await this.#port.steer({
@@ -3030,7 +2998,6 @@ export class WorkLaneManager {
 		if (row.state === "pending") {
 			opRef = laneWakeOpRef(row.parent_name, row.report_id, row.claim_seq + 1);
 			const result = this.#reportMutation((tx) =>
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				this.#db.work.laneReportClaim(tx, row.report_id, "wake", opRef!, null),
 			);
 			if (!result) return;
@@ -3067,11 +3034,9 @@ export class WorkLaneManager {
 		this.#logLaneReportTransition(fresh, "claimed", "pending", "wake_unprepared");
 		const parentJob = this.#job(row.parent_name);
 		if (parentJob?.state === "awaiting_operator" || parentJob?.state === "stalled") {
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			this.#fallbackLaneReport(this.#db.work.laneReportGet(row.report_id)!, "parent_held");
 		} else if (parentJob?.state === "awaiting_checks" || parentJob?.state === "done") {
 			this.#fallbackLaneReport(
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				this.#db.work.laneReportGet(row.report_id)!,
 				parentJob.state === "done" ? "parent_done" : "parent_awaiting_checks",
 			);
@@ -3195,7 +3160,6 @@ export class WorkLaneManager {
 				const terminalStillRunning = unresolvedTerminalReceipt(terminal) && runtime.turnEndObservedAt === undefined;
 				if (terminal && !terminalStillRunning && this.#writeCurrent(observer)) {
 					this.#updateAttempt(runtime.opRef, runtime.version, {
-						// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 						...(provesAcceptance(status!)
 							? {
 									sendPhase: "accepted" as const,
@@ -3334,7 +3298,6 @@ export class WorkLaneManager {
 						workError(
 							"work wait timed out; attempt remains observable",
 							"work_wait_timeout",
-							// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 							this.#db.work.workAttemptGet(opRef)!,
 						),
 					),
@@ -3791,7 +3754,6 @@ export async function laneLastCommits(
 	let next = 0;
 	const worker = async () => {
 		while (next < unique.length) {
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const path = unique[next++]!;
 			result.set(path, await laneLastCommit(path));
 		}
@@ -4111,7 +4073,6 @@ async function remoteBranchSha(remoteUrl: string, branchName: string, timeoutMs:
 		const [sha, ref] = output.split(/\s+/, 2);
 		if (probe.exitCode === 2 && output === "") return { kind: "missing" };
 		if (probe.exitCode === 0 && ref === `refs/heads/${branchName}` && /^[0-9a-f]{40}$/.test(sha ?? ""))
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			return { kind: "found", sha: sha! };
 		return { kind: "unknown" };
 	} catch {

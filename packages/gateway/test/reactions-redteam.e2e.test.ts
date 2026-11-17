@@ -72,7 +72,6 @@ interface Client {
 	send(value: unknown): Promise<void>;
 	/** Writes several frames as ONE chunk, so the daemon handles them back to back. */
 	sendBatch(values: readonly unknown[]): Promise<void>;
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	frames: any[];
 	/** Bytes of an incomplete trailing line: nonzero means a frame was cut off. */
 	readonly partial: number;
@@ -81,7 +80,6 @@ interface Client {
 }
 
 async function connect(socketPath: string): Promise<Client> {
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = "";
 	let badLines = 0;
@@ -214,23 +212,18 @@ async function inboundReactionRequest(client: Client, id: string, params: Record
 	});
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 function chatMessages(frames: any[]): any[] {
 	return frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
 }
-// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 function reactionEvents(frames: any[]): any[] {
 	return chatMessages(frames).filter((frame) => frame.payload.reaction);
 }
-// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 function textEvents(frames: any[]): any[] {
 	return chatMessages(frames).filter((frame) => !frame.payload.reaction);
 }
-// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 function response(frames: any[], id: string): any {
 	return frames.find((frame) => frame.type === "response" && frame.id === id);
 }
-// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 function errorFrame(frames: any[], id: string): any {
 	return frames.find((frame) => frame.type === "error" && frame.id === id);
 }

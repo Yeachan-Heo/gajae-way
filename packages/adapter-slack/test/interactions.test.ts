@@ -139,7 +139,6 @@ describe("panel actions", () => {
 			new Date(Date.now() - 60_000).toISOString(),
 		]) {
 			const base = message();
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const ask = { ...base, duplicateWarning: true, askUserPanel: { ...base.askUserPanel!, expiresAt } };
 			const approval = {
 				...ask,

@@ -22,13 +22,11 @@ afterEach(async () => {
 
 interface Client {
 	send(value: unknown): void;
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	frames: any[];
 	close(): void;
 }
 
 async function connect(socketPath: string): Promise<Client> {
-	// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 	const frames: any[] = [];
 	let buffered = "";
 	const socket = await Bun.connect({
@@ -118,12 +116,10 @@ function sendMessage(
 	});
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 function reactionEvents(frames: any[]): any[] {
 	return frames.filter((frame) => frame.type === "event" && frame.event === "chat.message" && frame.payload.reaction);
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: ignored using `--suppress`
 function textEvents(frames: any[]): any[] {
 	return frames.filter((frame) => frame.type === "event" && frame.event === "chat.message" && !frame.payload.reaction);
 }

@@ -61,7 +61,6 @@ const KEY = "loopback/loopback/persona";
 async function establishStoredSession(port: ScriptedSessionPort, messageId: string) {
 	enqueue(messageId, "seed turn");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const stored = port.sends.at(-1)!;
 	port.complete(stored.opRef, "seed answer");
 	await manager?.tick(KEY);
@@ -74,7 +73,6 @@ async function establishStoredSession(port: ScriptedSessionPort, messageId: stri
 
 function trackRecoveryCalls(): () => number {
 	let calls = 0;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const recover = manager?.recover.bind(manager!);
 	Object.defineProperty(manager, "recover", {
 		value: async () => {
@@ -114,7 +112,6 @@ function registerFixtureBindings(port: ScriptedSessionPort): void {
 	fixtureBindings.set(port, original);
 	port.bind = original.bind;
 	port.resume = original.resume;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	attachTestBrokerOwnership(database!, port, join(home, "agent"));
 }
 
@@ -195,7 +192,6 @@ async function settleFailedInbound(port: ScriptedSessionPort, messageId: string)
 			activeManager.state(KEY) === "idle"
 		);
 	}, `failed turn ${messageId} did not settle`);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	return sendsFor().at(-1)!;
 }
 
@@ -203,9 +199,7 @@ function seedPersonaPrompt(
 	send: { sessionId: string; opRef: string },
 	result: "busy" | "pending" | "accepted" = "busy",
 ) {
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const store = database!;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const authority = store.bindings.authority!;
 	const scope = JSON.stringify([send.sessionId, send.opRef]);
 	store.transaction((tx) => {
@@ -233,13 +227,11 @@ test("retryInboundTurn removes only the abandoned persona busy proof and rolls i
 	await harness(port);
 	enqueue("retry-busy-proof", "retry this turn");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	const proof = seedPersonaPrompt(first);
 	const before = database?.inbox.turnRow(first.opRef);
 	expect(() =>
 		database?.transaction((tx) => {
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(retryInboundTurn(database!, tx, first.opRef)).toBe(1);
 			expect(proof()).toBeUndefined();
 			throw new Error("rollback busy release");
@@ -247,7 +239,6 @@ test("retryInboundTurn removes only the abandoned persona busy proof and rolls i
 	).toThrow("rollback busy release");
 	expect(database?.inbox.turnRow(first.opRef)).toEqual(before);
 	expect(proof()).toMatchObject({ state: "complete", resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL) });
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(database?.transaction((tx) => retryInboundTurn(database!, tx, first.opRef))).toBe(1);
 	expect(database?.inbox.pendingOldest(KEY)).toMatchObject({ turn_state: null, bound_session_id: null });
 	expect(proof()).toBeUndefined();
@@ -259,7 +250,6 @@ for (const result of ["busy", "pending", "accepted"] as const)
 		await harness(port);
 		enqueue(`terminal-proof-${result}`, "finish this turn");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
 		const proof = seedPersonaPrompt(first, result);
 		await manager?.tick(KEY);
@@ -274,13 +264,11 @@ for (const result of ["busy", "pending", "accepted"] as const)
 
 test("standalone persona retry uses the owned binding repo rather than the manager repo", async () => {
 	await harness(new ScriptedSessionPort());
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const store = database!;
 	const sessionId = "standalone-owned-session";
 	const opRef = "standalone-owned-ref";
 	store.transaction((tx) =>
 		store.bindings.recordOwnedBinding(tx, {
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			authority: store.bindings.authority!,
 			sessionId,
 			originKey: KEY,
@@ -303,10 +291,7 @@ for (const mismatch of ["session", "origin", "epoch", "ref", "authority"] as con
 		await harness(port);
 		enqueue(`mismatch-${mismatch}`, "retry without deleting unrelated proof");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-		// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 		const authority = database?.bindings.authority!;
 		const proof = seedPersonaPrompt({
 			sessionId: mismatch === "session" ? "unrelated-session" : first.sessionId,
@@ -337,7 +322,6 @@ for (const mismatch of ["session", "origin", "epoch", "ref", "authority"] as con
 				database?.bindings.setAuthority(tx, { ...authority, identity: "revoked-persona-owner" }),
 			);
 		try {
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			database?.transaction((tx) => retryInboundTurn(database!, tx, first.opRef));
 			expect(proof()).toBeDefined();
 		} finally {
@@ -365,10 +349,7 @@ test("ambiguous busy send retains its identity and proof despite an unobserved t
 	await harness(port);
 	enqueue("bound-busy-proof", "do not abandon an unresolved send");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sendAttempts[0]!;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-	// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 	const authority = database?.bindings.authority!;
 	const proof = () =>
 		database?.bindings.brokerOperation(authority, "turn.prompt", JSON.stringify([first.sessionId, first.opRef]));
@@ -394,7 +375,6 @@ test("persona terminal failed completion CAS retains its busy proof", async () =
 	await harness(port);
 	enqueue("failed-completion-cas", "hold on failed CAS");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	const proof = seedPersonaPrompt(first);
 	const complete = database?.inbox.turnComplete.bind(database?.inbox);
@@ -419,7 +399,6 @@ test("persona failure completion releases its abandoned busy proof", async () =>
 	await harness(port);
 	enqueue("failed-busy-proof", "fail this turn");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	const proof = seedPersonaPrompt(first);
 	port.fail(first.opRef, "terminal failure");
@@ -477,7 +456,6 @@ test("actor immediately dispatches durable inbound with one deterministic caller
 	await eventually(() => terminal.length === 1, "tail terminal did not reach lifecycle");
 
 	expect(port.sends).toHaveLength(1);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = port.sends[0]!;
 	expect(send.text).toBe("hello");
 	expect(send.opRef).toBe(latestOpRef);
@@ -539,7 +517,6 @@ test("oversized text plus images is a local terminal failure and does not hold a
 	enqueue("after-oversized", "next pending message");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "the pending message after the local rejection did not dispatch");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const rejected = port.oversizedAttempts[0]!;
 	const rejectedOpRef = rejected.opRef;
 	expect(rejected.text).toBe("x".repeat(220_000));
@@ -682,8 +659,6 @@ test("actual relay envelope rejection is durable before actor error handling and
 						markerAtDecision = database?.core.metaGet(`persona-local-preflight-rejection:${input.opRef}`);
 						fencedAtDecision = database?.inbox.sendAttempted(input.opRef);
 						pendingRequestAtDecision = database?.bindings.brokerOperation(
-							// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-							// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 							database?.bindings.authority!,
 							"turn.prompt",
 							JSON.stringify([input.sessionId, input.opRef]),
@@ -702,10 +677,7 @@ test("actual relay envelope rejection is durable before actor error handling and
 	await harness(port);
 	runner = new TailRunner({ stream: relay.spawn, repo: join(home, "workspace") });
 	broker = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-		// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 		authority: database?.bindings.authority!,
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		cli: async () => {
 			throw new Error("unexpected CLI call");
@@ -740,13 +712,10 @@ test("actual relay envelope rejection is durable before actor error handling and
 	// unwritten-request cleanup, to model a crash at that exact boundary.
 	const scope = JSON.stringify(["session-1", opRef]);
 	database?.transaction((tx) =>
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-		// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 		database?.bindings.beginBrokerOperation(tx, database?.bindings.authority!, {
 			operation: "turn.prompt",
 			scope,
 			operationRef: opRef,
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			requestJson: pendingRequestAtDecision!,
 		}),
 	);
@@ -779,7 +748,6 @@ test("actual relay envelope rejection is durable before actor error handling and
 	expect(port.sends.some((send) => send.opRef === opRef)).toBe(false);
 	expect(database.inbox.turnRow(opRef)).toMatchObject({ state: "done", turn_state: "done" });
 	expect(database.core.metaGet(`persona-local-preflight-rejection:${opRef}`)).toBeUndefined();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(database.bindings.brokerOperation(database.bindings.authority!, "turn.prompt", scope)).toBeUndefined();
 });
 
@@ -787,8 +755,6 @@ test("a fitting real relay request commits its send fence before the write", asy
 	const port = new ScriptedSessionPort();
 	await harness(port);
 	await establishStoredSession(port, "fence-fixture");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-	// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 	const binding = database?.bindings.getSessionRecord(KEY)!;
 	enqueue("fence-write", "fits");
 	database?.transaction((tx) =>
@@ -807,10 +773,7 @@ test("a fitting real relay request commits its send fence before the write", asy
 	});
 	const runner = new TailRunner({ stream: relay.spawn, repo: join(home, "workspace") });
 	const broker = new BrokerSessionPort({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-		// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 		authority: database?.bindings.authority!,
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		cli: async () => {
 			throw new Error("unexpected CLI call");
@@ -884,14 +847,12 @@ test("a size-shaped error after acceptance remains ambiguous without local rejec
 	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) });
 	enqueue("post-write-size-error", "accepted before error");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const sent = port.sends[0]!;
 	expect(database?.inbox.sendAttempted(sent.opRef)).toBe(true);
 	expect(database?.core.metaGet(`persona-local-preflight-rejection:${sent.opRef}`)).toBeUndefined();
 	expect(notices).toEqual([]);
 	await manager?.stop();
 	manager = new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port,
 		instanceId: "instance-test",
@@ -910,7 +871,6 @@ for (const outcome of ["complete", "incomplete", "in_flight"] as const)
 		await harness(port);
 		enqueue("recover-without-tail", "execute only once");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const send = port.sends[0]!;
 		await manager?.stop();
 		if (outcome !== "in_flight") port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "original result");
@@ -944,7 +904,6 @@ for (const outcome of ["complete", "incomplete", "in_flight"] as const)
 		const terminals: string[] = [];
 		const logs: string[] = [];
 		manager = new PersonaSessionManager({
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			database: database!,
 			port,
 			instanceId: "instance-test",
@@ -983,7 +942,6 @@ for (const answer of ["owned original answer", ""])
 		await harness(port, { terminal: (text) => terminal.push(text) });
 		enqueue("original", "execute once");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const send = port.sends[0]!;
 		port.fetchAssistantSince = async () => {
 			throw new Error("transcript.list returned no page items");
@@ -1003,8 +961,6 @@ for (const answer of ["owned original answer", ""])
 		expect(port.workerOutputReads).toHaveLength(1);
 		expect(port.workerOutputReads[0]).toMatchObject({ sessionId: send.sessionId, opRef: send.opRef });
 		expect(port.workerOutputReads[0]?.notBeforeMs).toBeGreaterThanOrEqual(
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-			// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 			Date.parse(database?.inbox.turnDispatchedAt(send.opRef)!),
 		);
 		expect(database?.inbox.turnRow(send.opRef)?.turn_state).toBe("done");
@@ -1019,7 +975,6 @@ for (const evidence of ["missing", "truncated", "mismatch"] as const)
 		await harness(port, { terminal: (text) => terminal.push(text) }, (line) => logs.push(line));
 		enqueue("held-original", "execute once");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const send = port.sends[0]!;
 		port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "owned answer");
 		const status = (await port.status(send)).status;
@@ -1070,7 +1025,6 @@ test("stop fences a pending original-result callback before delivery or database
 	await harness(port, { terminal: (text) => terminal.push(text) });
 	enqueue("stop-original", "execute once");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = port.sends[0]!;
 	const fetch = port.fetchWorkerOutput.bind(port);
 	let release!: () => void;
@@ -1178,7 +1132,6 @@ test("a post-start prompt failure delivers the runtime's code and logs its bound
 	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) }, (line) => logs.push(line));
 	enqueue("post-start-failure", "work that failed after it started");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	port.fail(first.opRef, "Agent run failed after execution started.", {
 		code: "prompt_failed",
@@ -1236,7 +1189,6 @@ test("a turn that fails with a tool still running names the tool and hands over 
 	};
 	enqueue("tool-timeout", "check the 1password session");
 	await manager.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	port.emitTool(first.sessionId, { toolName: "bash", args: { command: "op whoami" } });
 	await eventually(() => frames.includes("tool_execution_start"), "tool start did not reach the actor");
@@ -1283,7 +1235,6 @@ test("a failed turn whose answer already reached the tail neither re-reads the t
 	};
 	enqueue("visible-then-fail", "work");
 	await manager.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	port.emitTool(first.sessionId, { toolName: "bash" });
 	port.emitToolEnd(first.sessionId, "bash");
@@ -1308,7 +1259,6 @@ test("a rebindable post-start code keeps its /new hint, and a codeless failure s
 
 	enqueue("codeless-failure", "second");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const second = port.sends[1]!;
 	// A child killed mid-write reports neither code nor message.
 	port.fail(second.opRef, "");
@@ -1323,7 +1273,6 @@ test("post-start failure captures real error message in terminal_failure log (#4
 	await harness(port, { failureError: (error) => notices.push(formatFailureNotice(error)) }, (line) => logs.push(line));
 	enqueue("boom-failure", "work that throws an error");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	// Failure with error.code and outcome with failureCauseDiagnostic to test real cause capture (#408)
 	port.fail(first.opRef, "boom", {
@@ -1358,7 +1307,6 @@ test("failed notice must persist before reset completion and may retry without r
 	});
 	enqueue("failed-notice", "work that must not run twice");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
 	port.fail(first.opRef);
@@ -1388,15 +1336,13 @@ test("reset consumes only the failed trigger context, preserving unrelated unrea
 	}
 	enqueue("failed-context", "failed-context");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
 	port.fail(first.opRef);
 	await eventually(() => manager?.state(KEY) === "idle", "failed trigger did not settle");
 	expect(database?.inbox.contextDiagnostics(KEY).unread).toBe(1);
 	expect(
-		database
-			?.transaction((tx) => database?.inbox.contextWindow(tx, KEY, "later-message"))
+		database?.transaction((tx) => database?.inbox.contextWindow(tx, KEY, "later-message"))
 			.rows.map((row) => row.message_id),
 	).toEqual(["unrelated-context"]);
 });
@@ -1416,7 +1362,6 @@ for (const reason of ["unsupported_input_status", "context_exhausted"] as const)
 		});
 		enqueue("failed", "original work");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
 		port.emitTool(first.sessionId);
 		port.emitToolEnd(first.sessionId, "tool");
@@ -1736,7 +1681,6 @@ for (const restart of [false, true])
 		await harness(port, { failure: (message) => failures.push(message) });
 		enqueue("first", "first failed message");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
 		port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
 		port.fail(first.opRef);
@@ -1763,7 +1707,6 @@ for (const restart of [false, true])
 		}
 		enqueue("second", "different failed message");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const second = port.sends[1]!;
 		port.setFailedTurnEvidence(second.sessionId, "unsupported_input_status");
 		port.fail(second.opRef, "second failure");
@@ -1785,7 +1728,6 @@ for (const held of [false, true])
 		await harness(port);
 		enqueue("failed", "original");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
 		enqueue("steer", "additional accepted or uncertain work");
 		await manager?.notifyInbound(KEY);
@@ -1817,7 +1759,6 @@ for (const evidence of ["missing", "throws"] as const)
 		await harness(port, { failure: (message) => failures.push(message) });
 		enqueue("rate-limit", "original");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
 		port.fail(first.opRef, "429 rate limited");
 		await eventually(() => manager?.state(KEY) === "idle", "ordinary failure did not settle");
@@ -1842,12 +1783,10 @@ test("a wedged submission resets the next binding once without transcript eviden
 	await harness(port, { failure: (message) => failures.push(message) }, (line) => logs.push(line));
 	enqueue("wedged", "first");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	port.fail(first.opRef, "Prompt submission failed.", { code: "internal", outcome: WEDGED_SUBMISSION });
 	// #424 re-sends a never-started prompt once on the same session; only a wedge that survives it resets.
 	await eventually(() => port.sends.length === 2, "wedged submission was not re-sent");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const retry = port.sends[1]!;
 	expect(retry).toMatchObject({ text: "first", sessionId: "session-e0" });
 	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
@@ -1921,7 +1860,6 @@ for (const missing of ["start", "terminal", "nan", "reversed", "future", "op-ref
 		await harness(port);
 		enqueue("invalid-status", "fail closed");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
 		port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
 		port.fail(first.opRef);
@@ -1935,7 +1873,6 @@ test("retired exact failure never resets the replacement binding", async () => {
 	await harness(port);
 	enqueue("old", "old");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	await manager?.reset(KEY, JSON.stringify(ORIGIN));
 	enqueue("current", "current");
@@ -2029,7 +1966,6 @@ test("/new with a turn in flight ends the old host only after that turn is recon
 	await harness(port, undefined, (line) => logs2.push(line));
 	enqueue("slow", "slow");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	await manager?.reset(KEY, JSON.stringify(ORIGIN));
 	await manager?.tick(KEY);
@@ -2073,7 +2009,6 @@ for (const restart of [false, true])
 			await harness(port, { terminal: (text) => terminal.push(text), failure: (text) => failures.push(text) });
 			enqueue("admitted", "execute exactly once");
 			await manager?.notifyInbound(KEY);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const first = port.sends[0]!;
 			if (restart) {
 				await manager?.stop();
@@ -2305,7 +2240,6 @@ test("session_not_found text without the broker error code remains ambiguous and
 	await harness(port, {}, (line) => logs.push(line));
 	enqueue("ambiguous-session-seed", "seed turn");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const stored = port.sends[0]!;
 	port.complete(stored.opRef, "seed answer");
 	await manager?.tick(KEY);
@@ -2340,7 +2274,6 @@ for (const authorityFailure of ["direct", "probe"] as const)
 		await harness(port);
 		enqueue(`held-steer-authority-${authorityFailure}`, "original");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
 		enqueue(`held-steer-${authorityFailure}`, "uncertain steer");
 		await manager?.notifyInbound(KEY);
@@ -2373,7 +2306,6 @@ for (const exact of [false, true])
 		await harness(port);
 		enqueue("recover", "original");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
 		await manager?.stop();
 		port.seedOperation(first.opRef, first.sessionId, "failed");
@@ -2384,7 +2316,6 @@ for (const exact of [false, true])
 		};
 		if (exact) port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
 		manager = new PersonaSessionManager({
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			database: database!,
 			port,
 			instanceId: "instance-test",
@@ -2417,7 +2348,6 @@ for (const resetBy of ["healthy", "new"] as const)
 		const before = database?.bindings.getSessionRecord(KEY)?.epoch;
 		enqueue("failed-2", "second");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const last = port.sends.at(-1)!;
 		port.setFailedTurnEvidence(last.sessionId, "unsupported_input_status");
 		port.fail(last.opRef);
@@ -2479,7 +2409,6 @@ for (const value of ["1", "garbage", "-1", ""])
 		await harness(port);
 		enqueue("cap", "original");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
 		const key = `failed-turn-reset-cap:${createHash("sha256")
 			.update(JSON.stringify([KEY]))
@@ -2488,7 +2417,6 @@ for (const value of ["1", "garbage", "-1", ""])
 		const before = database?.inbox.turnRow(first.opRef);
 		expect(
 			database?.transaction((tx) =>
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				resetFailedTurn(database!, tx, {
 					originKey: KEY,
 					epoch: 0,
@@ -2507,7 +2435,6 @@ test("atomic reset rolls completion and markers back when epoch advancement fail
 	await harness(port);
 	enqueue("rollback", "original");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	const proof = seedPersonaPrompt(first);
 	const input = {
@@ -2522,7 +2449,6 @@ test("atomic reset rolls completion and markers back when epoch advancement fail
 	database?.bindings.rotateEpoch = () => {
 		throw new Error("injected transaction failure");
 	};
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(() => database?.transaction((tx) => resetFailedTurn(database!, tx, input))).toThrow(
 		"injected transaction failure",
 	);
@@ -2530,11 +2456,9 @@ test("atomic reset rolls completion and markers back when epoch advancement fail
 	expect(proof()).toMatchObject({ state: "complete", resultJson: JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL) });
 	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
 	database?.bindings.rotateEpoch = original;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(database?.transaction((tx) => resetFailedTurn(database!, tx, input))).toBe(1);
 	expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
 	expect(proof()).toBeUndefined();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(database?.transaction((tx) => resetFailedTurn(database!, tx, input))).toBeUndefined();
 });
 
@@ -2601,7 +2525,6 @@ test("stop drains an admitted generation callback and fences queued and delayed 
 	expect(database?.inbox.turnRow(latestOpRef)).toEqual(before);
 	database?.close();
 	database = undefined;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const callbacks = tailInput!;
 	await manager?.onBrokerGeneration(3);
 	await manager?.tick(KEY);
@@ -2631,7 +2554,6 @@ test("/new retires an accepted turn, fences its late output, and preserves turn 
 	enqueue("m-1", "old turn");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "accepted turn did not start before reset");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	await manager?.reset(KEY, JSON.stringify(ORIGIN));
 
@@ -2673,7 +2595,6 @@ test("a /new-retired turn survives broker registry loss until its original nativ
 	enqueue("m-1", "old turn");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const old = port.sends[0]!;
 	await manager?.reset(KEY, JSON.stringify(ORIGIN));
 	expect(database?.inbox.turnRow(old.opRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
@@ -2739,7 +2660,6 @@ for (const restart of [false, true])
 				enqueue("registry-original", "execute exactly once");
 				await manager?.notifyInbound(KEY);
 				await eventually(() => port.sends.length === 1, "accepted turn did not start");
-				// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 				const first = port.sends[0]!;
 				expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
 				port.lost = true;
@@ -2819,7 +2739,6 @@ test("an ACCEPTED turn whose status is endpoint_stale but whose liveness is unan
 	enqueue("m-1", "question");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	port.dropped.add(first.sessionId);
 	await manager?.tick(KEY);
@@ -2850,7 +2769,6 @@ test("broker registry loss never fabricates a cutoff notice even when its persis
 	enqueue("m-1", "question");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	port.dropped.add(first.sessionId);
 
@@ -2919,7 +2837,6 @@ async function wedgedHarness(port: WedgedSessionPort) {
 	enqueue("m-1", "question");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("accepted");
 	return { clock, logs, terminal, recorded, failures, first };
@@ -2947,7 +2864,6 @@ for (const lostAck of [false, true])
 		await harness(port, { terminal: (text) => terminal.push(text) });
 		enqueue("stalled-original", "execute once");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
 		await manager?.tick(KEY);
 		port.emitStall(first.sessionId);
@@ -2985,7 +2901,6 @@ test("an unknown observation followed by native terminal before the first stall 
 	await harness(port, { terminal: (text) => terminal.push(text) });
 	enqueue("terminal-before-stall", "execute once");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	await manager?.reconcile(KEY);
 	port.unknown = false;
@@ -3253,7 +3168,6 @@ test("terminal text recovery window survives a gateway restart instead of restar
 	enqueue("m-1", "question");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	port.pending.add(first.opRef);
 	port.seedOperation(first.opRef, first.sessionId, "terminal_ok", "");
@@ -3358,7 +3272,6 @@ test("a silent in-flight turn is failed after the stall deadline and releases a 
 	enqueue("stalled-trigger", "start the lane");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "persona turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	port.emitAssistant(first.sessionId, "The lane is running", "lane-running", first.opRef);
 	await eventually(() => interimSeen, "mid-work frame was not observed before the stall");
@@ -3436,7 +3349,6 @@ async function durableExitFixture(outcome: "terminated" | "already_gone" | "asyn
 	);
 	enqueue("durable-exit-original", "execute exactly once");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	port.setActivity(first.sessionId, "tool", clock.now);
 	port.emitStall(first.sessionId);
@@ -3506,7 +3418,6 @@ async function durableExitFixture(outcome: "terminated" | "already_gone" | "asyn
 		port,
 		first,
 		proofKey,
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		proof: proof!,
 		failures,
 		terminal,
@@ -3560,7 +3471,6 @@ test("durable stalled-host exit retry preserves native submission retry and cons
 		bound_session_id: null,
 	});
 	expect(database?.inbox.turnRow(f.first.opRef)).toBeUndefined();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(freshTurnAttempt(database!, KEY, 0, "durable-exit-original")).toBe(1);
 	expect(database?.core.metaGet(f.proofKey)).toBeUndefined();
 	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(0);
@@ -3573,24 +3483,19 @@ test("durable stalled-host exit retry rolls back proof, trigger and attempt toge
 	const f = await durableExitFixture("terminated");
 	await manager?.stop();
 	const before = database?.inbox.turnRow(f.first.opRef);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(freshTurnAttempt(database!, KEY, 0, "durable-exit-original")).toBe(0);
 	expect(() =>
 		database?.transaction((tx) => {
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(retryInboundTurn(database!, tx, f.first.opRef)).toBe(1);
 			expect(database?.inbox.turnRow(f.first.opRef)).toBeUndefined();
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			expect(freshTurnAttempt(database!, KEY, 0, "durable-exit-original")).toBe(1);
 			expect(database?.core.metaGet(f.proofKey)).toBeUndefined();
 			throw new Error("rollback exit retry");
 		}),
 	).toThrow("rollback exit retry");
 	expect(database?.inbox.turnRow(f.first.opRef)).toEqual(before);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(freshTurnAttempt(database!, KEY, 0, "durable-exit-original")).toBe(0);
 	expect(database?.core.metaGet(f.proofKey)).toBe(f.proof);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(database?.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toBe(1);
 	expect(database?.inbox.pendingOldest(KEY)).toMatchObject({
 		state: "pending",
@@ -3598,7 +3503,6 @@ test("durable stalled-host exit retry rolls back proof, trigger and attempt toge
 		turn_op_ref: null,
 		bound_session_id: null,
 	});
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(freshTurnAttempt(database!, KEY, 0, "durable-exit-original")).toBe(1);
 	expect(database?.core.metaGet(f.proofKey)).toBeUndefined();
 });
@@ -3623,7 +3527,6 @@ for (const mismatch of [
 		else if (mismatch !== "malformed") proof[mismatch] = "foreign-or-unconfirmed";
 		const poisoned = mismatch === "malformed" ? "{broken-json" : JSON.stringify(proof);
 		database?.transaction(() => database?.core.metaSet(f.proofKey, poisoned));
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(database?.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toBe(1);
 		expect(database?.inbox.turnRow(f.first.opRef)).toBeUndefined();
 		expect(database?.core.metaGet(f.proofKey)).toBe(poisoned);
@@ -3632,11 +3535,8 @@ for (const mismatch of [
 test("durable stalled-host exit retry preserves proof after persisted broker authority changes", async () => {
 	const f = await durableExitFixture("terminated");
 	await manager?.stop();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-	// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 	const authority = database?.bindings.authority!;
 	database?.transaction((tx) => database?.bindings.setAuthority(tx, { ...authority, identity: "replacement-broker" }));
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(database?.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toBe(1);
 	expect(database?.inbox.turnRow(f.first.opRef)).toBeUndefined();
 	expect(database?.core.metaGet(f.proofKey)).toBe(f.proof);
@@ -3646,8 +3546,6 @@ test("durable stalled-host exit retry rejects quarantine without changing proof,
 	const f = await durableExitFixture("terminated");
 	await manager?.stop();
 	const before = database?.inbox.turnRow(f.first.opRef);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-	// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 	const authority = database?.bindings.authority!;
 	database?.transaction((tx) =>
 		database?.bindings.cutoverBrokerAuthority(tx, {
@@ -3658,12 +3556,10 @@ test("durable stalled-host exit retry rejects quarantine without changing proof,
 		}),
 	);
 	expect(database?.bindings.isQuarantined("inbound", "durable-exit-original")).toBe(true);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(() => database?.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toThrow(
 		BrokerAuthorityError,
 	);
 	expect(database?.inbox.turnRow(f.first.opRef)).toEqual(before);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(freshTurnAttempt(database!, KEY, 0, "durable-exit-original")).toBe(0);
 	expect(database?.core.metaGet(f.proofKey)).toBe(f.proof);
 });
@@ -3680,7 +3576,6 @@ test("durable stalled-host exit retry preserves proof when requeue changes zero 
 		return 0;
 	};
 	try {
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		expect(database?.transaction((tx) => retryInboundTurn(database!, tx, f.first.opRef))).toBe(1);
 	} finally {
 		database?.inbox.turnRequeue = requeue;
@@ -3758,7 +3653,6 @@ for (const outcome of ["refused", "terminating", "throw"] as const)
 		);
 		enqueue("durable-exit-unconfirmed", "do not infer producer death");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
 		port.setActivity(first.sessionId, "tool", clock.now);
 		port.emitStall(first.sessionId);
@@ -3784,8 +3678,6 @@ for (const outcome of ["refused", "terminating", "throw"] as const)
 test("durable stalled-host exit rejects proof when persisted broker authority changes", async () => {
 	const f = await durableExitFixture("terminated");
 	await f.reopen("unavailable");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-	// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 	const authority = database?.bindings.authority!;
 	database?.transaction((tx) => database?.bindings.setAuthority(tx, { ...authority, identity: "replacement-broker" }));
 	await manager?.recover().catch(() => {});
@@ -3800,8 +3692,6 @@ test("durable stalled-host exit rejects proof when persisted broker authority ch
 test("durable stalled-host exit stays quarantined after broker cutover", async () => {
 	const f = await durableExitFixture("terminated");
 	await f.reopen("unavailable");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-	// biome-ignore lint/suspicious/noNonNullAssertedOptionalChain: ignored using `--suppress`
 	const authority = database?.bindings.authority!;
 	database?.transaction((tx) =>
 		database?.bindings.cutoverBrokerAuthority(tx, {
@@ -3851,7 +3741,6 @@ test("durable stalled-host exit from reset-retired epoch cannot rotate or close 
 	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
 	enqueue("durable-exit-replacement", "replacement epoch");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const replacement = f.port.sends[1]!;
 	expect(replacement).toMatchObject({ sessionId: "session-e1", text: "replacement epoch" });
 	await manager?.recover();
@@ -3889,9 +3778,7 @@ test("durable stalled-host exit confirms reset-retired original before cleanup a
 	);
 	enqueue("retired-confirm-original", "original producer");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const tail = port.tailsOf(first.sessionId)[0]!;
 	port.setActivity(first.sessionId, "tool", clock.now);
 	port.emitStall(first.sessionId);
@@ -3954,7 +3841,6 @@ test("durable stalled-host exit confirms reset-retired original before cleanup a
 	expect(database?.inbox.turnRow(first.opRef)?.turn_state).toBe("done");
 	expect(database?.core.metaGet(proofKey)).toBeUndefined();
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const replacement = port.sends[1]!;
 	expect(replacement).toMatchObject({ sessionId: "session-e1", text: "replacement remains running" });
 	await manager?.recover();
@@ -3987,7 +3873,6 @@ for (const foreignStatus of ["unknown", "in_flight"] as const)
 		);
 		enqueue("foreign-confirm-original", "original output only");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
 		port.setActivity(first.sessionId, "tool", clock.now);
 		port.emitStall(first.sessionId);
@@ -4031,7 +3916,6 @@ test("a terminal operation found after host exit is not failed", async () => {
 	enqueue("terminal-before-cutoff", "finish the current turn");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "persona turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = port.sends[0]!;
 	port.setActivity(send.sessionId, "tool", clock.now);
 	const readsBeforeStall = port.statusReads.length;
@@ -4076,7 +3960,6 @@ test("tail activity that resumes after the stall deadline cancels the cutoff", a
 	enqueue("stall-resumed", "continue working");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "persona turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = port.sends[0]!;
 	port.setActivity(send.sessionId, "tool", clock.now);
 	const readsBeforeStall = port.statusReads.length;
@@ -4118,7 +4001,6 @@ test("resumed activity clears an unknown-status recovery hold before a later sta
 	enqueue("unknown-stall-trigger", "keep working");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "persona turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	port.unknown = true;
 
@@ -4156,7 +4038,6 @@ test("a stalled turn with a reply ending in stopReason stop does not post a fail
 	enqueue("stall-stop-reply", "answer with a proper conclusion");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "persona turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = port.sends[0]!;
 	// Set up the transcript with a reply that ended with stopReason "stop"
 	port.appendAssistant(send.sessionId, "Here is my answer", clock.now, "stop");
@@ -4205,7 +4086,6 @@ test("a steered turn whose host ends it uncorrelated is cut off as answered whil
 	enqueue("steered-root-trigger", "summarize the contract");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "persona turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = port.sends[0]!;
 	enqueue("steered-root-edit", "edited: also list the owners");
 	await manager?.notifyInbound(KEY);
@@ -4249,7 +4129,6 @@ test("a stalled turn with interim speech still posts a failure notice", async ()
 	enqueue("stall-interim-speech", "start working with interim updates");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "persona turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = port.sends[0]!;
 	// Emit interim speech without final answer (no stopReason)
 	port.emitAssistant(send.sessionId, "Still thinking...", "interim-1", send.opRef);
@@ -4287,7 +4166,6 @@ test("a stalled turn with a reply ending in stopReason error still posts a failu
 	enqueue("stall-error-reply", "fail with an error");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "persona turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = port.sends[0]!;
 	// Set up the transcript with a reply that ended with stopReason "error"
 	port.appendAssistant(send.sessionId, "An error occurred", clock.now, "error");
@@ -4328,7 +4206,6 @@ test("an uncorrelated idle broadcast does not retire a turn with stalled-status 
 	enqueue("idle-unknown-stall-trigger", "keep working");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "persona turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	port.unknown = true;
 
@@ -4404,19 +4281,16 @@ test("a retired stalled turn terminates its producer and summarizes discarded fr
 	enqueue("m-1", "old turn");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "accepted turn did not start before retired stall");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = port.sends[0]!;
 	const opRef = latestOpRef;
 	await manager?.reset(KEY, JSON.stringify(ORIGIN));
 	enqueue("m-2", "new turn");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 2 && terminal.length === 1, "replacement turn did not settle");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const replacement = port.sends[1]!;
 	expect(replacement.sessionId).not.toBe(send.sessionId);
 	expect(database?.bindings.getSessionRecord(KEY)?.sessionId).toBe(replacement.sessionId);
 	await eventually(() => port.tailsOf(send.sessionId).length === 1, "retired turn did not reattach its tail");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const tail = port.tailsOf(send.sessionId)[0]!;
 	for (let index = 0; index < 3; index++)
 		tail.emit({
@@ -4520,7 +4394,6 @@ for (const restart of [false, true])
 			await harness(port);
 			enqueue("lost-ack", "execute exactly once");
 			await manager?.notifyInbound(KEY);
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			const first = port.sends[0]!;
 			if (evidence === "transcript_only") {
 				port.appendAssistant(first.sessionId, "not an operation receipt");
@@ -4680,7 +4553,6 @@ test("authenticated model_not_selected refusal requeues plain pending, notices o
 		dispatched_at: null,
 		terminal_delivery_id: null,
 	});
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(freshTurnAttempt(database!, KEY, 0, "model-not-selected")).toBe(1);
 	expect(port.sendAttempts).toHaveLength(1);
 	expect(port.sends).toHaveLength(0);
@@ -4853,7 +4725,6 @@ test("an accepted turn resumed after an authenticated refusal reports its submis
 	enqueue("refused-then-submission", "refusal spends the shared retry budget");
 	await manager?.notifyInbound(KEY);
 	const refusedOpRef = latestOpRef;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(freshTurnAttempt(database!, KEY, 0, "refused-then-submission")).toBe(1);
 	expect(port.sendAttempts).toHaveLength(1);
 	expect(port.sends).toHaveLength(0);
@@ -4872,14 +4743,12 @@ test("an accepted turn resumed after an authenticated refusal reports its submis
 	});
 	expect(port.sendAttempts).toHaveLength(2);
 	expect(port.sends).toHaveLength(1);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const accepted = port.sends[0]!;
 	expect(accepted.opRef).not.toBe(refusedOpRef);
 	expect(accepted).toMatchObject({ sessionId: "session-e0", text: "refusal spends the shared retry budget" });
 	expect(failures).toEqual(["internal: Prompt submission failed."]);
 	expect(terminal).toEqual([]);
 	expect(database?.inbox.turnRow(accepted.opRef)).toMatchObject({ state: "done", turn_state: "done" });
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	expect(freshTurnAttempt(database!, KEY, 0, "refused-then-submission")).toBe(1);
 	expect(database?.inbox.pendingCount(KEY)).toBe(0);
 	expect(database?.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
@@ -5025,7 +4894,6 @@ test("a refused running steer waits without rotating or retrying, then sends on 
 	await harness(port);
 	enqueue("m-1", "first");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	enqueue("m-2", "next turn");
 	await manager?.notifyInbound(KEY);
@@ -5055,7 +4923,6 @@ for (const details of [{ code: "receipt_identity_mismatch" }, { code: "unknown_r
 		await harness(port);
 		enqueue("m-1", "first");
 		await manager?.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const first = port.sends[0]!;
 		enqueue("m-2", "held input");
 		await manager?.notifyInbound(KEY);
@@ -5063,7 +4930,6 @@ for (const details of [{ code: "receipt_identity_mismatch" }, { code: "unknown_r
 		expect(database?.inbox.steersHeld(first.opRef).map((row) => row.message_id)).toEqual(["m-2"]);
 		await manager?.stop();
 		manager = new PersonaSessionManager({
-			// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 			database: database!,
 			port,
 			instanceId: "instance-test",
@@ -5105,7 +4971,6 @@ test("startup recovery preserves a bound operation whose running status is known
 	enqueue("m-1", "orphaned by cutover");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const orphan = port.sends[0]!;
 	const opRef = latestOpRef;
 	await manager?.stop();
@@ -5131,7 +4996,6 @@ test("startup recovery preserves a bound operation whose running status is known
 	// (live shape: the id is indexed but the tail router disowns it).
 	disowning.setSessionState(orphan.sessionId, { repo: join(home, "workspace"), live: true, deleted: false });
 	manager = new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port: disowning,
 		instanceId: "instance-test",
@@ -5162,14 +5026,12 @@ test("startup recovery preserves a retired ambiguous bound turn after the broker
 	await harness(port);
 	enqueue("m-1", "torn send");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const ghostOpRef = port.ghostOpRef!;
 	// Only an explicit operator reset retires this still-unresolved turn.
 	await manager?.reset(KEY, JSON.stringify(ORIGIN));
 	enqueue("m-2", "replacement turn");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "replacement turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const replacement = port.sends[0]!;
 	port.complete(replacement.opRef, "answered");
 	await eventually(
@@ -5185,7 +5047,6 @@ test("startup recovery preserves a retired ambiguous bound turn after the broker
 	const logs: string[] = [];
 	const released: string[] = [];
 	manager = new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port,
 		instanceId: "instance-test",
@@ -5298,7 +5159,6 @@ async function idleClosedHarness() {
 	enqueue("before-idle", "earlier conversation");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "first turn did not start");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
 	port.complete(first.opRef, "earlier answer");
 	await eventually(() => terminal.length === 1, "first turn did not finish");
@@ -5323,7 +5183,6 @@ test("가8: the first message after the host closed itself resumes the same sess
 });
 
 test("가8: an attach failure after a closed host requeues the trigger without resending or resuming", async () => {
-	// biome-ignore lint/correctness/noUnusedVariables: ignored using `--suppress`
 	const { port, logs, terminal, sessionId } = await idleClosedHarness();
 	port.staleLive = true;
 	enqueue("after-idle", "작업다됨?");
@@ -5364,7 +5223,6 @@ test("가8: a failed resume cannot authorize a resend or a resume", async () => 
 });
 
 test("가8: a deleted saved session is never resumed", async () => {
-	// biome-ignore lint/correctness/noUnusedVariables: ignored using `--suppress`
 	const { port, sessionId } = await idleClosedHarness();
 	port.staleLive = true;
 	port.deleted = true;
@@ -5395,13 +5253,11 @@ test("startup recovery reconstructs an accepted durable turn and reconciles stat
 	enqueue("m-1", "recover me");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "accepted turn did not start before restart");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const oldManager = manager!;
 	const opRef = port.sends[0]?.opRef;
 	await oldManager.stop();
 	const terminal: string[] = [];
 	manager = new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port,
 		instanceId: "instance-test",
@@ -5693,7 +5549,6 @@ test("PR #337: after turn terminal and restart, an in-context message is never s
 
 	// Restart: fresh manager on the same database.
 	manager = new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port,
 		instanceId: "instance-test",
@@ -5743,7 +5598,6 @@ test("recovery and stop never scan or delete unrelated shared broker sessions", 
 	enqueue("m-1", "recover my pending message");
 	await manager?.recover();
 	await eventually(() => port.sends.length === 1, "pending recovery did not dispatch");
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = port.sends[0]!;
 	expect(port.indexScans).toBe(0);
 	expect(port.deleted).toEqual([]);
@@ -5752,7 +5606,6 @@ test("recovery and stop never scan or delete unrelated shared broker sessions", 
 	expect(port.deleted).toEqual([]);
 
 	manager = new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port,
 		instanceId: "instance-test",
@@ -5826,7 +5679,6 @@ async function preambleHarness(
 	database = await Store.open(join(home, "gateway.db"));
 	registerFixtureBindings(port);
 	manager = new PersonaSessionManager({
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		database: database!,
 		port,
 		instanceId: "instance-test",
@@ -6271,9 +6123,7 @@ test("status-settled predecessor frames cannot affect its reused relay's delayed
 	});
 	enqueue("status-predecessor", "first question");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const first = port.sends[0]!;
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const tail = port.tailsOf(first.sessionId)[0]!;
 	const emit = tail.emit.bind(tail);
 	// The status/result path proves A terminal while its content/terminal never
@@ -6306,7 +6156,6 @@ test("status-settled predecessor frames cannot affect its reused relay's delayed
 	release();
 	await dispatch;
 	await Bun.sleep(10);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const second = port.sends[1]!;
 	expect(port.tailsOf(first.sessionId)[0]).toBe(tail);
 	expect(database?.inbox.turnRow(second.opRef)?.turn_state).toBe("accepted");
@@ -6339,14 +6188,12 @@ async function agentObserverFixture() {
 	});
 	enqueue("observer-seed", "start background work");
 	await manager?.notifyInbound(KEY);
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const send = port.sends[0]!;
 	port.complete(send.opRef, "working");
 	await eventually(() => manager?.state(KEY) === "idle", "seed did not settle");
 	port.setActivity(send.sessionId, "idle", now);
 	database?.transaction((tx) => database?.bindings.touch(tx, KEY, JSON.stringify(ORIGIN)));
 	const end = () => {
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const tail = port.tailsOf(send.sessionId)[0]!;
 		tail.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
 		tail.emit({ kind: "agent_end", rawKind: "agent_end", payload: {}, idle: true, steerEcho: false });
@@ -6372,18 +6219,14 @@ async function agentObserverFixture() {
 for (const outcome of ["terminated", "already_gone"] as const)
 	test(`confirmed stalled-host exit (${outcome}) closes an active observer before unavailable post-stop probes`, async () => {
 		const f = await agentObserverFixture();
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const active = manager!;
 		enqueue("joined-turn", "continue the work");
 		await active.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const joined = f.port.sends[1]!;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const tail = f.port.tailsOf(joined.sessionId)[0]!;
 		expect(joined.sessionId).toBe(f.send.sessionId);
 		f.end();
 		await eventually(() => f.noticeTimers.size === 1, "notice debounce was not armed");
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const queuedDebounce = [...f.noticeTimers][0]!;
 		tail.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
 		await active.reconcile(KEY);
@@ -6450,13 +6293,10 @@ for (const outcome of ["terminated", "already_gone"] as const)
 for (const guard of ["notice", "sweep"] as const)
 	test(`${guard} rejects an observer on a terminating host with unavailable probes`, async () => {
 		const f = await agentObserverFixture();
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const active = manager!;
 		enqueue("terminating-joined-turn", "continue working");
 		await active.notifyInbound(KEY);
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const joined = f.port.sends[1]!;
-		// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 		const tail = f.port.tailsOf(joined.sessionId)[0]!;
 		tail.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
 		await active.reconcile(KEY);
@@ -6578,8 +6418,7 @@ test("capacity-evicted observer warns and sweep reattaches within grace", async 
 test("an autonomous run starting with no jobs retains observation past grace and ends in one notice", async () => {
 	const f = await agentObserverFixture();
 	f.port
-		.tailsOf(f.send.sessionId)[0]
-		?.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
+		.tailsOf(f.send.sessionId)[0]?.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
 	// Drain the tail's serialized callback before evaluating expiry; even a stale
 	// idle liveness report must not override an observed unfinished autonomous run.
 	await Bun.sleep(10);
@@ -6596,7 +6435,6 @@ test("an autonomous run starting with no jobs retains observation past grace and
 
 test("an active autonomous observer lost across its terminal infers completion from idle liveness", async () => {
 	const f = await agentObserverFixture();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const tail = f.port.tailsOf(f.send.sessionId)[0]!;
 	tail.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
 	await Bun.sleep(10);
@@ -6614,7 +6452,6 @@ test("a start missed during observer loss is inferred from working liveness with
 	await f.port.tailsOf(f.send.sessionId)[0]?.close();
 	f.port.setActivity(f.send.sessionId, "working");
 	await f.sweep();
-	// biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
 	const recovered = f.port.tailsOf(f.send.sessionId)[0]!;
 	expect(recovered.running).toBe(false);
 	f.port.setActivity(f.send.sessionId, "idle");
