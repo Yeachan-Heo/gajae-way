@@ -500,6 +500,10 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				? "1=1"
 				: "EXISTS (SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?)";
 		const leaseParams = leaseId === "" ? [] : [leaseId, new Date(now).toISOString()];
+		// The stage predicate below can exclude a quarantined row before its update trigger fires, so
+		// enforce broker quarantine explicitly instead of returning a silent `false`.
+		if (this.#db.prepare("SELECT 1 FROM broker_quarantine WHERE kind = 'monitor' AND subject_id = ?").get(eventId))
+			throw new Error("broker authority: quarantined");
 		// A silent author on an already-authored row is a no-op. Only allow re-authoring from non-authored, non-terminal stages.
 		// The stage check is atomic in the WHERE clause to prevent late [SILENT] from replacing an already-authored answer.
 		const changes = this.#db
