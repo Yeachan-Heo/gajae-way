@@ -26,6 +26,7 @@ import {
 	type GjcServiceTier,
 	type SessionHostConfig,
 } from "../config";
+import { LocalizationResolver, type SupportedLocale } from "../server/localization";
 import { BrokerAuthorityError, type Store } from "../store";
 import {
 	editedOriginalId,
@@ -87,8 +88,6 @@ const STATUS_RECHECK_MAX_MS = 5_000;
  */
 const TERMINAL_TEXT_RECOVERY_WINDOW_MS = 60_000;
 const TERMINAL_TEXT_RECOVERY_MAX_ATTEMPTS = 12;
-const TERMINAL_TEXT_UNRECOVERABLE_NOTICE =
-	"[turn completed] The session finished but its result text was not recoverable. Send the request again if you need the answer.";
 const HOST_TERMINATION_RECHECK_MS = 1_000;
 /**
  * A transcript row is judged against the turn's dispatch floor with this much
@@ -765,14 +764,10 @@ export interface PersonaBindHoldInput {
 export const UNRESOLVED_HOLD_ESCALATED = "unresolved_hold_escalated";
 /** How often a parked dead retired hold is still probed for a late terminal, instead of every sweep. */
 export const RETIRED_HOLD_PARKED_PROBE_MS = 60 * 60_000;
-const UNRESOLVED_HOLD_NOTICE =
-	"[turn held] I could not confirm whether my answer to an earlier message finished, so I will not run it again. Newer messages continue in a fresh session; if that earlier answer still arrives, it will be posted here.";
 
 export const AGENT_RUN_GRACE_MS = 120_000;
 export const AGENT_RUN_MAX_MS = 6 * 60 * 60_000;
 const AGENT_RUN_NOTICE_DELAY_MS = 3_000;
-const AGENT_RUN_NOTICE =
-	"[Gateway notice] The runtime started one or more runs on its own (background job / subagent results) since your last reply that reached this conversation. Text you wrote in those runs was NOT delivered, except replies you gave to user messages. If anything the user should see is still undelivered, send it now in full; otherwise reply [SILENT].";
 
 type AgentRunObserver = {
 	readonly sessionId: string;
@@ -903,6 +898,8 @@ export interface PersonaSessionManagerOptions {
 			payload: { method: string; payload: unknown };
 		};
 	}) => void | Promise<void>;
+	/** Default locale for gateway system notices. */
+	readonly defaultLocale?: SupportedLocale;
 	readonly log?: (line: string, level?: LogLevel) => void;
 }
 
@@ -944,6 +941,7 @@ export class PersonaSessionManager {
 	readonly #onRestartDrainCancelled: PersonaSessionManagerOptions["onRestartDrainCancelled"];
 	readonly #onRestartDrainTransferred: PersonaSessionManagerOptions["onRestartDrainTransferred"];
 	readonly #log: (line: string, level?: LogLevel) => void;
+	readonly #localizationResolver: LocalizationResolver;
 	readonly #actors = new Map<string, OriginActor>();
 	/** Host slots claimed by bind attempts that have not yet become live actors. */
 	readonly #hostAdmissionReservations = new Map<OriginActor, "free" | "replacement">();
@@ -1009,6 +1007,7 @@ export class PersonaSessionManager {
 		this.#onRestartDrainStarted = options.onRestartDrainStarted;
 		this.#onRestartDrainCancelled = options.onRestartDrainCancelled;
 		this.#onRestartDrainTransferred = options.onRestartDrainTransferred;
+		this.#localizationResolver = new LocalizationResolver(options.defaultLocale ?? "en");
 	}
 
 	#observeRestartDrain(event: string, notify: () => void): void {
@@ -1523,6 +1522,23 @@ export class PersonaSessionManager {
 		}
 	}
 
+	/** Render a localized system notice based on the trigger's detected language. */
+	renderLocalizedNotice(messageId: string, vars?: Record<string, string>, trigger?: InboundMessageRow): string {
+		try {
+			let lastHumanMessage: string | undefined;
+
+			if (trigger) {
+				// Use the trigger message itself as the language detection source
+				lastHumanMessage = trigger.body;
+			}
+			return this.#localizationResolver.render(messageId, vars, lastHumanMessage);
+		} catch (error) {
+			this.#log(`localized_notice_render_failed messageId=${messageId} detail=${safeDiagnostic(error)}`, "error");
+			// Fall back to English in case of any error
+			return this.#localizationResolver.render(messageId, vars);
+		}
+	}
+
 	/** False when the notice hook failed; a durable notice intent is then retried. */
 	async emitBindHold(input: PersonaBindHoldInput): Promise<boolean> {
 		try {
@@ -1778,11 +1794,16 @@ class OriginActor {
 		this.#hostHeldSince ??= this.#manager.now();
 		if (this.#lastBindHoldReason !== "host_capacity") {
 			this.#lastBindHoldReason = "host_capacity";
+			const notice = this.#manager.renderLocalizedNotice(
+				"turn.held.capacity",
+				{ live: String(live), max: String(max) },
+				trigger,
+			);
 			await this.#manager.emitBindHold({
 				originKey: this.originKey,
 				trigger,
 				reason: "host_capacity",
-				notice: `[turn held] session hosts at capacity (${live}/${max} busy). Starting as soon as one frees.`,
+				notice,
 				verdict: undefined,
 			});
 		}
@@ -2318,11 +2339,12 @@ class OriginActor {
 				continue;
 			}
 			this.#linkEscalationNotice(trigger);
+			const notice = this.#manager.renderLocalizedNotice("turn.held.unresolved", undefined, trigger);
 			const delivered = await this.#manager.emitBindHold({
 				originKey: this.originKey,
 				trigger,
 				reason: UNRESOLVED_HOLD_ESCALATED,
-				notice: UNRESOLVED_HOLD_NOTICE,
+				notice,
 				verdict: undefined,
 			});
 			if (delivered) database.core.metaDelete(key);
@@ -3414,7 +3436,36 @@ class OriginActor {
 				);
 				if (hold.reason !== this.#lastBindHoldReason) {
 					this.#lastBindHoldReason = hold.reason;
-					await this.#manager.emitBindHold({ originKey: this.originKey, trigger, ...hold, verdict });
+					// Render localized notice based on the broker hold reason
+					let messageId: string;
+					let vars: Record<string, string> = {};
+					if (hold.reason === "broker_wedged" && verdict?.state === "wedged") {
+						messageId = "turn.held.broker_wedged";
+						vars = {
+							since: new Date(verdict.heartbeatAt).toISOString(),
+							why:
+								verdict.reason === "pid_dead"
+									? `daemon pid ${verdict.pid} is dead`
+									: `daemon pid ${verdict.pid} stopped heartbeating`,
+							failures: `${this.#sameDetailBindFailures} consecutive bind failures: ${detail}`,
+							exitDetails: hold.brokerExitReason ? ` (broker exit: ${hold.brokerExitReason})` : "",
+						};
+					} else if (hold.reason === "broker_discovery_absent") {
+						messageId = "turn.held.broker_discovery_absent";
+						vars = {
+							failures: `${this.#sameDetailBindFailures} consecutive bind failures: ${detail}`,
+							exitDetails: hold.brokerExitReason ? ` (broker exit: ${hold.brokerExitReason})` : "",
+						};
+					} else {
+						messageId = "turn.held.sdk_unavailable";
+						vars = {
+							verdict: verdict ? "is live" : "liveness unknown",
+							failures: `${this.#sameDetailBindFailures} consecutive bind failures: ${detail}`,
+							exitDetails: hold.brokerExitReason ? ` (broker exit: ${hold.brokerExitReason})` : "",
+						};
+					}
+					const notice = this.#manager.renderLocalizedNotice(messageId, vars, trigger);
+					await this.#manager.emitBindHold({ originKey: this.originKey, trigger, ...hold, notice, verdict });
 				}
 			}
 		}
@@ -3869,13 +3920,14 @@ class OriginActor {
 		const origin = this.#manager.database.bindings.getOriginByKey(this.originKey);
 		if (!origin) throw new Error("agent run notice has no bound origin");
 		const messageId = `agent-run/${observer.sessionId}/${observer.batchId}`;
+		const localizedNotice = this.#manager.renderLocalizedNotice("gateway.notice.agent_run");
 		const coalesced = this.#manager.database.transaction((tx) => {
 			if (this.#manager.database.inbox.hasPendingAgentRunNotice(this.originKey)) return true;
 			const enqueued = this.#manager.database.inbox.enqueue(tx, {
 				messageId,
 				originKey: this.originKey,
 				originRefJson: JSON.stringify(origin),
-				body: AGENT_RUN_NOTICE,
+				body: localizedNotice,
 				source: "lane_report",
 				receivedAt: new Date(this.#manager.now()).toISOString(),
 			});
@@ -4827,7 +4879,7 @@ class OriginActor {
 					);
 					// The operation completed, so silence is not a valid answer: settle its
 					// trigger with one notice instead of holding the turn forever.
-					text = TERMINAL_TEXT_UNRECOVERABLE_NOTICE;
+					text = this.#manager.renderLocalizedNotice("turn.completed.text_unrecoverable");
 				}
 				await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
 			} else if (!bound.retired || bound.answerWanted) {

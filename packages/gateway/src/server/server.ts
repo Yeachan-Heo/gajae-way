@@ -1032,6 +1032,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		brokerAvailable: () => options.broker?.isAvailable ?? true,
 		// biome-ignore lint/style/noNonNullAssertion: broker is non-null when lambda is called
 		brokerLiveness: options.broker ? () => options.broker!.judgeLiveness() : undefined,
+		defaultLocale: (options.config.locale as "en" | "ko" | undefined) ?? "en",
 		onBindHold: ({ originKey, trigger, notice, reason }: PersonaBindHoldInput) => {
 			let origin: OriginRef;
 			try {

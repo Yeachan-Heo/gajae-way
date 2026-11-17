@@ -168,6 +168,8 @@ export interface GatewayConfigFile {
 	readonly sqlite?: { readonly journalMode?: SqliteJournalMode };
 	/** Chat notices around a stack restart; on unless `enabled` is false. */
 	readonly restartNotice?: RestartNoticeConfig;
+	/** Default locale for gateway system notices; unset means `en`. Detected per-conversation from recent human message language. */
+	readonly locale?: "en" | "ko";
 }
 
 export interface RestartNoticeConfig {
@@ -755,6 +757,13 @@ function parseDmPolicy(value: unknown): DmPolicy {
 	return value as DmPolicy;
 }
 
+function parseLocale(value: unknown): "en" | "ko" | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string" || !((value as string) === "en" || (value as string) === "ko"))
+		throw new ConfigError("config_invalid", 'locale must be "en" or "ko"');
+	return value as "en" | "ko";
+}
+
 function parseGjcConfig(value: unknown): { readonly agentDir?: string } | undefined {
 	if (value === undefined) return undefined;
 	const input = requireObject(value, "gjc");
@@ -851,6 +860,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(parseInterimSpeech(input.interimSpeech) ? { interimSpeech: parseInterimSpeech(input.interimSpeech) } : {}),
 		...(input.memory === undefined ? {} : { memory: parseMemory(input.memory) }),
 		...(parseGjcConfig(input.gjc) ? { gjc: parseGjcConfig(input.gjc) } : {}),
+		...(parseLocale(input.locale) ? { locale: parseLocale(input.locale) } : {}),
 	};
 }
 
@@ -963,6 +973,7 @@ export const RELOADABLE_FIELDS = [
 	"handoffTargets",
 	"sessions",
 	"restartNotice",
+	"locale",
 ] as const;
 
 /** Fields bound to live startup resources and therefore changeable only by restart. */
