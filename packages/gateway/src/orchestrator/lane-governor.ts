@@ -569,24 +569,41 @@ export class LaneGovernor {
 							this.#log(`lane_reclaim_skipped name=${name} reason=unpushed`, "warn");
 							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: true };
 						}
-						// Verify remote is reachable and ref is current; fail closed if unable to establish freshness
+						// Verify work is truly pushed: either to the lane branch or merged into main/dev.
+						// Issue #833: after squash-merge, the original branch may be deleted but the commit
+						// is still part of main/dev. Fail closed if we cannot verify freshness via fetch.
 						const origin = await runGit(["config", "remote.origin.url"], { cwd: repositoryPath });
 						if (origin.exitCode !== 0 || !origin.stdout.trim()) {
-							this.#log(`lane_reclaim_skipped name=${name} reason=remote_url_failed`, "warn");
+							this.#log(`lane_reclaim_skipped name=${name} reason=remote_url_missing`, "warn");
 							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
 						}
-						const lsRemote = await runGit(["ls-remote", origin.stdout.trim()], { cwd: repositoryPath });
-						if (lsRemote.exitCode !== 0) {
-							// Remote is unreachable; fail closed: cannot verify current state
+						// Fetch with timeout: verify remote is reachable and get fresh refs in a temp namespace
+						const fetch = await runGit(["fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin-fresh/*"], {
+							cwd: repositoryPath,
+							timeoutMs: 10_000,
+						});
+						if (fetch.exitCode !== 0) {
 							this.#log(`lane_reclaim_skipped name=${name} reason=remote_unreachable`, "warn");
 							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
 						}
-						// Verify that HEAD commit exists in the actual remote (not just stale local tracking refs)
-						const headInRemote = lsRemote.stdout.split(/\r?\n/).some((line) => {
-							const [sha] = line.split(/\s+/);
-							return sha === head.stdout.trim();
-						});
-						if (!headInRemote) {
+						// Check if HEAD is in freshly-fetched remote refs or merged into main
+						const freshRemote = await runGit(
+							["for-each-ref", `--contains=${head.stdout.trim()}`, "--format=%(refname)", "refs/remotes/origin-fresh"],
+							{ cwd: repositoryPath },
+						);
+						if (freshRemote.exitCode === 0 && freshRemote.stdout.trim()) {
+							// Commit is in a current remote ref: safe to reclaim
+						} else if (existsSync(join(repositoryPath, ".git", "refs", "remotes", "origin-fresh", "main"))) {
+							// Check if HEAD is ancestor of main: handles squash-merge case (issue #833)
+							const isAncestorOfMain = await runGit(
+								["merge-base", "--is-ancestor", head.stdout.trim(), "refs/remotes/origin-fresh/main"],
+								{ cwd: repositoryPath },
+							);
+							if (isAncestorOfMain.exitCode !== 0) {
+								this.#log(`lane_reclaim_skipped name=${name} reason=head_not_in_remote`, "warn");
+								return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+							}
+						} else {
 							this.#log(`lane_reclaim_skipped name=${name} reason=head_not_in_remote`, "warn");
 							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
 						}

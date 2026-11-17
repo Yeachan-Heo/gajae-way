@@ -342,13 +342,13 @@ test("reclaimed work status and resume return an explicit error instead of recre
 					lowDiskFreeBytes: 1024,
 					lowDiskFreeRatio: 0.25,
 				},
-		}).work,
-	).toEqual({
-		doneReclaimGraceMs: DAY,
-		attemptEndedReclaimAfterMs: DAY * 7,
-		lowDiskFreeBytes: 1024,
-		lowDiskFreeRatio: 0.25,
-	});
+			}).work,
+		).toEqual({
+			doneReclaimGraceMs: DAY,
+			attemptEndedReclaimAfterMs: DAY * 7,
+			lowDiskFreeBytes: 1024,
+			lowDiskFreeRatio: 0.25,
+		});
 	} finally {
 		await manager?.stop();
 		await f.close();
@@ -385,21 +385,20 @@ test("regression: stale git worktree registration after external deletion is pru
 	}
 });
 
-test("regression: reclaim requires remote reachability to verify pushed HEAD", async () => {
+test("regression: reclaim requires remote reachability to verify pushed HEAD (issue #833, finding #2)", async () => {
 	const f = await fixture();
 	try {
 		const paths = await managedWorktree(f, "remote-unreachable");
 		// Create and push a commit
 		await addCommit(paths.worktreePath, "test commit");
 		await pushHead(paths);
-		// Delete the upstream to simulate remote being unavailable
-		const upstreamFile = Bun.spawnSync(
-			["git", "config", "remote.origin.url"],
-			{ cwd: paths.repositoryPath, stdout: "pipe" },
-		).stdout.toString().trim();
-		await rm(upstreamFile, { recursive: true });
 		persistJob(f.database, "remote-unreachable", paths, "attempt_ended", NOW - DAY * 7);
-		// Reclaim should fail when remote is unreachable, fail closed
+		// Point remote URL to a non-existent location to simulate unreachable remote
+		Bun.spawnSync(["git", "remote", "set-url", "origin", "https://invalid.example.test/repo.git"], {
+			cwd: paths.repositoryPath,
+			stdout: "pipe",
+		});
+		// Reclaim should fail when remote is unreachable, fail closed (with 10s timeout)
 		const reclaimed = await f.governor.reclaimTerminalWorktrees(NOW);
 		expect(reclaimed).toBe(0);
 		expect(existsSync(paths.worktreePath)).toBe(true);
@@ -416,20 +415,15 @@ test("regression: reclaim detects when HEAD was not pushed to current remote sta
 		// Create and push a commit on the lane branch
 		await addCommit(paths.worktreePath, "test commit");
 		await pushHead(paths);
-		const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], {
-			cwd: paths.worktreePath,
-			stdout: "pipe",
-		}).stdout.toString().trim();
 		// Now delete the upstream branch to simulate it being force-deleted or moved
-		const upstreamPath = Bun.spawnSync(
-			["git", "config", "remote.origin.url"],
-			{ cwd: paths.repositoryPath, stdout: "pipe" },
-		).stdout.toString().trim();
+		const upstreamPath = Bun.spawnSync(["git", "config", "remote.origin.url"], {
+			cwd: paths.repositoryPath,
+			stdout: "pipe",
+		})
+			.stdout.toString()
+			.trim();
 		// Delete the branch from upstream
-		Bun.spawnSync(
-			["git", "-C", upstreamPath, "update-ref", "-d", `refs/heads/${paths.branch}`],
-			{ stdout: "pipe" },
-		);
+		Bun.spawnSync(["git", "-C", upstreamPath, "update-ref", "-d", `refs/heads/${paths.branch}`], { stdout: "pipe" });
 		persistJob(f.database, "stale-ref", paths, "attempt_ended", NOW - DAY * 7);
 		// Reclaim should fail because HEAD is not in current remote
 		const reclaimed = await f.governor.reclaimTerminalWorktrees(NOW);
