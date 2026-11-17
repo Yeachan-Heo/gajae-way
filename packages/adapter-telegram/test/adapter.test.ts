@@ -142,7 +142,7 @@ test.each([
 		const bytes =
 			mimeType === "image/png"
 				? testImage
-				: Buffer.from((await preparePromptImages([testImage])).images[0]?.data, "base64");
+				: Buffer.from((await preparePromptImages([testImage])).images[0]!.data, "base64");
 		const path = join(home, "input-image");
 		await writeFile(path, bytes);
 		const state = await TelegramAdapterState.load(home);
@@ -173,7 +173,7 @@ test.each([
 		const disk = await readFile(state.path, "utf8");
 		expect(disk).not.toContain("private");
 		expect(disk).not.toContain("secret-token");
-		expect(disk).not.toContain((requests[0]?.params as ChatSendParams).images?.[0]?.data);
+		expect(disk).not.toContain((requests[0]?.params as ChatSendParams).images![0]!.data);
 		const reloaded = await TelegramAdapterState.load(home);
 		expect(reloaded.updateId).toBe(81);
 		expect(reloaded.lastRejection).toEqual({ updateId: 81, verb: "chat.send", code: "invalid_params" });
@@ -338,8 +338,8 @@ test("forwards a captioned photo natively without posting or exposing its local 
 		expect(params.text).toBe("what is this @agent\n[image · 122.1 KB]");
 		expect(params.text).not.toContain(path);
 		expect(params.images).toHaveLength(1);
-		expect(params.images?.[0]?.mimeType).toBe("image/jpeg");
-		expect(Buffer.from(params.images?.[0]?.data, "base64").subarray(0, 2)).toEqual(Buffer.from([0xff, 0xd8]));
+		expect(params.images![0]!.mimeType).toBe("image/jpeg");
+		expect(Buffer.from(params.images![0]!.data, "base64").subarray(0, 2)).toEqual(Buffer.from([0xff, 0xd8]));
 		expect(JSON.stringify(requests)).not.toContain("secret-token");
 		expect(await readFile(path)).toEqual(image);
 		expect((await stat(path)).mode & 0o777).toBe(0o600);

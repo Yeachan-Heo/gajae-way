@@ -41,6 +41,7 @@ import {
 	type FailedTurnEvidence,
 	type FailedTurnEvidenceInput,
 	locateSavedTranscript,
+	readFailedTransportCause,
 	readFailedTurnEvidence,
 } from "./failed-turn-evidence";
 import { isSessionGoneCode } from "./gjc-contract";
@@ -1830,8 +1831,8 @@ export class BrokerSessionPort implements SessionPort {
 		let onAbort!: () => void;
 		const cancelled = new Promise<WorkerOutputResult>((resolve) => {
 			onAbort = () => resolve({ status: "unavailable", code: "cancelled" });
-			input.signal?.addEventListener("abort", onAbort, { once: true });
-			if (input.signal?.aborted) onAbort();
+			input.signal!.addEventListener("abort", onAbort, { once: true });
+			if (input.signal!.aborted) onAbort();
 		});
 		try {
 			return await Promise.race([read(), cancelled]);
@@ -2714,10 +2715,10 @@ async function processCommand(pid: number): Promise<ProcessCommandInspection> {
 					line,
 				);
 			if (!match || Number(match[1]) !== pid) return { outcome: "unreadable", reason: "ps_pid_mismatch" };
-			if (match[4]?.startsWith("Z")) {
+			if (match[4]!.startsWith("Z")) {
 				// Linux keeps an exited thread-group leader as a zombie while sibling
 				// threads still run; ps marks that with "l". Neither live nor gone.
-				return match[4]?.includes("l") ? { outcome: "unreadable", reason: "ps_zombie_threads" } : { outcome: "gone" };
+				return match[4]!.includes("l") ? { outcome: "unreadable", reason: "ps_zombie_threads" } : { outcome: "gone" };
 			}
 			return {
 				outcome: "live",

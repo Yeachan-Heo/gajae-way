@@ -28,7 +28,7 @@ test("reconciliation uses retained authored output and otherwise re-dispatches",
 			},
 			respond: async (_id: string, text: string) =>
 				JSON.stringify(
-					(JSON.parse(text.match(/\[.*\]$/s)?.[0]) as Array<{ eventId: string }>).map(({ eventId }) => ({
+					(JSON.parse(text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>).map(({ eventId }) => ({
 						eventId,
 						note: "authored by model",
 					})),
@@ -190,7 +190,7 @@ test("a monitor without its own channel target reports authored notes to the own
 		state: "inflight",
 		origin_key: "discord/dm/owner-dm/peer=owner",
 	});
-	const payload = JSON.parse(rows[0]?.payload_json);
+	const payload = JSON.parse(rows[0]!.payload_json);
 	expect(payload).toMatchObject({
 		origin: { platform: "discord", kind: "dm", conversationId: "owner-dm" },
 		text: "owner-target note",

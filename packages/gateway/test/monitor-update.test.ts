@@ -22,8 +22,8 @@ test("monitor update changes a cron schedule without replacing identity or event
 		const before = registry.get(created.monitorId);
 		if (!before) throw new Error("new monitor was not persisted");
 		const eventId = crypto.randomUUID();
-		database?.transaction((tx) =>
-			database?.monitors.eventCreate(tx, {
+		database!.transaction((tx) =>
+			database!.monitors.eventCreate(tx, {
 				eventId,
 				monitorId: created.monitorId,
 				eventType: "schedule.changed",

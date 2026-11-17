@@ -121,7 +121,7 @@ test("retire closes the session in its job repo, clears the binding, bumps epoch
 		closed: true,
 	});
 	expect(port.closes).toEqual([{ sessionId: "sess-a", repo: "/tmp/worker-repo" }]);
-	expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before?.epoch + 1 });
+	expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before!.epoch + 1 });
 	expect(governor.activeLanes()).toEqual([]);
 	expect(logs).toContain("lane_retired name=a session=sess-a reason=operator closed=true");
 });
@@ -180,7 +180,7 @@ test("a failed close keeps the lane bound unless the broker proves the session g
 		closed: false,
 	});
 	expect(port.closes).toHaveLength(2);
-	expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before?.epoch + 1 });
+	expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: before!.epoch + 1 });
 	expect(governor.activeLanes()).toEqual([]);
 	expect(logs).toContain("lane_retired name=a session=sess-a reason=operator closed=false");
 });

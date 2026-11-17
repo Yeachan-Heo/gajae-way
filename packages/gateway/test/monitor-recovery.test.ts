@@ -2897,7 +2897,7 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 
 			// Later, pointer is replaced with opB
 			const pointerB = JSON.stringify({ sessionId: "s1", opRef: opB, eventIds: [eventId] });
-			db.transaction((_tx) => {
+			db.transaction((tx) => {
 				db.core.metaSet(`monitor_authoring_turn:${eventId}`, pointerB);
 			});
 

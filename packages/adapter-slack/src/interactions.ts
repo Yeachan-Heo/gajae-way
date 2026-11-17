@@ -93,7 +93,8 @@ export function describePanelResponse(event: SlackBlockAction): EngagementPanelR
 	if (event.type !== "block_actions" || !Array.isArray(event.actions) || event.actions.length !== 1) return null;
 	const action = event.actions[0];
 	if (
-		action?.type !== "button" ||
+		!action ||
+		action.type !== "button" ||
 		typeof action.value !== "string" ||
 		typeof event.user?.id !== "string" ||
 		!event.user.id

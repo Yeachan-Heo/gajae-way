@@ -456,7 +456,7 @@ test("a child report drained after the parent's hold lands is retained instead o
 	});
 	await steering;
 	// The parent's observer holds the lane outside this session lock while the first steer is out.
-	const startedAt = Date.parse(f.db.work.workAttemptGet(parent.opRef)?.startedAt);
+	const startedAt = Date.parse(f.db.work.workAttemptGet(parent.opRef)!.startedAt);
 	const live = f.port.status;
 	f.port.status = async (input) =>
 		input.opRef !== parent.opRef
@@ -1278,7 +1278,7 @@ test("source forward link survives definitive completion, check repair, restart 
 	const f = await fixture(8, undefined, { checkStatusClient: checks });
 	const successor = await f.manager.start(f.request());
 	if (!successor.started) throw new Error("successor held");
-	const link = f.db.work.workAttemptGet(f.first.opRef)?.successor;
+	const link = f.db.work.workAttemptGet(f.first.opRef)!.successor;
 	git(f.runtime.cwd, "push", "-u", "origin", git(f.runtime.cwd, "branch", "--show-current"));
 	f.port.status = f.liveStatus;
 	f.port.complete(f.first.opRef, "source actually finished");
@@ -1322,7 +1322,7 @@ test("check repair derives a missing legacy authorization owner from its report 
 		await Bun.sleep(5);
 	}
 	expect(f.port.sends).toHaveLength(3);
-	const repair = f.db.work.workAttemptGet(f.port.sends[2]?.opRef)!;
+	const repair = f.db.work.workAttemptGet(f.port.sends[2]!.opRef)!;
 	expect(repair.parent).toEqual(initial.parent);
 	expect(repair.authorizationOwner).toEqual(initial.authorizationOwner);
 	expect(repair.authorizationOwner).not.toBeNull();
@@ -1354,7 +1354,7 @@ test("automatic successor check repair preserves a response-only replacement nul
 			await Bun.sleep(5);
 		}
 		expect(f.port.sends).toHaveLength(4);
-		const repair = f.db.work.workAttemptGet(f.port.sends[3]?.opRef)!;
+		const repair = f.db.work.workAttemptGet(f.port.sends[3]!.opRef)!;
 		expect(repair.parent).toBeNull();
 		expect(repair.authorizationOwner).toEqual(initial.authorizationOwner);
 		expect(repair.successorOf).toBeUndefined();

@@ -46,8 +46,8 @@ test("monitors sharing an event type each own a separate session and failure dom
 			respond: async (sessionId: string, text: string) => {
 				promptsBySession.set(sessionId, [...(promptsBySession.get(sessionId) ?? []), text]);
 				if (sessionId === poisoned) throw new Error("session terminal: failed");
-				const [event] = JSON.parse(text.match(/\[.*\]$/s)?.[0]) as Array<{ eventId: string }>;
-				return JSON.stringify([{ eventId: event?.eventId, note: "ok" }]);
+				const [event] = JSON.parse(text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>;
+				return JSON.stringify([{ eventId: event!.eventId, note: "ok" }]);
 			},
 		});
 		const pipeline = new MonitorPropagator({
@@ -66,8 +66,8 @@ test("monitors sharing an event type each own a separate session and failure dom
 		const otherSession = sessionByOrigin.get(otherKey)!;
 		expect(waySession).not.toBe(otherSession);
 		// (b) neither session ever sees the other monitor's instruction.
-		expect(promptsBySession.get(waySession)?.join("\n")).not.toContain("OPENINSTINCT-INSTRUCTION");
-		expect(promptsBySession.get(otherSession)?.join("\n")).not.toContain("WAY-INSTRUCTION");
+		expect(promptsBySession.get(waySession)!.join("\n")).not.toContain("OPENINSTINCT-INSTRUCTION");
+		expect(promptsBySession.get(otherSession)!.join("\n")).not.toContain("WAY-INSTRUCTION");
 		// (c) a poisoned session fails only its own monitor.
 		poisoned = waySession;
 		const wayFailed = await pipeline.submitAwaitable(way.monitorId, "backlog.watch", {});

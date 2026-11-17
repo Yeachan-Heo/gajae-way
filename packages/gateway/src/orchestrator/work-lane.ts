@@ -1,7 +1,7 @@
 import { execSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve, } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import {
 	type ChatMessagePayload,
 	isSilentOutput,
@@ -1282,7 +1282,7 @@ export class WorkLaneManager {
 		const predecessor = await this.#successorSource(input, context.authorizationOwner, true);
 		const successorOf = predecessor
 			? {
-					name: input.successorOf?.name,
+					name: input.successorOf!.name,
 					opRef: predecessor.opRef,
 					sessionId: predecessor.sessionId,
 					baseSha: input.base!,
@@ -1490,7 +1490,8 @@ export class WorkLaneManager {
 				// A settled attempt whose host is gone has no live op to report.
 				if (successor || provenance || (job.state === "awaiting_operator" && attempt.endedAt === undefined))
 					opUnavailable = true;
-				else if (!isSessionUnavailable(error) && attempt.endedAt === undefined)
+				else if (attempt.endedAt === undefined || !isSessionUnavailable(error))
+					throw workError("work status unavailable", "status_unavailable", { ...attempt, jobId: job.jobId });
 					throw workError("work status unavailable", "status_unavailable", { ...attempt, jobId: job.jobId });
 			}
 			const current = this.#db.bindings.getSessionRecord(key);
@@ -2550,7 +2551,8 @@ export class WorkLaneManager {
 			// Another writer moved the lane on while the checks were read.
 			const currentCycle = job?.awaitingChecks;
 			if (
-				job?.state !== "awaiting_checks" ||
+				!job ||
+				job.state !== "awaiting_checks" ||
 				!currentCycle ||
 				currentCycle.since !== cycle.since ||
 				currentCycle.prNumber !== cycle.prNumber ||
@@ -2619,7 +2621,7 @@ export class WorkLaneManager {
 		if (cycle.prNumber === null) throw new Error("cannot re-steer before discovering the open PR");
 		const counted = recordChecksRetry(job, this.#at());
 		this.#putJob(name, counted);
-		const retries = counted.awaitingChecks?.retries;
+		const retries = counted.awaitingChecks!.retries;
 		const names = failingChecks.length > 0 ? failingChecks.join(", ") : "unnamed checks";
 		const log = failureLogTail ? `\nFailed log tail:\n${utf8Prefix(sanitizeDiagnostic(failureLogTail), 3_200)}` : "";
 		const text = `PR #${cycle.prNumber} checks failed on ${cycle.headSha.slice(0, 12)}: ${names}. Fix the failures, commit and push again (re-steer ${retries}/${AWAITING_CHECKS_RETRY_LIMIT}).${log}`;
@@ -3029,7 +3031,7 @@ export class WorkLaneManager {
 		}
 		if (this.#attemptByOpRef(opRef)) return;
 		const fresh = this.#db.work.laneReportGet(row.report_id);
-		if (fresh?.state !== "claimed") return;
+		if (!fresh || fresh.state !== "claimed") return;
 		if (!this.#reportMutation((tx) => this.#db.work.laneReportRequeue(tx, row.report_id, opRef))) return;
 		this.#logLaneReportTransition(fresh, "claimed", "pending", "wake_unprepared");
 		const parentJob = this.#job(row.parent_name);
@@ -3688,8 +3690,8 @@ function safeStatus(status: PromptStatusBody): PromptStatusBody {
 				: {}),
 			...Object.fromEntries(
 				(Object.keys(WORK_OUTCOME_TOKENS) as Array<keyof typeof WORK_OUTCOME_TOKENS>)
-					.filter((key) => (WORK_OUTCOME_TOKENS[key] as readonly string[]).includes(status.outcome?.[key] ?? ""))
-					.map((key) => [key, status.outcome?.[key]]),
+					.filter((key) => (WORK_OUTCOME_TOKENS[key] as readonly string[]).includes(status.outcome![key] ?? ""))
+					.map((key) => [key, status.outcome![key]]),
 			),
 		};
 	if (status.error)
@@ -3817,7 +3819,7 @@ export function reportText(
 	if (status?.status === "failed") {
 		if (status.receiptState) factsLines.push(`receiptState=${status.receiptState}`);
 		if (status.error?.code === "agent_error" || reasons.has(status.error?.code ?? ""))
-			factsLines.push(`errorCode=${status.error?.code}`);
+			factsLines.push(`errorCode=${status.error!.code}`);
 		for (const key of Object.keys(WORK_OUTCOME_TOKENS) as Array<keyof typeof WORK_OUTCOME_TOKENS>) {
 			const token = status.outcome?.[key];
 			if (token && (WORK_OUTCOME_TOKENS[key] as readonly string[]).includes(token)) factsLines.push(`${key}=${token}`);
