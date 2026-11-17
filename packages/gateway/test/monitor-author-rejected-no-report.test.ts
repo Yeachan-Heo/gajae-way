@@ -47,11 +47,9 @@ test("REGRESSION: MonitorPropagator rejects late non-silent on authored row via 
 				payloadJson: "{}",
 				firedAt: new Date().toISOString(),
 			});
-			// Author the event - this sets the stage to authored
+			// Author the event - this sets the stage to authored and stores the output
 			const result = database.monitors.authorFenced(tx, eventId, "", "original answer", false);
 			expect(result).toBe(true);
-			// Store the output
-			database.monitors.authoredOutputCreate(tx, eventId, "original answer");
 		});
 
 		expect(database.monitors.eventGet(eventId)?.stage).toBe("authored");
@@ -136,11 +134,9 @@ test("REGRESSION: MonitorPropagator rejects late SILENT on authored row via reco
 				payloadJson: "{}",
 				firedAt: new Date().toISOString(),
 			});
-			// Author the event with SILENT
+			// Author the event with SILENT - this sets the stage to authored and stores the output
 			const result = database.monitors.authorFenced(tx, eventId, "", "[SILENT]", false);
 			expect(result).toBe(true);
-			// Store the output
-			database.monitors.authoredOutputCreate(tx, eventId, "[SILENT]");
 		});
 
 		expect(database.monitors.eventGet(eventId)?.stage).toBe("authored");
