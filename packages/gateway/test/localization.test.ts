@@ -8,17 +8,17 @@ test("detectLanguage detects Korean with Hangul characters", () => {
 	assert.equal(detectLanguage(koreanText), "ko");
 });
 
-test("detectLanguage detects English with minimal Hangul", () => {
+test("detectLanguage detects English with ASCII characters", () => {
 	const englishText = "Hello, this is English text.";
-	assert.equal(detectLanguage(englishText), undefined);
+	assert.equal(detectLanguage(englishText), "en");
 });
 
-test("detectLanguage returns undefined for mixed low-ratio Hangul", () => {
-	// Very little Hangul mixed with English
-	const mixedText = "Hello 한글 world";
+test("detectLanguage returns undefined for text with low Hangul and low Latin ratio", () => {
+	// Numbers, symbols, and spaces with minimal recognizable language markers
+	const mixedText = "123 한 456 789 ... !!! ???";
 	const result = detectLanguage(mixedText);
-	// Should return undefined or ko depending on ratio
-	assert(result === undefined || result === "ko");
+	// Should return undefined when neither language ratio is high enough
+	assert.equal(result, undefined, "Should not detect language in symbol/number-heavy text");
 });
 
 test("detectLanguage handles empty string", () => {
@@ -47,11 +47,12 @@ test("LocalizationResolver detects Korean from last human message", () => {
 	assert(rendered.includes("[턴 보류됨]"));
 });
 
-test("LocalizationResolver respects English default for English messages", () => {
-	const resolver = new LocalizationResolver("en");
-	const englishMessage = "Hello, this is English.";
+test("LocalizationResolver respects English detection for English messages", () => {
+	const resolver = new LocalizationResolver("ko");
+	// Even with ko default, English message should be detected and rendered in English
+	const englishMessage = "Hello, this is English text.";
 	const rendered = resolver.render("turn.held.capacity", { live: "5", max: "10" }, englishMessage);
-	assert(rendered.includes("[turn held]"));
+	assert(rendered.includes("[turn held]"), "Should render English message in English even with ko default");
 });
 
 test("LocalizationResolver substitutes variables correctly", () => {
@@ -129,4 +130,27 @@ test("LocalizationResolver with high Hangul ratio detects Korean", () => {
 	const rendered = resolver.render("turn.held.capacity", { live: "1", max: "2" }, koreanDominant);
 	// Should be rendered in Korean
 	assert(rendered.includes("[턴 보류됨]"));
+});
+
+test("detectLanguage detects Korean even with English words", () => {
+	// Korean-dominant text with some English words
+	const koreanWithEnglish = "Hello 안녕하세요. 한국어 테스트입니다. World";
+	const result = detectLanguage(koreanWithEnglish);
+	assert.equal(result, "ko", "Should detect Korean as dominant language");
+});
+
+test("LocalizationResolver.setDefaultLocale updates the default", () => {
+	const resolver = new LocalizationResolver("en");
+	let rendered = resolver.render("turn.held.unresolved");
+	assert(rendered.includes("[turn held]"), "Should start with English");
+
+	// Update to Korean
+	resolver.setDefaultLocale("ko");
+	rendered = resolver.render("turn.held.unresolved");
+	assert(rendered.includes("[턴 보류됨]"), "Should now render in Korean");
+
+	// Update back to English
+	resolver.setDefaultLocale("en");
+	rendered = resolver.render("turn.held.unresolved");
+	assert(rendered.includes("[turn held]"), "Should render in English again");
 });

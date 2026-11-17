@@ -11,10 +11,11 @@ export type SupportedLocale = "en" | "ko";
 export function detectLanguage(text: string): SupportedLocale | undefined {
 	if (!text || text.trim().length === 0) return undefined;
 
-	// Count Hangul characters (Korean script)
+	// Count Hangul characters (Korean script) and ASCII/Latin characters (English)
 	// Hangul syllables: AC00–D7A3 (19,968 characters)
 	// Hangul jamo: 1100–11FF (pre-composed), 3130–318F (compatibility)
 	let hangulCount = 0;
+	let latinCount = 0;
 	let totalCharCount = 0;
 
 	for (const char of text) {
@@ -29,11 +30,24 @@ export function detectLanguage(text: string): SupportedLocale | undefined {
 		else if ((code >= 0x1100 && code <= 0x11ff) || (code >= 0x3130 && code <= 0x318f)) {
 			hangulCount++;
 		}
+		// ASCII/Latin letters (A-Z, a-z)
+		else if ((code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a)) {
+			latinCount++;
+		}
 	}
 
+	const hangulRatio = totalCharCount > 0 ? hangulCount / totalCharCount : 0;
+	const latinRatio = totalCharCount > 0 ? latinCount / totalCharCount : 0;
+
 	// If more than 10% of characters are Hangul, treat as Korean
-	if (totalCharCount > 0 && hangulCount / totalCharCount > 0.1) {
+	if (hangulRatio > 0.1) {
 		return "ko";
+	}
+
+	// If more than 20% of characters are Latin/ASCII letters, treat as English
+	// (Higher threshold to avoid false positives from mixed-language text)
+	if (latinRatio > 0.2) {
+		return "en";
 	}
 
 	return undefined;
@@ -115,10 +129,15 @@ function renderMessage(catalog: MessageCatalog, messageId: string, vars: Record<
  * the conversation's most recent message, falling back to configured default.
  */
 export class LocalizationResolver {
-	readonly #defaultLocale: SupportedLocale;
+	#defaultLocale: SupportedLocale;
 
 	constructor(defaultLocale: SupportedLocale = "en") {
 		this.#defaultLocale = defaultLocale;
+	}
+
+	/** Update the default locale (called when config reloads). */
+	setDefaultLocale(locale: SupportedLocale): void {
+		this.#defaultLocale = locale;
 	}
 
 	/** Get the effective locale for a message. */

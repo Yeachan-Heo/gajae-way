@@ -370,6 +370,9 @@ async function applyConfigReload(
 	runtime.personaSessions.setStallTimeoutMs(result.config.stallTimeoutMs);
 	runtime.personaSessions.setHostLimits(result.config.sessions);
 	options.broker?.setMaxPoolSize(result.config.sessions?.maxLiveHosts ?? DEFAULT_SESSIONS_MAX_LIVE_HOSTS);
+	if (result.changed.includes("locale")) {
+		runtime.personaSessions.setDefaultLocale(result.config.locale ?? "en");
+	}
 	console.info(
 		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
 	);

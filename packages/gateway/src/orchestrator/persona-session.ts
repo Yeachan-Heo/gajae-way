@@ -1539,6 +1539,11 @@ export class PersonaSessionManager {
 		}
 	}
 
+	/** Update the default locale when config reloads. */
+	setDefaultLocale(locale: SupportedLocale): void {
+		this.#localizationResolver.setDefaultLocale(locale);
+	}
+
 	/** False when the notice hook failed; a durable notice intent is then retried. */
 	async emitBindHold(input: PersonaBindHoldInput): Promise<boolean> {
 		try {
