@@ -2734,26 +2734,44 @@ export class MonitorPropagator {
 		const intentId = `monitor-event-intent:${eventId}`;
 		const result = this.#database.transaction((tx) => {
 			const updated = this.#database.monitors.authorFenced(tx, eventId, "", note, noDelivery);
-			// Decouple memory-intent repair from permission to replace the answer.
-			// Always ensure memory intent exists if it doesn't, even if the row update failed.
-			if (!this.#database.memory.get(intentId))
-				this.#database.memory.createIntent(tx, {
-					id: intentId,
-					kind: "monitor-event",
-					payloadJson: JSON.stringify({
+			if (updated) {
+				// Row was successfully updated: create/update intent with new note and enqueue report.
+				if (!this.#database.memory.get(intentId))
+					this.#database.memory.createIntent(tx, {
+						id: intentId,
 						kind: "monitor-event",
-						identity: `monitor-event:${eventId}`,
-						originRefJson: JSON.stringify(eventTypeOrigin(eventRow.event_type)),
-						userText: `Monitor event ${eventId}: ${eventRow.event_type}`,
-						replyText: note,
-					}),
-				});
-			if (reportable && monitor) this.#enqueueMonitorReport(tx, monitor, eventRow, note);
+						payloadJson: JSON.stringify({
+							kind: "monitor-event",
+							identity: `monitor-event:${eventId}`,
+							originRefJson: JSON.stringify(eventTypeOrigin(eventRow.event_type)),
+							userText: `Monitor event ${eventId}: ${eventRow.event_type}`,
+							replyText: note,
+						}),
+					});
+				if (reportable && monitor) this.#enqueueMonitorReport(tx, monitor, eventRow, note);
+			} else if (!this.#database.memory.get(intentId)) {
+				// Row update failed (authorFenced returned false): for memory repair, create missing intent
+				// with STORED output only, never enqueue a report or notify.
+				const storedOutput = this.#database.monitors.authoredOutput(eventId);
+				if (storedOutput)
+					this.#database.memory.createIntent(tx, {
+						id: intentId,
+						kind: "monitor-event",
+						payloadJson: JSON.stringify({
+							kind: "monitor-event",
+							identity: `monitor-event:${eventId}`,
+							originRefJson: JSON.stringify(eventTypeOrigin(eventRow.event_type)),
+							userText: `Monitor event ${eventId}: ${eventRow.event_type}`,
+							replyText: storedOutput,
+						}),
+					});
+			}
 			return updated;
 		});
 		// Wake the closure queue for the intent (always, even if row update failed).
 		this.#memory.enqueueExistingId(intentId);
-		if (reportable && monitor?.reportTo) this.#notifyMonitorReport(monitor.reportTo);
+		// Only notify if the row was successfully updated and is reportable.
+		if (result && reportable && monitor?.reportTo) this.#notifyMonitorReport(monitor.reportTo);
 		// Only emit stage if the row was actually updated.
 		if (result) this.#emitStage(eventRow, noDelivery ? "authored_no_delivery" : "authored");
 	}
