@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
 	type ChatMessagePayload,
 	isSilentOutput,
+	isWorkRefusalCause,
 	type OriginRef,
 	originKey,
 	validateOriginRef,
@@ -102,6 +103,7 @@ export interface WorkAttemptTerminalEvidence {
 	readonly kind: "broker" | "local";
 	readonly observedAt: string;
 	readonly reasonCode: string;
+	readonly refusalCode?: string;
 	readonly status?: PromptStatusBody;
 }
 
@@ -387,6 +389,10 @@ export function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: strin
 		const terminal = value.terminal;
 		workAssert(["broker", "local"].includes(terminal.kind) && workTime(terminal.observedAt));
 		workAssert(WORK_REASON_CODES.has(terminal.reasonCode));
+		if (terminal.refusalCode !== undefined) {
+			workAssert(terminal.kind === "local" && terminal.reasonCode === "send_rejected" && terminal.status === undefined);
+			workAssert(isWorkRefusalCause(terminal.refusalCode));
+		}
 		if (terminal.kind === "broker") workAssert(terminal.status !== undefined);
 		if (terminal.status !== undefined) {
 			const status = terminal.status;
