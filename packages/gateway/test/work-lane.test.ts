@@ -839,7 +839,7 @@ test("status is pure during a run wait and steer returns the exact supplied clie
 	const snapshot = await f.manager.status({ name: "a" });
 	expect(snapshot).toMatchObject({ attempt: { opRef: op }, op: { status: "in_flight" } });
 	expect(f.db.work.laneJobJson(snapshot.jobId)).toBe(before);
-	expect(f.db.bindings.workLaneRows()[0]!.last_activity_at).toBe(activity);
+	expect(f.db.bindings.workLaneRows()[0]?.last_activity_at).toBe(activity);
 	const steer = await f.manager.steer({ name: "a", text: "correction" });
 	expect(steer.steered).toBe(true);
 	if (steer.steered) expect(f.port.steers[0]?.clientRef).toBe(steer.clientRef);
@@ -4663,7 +4663,7 @@ test("CAS loss does not fan out or perform a separate history/activity update", 
 	const seen = calls;
 	await until(() => calls > seen);
 	expect(f.db.work.laneJobJson(result.jobId)).toBe(history);
-	expect(f.db.bindings.workLaneRows()[0]!.last_activity_at).toBe(activity);
+	expect(f.db.bindings.workLaneRows()[0]?.last_activity_at).toBe(activity);
 	expect(f.notices).toHaveLength(0);
 	expect(f.db.outbox.rows()).toHaveLength(0);
 	f.db.work.workAttemptSettle = settle;
