@@ -71,7 +71,6 @@ test("installPinnedGjc prunes old versions while retaining current and its prede
 		const layout = homeLayout(directory);
 		expect(await readlink(layout.gjcCurrent)).toBe("0.21.0");
 		expect((await readdir(layout.gjcPrefix)).sort()).toEqual(["0.19.0", "0.21.0", "current"]);
-
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
