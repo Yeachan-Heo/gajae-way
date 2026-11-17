@@ -111,8 +111,8 @@ test("queued attachment abort leaves the running capacity owner untouched", asyn
 	expect(await outcome).toMatchObject({ name: "AbortError" });
 	expect(tail.activeCount).toBe(1);
 	expect(relays).toHaveLength(1);
-	expect(relays[0]!.closed).toBe(false);
-	expect(relays[0]!.written.some((frame) => frame.type === "control_request")).toBe(false);
+	expect(relays[0]?.closed).toBe(false);
+	expect(relays[0]?.written.some((frame) => frame.type === "control_request")).toBe(false);
 	await owner.close();
 	const next = await tail.attach({ sessionId: "next", brokerGeneration: 1, repo: "/tmp" });
 	expect(tail.activeCount).toBe(1);
@@ -390,13 +390,13 @@ test("control responses resolve by id; a refused control carries its error code"
 	// Out-of-order answers land on the right waiter.
 	relay.host({
 		type: "control_response",
-		id: requestB!.id,
+		id: requestB?.id,
 		ok: false,
 		error: { code: "busy", message: "turn running" },
 	});
 	relay.host({
 		type: "control_response",
-		id: requestA!.id,
+		id: requestA?.id,
 		ok: true,
 		result: { commandId: "c", turnId: "t", accepted: true },
 	});
@@ -638,7 +638,7 @@ test("a relay that ends mid-turn reports the loss, fails pending requests, and r
 	handle.beginTurn("op-1", CORRELATION);
 	handle.setTurnRunning(true);
 	const pending = handle.query("turn.result", { kind: "prompt", clientRef: "op-1" });
-	relays[0]!.end();
+	relays[0]?.end();
 	await expect(pending).rejects.toBeInstanceOf(RelayClosedError);
 	await Bun.sleep(10);
 	expect(lost).toEqual([{ sessionId: "s1", brokerGeneration: 3, opRef: "op-1" }]);
@@ -647,9 +647,9 @@ test("a relay that ends mid-turn reports the loss, fails pending requests, and r
 	// The reopened relay is usable for commands again.
 	const after = handle.query("turn.result", { kind: "prompt", clientRef: "op-1" });
 	await Bun.sleep(0);
-	const request = relays[1]!.lastRequest("query_request")!;
+	const request = relays[1]?.lastRequest("query_request")!;
 	expect(request.connectionId).toBe("connection:2");
-	relays[1]!.host({ type: "query_response", id: request.id, ok: true, result: { status: "terminal_ok" } });
+	relays[1]?.host({ type: "query_response", id: request.id, ok: true, result: { status: "terminal_ok" } });
 	expect(await after).toMatchObject({ ok: true });
 	await handle.close();
 });
@@ -820,14 +820,14 @@ test("providers are registered after a reused turn's transport reopens", async (
 	});
 	const handle = await tail.attach({ sessionId: "providers", brokerGeneration: 1, repo: "/tmp" });
 	handle.beginTurn("first");
-	expect(relays[0]!.written.filter((frame) => frame.type === "register_provider")).toMatchObject([
+	expect(relays[0]?.written.filter((frame) => frame.type === "register_provider")).toMatchObject([
 		{ capability: "permission", definitions: { methods: ["request"] } },
 	]);
 	handle.beginTurn("second");
-	relays[0]!.end();
+	relays[0]?.end();
 	await Bun.sleep(10);
 	expect(relays).toHaveLength(2);
-	expect(relays[1]!.written.filter((frame) => frame.type === "register_provider")).toMatchObject([
+	expect(relays[1]?.written.filter((frame) => frame.type === "register_provider")).toMatchObject([
 		{ capability: "permission", definitions: { methods: ["request"] } },
 	]);
 	await handle.close();
@@ -890,13 +890,13 @@ test("an observer remains capacity-evictable while an autonomous run is active",
 	});
 	handle.setObserving(true);
 	const start = { type: "agent_start", sessionId: "observed" };
-	relays[0]!.host(start);
-	relays[0]!.host({ type: "event", kind: "agent_start", payload: start });
+	relays[0]?.host(start);
+	relays[0]?.host({ type: "event", kind: "agent_start", payload: start });
 	await Bun.sleep(10);
 	expect((handle as unknown as { readonly running: boolean }).running).toBe(false);
 	expect(lifecycle).toEqual([["agent_start", false]]);
 	const successor = await tail.attach({ sessionId: "other", brokerGeneration: 1, repo: "/tmp", priority: "retired" });
-	expect(relays[0]!.closed).toBe(true);
+	expect(relays[0]?.closed).toBe(true);
 	await successor.close();
 });
 
@@ -922,7 +922,7 @@ test("a relay that dies six times in a row is declared dead: the handle closes a
 	handle.beginTurn("op-1", CORRELATION);
 	handle.setTurnRunning(true);
 	for (let i = 0; i < 8; i++) {
-		relays.at(-1)!.end();
+		relays.at(-1)?.end();
 		await Bun.sleep(5);
 	}
 	expect(dead).toEqual([{ sessionId: "s1", brokerGeneration: 2, opRef: "op-1" }]);
@@ -952,7 +952,7 @@ test("request replies do not count as turn progress: a silent turn still stalls 
 		await Bun.sleep(0);
 		relay.host({
 			type: "query_response",
-			id: relay.lastRequest("query_request")!.id,
+			id: relay.lastRequest("query_request")?.id,
 			ok: true,
 			result: { status: "in_flight" },
 		});

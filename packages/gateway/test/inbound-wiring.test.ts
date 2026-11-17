@@ -190,7 +190,7 @@ test("a message arriving while a persistent turn is in flight is steered into th
 	expect(sessionPort.steers.map((steer) => steer.text.replace(/^\[Additional message[^\n]*\]\n/, ""))).toEqual([
 		"second",
 	]);
-	sessionPort.complete(sessionPort.sends[0]!.opRef, "reply to first");
+	sessionPort.complete(sessionPort.sends[0]?.opRef, "reply to first");
 	await eventually(
 		() => client.frames.some((frame) => frame.event === "chat.message"),
 		"the completed turn never replied",

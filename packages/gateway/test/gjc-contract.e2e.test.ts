@@ -106,7 +106,7 @@ async function processSnapshot(env: Record<string, string>, pid?: number): Promi
 			if (line.trim()) throw new Error("unparseable process ownership snapshot");
 			return [];
 		}
-		const command = match[3]!.trim();
+		const command = match[3]?.trim();
 		return [{ pid: Number(match[1]), ppid: Number(match[2]), command }];
 	});
 	if (records.length === 0) throw new Error("empty process ownership snapshot");

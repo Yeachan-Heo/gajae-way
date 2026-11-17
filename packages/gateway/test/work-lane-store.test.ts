@@ -5,9 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LOOPBACK_ORIGIN, type OriginRef, originKey } from "@gajae-gateway/protocol";
 import { appendAttempt, closeAttempt, createLaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
-import { bootGateway } from "../src/boot";
 import { buildDeliveryPayload, DeliveryService } from "../src/delivery/delivery";
-import { readPinnedGjcVersion } from "../src/orchestrator/broker";
 import { DatabaseStartupError, LATEST_SCHEMA_VERSION, Store } from "../src/store";
 import {
 	resolveLaneReportOrigin,
@@ -1220,8 +1218,8 @@ describe("work attempt durable transactions", () => {
 				refusalCode: refusalCode as string,
 			})),
 			{ ...terminal, reasonCode: "session_dead" },
-			{ ...terminal, status: f.settlement.terminal!.status },
-			{ ...terminal, kind: "broker" as const, status: f.settlement.terminal!.status },
+			{ ...terminal, status: f.settlement.terminal?.status },
+			{ ...terminal, kind: "broker" as const, status: f.settlement.terminal?.status },
 		]) {
 			expect(() =>
 				f.database.transaction((tx) => updateAttempt(f.database, tx, f.runtime.opRef, 0, { terminal: invalid })),
@@ -1777,7 +1775,7 @@ DELETE FROM schema_migrations WHERE version >= 21;
 
 		// No-op update should return the current runtime without bumping version
 		expect(patched).toBeTruthy();
-		expect(patched!.version).toBe(0);
+		expect(patched?.version).toBe(0);
 
 		// No journal entry should be created for no-op update
 		const journalEvents = f.raw
@@ -1807,8 +1805,8 @@ DELETE FROM schema_migrations WHERE version >= 21;
 
 		// Update should succeed and bump version
 		expect(patched).toBeTruthy();
-		expect(patched!.version).toBe(1);
-		expect(patched!.sendPhase).toBe("accepted");
+		expect(patched?.version).toBe(1);
+		expect(patched?.sendPhase).toBe("accepted");
 
 		// Journal should have the acceptance event (not update, since this changes acceptance status)
 		const journalEventsReal = f.raw

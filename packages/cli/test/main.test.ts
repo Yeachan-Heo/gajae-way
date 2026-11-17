@@ -1620,7 +1620,7 @@ describe("work operator commands", () => {
 		...successorOptions.map(
 			(option) =>
 				[
-					"duplicate " + option[0],
+					`duplicate ${option[0]}`,
 					"start",
 					"replacement",
 					["--repo", ".", "--base", successorBase],
@@ -1633,7 +1633,7 @@ describe("work operator commands", () => {
 			.map(
 				(option, index) =>
 					[
-						"blank " + option[0],
+						`blank ${option[0]}`,
 						"start",
 						"replacement",
 						["--repo", ".", "--base", successorBase],

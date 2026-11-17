@@ -178,7 +178,7 @@ test("broker restart mid-attach: the never-sent trigger is answered once after t
 		f.elapse(RECOVERY_BUDGET_MS);
 		await until(() => f.answers.length === 1);
 		expect(port.sendAttempts).toHaveLength(1);
-		expect(f.answers[0]!.text).toBe("answer");
+		expect(f.answers[0]?.text).toBe("answer");
 	} finally {
 		await f.manager.stop();
 	}
@@ -200,7 +200,7 @@ test("broker restart mid-send: an accepted prompt whose receipt was lost is reco
 	f.enqueue("m-1", "answer me");
 	try {
 		await f.manager.recover();
-		const opRef = port.sendAttempts[0]!.opRef;
+		const opRef = port.sendAttempts[0]?.opRef;
 		expect(f.db.inbox.turnRow(opRef)?.turn_state).not.toBe("done");
 		await f.bumpGeneration();
 		await f.manager.recover();
@@ -238,8 +238,8 @@ test("host death mid-turn: past the hold bound the origin answers new messages, 
 		await until(() => f.answers.length === 1);
 		const after = port.sendAttempts.slice(1);
 		expect(after).toHaveLength(1);
-		expect(after[0]!.text).toContain("newer message");
-		expect(after[0]!.text).not.toContain("held request");
+		expect(after[0]?.text).toContain("newer message");
+		expect(after[0]?.text).not.toContain("held request");
 		expect(attemptsByOpRef(port).get(held.opRef)).toBe(1);
 		expect(f.logs.some((line) => line.startsWith("recovery_hold_escalated"))).toBe(true);
 	} finally {
@@ -438,7 +438,7 @@ test("gateway crash during the busy wait: restart requeues from the journaled re
 	f.enqueue("m-1", "answer me");
 	void f.manager.recover();
 	await until(() => port.sendAttempts.length === 1);
-	const refused = port.sendAttempts[0]!.opRef;
+	const refused = port.sendAttempts[0]?.opRef;
 	expect(f.db.inbox.sendAttempted(refused)).toBe(true);
 	// The process dies mid-wait. A new process sees only the database.
 	port.busy = undefined;
@@ -458,7 +458,7 @@ test("gateway crash during the busy wait: restart requeues from the journaled re
 	try {
 		await restarted.recover();
 		await until(() => f.answers.length === 1);
-		expect(f.answers[0]!.opRef).not.toBe(refused);
+		expect(f.answers[0]?.opRef).not.toBe(refused);
 		expect(
 			f.logs.some(
 				(line) =>
@@ -508,9 +508,9 @@ for (const outcome of ["host_finishes", "host_dies"] as const) {
 				// Exactly one new prompt: the newer message, never the ambiguous request under a fresh op-ref.
 				const after = port.sendAttempts.slice(1);
 				expect(after).toHaveLength(1);
-				expect(after[0]!.text).toContain("newer message");
-				expect(after[0]!.text).not.toContain("request during compaction");
-				expect(f.answers[0]!.opRef).toBe(after[0]!.opRef);
+				expect(after[0]?.text).toContain("newer message");
+				expect(after[0]?.text).not.toContain("request during compaction");
+				expect(f.answers[0]?.opRef).toBe(after[0]?.opRef);
 				expect(f.db.inbox.turnRow(ambiguous.opRef)?.turn_state).not.toBe("done");
 			}
 			expect(attemptsByOpRef(port).get(ambiguous.opRef)).toBe(1);

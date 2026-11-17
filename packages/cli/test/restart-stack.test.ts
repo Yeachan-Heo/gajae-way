@@ -1354,7 +1354,7 @@ test("a nonzero systemd-run result fails the receipt and cannot be replayed as a
 		expect(receipt?.state).toBe("failed");
 		expect(receipt?.detail).toContain("systemd-run exited with status 23");
 		expect(receipt?.steps.every((step) => step.result === "skipped")).toBe(true);
-		await expect(runRestartStack({ home, id: receipt!.id })).rejects.toThrow(
+		await expect(runRestartStack({ home, id: receipt?.id })).rejects.toThrow(
 			"receipt is failed; refusing to start worker",
 		);
 	} finally {

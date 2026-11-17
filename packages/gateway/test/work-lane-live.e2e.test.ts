@@ -343,7 +343,7 @@ liveTest(
 			let active = false;
 			while (Date.now() < activeDeadline) {
 				const status = await statusObservation.run({ deadline: activeDeadline, method: "port.status.active" }, () =>
-					port!.status({ sessionId: activeSessionId, repo, opRef: started.opRef }),
+					port?.status({ sessionId: activeSessionId, repo, opRef: started.opRef }),
 				);
 				if (status.status.status === "in_flight") {
 					active = true;
@@ -374,7 +374,7 @@ liveTest(
 			const deadline = Date.now() + 120_000;
 			while (Date.now() < deadline) {
 				const status = await statusObservation.run({ deadline, method: "manager.status -> port.status" }, () =>
-					manager!.status({ name: "live-smoke" }),
+					manager?.status({ name: "live-smoke" }),
 				);
 				expect(status.sessionId).toBe(activeSessionId);
 				expect(status.attempt?.opRef).toBe(started.opRef);
@@ -398,7 +398,7 @@ liveTest(
 			stage = "same-operation-steer-output";
 			expect(runtime.sessionId).toBe(activeSessionId);
 			const terminal = await statusObservation.run({ deadline, method: "port.status.terminal" }, () =>
-				port!.status({ sessionId: activeSessionId, repo, opRef: started.opRef }),
+				port?.status({ sessionId: activeSessionId, repo, opRef: started.opRef }),
 			);
 			const output = await port.fetchWorkerOutput({
 				sessionId: activeSessionId,
@@ -519,7 +519,7 @@ liveTest(
 		}
 		if (failures.length || preservation.length)
 			throw new Error(
-				"work live failure " + JSON.stringify({ stage, evidence: primaryEvidence, failures, preservation }),
+				`work live failure ${JSON.stringify({ stage, evidence: primaryEvidence, failures, preservation })}`,
 			);
 		console.error(
 			"work_live_evidence " +

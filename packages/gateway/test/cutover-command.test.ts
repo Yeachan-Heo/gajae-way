@@ -53,7 +53,7 @@ test("cutover backs up, exports open work, then quarantines under one lease", as
 	const backupName = backups.find((name) => /^pre-cutover-.*\.db$/.test(name));
 	expect(backupName).toBeDefined();
 	const backup = join(f.layout.backupsDir, backupName as string);
-	const exportPath = backup.slice(0, -3) + ".open-work.json";
+	const exportPath = `${backup.slice(0, -3)}.open-work.json`;
 	expect((await lstat(backup)).mode & 0o777).toBe(0o600);
 	expect((await lstat(exportPath)).mode & 0o777).toBe(0o600);
 	expect(await Bun.file(`${backup}-wal`).exists()).toBe(false);

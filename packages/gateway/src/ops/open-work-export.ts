@@ -93,7 +93,7 @@ function cutoverIds(report: OpenWorkReport): string[] {
 export function writeOpenWorkExport(backupPath: string, report: OpenWorkExportInput): OpenWorkExportReceipt {
 	const backup = resolve(backupPath);
 	if (!backup.endsWith(".db")) throw new Error("open_work_export backup path must end in .db");
-	const outputPath = backup.slice(0, -3) + ".open-work.json";
+	const outputPath = `${backup.slice(0, -3)}.open-work.json`;
 	const directory = dirname(outputPath);
 	assertAbsent(outputPath);
 	const backupSha256 = hashFile(backup);

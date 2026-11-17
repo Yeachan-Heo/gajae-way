@@ -682,7 +682,7 @@ export interface PersonaTurnLifecycle {
 	steerContextMessageId?(row: InboundMessageRow): string | undefined;
 	/** The steer landed in the session (durably, context consumed): release transient ownership. */
 	onSteerAccepted?(input: PersonaSteerInput): void | Promise<void>;
-	onFrame?(input: PersonaTailFrameInput): boolean | void | Promise<boolean | void>;
+	onFrame?(input: PersonaTailFrameInput): boolean | undefined | Promise<boolean | undefined>;
 	onTerminal?(input: PersonaTerminalInput): void | Promise<void>;
 	onFailure?(input: PersonaFailureInput): void | Promise<void>;
 	/** Persists one safe notice for an authenticated prompt refusal after its trigger is requeued. */
@@ -5078,7 +5078,7 @@ class OriginActor {
 			// The earlier run landed: the context is compacted and the persona goes back in.
 			this.#manager.database.core.metaDelete(unresolvedKey);
 			this.#manager.log(
-				`persona_compaction_resolved origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage!.tokens} evidence=context_below_line`,
+				`persona_compaction_resolved origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage?.tokens} evidence=context_below_line`,
 			);
 			return { compacted: true };
 		}
@@ -5215,7 +5215,7 @@ class OriginActor {
 		// Only a still-open trigger is closed: a repeat call after completion (or
 		// after a restart that already closed it) sends no second notice.
 		const open = database.inbox.turnRow(bound.turn.opRef);
-		if (!open || open.state !== "pending" || (open.turn_state !== "accepted" && open.turn_state !== "bound")) {
+		if (open?.state !== "pending" || (open.turn_state !== "accepted" && open.turn_state !== "bound")) {
 			await this.#forgetClosed(bound);
 			return;
 		}

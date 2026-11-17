@@ -210,7 +210,7 @@ for (const platform of ["slack", "discord", "telegram"] as const) {
 		await settle();
 		const rows = f.database.outbox.rows();
 		expect(rows).toHaveLength(1);
-		const payload = JSON.parse(rows[0]!.payload_json);
+		const payload = JSON.parse(rows[0]?.payload_json);
 		expect(payload.replyToMessageId).toBe(platform === "slack" ? messageId : undefined);
 		if (platform === "slack") expect(f.posts).toEqual([["C1", "answer", "7.0"]]);
 	});
@@ -339,7 +339,7 @@ for (const silent of [false, true])
 		await eventually(() => added.length === 1 && port.sends.length === 1);
 		expect(added).toEqual([["C1", "1.0", "hourglass_flowing_sand"]]);
 		expect(progress).toEqual([]);
-		port.complete(port.sends[0]!.opRef, silent ? "[SILENT]" : "answer");
+		port.complete(port.sends[0]?.opRef, silent ? "[SILENT]" : "answer");
 		await eventually(() => progress.some((p) => p.final));
 		await settle();
 		expect(removed).toEqual(added);

@@ -269,7 +269,7 @@ for (const state of ["unknown", "accepted", "in_flight"] as const) {
 		const f = await actor(port);
 		await f.enqueue("trigger");
 		expect(sequence).toEqual(["send", "status"]);
-		const op = port.sendAttempts[0]!.opRef;
+		const op = port.sendAttempts[0]?.opRef;
 		expect(f.db.inbox.turnRow(op)?.turn_state).toBe(state === "unknown" ? "bound" : "accepted");
 		if (state === "unknown") expect(f.logs.some((line) => line.includes("operation_state_unknown"))).toBe(true);
 		expect(f.released).toEqual([]);
@@ -475,7 +475,7 @@ test("RT06 status query timeout keeps actor accepted and held", async () => {
 	await f.manager.reconcile(key);
 	expect(sawRelay).toBe(true);
 	expect(f.logs.some((line) => line.includes("reason=status_unavailable"))).toBe(true);
-	expect(f.db.inbox.turnRow(f.port.sends[0]!.opRef)?.turn_state).toBe("accepted");
+	expect(f.db.inbox.turnRow(f.port.sends[0]?.opRef)?.turn_state).toBe("accepted");
 	expect(f.port.sends).toHaveLength(1);
 	expect(f.released).toEqual([]);
 });
@@ -559,7 +559,7 @@ test("RT09 steer uses owned connection and held steer replay retains clientRef w
 	expect(port.steers.length).toBeGreaterThan(1);
 	expect(port.steers[0]?.relay).toBe(port.sends[0]?.relay);
 	accept = true;
-	port.complete(port.sends[0]!.opRef, "done");
+	port.complete(port.sends[0]?.opRef, "done");
 	await until(() => f.terminal.length === 1);
 	await f.manager.reconcile(key);
 	expect(new Set(port.steers.map((input) => input.clientRef)).size).toBe(1);
@@ -705,21 +705,21 @@ test("work session activity survives loss of the submitting relay without claimi
 	await until(() => hosts.length === 1 && port.sends.length === 1);
 	const correlation = { commandId: `command-${result.opRef}`, turnId: `turn-${result.opRef}` };
 	const activity = () =>
-		db.bindings.workLaneRows().find((row) => row.origin_key === result.sessionKey)!.last_activity_at;
+		db.bindings.workLaneRows().find((row) => row.origin_key === result.sessionKey)?.last_activity_at;
 	// The original submitter receives correlated content and advances activity.
 	now += 2_000;
-	hosts[0]!.host(message("owned", correlation));
+	hosts[0]?.host(message("owned", correlation));
 	await until(() => activity() === new Date(now).toISOString());
 	const beforeLoss = activity();
-	hosts[0]!.close();
-	await until(() => hosts.length === 2 && hosts[1]!.written.some((frame) => frame.type === "hello"));
+	hosts[0]?.close();
+	await until(() => hosts.length === 2 && hosts[1]?.written.some((frame) => frame.type === "hello"));
 	// SDK publishContentFrames keeps the old invocation connectionId. A fresh
 	// connection only gets an uncorrelated copy if BOTH observer caps were offered.
 	now += 2_000;
-	const hello = hosts[1]!.written.find((frame) => frame.type === "hello")!;
+	const hello = hosts[1]?.written.find((frame) => frame.type === "hello")!;
 	const caps = hello.capabilities as string[];
 	if (caps.includes("turn_stream") && caps.includes("session_host_observer_v1"))
-		hosts[1]!.host({ type: "event", kind: "tool_execution_end", payload: { toolCallId: "after-reopen" } });
+		hosts[1]?.host({ type: "event", kind: "tool_execution_end", payload: { toolCallId: "after-reopen" } });
 	await until(() => activity() !== beforeLoss);
 	expect(activity()).toBe(new Date(now).toISOString());
 	expect(db.work.workAttemptGet(result.opRef)).toMatchObject({ settledAt: null });
@@ -729,9 +729,9 @@ test("work session activity survives loss of the submitting relay without claimi
 	// Observation, hello, and lifecycle broadcasts are not execution progress.
 	const observed = activity();
 	now += 2_000;
-	hosts[1]!.host({ type: "activity", state: "active", at: now });
-	hosts[1]!.host({ type: "agent_end" });
-	hosts[1]!.host(message("foreign", { commandId: "foreign", turnId: "foreign" }));
+	hosts[1]?.host({ type: "activity", state: "active", at: now });
+	hosts[1]?.host({ type: "agent_end" });
+	hosts[1]?.host(message("foreign", { commandId: "foreign", turnId: "foreign" }));
 	await Bun.sleep(25);
 	expect(activity()).toBe(observed);
 	expect(db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();

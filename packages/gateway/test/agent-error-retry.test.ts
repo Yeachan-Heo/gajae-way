@@ -25,7 +25,7 @@ const KEY = "loopback/loopback/persona";
 
 function enqueue(messageId: string, body: string): void {
 	const accepted = database?.transaction((tx) =>
-		database!.inbox.enqueue(tx, {
+		database?.inbox.enqueue(tx, {
 			messageId,
 			originKey: KEY,
 			originRefJson: JSON.stringify(ORIGIN),
@@ -343,7 +343,7 @@ test("provider failure after an accepted steer is not replayed", async () => {
 	enqueue("accepted-correction", "important correction");
 	await manager.notifyInbound(KEY);
 	await eventually(() => port.steers.length === 1, "correction was not steered");
-	expect(database!.inbox.turnRows(first.opRef)).toEqual(
+	expect(database?.inbox.turnRows(first.opRef)).toEqual(
 		expect.arrayContaining([expect.objectContaining({ message_id: "accepted-correction", turn_role: "steer" })]),
 	);
 
@@ -420,9 +420,9 @@ test("provider retry budget is independent of prior submission retries", async (
 	});
 
 	enqueue("submission-then-provider", "retry budget isolation");
-	await manager!.notifyInbound(KEY);
+	await manager?.notifyInbound(KEY);
 	await eventually(
-		() => failures.length === 1 && manager!.state(KEY) === "idle",
+		() => failures.length === 1 && manager?.state(KEY) === "idle",
 		"provider retries did not exhaust after a submission retry",
 		10_000,
 	);
@@ -448,7 +448,7 @@ test("permission panels make provider replay unsafe", async () => {
 	});
 
 	enqueue("permission-before-failure", "permission-gated action");
-	await manager!.notifyInbound(KEY);
+	await manager?.notifyInbound(KEY);
 	const first = port.sends[0];
 	if (!first) throw new Error("permission-gated request was not dispatched");
 	await port.emitPermissionRequest(first.sessionId);
@@ -457,7 +457,7 @@ test("permission panels make provider replay unsafe", async () => {
 		code: "provider_unavailable",
 		outcome: { kind: "failed", phase: "post_start", category: "provider_transport", provenance: "agent_failed" },
 	});
-	await manager!.tick(KEY);
+	await manager?.tick(KEY);
 	await eventually(() => failures.length === 1, "permission-gated failure was not delivered");
 	expect(port.sends).toHaveLength(1);
 });
@@ -493,19 +493,19 @@ test("a queued retry cannot clear a turn created by reset", async () => {
 	});
 
 	enqueue("retry-before-reset", "old request");
-	await manager!.notifyInbound(KEY);
+	await manager?.notifyInbound(KEY);
 	const first = port.sends[0];
 	if (!first) throw new Error("initial request was not dispatched");
 	port.fail(first.opRef, "Provider unavailable", {
 		code: "provider_unavailable",
 		outcome: { kind: "failed", phase: "post_start", category: "provider_transport", provenance: "agent_failed" },
 	});
-	await manager!.tick(KEY);
+	await manager?.tick(KEY);
 	await eventually(() => timers.some((timer) => timer.delayMs === 1_000), "provider retry was not scheduled");
 
 	enqueue("discarded-during-reset", "stale request");
 	await new Promise((resolve) => setTimeout(resolve, 20));
-	const resetting = manager!.reset(KEY, JSON.stringify(ORIGIN));
+	const resetting = manager?.reset(KEY, JSON.stringify(ORIGIN));
 	await discardStarted;
 	const retryTimer = timers.find((timer) => timer.delayMs === 1_000 && !timer.canceled);
 	if (!retryTimer) throw new Error("provider retry timer was not captured");
@@ -514,7 +514,7 @@ test("a queued retry cannot clear a turn created by reset", async () => {
 	enqueue("replacement-after-reset", "replacement request");
 	unblockDiscard();
 	await resetting;
-	await manager!.tick(KEY);
+	await manager?.tick(KEY);
 	await eventually(() => port.sends.length === 2, "reset replacement was not dispatched");
 	expect(port.sends.map((send) => send.text)).toEqual(["old request", "replacement request"]);
 });

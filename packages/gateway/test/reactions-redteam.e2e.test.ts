@@ -1268,7 +1268,7 @@ test("RT-TELEGRAM-02 no reaction path ever calls sendMessage, on any outcome", a
 			expect(requests[0]?.verb, label).toBe("delivery.confirm");
 		} else {
 			expect(requests[0]?.verb, label).toBe("delivery.fail");
-			expect((requests[0]!.params as { ambiguous: boolean }).ambiguous, label).toBe(expectedAmbiguous);
+			expect((requests[0]?.params as { ambiguous: boolean }).ambiguous, label).toBe(expectedAmbiguous);
 		}
 	}
 });
@@ -1291,7 +1291,7 @@ test("RT-TELEGRAM-03 markup and near-miss spellings can never reach Telegram", a
 	);
 	expect(harness.calls).toEqual([]);
 	expect(requests[0]?.verb).toBe("delivery.fail");
-	expect((requests[0]!.params as { ambiguous: boolean }).ambiguous).toBe(false);
+	expect((requests[0]?.params as { ambiguous: boolean }).ambiguous).toBe(false);
 });
 // ---------------------------------------------------------------------------
 // Requirement 8: allowlisted is NOT the same as deliverable. Telegram's Bot API

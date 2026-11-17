@@ -551,7 +551,7 @@ async function processSnapshot(): Promise<ProcessRecord[]> {
 		.split("\n")
 		.map((line) => {
 			const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
-			return match ? { pid: Number(match[1]), ppid: Number(match[2]), command: match[3]!.trim() } : undefined;
+			return match ? { pid: Number(match[1]), ppid: Number(match[2]), command: match[3]?.trim() } : undefined;
 		})
 		.filter((record): record is ProcessRecord => record !== undefined);
 }
@@ -672,7 +672,7 @@ async function assertRestartRecovery(
 			"--idempotency-key",
 			`gajaeway-e2e-cleanup-${randomUUID()}`,
 			"--json-input",
-			JSON.stringify({ sessionId: envelope.result!.sessionId }),
+			JSON.stringify({ sessionId: envelope.result?.sessionId }),
 		]);
 		expect(JSON.parse(closed.stdout).ok).toBe(true);
 	}
@@ -879,7 +879,7 @@ attachOnlyTest(
 			const probes = attachOnlyProbes(fixture);
 			const barrier = createSpawnBarrier();
 			harness.armBarrier(barrier);
-			const command = harness.client.cli(probes[0]!.args);
+			const command = harness.client.cli(probes[0]?.args);
 			try {
 				const held = await barrier.entered;
 				expect(held.cmd.slice(1, 4)).toEqual(["sdk", "session", "list"]);
