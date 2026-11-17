@@ -19,6 +19,7 @@
 - **adapters**: Forward static PNG/JPEG attachments from Discord, Slack, and Telegram as durable native model inputs through the `chat.images` capability; persist inbound image rows in schema 42 and keep non-native formats as attachment descriptions (#775)
 - **adapter-slack**: Complete command routing, interactions, and delivery lifecycle; route explicitly bot-addressed session commands through gateway authorization without creating a top-level mention thread; dispatch Socket Mode interactive envelopes, preserve panel origin and underscore-containing option ids (#777)
 - **adapter-telegram**: Send persona Markdown as Telegram HTML, split without breaking tags or entities; syntax the renderer cannot place exactly stays literal text; a retried multi-chunk reply resumes after chunks already accepted and respects Telegram flood-control (#774)
+- **gateway**: Run an operator-configured `work.completionCheck` command before a completed `work.start` attempt settles: exit 1 re-steers the lane's session within `maxResteers`, exit 3 settles as waiting, any other exit, a timeout or a command that cannot start fails open, and a spent budget marks the lane report `completion_check_exhausted`.
 
 ## [0.4.4] - 2026-11-04
 

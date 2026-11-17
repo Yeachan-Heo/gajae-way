@@ -128,6 +128,22 @@ export type AwaitingChecks = {
 	readonly retries: number;
 };
 
+/** A lane's completion-check cycle; persisted so the re-steer budget and an owed re-steer survive restarts. */
+export type CompletionCheckState = {
+	/** Re-steers already spent on failed completion checks in this cycle. */
+	readonly retries: number;
+	/**
+	 * Written by the settlement that decided to re-steer and consumed by the next
+	 * attempt that opens. A marker with no open attempt means that start never
+	 * happened, so the lane still owes its parent a report.
+	 */
+	readonly pendingResteer?: {
+		/** The attempt whose completion check failed. */
+		readonly opRef: string;
+		readonly at: string;
+	};
+};
+
 export type LaneJobRecord = {
 	readonly schemaVersion: typeof LANE_JOB_SCHEMA_VERSION;
 	/** Stable job identity: `lanejob-<laneSessionKey>`. Outlives every op. */
@@ -165,6 +181,8 @@ export type LaneJobRecord = {
 	 * and kept through a re-steered attempt so its retries carry over.
 	 */
 	readonly awaitingChecks?: AwaitingChecks;
+	/** Present only between a failed completion check and the settlement that ends its cycle. */
+	readonly completionCheck?: CompletionCheckState;
 };
 
 export type CreateLaneJobInput = {
@@ -306,6 +324,8 @@ export function parseLaneJobRecord(raw: string): LaneJobRecord {
 	if (record.state === "awaiting_checks" && awaitingChecks === undefined) {
 		throw new LaneJobError("awaiting_checks job is missing its awaitingChecks block");
 	}
+	const completionCheck =
+		record.completionCheck === undefined ? undefined : parseCompletionCheck(record.completionCheck);
 
 	return Object.freeze({
 		schemaVersion: LANE_JOB_SCHEMA_VERSION,
@@ -330,6 +350,28 @@ export function parseLaneJobRecord(raw: string): LaneJobRecord {
 			: { baselineSha: assertFullSha(asString(record.baselineSha), "baselineSha") }),
 		escalations,
 		...(awaitingChecks === undefined ? {} : { awaitingChecks }),
+		...(completionCheck === undefined ? {} : { completionCheck }),
+	});
+}
+
+function parseCompletionCheck(value: unknown): CompletionCheckState {
+	if (typeof value !== "object" || value === null) {
+		throw new LaneJobError("completionCheck must be an object");
+	}
+	const block = value as Record<string, unknown>;
+	const retries = parseCounter(block.retries, "completionCheck.retries");
+	if (block.pendingResteer === undefined) return Object.freeze({ retries });
+	if (typeof block.pendingResteer !== "object" || block.pendingResteer === null) {
+		throw new LaneJobError("completionCheck.pendingResteer must be an object");
+	}
+	const pending = block.pendingResteer as Record<string, unknown>;
+	assertValidOpRef(asString(pending.opRef));
+	return Object.freeze({
+		retries,
+		pendingResteer: Object.freeze({
+			opRef: pending.opRef as string,
+			at: assertRequiredTimestamp(pending.at, "completionCheck.pendingResteer.at"),
+		}),
 	});
 }
 
@@ -649,7 +691,8 @@ export function applyReconciliation(input: TransitionInput): LaneJobRecord {
  * Appends one attempt as the job's single open attempt.
  *
  * At most ONE attempt may lack `endedAt`: a second open op-ref against the
- * same lane is exactly how a restart mints duplicate work.
+ * same lane is exactly how a restart mints duplicate work. Any attempt that
+ * opens is the one a pending completion-check re-steer was waiting for.
  */
 export function appendAttempt(record: LaneJobRecord, attempt: JobAttempt): LaneJobRecord {
 	if (record.attempts.some((existing) => existing.opRef === attempt.opRef)) {
@@ -663,6 +706,9 @@ export function appendAttempt(record: LaneJobRecord, attempt: JobAttempt): LaneJ
 	}
 	return Object.freeze({
 		...record,
+		...(record.completionCheck?.pendingResteer
+			? { completionCheck: Object.freeze({ retries: record.completionCheck.retries }) }
+			: {}),
 		sessions: record.sessions.includes(attempt.sessionId)
 			? record.sessions
 			: Object.freeze([...record.sessions, attempt.sessionId]),
@@ -811,6 +857,44 @@ export function clearAwaitingChecks(record: LaneJobRecord): LaneJobRecord {
 	if (record.awaitingChecks === undefined) return record;
 	const { awaitingChecks: _, ...rest } = record;
 	return Object.freeze(rest);
+}
+
+/** Counts one completion-check re-steer and records that the next attempt is still owed. */
+export function recordCompletionResteer(record: LaneJobRecord, at: string, opRef: string): LaneJobRecord {
+	return Object.freeze({
+		...record,
+		completionCheck: Object.freeze({
+			retries: (record.completionCheck?.retries ?? 0) + 1,
+			pendingResteer: Object.freeze({ opRef, at }),
+		}),
+		updatedAt: at,
+	});
+}
+
+/** Ends the completion-check cycle without touching the job state. */
+export function clearCompletionCheck(record: LaneJobRecord): LaneJobRecord {
+	if (record.completionCheck === undefined) return record;
+	const { completionCheck: _, ...rest } = record;
+	return Object.freeze(rest);
+}
+
+/**
+ * Gives up on a re-steer that never opened: its cycle and any checks cycle end,
+ * and the job stays continuable with the reason on the escalation trail.
+ */
+export function abandonCompletionResteer(record: LaneJobRecord, at: string): LaneJobRecord {
+	const pending = record.completionCheck?.pendingResteer;
+	if (!pending) {
+		throw new LaneJobError(`${record.jobId} has no pending completion-check re-steer`);
+	}
+	return Object.freeze({
+		...clearAwaitingChecks(clearCompletionCheck(record)),
+		escalations: Object.freeze([
+			...record.escalations,
+			`${at} completion check re-steer failed: no attempt followed ${pending.opRef}`,
+		]),
+		updatedAt: at,
+	});
 }
 
 /**

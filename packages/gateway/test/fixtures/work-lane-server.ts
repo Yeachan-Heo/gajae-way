@@ -4,6 +4,7 @@ import { mkdtemp, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { StatusReport } from "@gajae-gateway/subsession";
+import type { WorkLaneConfig } from "../../src/config";
 import type {
 	SessionBindInput,
 	SessionSendInput,
@@ -305,7 +306,7 @@ async function serve(home: string, barrier?: Barrier) {
 		if (settling) hit("settle-ledger");
 		return result;
 	};
-	const storedConfig = json<{ readonly work?: { readonly allowNested?: boolean } }>(join(home, "config.json"), {});
+	const storedConfig = json<{ readonly work?: WorkLaneConfig }>(join(home, "config.json"), {});
 	const config = {
 		schemaVersion: 1 as const,
 		home,
@@ -388,14 +389,18 @@ export class WorkFixture {
 	get socket() {
 		return join(this.home, "gateway.sock");
 	}
-	static async create(options: { readonly allowNested?: boolean } = {}) {
+	static async create(options: Pick<WorkLaneConfig, "allowNested" | "completionCheck"> = {}) {
 		const fixture = new WorkFixture(await mkdtemp(join(tmpdir(), "work-crash-")));
+		const work = {
+			...(options.allowNested === undefined ? {} : { allowNested: options.allowNested }),
+			...(options.completionCheck === undefined ? {} : { completionCheck: options.completionCheck }),
+		};
 		await Bun.write(
 			join(fixture.home, "config.json"),
 			JSON.stringify({
 				schemaVersion: 1,
 				ownerTarget: { origin: noticeOrigin },
-				...(options.allowNested === undefined ? {} : { work: { allowNested: options.allowNested } }),
+				...(Object.keys(work).length === 0 ? {} : { work }),
 			}),
 		);
 		return fixture;

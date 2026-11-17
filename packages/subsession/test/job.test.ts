@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
+	abandonCompletionResteer,
 	appendAttempt,
 	applyReconciliation,
 	classifyWorkEvidence,
+	clearCompletionCheck,
 	closeAttempt,
 	createLaneJobRecord,
 	type JobAttempt,
@@ -15,6 +17,7 @@ import {
 	projectAttemptOutcome,
 	type RepositoryFacts,
 	recordChecksRetry,
+	recordCompletionResteer,
 	settleAwaitingChecks,
 	transitionToAwaitingChecks,
 } from "../src/job";
@@ -675,5 +678,81 @@ describe("awaiting_checks cycle (#481)", () => {
 		const corrupt = { ...awaiting(), awaitingChecks: { ...awaiting().awaitingChecks, retries: -1 } };
 		expect(() => parseLaneJobRecord(JSON.stringify(corrupt))).toThrow(/retries/);
 		expect(() => recordChecksRetry(record(), NOW.toISOString())).toThrow(LaneJobError);
+	});
+});
+
+describe("completion-check cycle", () => {
+	const at = NOW.toISOString();
+	function ended() {
+		return closeAttempt({
+			record: appendAttempt(record(), attempt()),
+			opRef: attempt().opRef,
+			endState: "completed",
+			endedAt: at,
+		});
+	}
+
+	test("a record without the cycle parses as before, and the cycle round-trips", () => {
+		const plain = ended();
+		expect(plain.completionCheck).toBeUndefined();
+		expect(parseLaneJobRecord(JSON.stringify(plain))).toEqual(plain);
+		expect("completionCheck" in parseLaneJobRecord(JSON.stringify(plain))).toBe(false);
+
+		const owed = recordCompletionResteer(plain, at, attempt().opRef);
+		expect(owed.state).toBe("attempt_ended");
+		expect(owed.completionCheck).toEqual({ retries: 1, pendingResteer: { opRef: attempt().opRef, at } });
+		expect(parseLaneJobRecord(JSON.stringify(owed))).toEqual(owed);
+	});
+
+	test("the attempt that opens consumes the owed re-steer and keeps the spent budget", () => {
+		const owed = recordCompletionResteer(ended(), at, attempt().opRef);
+		const reopened = appendAttempt(owed, attempt({ opRef: "gw-lanejob-02" }));
+		expect(reopened.state).toBe("running");
+		expect(reopened.completionCheck).toEqual({ retries: 1 });
+		expect(parseLaneJobRecord(JSON.stringify(reopened))).toEqual(reopened);
+
+		const failedAgain = recordCompletionResteer(
+			closeAttempt({ record: reopened, opRef: "gw-lanejob-02", endState: "completed", endedAt: at }),
+			at,
+			"gw-lanejob-02",
+		);
+		expect(failedAgain.completionCheck).toEqual({ retries: 2, pendingResteer: { opRef: "gw-lanejob-02", at } });
+		expect(clearCompletionCheck(failedAgain).completionCheck).toBeUndefined();
+		expect(clearCompletionCheck(ended())).toEqual(ended());
+	});
+
+	test("abandoning an owed re-steer ends both cycles, stays continuable and leaves a trail", () => {
+		const parked = transitionToAwaitingChecks({ record: ended(), at, prNumber: 7, headSha: "c".repeat(40) });
+		const resteered = closeAttempt({
+			record: appendAttempt(recordChecksRetry(parked, at), attempt({ opRef: "gw-lanejob-02" })),
+			opRef: "gw-lanejob-02",
+			endState: "completed",
+			endedAt: at,
+		});
+		const owed = recordCompletionResteer(resteered, at, "gw-lanejob-02");
+		expect(owed.awaitingChecks?.retries).toBe(1);
+
+		const abandoned = abandonCompletionResteer(owed, at);
+		expect(abandoned.state).toBe("attempt_ended");
+		expect(abandoned.completionCheck).toBeUndefined();
+		expect(abandoned.awaitingChecks).toBeUndefined();
+		expect(abandoned.escalations.at(-1)).toBe(
+			`${at} completion check re-steer failed: no attempt followed gw-lanejob-02`,
+		);
+		expect(parseLaneJobRecord(JSON.stringify(abandoned))).toEqual(abandoned);
+		expect(() => abandonCompletionResteer(ended(), at)).toThrow(LaneJobError);
+	});
+
+	test("a corrupt cycle fails closed", () => {
+		const owed = recordCompletionResteer(ended(), at, attempt().opRef);
+		const corrupt = (completionCheck: unknown) => () =>
+			parseLaneJobRecord(JSON.stringify({ ...owed, completionCheck }));
+		expect(corrupt("yes")).toThrow(/completionCheck/);
+		expect(corrupt({ retries: -1 })).toThrow(/completionCheck\.retries/);
+		expect(corrupt({ retries: 1, pendingResteer: "yes" })).toThrow(/pendingResteer/);
+		expect(corrupt({ retries: 1, pendingResteer: { opRef: attempt().opRef, at: "yesterday" } })).toThrow(
+			/pendingResteer\.at/,
+		);
+		expect(corrupt({ retries: 1, pendingResteer: { opRef: "", at } })).toThrow();
 	});
 });
