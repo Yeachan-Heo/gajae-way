@@ -896,6 +896,55 @@ export class InboxGroup {
 		);
 	}
 
+	/** Retains history/dedupe and a no-delivery receipt without inventing a dispatched turn. */
+	cancelPending(tx: WriteTx, restartId: string, messageIds: readonly string[]): string[] {
+		const receipt = JSON.stringify({ none: "operator_cancelled", restartId, cancelledAt: new Date().toISOString() });
+		const pending: string[] = [];
+		for (const messageId of messageIds) {
+			this.#assertNotQuarantined(messageId);
+			const row = this.#db
+				.prepare(`SELECT ${INBOUND_COLUMNS} FROM inbound_messages WHERE message_id = ?`)
+				.get(messageId) as InboundMessageRow | null;
+			if (
+				row === null ||
+				row.source !== "platform" ||
+				row.turn_role !== null ||
+				row.turn_epoch !== null ||
+				row.turn_state !== null ||
+				row.turn_op_ref !== null ||
+				row.bound_session_id !== null ||
+				row.dispatched_at !== null
+			)
+				throw new Error(`inbound ${messageId} is not an unbound platform message`);
+			if (row.state === "done" && row.terminal_delivery_id) {
+				try {
+					const previous: unknown = JSON.parse(row.terminal_delivery_id);
+					if (
+						typeof previous === "object" &&
+						previous !== null &&
+						"none" in previous &&
+						previous.none === "operator_cancelled" &&
+						"restartId" in previous &&
+						previous.restartId === restartId
+					)
+						continue;
+				} catch {
+					// A malformed receipt is not evidence of a successful cancellation.
+				}
+			}
+			if (row.state !== "pending" || row.terminal_delivery_id !== null)
+				throw new Error(`inbound ${messageId} is not pending or was cancelled by a different operation`);
+			pending.push(messageId);
+		}
+		const update = this.#db.prepare(
+			"UPDATE inbound_messages SET state = 'done', terminal_delivery_id = ? WHERE message_id = ? AND state = 'pending' AND turn_state IS NULL AND terminal_delivery_id IS NULL",
+		);
+		for (const messageId of pending)
+			if (update.run(tx, receipt, messageId).changes !== 1)
+				throw new Error(`inbound ${messageId} changed during cancellation`);
+		return [...messageIds];
+	}
+
 	discardBefore(tx: WriteTx, originKey: string, floorAt: string): string[] {
 		const ids = this.#db
 			.prepare(
@@ -1328,7 +1377,7 @@ export class InboxGroup {
 	sweep(tx: WriteTx, cutoffs: { historyCutoff: string; batch: number }): number {
 		return this.#db
 			.prepare(
-				`DELETE FROM inbound_messages WHERE rowid IN (SELECT rowid FROM inbound_messages WHERE state = 'done' AND received_at < ? AND ${REPLAYABLE_INBOUND} AND NOT EXISTS (SELECT 1 FROM inbound_messages s WHERE s.turn_op_ref = inbound_messages.turn_op_ref AND s.state <> 'done') AND NOT EXISTS (SELECT 1 FROM meta m WHERE m.key = ${ESCALATION_NOTICE_KEY_SQL}) LIMIT ?)`,
+				`DELETE FROM inbound_messages WHERE rowid IN (SELECT rowid FROM inbound_messages WHERE state = 'done' AND (CASE WHEN json_valid(terminal_delivery_id) THEN CASE WHEN json_extract(terminal_delivery_id, '$.none') = 'operator_cancelled' THEN COALESCE(json_extract(terminal_delivery_id, '$.cancelledAt'), received_at) ELSE received_at END ELSE received_at END) < ? AND ${REPLAYABLE_INBOUND} AND NOT EXISTS (SELECT 1 FROM inbound_messages s WHERE s.turn_op_ref = inbound_messages.turn_op_ref AND s.state <> 'done') AND NOT EXISTS (SELECT 1 FROM meta m WHERE m.key = ${ESCALATION_NOTICE_KEY_SQL}) LIMIT ?)`,
 			)
 			.run(tx, cutoffs.historyCutoff, cutoffs.batch).changes;
 	}
