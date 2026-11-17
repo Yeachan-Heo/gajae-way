@@ -951,16 +951,6 @@ async function sendFirstDiscordPart(
 	}
 }
 
-async function sendDiscordInboundNotice(message: DiscordInboundMessage, content: string): Promise<void> {
-	const channel = message.channel as typeof message.channel & { send?: DiscordTextChannelLike["send"] };
-	if (typeof channel.send !== "function") return;
-	try {
-		await sendFirstDiscordPart({ send: channel.send.bind(channel) }, { content }, message.id);
-	} catch {
-		console.error(`Discord inbound image notice failed message=${message.id}.`);
-	}
-}
-
 export async function settleDiscordDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	discord: DiscordClientLike,
@@ -1386,7 +1376,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		const receivedAt =
 			typeof message.createdTimestamp === "number" ? new Date(message.createdTimestamp).toISOString() : undefined;
 		ingress.run(origin.conversationId, async () => {
-			let preparedImages: { readonly images: PromptImage[]; readonly notice: string };
+			let preparedImages: { readonly images: PromptImage[] };
 			try {
 				preparedImages = await prepareImages(message);
 			} catch {
@@ -1395,7 +1385,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 				console.error(`Discord image preparation failed message=${message.id}; no chat.send was issued.`);
 				return;
 			}
-			// Do not create a thread or emit notices for an image that cannot be sent.
+			// Do not create a thread for an image that cannot be sent.
 			// Auto-create thread on mention in channel (Hermes-like contract).
 			void nameThreadFromMessage(message, origin, unnamedThreads);
 			origin = await maybeCreateThreadOnMention(
@@ -1418,7 +1408,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 				gateway.sendInbound(message.id as string, origin, body, engagement, receivedAt, spoken, messageChannelId);
 				return;
 			}
-			const accepted = await gateway.requestInbound(
+			await gateway.requestInbound(
 				message.id as string,
 				origin,
 				body,
@@ -1428,8 +1418,6 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 				messageChannelId,
 				preparedImages.images,
 			);
-			if (accepted?.engaged && accepted.turnId != null && preparedImages.notice)
-				await sendDiscordInboundNotice(message, `Image processing: ${preparedImages.notice}`);
 		});
 	});
 	// An edit is an update of a message the persona may already have read, not a
@@ -1943,7 +1931,7 @@ export class ReconnectingGateway {
 				if (!engagement) return "skip";
 				const text = describeInboundBody(message);
 				if (text === "") return "skip";
-				let preparedImages: { readonly images: PromptImage[]; readonly notice: string } | undefined;
+				let preparedImages: { readonly images: PromptImage[] } | undefined;
 				let imageFailure: DiscordImagePreparationError | undefined;
 				let preparationDone = false;
 				const origin = discordMessageOrigin(message);
@@ -1973,8 +1961,6 @@ export class ReconnectingGateway {
 						: await this.requestRecovered(message.id, origin, text, engagement, preparedImages?.images);
 					if (result.verdict !== "unavailable") {
 						this.forgetAttempts(message.id);
-						if (result.verdict === "acked" && result.engaged && result.turnId != null && preparedImages?.notice)
-							await sendDiscordInboundNotice(message, `Image processing: ${preparedImages.notice}`);
 						return result.verdict;
 					}
 					failure = result.failure;

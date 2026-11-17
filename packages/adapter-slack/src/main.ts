@@ -347,25 +347,6 @@ export function replyThreadTs(message: Pick<ChatMessagePayload, "origin" | "repl
 	return target.ts;
 }
 
-async function sendSlackImageNotice(
-	api: Pick<SlackWebApi, "postMessage">,
-	origin: OriginRef,
-	notice: string,
-	log: Pick<Console, "error">,
-	replyToMessageId?: string,
-): Promise<void> {
-	if (notice === "") return;
-	try {
-		await api.postMessage(
-			deliveryChannel(origin),
-			`Image adjustment: ${notice}`,
-			replyThreadTs({ origin, replyToMessageId }),
-		);
-	} catch {
-		log.error("Slack image preparation notice could not be delivered.");
-	}
-}
-
 export async function settleSlackDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	api: Pick<SlackWebApi, "postMessage" | "addReaction" | "removeReaction"> & Partial<Pick<SlackWebApi, "uploadFile">>,
@@ -1195,8 +1176,6 @@ export async function startSlackAdapter(
 				);
 				if (result?.engaged) {
 					await rememberThread(origin, message);
-					if (typeof result.turnId === "string")
-						await sendSlackImageNotice(api, origin, prepared.notice, log, engagement.replyTo?.messageId);
 				}
 			});
 		} else if (event.type === "reaction_added" || event.type === "reaction_removed") {
@@ -1352,8 +1331,6 @@ export async function startSlackAdapter(
 				if (!isWithinGrace) await mutate((state) => clearAttempt(state, messageId));
 				if (sent.verdict === "acked" && sent.result?.engaged) {
 					await rememberThread(origin, message);
-					if (typeof sent.result.turnId === "string")
-						await sendSlackImageNotice(api, origin, prepared.notice, log, engagement.replyTo?.messageId);
 				}
 				return sent.verdict;
 			}
