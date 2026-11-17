@@ -14,7 +14,7 @@ import type {
 	SessionActivity,
 	SessionBindInput,
 	SessionBinding,
-	SessionCompactionStatus,
+	SessionCompactionResult,
 	SessionLiveness,
 	SessionPort,
 	SessionRequestInput,
@@ -150,6 +150,7 @@ export class ScriptedSessionPort implements SessionPort {
 	readonly statusReads: Array<{ sessionId: string; repo: string; opRef: string; relayUsed: boolean }> = [];
 	readonly #sessions = new Map<string, string>();
 	readonly #sessionStates = new Map<string, BrokerSession>();
+	readonly #exitedHosts = new Set<string>();
 	readonly #resumeFailures = new Map<string, Error>();
 	readonly #operations = new Map<string, Operation>();
 	readonly #transcripts = new Map<string, string[]>();
@@ -284,12 +285,35 @@ export class ScriptedSessionPort implements SessionPort {
 		this.#activity.set(sessionId, { state, at });
 	}
 
+	readonly #hostIncarnations = new Map<string, string>();
+
+	/** The host process identity `session inspect` reports; a revived host gets a new one. */
+	setHostIncarnation(sessionId: string, hostIncarnation: string): void {
+		this.#hostIncarnations.set(sessionId, hostIncarnation);
+	}
+
 	/** Broker liveness from the scripted state table; an unseeded id is disowned, like an id the broker never indexed. */
 	async liveness(input: { sessionId: string; repo: string }): Promise<SessionLiveness> {
 		const state = this.#sessionStates.get(input.sessionId);
 		if (!state) return { live: undefined, disowned: true };
 		const activity = this.#activity.get(input.sessionId);
-		return { live: state.live, disowned: false, ...(activity ? { activity } : {}) };
+		const hostIncarnation = this.#hostIncarnations.get(input.sessionId);
+		return {
+			live: state.live,
+			disowned: false,
+			...(activity ? { activity } : {}),
+			...(hostIncarnation ? { hostIncarnation } : {}),
+		};
+	}
+
+	async hostExited(input: { sessionId: string; repo: string }): Promise<boolean> {
+		return this.#exitedHosts.has(input.sessionId);
+	}
+
+	/** Explicit process-exit evidence, independent of broker liveness. */
+	setHostExited(sessionId: string, exited: boolean): void {
+		if (exited) this.#exitedHosts.add(sessionId);
+		else this.#exitedHosts.delete(sessionId);
 	}
 
 	async resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding> {
@@ -565,7 +589,7 @@ export class ScriptedSessionPort implements SessionPort {
 		sessionId: string;
 		repo: string;
 		originKey: string;
-	}): Promise<{ readonly status: SessionCompactionStatus }> {
+	}): Promise<SessionCompactionResult> {
 		return { status: "unavailable" };
 	}
 

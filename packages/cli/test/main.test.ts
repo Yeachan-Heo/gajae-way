@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, readlink, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { OpsCycleResult, OpsSloResult } from "@gajae-gateway/protocol";
+import { ProtocolError } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 
@@ -702,12 +703,12 @@ describe("service installation", () => {
 		}
 	});
 
-	test("services repair installs the checkout's GJC pin before writing definitions, and fails when it cannot", async () => {
+	test("services repair installs the target release manifest's GJC pin before writing definitions, and fails when it cannot", async () => {
 		const home = await mkdtemp(join(tmpdir(), "gajaeway-services-pin-"));
 		const saved = { HOME: process.env.HOME, GAJAEWAY_HOME: process.env.GAJAEWAY_HOME };
 		const originalLog = console.log;
 		const originalError = console.error;
-		const previousExitCode = process.exitCode;
+		const previousExitCode = process.exitCode ?? 0;
 		try {
 			process.env.HOME = home;
 			process.env.GAJAEWAY_HOME = home;
@@ -717,6 +718,8 @@ describe("service installation", () => {
 			const binDir = join(home, "bin");
 			await mkdir(binDir);
 			for (const spec of serviceSpecs()) await writeFile(join(binDir, spec.binary), "stub");
+			const releaseManifest = join(binDir, "package.json");
+			await writeFile(releaseManifest, JSON.stringify({ name: "gajaeway", gjc: { version: "0.19.3" } }));
 			const args = [
 				"services",
 				"repair",
@@ -727,42 +730,48 @@ describe("service installation", () => {
 				"--launch-agents-dir",
 				join(home, "LaunchAgents"),
 			];
-			const checkoutPin = (
-				JSON.parse(await readFile(join(import.meta.dir, "..", "..", "gateway", "package.json"), "utf8")) as {
-					gjc: { version: string };
-				}
-			).gjc.version;
 			const writes: string[] = [];
 			const writeServiceFile = async (path: string): Promise<void> => {
 				writes.push(path);
 			};
 			const installs: string[] = [];
-			await main(args, {
-				services: {
-					loginPathRunner: async () => "/usr/bin",
-					writeFile: writeServiceFile,
-					gjcInstallRunner: async (command, cwd) => {
-						if (command[0] === "bun") {
-							const version = (
-								JSON.parse(await readFile(join(cwd, "package.json"), "utf8")) as {
-									dependencies: { "gajae-code": string };
-								}
-							).dependencies["gajae-code"];
-							installs.push(version);
-							await mkdir(join(cwd, "node_modules", ".bin"), { recursive: true });
-							await writeFile(join(cwd, "node_modules", ".bin", "gjc"), version);
-							return { exitCode: 0, stdout: "", stderr: "" };
+			const gjcInstallRunner = async (command: readonly string[], cwd: string) => {
+				if (command[0] === "bun") {
+					const version = (
+						JSON.parse(await readFile(join(cwd, "package.json"), "utf8")) as {
+							dependencies: { "gajae-code": string };
 						}
-						return { exitCode: 0, stdout: `gjc/${await readFile(command[0] as string, "utf8")}`, stderr: "" };
-					},
-				},
+					).dependencies["gajae-code"];
+					installs.push(version);
+					await mkdir(join(cwd, "node_modules", ".bin"), { recursive: true });
+					await writeFile(join(cwd, "node_modules", ".bin", "gjc"), version);
+					return { exitCode: 0, stdout: "", stderr: "" };
+				}
+				return { exitCode: 0, stdout: `gjc/${await readFile(command[0] as string, "utf8")}`, stderr: "" };
+			};
+			await main(args, {
+				services: { loginPathRunner: async () => "/usr/bin", writeFile: writeServiceFile, gjcInstallRunner },
 			});
-			expect(installs).toEqual([checkoutPin]);
-			expect(await readlink(join(home, "gjc", "current"))).toBe(checkoutPin);
+			expect(installs).toEqual(["0.19.3"]);
+			expect(await readlink(join(home, "gjc", "current"))).toBe("0.19.3");
 			expect(writes).toHaveLength(serviceSpecs().length);
 
+			// A bin dir that cannot supply its own pin is refused before any definition is
+			// written: the CLI checkout's pin is not installable for a target it does not describe.
 			writes.length = 0;
+			installs.length = 0;
 			await rm(join(home, "gjc"), { recursive: true, force: true });
+			await rm(releaseManifest);
+			await main(args, {
+				services: { loginPathRunner: async () => "/usr/bin", writeFile: writeServiceFile, gjcInstallRunner },
+			});
+			expect(process.exitCode).toBe(1);
+			expect(installs).toEqual([]);
+			expect(writes).toHaveLength(0);
+
+			writes.length = 0;
+			process.exitCode = previousExitCode;
+			await writeFile(releaseManifest, JSON.stringify({ name: "gajaeway", gjc: { version: "0.19.3" } }));
 			await main(args, {
 				services: {
 					loginPathRunner: async () => "/usr/bin",
@@ -1429,6 +1438,27 @@ describe("work operator commands", () => {
 			expect(output.closed).toBe(true);
 		});
 	}
+
+	test("unknown work status warns that a disconnected start may still be admitted", async () => {
+		const output = await run(
+			["status", "fix"],
+			new ProtocolError("invalid_params", "unknown work lane", { reasonCode: "unknown_work_lane", name: "fix" }),
+		);
+		expect(output.errors).toEqual([
+			"unknown work lane; a previous start or run may still be admitted after a timeout or disconnect. Do not blindly retry, even with the same name; continue observing and reconcile the original request.",
+		]);
+		expect(output.requests).toHaveLength(1);
+		expect(output.exitCode).toBe(1);
+		expect(output.closed).toBe(true);
+	});
+
+	test("unrelated work status errors are not rewritten as unknown admission", async () => {
+		const output = await run(
+			["status", "fix"],
+			new ProtocolError("invalid_params", "other failure", { reasonCode: "other" }),
+		);
+		expect(output.errors).toEqual(["other failure"]);
+	});
 
 	for (const closed of [true, false]) {
 		test(`work retire prints a successful retirement with closed=${closed}`, async () => {

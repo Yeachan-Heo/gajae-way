@@ -61,6 +61,7 @@ import {
 } from "../store/groups/work";
 import type { WriteTx } from "../store/tx";
 import { type BrokerWaitOptions, isBrokerUnavailable, waitForBroker } from "./broker";
+import { isEmbeddedModuleDir } from "./embedded-module";
 import { readFailedTransportCause } from "./failed-turn-evidence";
 import { GIT_COMMAND_TIMEOUT_MS, runGit } from "./git-command";
 import {
@@ -268,11 +269,6 @@ export function getServiceDirectory(): string {
 	} catch {
 		return anchor;
 	}
-}
-
-/** True for the virtual directory a `bun build --compile` binary embeds its modules under. */
-export function isEmbeddedModuleDir(dir: string): boolean {
-	return dir === "/$bunfs/root" || dir.startsWith("/$bunfs/") || /^[A-Z]:[\\/]~BUN[\\/]/i.test(dir);
 }
 
 /** Nearest existing ancestor's realpath with the missing tail re-appended. */
@@ -1122,6 +1118,7 @@ export class WorkLaneManager {
 		let accepted = false;
 		let rejected = false;
 		let source: "receipt" | "status" = "receipt";
+		let transportUnavailableError = false;
 		try {
 			const receipt = await this.#port.send({
 				sessionId: runtime.sessionId,
@@ -1142,6 +1139,10 @@ export class WorkLaneManager {
 				typeof error === "object" && error !== null && "details" in error
 					? (error.details as { code?: unknown } | undefined)?.code
 					: undefined;
+			// Track transport_unavailable specifically: the message was definitely not delivered
+			if (!rejected && code === "transport_unavailable") {
+				transportUnavailableError = true;
+			}
 			console.error(
 				`work_send_error opRef=${opRef} code=${typeof code === "string" && /^[a-z_]{1,64}$/.test(code) ? code : "transport_unavailable"}`,
 			);
@@ -1154,9 +1155,11 @@ export class WorkLaneManager {
 			throw workError("work send acceptance uncertain", "send_acceptance_uncertain", runtime);
 		}
 		let latest = this.#db.work.workAttemptGet(opRef)!;
+		let statusFromQuery: PromptStatusBody | undefined;
 		if (!accepted && !rejected) {
 			try {
-				accepted = provesAcceptance(await this.#query(latest, observer.tail));
+				statusFromQuery = await this.#query(latest, observer.tail);
+				accepted = provesAcceptance(statusFromQuery);
 				source = "status";
 			} catch {
 				/* Observation owns recovery; never replay. */
@@ -1169,6 +1172,34 @@ export class WorkLaneManager {
 			this.#live();
 			throw workError("work send acceptance uncertain", "send_acceptance_uncertain", runtime);
 		}
+		// Detect provably undelivered sends: transport_unavailable AND session has no record of the operation
+		// AND broker-reported activity is idle AND session has no accepted command/user turn for this clientRef.
+		// Missing/unreported activity counts as NOT idle (per #779 rule).
+		let sendUndelivered = false;
+		if (
+			transportUnavailableError &&
+			statusFromQuery &&
+			statusFromQuery.status === "unknown" &&
+			!accepted &&
+			!rejected
+		) {
+			// Require positive broker evidence: activity must be idle AND no accepted turn/command
+			try {
+				if (this.#port.liveness) {
+					const liveness = await this.#port.liveness({ sessionId: runtime.sessionId, repo: runtime.cwd });
+					// Missing activity counts as NOT idle per #779; only settle on positive idle evidence
+					const activityIsIdle = liveness.activity?.state === "idle";
+					// Check if there's no accepted command/user turn for this clientRef
+					const noAcceptedTurn = !statusFromQuery.commandId && !statusFromQuery.turnId;
+					// Only settle if we have positive evidence of both idle + no accepted turn
+					if (activityIsIdle && noAcceptedTurn) {
+						sendUndelivered = true;
+					}
+				}
+			} catch {
+				// If liveness check fails, don't settle (uncertain)
+			}
+		}
 		latest =
 			this.#updateAttempt(
 				opRef,
@@ -1179,11 +1210,14 @@ export class WorkLaneManager {
 							sendPhase: "uncertain",
 							...(rejected
 								? { terminal: { kind: "local", observedAt: this.#at(), reasonCode: "send_rejected" } as const }
-								: {}),
+								: sendUndelivered
+									? { terminal: { kind: "local", observedAt: this.#at(), reasonCode: "send_undelivered" } as const }
+									: {}),
 						},
 			) ?? latest;
 		this.#schedule(observer, 0);
 		if (rejected) throw workError("work send rejected", "send_rejected", latest);
+		if (sendUndelivered) throw workError("work send undelivered", "send_undelivered", latest);
 		if (!accepted) throw workError("work send acceptance uncertain", "send_acceptance_uncertain", latest);
 		return { started: true, jobId, opRef, sessionKey, sessionId: runtime.sessionId };
 	}

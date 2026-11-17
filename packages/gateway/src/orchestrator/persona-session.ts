@@ -20,6 +20,7 @@ import {
 	DEFAULT_SESSIONS_BUSY_STALL_MS,
 	DEFAULT_SESSIONS_IDLE_RETIRE_MS,
 	DEFAULT_SESSIONS_MAX_LIVE_HOSTS,
+	DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS,
 	DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
 	type GjcModelSelection,
 	type GjcServiceTier,
@@ -108,17 +109,31 @@ const STEER_REPLAY_ATTEMPTS = 2;
 /** Bind failures back off exponentially from DISPATCH_FAILURE_RETRY_MS up to this ceiling. */
 const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
 const LOCAL_PREFLIGHT_REJECTION_PREFIX = "persona-local-preflight-rejection:";
+const LOCAL_PREFLIGHT_MODEL_PREFIX = "persona-local-preflight-model:";
 const PROMPT_TOO_LARGE_CODE = "prompt_too_large";
+const MODEL_NOT_FOUND_REJECTION_CODE = "model_not_found";
 
 class SendTurnNoLongerBoundError extends Error {}
+
+/** The pre-send compaction may still be running on the host; the send must wait for evidence it is over. */
+class CompactionUnresolvedError extends Error {
+	constructor(code: string | undefined) {
+		super(`compaction may still be running${code ? ` (${code})` : ""}`);
+		this.name = "CompactionUnresolvedError";
+	}
+}
 
 function localPreflightRejectionKey(opRef: string): string {
 	return `${LOCAL_PREFLIGHT_REJECTION_PREFIX}${opRef}`;
 }
 
+function localPreflightModelKey(opRef: string): string {
+	return `${LOCAL_PREFLIGHT_MODEL_PREFIX}${opRef}`;
+}
+
 function localPreflightRejection(store: Store, opRef: string): string | undefined {
 	const code = store.core.metaGet(localPreflightRejectionKey(opRef));
-	return code === PROMPT_TOO_LARGE_CODE ? code : undefined;
+	return code === PROMPT_TOO_LARGE_CODE || code === MODEL_NOT_FOUND_REJECTION_CODE ? code : undefined;
 }
 
 function freshTurnMetaKey(originKey: string, epoch: number, triggerMessageId: string): string {
@@ -157,14 +172,175 @@ function providerTransportRetryAttempt(
 	return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
+/** `work`'s result, or undefined when it is still running at `deadlineMs` (epoch ms). */
+async function beforeDeadline<T>(work: Promise<T>, deadlineMs: number): Promise<T | undefined> {
+	if (!Number.isFinite(deadlineMs)) return await work;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			work,
+			new Promise<undefined>((resolve) => {
+				timer = setTimeout(() => resolve(undefined), Math.max(0, deadlineMs - Date.now()));
+			}),
+		]);
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+	}
+}
+
 /** An escalated hold (#686) whose late answer is still wanted; restored on adoption after a restart. */
 function escalatedHoldKey(opRef: string): string {
 	return `escalated-hold:${opRef}`;
 }
 
+/**
+ * When an escalated retired hold was first seen with its host provably not live,
+ * and which host identity it saw then (a {@link DeadHostMark}). Cleared when the
+ * host is seen live or the op reports a status other than unknown.
+ */
+function retiredHoldDeadSinceKey(opRef: string): string {
+	return `retired-hold-dead-since:${opRef}`;
+}
+
+/**
+ * Set once the origin confirmed the escalation notice of a hold. Kept apart from
+ * the delivery ledger, which prunes confirmed rows after a week.
+ */
+function escalationNoticeConfirmedKey(opRef: string): string {
+	return `escalation-notice-confirmed:${opRef}`;
+}
+
+/**
+ * Set when a hold's escalation notice was reissued because its delivery row was
+ * gone (pruned before the retention link existed). At most one reissue per hold:
+ * a second missing row is a ledger anomaly, not a reason to notify again.
+ */
+function escalationNoticeReissuedKey(opRef: string): string {
+	return `escalation-notice-reissued:${opRef}`;
+}
+
+/**
+ * What the delivery ledger knows about a hold's escalation notice. `missing`
+ * is a row that does not exist at all (never queued, or pruned); it is never
+ * read as confirmed.
+ */
+export type EscalationNoticeReceipt = "confirmed" | "unconfirmed" | "missing";
+
+/**
+ * Links an escalation notice's delivery row to its open hold. Outbox retention
+ * keeps a confirmed row while this key exists, so the proof that the user was
+ * told outlives a gateway that stayed down past the confirmed-row retention.
+ * Deleted when the hold's turn completes.
+ */
+/** The retention link of a trigger's escalation notice; see escalationNoticeDeliveryKey. */
+function escalationNoticeLinkKey(trigger: InboundMessageRow): string {
+	return escalationNoticeDeliveryKey(
+		deterministicBindHoldDeliveryId(trigger.origin_key, trigger.message_id, UNRESOLVED_HOLD_ESCALATED),
+	);
+}
+
+function escalationNoticeDeliveryKey(deliveryId: string): string {
+	return `escalation-notice-delivery:${deliveryId}`;
+}
+
+/** Deterministic delivery id of a bind-hold or escalation notice, so a replayed notice posts once. */
+export function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string, reason: string): string {
+	const kind = reason === UNRESOLVED_HOLD_ESCALATED ? UNRESOLVED_HOLD_ESCALATED : "bind_hold";
+	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|${kind}`).digest("hex").slice(0, 32)}`;
+}
+
+/** A trigger whose turn is still open: the only kind whose escalation notice row must outlive retention. */
+function openHoldTrigger(trigger: InboundMessageRow): boolean {
+	return trigger.state === "pending" && (trigger.turn_state === "accepted" || trigger.turn_state === "bound");
+}
+
+/**
+ * Links the escalation notice of every open escalated hold to its delivery row,
+ * for holds escalated before the link existed. Runs at boot before the first
+ * outbox prune: persona recovery would link them too, but asynchronously, and a
+ * retention sweep that ran first would already have pruned a confirmed notice
+ * near the cutoff, leaving the hold without the proof it needs to ever close.
+ * Returns how many links were added. Already pruned rows are not inferred.
+ */
+export function linkOpenEscalatedHoldNotices(store: Store): number {
+	const prefix = escalatedHoldKey("");
+	let linked = 0;
+	for (const key of store.core.metaKeysInRange(prefix, `${prefix}\uffff`)) {
+		const opRef = key.slice(prefix.length);
+		const trigger = store.inbox.turnRow(opRef);
+		if (!trigger || !openHoldTrigger(trigger)) continue;
+		// Once the confirmation is durable the row is ordinary history again.
+		if (store.core.metaGet(escalationNoticeConfirmedKey(opRef)) !== undefined) continue;
+		const linkKey = escalationNoticeLinkKey(trigger);
+		if (store.core.metaGet(linkKey) !== undefined) continue;
+		store.core.metaSet(linkKey, trigger.turn_op_ref ?? "");
+		linked++;
+	}
+	return linked;
+}
+
+/**
+ * A dead retired hold that is parked: still tracked, its late answer still
+ * wanted, but probed once per {@link RETIRED_HOLD_PARKED_PROBE_MS} instead of
+ * every sweep. Cleared by any evidence that clears the dead-since mark.
+ */
+function retiredHoldParkedKey(opRef: string): string {
+	return `retired-hold-parked:${opRef}`;
+}
+
+interface ParkedMark {
+	readonly at: number;
+	readonly probedAt: number;
+}
+
+function parseParkedMark(value: string | undefined): ParkedMark | undefined {
+	if (value === undefined) return undefined;
+	try {
+		const mark = JSON.parse(value) as Partial<ParkedMark>;
+		if (typeof mark.at !== "number" || !Number.isFinite(mark.at)) return undefined;
+		if (typeof mark.probedAt !== "number" || !Number.isFinite(mark.probedAt)) return undefined;
+		return { at: mark.at, probedAt: mark.probedAt };
+	} catch {
+		return undefined;
+	}
+}
+
+/** The not-live host a dead retired hold's abandonment window opened on. */
+interface DeadHostMark {
+	readonly at: number;
+	readonly hostIncarnation: string;
+	readonly activityAt: number;
+}
+
+function parseDeadHostMark(value: string | undefined): DeadHostMark | undefined {
+	if (value === undefined) return undefined;
+	try {
+		const mark = JSON.parse(value) as Partial<DeadHostMark>;
+		if (typeof mark.at !== "number" || !Number.isFinite(mark.at)) return undefined;
+		if (typeof mark.hostIncarnation !== "string" || mark.hostIncarnation === "") return undefined;
+		if (typeof mark.activityAt !== "number" || !Number.isFinite(mark.activityAt)) return undefined;
+		return { at: mark.at, hostIncarnation: mark.hostIncarnation, activityAt: mark.activityAt };
+	} catch {
+		return undefined;
+	}
+}
+
+/** Session of an origin whose last pre-send compaction may still be running. */
+function unresolvedCompactionKey(originKey: string): string {
+	return `compaction-unresolved:${originKey}`;
+}
+
 /** Track relay unavailable events for a turn to detect unresponsive relays even on live hosts (#766). */
 function relayUnavailableTrackerKey(opRef: string): string {
 	return `relay_unavailable:${opRef}`;
+}
+
+/**
+ * First miss of a terminal operation's result text. Durable so the bounded
+ * recovery window still expires after a gateway restart instead of restarting.
+ */
+function terminalTextMissKey(opRef: string): string {
+	return `terminal_text_miss:${opRef}`;
 }
 
 const ESCALATION_NOTICE_PREFIX = "escalation-notice:";
@@ -173,6 +349,14 @@ const ESCALATION_NOTICE_PREFIX = "escalation-notice:";
  * Durable intent to post an escalation notice, deleted once the delivery ledger
  * owns it. Inbox retention keeps the trigger row while this key exists.
  */
+/**
+ * Intent value of a notice posted again after its ledger row was pruned. Unlike
+ * the original (#686), which is still owed after the turn settles because the
+ * user was never told, a reissue repeats what was already said, so it is dropped
+ * once the hold is settled.
+ */
+const ESCALATION_NOTICE_REISSUE = "reissue";
+
 function escalationNoticeKey(originKey: string, opRef: string): string {
 	return `${ESCALATION_NOTICE_PREFIX}${originKey}#${opRef}`;
 }
@@ -294,12 +478,24 @@ function completeInboundTurn(
 ): number {
 	const prompt = ownedTurnPrompt(store, opRef);
 	const consumeExit = prompt !== undefined && confirmedStalledExit(store, prompt);
+	const trigger = store.inbox.turnRow(opRef);
 	const changed = store.inbox.turnComplete(tx, opRef, unlinkedReason);
 	if (changed === 1 && prompt) store.bindings.abandonBrokerPromptBusyRefusal(tx, prompt);
 	if (changed === 1 && consumeExit) store.core.metaDelete(stalledExitProofKey(opRef));
 	if (changed === 1) store.core.metaDelete(escalatedHoldKey(opRef));
 	// Clean up relay unavailability tracker when turn completes (#766)
 	if (changed === 1) store.core.metaDelete(relayUnavailableTrackerKey(opRef));
+	if (changed === 1) store.core.metaDelete(retiredHoldDeadSinceKey(opRef));
+	if (changed === 1) store.core.metaDelete(retiredHoldParkedKey(opRef));
+	if (changed === 1) store.core.metaDelete(escalationNoticeConfirmedKey(opRef));
+	if (changed === 1) store.core.metaDelete(escalationNoticeReissuedKey(opRef));
+	if (changed === 1 && trigger) {
+		store.core.metaDelete(escalationNoticeLinkKey(trigger));
+		// A reissue left unposted by a failed retry must not repeat after the answer.
+		const intentKey = escalationNoticeKey(trigger.origin_key, opRef);
+		if (store.core.metaGet(intentKey) === ESCALATION_NOTICE_REISSUE) store.core.metaDelete(intentKey);
+	}
+	if (changed === 1) store.core.metaDelete(terminalTextMissKey(opRef));
 	return changed;
 }
 
@@ -567,6 +763,8 @@ export interface PersonaBindHoldInput {
 
 /** Bind-hold reason for a turn whose unresolved hold was escalated to a retired hold (#686). */
 export const UNRESOLVED_HOLD_ESCALATED = "unresolved_hold_escalated";
+/** How often a parked dead retired hold is still probed for a late terminal, instead of every sweep. */
+export const RETIRED_HOLD_PARKED_PROBE_MS = 60 * 60_000;
 const UNRESOLVED_HOLD_NOTICE =
 	"[turn held] I could not confirm whether my answer to an earlier message finished, so I will not run it again. Newer messages continue in a fresh session; if that earlier answer still arrives, it will be posted here.";
 
@@ -680,6 +878,17 @@ export interface PersonaSessionManagerOptions {
 	readonly busyStallMs?: number;
 	/** Unknown-state turn on a dead host holds its origin at most this long; default DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS (#686). */
 	readonly unresolvedHoldMs?: number;
+	/** Escalated retired hold on a host not live this long is parked; default DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS. */
+	readonly retiredHoldAbandonMs?: number;
+	/**
+	 * Whether the origin confirmed the escalation notice posted for this trigger.
+	 * A retired hold is abandoned only after it did. Unset means there is no
+	 * delivery ledger (the notice hook itself is final), which counts as confirmed.
+	 */
+	readonly escalationNoticeReceipt?: (input: {
+		originKey: string;
+		trigger: InboundMessageRow;
+	}) => EscalationNoticeReceipt;
 	/** Called when a reverse request from the SDK host arrives. */
 	readonly onReverseRequest?: (input: {
 		originKey: string;
@@ -724,6 +933,7 @@ export class PersonaSessionManager {
 	readonly #heldSteerContextMessageId: PersonaSessionManagerOptions["heldSteerContextMessageId"];
 	readonly #brokerLiveness: BrokerLivenessProbe | undefined;
 	readonly #onBindHold: PersonaSessionManagerOptions["onBindHold"];
+	readonly #escalationNoticeReceipt: PersonaSessionManagerOptions["escalationNoticeReceipt"];
 	readonly #onReverseRequest: PersonaSessionManagerOptions["onReverseRequest"];
 	readonly #onSloEvent: PersonaSessionManagerOptions["onSloEvent"];
 	readonly #onBindFailure: PersonaSessionManagerOptions["onBindFailure"];
@@ -743,6 +953,7 @@ export class PersonaSessionManager {
 	#hostIdleRetireMs: number;
 	#busyStallMs: number;
 	#unresolvedHoldMs: number;
+	#retiredHoldAbandonMs: number;
 	#draining = false;
 	#restartDrainId: string | undefined;
 	#stopped = false;
@@ -770,6 +981,7 @@ export class PersonaSessionManager {
 		this.#heldSteerContextMessageId = options.heldSteerContextMessageId;
 		this.#brokerLiveness = options.brokerLiveness;
 		this.#onBindHold = options.onBindHold;
+		this.#escalationNoticeReceipt = options.escalationNoticeReceipt;
 		this.#onReverseRequest = options.onReverseRequest;
 		this.#maxLiveHosts = positiveInteger(options.maxLiveHosts, DEFAULT_SESSIONS_MAX_LIVE_HOSTS, "maxLiveHosts");
 		this.#hostIdleRetireMs = positiveInteger(
@@ -782,6 +994,11 @@ export class PersonaSessionManager {
 			options.unresolvedHoldMs,
 			DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
 			"unresolvedHoldMs",
+		);
+		this.#retiredHoldAbandonMs = positiveInteger(
+			options.retiredHoldAbandonMs,
+			DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS,
+			"retiredHoldAbandonMs",
 		);
 		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
 		this.#onSloEvent = options.onSloEvent;
@@ -864,6 +1081,11 @@ export class PersonaSessionManager {
 			DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
 			"unresolvedHoldMs",
 		);
+		this.#retiredHoldAbandonMs = positiveInteger(
+			config?.retiredHoldAbandonMs,
+			DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS,
+			"retiredHoldAbandonMs",
+		);
 	}
 
 	get busyStallMs(): number {
@@ -872,6 +1094,10 @@ export class PersonaSessionManager {
 
 	get unresolvedHoldMs(): number {
 		return this.#unresolvedHoldMs;
+	}
+
+	get retiredHoldAbandonMs(): number {
+		return this.#retiredHoldAbandonMs;
 	}
 
 	get maxLiveHosts(): number {
@@ -1100,7 +1326,9 @@ export class PersonaSessionManager {
 		for (;;) {
 			if (this.#stopped || this.#restartDrainId !== restartId) return "stopped";
 			const actors = [...this.#actors.values()];
-			const checks = Promise.all(actors.map((actor) => actor.enqueue(async () => actor.hasUnsettledTurns())));
+			const checks = Promise.all(
+				actors.map((actor) => actor.enqueue(async () => await actor.hasUnsettledTurns(deadline))),
+			);
 			let timer: ReturnType<typeof setTimeout> | undefined;
 			const timedOut = Symbol("restart drain timed out");
 			let unsettled: (boolean | undefined)[] | typeof timedOut;
@@ -1284,6 +1512,17 @@ export class PersonaSessionManager {
 		await this.#onHeldSteerAccepted?.(input);
 	}
 
+	/** The ledger's receipt for this trigger's escalation notice; confirmed without a delivery ledger. */
+	escalationNoticeReceipt(originKey: string, trigger: InboundMessageRow): EscalationNoticeReceipt {
+		if (!this.#escalationNoticeReceipt) return "confirmed";
+		try {
+			return this.#escalationNoticeReceipt({ originKey, trigger });
+		} catch (error) {
+			this.#log(`escalation_notice_confirm_failed origin=${originKey} detail=${safeDiagnostic(error)}`, "error");
+			return "unconfirmed";
+		}
+	}
+
 	/** False when the notice hook failed; a durable notice intent is then retried. */
 	async emitBindHold(input: PersonaBindHoldInput): Promise<boolean> {
 		try {
@@ -1320,6 +1559,8 @@ type BoundTurn = PersonaTurnIdentity & {
 	 * delivered and its terminal completes the turn like a current one.
 	 */
 	answerWanted: boolean;
+	/** Only blocked restart probes are shared across the drain loop's short polling interval. */
+	restartDrainVerdict?: { checkedAtMs: number; blocked: true };
 	/**
 	 * The relay that owned this turn is gone (died mid-turn, or the turn was
 	 * adopted after a restart): its content will never arrive on a stream, so
@@ -1347,6 +1588,12 @@ type BoundTurn = PersonaTurnIdentity & {
 	stallHostTerminated?: boolean;
 	/** SIGTERM was accepted, but the host process has not yet been confirmed exited. */
 	stallHostTerminating?: boolean;
+	/**
+	 * The transcript showed, before the stall cutoff stopped the host, that the
+	 * reply the owned relay delivered ended with stopReason "stop" (#768). A
+	 * stopped host answers no transcript read, so closure cannot probe it later.
+	 */
+	stallReplyConcluded?: boolean;
 	/** Original authority captured before signalling; never refreshed into a new broker's proof. */
 	stallExitOwner?: NonNullable<ReturnType<typeof stalledExitOwner>>;
 	/** A stalled retired hold already attempted its one allowed host termination. */
@@ -1553,8 +1800,60 @@ class OriginActor {
 		return this.#state;
 	}
 
-	hasUnsettledTurns(): boolean {
-		return this.#state !== "idle" || this.#current !== undefined || this.#retired.size > 0;
+	/**
+	 * Restart-drain check. `deadlineMs` (epoch ms) is the drain's own deadline: a
+	 * host probe still running then counts as blocked and releases this actor's
+	 * queue, so a hung status read or inspect cannot hold up the origin after
+	 * the drain has given up.
+	 */
+	async hasUnsettledTurns(deadlineMs = Number.POSITIVE_INFINITY): Promise<boolean> {
+		if (this.#state !== "idle" || this.#current !== undefined) return true;
+		for (const bound of this.#retired.values()) {
+			// Only a detached escalated hold whose operation is not reported active and
+			// whose host process is proven exited by OS `ps` can be skipped: recovery
+			// readopts it from the durable marker and pending trigger, and no producer
+			// can be lost. Registry liveness alone is not process-exit evidence.
+			if (
+				bound.answerWanted !== true ||
+				bound.detached !== true ||
+				this.#manager.database.core.metaGet(escalatedHoldKey(bound.turn.opRef)) === undefined
+			) {
+				bound.restartDrainVerdict = undefined;
+				return true;
+			}
+			// Only a blocked verdict is cached. An exemption is re-proven on every
+			// drain poll, because it lets the restart go ahead while this turn's
+			// producer would be lost if the host were in fact still running.
+			const verdict = bound.restartDrainVerdict;
+			if (verdict && this.#manager.now() - verdict.checkedAtMs < STATUS_RECHECK_MIN_MS) return true;
+			const blocked = await beforeDeadline(this.#restartDrainProbe(bound), deadlineMs);
+			if (blocked === undefined) return true;
+			if (this.#stopped || this.#manager.stopped) return true;
+			bound.restartDrainVerdict = blocked ? { checkedAtMs: this.#manager.now(), blocked: true } : undefined;
+			if (blocked) return true;
+		}
+		return false;
+	}
+
+	/** True unless the held operation is reported settled and its host process is proven exited. */
+	async #restartDrainProbe(bound: BoundTurn): Promise<boolean> {
+		try {
+			const report = await this.#statusForRecovery(bound.sessionId, bound.turn.opRef);
+			if (this.#stopped || this.#manager.stopped) return true;
+			const port = this.#manager.port;
+			// A report for another (or no) operation says nothing about this one, as in recovery.
+			if (
+				report.operationRef !== bound.turn.opRef ||
+				report.status.status === "accepted" ||
+				report.status.status === "in_flight" ||
+				port.hostExited === undefined
+			)
+				return true;
+			return (await port.hostExited({ sessionId: bound.sessionId, repo: this.#manager.repo })) !== true;
+		} catch {
+			// Unreadable host evidence keeps the producer fence.
+			return true;
+		}
 	}
 
 	enqueue<T>(work: () => Promise<T>): Promise<T | undefined> {
@@ -1707,14 +2006,23 @@ class OriginActor {
 	}
 
 	async #settleLocalPreflightRejection(bound: BoundTurn, code: string): Promise<void> {
-		if (code !== PROMPT_TOO_LARGE_CODE) return;
+		if (code !== PROMPT_TOO_LARGE_CODE && code !== MODEL_NOT_FOUND_REJECTION_CODE) return;
 		const opRef = bound.turn.opRef;
 		const key = localPreflightRejectionKey(opRef);
 		if (localPreflightRejection(this.#manager.database, opRef) !== code) return;
-		const message = `the prompt exceeded the ${MAX_RELAY_REQUEST_FRAME_BYTES}-byte request limit before it was sent; reduce the text or number of images and send again`;
-		const error = new GjcRuntimeError(`${code}: ${message}`, { code, message });
+		const selectionKey = localPreflightModelKey(opRef);
+		const modelSelection =
+			code === MODEL_NOT_FOUND_REJECTION_CODE
+				? (this.#manager.database.core.metaGet(selectionKey) ?? describeModel(bound.lifecycle.effectiveModel))
+				: undefined;
+		const errorCode = code === MODEL_NOT_FOUND_REJECTION_CODE ? "invalid_input" : code;
+		const message =
+			code === PROMPT_TOO_LARGE_CODE
+				? `the prompt exceeded the ${MAX_RELAY_REQUEST_FRAME_BYTES}-byte request limit before it was sent; reduce the text or number of images and send again`
+				: `the selected model "${modelSelection}" was not found; choose a valid model with /model and send again`;
+		const error = new GjcRuntimeError(`${errorCode}: ${message}`, { code: errorCode, message });
 		this.#manager.log(
-			`persona_send_preflight_rejected origin=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} opRef=${opRef} reason=${code}`,
+			`persona_send_preflight_rejected origin=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} opRef=${opRef} reason=${code}${modelSelection ? ` selection=${modelSelection}` : ""}`,
 			"warn",
 		);
 		bound.tail?.setTurnRunning(false);
@@ -1754,6 +2062,8 @@ class OriginActor {
 				);
 			if (changed === 1 || this.#manager.database.inbox.turnRow(opRef)?.turn_state === "done")
 				this.#manager.database.core.metaDelete(key);
+			if (changed === 1 || this.#manager.database.inbox.turnRow(opRef)?.turn_state === "done")
+				this.#manager.database.core.metaDelete(selectionKey);
 			return changed;
 		});
 		await this.#notifySettled(bound);
@@ -1996,6 +2306,18 @@ class OriginActor {
 				this.#manager.log(`escalation_notice_unresolvable origin=${this.originKey} opRef=${opRef}`, "error");
 				continue;
 			}
+			if (!openHoldTrigger(trigger) && database.core.metaGet(key) === ESCALATION_NOTICE_REISSUE) {
+				// The hold settled while its reissue was still unposted: the user was
+				// told once at escalation and now has the outcome; repeating the
+				// notice would be noise. (An unposted original is still owed, #686.)
+				database.core.metaDelete(key);
+				this.#manager.log(
+					`escalation_notice_discarded origin=${this.originKey} opRef=${opRef} reason=trigger_settled`,
+					"warn",
+				);
+				continue;
+			}
+			this.#linkEscalationNotice(trigger);
 			const delivered = await this.#manager.emitBindHold({
 				originKey: this.originKey,
 				trigger,
@@ -2290,6 +2612,8 @@ class OriginActor {
 	readonly #holdSweeps = new Map<string, number>();
 	/** Logged recovery hold reasons to dedupe alternating reasons; keyed by "opRef:reason" (#772). */
 	readonly #loggedRecoveryHolds = new Set<string>();
+	/** Dead retired holds whose window closed while their producer process was still present, logged once. */
+	readonly #producerPresentLogged = new Set<string>();
 
 	/** Liveness of a binding from the raw broker envelope; the normalized inspect where the port has no raw read. */
 	async #bindingState(sessionId: string): Promise<{
@@ -2297,6 +2621,8 @@ class OriginActor {
 		readonly deleted?: boolean;
 		readonly workspace?: string;
 		readonly disowned?: boolean;
+		readonly hostIncarnation?: string;
+		readonly activity?: { readonly state: string; readonly at: number };
 	}> {
 		const port = this.#manager.port;
 		if (port.liveness) {
@@ -2723,16 +3049,20 @@ class OriginActor {
 		// backoff instead.
 		const modelKey = describeModel(lifecycle.effectiveModel);
 		let modelReceipt: { readonly changed: boolean } | undefined;
+		let applyingModel = false;
 		try {
-			modelReceipt =
-				lifecycle.effectiveModel && this.#appliedModel.get(binding.sessionId) !== modelKey
-					? await this.#manager.port.setModel({
-							sessionId: binding.sessionId,
-							repo: this.#manager.repo,
-							selection: lifecycle.effectiveModel,
-							relay: tail,
-						})
-					: undefined;
+			if (lifecycle.effectiveModel && this.#appliedModel.get(binding.sessionId) !== modelKey) {
+				applyingModel = true;
+				modelReceipt = await this.#manager.port.setModel({
+					sessionId: binding.sessionId,
+					repo: this.#manager.repo,
+					selection: lifecycle.effectiveModel,
+					relay: tail,
+				});
+				applyingModel = false;
+			} else {
+				modelReceipt = undefined;
+			}
 			if (lifecycle.effectiveModel) this.#appliedModel.set(binding.sessionId, modelKey);
 			if (
 				lifecycle.effectiveServiceTier &&
@@ -2755,6 +3085,20 @@ class OriginActor {
 					`persona_service_tier origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} tier=${lifecycle.effectiveServiceTier} source=turn`,
 				);
 		} catch (error) {
+			if (applyingModel && typeof lifecycle.effectiveModel === "string" && isStructuredModelNotFoundFailure(error)) {
+				this.#manager.database.transaction(() => {
+					this.#manager.database.core.metaSet(localPreflightModelKey(opRef), lifecycle.effectiveModel as string);
+					this.#manager.database.core.metaSet(localPreflightRejectionKey(opRef), MODEL_NOT_FOUND_REJECTION_CODE);
+				});
+				this.#preSendFailures = 0;
+				this.#manager.recordPreSendFailure(this.originKey, safeDiagnostic(error));
+				this.#manager.log(
+					`persona_model_failed origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} message=${trigger.message_id} terminal=true selection=${modelKey} detail=${safeDiagnostic(error)}`,
+					"error",
+				);
+				await this.#settleLocalPreflightRejection(current, MODEL_NOT_FOUND_REJECTION_CODE);
+				return;
+			}
 			await tail.close();
 			const sessionGone = sdkStatusErrorCode(error) === "session_unavailable";
 			const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
@@ -3857,6 +4201,13 @@ class OriginActor {
 			this.#clearStallReconciliation(bound);
 			return false;
 		}
+		// Read the stopReason proof while the host can still serve the transcript.
+		bound.stallReplyConcluded =
+			bound.lastAssistantText !== undefined && (await this.#lastAssistantIsAnswering(bound)) === true;
+		if (!canTerminate()) {
+			this.#clearStallReconciliation(bound);
+			return false;
+		}
 		const authorizeTermination = async () => {
 			if (!canTerminate()) return false;
 			try {
@@ -4269,6 +4620,9 @@ class OriginActor {
 			epoch: bound.epoch,
 			repo: this.#manager.repo,
 		});
+		// A parked dead hold is probed once an hour, not once a sweep: its late
+		// terminal is still wanted, its status spawn every minute is not.
+		if (knownReport === undefined && !this.#parkedProbeDue(bound)) return;
 		let report: StatusReport;
 		try {
 			report = knownReport ?? (await this.#statusOf(bound));
@@ -4285,6 +4639,7 @@ class OriginActor {
 				await this.#dispatchNext();
 				return;
 			}
+			if (await this.#parkDeadRetiredHold(bound)) return;
 			this.#logRecoveryHoldOnce(bound.turn, "status_unavailable", `detail=${safeDiagnostic(error)}`);
 			// A turn no relay will announce the end of must not wait for the 60 s
 			// sweep after one unreadable status: keep rechecking at the bounded cadence.
@@ -4302,6 +4657,9 @@ class OriginActor {
 		const hasRelayUnavailableEvidence =
 			relayTrackerTs !== undefined &&
 			this.#manager.now() - Number.parseInt(relayTrackerTs, 10) >= this.#manager.unresolvedHoldMs;
+		// Any readable status other than unknown, including an in-flight one held below
+		// on relay evidence, breaks the run of unknown reads an abandonment requires.
+		if (report.status.status !== "unknown") this.#clearRetiredHoldDeadSince(bound.turn.opRef);
 		if (report.status.status === "unknown" || (report.status.status === "in_flight" && hasRelayUnavailableEvidence)) {
 			const count = (this.#holdSweeps.get(bound.turn.opRef) ?? 0) + 1;
 			this.#holdSweeps.set(bound.turn.opRef, count);
@@ -4316,6 +4674,8 @@ class OriginActor {
 				await this.#dispatchNext();
 				return;
 			}
+			// Only an unknown op is eligible: an in-flight one may still be mutating the workspace (#772).
+			if (report.status.status === "unknown" && (await this.#parkDeadRetiredHold(bound))) return;
 			const reason =
 				report.status.status === "unknown" ? "operation_state_unknown" : "relay_unavailable_holds_in_flight";
 			this.#logRecoveryHoldOnce(bound.turn, reason, `sweeps=${count}`);
@@ -4437,8 +4797,17 @@ class OriginActor {
 				}
 				if (text === undefined) {
 					const now = this.#manager.now();
+					// The window is a limit on how long the turn may hold, not on how long
+					// this process may live: recover the first miss from durable state so a
+					// restart cannot restart the budget and leave the turn pending forever.
+					const firstMissKey = terminalTextMissKey(bound.turn.opRef);
+					const recordedFirstMiss = Number.parseInt(this.#manager.database.core.metaGet(firstMissKey) ?? "", 10);
+					const durableFirstMiss =
+						Number.isSafeInteger(recordedFirstMiss) && recordedFirstMiss > 0 ? recordedFirstMiss : undefined;
+					bound.terminalTextFirstMissAtMs ??= durableFirstMiss ?? now;
+					if (durableFirstMiss === undefined)
+						this.#manager.database.core.metaSet(firstMissKey, bound.terminalTextFirstMissAtMs.toString());
 					bound.terminalTextMisses += 1;
-					bound.terminalTextFirstMissAtMs ??= now;
 					const exhausted =
 						bound.terminalTextMisses >= TERMINAL_TEXT_RECOVERY_MAX_ATTEMPTS ||
 						now - bound.terminalTextFirstMissAtMs >= TERMINAL_TEXT_RECOVERY_WINDOW_MS;
@@ -4677,8 +5046,23 @@ class OriginActor {
 	 * send, so no prompt ever lands on a session gjc would compact first. A
 	 * compaction that fails or is unavailable is logged and the send goes ahead:
 	 * gjc's own compaction and the wedged-submission reset stay the fallback.
+	 *
+	 * A compaction that may still be running (gjc's request timed out, or no gjc
+	 * answer was read) never lets the send through: a prompt sent now queues
+	 * behind it on the session's ordered controls and times out as an ambiguous
+	 * send. The turn goes back to pending, and each retry needs evidence that
+	 * the run is over: a readable context below the line (it landed), or the
+	 * host's answer to a second `compaction.run` sent on the relay, which gjc's
+	 * ordered dispatcher runs only after the first. An unreadable context, a
+	 * refusal before dispatch and a missing reply are not evidence.
 	 */
 	async #prepareContext(sessionId: string, epoch: number, opRef: string, tail: TailHandle): Promise<PreparedContext> {
+		// Durable, so a restarted gateway keeps holding until the run is proven over.
+		const unresolvedKey = unresolvedCompactionKey(this.originKey);
+		const unresolvedOn = this.#manager.database.core.metaGet(unresolvedKey);
+		// A run left unresolved on another session says nothing about this one.
+		if (unresolvedOn !== undefined && unresolvedOn !== sessionId) this.#manager.database.core.metaDelete(unresolvedKey);
+		const unresolved = unresolvedOn === sessionId;
 		let usage: SessionContextUsage | undefined;
 		try {
 			usage = await this.#manager.port.contextUsage?.({ sessionId, repo: this.#manager.repo, relay: tail });
@@ -4687,19 +5071,46 @@ class OriginActor {
 			this.#manager.log(
 				`persona_context_unreadable origin=${this.originKey} session=${sessionId} detail=${safeDiagnostic(error)}`,
 			);
-			return { compacted: false };
+			if (!unresolved) return { compacted: false };
 		}
-		if (!usage || usage.tokens < PERSONA_COMPACTION_TOKENS) return { ...(usage ? { usage } : {}), compacted: false };
+		const belowLine = usage !== undefined && usage.tokens < PERSONA_COMPACTION_TOKENS;
+		if (unresolved && belowLine) {
+			// The earlier run landed: the context is compacted and the persona goes back in.
+			this.#manager.database.core.metaDelete(unresolvedKey);
+			this.#manager.log(
+				`persona_compaction_resolved origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage!.tokens} evidence=context_below_line`,
+			);
+			return { compacted: true };
+		}
+		if (!unresolved && (usage === undefined || belowLine)) return { ...(usage ? { usage } : {}), compacted: false };
+		// Written ahead of the run: a gateway that stops while it is in flight must
+		// come back holding, since the host keeps compacting regardless.
+		if (!unresolved) this.#manager.database.core.metaSet(unresolvedKey, sessionId);
 		const startedAt = this.#manager.now();
-		const { status } = await this.#manager.port.runCompaction({
+		const { status, code, outcomeUnknown, answered } = await this.#manager.port.runCompaction({
 			sessionId,
 			repo: this.#manager.repo,
 			originKey: this.originKey,
+			relay: tail,
 		});
 		this.#manager.log(
-			`persona_compaction origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage.tokens} status=${status} elapsedMs=${this.#manager.now() - startedAt}`,
+			`persona_compaction origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage?.tokens ?? "unknown"} status=${status}${code ? ` code=${code}` : ""}${outcomeUnknown ? " outcome=unknown" : ""}${unresolved ? " after=unresolved" : ""} elapsedMs=${this.#manager.now() - startedAt}`,
 		);
-		return status === "succeeded" ? { compacted: true } : { usage, compacted: false };
+		// Behind an unresolved run, only the host dispatcher's answer to this run
+		// proves the earlier one is over (gjc orders them): a refusal before
+		// dispatch or a reply that never came does not. The hold lasts until such
+		// an answer, a readable context below the line, the host's death or /new.
+		// A receipt is the host's answer on either path, and a host without
+		// compaction.run cannot have one running.
+		const settled = answered === true || status === "succeeded" || status === "skipped" || status === "unavailable";
+		if (outcomeUnknown || (unresolved && !settled)) throw new CompactionUnresolvedError(code);
+		// Answered, or a first run that never reached the host (refused before
+		// dispatch, frame never written): nothing is left compacting.
+		this.#manager.database.core.metaDelete(unresolvedKey);
+		// The earlier run may have compacted even if this one failed ("already
+		// compacted"): resolve it as compacted so the persona goes back in.
+		if (unresolved || status === "succeeded") return { compacted: true };
+		return { ...(usage ? { usage } : {}), compacted: false };
 	}
 
 	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {
@@ -4821,21 +5232,14 @@ class OriginActor {
 			const message =
 				"the session running this turn produced no terminal event before the stall deadline; the request was not resent";
 			try {
-				// Check if the turn delivered a reply that properly concluded (stopReason "stop").
-				// If it did, don't post the failure notice, as the user has their answer.
-				let forceFailureNotice = true;
-				if (bound.lastAssistantText !== undefined) {
-					const isAnswering = await this.#lastAssistantIsAnswering(bound);
-					// isAnswering === true: last message has stopReason "stop" → no notice needed
-					// isAnswering === false: last message has different stopReason → keep notice
-					// isAnswering === undefined: read failed → keep notice (fail safe)
-					if (isAnswering === true) {
-						forceFailureNotice = false;
-						this.#manager.log(
-							`stall_turn_answered_properly origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} last_stop_reason=stop`,
-						);
-					}
-				}
+				// A delivered reply that properly concluded (stopReason "stop", probed
+				// before the host was stopped) already answered the user: no notice.
+				// An unreadable or non-"stop" transcript keeps the notice (fail safe).
+				const forceFailureNotice = bound.stallReplyConcluded !== true;
+				if (!forceFailureNotice)
+					this.#manager.log(
+						`stall_turn_answered_properly origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} last_stop_reason=stop`,
+					);
 				await bound.lifecycle.onFailure?.({
 					...bound,
 					error: new GjcRuntimeError(`session_unavailable: ${message}`, { code: "session_unavailable", message }),
@@ -4881,9 +5285,202 @@ class OriginActor {
 		await this.#settleAfterTerminal(bound);
 	}
 
+	/**
+	 * Parks an escalated retired hold (#686) whose host has stayed provably not
+	 * live for `retiredHoldAbandonMs` while its operation state stayed unknown or
+	 * unreadable. #718 keeps such a hold open so a late answer can still land,
+	 * and parking keeps that: the hold, its tail and its answer path stay, only
+	 * the per-minute status spawn becomes hourly. Those spawns are what piled up
+	 * on a long-lived gateway until the broker stopped answering live turns.
+	 * The hold is never closed on this evidence (an absent host PID is not proof
+	 * that every producer of the op exited); any readable status unparks it.
+	 *
+	 * Parking needs all of:
+	 * - the origin confirmed the escalation notice (not merely queued it), so the
+	 *   user was told before the hold goes quiet; no second notice is sent;
+	 * - a positive `live=false` read when the window opened and when it ended;
+	 *   a disowned id or unanswerable liveness proves nothing and keeps waiting;
+	 * - the same host incarnation, and the same activity stamp, at both reads:
+	 *   a host that revived in between (and might have finished the op while
+	 *   status was unreadable) is a new incarnation, and opens a new window;
+	 * - no status other than unknown in between (cleared by the caller).
+	 * Liveness is read only when the window opens and when it ends. Returns true
+	 * only when the trigger turned out to be already settled and was forgotten.
+	 */
+	async #parkDeadRetiredHold(bound: BoundTurn): Promise<boolean> {
+		if (!bound.retired || !bound.answerWanted) return false;
+		const database = this.#manager.database;
+		const opRef = bound.turn.opRef;
+		if (database.core.metaGet(escalatedHoldKey(opRef)) === undefined) return false;
+		// An escalation notice not yet handed to delivery keeps its trigger, as retention does.
+		if (database.core.metaGet(escalationNoticeKey(this.originKey, opRef)) !== undefined) return false;
+		const trigger = database.inbox.turnRow(opRef);
+		if (!trigger) return false;
+		const confirmedKey = escalationNoticeConfirmedKey(opRef);
+		const linkKey = escalationNoticeLinkKey(trigger);
+		if (database.core.metaGet(confirmedKey) === undefined) {
+			// Until the confirmation is durable, the ledger row is the only proof the
+			// user was told, so a hold escalated before the link existed gets it now.
+			this.#linkEscalationNotice(trigger);
+			const receipt = this.#manager.escalationNoticeReceipt(this.originKey, trigger);
+			if (receipt === "missing") {
+				// No row at all: the notice of a hold escalated before the retention
+				// link existed was pruned, so nothing can ever prove the user was told.
+				// Post it once more under its deterministic id, so the ledger can
+				// confirm it; a missing row is never read as confirmed, and the
+				// held operation itself is never resent.
+				await this.#reissueEscalationNotice(opRef);
+				return false;
+			}
+			// Queued is not delivered: an adapter offline past the outbox TTL expires
+			// the notice, and closing then would leave the user told nothing.
+			if (receipt !== "confirmed") return false;
+			// The durable marker replaces the row as proof: release the retention
+			// pin with it, so a hold parked for months keeps no payload around.
+			database.transaction(() => {
+				database.core.metaSet(confirmedKey, "1");
+				database.core.metaDelete(linkKey);
+			});
+		} else if (database.core.metaGet(linkKey) !== undefined) {
+			database.core.metaDelete(linkKey);
+		}
+		const now = this.#manager.now();
+		const deadSinceKey = retiredHoldDeadSinceKey(opRef);
+		const mark = parseDeadHostMark(database.core.metaGet(deadSinceKey));
+		if (mark && now - mark.at < this.#manager.retiredHoldAbandonMs) return false;
+		const host = await this.#bindingState(bound.sessionId);
+		if (host.live === true) {
+			// A live host may still produce the answer: the window starts over.
+			this.#clearRetiredHoldDeadSince(opRef);
+			return false;
+		}
+		// Only a positive not-live read is evidence. Unanswerable liveness, or a
+		// disowned id (the broker lost the route; a detached host may still run),
+		// proves nothing: keep the window and ask again next sweep.
+		if (host.live !== false) return false;
+		// Without a host identity and an activity stamp, a revival or late work in
+		// between could not be ruled out: keep the window and ask again next sweep.
+		const activityAt = host.activity?.at;
+		if (!host.hostIncarnation || activityAt === undefined) return false;
+		const sameHost =
+			mark !== undefined && mark.hostIncarnation === host.hostIncarnation && mark.activityAt === activityAt;
+		if (!sameHost) {
+			// First dead read, or the host ran in between: (re)open the window on what is seen now.
+			const next: DeadHostMark = { at: now, hostIncarnation: host.hostIncarnation, activityAt };
+			database.core.metaSet(deadSinceKey, JSON.stringify(next));
+			if (mark)
+				this.#manager.log(
+					`retired_hold_window_restarted origin=${this.originKey} opRef=${opRef} reason=host_changed`,
+					"warn",
+				);
+			return false;
+		}
+		if (!openHoldTrigger(trigger)) {
+			this.#clearRetiredHoldDeadSince(opRef);
+			await this.#forgetClosed(bound);
+			return true;
+		}
+		// Broker non-liveness is not producer exit: a detached host process can
+		// still be running the op (`session_not_live_but_process_live`). Park only
+		// on the port's process probe; absent or inconclusive evidence keeps the
+		// hold swept every minute, and the window, for the next sweep.
+		if (!(await this.#producerExited(bound))) {
+			if (!this.#producerPresentLogged.has(opRef)) {
+				this.#producerPresentLogged.add(opRef);
+				this.#manager.log(
+					`retired_hold_kept origin=${this.originKey} epoch=${bound.epoch} opRef=${opRef} session=${bound.sessionId} notLiveMs=${now - mark.at} host=${host.hostIncarnation} reason=producer_exit_unproven`,
+					"warn",
+				);
+			}
+			return false;
+		}
+		this.#producerPresentLogged.delete(opRef);
+		// Nothing is forgotten: the hold, its retired tail and its late answer stay
+		// exactly as #718 left them; only the per-sweep status spawn becomes hourly.
+		// Any readable evidence unparks it. Closing on this evidence is deliberately
+		// not offered: an absent host PID is not an identity-correlated proof that
+		// every producer of the op has exited.
+		const parkedKey = retiredHoldParkedKey(opRef);
+		if (database.core.metaGet(parkedKey) === undefined) {
+			database.core.metaSet(parkedKey, JSON.stringify({ at: now, probedAt: now } satisfies ParkedMark));
+			this.#manager.log(
+				`retired_hold_parked origin=${this.originKey} epoch=${bound.epoch} opRef=${opRef} session=${bound.sessionId} notLiveMs=${now - mark.at} host=${host.hostIncarnation} probeEveryMs=${RETIRED_HOLD_PARKED_PROBE_MS} reason=host_not_live`,
+				"warn",
+			);
+		}
+		return false;
+	}
+
+	/** Keeps the notice row of an open hold past retention; a settled trigger's retried notice is not linked (its proof is no longer needed). */
+	#linkEscalationNotice(trigger: InboundMessageRow): void {
+		if (!openHoldTrigger(trigger)) return;
+		const key = escalationNoticeLinkKey(trigger);
+		const database = this.#manager.database;
+		if (database.core.metaGet(key) === undefined) database.core.metaSet(key, trigger.turn_op_ref ?? "");
+	}
+
+	/** True only on the port's positive process-exit evidence; no probe, a failed probe, or a present process is false. */
+	async #producerExited(bound: BoundTurn): Promise<boolean> {
+		const port = this.#manager.port;
+		if (port.hostExited === undefined) return false;
+		try {
+			return (await port.hostExited({ sessionId: bound.sessionId, repo: this.#manager.repo })) === true;
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			return false;
+		}
+	}
+
+	/** Posts a hold's escalation notice again, once, when its ledger row is gone; logged as an audit line. */
+	async #reissueEscalationNotice(opRef: string): Promise<void> {
+		const database = this.#manager.database;
+		const reissuedKey = escalationNoticeReissuedKey(opRef);
+		const scheduled = database.transaction(() => {
+			if (database.core.metaGet(reissuedKey) !== undefined) return false;
+			database.core.metaSet(reissuedKey, new Date(this.#manager.now()).toISOString());
+			database.core.metaSet(escalationNoticeKey(this.originKey, opRef), ESCALATION_NOTICE_REISSUE);
+			return true;
+		});
+		if (!scheduled) return;
+		this.#manager.log(
+			`escalation_notice_reissued origin=${this.originKey} opRef=${opRef} reason=receipt_missing`,
+			"warn",
+		);
+		await this.#emitEscalationNotices();
+	}
+
+	#clearRetiredHoldDeadSince(opRef: string): void {
+		const database = this.#manager.database;
+		const key = retiredHoldDeadSinceKey(opRef);
+		if (database.core.metaGet(key) !== undefined) database.core.metaDelete(key);
+		const parkedKey = retiredHoldParkedKey(opRef);
+		if (database.core.metaGet(parkedKey) !== undefined) {
+			// Readable evidence, or a live host: the hold is swept every minute again.
+			database.core.metaDelete(parkedKey);
+			this.#manager.log(`retired_hold_unparked origin=${this.originKey} opRef=${opRef} reason=evidence`, "warn");
+		}
+	}
+
+	/**
+	 * Whether this sweep may read the op's status: always for an unparked hold;
+	 * for a parked one, once per {@link RETIRED_HOLD_PARKED_PROBE_MS}, stamping
+	 * the probe so a restart does not reset the cadence.
+	 */
+	#parkedProbeDue(bound: BoundTurn): boolean {
+		const database = this.#manager.database;
+		const key = retiredHoldParkedKey(bound.turn.opRef);
+		const parked = parseParkedMark(database.core.metaGet(key));
+		if (!parked) return true;
+		const now = this.#manager.now();
+		if (now - parked.probedAt < RETIRED_HOLD_PARKED_PROBE_MS) return false;
+		database.core.metaSet(key, JSON.stringify({ at: parked.at, probedAt: now } satisfies ParkedMark));
+		return true;
+	}
+
 	/** Drops actor tracking for a turn that is already closed durably, then serves anything queued behind it. */
 	async #forgetClosed(bound: BoundTurn): Promise<void> {
 		this.#holdSweeps.delete(bound.turn.opRef);
+		this.#producerPresentLogged.delete(bound.turn.opRef);
 		this.#clearStallReconciliation(bound);
 		this.#cancelStatusRecheck(bound);
 		if (bound.retired) {
@@ -5536,6 +6133,14 @@ function sdkStatusErrorCode(error: unknown): string | undefined {
 	if (raw) return raw;
 	const message = error instanceof Error ? error.message : "";
 	return /session_unavailable|endpoint_stale/.test(message) ? "session_unavailable" : undefined;
+}
+
+function isStructuredModelNotFoundFailure(error: unknown): boolean {
+	if (sdkStatusErrorCode(error) !== "invalid_input") return false;
+	const details = (error as { details?: unknown } | undefined)?.details;
+	const message =
+		typeof details === "object" && details !== null ? (details as { message?: unknown }).message : undefined;
+	return typeof message === "string" && /^Model .+ was not found\.$/.test(message);
 }
 
 /** Keeps raw platform identifiers in SQLite and derives a safe, fixed-length SDK client reference. */

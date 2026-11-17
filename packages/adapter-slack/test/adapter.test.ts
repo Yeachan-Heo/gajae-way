@@ -728,7 +728,7 @@ const appMention = (extra: Record<string, unknown> = {}) => ({
 const chatSends = (gateway: Gateway) =>
 	gateway.requests.filter((r) => r.verb === "chat.send").map((r) => r.params as Record<string, unknown>);
 
-test("Slack forwards prepared native images and delivers resize notices only after an engaged chat.send", async () => {
+test("Slack forwards prepared native images without posting an extra message", async () => {
 	const f = await fixture(undefined, {
 		imageFetch: async () => new Response(ONE_PIXEL_PNG, { status: 200, headers: { "content-type": "image/png" } }),
 	});
@@ -763,15 +763,8 @@ test("Slack forwards prepared native images and delivers resize notices only aft
 		expect(sends).toHaveLength(2);
 		expect(sends[0]?.images).toHaveLength(1);
 		expect(sends[1]?.images).toHaveLength(1);
-		expect(sends[0]?.text).not.toContain("Image preparation notice");
 		expect(sends[0]?.text).not.toContain("files.slack.com");
-		expect(f.api.posts).toEqual([
-			[
-				"C1",
-				"Image adjustment: Images resized/compressed for model input; fine detail may be lost.",
-				"1699999999.000001",
-			],
-		]);
+		expect(f.api.posts).toEqual([]);
 		await f.event({
 			...inbound({
 				ts: "1700000001.123456",
@@ -781,13 +774,13 @@ test("Slack forwards prepared native images and delivers resize notices only aft
 			}),
 		});
 		expect(chatSends(f.client)).toHaveLength(2);
-		expect(f.api.posts).toHaveLength(1);
+		expect(f.api.posts).toEqual([]);
 		f.client.turnId = null;
 		await f.event({
 			...inbound({ ts: "1700000002.123456", thread_ts: "1699999999.000001", parent_user_id: "UBOT", files: [file] }),
 		});
 		expect(chatSends(f.client)).toHaveLength(3);
-		expect(f.api.posts).toHaveLength(1);
+		expect(f.api.posts).toEqual([]);
 	} finally {
 		f.socket.stop();
 	}
@@ -1740,7 +1733,10 @@ test("Slack shares image admission between live conversations and recovery witho
 		expect(await f.recoverMissedMessages()).toBe(true);
 		expect(downloads).toBe(3);
 		expect((await loadRecoveryCursors(f.recoveryCursorPath)).recoveredThrough.C1).toBe("1700000040.000001");
-		expect(chatSends(f.client).filter((send) => send.text === "recovered\n[image · photo.png]")).toHaveLength(1);
+		const recovered = chatSends(f.client).filter((send) => send.text === "recovered\n[image · photo.png]");
+		expect(recovered).toHaveLength(1);
+		expect(recovered[0]?.images).toHaveLength(1);
+		expect(f.api.posts).toEqual([]);
 	} finally {
 		release();
 		f.socket.stop();
@@ -2049,7 +2045,7 @@ test("Slack recovery retains image messages and the watermark after a transient 
 			text: expect.stringContaining("inspect this"),
 			images: [{ mimeType: "image/jpeg" }],
 		});
-		expect(f.api.posts).toHaveLength(1);
+		expect(f.api.posts).toEqual([]);
 	} finally {
 		f.socket.stop();
 		f.recovery.stop();

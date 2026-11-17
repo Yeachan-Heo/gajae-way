@@ -436,8 +436,15 @@ export interface SessionListResult {
  * `/model set` choices (session.modelChoices): preset names from the gjc
  * profile's `models.yml` `profiles:` map plus the configured gateway selector,
  * then the `provider/model` ids gjc lists (`gjc --list-models`). Fails soft: an
- * unreadable catalog yields fewer (or no) choices, never an error.
+ * unreadable catalog yields fewer (or no) choices, never an error. Preset names
+ * are private to the owner: the result is empty unless `authorId` is the
+ * configured owner (`ownerTarget.origin.peerId`).
  */
+export interface SessionModelChoicesParams {
+	/** Platform user id of whoever is typing the `/model set` choice. */
+	readonly authorId?: string;
+}
+
 export interface SessionModelChoicesResult {
 	readonly choices: readonly string[];
 }
@@ -1299,7 +1306,7 @@ export interface VerbCatalogV01 {
 	"delivery.fail": { params: DeliveryFailParams; result: { readonly recorded: true } };
 	"session.recall": { params: SessionRecallParams; result: SessionRecallResult };
 	"session.list": { params: undefined; result: SessionListResult };
-	"session.modelChoices": { params: undefined; result: SessionModelChoicesResult };
+	"session.modelChoices": { params: SessionModelChoicesParams; result: SessionModelChoicesResult };
 	"memory.audit": { params: undefined; result: MemoryOperationAccepted };
 	"memory.autolink": { params: undefined; result: MemoryOperationAccepted };
 	"memory.status": { params: { readonly opRef: string }; result: MemoryOperationStatusResult };

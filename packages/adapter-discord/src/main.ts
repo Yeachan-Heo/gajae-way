@@ -549,8 +549,9 @@ export function deliveryFailureIsAmbiguous(error: unknown): boolean {
 	const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
 	// Discord's known permanent errors have not dispatched anything: unknown channel
 	// (10003), unknown message (10008), missing access/permissions (50001, 50013),
-	// and a request Discord will reject identically forever (50035 Invalid Form Body).
-	return !new Set(["10003", "10008", "50001", "50013", "50035"]).has(code);
+	// a request Discord will reject identically forever (50035 Invalid Form Body),
+	// and a thread that was archived before the post landed (50083).
+	return !new Set(["10003", "10008", "50001", "50013", "50035", "50083"]).has(code);
 }
 
 /**
@@ -950,16 +951,6 @@ async function sendFirstDiscordPart(
 	}
 }
 
-async function sendDiscordInboundNotice(message: DiscordInboundMessage, content: string): Promise<void> {
-	const channel = message.channel as typeof message.channel & { send?: DiscordTextChannelLike["send"] };
-	if (typeof channel.send !== "function") return;
-	try {
-		await sendFirstDiscordPart({ send: channel.send.bind(channel) }, { content }, message.id);
-	} catch {
-		console.error(`Discord inbound image notice failed message=${message.id}.`);
-	}
-}
-
 export async function settleDiscordDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	discord: DiscordClientLike,
@@ -977,8 +968,13 @@ export async function settleDiscordDelivery(
 		await settleDiscordReaction(gateway, discord, message, reactions.resolver, reactions.limiter);
 		return;
 	}
+	// Parts Discord accepted for this delivery: once one landed, a later failure
+	// cannot be retried as if nothing was sent.
+	let sentParts = 0;
+	let resolved = false;
 	try {
 		const { channel, notice } = await resolveDeliveryChannel(discord, message.origin, deliveryId);
+		resolved = true;
 		const parsed = parseDiscordMedia(message.text);
 		const body = message.duplicateWarning ? `[recovered - may be a duplicate] ${parsed.text}` : parsed.text;
 		const mediaResult = await loadDiscordMedia(parsed.paths, mediaDirectories);
@@ -998,6 +994,7 @@ export async function settleDiscordDelivery(
 		try {
 			if (files.length > 0 && chunks.length === 0) {
 				await sendFirstDiscordPart(channel, { files, content: "" }, reference);
+				sentParts++;
 			} else {
 				for (let index = 0; index < chunks.length; index++) {
 					const chunk = chunks[index] as string;
@@ -1008,11 +1005,16 @@ export async function settleDiscordDelivery(
 							reference,
 						);
 					else await channel.send(chunk);
+					sentParts++;
 				}
 			}
 		} finally {
 			if (!message.final) typing?.refresh(message.origin.conversationId);
 		}
+		if (sentParts === 0)
+			// Nothing to post (an empty reply): confirming settles it; failing it would
+			// report a lost delivery for a message that never had content.
+			console.log(`discord_delivery_empty deliveryId=${deliveryId} origin=${message.origin.conversationId}`);
 		if (message.final) endDiscordWorkingState(message.origin.conversationId, status, typing);
 		// Voice rides AFTER the text, and only after the text actually landed:
 		// pairing them is for a readable history, so the readable half must be
@@ -1023,16 +1025,79 @@ export async function settleDiscordDelivery(
 			// A voice post clears Discord's typing hint just like a text post.
 			if (!message.final) typing?.refresh(message.origin.conversationId);
 		}
-		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
 		if (message.final) endDiscordWorkingState(message.origin.conversationId, status, typing);
-		const failReason = error instanceof Error ? error.message : String(error);
-		console.error(`discord delivery failed origin=${message.origin.conversationId}: ${failReason}`);
-		await gateway.request("delivery.fail", {
-			deliveryId,
-			reason: error instanceof Error ? error.message : String(error),
-			ambiguous: deliveryFailureIsAmbiguous(error),
-		});
+		const failure = deliveryFailure(error, resolved, sentParts);
+		console.error(
+			`discord delivery failed origin=${message.origin.conversationId} stage=${failure.stage} ambiguous=${failure.ambiguous}: ${failure.reason}`,
+		);
+		await gateway.request("delivery.fail", { deliveryId, reason: failure.reason, ambiguous: failure.ambiguous });
+		return;
+	}
+	await confirmDiscordDelivery(gateway, deliveryId);
+}
+
+/** Pause before each re-send of a lost `delivery.confirm` (the ledger transition is idempotent). */
+const DELIVERY_CONFIRM_RETRY_DELAYS_MS = [100, 500] as const;
+
+/**
+ * Every part landed, so the delivery is never reported failed from here. A
+ * confirm the gateway does not acknowledge is retried; once retries run out the
+ * row stays inflight and the ACK-timeout replay carries the duplicate label.
+ */
+async function confirmDiscordDelivery(gateway: Pick<GatewayClientLike, "request">, deliveryId: string): Promise<void> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			await gateway.request("delivery.confirm", { deliveryId });
+			return;
+		} catch (error) {
+			const delay = DELIVERY_CONFIRM_RETRY_DELAYS_MS[attempt];
+			if (delay === undefined) {
+				console.error(
+					`discord delivery_confirm_unconfirmed deliveryId=${deliveryId}: ${error instanceof Error ? error.message : String(error)}`,
+				);
+				return;
+			}
+			await Bun.sleep(delay);
+		}
+	}
+}
+
+/**
+ * The exact failure a delivery reports. Before any part landed nothing was
+ * dispatched: a destination that could not be resolved is a definitive failure
+ * (`thread_missing`, `thread_archived_unrestorable`, `resolve_failed`). After a
+ * part landed the retry may duplicate it (`partial_send`, ambiguous). A send
+ * that failed in an unknown way is ambiguous (`send_unknown`), unless Discord
+ * answered with a known permanent refusal, which keeps its own message.
+ */
+function deliveryFailure(
+	error: unknown,
+	resolved: boolean,
+	sentParts: number,
+): { readonly stage: "resolve" | "send"; readonly reason: string; readonly ambiguous: boolean } {
+	const message = error instanceof Error ? error.message : String(error);
+	if (!resolved) {
+		if (error instanceof DeliveryDestinationError) return { stage: "resolve", reason: error.message, ambiguous: false };
+		return {
+			stage: "resolve",
+			reason: deliveryFailureIsAmbiguous(error) ? `resolve_failed: ${message}` : message,
+			ambiguous: false,
+		};
+	}
+	if (sentParts > 0) return { stage: "send", reason: `partial_send: ${message}`, ambiguous: true };
+	if (deliveryFailureIsAmbiguous(error)) return { stage: "send", reason: `send_unknown: ${message}`, ambiguous: true };
+	return { stage: "send", reason: message, ambiguous: false };
+}
+
+/** A thread the delivery addressed that cannot receive it; the reply is not moved elsewhere. */
+class DeliveryDestinationError extends Error {
+	readonly code: unknown;
+
+	constructor(kind: "thread_missing" | "thread_archived_unrestorable", cause: unknown) {
+		super(`${kind}: ${errorMessage(cause)}`);
+		this.name = "DeliveryDestinationError";
+		this.code = typeof cause === "object" && cause !== null && "code" in cause ? cause.code : undefined;
 	}
 }
 
@@ -1082,13 +1147,15 @@ async function fetchTextChannel(discord: DiscordClientLike, id: string): Promise
 /**
  * Resolves where a delivery is posted. A thread archives after inactivity, and
  * posting into it only auto-unarchives when the bot holds the right permission,
- * so an archived thread is explicitly unarchived first. When that fails the
- * reply goes to the parent channel with a visible notice and a log line: a
- * monitor result that silently vanishes behind an archived thread is the worst
- * outcome, because its schedule still looks healthy. Public threads may fall
- * back to their parent. Synthetic handoff/work ids are not Discord thread ids,
- * so they also fall back when visibility is unknown; explicitly private threads
- * never fall back into a broader channel.
+ * so an archived thread is explicitly unarchived first. A real thread that is
+ * gone or stays archived fails the delivery with that exact reason: the reply
+ * is never moved into the parent channel, where it would answer a conversation
+ * the user did not address and the ledger would report a success that did not
+ * happen. The failure stays visible through the ledger (pending, then expired
+ * with the owner's lost-delivery notice and `ops redeliver`), readiness and the
+ * logs. Synthetic handoff/work ids are not Discord threads at all, so their
+ * parent channel is their real destination; explicitly private ones never
+ * fall back into a broader channel.
  */
 async function resolveDeliveryChannel(
 	discord: DiscordClientLike,
@@ -1099,23 +1166,19 @@ async function resolveDeliveryChannel(
 	try {
 		channel = await fetchTextChannel(discord, origin.conversationId);
 	} catch (error) {
-		const syntheticThread = isSyntheticDiscordThreadId(origin.conversationId);
-		if (
-			origin.kind !== "thread" ||
-			(origin.threadVisibility !== "public" && !(syntheticThread && origin.threadVisibility !== "private")) ||
-			!origin.parentId ||
-			!isChannelNotFoundError(error)
-		)
-			throw error;
-		const reason = `${syntheticThread ? "synthetic " : ""}thread ${origin.conversationId} does not exist`;
-		const noticeThread = syntheticThread
-			? `synthetic thread ${origin.conversationId}`
-			: `thread <#${origin.conversationId}>`;
+		if (origin.kind !== "thread" || !origin.parentId || !isChannelNotFoundError(error)) throw error;
+		if (!isSyntheticDiscordThreadId(origin.conversationId)) {
+			if (origin.threadVisibility !== "public") throw error;
+			throw new DeliveryDestinationError("thread_missing", error);
+		}
+		if (origin.threadVisibility === "private") throw error;
 		const parent = await fetchTextChannel(discord, origin.parentId);
-		console.error(`Discord delivery ${deliveryId}: ${reason}; delivered to parent channel ${origin.parentId} instead.`);
+		console.error(
+			`Discord delivery ${deliveryId}: synthetic thread ${origin.conversationId} does not exist; delivered to parent channel ${origin.parentId} instead.`,
+		);
 		return {
 			channel: parent,
-			notice: `[${noticeThread} does not exist; posting here instead]`,
+			notice: `[synthetic thread ${origin.conversationId} does not exist; posting here instead]`,
 		};
 	}
 	if (origin.kind !== "thread" || !origin.parentId || !isArchivedThread(channel)) return { channel };
@@ -1123,14 +1186,10 @@ async function resolveDeliveryChannel(
 		await channel.setArchived(false);
 		return { channel };
 	} catch (error) {
-		if (origin.threadVisibility !== "public") throw error;
-		const reason = `thread ${origin.conversationId} is archived and could not be unarchived (${errorMessage(error)})`;
-		const parent = await fetchTextChannel(discord, origin.parentId);
-		console.error(`Discord delivery ${deliveryId}: ${reason}; delivered to parent channel ${origin.parentId} instead.`);
-		return {
-			channel: parent,
-			notice: `[thread <#${origin.conversationId}> is archived and could not be unarchived (${errorMessage(error)}); posting here instead]`,
-		};
+		// A transient failure to reopen it is a definitive lookup failure (nothing was
+		// sent), retried later; only Discord's refusal makes the thread unrestorable.
+		if (origin.threadVisibility !== "public" || deliveryFailureIsAmbiguous(error)) throw error;
+		throw new DeliveryDestinationError("thread_archived_unrestorable", error);
 	}
 }
 
@@ -1317,7 +1376,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		const receivedAt =
 			typeof message.createdTimestamp === "number" ? new Date(message.createdTimestamp).toISOString() : undefined;
 		ingress.run(origin.conversationId, async () => {
-			let preparedImages: { readonly images: PromptImage[]; readonly notice: string };
+			let preparedImages: { readonly images: PromptImage[] };
 			try {
 				preparedImages = await prepareImages(message);
 			} catch {
@@ -1326,7 +1385,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 				console.error(`Discord image preparation failed message=${message.id}; no chat.send was issued.`);
 				return;
 			}
-			// Do not create a thread or emit notices for an image that cannot be sent.
+			// Do not create a thread for an image that cannot be sent.
 			// Auto-create thread on mention in channel (Hermes-like contract).
 			void nameThreadFromMessage(message, origin, unnamedThreads);
 			origin = await maybeCreateThreadOnMention(
@@ -1349,7 +1408,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 				gateway.sendInbound(message.id as string, origin, body, engagement, receivedAt, spoken, messageChannelId);
 				return;
 			}
-			const accepted = await gateway.requestInbound(
+			await gateway.requestInbound(
 				message.id as string,
 				origin,
 				body,
@@ -1359,8 +1418,6 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 				messageChannelId,
 				preparedImages.images,
 			);
-			if (accepted?.engaged && accepted.turnId != null && preparedImages.notice)
-				await sendDiscordInboundNotice(message, `Image processing: ${preparedImages.notice}`);
 		});
 	});
 	// An edit is an update of a message the persona may already have read, not a
@@ -1486,14 +1543,17 @@ export const DISCORD_SLASH_COMMANDS = [
 export interface AutocompleteInteractionLike {
 	isAutocomplete?(): boolean;
 	readonly commandName?: string;
+	readonly user?: { readonly id: string };
 	readonly options: { getFocused(): string };
 	respond(choices: Array<{ name: string; value: string }>): Promise<unknown>;
 }
 
 /**
- * Answers `/model set` autocomplete from the gateway's catalog. Fails soft: an
- * unreachable gateway or unreadable catalog yields an empty list, which Discord
- * shows as "no options" while still accepting a typed choice.
+ * Answers `/model set` autocomplete from the gateway's catalog. The gateway
+ * lists choices only to the configured owner (preset names are private), so
+ * the invoking user is passed along and anyone else sees no suggestions. Fails
+ * soft: an unreachable gateway or unreadable catalog yields an empty list,
+ * which Discord shows as "no options" while still accepting a typed choice.
  */
 export async function handleModelAutocomplete(
 	interaction: AutocompleteInteractionLike,
@@ -1503,7 +1563,7 @@ export async function handleModelAutocomplete(
 	if (!interaction.isAutocomplete?.() || interaction.commandName !== "model") return;
 	let choices: readonly string[] = [];
 	try {
-		choices = await gateway.modelChoices();
+		if (interaction.user) choices = await gateway.modelChoices(interaction.user.id);
 	} catch (error) {
 		log.error(`Discord /model autocomplete failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
@@ -1547,6 +1607,8 @@ export interface SlashInteractionLike {
 	} | null;
 	readonly channel?: DiscordMessageOriginShape["channel"] | null;
 	reply(options: { content: string; ephemeral?: boolean }): Promise<unknown>;
+	deferReply(options: { flags: number }): Promise<unknown>;
+	editReply(options: { content: string }): Promise<unknown>;
 }
 
 /** Same precedence as messages, for a slash command's invoking user. */
@@ -1565,6 +1627,10 @@ export async function handleSlashCommand(
 	const command = interaction.commandName;
 	if (command !== "new" && command !== "reset" && command !== "model") return;
 	if (!interaction.channel || !interaction.user) return;
+	// Discord fails an interaction not acknowledged within 3s ("application did
+	// not respond") even when the command still applies, so the reply is
+	// deferred before the gateway round trip and edited with the outcome.
+	let deferred = false;
 	try {
 		let text = `/${command}`;
 		if (command === "model") {
@@ -1580,6 +1646,8 @@ export async function handleSlashCommand(
 				text = `/model set ${choice}`;
 			} else if (subcommand === "clear") text = "/model clear";
 		}
+		await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+		deferred = true;
 		const origin = discordMessageOrigin({ author: { id: interaction.user.id }, channel: interaction.channel });
 		const interactionServerTag = resolveServerTag(interaction.user);
 		const result = await gateway.requestInbound(`slash-${interaction.id}`, origin, text, {
@@ -1592,16 +1660,23 @@ export async function handleSlashCommand(
 			...(interaction.user.username ? { authorHandle: interaction.user.username } : {}),
 			...(interactionServerTag ? { authorServerTag: interactionServerTag } : {}),
 		});
-		// Honest ack: the gateway allowlist may decline the command (non-owner in a
-		// group surface) — never claim a reset that did not happen. `/model` never
-		// resets the session; the gateway posts the resulting selection itself.
-		await interaction.reply(
-			result?.engaged
-				? { content: command === "model" ? "🦞 model command accepted" : "🦞 session reset", ephemeral: true }
-				: { content: "not authorized for session commands here", ephemeral: true },
-		);
+		// Honest ack: the gateway declines a command its authorization refuses
+		// (non-owner `/model`, non-allowlisted group author) — never claim a change
+		// that did not happen. `/model` never resets the session; the gateway posts
+		// the resulting selection itself.
+		await interaction.editReply({
+			content: result?.engaged
+				? command === "model"
+					? "🦞 model command accepted"
+					: "🦞 session reset"
+				: command === "model"
+					? "not authorized: /model is owner-only"
+					: "not authorized for session commands here",
+		});
 	} catch (error) {
 		log.error(`Discord slash command failed: ${error instanceof Error ? error.message : String(error)}`);
+		// A deferred interaction otherwise stays on "thinking…" forever.
+		if (deferred) await interaction.editReply({ content: `/${command} failed; try again` }).catch(() => undefined);
 	}
 }
 
@@ -1856,7 +1931,7 @@ export class ReconnectingGateway {
 				if (!engagement) return "skip";
 				const text = describeInboundBody(message);
 				if (text === "") return "skip";
-				let preparedImages: { readonly images: PromptImage[]; readonly notice: string } | undefined;
+				let preparedImages: { readonly images: PromptImage[] } | undefined;
 				let imageFailure: DiscordImagePreparationError | undefined;
 				let preparationDone = false;
 				const origin = discordMessageOrigin(message);
@@ -1886,8 +1961,6 @@ export class ReconnectingGateway {
 						: await this.requestRecovered(message.id, origin, text, engagement, preparedImages?.images);
 					if (result.verdict !== "unavailable") {
 						this.forgetAttempts(message.id);
-						if (result.verdict === "acked" && result.engaged && result.turnId != null && preparedImages?.notice)
-							await sendDiscordInboundNotice(message, `Image processing: ${preparedImages.notice}`);
 						return result.verdict;
 					}
 					failure = result.failure;
@@ -2258,11 +2331,11 @@ export class ReconnectingGateway {
 		});
 	}
 
-	/** `/model set` autocomplete source; throws when the gateway link is down. */
-	async modelChoices(): Promise<readonly string[]> {
+	/** `/model set` autocomplete source for `authorId` (empty unless the owner); throws when the gateway link is down. */
+	async modelChoices(authorId: string): Promise<readonly string[]> {
 		const client = this.#client;
 		if (!client) throw new Error("gateway link not connected");
-		const result = await client.request<SessionModelChoicesResult>("session.modelChoices");
+		const result = await client.request<SessionModelChoicesResult>("session.modelChoices", { authorId });
 		return result.choices;
 	}
 

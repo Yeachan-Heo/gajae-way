@@ -241,11 +241,9 @@ async function encodeWithinBudget(
 }
 
 /** Convert bounded static PNG/JPEG sources into canonical, budgeted JPEG prompt images. */
-export async function preparePromptImages(
-	sources: readonly Uint8Array[],
-): Promise<{ images: PromptImage[]; notice: string }> {
+export async function preparePromptImages(sources: readonly Uint8Array[]): Promise<{ images: PromptImage[] }> {
 	if (!Array.isArray(sources) || sources.length > MAX_PROMPT_IMAGES) throw new Error(INVALID_IMAGES);
-	if (sources.length === 0) return { images: [], notice: "" };
+	if (sources.length === 0) return { images: [] };
 
 	for (const source of sources) inspectSourceImage(source);
 	const byteBudget = Math.floor(MAX_IMAGE_TOTAL_BYTES / sources.length);
@@ -263,7 +261,6 @@ export async function preparePromptImages(
 
 	return {
 		images: validatePromptImages(images),
-		notice: "Images resized/compressed for model input; fine detail may be lost.",
 	};
 }
 
