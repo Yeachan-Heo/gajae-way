@@ -203,20 +203,28 @@ async function readDistTags(name: string, cwd: string): Promise<Record<string, s
 		if (result.stderr.includes("404")) return Object.create(null);
 		throw new Error(`npm dist-tag lookup failed for ${name}: ${result.stderr || result.stdout}`);
 	}
+	return parseDistTagsJson(name, result.stdout);
+}
+
+// npm 11 prints the tag map itself; npm 12 wraps a single-package object field in a
+// one-element array (`[{"latest":"0.5.0"}]`). Both shapes name exactly one map, so the
+// wrapper is unwrapped; anything else is still unexpected data.
+export function parseDistTagsJson(name: string, stdout: string): Record<string, string> {
 	let parsed: unknown;
 	try {
-		parsed = JSON.parse(result.stdout);
+		parsed = JSON.parse(stdout);
 	} catch {
-		throw new Error(`npm dist-tag lookup returned invalid JSON for ${name}: ${result.stdout}`);
+		throw new Error(`npm dist-tag lookup returned invalid JSON for ${name}: ${stdout}`);
 	}
+	if (Array.isArray(parsed) && parsed.length === 1) parsed = parsed[0];
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-		throw new Error(`npm dist-tag lookup returned unexpected data for ${name}: ${result.stdout}`);
+		throw new Error(`npm dist-tag lookup returned unexpected data for ${name}: ${stdout}`);
 	}
 	// A null prototype keeps a `__proto__` entry from resolving to Object.prototype.
 	const tags: Record<string, string> = Object.create(null);
 	for (const [key, value] of Object.entries(parsed)) {
 		if (typeof value !== "string" || value.length === 0) {
-			throw new Error(`npm dist-tag lookup returned unexpected data for ${name}: ${result.stdout}`);
+			throw new Error(`npm dist-tag lookup returned unexpected data for ${name}: ${stdout}`);
 		}
 		tags[key] = value;
 	}
