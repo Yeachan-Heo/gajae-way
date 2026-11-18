@@ -2241,9 +2241,9 @@ export class BrokerSessionPort implements SessionPort {
 				throw markSessionRequestStep(error, "attach");
 			}
 			// Pre-send floor for the op-owned read: stamped at or before the host's
-		// startedAt (acceptedAt is stamped after the turn may have started).
-		const preSendAt = this.#now();
-		let receipt: SendReceipt;
+			// startedAt (acceptedAt is stamped after the turn may have started).
+			const preSendAt = this.#now();
+			let receipt: SendReceipt;
 			let status: StatusReport | undefined;
 			try {
 				receipt = await this.send({ ...input, relay });
