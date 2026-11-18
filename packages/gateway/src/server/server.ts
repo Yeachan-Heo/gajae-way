@@ -4816,14 +4816,6 @@ export function currentConversationNotice(origin: OriginRef): string {
 					"To mute a thread so it stops sending you messages unless explicitly mentioned or replied to, reply with exactly [SHUTUP] and nothing else. This mutes the thread for this bot and persists across restarts; mention the bot or reply to one of its messages to unmute and resume normal engagement.",
 				]
 			: []),
-		// Slack keeps a thread rooted at the persona's own message on the channel
-		// session (adapter-slack decideInbound), so the thread notice above never
-		// reaches it.
-		...(origin.platform === "slack" && origin.kind === "channel"
-			? [
-					"Replies in a Slack thread under one of your own messages arrive in this channel session. To mute such a thread so it stops sending you messages unless you are explicitly mentioned there, answer a message from that thread with exactly [SHUTUP] and nothing else. This mutes only that thread, persists across restarts, and a mention in the thread unmutes it.",
-				]
-			: []),
 		// Reply-threading was implemented end to end (parser, ledger, Slack/Discord
 		// adapters) but never named in the session context, so the persona answered
 		// threaded messages at the conversation root and looked like it ignored the

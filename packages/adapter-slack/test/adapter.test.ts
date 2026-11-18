@@ -649,9 +649,8 @@ for (const shape of [
 			await f.event({ ...inbound(shape) });
 			const dm = shape.channel === "D1";
 			const thread = "thread_ts" in shape;
-			// A thread rooted at the bot's own message routes to the channel session (see decideInbound),
-			// while replyTo still names the thread so the answer lands where the human wrote.
-			const threadSession = thread && shape.parent_user_id !== "UBOT";
+			// Every reply keeps its thread session, including one under the bot's own message.
+			const threadSession = thread;
 			expect(f.client.requests).toEqual([
 				{
 					verb: "chat.send",
@@ -989,16 +988,21 @@ test("Slack mention, open-channel and parent-bot promotion; bot authors remain m
 	});
 });
 
-test("Slack thread reply under the bot's own message continues the channel session; a human-rooted thread stays isolated", () => {
-	// Reply threaded under the bot's answer: origin collapses to the channel (same session), while
-	// replyTo still names the thread so the answer lands where the human wrote.
+test("Slack thread replies keep their own thread session whoever posted the root", () => {
+	// Reply threaded under the bot's answer: its own thread session, never the channel's, and
+	// replyTo marks the root as ours.
 	const underBot = decideInbound(
 		inbound({ ts: "1700000002.000000", thread_ts: "1700000001.000000", parent_user_id: "UBOT", text: "and then?" }),
 		identity,
 		names,
 		undefined,
 	);
-	expect(underBot?.origin).toEqual({ platform: "slack", kind: "channel", conversationId: "C1" });
+	expect(underBot?.origin).toEqual({
+		platform: "slack",
+		kind: "thread",
+		conversationId: "C1:1700000001.000000",
+		parentId: "C1",
+	});
 	expect(underBot?.engagement.replyTo).toEqual({ messageId: "C1:1700000001.000000", authorId: "UBOT", fromSelf: true });
 	expect(underBot?.engagement.mentioned).toBe(true);
 	expect(underBot?.engagement.explicitMention).toBe(false);
@@ -1928,12 +1932,13 @@ test("Slack recovery joins a still-pending live send instead of calling it a dup
 	}
 });
 
-test("Slack bot-root threads remain recoverable after a restart and the root leaves channel history", async () => {
+test("Slack bot-root threads keep their thread session, quote the root, and stay recoverable after a restart", async () => {
 	for (const initial of ["live", "recovered"]) {
 		const channels = { C1: { engagement: "mention-open" as const } };
 		const f = await fixture(channels, { autoRecover: false });
 		let resumed: Awaited<ReturnType<typeof fixture>> | undefined;
 		const root = "1700000001.000000";
+		const threadOrigin = { platform: "slack", kind: "thread", conversationId: `C1:${root}`, parentId: "C1" };
 		const rootMessage = { type: "message", user: "UBOT", ts: root, text: "bot parent", reply_count: 1 };
 		const firstReply = inbound({
 			ts: "1700000030.000001",
@@ -1949,7 +1954,10 @@ test("Slack bot-root threads remain recoverable after a restart and the root lea
 			if (initial === "live") await f.event({ ...firstReply });
 			f.api.history.C1 = [{ ...inbound({ ts: "1700000050.000001", text: "later channel context" }) }, rootMessage];
 			expect(await f.recoverMissedMessages()).toBe(true);
-			expect(chatSends(f.client).find((send) => send.text === "@UBOT first reply")).toMatchObject({ origin });
+			expect(chatSends(f.client).find((send) => send.text === "@UBOT first reply")).toMatchObject({
+				origin: threadOrigin,
+				engagement: { replyTo: { fromSelf: true, excerpt: "bot parent" } },
+			});
 			const saved = await loadRecoveryCursors(f.recoveryCursorPath);
 			expect(saved.recoveredThrough.C1).toBe("1700000050.000001");
 			expect(saved.participatedThreads[`C1:${root}`]).toBeDefined();
@@ -1966,7 +1974,7 @@ test("Slack bot-root threads remain recoverable after a restart and the root lea
 			});
 			expect(await resumed.recoverMissedMessages()).toBe(true);
 			expect(chatSends(resumed.client)).toHaveLength(1);
-			expect(chatSends(resumed.client)[0]).toMatchObject({ origin, text: "@UBOT late reply" });
+			expect(chatSends(resumed.client)[0]).toMatchObject({ origin: threadOrigin, text: "@UBOT late reply" });
 			const recovered = await loadRecoveryCursors(resumed.recoveryCursorPath);
 			expect(recovered.participatedThreads[`C1:${root}`]?.through).toBe("1700000060.000001");
 		} finally {

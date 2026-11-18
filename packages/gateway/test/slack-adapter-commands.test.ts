@@ -180,11 +180,16 @@ test("real Slack envelopes reset only the addressed gateway session and retain a
 		expect(port.sends).toHaveLength(2);
 
 		const channel = "slack/channel/C1";
+		// A thread rooted at the bot's own message has its own session, never the channel's.
+		const botThread = "slack/thread/C1:20.0/parent=C1";
 		const botRoot = { thread_ts: "20.0", parent_user_id: "UBOT" };
-		await event(message("21.0", "<@UBOT> channel conversation", botRoot));
-		await eventually(() => api.posts.length === 5);
 		const channelBefore = database.bindings.getSessionRecord(channel);
 		expect(channelBefore?.epoch).toBe(1);
+		await event(message("21.0", "<@UBOT> bot-rooted thread conversation", botRoot));
+		await eventually(() => api.posts.length === 5);
+		const threadBefore = database.bindings.getSessionRecord(botThread);
+		expect(threadBefore?.epoch).toBe(0);
+		expect(database.bindings.getSessionRecord(channel)).toEqual(channelBefore);
 		expect(port.sends).toHaveLength(3);
 
 		await event(message("22.0", "<@UBOT> /model\tset fast", botRoot));
@@ -196,23 +201,28 @@ test("real Slack envelopes reset only the addressed gateway session and retain a
 			text: "🦞 model set to *preset fast* for this conversation. It applies from the next turn on this same session.",
 			threadTs: "20.0",
 		});
-		expect(database.bindings.modelGet(channel)?.selection).toEqual({ preset: "fast" });
-		expect(database.bindings.getSessionRecord(channel)).toEqual(channelBefore);
+		expect(database.bindings.modelGet(botThread)?.selection).toEqual({ preset: "fast" });
+		expect(database.bindings.modelGet(channel)).toBeUndefined();
+		expect(database.bindings.getSessionRecord(botThread)).toEqual(threadBefore);
 		expect(port.models.at(-1)?.selection).toEqual({ preset: "fast" });
 
 		await event(message("23.0", "<@UBOT> /new", botRoot));
 		await eventually(() => api.posts.length === 7);
 		expect(api.posts[6]).toEqual({ channel: "C1", text: "Started a fresh session.", threadTs: "20.0" });
-		expect(database.bindings.getSessionRecord(channel)?.epoch).toBe(2);
+		expect(database.bindings.getSessionRecord(botThread)?.epoch).toBe(1);
 		await event(message("24.0", "<@UBOT> /reset", botRoot));
 		await eventually(() => api.posts.length === 8);
 		expect(api.posts[7]).toEqual({ channel: "C1", text: "Started a fresh session.", threadTs: "20.0" });
-		expect(database.bindings.getSessionRecord(channel)?.epoch).toBe(3);
+		expect(database.bindings.getSessionRecord(botThread)?.epoch).toBe(2);
+		expect(database.bindings.getSessionRecord(channel)).toEqual(channelBefore);
 
-		await event(message("25.0", "<@UBOT> /model"));
+		await event(message("25.0", "<@UBOT> /model\tset fast"));
 		await eventually(() => api.posts.length === 9);
-		const showText = "🦞 model: **preset fast** (this conversation)";
-		expect(api.posts[8]).toEqual({ channel: "C1", text: "🦞 model: *preset fast* (this conversation)" });
+		expect(api.posts[8]).toEqual({
+			channel: "C1",
+			text: "🦞 model set to *preset fast* for this conversation. It applies from the next turn on this same session.",
+		});
+		expect(database.bindings.modelGet(channel)?.selection).toEqual({ preset: "fast" });
 		await event(message("26.0", "<@UBOT> /model set denied", { ...botRoot, channel: "C2", user: "U2" }));
 		await event(message("27.0", "<@UBOT> /restart", { ...botRoot, user: "U2" }));
 		expect(database.bindings.modelGet("slack/channel/C2")).toBeUndefined();
@@ -232,16 +242,17 @@ test("real Slack envelopes reset only the addressed gateway session and retain a
 		expect(api.posts[9]).toEqual({ channel: "C1", text: restartText, threadTs: "20.0" });
 		expect(api.posts[10]).toEqual({ channel: "C1", text: cancelledText, threadTs: "20.0" });
 		expect(exitCode).toBeUndefined();
-		expect(database.bindings.getSessionRecord(channel)?.epoch).toBe(3);
+		expect(database.bindings.getSessionRecord(botThread)?.epoch).toBe(2);
 		expect(database.bindings.getSessionRecord(other)).toEqual(unrelated);
 		await client.request("gateway.restart.cancel", { restartId: "stalled-supervisor" });
 
 		const channelOrigin = { platform: "slack", kind: "channel", conversationId: "C1" };
+		const threadOrigin = { platform: "slack", kind: "thread", conversationId: "C1:20.0", parentId: "C1" };
 		const deliveries = database.outbox.list().map((row) => ({ row, payload: JSON.parse(row.payloadJson) }));
 		for (const text of [modelText, restartText, cancelledText]) {
-			const match = deliveries.find(({ payload }) => payload.text === text);
-			expect(match?.row.originKey).toBe(channel);
-			expect(match?.payload.origin).toEqual(channelOrigin);
+			const match = deliveries.find(({ row, payload }) => row.originKey !== channel && payload.text === text);
+			expect(match?.row.originKey).toBe(botThread);
+			expect(match?.payload.origin).toEqual(threadOrigin);
 			expect(match?.payload.replyToMessageId).toBe("C1:20.0");
 		}
 		const botRootResets = deliveries.filter(
@@ -249,10 +260,12 @@ test("real Slack envelopes reset only the addressed gateway session and retain a
 		);
 		expect(botRootResets).toHaveLength(2);
 		for (const { row, payload } of botRootResets) {
-			expect(row.originKey).toBe(channel);
-			expect(payload.origin).toEqual(channelOrigin);
+			expect(row.originKey).toBe(botThread);
+			expect(payload.origin).toEqual(threadOrigin);
 		}
-		const topLevelModel = deliveries.find(({ payload }) => payload.text === showText);
+		const topLevelModel = deliveries.find(
+			({ row, payload }) => row.originKey === channel && payload.text === modelText,
+		);
 		expect(topLevelModel?.payload.origin).toEqual(channelOrigin);
 		expect(topLevelModel?.payload.replyToMessageId).toBeUndefined();
 		const topLevelReset = deliveries.find(

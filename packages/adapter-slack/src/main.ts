@@ -193,7 +193,6 @@ export function decideInbound(
 	const engagement = engagementForMessage(message, slackMessageOrigin(message), identity, names, channels);
 	const origin = resolveSlackMessageOrigin(
 		message,
-		identity.botUserId,
 		engagement.mentioned && !extractBotCommand(message, identity.botUserId),
 	);
 	return { origin, engagement };
@@ -309,6 +308,8 @@ export class OrderedIngress {
 }
 
 const SLACK_BARE_TS = /^\d+\.\d+$/;
+/** Bot-rooted threads whose root text is remembered for the reply header. */
+const ROOT_EXCERPT_CACHE_LIMIT = 500;
 
 /** The Slack channel a delivery for this origin is posted in. */
 export function deliveryChannel(origin: OriginRef): string {
@@ -1099,7 +1100,7 @@ export async function startSlackAdapter(
 		if (!isSlackDmChannel(message.channel, message.channel_type)) return Promise.resolve();
 		return mutate((state) => rememberKnownDm(state, message.channel, now()));
 	};
-	/** Physical threads stay recoverable even when a bot-root reply uses the channel session. */
+	/** Physical threads the persona took part in stay recoverable after a missed event. */
 	const rememberThread = (origin: OriginRef, message: SlackInboundMessage): Promise<void> => {
 		if (origin.kind === "dm") return Promise.resolve();
 		const threadId =
@@ -1110,6 +1111,33 @@ export async function startSlackAdapter(
 					: undefined;
 		if (!threadId) return Promise.resolve();
 		return mutate((state) => rememberParticipatedThread(state, threadId, now()));
+	};
+	// A thread rooted at the bot's own message opens its own session, which never saw the
+	// root the bot posted (often from another session). Quoting the root in the reply header
+	// tells that session what the thread is about. Cached per root: the text rarely changes.
+	const rootExcerpts = new Map<string, string>();
+	const withRootExcerpt = async (engagement: EngagementContext): Promise<EngagementContext> => {
+		const replyTo = engagement.replyTo;
+		if (replyTo?.fromSelf !== true || replyTo.excerpt !== undefined) return engagement;
+		const root = parseSlackMessageId(replyTo.messageId);
+		if (!root) return engagement;
+		let excerpt = rootExcerpts.get(replyTo.messageId);
+		if (excerpt === undefined) {
+			try {
+				const page = await api.conversationsReplies(root.channel, root.ts, { limit: 1 });
+				const text = page.messages.find((message) => message.ts === root.ts)?.text;
+				excerpt = typeof text === "string" ? normalizeSlackText(text, directory).trim() : "";
+			} catch {
+				// Best effort: the reply still routes and answers without the quoted root.
+				return engagement;
+			}
+			if (rootExcerpts.size >= ROOT_EXCERPT_CACHE_LIMIT) {
+				const oldest = rootExcerpts.keys().next().value;
+				if (oldest !== undefined) rootExcerpts.delete(oldest);
+			}
+			rootExcerpts.set(replyTo.messageId, excerpt);
+		}
+		return excerpt ? { ...engagement, replyTo: { ...replyTo, excerpt } } : engagement;
 	};
 	const prime = async (message: SlackInboundMessage): Promise<void> => {
 		await Promise.all([
@@ -1174,7 +1202,9 @@ export async function startSlackAdapter(
 				}
 				const text = extractBotCommand(message, identity.botUserId) ?? renderInboundText(message, directory);
 				if (text === "") return;
-				const engagement = engagementForMessage(message, admitted.origin, identity, directory, config.channels);
+				const engagement = await withRootExcerpt(
+					engagementForMessage(message, admitted.origin, identity, directory, config.channels),
+				);
 				const origin = routedOrigin;
 				let prepared: Awaited<ReturnType<typeof prepareSlackImages>>;
 				try {
@@ -1287,7 +1317,9 @@ export async function startSlackAdapter(
 			if (text === "") return "skip";
 			const messageId = slackMessageId(message.channel, message.ts);
 			const origin = rememberOrigin(messageId, admitted.origin);
-			const engagement = engagementForMessage(message, admitted.origin, identity, directory, config.channels);
+			const engagement = await withRootExcerpt(
+				engagementForMessage(message, admitted.origin, identity, directory, config.channels),
+			);
 			const recordFailure = async (
 				classification: ReturnType<typeof classifyRecoveryFailure>,
 				reason: string,
