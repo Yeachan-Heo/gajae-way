@@ -469,6 +469,57 @@ test("squash-merged lane with deleted branch is reclaimable (issue #833)", async
 	}
 });
 
+test("squash-merged lane with new commit on main is reclaimable (issue #833 - real squash merge)", async () => {
+	const f = await fixture();
+	try {
+		const paths = await managedWorktree(f, "true-squash-merged");
+		// Create and push commits on the lane branch
+		await addCommit(paths.worktreePath, "squashed work part one");
+		await addCommit(paths.worktreePath, "squashed work part two");
+		await pushHead(paths);
+		// Get the lane head tree
+		const laneHeadTree = git(["rev-parse", "HEAD^{tree}"], paths.worktreePath).trim();
+		// Get upstream path
+		const upstreamPath = Bun.spawnSync(["git", "config", "remote.origin.url"], {
+			cwd: paths.repositoryPath,
+			stdout: "pipe",
+		})
+			.stdout.toString()
+			.trim();
+		// Get current main commit
+		const mainCommit = git(["rev-parse", "refs/heads/main"], upstreamPath).trim();
+		// Simulate a squash merge by creating a new commit on main with the same tree
+		// but different commit history (this is what a squash merge does)
+		const squashCommit = git(
+			[
+				"commit-tree",
+				laneHeadTree,
+				"-p",
+				mainCommit,
+				"-m",
+				"Squash merge of feature branch",
+			],
+			upstreamPath,
+		).trim();
+		// Update main to the squash commit
+		git(["update-ref", "refs/heads/main", squashCommit], upstreamPath);
+		// Delete the lane branch to simulate post-merge cleanup
+		Bun.spawnSync(["git", "-C", upstreamPath, "update-ref", "-d", `refs/heads/${paths.branch}`], { stdout: "pipe" });
+		// Refresh the bare repo refs
+		git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], paths.repositoryPath);
+		// Mark the lane as terminal and old enough for reclaim
+		persistJob(f.database, "true-squash-merged", paths, "attempt_ended", NOW - DAY * 7);
+		// Reclaim should succeed because the lane's tree is in main (even though it's a different commit)
+		const reclaimed = await f.governor.reclaimTerminalWorktrees(NOW);
+		expect(reclaimed).toBe(1);
+		expect(existsSync(paths.worktreePath)).toBe(false);
+		const job = savedJob(f.database, "true-squash-merged");
+		expect(job).toMatchObject({ state: "attempt_ended", reclaimedAt: expect.any(String) });
+	} finally {
+		await f.close();
+	}
+});
+
 test("lane with moved-on branch (force-pushed) is not reclaimable (issue #833)", async () => {
 	const f = await fixture();
 	try {
@@ -539,6 +590,48 @@ test("dirty lane prevents reclaim even if work is merged (issue #833)", async ()
 		expect(reclaimed).toBe(0);
 		expect(existsSync(paths.worktreePath)).toBe(true);
 		expect(f.logs).toContain("lane_reclaim_skipped name=dirty-merged reason=dirty");
+	} finally {
+		await f.close();
+	}
+});
+
+test("work.start rejects reclaimed lane even inside lock (race with reclamation)", async () => {
+	const f = await fixture();
+	try {
+		const paths = await managedWorktree(f, "race-reclaimed");
+		// Create and push a commit to have a valid lane
+		await addCommit(paths.worktreePath, "some work");
+		await pushHead(paths);
+		// Create a lane job record with reclaimedAt set
+		const rec = persistJob(f.database, "race-reclaimed", paths, "attempt_ended", NOW - DAY * 7);
+		const reclaimedRecord = { ...rec, reclaimedAt: new Date(NOW).toISOString() };
+		const identity = laneJobIdentity("race-reclaimed");
+		f.database.transaction((tx) =>
+			f.database.work.putLaneJob(tx, {
+				jobId: identity.jobId,
+				laneKey: identity.laneKey,
+				state: reclaimedRecord.state,
+				createdAt: reclaimedRecord.createdAt,
+				updatedAt: reclaimedRecord.updatedAt,
+				lane: reclaimedRecord.lane,
+				json: JSON.stringify(reclaimedRecord),
+			}),
+		);
+		// Now create a WorkLaneManager and try to start the reclaimed lane
+		const manager = new WorkLaneManager({
+			database: f.database,
+			port: f.sessionPort,
+			lanes: f.governor,
+			gajaewayHome: f.laneRoot,
+			serviceDirectory: f.serviceDirectory,
+			deliverFallback: () => {},
+			now: () => NOW,
+			brokerWait: { deadlineMs: 0 },
+		});
+		// Attempt to start the reclaimed lane should fail
+		await expect(manager.start({ name: "race-reclaimed", text: "work", repo: paths.upstream })).rejects.toMatchObject({
+			detail: { reasonCode: "lane_reclaimed" },
+		});
 	} finally {
 		await f.close();
 	}

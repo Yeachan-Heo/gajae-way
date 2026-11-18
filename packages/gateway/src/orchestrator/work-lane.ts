@@ -1044,6 +1044,17 @@ export class WorkLaneManager {
 	}
 	async #startLocked(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
 		this.#live();
+		// Recheck reclaimedAt inside the lock to prevent race with reclamation.
+		// A start may have read an unmarked record before reclamation acquired the lock,
+		// then reclamation removes the worktree and sets reclaimedAt, and then start acquires
+		// the lock. We must reject this stale view before proceeding.
+		const currentRecord = this.#job(input.name);
+		if (currentRecord?.reclaimedAt !== undefined)
+			throw new ProtocolError("invalid_params", "work lane worktree was reclaimed; use a new lane name", {
+				reasonCode: "lane_reclaimed",
+				name: input.name,
+				reclaimedAt: currentRecord.reclaimedAt,
+			});
 		if (input.successorOf) {
 			const expected = input.successorOf;
 			this.#job(expected.name, true);

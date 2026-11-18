@@ -593,7 +593,7 @@ export class LaneGovernor {
 						);
 						if (freshRemote.exitCode === 0 && freshRemote.stdout.trim()) {
 							// Commit is in a current remote ref: safe to reclaim
-						} else if (existsSync(join(repositoryPath, ".git", "refs", "remotes", "origin-fresh", "main"))) {
+						} else if (existsSync(join(repositoryPath, "refs", "remotes", "origin-fresh", "main"))) {
 							// Check if HEAD is ancestor of main: handles regular merge case (issue #833)
 							const isAncestorOfMain = await runGit(
 								["merge-base", "--is-ancestor", head.stdout.trim(), "refs/remotes/origin-fresh/main"],
@@ -602,7 +602,8 @@ export class LaneGovernor {
 							if (isAncestorOfMain.exitCode === 0) {
 								// Commit is an ancestor of main: safe to reclaim (regular merge)
 							} else {
-								// Commit is not an ancestor of main: check for squash-merge case
+								// Commit is not an ancestor of main: check for squash-merge case by verifying
+								// that the lane's tree appears in the history from merge-base to main.
 								// Get merge base between HEAD and main
 								const mergeBase = await runGit(["merge-base", head.stdout.trim(), "refs/remotes/origin-fresh/main"], {
 									cwd: repositoryPath,
@@ -611,21 +612,41 @@ export class LaneGovernor {
 									this.#log(`lane_reclaim_skipped name=${name} reason=head_not_in_remote`, "warn");
 									return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
 								}
-								// Compare tree at HEAD with tree at merge base
-								// If trees are identical, the lane has no unmerged changes (squash-merged)
+								// Check if the lane head's tree appears in any commit between merge-base and main.
+								// This handles the squash-merge case where the tree content is preserved but
+								// the commit itself is not an ancestor.
 								const headTree = await runGit(["rev-parse", `${head.stdout.trim()}^{tree}`], { cwd: repositoryPath });
-								const baseTree = await runGit(["rev-parse", `${mergeBase.stdout.trim()}^{tree}`], {
-									cwd: repositoryPath,
-								});
-								if (
-									headTree.exitCode !== 0 ||
-									baseTree.exitCode !== 0 ||
-									headTree.stdout.trim() !== baseTree.stdout.trim()
-								) {
+								if (headTree.exitCode !== 0) {
+									this.#log(`lane_reclaim_skipped name=${name} reason=head_tree_failed`, "warn");
+									return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+								}
+								const headTreeId = headTree.stdout.trim();
+								// Search for the lane's tree in the range from merge-base to main
+								const range = `${mergeBase.stdout.trim()}..refs/remotes/origin-fresh/main`;
+								const matchingCommit = await runGit(
+									["log", "--format=%H", "--all", `--grep-reflog=^${headTreeId}$`, range],
+									{ cwd: repositoryPath },
+								);
+								// Alternative: use a simpler approach - check each commit's tree
+								const logsWithTrees = await runGit(["log", "--format=%H %T", range], { cwd: repositoryPath });
+								if (logsWithTrees.exitCode === 0) {
+									const foundMatch = logsWithTrees.stdout
+										.trim()
+										.split("\n")
+										.some((line) => {
+											const [, treeId] = line.split(" ");
+											return treeId === headTreeId;
+										});
+									if (foundMatch) {
+										// Trees match: squash-merge detected, safe to reclaim
+									} else {
+										this.#log(`lane_reclaim_skipped name=${name} reason=head_not_in_remote`, "warn");
+										return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+									}
+								} else {
 									this.#log(`lane_reclaim_skipped name=${name} reason=head_not_in_remote`, "warn");
 									return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
 								}
-								// Trees are identical: squash-merge detected, safe to reclaim
 							}
 						} else {
 							this.#log(`lane_reclaim_skipped name=${name} reason=head_not_in_remote`, "warn");
