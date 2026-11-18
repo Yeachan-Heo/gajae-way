@@ -41,6 +41,71 @@ function git(args: readonly string[], cwd?: string): string {
 	return stdout;
 }
 
+/**
+ * Configures the upstream's default branch symbol so the merged signal can
+ * fetch the base as `+HEAD:...` (simulates any integration base, `dev` or
+ * `main`, without hardcoding a branch name in production code).
+ */
+function setUpstreamDefaultBranch(paths: Awaited<ReturnType<typeof managedWorktree>>): void {
+	git(["symbolic-ref", "HEAD", "refs/heads/main"], upstreamOf(paths));
+}
+
+/** Move the base forward with an unrelated commit and refresh the lane repo's tracking refs. */
+async function advanceBaseWithUnrelatedCommit(paths: Awaited<ReturnType<typeof managedWorktree>>): Promise<void> {
+	const upstream = upstreamOf(paths);
+	const tempDir = await mkdtemp(join(tmpdir(), "temp-base-advance-"));
+	try {
+		git(["clone", "--quiet", "--shared", upstream, tempDir]);
+		git(["config", "user.name", "Lane Reclaimer Test"], tempDir);
+		git(["config", "user.email", "lane-reclaimer@example.test"], tempDir);
+		await writeFile(join(tempDir, "base-only.txt"), "unrelated base work\n");
+		git(["add", "base-only.txt"], tempDir);
+		git(["commit", "-m", "unrelated base work"], tempDir);
+		git(["push", "--quiet", "origin", "HEAD:refs/heads/main"], tempDir);
+	} finally {
+		await rm(tempDir, { recursive: true, force: true });
+	}
+	git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], paths.repositoryPath);
+}
+
+/** Squash-merge the lane branch into the upstream base and delete the remote lane branch. */
+async function squashMergeLaneToBase(paths: Awaited<ReturnType<typeof managedWorktree>>): Promise<void> {
+	const upstream = upstreamOf(paths);
+	const tempDir = await mkdtemp(join(tmpdir(), "temp-squash-merge-"));
+	try {
+		git(["clone", "--quiet", "--shared", upstream, tempDir]);
+		git(["config", "user.name", "Lane Reclaimer Test"], tempDir);
+		git(["config", "user.email", "lane-reclaimer@example.test"], tempDir);
+		git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], tempDir);
+		git(["merge", "--squash", "--quiet", `origin/${paths.branch}`], tempDir);
+		git(["commit", "-m", `Squash-merge ${paths.branch} onto the integration base`], tempDir);
+		git(["push", "--quiet", "origin", "HEAD:refs/heads/main"], tempDir);
+	} finally {
+		await rm(tempDir, { recursive: true, force: true });
+	}
+	gitAllow(["push", "origin", "--delete", paths.branch], paths.worktreePath);
+	git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], paths.repositoryPath);
+}
+
+/** Fire-and-report git call for fixtures that intentionally drive git into a failure state. */
+function gitAllow(args: readonly string[], cwd?: string): { exitCode: number; stdout: string; stderr: string } {
+	const result = Bun.spawnSync(["git", ...args], {
+		...(cwd === undefined ? {} : { cwd }),
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	return {
+		exitCode: result.exitCode,
+		stdout: result.stdout.toString(),
+		stderr: result.stderr.toString(),
+	};
+}
+
+/** The upstream path a fixture lane pushes to (the seed's origin remote). */
+function upstreamOf(paths: Awaited<ReturnType<typeof managedWorktree>>): string {
+	return gitAllow(["config", "remote.origin.url"], paths.worktreePath).stdout.trim();
+}
+
 async function fixture(options: Partial<ConstructorParameters<typeof LaneGovernor>[0]> = {}) {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-lane-reclaimer-"));
 	const laneRoot = join(directory, "home");
@@ -194,6 +259,7 @@ test("a dirty stale attempt_ended lane is kept, logged, and exposed in health", 
 	const f = await fixture();
 	try {
 		const paths = await managedWorktree(f, "ended-dirty");
+		setUpstreamDefaultBranch(paths);
 		persistJob(f.database, "ended-dirty", paths, "attempt_ended", NOW - 8 * DAY);
 		await writeFile(join(paths.worktreePath, "untracked.txt"), "keep me\n");
 		expect(await f.governor.reclaimTerminalWorktrees(NOW)).toBe(0);
@@ -222,12 +288,15 @@ test("a clean stale attempt_ended lane with an unpushed HEAD is kept and reporte
 	const f = await fixture();
 	try {
 		const paths = await managedWorktree(f, "ended-unpushed");
+		setUpstreamDefaultBranch(paths);
 		await addCommit(paths.worktreePath, "unpushed change");
 		persistJob(f.database, "ended-unpushed", paths, "attempt_ended", NOW - 8 * DAY);
 		expect(await f.governor.reclaimTerminalWorktrees(NOW)).toBe(0);
 		expect(existsSync(paths.worktreePath)).toBe(true);
-		expect(f.logs).toContain("lane_reclaim_skipped name=ended-unpushed reason=unpushed");
-		expect(f.governor.laneDiskSnapshot?.unpushedAttemptEnded).toBe(1);
+		// Fail closed: a commit that exists only in the worktree is not on the
+		// integration base, so the merged signal refuses regardless of push state.
+		expect(f.logs).toContain("lane_reclaim_skipped name=ended-unpushed reason=work_not_merged_into_base");
+		expect(f.governor.laneDiskSnapshot?.unpushedAttemptEnded).toBe(0);
 	} finally {
 		await f.close();
 	}
@@ -241,18 +310,22 @@ test("git evidence errors keep an expired attempt_ended worktree", async () => {
 		await rm(join(paths.worktreePath, ".git"));
 		expect(await f.governor.reclaimTerminalWorktrees(NOW)).toBe(0);
 		expect(existsSync(paths.worktreePath)).toBe(true);
-		expect(f.logs).toContain("lane_reclaim_skipped name=ended-git-error reason=git_status_failed");
+		expect(f.logs).toContain("lane_reclaim_skipped name=ended-git-error reason=git_head_failed");
 	} finally {
 		await f.close();
 	}
 });
 
-test("a clean, pushed stale attempt_ended lane is removed and marked reclaimed", async () => {
+test("a clean, pushed stale attempt_ended lane merged into the base is removed and marked reclaimed", async () => {
 	const f = await fixture();
 	try {
 		const paths = await managedWorktree(f, "ended-pushed");
+		setUpstreamDefaultBranch(paths);
 		await addCommit(paths.worktreePath, "pushed change");
 		await pushHead(paths);
+		// Land the pushed work on the integration base via squash-merge.
+		await advanceBaseWithUnrelatedCommit(paths);
+		squashMergeLaneToBase(paths);
 		persistJob(f.database, "ended-pushed", paths, "attempt_ended", NOW - 8 * DAY);
 		expect(await f.governor.reclaimTerminalWorktrees(NOW)).toBe(1);
 		expect(existsSync(paths.worktreePath)).toBe(false);
@@ -425,86 +498,32 @@ test("regression: reclaim detects when HEAD was not pushed to current remote sta
 		// Delete the branch from upstream
 		Bun.spawnSync(["git", "-C", upstreamPath, "update-ref", "-d", `refs/heads/${paths.branch}`], { stdout: "pipe" });
 		persistJob(f.database, "stale-ref", paths, "attempt_ended", NOW - DAY * 7);
-		// Reclaim should fail because HEAD is not in current remote
-		const reclaimed = await f.governor.reclaimTerminalWorktrees(NOW);
-		expect(reclaimed).toBe(0);
+		// Fail closed: the worktree stays because its work never landed on a base.
+		expect(await f.governor.reclaimTerminalWorktrees(NOW)).toBe(0);
 		expect(existsSync(paths.worktreePath)).toBe(true);
-		expect(f.logs).toContain("lane_reclaim_skipped name=stale-ref reason=head_not_in_remote");
+		expect(f.logs).toContain("lane_reclaim_skipped name=stale-ref reason=work_not_merged_into_base");
 	} finally {
 		await f.close();
 	}
 });
 
-test("squash-merged lane with deleted branch is reclaimable (issue #833)", async () => {
-	const f = await fixture();
-	try {
-		const paths = await managedWorktree(f, "squash-merged");
-		// Create and push a commit on the lane branch
-		await addCommit(paths.worktreePath, "squashed work");
-		await pushHead(paths);
-		// Get the commit hash
-		const commitHash = git(["rev-parse", "HEAD"], paths.worktreePath).trim();
-		// Simulate squash-merge: update main to point to the same commit
-		const upstreamPath = Bun.spawnSync(["git", "config", "remote.origin.url"], {
-			cwd: paths.repositoryPath,
-			stdout: "pipe",
-		})
-			.stdout.toString()
-			.trim();
-		Bun.spawnSync(["git", "-C", upstreamPath, "update-ref", "refs/heads/main", commitHash], { stdout: "pipe" });
-		// Delete the lane branch to simulate the post-merge cleanup
-		Bun.spawnSync(["git", "-C", upstreamPath, "update-ref", "-d", `refs/heads/${paths.branch}`], { stdout: "pipe" });
-		// Refresh the bare repo refs
-		git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], paths.repositoryPath);
-		// Mark the lane as terminal and old enough for reclaim
-		persistJob(f.database, "squash-merged", paths, "attempt_ended", NOW - DAY * 7);
-		// Reclaim should succeed because the lane's changes are in main
-		const reclaimed = await f.governor.reclaimTerminalWorktrees(NOW);
-		expect(reclaimed).toBe(1);
-		expect(existsSync(paths.worktreePath)).toBe(false);
-		const job = savedJob(f.database, "squash-merged");
-		expect(job).toMatchObject({ state: "attempt_ended", reclaimedAt: expect.any(String) });
-	} finally {
-		await f.close();
-	}
-});
-
-test("squash-merged lane with new commit on main is reclaimable (issue #833 - real squash merge)", async () => {
+test("squash-merged lane is reclaimed against a base that moved on (issue #833)", async () => {
 	const f = await fixture();
 	try {
 		const paths = await managedWorktree(f, "true-squash-merged");
-		// Create and push commits on the lane branch
+		setUpstreamDefaultBranch(paths);
+		// Real file changes on the lane: two commits pushed to the lane branch.
 		await addCommit(paths.worktreePath, "squashed work part one");
 		await addCommit(paths.worktreePath, "squashed work part two");
 		await pushHead(paths);
-		// Get the lane head tree
-		const laneHeadTree = git(["rev-parse", "HEAD^{tree}"], paths.worktreePath).trim();
-		// Get upstream path
-		const upstreamPath = Bun.spawnSync(["git", "config", "remote.origin.url"], {
-			cwd: paths.repositoryPath,
-			stdout: "pipe",
-		})
-			.stdout.toString()
-			.trim();
-		// Get current main commit
-		const mainCommit = git(["rev-parse", "refs/heads/main"], upstreamPath).trim();
-		// Simulate a squash merge by creating a new commit on main with the same tree
-		// but different commit history (this is what a squash merge does)
-		const squashCommit = git(
-			["commit-tree", laneHeadTree, "-p", mainCommit, "-m", "Squash merge of feature branch"],
-			upstreamPath,
-		).trim();
-		// Update main to the squash commit
-		git(["update-ref", "refs/heads/main", squashCommit], upstreamPath);
-		// Delete the lane branch to simulate post-merge cleanup
-		Bun.spawnSync(["git", "-C", upstreamPath, "update-ref", "-d", `refs/heads/${paths.branch}`], { stdout: "pipe" });
-		// Refresh the bare repo refs
-		git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], paths.repositoryPath);
-		// Mark the lane as terminal and old enough for reclaim
+		// The base moves on with unrelated work BEFORE the squash lands.
+		await advanceBaseWithUnrelatedCommit(paths);
+		// GitHub-style squash-merge onto the base; the lane branch is deleted after.
+		squashMergeLaneToBase(paths);
 		persistJob(f.database, "true-squash-merged", paths, "attempt_ended", NOW - DAY * 7);
-		// Reclaim should succeed because the lane's tree is in main (even though it's a different commit)
-		const reclaimed = await f.governor.reclaimTerminalWorktrees(NOW);
-		expect(reclaimed).toBe(1);
+		// Reclaimed via rule 3: the combined lane diff's patch-id equals the
+		// single squashed commit's patch-id on the base.
+		expect(await f.governor.reclaimTerminalWorktrees(NOW)).toBe(1);
 		expect(existsSync(paths.worktreePath)).toBe(false);
 		const job = savedJob(f.database, "true-squash-merged");
 		expect(job).toMatchObject({ state: "attempt_ended", reclaimedAt: expect.any(String) });
@@ -513,41 +532,84 @@ test("squash-merged lane with new commit on main is reclaimable (issue #833 - re
 	}
 });
 
-test("lane with moved-on branch (force-pushed) is not reclaimable (issue #833)", async () => {
+test("lane with real unmerged changes while the base moved on is NOT reclaimed (issue #833)", async () => {
 	const f = await fixture();
 	try {
-		const paths = await managedWorktree(f, "moved-on");
-		// Create and push a commit on the lane branch
-		await addCommit(paths.worktreePath, "initial work");
+		const paths = await managedWorktree(f, "unmerged-while-base-moves");
+		setUpstreamDefaultBranch(paths);
+		await addCommit(paths.worktreePath, "real unmerged work");
 		await pushHead(paths);
-		// Get upstream path
-		const upstreamPath = Bun.spawnSync(["git", "config", "remote.origin.url"], {
-			cwd: paths.repositoryPath,
-			stdout: "pipe",
-		})
-			.stdout.toString()
-			.trim();
-		// Create a completely different history by force-pushing main to something unrelated to the lane work
-		const tempDir = await mkdtemp(join(tmpdir(), "temp-moved-on-"));
-		git(["init", "-b", "main"], tempDir);
-		git(["config", "user.name", "Lane Reclaimer Test"], tempDir);
-		git(["config", "user.email", "lane-reclaimer@example.test"], tempDir);
-		await writeFile(join(tempDir, "independent.txt"), "completely independent\n");
-		git(["add", "independent.txt"], tempDir);
-		git(["commit", "-m", "independent work"], tempDir);
-		Bun.spawnSync(["git", "-C", tempDir, "push", "-f", upstreamPath, "main:main"], { stdout: "pipe", stderr: "pipe" });
-		await rm(tempDir, { recursive: true });
-		// Now add a new commit to the lane worktree but DON'T push it
-		await addCommit(paths.worktreePath, "lane-specific change");
-		// Refresh the bare repo refs (the branch is deleted upstream, but HEAD still has the new commit locally)
-		git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], paths.repositoryPath);
-		// Mark the lane as terminal
-		persistJob(f.database, "moved-on", paths, "attempt_ended", NOW - DAY * 7);
-		// Reclaim should fail because HEAD has unpushed changes
-		const reclaimed = await f.governor.reclaimTerminalWorktrees(NOW);
-		expect(reclaimed).toBe(0);
+		// The base advances with unrelated commits; the lane's work never lands there.
+		await advanceBaseWithUnrelatedCommit(paths);
+		persistJob(f.database, "unmerged-while-base-moves", paths, "attempt_ended", NOW - DAY * 7);
+		// Fail closed: pushed but not merged into the integration base.
+		expect(await f.governor.reclaimTerminalWorktrees(NOW)).toBe(0);
 		expect(existsSync(paths.worktreePath)).toBe(true);
-		expect(f.logs).toContain("lane_reclaim_skipped name=moved-on reason=unpushed");
+		expect(savedJob(f.database, "unmerged-while-base-moves").reclaimedAt).toBeUndefined();
+		expect(f.logs).toContain("lane_reclaim_skipped name=unmerged-while-base-moves reason=work_not_merged_into_base");
+	} finally {
+		await f.close();
+	}
+});
+
+test("lane whose head is an ancestor of the base is reclaimed (regular merge, issue #833)", async () => {
+	const f = await fixture();
+	try {
+		const paths = await managedWorktree(f, "regular-merged");
+		setUpstreamDefaultBranch(paths);
+		await addCommit(paths.worktreePath, "feature landed by merge");
+		await pushHead(paths);
+		// Merge the lane into the base with a real merge commit; HEAD of the lane
+		// becomes an ancestor of the base tip.
+		const upstream = upstreamOf(paths);
+		const tempDir = await mkdtemp(join(tmpdir(), "temp-regular-merge-"));
+		try {
+			git(["clone", "--quiet", "--shared", upstream, tempDir]);
+			git(["config", "user.name", "Lane Reclaimer Test"], tempDir);
+			git(["config", "user.email", "lane-reclaimer@example.test"], tempDir);
+			git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], tempDir);
+			git(
+				[
+					"merge",
+					"--quiet",
+					"--no-ff",
+					"-m",
+					`Merge ${paths.branch} into the integration base`,
+					`origin/${paths.branch}`,
+				],
+				tempDir,
+			);
+			git(["push", "--quiet", "origin", "HEAD:refs/heads/main"], tempDir);
+		} finally {
+			await rm(tempDir, { recursive: true, force: true });
+		}
+		persistJob(f.database, "regular-merged", paths, "attempt_ended", NOW - DAY * 7);
+		expect(await f.governor.reclaimTerminalWorktrees(NOW)).toBe(1);
+		expect(existsSync(paths.worktreePath)).toBe(false);
+		expect(savedJob(f.database, "regular-merged").reclaimedAt).toBeDefined();
+	} finally {
+		await f.close();
+	}
+});
+
+test("packed-refs base ref is resolved and a no-op fetch keeps it fresh (issue #833)", async () => {
+	const f = await fixture();
+	try {
+		const paths = await managedWorktree(f, "packed-base");
+		setUpstreamDefaultBranch(paths);
+		await addCommit(paths.worktreePath, "packed-refs lane work");
+		await pushHead(paths);
+		// Land the lane work on the integration base before packing refs, so the
+		// only remaining merged-signal evidence is the packed base ref.
+		await advanceBaseWithUnrelatedCommit(paths);
+		squashMergeLaneToBase(paths);
+		// Pack every ref in the lane repository (origin-fresh/HEAD included): the
+		// merged signal must resolve the base through packed-refs, not ref files.
+		git(["pack-refs", "--all"], paths.repositoryPath);
+		expect(existsSync(join(paths.repositoryPath, "refs", "remotes", "origin-fresh", "HEAD"))).toBe(false);
+		persistJob(f.database, "packed-base", paths, "attempt_ended", NOW - DAY * 7);
+		expect(await f.governor.reclaimTerminalWorktrees(NOW)).toBe(1);
+		expect(existsSync(paths.worktreePath)).toBe(false);
 	} finally {
 		await f.close();
 	}
@@ -557,30 +619,16 @@ test("dirty lane prevents reclaim even if work is merged (issue #833)", async ()
 	const f = await fixture();
 	try {
 		const paths = await managedWorktree(f, "dirty-merged");
-		// Create and push a commit
+		setUpstreamDefaultBranch(paths);
 		await addCommit(paths.worktreePath, "squashed work");
 		await pushHead(paths);
-		// Get the commit hash
-		const commitHash = git(["rev-parse", "HEAD"], paths.worktreePath).trim();
-		// Simulate squash-merge: update main to point to the same commit
-		const upstreamPath = Bun.spawnSync(["git", "config", "remote.origin.url"], {
-			cwd: paths.repositoryPath,
-			stdout: "pipe",
-		})
-			.stdout.toString()
-			.trim();
-		Bun.spawnSync(["git", "-C", upstreamPath, "update-ref", "refs/heads/main", commitHash], { stdout: "pipe" });
-		// Delete the lane branch
-		Bun.spawnSync(["git", "-C", upstreamPath, "update-ref", "-d", `refs/heads/${paths.branch}`], { stdout: "pipe" });
-		// Refresh the bare repo refs
-		git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], paths.repositoryPath);
+		await advanceBaseWithUnrelatedCommit(paths);
+		squashMergeLaneToBase(paths);
 		// Add untracked files to dirty the worktree
 		await writeFile(join(paths.worktreePath, "untracked.txt"), "dirty content\n");
-		// Mark the lane as terminal
 		persistJob(f.database, "dirty-merged", paths, "attempt_ended", NOW - DAY * 7);
 		// Reclaim should fail because worktree is dirty
-		const reclaimed = await f.governor.reclaimTerminalWorktrees(NOW);
-		expect(reclaimed).toBe(0);
+		expect(await f.governor.reclaimTerminalWorktrees(NOW)).toBe(0);
 		expect(existsSync(paths.worktreePath)).toBe(true);
 		expect(f.logs).toContain("lane_reclaim_skipped name=dirty-merged reason=dirty");
 	} finally {
@@ -628,25 +676,4 @@ test("work.start rejects reclaimed lane even inside lock (race with reclamation)
 	} finally {
 		await f.close();
 	}
-});
-
-test("(stub) squash merge detection uses alternative verification when tree equality is insufficient", () => {
-	// This stub test documents the expectation for P2.1:
-	// The squash merge detection should use GitHub API and/or git cherry/patch-id equivalence
-	// as fallback mechanisms when simple tree equality checks are insufficient.
-	// TODO: Implement GitHub API integration to verify PR merged state from GitHub API
-	// TODO: Implement git cherry/patch-id equivalence check as alternative verification
-	// TODO: Support bare lane-repo layout and fail closed on verification errors
-	// For now, the tree-equality check in the range from merge-base to main provides
-	// sufficient coverage for most real squash merge scenarios.
-	expect(true).toBe(true);
-});
-
-test("(stub) work.start rechecks reclaimedAt inside exclusive lock before starting", () => {
-	// This stub test documents the implementation of P2.2:
-	// work-lane.ts #startLocked already rechecks reclaimedAt to prevent race conditions
-	// where reclamation marks a lane as reclaimed between the initial check and lock acquisition.
-	// See: work-lane.ts lines 1051-1057
-	// Covered by: "work.start rejects reclaimed lane even inside lock (race with reclamation)" test
-	expect(true).toBe(true);
 });

@@ -12,6 +12,8 @@ export interface GitCommandResult {
 export interface GitCommandOptions {
 	readonly cwd?: string;
 	readonly timeoutMs?: number;
+	/** Optional data piped to the command's standard input (e.g. diffs for `git patch-id`). */
+	readonly stdin?: string;
 }
 
 /**
@@ -31,11 +33,20 @@ export async function runGit(args: readonly string[], options: GitCommandOptions
 	const child = Bun.spawn(["git", ...args], {
 		...(options.cwd === undefined ? {} : { cwd: options.cwd }),
 		env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-		stdin: "ignore",
+		stdin: options.stdin === undefined ? "ignore" : "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
 		detached: true,
 	});
+	const stdin = options.stdin;
+	if (stdin !== undefined && child.stdin) {
+		// Piped input is bounded lane metadata (a small diff); write it eagerly and
+		// end the stream, so the child's exit never waits on us past the deadline.
+		void new Response(stdin)
+			.arrayBuffer()
+			.then((data) => child.stdin?.write(data))
+			.finally(() => child.stdin?.end());
+	}
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	const expired = new Promise<"timeout">((resolve) => {
 		timer = setTimeout(() => resolve("timeout"), timeoutMs);

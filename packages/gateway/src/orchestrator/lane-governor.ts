@@ -29,6 +29,8 @@ const TERMINAL_JOB_STATES = new Set(["done", "aborted"]);
  * such a lane needs runtime evidence; only `completed` is broker-proven.
  */
 const UNPROVEN_END_STATES = new Set(["attempt_ended", "terminal_uncertain", "terminal_missing_receipt", "failed"]);
+/** Deadline for the fresh-remote fetch that proves a lane's work landed on its integration base. */
+const RECLAIM_REMOTE_FETCH_TIMEOUT_MS = 10_000;
 
 /**
  * Durable identity of one work lane job. The jobId is INJECTIVE: each
@@ -541,6 +543,24 @@ export class LaneGovernor {
 						return { reclaimed: true, eligible: true, bytes: 0, dirty: false, unpushed: false };
 					}
 					if (record.state === "attempt_ended") {
+						const head = await runGit(["rev-parse", "--verify", "HEAD^{commit}"], { cwd: worktreePath });
+						if (head.exitCode !== 0 || !/^[0-9a-f]{40}\s*$/.test(head.stdout)) {
+							this.#log(`lane_reclaim_skipped name=${name} reason=git_head_failed`, "warn");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+						}
+						// A lane is reclaimable-as-merged only when its work provably landed on
+						// the integration base (issuecomment-6960912321): see #laneMergedIntoBase.
+						const merged = await this.#laneMergedIntoBase(name, head.stdout.trim(), repositoryPath);
+						if (!merged.ok) {
+							this.#log(`lane_reclaim_skipped name=${name} reason=${merged.reason}`, "warn");
+							return {
+								reclaimed: false,
+								eligible: false,
+								bytes: 0,
+								dirty: false,
+								unpushed: merged.reason === "unpushed",
+							};
+						}
 						const status = await runGit(["status", "--porcelain", "--untracked-files=all"], {
 							cwd: worktreePath,
 						});
@@ -551,106 +571,6 @@ export class LaneGovernor {
 						if (status.stdout.length > 0) {
 							this.#log(`lane_reclaim_skipped name=${name} reason=dirty`, "warn");
 							return { reclaimed: false, eligible: false, bytes: 0, dirty: true, unpushed: false };
-						}
-						const head = await runGit(["rev-parse", "--verify", "HEAD^{commit}"], { cwd: worktreePath });
-						if (head.exitCode !== 0 || !/^[0-9a-f]{40}\s*$/.test(head.stdout)) {
-							this.#log(`lane_reclaim_skipped name=${name} reason=git_head_failed`, "warn");
-							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
-						}
-						const remote = await runGit(
-							["for-each-ref", `--contains=${head.stdout.trim()}`, "--format=%(refname)", "refs/remotes"],
-							{ cwd: repositoryPath },
-						);
-						if (remote.exitCode !== 0) {
-							this.#log(`lane_reclaim_skipped name=${name} reason=git_remote_refs_failed`, "warn");
-							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
-						}
-						if (!remote.stdout.trim()) {
-							this.#log(`lane_reclaim_skipped name=${name} reason=unpushed`, "warn");
-							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: true };
-						}
-						// Verify work is truly pushed: either to the lane branch or merged into main/dev.
-						// Issue #833: after squash-merge, the original branch may be deleted but the commit
-						// is still part of main/dev. Fail closed if we cannot verify freshness via fetch.
-						const origin = await runGit(["config", "remote.origin.url"], { cwd: repositoryPath });
-						if (origin.exitCode !== 0 || !origin.stdout.trim()) {
-							this.#log(`lane_reclaim_skipped name=${name} reason=remote_url_missing`, "warn");
-							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
-						}
-						// Fetch with timeout: verify remote is reachable and get fresh refs in a temp namespace
-						const fetch = await runGit(["fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin-fresh/*"], {
-							cwd: repositoryPath,
-							timeoutMs: 10_000,
-						});
-						if (fetch.exitCode !== 0) {
-							this.#log(`lane_reclaim_skipped name=${name} reason=remote_unreachable`, "warn");
-							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
-						}
-						// Check if HEAD is in freshly-fetched remote refs or merged into main
-						const freshRemote = await runGit(
-							["for-each-ref", `--contains=${head.stdout.trim()}`, "--format=%(refname)", "refs/remotes/origin-fresh"],
-							{ cwd: repositoryPath },
-						);
-						if (freshRemote.exitCode === 0 && freshRemote.stdout.trim()) {
-							// Commit is in a current remote ref: safe to reclaim
-						} else if (existsSync(join(repositoryPath, "refs", "remotes", "origin-fresh", "main"))) {
-							// Check if HEAD is ancestor of main: handles regular merge case (issue #833)
-							const isAncestorOfMain = await runGit(
-								["merge-base", "--is-ancestor", head.stdout.trim(), "refs/remotes/origin-fresh/main"],
-								{ cwd: repositoryPath },
-							);
-							if (isAncestorOfMain.exitCode === 0) {
-								// Commit is an ancestor of main: safe to reclaim (regular merge)
-							} else {
-								// Commit is not an ancestor of main: check for squash-merge case by verifying
-								// that the lane's tree appears in the history from merge-base to main.
-								// Get merge base between HEAD and main
-								const mergeBase = await runGit(["merge-base", head.stdout.trim(), "refs/remotes/origin-fresh/main"], {
-									cwd: repositoryPath,
-								});
-								if (mergeBase.exitCode !== 0) {
-									this.#log(`lane_reclaim_skipped name=${name} reason=head_not_in_remote`, "warn");
-									return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
-								}
-								// Check if the lane head's tree appears in any commit between merge-base and main.
-								// This handles the squash-merge case where the tree content is preserved but
-								// the commit itself is not an ancestor.
-								const headTree = await runGit(["rev-parse", `${head.stdout.trim()}^{tree}`], { cwd: repositoryPath });
-								if (headTree.exitCode !== 0) {
-									this.#log(`lane_reclaim_skipped name=${name} reason=head_tree_failed`, "warn");
-									return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
-								}
-								const headTreeId = headTree.stdout.trim();
-								// Search for the lane's tree in the range from merge-base to main
-								const range = `${mergeBase.stdout.trim()}..refs/remotes/origin-fresh/main`;
-								const matchingCommit = await runGit(
-									["log", "--format=%H", "--all", `--grep-reflog=^${headTreeId}$`, range],
-									{ cwd: repositoryPath },
-								);
-								// Alternative: use a simpler approach - check each commit's tree
-								const logsWithTrees = await runGit(["log", "--format=%H %T", range], { cwd: repositoryPath });
-								if (logsWithTrees.exitCode === 0) {
-									const foundMatch = logsWithTrees.stdout
-										.trim()
-										.split("\n")
-										.some((line) => {
-											const [, treeId] = line.split(" ");
-											return treeId === headTreeId;
-										});
-									if (foundMatch) {
-										// Trees match: squash-merge detected, safe to reclaim
-									} else {
-										this.#log(`lane_reclaim_skipped name=${name} reason=head_not_in_remote`, "warn");
-										return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
-									}
-								} else {
-									this.#log(`lane_reclaim_skipped name=${name} reason=head_not_in_remote`, "warn");
-									return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
-								}
-							}
-						} else {
-							this.#log(`lane_reclaim_skipped name=${name} reason=head_not_in_remote`, "warn");
-							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
 						}
 					}
 					if (existsSync(worktreePath)) {
@@ -762,6 +682,104 @@ export class LaneGovernor {
 			}),
 		);
 		return true;
+	}
+
+	/**
+	 * Merged signal for reclaiming an expired `attempt_ended` lane (issue #833,
+	 * issuecomment-6960912321/6966669378/6967618377).
+	 *
+	 * The remote's integration-branch tip is fetched into a scratch namespace
+	 * (`+<base-ref>:refs/remotes/origin-fresh/HEAD`), so the branch name is never
+	 * hardcoded — gajae-way lands on `dev`, others on `main`) and the lane counts
+	 * as merged only when one of these holds, checked in order:
+	 *
+	 * 1. the lane head is an ancestor of the base tip (regular merge), or
+	 * 2. `git cherry` lists every lane commit `-` against the base (each commit's
+	 *    patch-id exists on the base side; rebase/cherry-pick merges), or
+	 * 3. the combined `git diff merge-base..lane-head` patch-id equals the
+	 *    patch-id of a single commit introduced on base since the merge-base
+	 *    (a squash of several lane commits).
+	 *
+	 * Anything else — including a clean push to the lane's own remote branch —
+	 * fails closed: the worktree keeps its commits and stays resumable. Every
+	 * git failure also fails closed with a distinct logged reason.
+	 */
+	async #laneMergedIntoBase(
+		name: string,
+		headSha: string,
+		repositoryPath: string,
+	): Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string }> {
+		const origin = await runGit(["config", "remote.origin.url"], { cwd: repositoryPath });
+		if (origin.exitCode !== 0 || !origin.stdout.trim()) return { ok: false, reason: "remote_url_missing" };
+		// The integration base is the remote's default branch, never a hardcoded
+		// name: prefer the upstream's symbolic HEAD, else `origin/HEAD` as recorded
+		// by the last full clone/fetch. `HEAD` is unresolvable when the upstream
+		// never set a default-branch symbol (a bare `git init` points `master` at
+		// nothing), so only fetch a ref that exists.
+		const baseTip = await runGit(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], { cwd: repositoryPath });
+		const originHead = baseTip.exitCode === 0 ? baseTip.stdout.trim() : "";
+		let fetchRef = originHead.startsWith("refs/remotes/origin/") ? originHead.slice("refs/remotes/".length) : "HEAD";
+		// Refresh only that base tip into a scratch namespace; a packed ref survives
+		// this no-op fetch, so the base is always resolved with
+		// `rev-parse --verify --quiet` below, never via ref files on disk.
+		if (fetchRef === "HEAD") {
+			// The upstream has no default-branch symbol: fall back to the last branch
+			// this lane repository fetched (`origin/HEAD` is equally absent here).
+			const heads = await runGit(["for-each-ref", "--format=%(refname)", "--count=1", "refs/remotes/origin/"], {
+				cwd: repositoryPath,
+			});
+			const first = heads.stdout.trim();
+			if (heads.exitCode === 0 && first.startsWith("refs/remotes/origin/"))
+				fetchRef = `refs/heads/${first.slice("refs/remotes/origin/".length)}`;
+		}
+		const fetch = await runGit(["fetch", "origin", `+${fetchRef}:refs/remotes/origin-fresh/HEAD`], {
+			cwd: repositoryPath,
+			timeoutMs: RECLAIM_REMOTE_FETCH_TIMEOUT_MS,
+		});
+		if (fetch.exitCode !== 0) return { ok: false, reason: "remote_unreachable" };
+		const base = await runGit(["rev-parse", "--verify", "--quiet", "refs/remotes/origin-fresh/HEAD^{commit}"], {
+			cwd: repositoryPath,
+		});
+		const baseSha = base.stdout.trim();
+		if (base.exitCode !== 0 || !/^[0-9a-f]{40}$/.test(baseSha)) return { ok: false, reason: "base_ref_unresolved" };
+		if (baseSha === headSha) return { ok: true };
+		const ancestor = await runGit(["merge-base", "--is-ancestor", headSha, baseSha], { cwd: repositoryPath });
+		if (ancestor.exitCode === 0) return { ok: true };
+		const mergeBase = await runGit(["merge-base", headSha, baseSha], { cwd: repositoryPath });
+		const mergeBaseSha = mergeBase.stdout.trim();
+		if (mergeBase.exitCode !== 0 || !/^[0-9a-f]{40}$/.test(mergeBaseSha))
+			return { ok: false, reason: "head_not_in_base_history" };
+		// Patch-id equivalence per lane commit: every `-` line means that commit's
+		// changes already exist on the base side of the merge-base.
+		const cherry = await runGit(["cherry", mergeBaseSha, headSha], { cwd: repositoryPath });
+		if (cherry.exitCode !== 0) return { ok: false, reason: "git_cherry_failed" };
+		const laneCommits = cherry.stdout
+			.split("\n")
+			.map((line) => line.trim())
+			.filter((line) => line.length > 0);
+		if (laneCommits.length > 0 && laneCommits.every((line) => line.startsWith("-"))) return { ok: true };
+		// Squash of several lane commits: the combined diff since the merge-base
+		// must equal the patch-id of a single commit introduced on base.
+		const laneDiff = await runGit(["diff", `${mergeBaseSha}..${headSha}`], { cwd: repositoryPath });
+		if (laneDiff.exitCode !== 0) return { ok: false, reason: "lane_diff_failed" };
+		const lanePatch = await runGit(["patch-id", "--stable"], { stdin: laneDiff.stdout, cwd: repositoryPath });
+		if (lanePatch.exitCode !== 0 || lanePatch.stdout.trim().length === 0)
+			return { ok: false, reason: "git_patch_id_failed" };
+		const lanePatchId = lanePatch.stdout.trim().split(/\s+/)[0];
+		if (!lanePatchId) return { ok: false, reason: "git_patch_id_failed" };
+		const baseLog = await runGit(["log", "--no-merges", "--format=medium", "-p", `${mergeBaseSha}..${baseSha}`], {
+			cwd: repositoryPath,
+		});
+		if (baseLog.exitCode !== 0) return { ok: false, reason: "git_patch_id_failed" };
+		const basePatchIds = await runGit(["patch-id", "--stable"], { stdin: baseLog.stdout, cwd: repositoryPath });
+		if (basePatchIds.exitCode !== 0) return { ok: false, reason: "git_patch_id_failed" };
+		const known = patchIdsFromGitLog(basePatchIds.stdout);
+		if (known.has(lanePatchId)) return { ok: true };
+		this.#log(
+			`lane_reclaim_merged_check name=${name} lane_commits=${laneCommits.length} lane_patch_id=${lanePatchId.slice(0, 12)}`,
+			"info",
+		);
+		return { ok: false, reason: "work_not_merged_into_base" };
 	}
 
 	/**
@@ -1286,6 +1304,21 @@ function canonicalPathIncludingMissing(target: string): string {
 			current = parent;
 		}
 	}
+}
+
+/**
+ * Patch ids from a `git patch-id --stable` run over a `git log -p` feed:
+ * the leading hash of every line whose second field (the commit it came
+ * from) is a full 40-hex sha. Empty-diff lines (`0000…`) carry no commit
+ * and are dropped.
+ */
+function patchIdsFromGitLog(stdout: string): Set<string> {
+	const ids = new Set<string>();
+	for (const line of stdout.split("\n")) {
+		const [patchId, commit] = line.trim().split(/\s+/);
+		if (patchId && commit && /^[0-9a-f]{40}$/.test(commit)) ids.add(patchId);
+	}
+	return ids;
 }
 
 function positiveInteger(value: number | undefined, fallback: number, name: string): number {
