@@ -12,6 +12,7 @@ import {
 	assertNoPrivateWorkspaceDeps,
 	highestPublishedVersion,
 	isPrereleaseVersion,
+	parseDistTagsJson,
 	parseNpmViewResult,
 	RELEASE_ORDER,
 	scratchTag,
@@ -165,6 +166,32 @@ describe("npm registry checks", () => {
 			alreadyPublished: false,
 			error: "E_TIMEOUT",
 		});
+	});
+
+	test("parseDistTagsJson reads the npm 11 tag map", () => {
+		expect({ ...parseDistTagsJson("p", '{"latest":"0.5.0","next":"0.6.0-rc.1"}') }).toEqual({
+			latest: "0.5.0",
+			next: "0.6.0-rc.1",
+		});
+	});
+
+	test("parseDistTagsJson unwraps the npm 12 one-element array", () => {
+		expect({ ...parseDistTagsJson("p", '[\n  {\n    "latest": "0.5.0"\n  }\n]') }).toEqual({ latest: "0.5.0" });
+	});
+
+	test("parseDistTagsJson rejects ambiguous or malformed shapes", () => {
+		expect(() => parseDistTagsJson("p", '[{"latest":"0.5.0"},{"latest":"0.4.0"}]')).toThrow("unexpected data");
+		expect(() => parseDistTagsJson("p", "[]")).toThrow("unexpected data");
+		expect(() => parseDistTagsJson("p", '["0.5.0"]')).toThrow("unexpected data");
+		expect(() => parseDistTagsJson("p", '[[{"latest":"0.5.0"}]]')).toThrow("unexpected data");
+		expect(() => parseDistTagsJson("p", '{"latest":""}')).toThrow("unexpected data");
+		expect(() => parseDistTagsJson("p", "not json")).toThrow("invalid JSON");
+	});
+
+	test("parseDistTagsJson keeps a __proto__ tag as data", () => {
+		const tags = parseDistTagsJson("p", '[{"__proto__":"1.0.0"}]');
+		expect(Object.getPrototypeOf(tags)).toBeNull();
+		expect(Object.entries(tags)).toEqual([["__proto__", "1.0.0"]]);
 	});
 });
 
