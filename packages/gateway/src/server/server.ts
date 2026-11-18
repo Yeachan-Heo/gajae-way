@@ -94,6 +94,8 @@ import type { GlobalGjcClient } from "../orchestrator/broker";
 import { ghCheckStatusClient } from "../orchestrator/gh-checks";
 import { LaneGovernor } from "../orchestrator/lane-governor";
 import {
+	deterministicBindHoldDeliveryId,
+	type EscalationNoticeReceipt,
 	PERSONA_RESTART_DRAIN_MAX_WAIT_MS,
 	PERSONA_RESTART_DRAIN_WAIT_MS,
 	type PersonaBindHoldInput,
@@ -349,29 +351,51 @@ interface InboundContext {
  * publishing and returns the previous config on any error, so a failed reload
  * cannot leave the daemon half-applied. Every outcome is logged with the fields
  * applied and the fields refused as restart-only.
+ * Serializes concurrent reloads to ensure each computes against the latest
+ * published config and applies atomically.
  */
 async function applyConfigReload(
 	runtime: Runtime,
 	options: GatewayServerOptions,
 	trigger: string,
 ): Promise<ReloadResult> {
-	const result = await reloadConfig(runtime.config, options.overrides);
-	if (!result.ok) {
-		console.error(
-			`gateway config reload (${trigger}) FAILED; keeping the previous config: ${result.diagnostics
-				.map((diagnostic) => `${diagnostic.code}: ${diagnostic.message}`)
-				.join("; ")}`,
+	// Wait for any in-flight reload to complete before starting this one.
+	// This ensures each reload computes against the latest published config.
+	let resolveChain: (() => void) | undefined;
+	const chainPromise = new Promise<void>((resolve) => {
+		resolveChain = resolve;
+	});
+	const previousChain = runtime.reloadMutex.current;
+	runtime.reloadMutex.current = previousChain.then(() => chainPromise);
+
+	try {
+		// Wait for prior reload to complete.
+		await previousChain;
+
+		const result = await reloadConfig(runtime.config, options.overrides);
+		if (!result.ok) {
+			console.error(
+				`gateway config reload (${trigger}) FAILED; keeping the previous config: ${result.diagnostics
+					.map((diagnostic) => `${diagnostic.code}: ${diagnostic.message}`)
+					.join("; ")}`,
+			);
+			return result;
+		}
+		runtime.config = result.config;
+		runtime.personaSessions.setStallTimeoutMs(result.config.stallTimeoutMs);
+		runtime.personaSessions.setHostLimits(result.config.sessions);
+		if (result.changed.includes("model") && result.config.model) {
+			runtime.personaSessions.setSessionModel(result.config.model);
+			runtime.monitors.setDefaultModel(result.config.model);
+		}
+		options.broker?.setMaxPoolSize(result.config.sessions?.maxLiveHosts ?? DEFAULT_SESSIONS_MAX_LIVE_HOSTS);
+		console.info(
+			`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
 		);
 		return result;
+	} finally {
+		resolveChain?.();
 	}
-	runtime.config = result.config;
-	runtime.personaSessions.setStallTimeoutMs(result.config.stallTimeoutMs);
-	runtime.personaSessions.setHostLimits(result.config.sessions);
-	options.broker?.setMaxPoolSize(result.config.sessions?.maxLiveHosts ?? DEFAULT_SESSIONS_MAX_LIVE_HOSTS);
-	console.info(
-		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
-	);
-	return result;
 }
 
 /**
@@ -463,6 +487,8 @@ function startMemoryOperation(runtime: Runtime, opRef: string, work: () => Promi
 interface Runtime {
 	/** The live config republished by SIGHUP/reload. */
 	config: GatewayConfig;
+	/** Serializes concurrent reload operations to prevent stale config application. */
+	readonly reloadMutex: { current: Promise<void> };
 	/** Canonical persona workspace shared by session binding and outbound file checks. */
 	readonly workspace: string;
 	readonly delivery: DeliveryService;
@@ -1025,6 +1051,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		hostIdleRetireMs: options.config.sessions?.idleRetireMs,
 		busyStallMs: options.config.sessions?.busyStallMs,
 		unresolvedHoldMs: options.config.sessions?.unresolvedHoldMs,
+		retiredHoldAbandonMs: options.config.sessions?.retiredHoldAbandonMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
 		brokerAvailable: () => options.broker?.isAvailable ?? true,
 		// biome-ignore lint/style/noNonNullAssertion: broker is non-null when lambda is called
@@ -1052,6 +1079,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			);
 			if (payload) broadcastDelivery(runtime, payload);
 		},
+		// A dead retired hold is abandoned only once its origin confirmed the
+		// escalation notice; a queued or expired notice is not proof the user was told.
+		escalationNoticeReceipt: ({ originKey, trigger }) =>
+			escalationNoticeReceiptInLedger(options.database, originKey, trigger),
 		onTurnStart: async (input) => await createInboundTurnLifecycle(input, options, runtime),
 		// A steer whose acceptance was learnt after its turn's lifecycle is gone
 		// (resolved at terminal or after a restart) is finalized exactly like a
@@ -1302,7 +1333,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		clearTimeout(retentionBootTimer);
 	};
 	const brokerWithGeneration = options.broker as
-		| (GlobalGjcClient & { onGeneration?: GlobalGjcClient["onGeneration"] })
+		| (GlobalGjcClient & {
+				onGeneration?: GlobalGjcClient["onGeneration"];
+				setOnStartupWedgeAlert?: GlobalGjcClient["setOnStartupWedgeAlert"];
+		  })
 		| undefined;
 	const stopBrokerGenerationListener =
 		typeof brokerWithGeneration?.onGeneration === "function"
@@ -1322,8 +1356,29 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 							.catch((error: unknown) => console.error(`gjc version refresh failed: ${diagnostic(error)}`));
 				})
 			: undefined;
+	// A broker that keeps failing startup parks every origin silently (#800): tell the owner once.
+	if (typeof brokerWithGeneration?.setOnStartupWedgeAlert === "function") {
+		brokerWithGeneration.setOnStartupWedgeAlert((detail) => {
+			const ownerOrigin = runtime.config.ownerTarget?.origin;
+			if (ownerOrigin) {
+				const ownerDeliveryId = `broker-startup-wedge:${crypto.randomUUID()}`;
+				const alertText = `[operator alert] broker startup wedged: reason=${detail.reason}${
+					detail.blockingPath ? ` blockingPath=${detail.blockingPath}` : ""
+				}`;
+				const ownerPayload = runtime.delivery.prepare(
+					crypto.randomUUID(),
+					ownerOrigin,
+					alertText,
+					undefined,
+					ownerDeliveryId,
+				);
+				if (ownerPayload) broadcastDelivery(runtime, ownerPayload);
+			}
+		});
+	}
 	runtime = {
 		config: options.config,
+		reloadMutex: { current: Promise.resolve() },
 		stopping: false,
 		workspace,
 		delivery,
@@ -1724,6 +1779,11 @@ async function handleRequest(
 			if (failOutcome === "transitioned") {
 				const failedRow = runtime.delivery.get(params.deliveryId);
 				const code = failedRow?.lastError ?? "other";
+				// The adapter's exact reason (stage prefix and platform message) is kept in the
+				// log; the ledger stores only its allowlisted code.
+				console.error(
+					`delivery_failed deliveryId=${params.deliveryId} code=${code} state=${failedRow?.state ?? "unknown"} reason=${safeDiagnosticField(params.reason)}`,
+				);
 				runtime.readiness.recordFailure({
 					category: "delivery",
 					code,
@@ -2020,6 +2080,12 @@ async function handleRequest(
 			return;
 		}
 		case "session.modelChoices": {
+			// Preset names are the owner's private configuration: anyone else typing
+			// `/model set` gets no suggestions, the same owner gate as `/model` itself.
+			if (!ownerAuthored(runtime.config, request.params)) {
+				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { choices: [] } });
+				return;
+			}
 			const choices = await listModelChoices(
 				options.broker?.agentDir,
 				runtime.config.model,
@@ -2581,11 +2647,15 @@ async function sendChat(
 		typeof params.engagement?.replyTo?.messageId === "string" && params.engagement.replyTo.messageId
 			? params.engagement.replyTo.messageId
 			: undefined;
-	// `/model` is a privileged control path. Apply the same direct-message and
-	// group authorisation policy as ordinary engagement before inspecting or
-	// mutating the durable override.
+	// `/model` is an owner-only control path: it changes the cost and behaviour
+	// of the owner's persona and `show` reveals private preset names. Ordinary
+	// engagement authorisation applies first, then the author must be the
+	// configured owner. Loopback is the local operator socket itself.
 	if (userText === "/model" || userText.startsWith("/model ")) {
-		if (!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp)) {
+		if (
+			!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp) ||
+			(origin.platform !== "loopback" && !ownerAuthored(runtime.config, params.engagement))
+		) {
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
@@ -2631,12 +2701,9 @@ async function sendChat(
 		// Owner-only: restarts the gateway process. The supervisor (launchd
 		// KeepAlive / systemd Restart=always) brings it back; sessions are durable
 		// and resume through recovery, so the persona keeps its transcript.
-		const owner = ownerPeerIdOf(runtime.config);
-		const authorId = (params.engagement as { authorId?: string } | undefined)?.authorId;
 		if (
 			!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp) ||
-			owner === undefined ||
-			authorId !== owner
+			!ownerAuthored(runtime.config, params.engagement)
 		) {
 			connection.write({
 				v: PROFILE_VERSION,
@@ -3610,16 +3677,9 @@ async function createInboundTurnLifecycle(
 			return { registration, auditIntentId };
 		});
 		if (outcome.auditIntentId) runtime.memory.enqueueExistingId(outcome.auditIntentId);
-		if (outcome.registration.kind === "already_watching") {
-			deliverTerminalLine(
-				renderWatchFailure(
-					line.target,
-					`this conversation is already watching until ${outcome.registration.watch.expires_at}`,
-				),
-				deliveredParts.length,
-			);
-			return;
-		}
+		// The pending watch stays registered with its original expiry, so the request
+		// already holds; reporting it as a failure only appends a misleading notice.
+		if (outcome.registration.kind === "already_watching") return;
 		if (outcome.registration.kind === "replayed" && outcome.registration.watch.state !== "pending") {
 			deliverTerminalLine(
 				`Watch for ${line.target} was already handled (${outcome.registration.watch.state}); it was not reopened.`,
@@ -4652,10 +4712,32 @@ function deterministicDeliveryExpiredNoticeId(deliveryId: string): string {
 }
 
 /** One bind-hold notice per trigger, and one separate notice when that trigger's unresolved hold is escalated (#686). */
-function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string, reason: string): string {
-	const kind = reason === UNRESOLVED_HOLD_ESCALATED ? UNRESOLVED_HOLD_ESCALATED : "bind_hold";
-	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|${kind}`).digest("hex").slice(0, 32)}`;
+/**
+ * The delivery ledger's receipt for the escalation notice of this trigger
+ * (#686). Only a `confirmed` row is confirmed; queued, in-flight, ambiguous or
+ * expired is unconfirmed; no row at all is `missing` (pruned, or never queued).
+ * A loopback notice is only written to the gateway log, which the chat client
+ * never shows, so it is unconfirmed and a loopback hold is never abandoned.
+ */
+export function escalationNoticeReceiptInLedger(
+	database: Pick<Store, "outbox">,
+	originKey: string,
+	trigger: Pick<InboundMessageRow, "message_id" | "origin_ref_json">,
+): EscalationNoticeReceipt {
+	let origin: OriginRef;
+	try {
+		origin = validateOriginRef(JSON.parse(trigger.origin_ref_json) as OriginRef);
+	} catch {
+		return "unconfirmed";
+	}
+	if (origin.platform === "loopback") return "unconfirmed";
+	const deliveryId = deterministicBindHoldDeliveryId(originKey, trigger.message_id, UNRESOLVED_HOLD_ESCALATED);
+	const row = database.outbox.get(deliveryId);
+	if (!row) return "missing";
+	return row.state === "confirmed" ? "confirmed" : "unconfirmed";
 }
+
+export { deterministicBindHoldDeliveryId };
 
 /** One deliverable part of a persona answer: here (optionally threaded) or posted to another conversation. */
 interface PlannedPart {
@@ -4884,15 +4966,27 @@ function writeError(connection: Connection, error: unknown, id?: string): void {
 	connection.write({ v: PROFILE_VERSION, type: "error", ...(id ? { id } : {}), error: protocol.toPayload() });
 }
 
+function ownerPeerIdOf(config: GatewayConfig): string | undefined {
+	const owner = config.ownerTarget?.origin;
+	return owner && "peerId" in owner ? (owner as { peerId?: string }).peerId : undefined;
+}
+
+/**
+ * Whether `authorId` in an engagement or request params is the configured
+ * owner (`ownerTarget.origin.peerId`). No configured owner authorises nobody.
+ * Owner-only verbs (`/restart`, `/model`, `session.modelChoices`) require it.
+ */
+function ownerAuthored(config: GatewayConfig, carrier: unknown): boolean {
+	const owner = ownerPeerIdOf(config);
+	const authorId = (carrier as { authorId?: unknown } | undefined)?.authorId;
+	return owner !== undefined && authorId === owner;
+}
+
 /**
  * Command authorization is exactly ordinary engagement authorization: loopback,
  * DM policy, owner identity, allowlist, and group gates apply before `/new`,
  * `/reset`, or `/model` can mutate persistent session state.
  */
-function ownerPeerIdOf(config: GatewayConfig): string | undefined {
-	const owner = config.ownerTarget?.origin;
-	return owner && "peerId" in owner ? (owner as { peerId?: string }).peerId : undefined;
-}
 
 function commandAuthorised(
 	origin: Parameters<typeof decideEngagement>[0],

@@ -1141,15 +1141,15 @@ test("transient image download failures keep recovery retryable without dispatch
 	expect(gateway.recoveryRetryPending).toBe(true);
 });
 
-test("recovered image resize notice is sent only for a fresh engaged acknowledgement", async () => {
-	const cursorPath = join(home, "image-notice", "recovery-cursor.json");
+test("a recovered image is forwarded without an extra chat post", async () => {
+	const cursorPath = join(home, "image-recovered", "recovery-cursor.json");
 	const inbound = message(snowflakeFromTimestamp(Date.now() - 60_000), {
 		content: "look",
 		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo?sig=secret" }],
 	});
-	const visibleNotices: unknown[] = [];
+	const visiblePosts: unknown[] = [];
 	(inbound as unknown as { channel: { send: (payload: unknown) => Promise<void> } }).channel.send = async (payload) => {
-		visibleNotices.push(payload);
+		visiblePosts.push(payload);
 	};
 	const requests: Array<{ verb: string; params?: unknown }> = [];
 	const gateway = wiredGateway(
@@ -1163,7 +1163,7 @@ test("recovered image resize notice is sent only for a fresh engaged acknowledge
 		cursorPath,
 		undefined,
 		() => bot,
-		async () => ({ images: [{ data: "AQ==", mimeType: "image/jpeg" }], notice: "Images resized/compressed." }),
+		async () => ({ images: [{ data: "AQ==", mimeType: "image/jpeg" }] }),
 	);
 	await gateway.recoverMissedMessages();
 	const send = requests.find((request) => request.verb === "chat.send");
@@ -1171,19 +1171,13 @@ test("recovered image resize notice is sent only for a fresh engaged acknowledge
 		images: [{ data: "AQ==", mimeType: "image/jpeg" }],
 		text: "look\n[image · photo.png]",
 	});
-	expect((send?.params as { text: string }).text).not.toContain("Image processing:");
-	expect(visibleNotices).toEqual([
-		{
-			content: "Image processing: Images resized/compressed.",
-			reply: { messageReference: inbound.id, failIfNotExists: false },
-		},
-	]);
+	expect(visiblePosts).toEqual([]);
 	expect(
 		await gateway.requestRecovered(inbound.id, channelOrigin, "look", { mentioned: true } as never, [
 			{ data: "AQ==", mimeType: "image/jpeg" },
 		]),
 	).toEqual({ verdict: "duplicate" });
-	expect(visibleNotices).toHaveLength(1);
+	expect(visiblePosts).toEqual([]);
 });
 
 test("unsupported images and ordinary attachments reach chat.send as captioned text", async () => {
@@ -1226,17 +1220,17 @@ test("unsupported images and ordinary attachments reach chat.send as captioned t
 	expect(send?.params).not.toHaveProperty("images");
 });
 
-test("a duplicate backfill acknowledgement with a null turn id does not repeat its notice", async () => {
-	const cursorPath = join(home, "image-notice-duplicate", "recovery-cursor.json");
+test("a duplicate backfill acknowledgement with a null turn id posts no extra message", async () => {
+	const cursorPath = join(home, "image-recovered-duplicate", "recovery-cursor.json");
 	const priorWatermark = snowflakeFromTimestamp(Date.now() - 2 * 24 * 60 * 60 * 1000);
 	const inbound = message(snowflakeFromTimestamp(Date.now() - 60_000), {
 		content: "look",
 		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo?sig=secret" }],
 	});
 	await saveRecoveryCursors(cursorPath, cursorState({ "channel-1": priorWatermark }));
-	const visibleNotices: unknown[] = [];
+	const visiblePosts: unknown[] = [];
 	(inbound as unknown as { channel: { send: (payload: unknown) => Promise<void> } }).channel.send = async (payload) => {
-		visibleNotices.push(payload);
+		visiblePosts.push(payload);
 	};
 	const gateway = wiredGateway(
 		fakeChannel([inbound]),
@@ -1246,21 +1240,21 @@ test("a duplicate backfill acknowledgement with a null turn id does not repeat i
 		cursorPath,
 		undefined,
 		() => bot,
-		async () => ({ images: [{ data: "AQ==", mimeType: "image/jpeg" }], notice: "Images resized/compressed." }),
+		async () => ({ images: [{ data: "AQ==", mimeType: "image/jpeg" }] }),
 	);
 	await gateway.recoverMissedMessages();
-	expect(visibleNotices).toEqual([]);
+	expect(visiblePosts).toEqual([]);
 });
 
-test("a declined recovered image does not post its resize notice", async () => {
-	const cursorPath = join(home, "image-notice-declined", "recovery-cursor.json");
+test("a declined recovered image posts no extra message", async () => {
+	const cursorPath = join(home, "image-recovered-declined", "recovery-cursor.json");
 	const inbound = message(snowflakeFromTimestamp(Date.now() - 60_000), {
 		content: "look",
 		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo" }],
 	});
-	const visibleNotices: unknown[] = [];
+	const visiblePosts: unknown[] = [];
 	(inbound as unknown as { channel: { send: (payload: unknown) => Promise<void> } }).channel.send = async (payload) => {
-		visibleNotices.push(payload);
+		visiblePosts.push(payload);
 	};
 	const gateway = wiredGateway(
 		fakeChannel([inbound]),
@@ -1268,10 +1262,10 @@ test("a declined recovered image does not post its resize notice", async () => {
 		cursorPath,
 		undefined,
 		() => bot,
-		async () => ({ images: [{ data: "AQ==", mimeType: "image/jpeg" }], notice: "Images resized/compressed." }),
+		async () => ({ images: [{ data: "AQ==", mimeType: "image/jpeg" }] }),
 	);
 	await gateway.recoverMissedMessages();
-	expect(visibleNotices).toEqual([]);
+	expect(visiblePosts).toEqual([]);
 });
 
 test("an edit that removes a prior image is rejected instead of retaining its old native bytes", () => {

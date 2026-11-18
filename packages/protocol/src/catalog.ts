@@ -436,8 +436,15 @@ export interface SessionListResult {
  * `/model set` choices (session.modelChoices): preset names from the gjc
  * profile's `models.yml` `profiles:` map plus the configured gateway selector,
  * then the `provider/model` ids gjc lists (`gjc --list-models`). Fails soft: an
- * unreadable catalog yields fewer (or no) choices, never an error.
+ * unreadable catalog yields fewer (or no) choices, never an error. Preset names
+ * are private to the owner: the result is empty unless `authorId` is the
+ * configured owner (`ownerTarget.origin.peerId`).
  */
+export interface SessionModelChoicesParams {
+	/** Platform user id of whoever is typing the `/model set` choice. */
+	readonly authorId?: string;
+}
+
 export interface SessionModelChoicesResult {
 	readonly choices: readonly string[];
 }
@@ -682,6 +689,22 @@ export interface MonitorProcedureVersion {
 	readonly mtime?: string;
 }
 
+/** Authenticated SDK refusal codes; some can refer to already-admitted logical work. */
+export const WORK_REFUSAL_CODES: ReadonlySet<string> = new Set([
+	"busy",
+	"steer_refused",
+	"invalid_params",
+	"not_running",
+	"no_active_turn",
+	"client_ref_conflict",
+	"session_not_found",
+]);
+
+/** Safe diagnostics include the redacted fallback, which is not itself proof of refusal. */
+export function isWorkRefusalCause(value: unknown): value is string {
+	return typeof value === "string" && (value === "sdk_refused" || WORK_REFUSAL_CODES.has(value));
+}
+
 /** A worker gjc session run: an isolated coding-register session doing delegated work. */
 export interface WorkRunParams {
 	/** Stable worker name; the same name resumes the same gjc session. */
@@ -698,6 +721,20 @@ export interface WorkRunParams {
 	 * the durable job is awaiting_operator (issue #10 hold semantics).
 	 */
 	readonly resume?: boolean;
+	/**
+	 * Explicit operator-authorized successor in a distinct checkout; valid only
+	 * for work.start, with repo and an immutable full SHA base, and without cwd
+	 * or resume. The original unresolved execution is NOT stopped. The operator
+	 * must review and isolate external effects before authorizing this recovery.
+	 * A response-only predecessor retains its null report route; its captured
+	 * authorization owner is checked independently of the delivery destination.
+	 */
+	readonly successorOf?: {
+		readonly name: string;
+		readonly opRef: string;
+		readonly sessionId: string;
+		readonly acknowledgeUnresolved: true;
+	};
 	/** Startup model: an explicit model id or a model profile preset; applied at session create and on every send. */
 	readonly model?: string | { readonly preset: string };
 	/** Untrusted routing hint linking this request to the calling GJC session. */
@@ -714,6 +751,8 @@ export type WorkStartResult =
 			readonly opRef: string;
 			readonly sessionKey: string;
 			readonly sessionId: string;
+			/** Exact task/model successor retry: the original accepted operation, never a new send. */
+			readonly alreadyStarted?: true;
 	  }
 	| {
 			readonly started: false;
@@ -764,6 +803,22 @@ export interface WorkStatusResult {
 		readonly endState?: string;
 	} | null;
 	readonly op: PromptStatusBody | null;
+	/** Linked recovery remains inspectable when its live operation query is unavailable. */
+	readonly opUnavailable?: true;
+	readonly recoveryHold?: "execution_end_unproven";
+	/** Original lane provenance, retained across later check-repair attempts and session replacement. */
+	readonly successorOf?: {
+		readonly name: string;
+		readonly opRef: string;
+		readonly sessionId: string;
+		readonly baseSha: string;
+		readonly authorizedAt: string;
+	};
+	readonly successor?: {
+		readonly name: string;
+		readonly opRef: string;
+		readonly sessionId: string;
+	};
 	/**
 	 * A fresh lane whose start is still being admitted (clone, worktree, bind,
 	 * send) has no durable record yet: state `admitting`. If that admission
@@ -1299,7 +1354,7 @@ export interface VerbCatalogV01 {
 	"delivery.fail": { params: DeliveryFailParams; result: { readonly recorded: true } };
 	"session.recall": { params: SessionRecallParams; result: SessionRecallResult };
 	"session.list": { params: undefined; result: SessionListResult };
-	"session.modelChoices": { params: undefined; result: SessionModelChoicesResult };
+	"session.modelChoices": { params: SessionModelChoicesParams; result: SessionModelChoicesResult };
 	"memory.audit": { params: undefined; result: MemoryOperationAccepted };
 	"memory.autolink": { params: undefined; result: MemoryOperationAccepted };
 	"memory.status": { params: { readonly opRef: string }; result: MemoryOperationStatusResult };

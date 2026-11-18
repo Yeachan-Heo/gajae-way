@@ -324,7 +324,7 @@ export class MonitorPropagator {
 	/** Per-origin serialization lives in SessionPort, shared with all SDK callers. */
 	readonly #repo: string;
 	readonly #memoryDebloat: { readonly root: string; readonly thresholdBytes: number } | undefined;
-	readonly #model: GjcModelSelection | undefined;
+	#model: GjcModelSelection | undefined;
 	readonly #serviceTier: GjcServiceTier | undefined;
 	readonly #appliedModels = new Map<string, string>();
 	readonly #appliedServiceTiers = new Map<string, GjcServiceTier>();
@@ -427,6 +427,11 @@ export class MonitorPropagator {
 			options.protocolFailureRollThreshold ?? MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD;
 		this.#repo = options.repo ?? process.cwd();
 		this.#memoryDebloat = options.memoryDebloat;
+	}
+
+	/** Future monitor turns inherit the latest gateway default unless explicitly overridden. */
+	setDefaultModel(model: GjcModelSelection): void {
+		this.#model = model;
 	}
 
 	/**
@@ -1357,15 +1362,11 @@ export class MonitorPropagator {
 					boundSessionId = sessionId;
 					boundSessionEpoch = binding.epoch;
 					dispatchPhase = "configure";
-					const modelKey = effectiveModel
-						? typeof effectiveModel === "string"
-							? effectiveModel
-							: `preset:${effectiveModel.preset}`
-						: undefined;
+					const modelKey = selectIdentity(effectiveModel);
 					if (effectiveModel && !binding.startupModelApplied && this.#appliedModels.get(sessionId) !== modelKey) {
 						dispatchOperation = "setModel";
 						dispatchOperationArgs = {
-							model: modelKey,
+							model: modelSelector(effectiveModel),
 						};
 						await this.#sessionPort.setModel({ sessionId, repo: this.#repo, selection: effectiveModel });
 						this.#appliedModels.set(sessionId, modelKey!);
@@ -1677,22 +1678,30 @@ export class MonitorPropagator {
 				// Lease fencing: after an await, this attempt may no longer own the
 				// claim (expired + stolen). Every write below is conditional on the
 				// live lease; a stale attempt's completion becomes a no-op.
-				// Atomic fencing: the dispatched transition and the authoring-pointer
-				// retirement commit in one transaction. Every stage write carries its
-				// live-lease check in the same UPDATE, so a stolen lease cannot be
-				// exploited (TOCTOU-free), and a stale attempt that lost the fenced
-				// transition returns before cleanup and can never erase a successor's
-				// reused pointer (#743). `fenced` = rows whose write landed.
-				// On empty response, the pointer is retired here, before the throw
+				// Every stage write carries its live-lease check in the same UPDATE, so
+				// a stolen lease cannot be exploited (TOCTOU-free). `fenced` = rows
+				// whose write landed.
+				// The whole batch fences and retires its authoring pointers in ONE
+				// transaction. Per-row transactions let a crash mid-batch commit the
+				// fence and pointer retirement for some events but not others; recovery
+				// then sees a pointer that no longer covers the batch, rejects it, and
+				// re-authors work that already ran (duplicate monitor side effects).
+				// A stale attempt that loses the fenced transition is not included, so
+				// it can never erase a successor's reused pointer (#743).
+				// On empty response, the pointers are retired here, before the throw
 				// below, so the same answer is not re-harvested on the next attempt.
-				const fenced = claimed.filter((row) =>
-					this.#database.transaction((tx) => {
-						if (!this.#database.monitors.eventFencedUpdate(tx, row.event_id, leaseId, "dispatched", batchId))
-							return false;
-						this.#forgetAuthoringTurn(tx, [row.event_id], pendingTurn);
-						return true;
-					}),
-				);
+				const fenced = this.#database.transaction((tx) => {
+					const rows = claimed.filter((row) =>
+						this.#database.monitors.eventFencedUpdate(tx, row.event_id, leaseId, "dispatched", batchId),
+					);
+					if (rows.length)
+						this.#forgetAuthoringTurn(
+							tx,
+							rows.map((row) => row.event_id),
+							pendingTurn,
+						);
+					return rows;
+				});
 				if (!fenced.length) return;
 				// Check for empty response after retiring pointer for rows we still own.
 				// If we don't own the lease, we never reach this code (#743).
@@ -3178,6 +3187,7 @@ export function failureDetail(error: unknown): string {
 		"AuthoringResultUnavailableError",
 		"BrokerAuthorityError",
 		"ModelNotSelectedError",
+		"SessionContractError",
 	]);
 	const allowedCodes = new Set([
 		"broker_unavailable",
@@ -3268,7 +3278,7 @@ export function failureDetail(error: unknown): string {
 	// A top-level message is recorded only for classes that build it from fixed
 	// text and numbers. Every other message can carry operation ids or remote
 	// text (SessionTerminalError, RelayRefusedError, plain Error).
-	const messageSourceClasses = new Set(["RelayHelloError", "ModelNotSelectedError"]);
+	const messageSourceClasses = new Set(["RelayHelloError", "ModelNotSelectedError", "SessionContractError"]);
 	const message =
 		causes
 			.slice()
@@ -3342,4 +3352,18 @@ export function failureDetail(error: unknown): string {
 		...(causeCode && causeCode !== code ? { causeCode } : {}),
 		...(message ? { message } : {}),
 	});
+}
+
+/** Generates a type-tagged unique identity for a model selection to avoid cache collisions. */
+function selectIdentity(selection: GjcModelSelection | undefined): string {
+	if (selection === undefined) return "undefined";
+	if (typeof selection === "string") return `string:${selection}`;
+	return `object:preset:${selection.preset}`;
+}
+
+/** Converts a model selection to its user-visible selector format. */
+function modelSelector(selection: GjcModelSelection | undefined): string {
+	if (selection === undefined) return "undefined";
+	if (typeof selection === "string") return selection;
+	return `preset:${selection.preset}`;
 }

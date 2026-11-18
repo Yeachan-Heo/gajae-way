@@ -35,7 +35,7 @@ import {
 	type BrokerOperationRecord,
 	isBrokerPromptBusyRefusal,
 } from "../store/groups/bindings";
-import { GjcCliUnavailableError, isBrokerUnavailable } from "./broker";
+import { GjcCliUnavailableError, GjcCommandQueueTimeoutError, isBrokerUnavailable } from "./broker";
 import {
 	type FailedTransportCause,
 	type FailedTurnEvidence,
@@ -127,6 +127,17 @@ export interface SessionPort {
 	bind(input: SessionBindInput): Promise<SessionBinding>;
 	inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined>;
 	liveness?(input: { sessionId: string; repo: string }): Promise<SessionLiveness>;
+	/**
+	 * Read-only: true only when a successful (exit 0) broker inspect envelope names this session,
+	 * is not flagged `ambiguous` (competing unresolved authority roots), carries a
+	 * safe integer host pid > 1, and OS `ps` reports that pid gone. This proves the
+	 * exit of the broker's selected host row, not of every past incarnation.
+	 * False for failed inspect,
+	 * session absence without a pid, an ambiguous or mismatched row, a
+	 * missing/invalid pid, a live (even reused) pid, or unreadable `ps`. Never
+	 * signals a process. BrokerAuthorityError is rethrown.
+	 */
+	hostExited?(input: { sessionId: string; repo: string }): Promise<boolean>;
 	/** True when the session's prompt queue has no pending messages (queue.messages.list empty). */
 	queueEmpty?(input: { sessionId: string; repo: string; relay?: TailHandle }): Promise<boolean>;
 	/** Live execution/queued-turn state from context.get; undefined is not idle proof. */
@@ -207,7 +218,7 @@ export interface SessionPort {
 		preferSpoken?: boolean;
 	}): Promise<LastAssistantResult | undefined>;
 	attachTail(input: TailAttachInput): Promise<TailHandle>;
-	runCompaction(input: SessionCompactionInput): Promise<{ readonly status: SessionCompactionStatus }>;
+	runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult>;
 	/** Emits live-tail stall signals; the owning actor applies bounded recovery policy. */
 	checkStalls(now?: number): void;
 	/** Sets the tail-silence threshold that triggers stall handling. */
@@ -232,6 +243,22 @@ export interface RunningHostJob {
 
 export type SessionCompactionStatus = "succeeded" | "failed" | "skipped" | "unavailable";
 
+export interface SessionCompactionResult {
+	readonly status: SessionCompactionStatus;
+	/** Stable SDK error code of a run that did not succeed, when gjc reported one. */
+	readonly code?: string;
+	/**
+	 * A `failed` run that may still be compacting on the host: gjc's request
+	 * timed out, its outcome is uncertain after send, or no gjc answer was read.
+	 */
+	readonly outcomeUnknown?: boolean;
+	/**
+	 * The host's ordered control dispatcher answered this run (relay runs only):
+	 * the run is over, and so is every ordered control queued before it.
+	 */
+	readonly answered?: boolean;
+}
+
 /** Session context usage: percent of the model's context window and the token count it stands for. */
 export interface SessionContextUsage {
 	readonly percent: number;
@@ -242,6 +269,11 @@ export interface SessionCompactionInput {
 	readonly sessionId: string;
 	readonly repo: string;
 	readonly originKey: string;
+	/**
+	 * The session's live relay. When given, the run goes straight to the host,
+	 * whose own control reply tells a finished run from a lost reply (`answered`).
+	 */
+	readonly relay?: TailHandle;
 }
 
 export interface SessionBindInput {
@@ -468,6 +500,27 @@ export class ModelNotSelectedError extends Error {
 }
 
 /**
+ * A fixed-text assertion failure from the session-port send-step invariant checks.
+ * These errors indicate contract violations in the SDK's control responses where
+ * expected fields are malformed or missing. All messages are fixed text with no
+ * interpolated user or session data; the closed message type keeps it that way,
+ * because monitor failure details record this class's message verbatim.
+ */
+export type SessionContractMessage =
+	| "model.profile.set succeeded without a changed receipt"
+	| "model.set succeeded without a changed receipt"
+	| "thinking.set succeeded without a changed receipt"
+	| "service_tier.set succeeded without a changed receipt"
+	| "session request completed without a result";
+
+export class SessionContractError extends Error {
+	constructor(message: SessionContractMessage) {
+		super(message);
+		this.name = "SessionContractError";
+	}
+}
+
+/**
  * The pre-send busy wait saw the host report `busy` with no progress evidence
  * (activity stamp and transcript size/mtime unchanged) for `silentMs`. The
  * busy refusal is already durable, so the prompt was provably never accepted.
@@ -537,6 +590,22 @@ const CONTEXT_QUERY_TIMEOUT_MS = 5_000;
  * 2026-09-30); the default 30s command bound reported such runs as failed.
  */
 const COMPACTION_TIMEOUT_MS = 5 * 60_000;
+/**
+ * Part of the end-to-end compaction budget left for gjc's own timeout reply:
+ * gjc's request budget is COMPACTION_TIMEOUT_MS minus this, inside a process
+ * bound (CLI slot wait included) of COMPACTION_TIMEOUT_MS.
+ */
+const COMPACTION_REPLY_GRACE_MS = 15_000;
+/**
+ * gjc host refusals of a control before its ordered dispatch (host admission,
+ * activation and dispatch preflight in gjc 0.20.0 `sdk/host`).
+ */
+const COMPACTION_PRE_DISPATCH_REFUSALS: ReadonlySet<string> = new Set([
+	"session_quiescing",
+	"not_activated",
+	"operation_not_session_owned",
+	"operation_prohibited",
+]);
 
 type SignaledHost = {
 	readonly pid: number;
@@ -1077,6 +1146,52 @@ export class BrokerSessionPort implements SessionPort {
 		return await this.#safe(async () => await inspectSession(this.#controller(input.repo), input.sessionId));
 	}
 
+	async hostExited(input: { sessionId: string; repo: string }): Promise<boolean> {
+		try {
+			this.#assertOwned(input);
+			const host = await this.#inspectHost(input);
+			// An ambiguous row is one of several hosts claiming the session; its pid speaks for no other.
+			// A failed (nonzero) inspect invocation is never exit evidence, whatever its stdout says.
+			return (
+				host.ok &&
+				host.succeeded &&
+				host.exclusive &&
+				host.pid !== undefined &&
+				(await processCommand(host.pid)).outcome === "gone"
+			);
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			return false;
+		}
+	}
+
+	async #inspectHost(input: {
+		sessionId: string;
+	}): Promise<
+		| { ok: true; pid: number | undefined; live: boolean | undefined; exclusive: boolean; succeeded: boolean }
+		| { ok: false; code: string | undefined }
+	> {
+		const result = await this.#cli(["sdk", "session", "inspect", input.sessionId], { timeoutMs: 10_000 });
+		const envelope = JSON.parse(result.stdout) as {
+			ok?: unknown;
+			result?: { session?: { sessionId?: unknown; pid?: unknown; live?: unknown; ambiguous?: unknown } };
+			error?: { code?: unknown; message?: unknown };
+		};
+		if (envelope.ok !== true) return { ok: false, code: stableErrorCode(envelope.error?.code) };
+		const session = envelope.result?.session;
+		return {
+			ok: true,
+			pid:
+				typeof session?.pid === "number" && Number.isSafeInteger(session.pid) && session.pid > 1
+					? session.pid
+					: undefined,
+			live: typeof session?.live === "boolean" ? session.live : undefined,
+			// The row names exactly this session and the broker flags no competing authority root.
+			exclusive: session?.sessionId === input.sessionId && session.ambiguous !== true,
+			succeeded: result.exitCode === 0,
+		};
+	}
+
 	/**
 	 * A retired session's host is this gateway's to end: the gateway created the
 	 * session, rebound away from it, and nothing else will ever prompt it again.
@@ -1109,26 +1224,15 @@ export class BrokerSessionPort implements SessionPort {
 		let pid: number | undefined;
 		let live: boolean | undefined;
 		try {
-			const result = await this.#cli(["sdk", "session", "inspect", input.sessionId], {
-				timeoutMs: 10_000,
-			});
-			const envelope = JSON.parse(result.stdout) as {
-				ok?: unknown;
-				result?: { session?: { pid?: unknown; live?: unknown } };
-				error?: { code?: unknown; message?: unknown };
-			};
-			if (envelope.ok !== true) {
-				const code = stableErrorCode(envelope.error?.code);
+			const host = await this.#inspectHost(input);
+			if (!host.ok) {
+				const code = host.code;
 				return isSessionGoneCode(code)
 					? { outcome: "refused", reason: "inspect_failed:session_gone_without_process_identity" }
 					: { outcome: "refused", reason: `inspect_failed:${code ?? "invalid_envelope"}` };
 			}
-			const session = envelope.result?.session;
-			pid =
-				typeof session?.pid === "number" && Number.isSafeInteger(session.pid) && session.pid > 1
-					? session.pid
-					: undefined;
-			live = typeof session?.live === "boolean" ? session.live : undefined;
+			pid = host.pid;
+			live = host.live;
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
 			return isSessionGoneCode(sdkErrorCode(error))
@@ -1638,7 +1742,8 @@ export class BrokerSessionPort implements SessionPort {
 					"model.profile.set",
 				);
 				const changed = typeof activation === "boolean" ? activation : activation?.changed;
-				if (typeof changed !== "boolean") throw new Error("model.profile.set succeeded without a changed receipt");
+				if (typeof changed !== "boolean")
+					throw new SessionContractError("model.profile.set succeeded without a changed receipt");
 				return { changed };
 			});
 		}
@@ -1651,7 +1756,8 @@ export class BrokerSessionPort implements SessionPort {
 				await sdk("control", "model.set", { id: model }),
 				"model.set",
 			);
-			if (typeof result?.changed !== "boolean") throw new Error("model.set succeeded without a changed receipt");
+			if (typeof result?.changed !== "boolean")
+				throw new SessionContractError("model.set succeeded without a changed receipt");
 			const thinkingChanged = thinking ? await this.#setThinking(sdk, thinking) : false;
 			return { changed: result.changed || thinkingChanged };
 		});
@@ -1662,7 +1768,8 @@ export class BrokerSessionPort implements SessionPort {
 			await sdk("control", "thinking.set", { level }),
 			"thinking.set",
 		);
-		if (typeof applied?.changed !== "boolean") throw new Error("thinking.set succeeded without a changed receipt");
+		if (typeof applied?.changed !== "boolean")
+			throw new SessionContractError("thinking.set succeeded without a changed receipt");
 		return applied.changed;
 	}
 
@@ -1678,7 +1785,8 @@ export class BrokerSessionPort implements SessionPort {
 				await sdk("control", "service_tier.set", { tier: input.tier }),
 				"service_tier.set",
 			);
-			if (typeof result?.changed !== "boolean") throw new Error("service_tier.set succeeded without a changed receipt");
+			if (typeof result?.changed !== "boolean")
+				throw new SessionContractError("service_tier.set succeeded without a changed receipt");
 			return { changed: result.changed };
 		});
 	}
@@ -1950,12 +2058,29 @@ export class BrokerSessionPort implements SessionPort {
 		return await this.#tailRunner.attach(input);
 	}
 
-	async runCompaction(input: SessionCompactionInput): Promise<{ readonly status: SessionCompactionStatus }> {
+	async runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult> {
 		this.#assertOwned(input);
+		if (input.relay) return await this.#runCompactionOnRelay(input, input.relay);
 		try {
 			const result = parseEnvelope<Record<string, unknown>>(
 				await this.#cli(
-					["sdk", "session", "raw", "control", input.sessionId, "--op", "compaction.run", "--json-input", "{}"],
+					[
+						"sdk",
+						"session",
+						"raw",
+						"control",
+						input.sessionId,
+						"--op",
+						"compaction.run",
+						"--json-input",
+						"{}",
+						// gjc replies only once the compaction is done; without this its
+						// default session request budget (40 s) gives up while the host
+						// keeps compacting.
+						"--timeout-ms",
+						String(COMPACTION_TIMEOUT_MS - COMPACTION_REPLY_GRACE_MS),
+					],
+					// One end-to-end deadline: CLI slot wait and request share it.
 					{ timeoutMs: COMPACTION_TIMEOUT_MS },
 				),
 				"compaction.run",
@@ -1969,9 +2094,48 @@ export class BrokerSessionPort implements SessionPort {
 			if (error instanceof BrokerAuthorityError) throw error;
 			const code = sdkErrorCode(error);
 			if (code === "unsupported_operation" || code === "not_supported" || code === "unknown_operation")
-				return { status: "unavailable" };
-			return { status: "failed" };
+				return { status: "unavailable", code };
+			// A run that never got a CLI slot never reached gjc.
+			if (error instanceof GjcCommandQueueTimeoutError) return { status: "failed", code: "queue_timeout" };
+			// gjc's request timeout settles only the client: the host keeps compacting.
+			// So may a run whose process was cut off or never printed gjc's envelope.
+			// Other structured CLI failures keep their code but do not prove the host
+			// finished (the CLI also reports a lost reply as operation_failed); only the
+			// relay path reports `answered`.
+			const outcomeUnknown =
+				code === "timeout" || code === "uncertain_after_send" || !(error instanceof GjcCliError && error.details);
+			return { status: "failed", ...(code ? { code } : {}), ...(outcomeUnknown ? { outcomeUnknown } : {}) };
 		}
+	}
+
+	async #runCompactionOnRelay(input: SessionCompactionInput, relay: TailHandle): Promise<SessionCompactionResult> {
+		let response: RelayResponse;
+		try {
+			response = await relay.control("compaction.run", {}, { timeoutMs: COMPACTION_TIMEOUT_MS });
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			// A frame never written never reached the host.
+			if (isUnwrittenRelayRequest(error)) return { status: "failed", code: "relay_unwritten" };
+			// No reply (timeout, relay lost after the write): the host may still be compacting.
+			return { status: "failed", outcomeUnknown: true };
+		}
+		this.#database.bindings.assertAuthority(this.#authority);
+		if (response.ok) {
+			const result = recordOf(response.result) ?? {};
+			this.#tailRunner.recordCompactionReceipt({ sessionId: input.sessionId, originKey: input.originKey, result });
+			if (result.started === true || result.status === "started" || result.status === "completed")
+				return { status: "succeeded", answered: true };
+			if (result.skipped === true || result.status === "skipped") return { status: "skipped", answered: true };
+			return { status: "failed", answered: true };
+		}
+		const code = stableErrorCode(response.error?.code);
+		if (code === "unsupported_operation" || code === "not_supported" || code === "unknown_operation")
+			return { status: "unavailable", code };
+		// Refused before the host's ordered dispatch: the run never started and
+		// proves nothing about controls queued earlier. Any other failure is the
+		// dispatcher's answer for this run, including compaction's own failures.
+		const refusedBeforeDispatch = code !== undefined && COMPACTION_PRE_DISPATCH_REFUSALS.has(code);
+		return { status: "failed", ...(code ? { code } : {}), ...(refusedBeforeDispatch ? {} : { answered: true }) };
 	}
 
 	checkStalls(now = this.#now()): void {
@@ -2152,7 +2316,7 @@ export class BrokerSessionPort implements SessionPort {
 		}
 		if (requestFailed) throw requestError;
 		if (cleanupFailed) throw markSessionRequestStep(cleanupError, "close");
-		if (result === undefined) throw new Error("session request completed without a result");
+		if (result === undefined) throw new SessionContractError("session request completed without a result");
 		return result;
 	}
 
@@ -2552,10 +2716,14 @@ async function waitForProcessExit(
 	}
 }
 
-/** `ps` is the portable process read on macOS and Linux; only a clean no-match proves the pid is gone. */
+/**
+ * `ps` is the portable process read on macOS and Linux. Gone is a clean
+ * no-match, or a zombie without live threads: it runs nothing, and its pid
+ * cannot be reused until its parent reaps it.
+ */
 async function processCommand(pid: number): Promise<ProcessCommandInspection> {
 	try {
-		const proc = Bun.spawn(["ps", "-o", "pid=,ppid=,pgid=,lstart=,command=", "-p", String(pid)], {
+		const proc = Bun.spawn(["ps", "-o", "pid=,ppid=,pgid=,stat=,lstart=,command=", "-p", String(pid)], {
 			stdout: "pipe",
 			stderr: "pipe",
 			env: { ...process.env, LC_ALL: "C" },
@@ -2568,15 +2736,20 @@ async function processCommand(pid: number): Promise<ProcessCommandInspection> {
 		const line = stdout.trim();
 		if (exitCode === 0 && line.length > 0) {
 			const match =
-				/^(\d+)\s+(\d+)\s+(\d+)\s+([A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})(?:\s+(.*))?$/.exec(
+				/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+([A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})(?:\s+(.*))?$/.exec(
 					line,
 				);
 			if (!match || Number(match[1]) !== pid) return { outcome: "unreadable", reason: "ps_pid_mismatch" };
+			if (match[4]!.startsWith("Z")) {
+				// Linux keeps an exited thread-group leader as a zombie while sibling
+				// threads still run; ps marks that with "l". Neither live nor gone.
+				return match[4]!.includes("l") ? { outcome: "unreadable", reason: "ps_zombie_threads" } : { outcome: "gone" };
+			}
 			return {
 				outcome: "live",
-				identity: `${match[1]}:${match[4]}`,
+				identity: `${match[1]}:${match[5]}`,
 				context: `${match[2]}:${match[3]}`,
-				command: match[5]?.trim() ?? "",
+				command: match[6]?.trim() ?? "",
 			};
 		}
 		if (exitCode === 1 && line.length === 0 && stderr.trim().length === 0) return { outcome: "gone" };

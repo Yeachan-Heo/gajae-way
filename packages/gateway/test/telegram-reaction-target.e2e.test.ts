@@ -76,7 +76,6 @@ async function fixture(reply: string, hold?: Promise<void>) {
 		"900",
 		{ chats: {} },
 		{ save: async () => Promise.reject(new Error("a text message never carries an attachment")) },
-		{ sendMessage: async (chatId, text) => void sent.push([chatId, text]) },
 	);
 	const gateway = client;
 	let updateId = 0;
