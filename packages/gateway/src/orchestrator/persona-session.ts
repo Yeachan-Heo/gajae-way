@@ -1522,12 +1522,16 @@ export class PersonaSessionManager {
 		}
 	}
 
-	/** Render a localized system notice based on the trigger's detected language. */
-	renderLocalizedNotice(messageId: string, vars?: Record<string, string>, trigger?: InboundMessageRow): string {
+	/** Render a localized system notice based on the trigger's detected language or provided message text. */
+	renderLocalizedNotice(
+		messageId: string,
+		vars?: Record<string, string>,
+		trigger?: InboundMessageRow | Pick<InboundMessageRow, "body">,
+	): string {
 		try {
 			let lastHumanMessage: string | undefined;
 
-			if (trigger) {
+			if (trigger && "body" in trigger) {
 				// Use the trigger message itself as the language detection source
 				lastHumanMessage = trigger.body;
 			}
@@ -1542,6 +1546,25 @@ export class PersonaSessionManager {
 	/** Update the default locale when config reloads. */
 	setDefaultLocale(locale: SupportedLocale): void {
 		this.#localizationResolver.setDefaultLocale(locale);
+	}
+
+	/** Get the localization resolver for rendering localized notices outside persona sessions. */
+	get localizationResolver(): LocalizationResolver {
+		return this.#localizationResolver;
+	}
+
+	/** Get the recent human message text for an origin, for language detection in delayed notices. */
+	getRecentHumanMessage(originKey: string): string | undefined {
+		try {
+			const turns = this.#database.inbox.nonterminalTurns(originKey);
+			if (turns.length > 0) {
+				const row = this.#database.inbox.turnRow(turns[turns.length - 1].opRef);
+				if (row?.body) return row.body;
+			}
+		} catch {
+			// Fall back to undefined if database query fails
+		}
+		return undefined;
 	}
 
 	/** False when the notice hook failed; a durable notice intent is then retried. */
@@ -3925,7 +3948,9 @@ class OriginActor {
 		const origin = this.#manager.database.bindings.getOriginByKey(this.originKey);
 		if (!origin) throw new Error("agent run notice has no bound origin");
 		const messageId = `agent-run/${observer.sessionId}/${observer.batchId}`;
-		const localizedNotice = this.#manager.renderLocalizedNotice("gateway.notice.agent_run");
+		const lastHumanMessage = this.#manager.getRecentHumanMessage(this.originKey);
+		const trigger = lastHumanMessage ? ({ body: lastHumanMessage } as Pick<InboundMessageRow, "body">) : undefined;
+		const localizedNotice = this.#manager.renderLocalizedNotice("gateway.notice.agent_run", undefined, trigger);
 		const coalesced = this.#manager.database.transaction((tx) => {
 			if (this.#manager.database.inbox.hasPendingAgentRunNotice(this.originKey)) return true;
 			const enqueued = this.#manager.database.inbox.enqueue(tx, {
@@ -4884,7 +4909,12 @@ class OriginActor {
 					);
 					// The operation completed, so silence is not a valid answer: settle its
 					// trigger with one notice instead of holding the turn forever.
-					text = this.#manager.renderLocalizedNotice("turn.completed.text_unrecoverable");
+					const triggerRow = this.#manager.database.inbox.turnRow(bound.turn.opRef);
+					text = this.#manager.renderLocalizedNotice(
+						"turn.completed.text_unrecoverable",
+						undefined,
+						triggerRow || undefined,
+					);
 				}
 				await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
 			} else if (!bound.retired || bound.answerWanted) {

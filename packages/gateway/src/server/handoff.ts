@@ -16,6 +16,7 @@ import { createHash } from "node:crypto";
 import { isChatPlatform, type OriginRef, OriginRefError, originKey, parseOriginKey } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../config";
 import { MONITOR_DIGEST_MAX_LENGTH } from "../monitors/compaction";
+import type { LocalizationResolver } from "./localization";
 
 /** Hops a handoff chain may take: A -> B -> C, never a third hop. */
 export const HANDOFF_MAX_DEPTH = 2;
@@ -477,15 +478,39 @@ export function renderWatchedInputTurn(input: {
 	].join("\n");
 }
 
-export function renderWatchRegistered(target: string, expiresAt: string): string {
+export function renderWatchRegistered(
+	target: string,
+	expiresAt: string,
+	localizer?: LocalizationResolver,
+	lastHumanMessage?: string,
+): string {
+	if (localizer) {
+		return localizer.render("watch.registered", { target, expiresAt }, lastHumanMessage);
+	}
 	return `Watching ${target} for its next human message until ${expiresAt}. The reason is stored with this watch but not copied to other conversations.`;
 }
 
-export function renderWatchFailure(target: string, reason: string): string {
+export function renderWatchFailure(
+	target: string,
+	reason: string,
+	localizer?: LocalizationResolver,
+	lastHumanMessage?: string,
+): string {
+	if (localizer) {
+		return localizer.render("watch.failure", { target: target || "(no target)", reason }, lastHumanMessage);
+	}
 	return `Watch for ${target || "(no target)"} failed: ${reason}. No watch was registered.`;
 }
 
-export function renderWakeFailure(target: string, reason: string): string {
+export function renderWakeFailure(
+	target: string,
+	reason: string,
+	localizer?: LocalizationResolver,
+	lastHumanMessage?: string,
+): string {
+	if (localizer) {
+		return localizer.render("wake.failure", { target: target || "(no target)", reason }, lastHumanMessage);
+	}
 	return `Wake for ${target || "(no target)"} failed: ${reason}. Nothing was sent there.`;
 }
 
@@ -494,10 +519,25 @@ export function renderWakeFailure(target: string, reason: string): string {
  * addressed to the target session and is the work itself, so none of it is
  * quoted here.
  */
-export function renderHandoffPointer(targetLabel: string): string {
+export function renderHandoffPointer(
+	targetLabel: string,
+	localizer?: LocalizationResolver,
+	lastHumanMessage?: string,
+): string {
+	if (localizer) {
+		return localizer.render("handoff.pointer", { targetLabel }, lastHumanMessage);
+	}
 	return `Moved to ${targetLabel}: this work belongs to that conversation, and the follow-up continues there.`;
 }
 
-export function renderHandoffFailure(target: string, reason: string): string {
+export function renderHandoffFailure(
+	target: string,
+	reason: string,
+	localizer?: LocalizationResolver,
+	lastHumanMessage?: string,
+): string {
+	if (localizer) {
+		return localizer.render("handoff.failure", { target, reason }, lastHumanMessage);
+	}
 	return `Handoff to ${target} failed: ${reason}. Nothing was sent there; the work stays in this conversation.`;
 }

@@ -3488,13 +3488,26 @@ async function createInboundTurnLifecycle(
 				}),
 		at: row.received_at,
 	});
+	const getLastHumanMessage = (): string | undefined => {
+		const recent = recentConversation(
+			options.database,
+			key,
+			origin.conversationId,
+			1,
+			new Date(Date.now() - RECENT_HISTORY_WINDOW_MS).toISOString(),
+		);
+		return recent.length > 0 ? recent[recent.length - 1].body : undefined;
+	};
 	const handOff = async (handoff: HandoffReply) => {
 		const relay = planRelay(handoff.target);
 		if (!relay.ok) {
 			console.error(
 				`gateway handoff refused origin=${key} target=${safeDiagnosticField(handoff.target)}: ${relay.reason}`,
 			);
-			deliverTerminalLine(renderHandoffFailure(handoff.target, relay.reason), deliveredParts.length);
+			deliverTerminalLine(
+				renderHandoffFailure(handoff.target, relay.reason, runtime.personaSessions.localizationResolver, userText),
+				deliveredParts.length,
+			);
 			return;
 		}
 		const provenance = relayProvenance(relay.chain);
@@ -3525,7 +3538,10 @@ async function createInboundTurnLifecycle(
 				.notifyInbound(relay.originKey)
 				.catch((error) => console.error(`gateway handoff dispatch deferred to recovery: ${diagnostic(error)}`));
 		}
-		deliverTerminalLine(renderHandoffPointer(handoff.target), deliveredParts.length);
+		deliverTerminalLine(
+			renderHandoffPointer(handoff.target, runtime.personaSessions.localizationResolver, userText),
+			deliveredParts.length,
+		);
 	};
 	/**
 	 * Every handoff block of one final answer. Spellings that resolve to the same
@@ -3555,7 +3571,10 @@ async function createInboundTurnLifecycle(
 		const relay = planRelay(line.target);
 		if (!relay.ok) {
 			console.error(`gateway wake refused origin=${key} target=${safeDiagnosticField(line.target)}: ${relay.reason}`);
-			deliverTerminalLine(renderWakeFailure(line.target, relay.reason), deliveredParts.length);
+			deliverTerminalLine(
+				renderWakeFailure(line.target, relay.reason, runtime.personaSessions.localizationResolver, userText),
+				deliveredParts.length,
+			);
 			return;
 		}
 		const provenance = relayProvenance(relay.chain);
@@ -3594,18 +3613,29 @@ async function createInboundTurnLifecycle(
 	const watch = (line: WatchLine) => {
 		const relay = resolveHandoffTarget(line.target, runtime.config);
 		if (!relay.ok) {
-			deliverTerminalLine(renderWatchFailure(line.target, relay.reason), deliveredParts.length);
+			deliverTerminalLine(
+				renderWatchFailure(line.target, relay.reason, runtime.personaSessions.localizationResolver, userText),
+				deliveredParts.length,
+			);
 			return;
 		}
 		const ttl = parseWatchTtl(line.ttl);
 		if (!ttl.ok) {
-			deliverTerminalLine(renderWatchFailure(line.target, ttl.reason), deliveredParts.length);
+			deliverTerminalLine(
+				renderWatchFailure(line.target, ttl.reason, runtime.personaSessions.localizationResolver, userText),
+				deliveredParts.length,
+			);
 			return;
 		}
 		const reason = stripControlCharacters(line.reason).replace(/\s+/g, " ").trim();
 		if (!reason || Array.from(reason).length > WATCH_REASON_MAX_LENGTH) {
 			deliverTerminalLine(
-				renderWatchFailure(line.target, `reason must be 1-${WATCH_REASON_MAX_LENGTH} characters after trimming`),
+				renderWatchFailure(
+					line.target,
+					`reason must be 1-${WATCH_REASON_MAX_LENGTH} characters after trimming`,
+					runtime.personaSessions.localizationResolver,
+					userText,
+				),
 				deliveredParts.length,
 			);
 			return;
@@ -3615,6 +3645,8 @@ async function createInboundTurnLifecycle(
 				renderWatchFailure(
 					line.target,
 					`${relay.originKey} is already in this handoff chain (${incomingHandoff.chain.join(" -> ")})`,
+					runtime.personaSessions.localizationResolver,
+					userText,
 				),
 				deliveredParts.length,
 			);
@@ -3622,7 +3654,10 @@ async function createInboundTurnLifecycle(
 		}
 		const hop = extendHandoffChain(incomingHandoff?.chain ?? [], relay.originKey, key);
 		if (!hop.ok) {
-			deliverTerminalLine(renderWatchFailure(line.target, hop.reason), deliveredParts.length);
+			deliverTerminalLine(
+				renderWatchFailure(line.target, hop.reason, runtime.personaSessions.localizationResolver, userText),
+				deliveredParts.length,
+			);
 			return;
 		}
 		const registeredAtDate = new Date();
@@ -3667,7 +3702,12 @@ async function createInboundTurnLifecycle(
 			return;
 		}
 		deliverTerminalLine(
-			renderWatchRegistered(line.target, outcome.registration.watch.expires_at),
+			renderWatchRegistered(
+				line.target,
+				outcome.registration.watch.expires_at,
+				runtime.personaSessions.localizationResolver,
+				userText,
+			),
 			deliveredParts.length,
 		);
 	};

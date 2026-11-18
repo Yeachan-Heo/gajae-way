@@ -1,6 +1,13 @@
 import { test } from "bun:test";
 import { strict as assert } from "node:assert";
 import { detectLanguage, EN_CATALOG, KO_CATALOG, LocalizationResolver } from "../src/server/localization";
+import {
+	renderWatchRegistered,
+	renderWatchFailure,
+	renderWakeFailure,
+	renderHandoffPointer,
+	renderHandoffFailure,
+} from "../src/server/handoff";
 
 test("detectLanguage detects Korean with Hangul characters", () => {
 	// Korean text with significant Hangul ratio
@@ -153,4 +160,44 @@ test("LocalizationResolver.setDefaultLocale updates the default", () => {
 	resolver.setDefaultLocale("en");
 	rendered = resolver.render("turn.held.unresolved");
 	assert(rendered.includes("[turn held]"), "Should render in English again");
+});
+
+test("renderWatchRegistered with localization resolver renders Korean for Korean text", () => {
+	const resolver = new LocalizationResolver("en");
+	const koreanText = "한국어 테스트입니다";
+	const rendered = renderWatchRegistered("target", "2026-12-18T12:00:00Z", resolver, koreanText);
+	assert(rendered.includes("모니터링하고"), "Should render in Korean when Korean text is detected");
+});
+
+test("renderWatchRegistered without localization resolver returns English", () => {
+	const rendered = renderWatchRegistered("target", "2026-12-18T12:00:00Z");
+	assert(rendered.includes("Watching"), "Should render in English without localization resolver");
+});
+
+test("renderWatchFailure with localization resolver renders Korean for Korean text", () => {
+	const resolver = new LocalizationResolver("en");
+	const koreanText = "한국어 테스트입니다";
+	const rendered = renderWatchFailure("target", "some reason", resolver, koreanText);
+	assert(rendered.includes("감시 실패"), "Should render in Korean when Korean text is detected");
+});
+
+test("renderWakeFailure with localization resolver renders Korean for Korean text", () => {
+	const resolver = new LocalizationResolver("en");
+	const koreanText = "한국어 테스트입니다";
+	const rendered = renderWakeFailure("target", "some reason", resolver, koreanText);
+	assert(rendered.includes("웨이크 실패"), "Should render in Korean when Korean text is detected");
+});
+
+test("renderHandoffPointer with localization resolver renders Korean for Korean text", () => {
+	const resolver = new LocalizationResolver("en");
+	const koreanText = "한국어 테스트입니다";
+	const rendered = renderHandoffPointer("targetLabel", resolver, koreanText);
+	assert(rendered.includes("이동됨"), "Should render in Korean when Korean text is detected");
+});
+
+test("renderHandoffFailure with localization resolver renders Korean for Korean text", () => {
+	const resolver = new LocalizationResolver("en");
+	const koreanText = "한국어 테스트입니다";
+	const rendered = renderHandoffFailure("target", "some reason", resolver, koreanText);
+	assert(rendered.includes("핸드오프 실패"), "Should render in Korean when Korean text is detected");
 });

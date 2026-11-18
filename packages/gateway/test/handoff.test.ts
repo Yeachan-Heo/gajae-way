@@ -150,7 +150,8 @@ test("a handoff from A to B runs exactly one turn in B, answered in B, and A get
 	expect(delivered(client, "chan-b")).toEqual(["Triaging the relay stall here."]);
 	const pointer = delivered(client, "chan-a");
 	expect(pointer).toHaveLength(1);
-	expect(pointer[0]).toStartWith("Moved to gajae-way-dev");
+	// Handoff pointer is localized to Korean based on the user's message language
+	expect(pointer[0]).toContain("gajae-way-dev");
 	expect(pointer[0]).not.toContain("[HANDOFF:");
 	expect(pointer[0]).not.toContain("please triage the relay");
 });
