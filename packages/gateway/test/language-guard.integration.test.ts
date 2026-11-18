@@ -5,11 +5,15 @@ import { buildLanguageInstruction, checkKanaGuard, detectLanguageFromText } from
  * Integration tests for the kana guard within the server lifecycle.
  *
  * The language guard is integrated into createInboundTurnLifecycle to:
- * 1. Detect conversation language from the last human message
- * 2. Inject language instruction into the system preamble for internal turns
+ * 1. Detect conversation language from the last human message (regardless of turn type)
+ * 2. Inject language instruction into the system preamble for internal turns (lane reports, monitors)
  * 3. Apply checkKanaGuard in onTerminal before sending responses
+ * 4. Implement hold-and-rewrite: request a rewrite instead of silently dropping
  *
  * These tests verify the guard works correctly in its integrated context.
+ *
+ * Lane-report turns (internal) are triggered after human messages in a conversation history.
+ * They should respect the conversation language established by the last human message.
  */
 
 test("kana guard integration: Korean conversation detected from human message", () => {

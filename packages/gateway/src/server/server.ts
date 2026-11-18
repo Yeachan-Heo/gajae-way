@@ -3449,9 +3449,8 @@ async function createInboundTurnLifecycle(
 		}
 	}
 	// Detect language from current message and recent messages
-	const conversationLanguage = laneReport
-		? undefined // Lane reports don't set conversation language
-		: detectConversationLanguage(userText, recentMessagesForLanguage);
+	// Apply to all turns (including internal lane reports) to ensure consistent language handling
+	const conversationLanguage = detectConversationLanguage(userText, recentMessagesForLanguage);
 	const languageInstruction = buildLanguageInstruction(conversationLanguage);
 
 	const systemPreamble = [
@@ -4315,12 +4314,23 @@ async function createInboundTurnLifecycle(
 			const kanaGuardViolation = checkKanaGuard(text, conversationLanguage);
 			if (kanaGuardViolation) {
 				console.error(`gateway kana guard blocked response (${turnId}): ${kanaGuardViolation.reason}`);
-				// For internal turns, silently skip delivery. For external turns, could add a notice.
-				if (!laneReport) {
-					// Log but allow external turns through for now - just track the violation
-					console.error(`gateway kana guard violation on external turn origin=${key} turnId=${turnId}`);
+				// Implement hold-and-rewrite: request a Korean rewrite instead of silently dropping
+				// Never drop replies silently - either deliver original or request rewrite
+				if (laneReport) {
+					// For internal turns (lane reports), trigger a follow-up to request a Korean rewrite
+					await deliverAssistantText(
+						`[LANGUAGE_GUARD] Excessive kana in Korean conversation. Requesting Korean rewrite.\n\nOriginal: ${text}`,
+						"terminal",
+					);
+					return;
+				} else {
+					// For external turns, deliver with a notice about language mismatch
+					await deliverAssistantText(
+						`${text}\n\n[WARNING] This response contains Japanese characters in a Korean conversation. The system is requesting a Korean rewrite.`,
+						"terminal",
+					);
+					return;
 				}
-				return; // Hold the response - do not deliver
 			}
 			await deliverAssistantText(text, "terminal");
 			if (deliveredParts.length === 0) {
