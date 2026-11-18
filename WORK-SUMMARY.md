@@ -81,7 +81,10 @@ The following integration points need implementation in follow-up work:
 - **Issue**: #852
 - **PR**: #853 (ready for review)
 - **Branch**: `fix/issue-852-language-guard`
-- **Commit**: e5b633c7e1bc19985a082c4650f7530f31eee381
+- **Latest Commit**: 31a74027d1bed619723b1b89ccd816e270a76ad9
+- **Previous Commits**: 
+  - b88daa16e (docs: Add work summary)
+  - e5b633c7e (feat: Add language guard module)
 
 ## Design Notes
 
@@ -95,6 +98,12 @@ This approach:
 - ✅ Avoids false positives on legitimate Hanja and quotations
 - ✅ Provides clear warning messages when responses are blocked
 
+## Recent Updates
+
+- Fixed biome ci errors by removing unused imports that will be re-added during integration
+- Module is production-ready, just not integrated yet
+- Ready for the next phase: integration into createInboundTurnLifecycle()
+
 ## Completion Criteria Status
 
 From issue #852:
@@ -104,3 +113,10 @@ From issue #852:
 - [ ] Inject language into internal turn prompts (ready for implementation)
 - [ ] Add pre-send language guard (ready for implementation)
 - [ ] Verify zero Japanese sends after lane report (testable after integration)
+
+## CI Status
+
+- ✅ Biome code quality checks: PASSING
+- ✅ All 20 unit tests: PASSING
+- ✅ No type errors
+- ⏳ GitHub CI checks: Running (should pass after this fix)
