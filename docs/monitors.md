@@ -163,7 +163,7 @@ Persona sessions likewise do not rotate on a turn count. Native SDK compaction i
 
 ## Persistent-session operator signals
 
-Monitor authoring uses the same broker-bound `SessionPort` and its request/response convenience. The daemon emits grep-stable signals: `broker_restart generation=… backoffMs=…` for a supervised lifecycle replacement, `compaction_event sessionId=… originKey=…` when native compaction is observed, and `stall_alert originKey=… sessionId=… silentMs=…` for an alert-only silent running operation. A held retired batch is logged as `retired_hold originKey=… batchKey=…`; do not resend it manually. Status and tail evidence decide terminal state.
+Monitor authoring uses the same broker-bound `SessionPort` and its request/response convenience. The daemon emits grep-stable signals: `gjc_version_changed from=… to=…` when the observed runtime version changes, `compaction_event sessionId=… originKey=…` when native compaction is observed, and `stall_alert originKey=… sessionId=… silentMs=…` for an alert-only silent running operation. A held retired batch is logged as `retired_hold originKey=… batchKey=…`; do not resend it manually. Status and tail evidence decide terminal state.
 
 ## Burst policies
 
