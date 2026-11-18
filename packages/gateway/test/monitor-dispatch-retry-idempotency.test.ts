@@ -185,32 +185,29 @@ test("issue #187: a completed exhausted turn is resumed and its authored result 
 		// journals no send, so the recovery assertions below still see exactly
 		// the original OP_REF send.
 		state.sessionPort.appendAssistant(input.sessionId, "", Date.now());
-		state.sessionPort.setWorkerOutputFixture(
-			input.opRef,
-			{
-				exitCode: 0,
-				stdout: JSON.stringify({
-					ok: true,
-					result: {
-						kind: "prompt",
-						clientRef: input.opRef,
-						status: "terminal_ok",
-						startedAt: Date.now(),
-						terminalAt: Date.now(),
-						outcome: { reason: "end_turn", provenance: "agent" },
-						content: {
-							version: 1,
-							type: "text",
-							text: "",
-							truncated: false,
-							byteLength: 0,
-						},
-						receiptState: "present",
+		state.sessionPort.setWorkerOutputFixture(input.opRef, {
+			exitCode: 0,
+			stdout: JSON.stringify({
+				ok: true,
+				result: {
+					kind: "prompt",
+					clientRef: input.opRef,
+					status: "terminal_ok",
+					startedAt: Date.now(),
+					terminalAt: Date.now(),
+					outcome: { reason: "end_turn", provenance: "agent" },
+					content: {
+						version: 1,
+						type: "text",
+						text: "",
+						truncated: false,
+						byteLength: 0,
 					},
-				}),
-				stderr: "",
-			},
-		);
+					receiptState: "present",
+				},
+			}),
+			stderr: "",
+		});
 		return {
 			receipt: { sessionId: input.sessionId, operationRef: input.opRef } as never,
 			status: {

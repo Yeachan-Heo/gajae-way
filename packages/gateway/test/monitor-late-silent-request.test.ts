@@ -146,65 +146,65 @@ test("a late [SILENT] after the authoring answer never replaces the monitor resp
 					transcript.push({ ts: new Date().toISOString(), body: "[SILENT]" });
 					silentRowAppended = true;
 				});
-			if (request.operation === "session.last_assistant")
-				return { ok: true, page: { items: [transcript.at(-1)?.body ?? ""], complete: true } };
-			return turn(request);
-		},
-		(args) => {
-			if (args.includes("query") && args.includes("turn.result")) {
-				// Handle turn.result query: find the clientRef in the args
-				const atIdx = args.indexOf("--json-input");
-				if (atIdx < 0) return undefined;
-				const inputIdx = atIdx + 1;
-				if (inputIdx >= args.length) return undefined;
-				let input: { clientRef?: string } | undefined;
-				try {
-					input = JSON.parse(args[inputIdx]);
-				} catch {
-					return undefined;
+				if (request.operation === "session.last_assistant")
+					return { ok: true, page: { items: [transcript.at(-1)?.body ?? ""], complete: true } };
+				return turn(request);
+			},
+			(args) => {
+				if (args.includes("query") && args.includes("turn.result")) {
+					// Handle turn.result query: find the clientRef in the args
+					const atIdx = args.indexOf("--json-input");
+					if (atIdx < 0) return undefined;
+					const inputIdx = atIdx + 1;
+					if (inputIdx >= args.length) return undefined;
+					let input: { clientRef?: string } | undefined;
+					try {
+						input = JSON.parse(args[inputIdx]);
+					} catch {
+						return undefined;
+					}
+					const clientRef = input?.clientRef;
+					if (!clientRef) return undefined;
+					const answer = outputs.get(clientRef);
+					const startTime = started.get(clientRef);
+					if (answer === undefined || startTime === undefined) return undefined;
+					return {
+						exitCode: 0,
+						stdout: JSON.stringify({
+							ok: true,
+							result: {
+								kind: "prompt",
+								clientRef,
+								status: "terminal_ok",
+								startedAt: startTime,
+								terminalAt: Date.now(),
+								outcome: { reason: "end_turn", provenance: "agent" },
+								content: {
+									version: 1,
+									type: "text",
+									text: answer,
+									truncated: false,
+									byteLength: Buffer.byteLength(answer),
+								},
+								receiptState: "present",
+							},
+						}),
+						stderr: "",
+					};
 				}
-				const clientRef = input?.clientRef;
-				if (!clientRef) return undefined;
-				const answer = outputs.get(clientRef);
-				const startTime = started.get(clientRef);
-				if (answer === undefined || startTime === undefined) return undefined;
+				if (!args.includes("transcript.list")) return undefined;
 				return {
 					exitCode: 0,
 					stdout: JSON.stringify({
-						ok: true,
-						result: {
-							kind: "prompt",
-							clientRef,
-							status: "terminal_ok",
-							startedAt: startTime,
-							terminalAt: Date.now(),
-							outcome: { reason: "end_turn", provenance: "agent" },
-							content: {
-								version: 1,
-								type: "text",
-								text: answer,
-								truncated: false,
-								byteLength: Buffer.byteLength(answer),
-							},
-							receiptState: "present",
+						page: {
+							items: transcript.map((row) => ({ role: "assistant", ts: row.ts, body: row.body })),
+							complete: true,
 						},
 					}),
 					stderr: "",
 				};
-			}
-			if (!args.includes("transcript.list")) return undefined;
-			return {
-				exitCode: 0,
-				stdout: JSON.stringify({
-					page: {
-						items: transcript.map((row) => ({ role: "assistant", ts: row.ts, body: row.body })),
-						complete: true,
-					},
-				}),
-				stderr: "",
-			};
-		},
-	);
+			},
+		);
 		const registry = new MonitorRegistry(database);
 		const monitor = registry.add({
 			name: "late-silent-watch",
