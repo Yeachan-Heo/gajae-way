@@ -164,7 +164,6 @@ import {
 	watchWakeMessageId,
 } from "./handoff";
 import { InterimSpeechGate } from "./interim-speech";
-import { buildLanguageInstruction, checkKanaGuard, detectLanguageFromText, type DetectedLanguage } from "./language-guard";
 import { applyModelCommand, listModelChoices, ProviderModelCatalog } from "./model-command";
 import { checkOutboundFile, deterministicFileDeliveryId } from "./outbound-files";
 import { type PanelResponseKind, PermissionPanels } from "./permission-panels";
