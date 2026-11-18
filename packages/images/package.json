@@ -1,6 +1,6 @@
 {
 	"name": "@gajae-gateway/images",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"type": "module",
 	"description": "Bounded image validation, downloading, and prompt-image preparation for gajaeway clients.",
 	"license": "AGPL-3.0-only",
