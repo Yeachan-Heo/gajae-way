@@ -67,6 +67,7 @@ import {
 	rememberParticipatedThread,
 	saveRecoveryCursors,
 } from "./recovery";
+import { SlackRootTexts } from "./root-text";
 import { type SlackSlashCommand, SlackSocketMode, type SocketModeOptions } from "./socket";
 import { isPresenceReaction, WorkingStatus } from "./status";
 import { mentionedUserIds, normalizeSlackText } from "./text";
@@ -308,8 +309,6 @@ export class OrderedIngress {
 }
 
 const SLACK_BARE_TS = /^\d+\.\d+$/;
-/** Bot-rooted threads whose root text is remembered for the reply header. */
-const ROOT_EXCERPT_CACHE_LIMIT = 500;
 
 /** The Slack channel a delivery for this origin is posted in. */
 export function deliveryChannel(origin: OriginRef): string {
@@ -375,6 +374,7 @@ export async function settleSlackDelivery(
 	status?: Pick<WorkingStatus, "clear" | "reassert">,
 	mentions?: MentionDirectory,
 	live?: LiveReplyTracker,
+	roots?: Pick<SlackRootTexts, "remember">,
 ): Promise<void> {
 	if (message.origin.platform !== "slack" || !message.deliveryId) return;
 	if (message.reaction) {
@@ -439,7 +439,9 @@ export async function settleSlackDelivery(
 		}
 		// Every chunk must stay in the same Slack thread, not just the first chunk.
 		for (const chunk of chunkSlackMessage(text)) {
-			await api.postMessage(channel, chunk, threadTs);
+			const posted = await api.postMessage(channel, chunk, threadTs);
+			// A top-level post may become a thread root; its replies quote it (root-text.ts).
+			if (!visibleTextPosted && threadTs === undefined) roots?.remember(posted.channel || channel, posted.ts, repaired);
 			visibleTextPosted = true;
 		}
 		// voiceText is intentionally ignored: Slack has no bot voice messages.
@@ -588,12 +590,13 @@ export function subscribeSlackDeliveries(
 	status?: Pick<WorkingStatus, "clear" | "reassert">,
 	mentions?: MentionDirectory,
 	live?: LiveReplyTracker,
+	roots?: Pick<SlackRootTexts, "remember">,
 ): () => void {
 	const queue = settlementQueue(gateway);
 	return gateway.onChatMessage((message) => {
 		if (message.origin.platform !== "slack") return;
 		queue.run(settlementKey(message.origin), async () => {
-			await settleSlackDelivery(gateway, api, message, log, status, mentions, live).catch((error) =>
+			await settleSlackDelivery(gateway, api, message, log, status, mentions, live, roots).catch((error) =>
 				log.error(`Slack delivery settlement request failed: ${errorText(error)}`),
 			);
 		});
@@ -672,6 +675,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 		private readonly monitorIntervals = { healthy: 30_000, degraded: 5_000 },
 		private readonly reconnectDelayMs = 500,
 		readonly live?: LiveReplyTracker,
+		readonly roots?: SlackRootTexts,
 	) {
 		if (initialClient) this.adoptClient(initialClient);
 	}
@@ -691,7 +695,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 		this.#deliveryOff?.();
 		// Old in-flight Slack writes still own their place across a gateway reconnect.
 		settlementQueues.set(client, this.#settlements);
-		const off = subscribeSlackDeliveries(client, this.api, console, this.status, this.mentions, this.live);
+		const off = subscribeSlackDeliveries(client, this.api, console, this.status, this.mentions, this.live, this.roots);
 		const progressOff =
 			this.status || this.live ? subscribeSlackProgress(client, this.status, console, this.live) : undefined;
 		const handlersOff = client.onChatMessage((message) => {
@@ -1025,6 +1029,7 @@ export async function startSlackAdapter(
 	const directory = new SlackDirectory(api);
 	const status = new WorkingStatus(api, log);
 	const live = config.liveReplies === true ? new LiveReplyTracker(api, log) : undefined;
+	const roots = new SlackRootTexts(api, (text) => normalizeSlackText(text, directory));
 	const gateway = new ReconnectingGateway(
 		config.gatewaySocket ?? join(adapterHome(), "gateway.sock"),
 		api,
@@ -1034,6 +1039,7 @@ export async function startSlackAdapter(
 		{ healthy: 30_000, degraded: 5_000 },
 		500,
 		live,
+		roots,
 	);
 	const ingress = new OrderedIngress();
 	const imageBudget = new ImagePreparationBudget();
@@ -1112,31 +1118,11 @@ export async function startSlackAdapter(
 		if (!threadId) return Promise.resolve();
 		return mutate((state) => rememberParticipatedThread(state, threadId, now()));
 	};
-	// A thread rooted at the bot's own message opens its own session, which never saw the
-	// root the bot posted (often from another session). Quoting the root in the reply header
-	// tells that session what the thread is about. Cached per root: the text rarely changes.
-	const rootExcerpts = new Map<string, string>();
-	const withRootExcerpt = async (engagement: EngagementContext): Promise<EngagementContext> => {
+	// Optional context only: never awaited, so a cold root never delays this message.
+	const withRootExcerpt = (engagement: EngagementContext): EngagementContext => {
 		const replyTo = engagement.replyTo;
 		if (replyTo?.fromSelf !== true || replyTo.excerpt !== undefined) return engagement;
-		const root = parseSlackMessageId(replyTo.messageId);
-		if (!root) return engagement;
-		let excerpt = rootExcerpts.get(replyTo.messageId);
-		if (excerpt === undefined) {
-			try {
-				const page = await api.conversationsReplies(root.channel, root.ts, { limit: 1 });
-				const text = page.messages.find((message) => message.ts === root.ts)?.text;
-				excerpt = typeof text === "string" ? normalizeSlackText(text, directory).trim() : "";
-			} catch {
-				// Best effort: the reply still routes and answers without the quoted root.
-				return engagement;
-			}
-			if (rootExcerpts.size >= ROOT_EXCERPT_CACHE_LIMIT) {
-				const oldest = rootExcerpts.keys().next().value;
-				if (oldest !== undefined) rootExcerpts.delete(oldest);
-			}
-			rootExcerpts.set(replyTo.messageId, excerpt);
-		}
+		const excerpt = roots.excerpt(replyTo.messageId);
 		return excerpt ? { ...engagement, replyTo: { ...replyTo, excerpt } } : engagement;
 	};
 	const prime = async (message: SlackInboundMessage): Promise<void> => {
@@ -1202,7 +1188,7 @@ export async function startSlackAdapter(
 				}
 				const text = extractBotCommand(message, identity.botUserId) ?? renderInboundText(message, directory);
 				if (text === "") return;
-				const engagement = await withRootExcerpt(
+				const engagement = withRootExcerpt(
 					engagementForMessage(message, admitted.origin, identity, directory, config.channels),
 				);
 				const origin = routedOrigin;
@@ -1317,7 +1303,7 @@ export async function startSlackAdapter(
 			if (text === "") return "skip";
 			const messageId = slackMessageId(message.channel, message.ts);
 			const origin = rememberOrigin(messageId, admitted.origin);
-			const engagement = await withRootExcerpt(
+			const engagement = withRootExcerpt(
 				engagementForMessage(message, admitted.origin, identity, directory, config.channels),
 			);
 			const recordFailure = async (

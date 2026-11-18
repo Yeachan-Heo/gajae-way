@@ -77,6 +77,10 @@ test("SHUTUP guidance reaches threads, not channels or DMs", () => {
 	const discordChannel: OriginRef = { platform: "discord", kind: "channel", conversationId: "C1" };
 	expect(currentConversationNotice(discordThread)).toContain("reply with exactly [SHUTUP]");
 	expect(currentConversationNotice(slackThread)).toContain("reply with exactly [SHUTUP]");
+	// A Slack reply names only the thread root, so only a mention unmutes there.
+	expect(currentConversationNotice(slackThread)).toContain("a mention of the bot in the thread unmutes it");
+	expect(currentConversationNotice(slackThread)).not.toContain("reply to one of its messages");
+	expect(currentConversationNotice(discordThread)).toContain("reply to one of its messages");
 	for (const origin of [discordChannel, slackChannel, slackDm, loopback])
 		expect(currentConversationNotice(origin)).not.toContain("[SHUTUP]");
 });

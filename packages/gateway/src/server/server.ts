@@ -3113,6 +3113,16 @@ export function messageEditId(messageId: string, text: string): string {
 	return `edit:${messageId}:${createHash("sha256").update(text).digest("hex").slice(0, 16)}`;
 }
 
+/**
+ * The channel origin an older Slack adapter recorded a reply under the persona's own thread
+ * root on, or undefined when `origin` is not such a thread reply.
+ */
+function legacySlackBotRootOrigin(origin: OriginRef, engagement: unknown): OriginRef | undefined {
+	if (origin.platform !== "slack" || origin.kind !== "thread" || !origin.parentId) return undefined;
+	const replyTo = (engagement as { replyTo?: { messageId?: unknown; fromSelf?: unknown } } | undefined)?.replyTo;
+	if (replyTo?.fromSelf !== true || replyTo.messageId !== origin.conversationId) return undefined;
+	return { platform: "slack", kind: "channel", conversationId: origin.parentId };
+}
 async function editChat(
 	connection: Connection,
 	request: RequestFrame,
@@ -3151,7 +3161,7 @@ async function editChat(
 			typeof params.engagement.authorId !== "string")
 	)
 		throw new ProtocolError("invalid_params", "non-loopback chat.edit requires engagement");
-	const key = originKey(origin);
+	let key = originKey(origin);
 	const declined = () =>
 		connection.write({
 			v: PROFILE_VERSION,
@@ -3159,6 +3169,18 @@ async function editChat(
 			id: request.id,
 			result: { turnId: null, engaged: false },
 		});
+	// Slack adapters before #854 recorded a reply under the persona's own root on the channel
+	// session; after the cutover an edit of that reply names its thread. Apply the edit where
+	// the original was recorded instead of declining it as unknown.
+	const legacy = legacySlackBotRootOrigin(origin, params.engagement);
+	if (
+		legacy &&
+		!options.database.inbox.knownMessage(key, params.messageId) &&
+		options.database.inbox.knownMessage(originKey(legacy), params.messageId)
+	) {
+		origin = legacy;
+		key = originKey(legacy);
+	}
 	if (!options.database.inbox.knownMessage(key, params.messageId)) {
 		// Never ingested: nothing to point at. Not context either - a message the
 		// gateway never saw must not appear by way of its edit.
@@ -4813,7 +4835,11 @@ export function currentConversationNotice(origin: OriginRef): string {
 			: []),
 		...(origin.kind === "thread"
 			? [
-					"To mute a thread so it stops sending you messages unless explicitly mentioned or replied to, reply with exactly [SHUTUP] and nothing else. This mutes the thread for this bot and persists across restarts; mention the bot or reply to one of its messages to unmute and resume normal engagement.",
+					// A Slack reply names only the thread root, never the message it answers, so a
+					// muted Slack thread unmutes on an explicit mention alone (policy threadMuteAddressed).
+					origin.platform === "slack"
+						? "To mute a thread so it stops sending you messages unless you are explicitly mentioned there, reply with exactly [SHUTUP] and nothing else. This mutes the thread for this bot and persists across restarts; a mention of the bot in the thread unmutes it and resumes normal engagement."
+						: "To mute a thread so it stops sending you messages unless explicitly mentioned or replied to, reply with exactly [SHUTUP] and nothing else. This mutes the thread for this bot and persists across restarts; mention the bot or reply to one of its messages to unmute and resume normal engagement.",
 				]
 			: []),
 		// Reply-threading was implemented end to end (parser, ledger, Slack/Discord

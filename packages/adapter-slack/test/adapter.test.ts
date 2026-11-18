@@ -222,6 +222,39 @@ test("Slack partial chunk success makes a later definitive failure uncertain", a
 	]);
 });
 
+test("Slack remembers the text of a top-level post so replies under it can quote it", async () => {
+	const client = new Gateway();
+	const api = new Api();
+	const remembered: [string, string, string][] = [];
+	const roots = { remember: (channel: string, ts: string, text: string) => remembered.push([channel, ts, text]) };
+	let next = 0;
+	api.postMessage = async (channel) => ({ channel, ts: `${++next}.000` });
+	await settleSlackDelivery(
+		client,
+		api,
+		delivery({ text: "x".repeat(9000) }),
+		console,
+		undefined,
+		undefined,
+		undefined,
+		roots,
+	);
+	// Only the first chunk can be a thread root.
+	expect(remembered).toEqual([["C1", "1.000", "x".repeat(9000)]]);
+	const threaded = { platform: "slack" as const, kind: "thread" as const, conversationId: "C1:1.000", parentId: "C1" };
+	await settleSlackDelivery(
+		client,
+		api,
+		delivery({ origin: threaded }),
+		console,
+		undefined,
+		undefined,
+		undefined,
+		roots,
+	);
+	expect(remembered).toHaveLength(1);
+});
+
 test("Slack complete settlements serialize one origin while unrelated origins continue after failure", async () => {
 	const client = new Gateway();
 	const api = new Api();
@@ -1932,7 +1965,46 @@ test("Slack recovery joins a still-pending live send instead of calling it a dup
 	}
 });
 
-test("Slack bot-root threads keep their thread session, quote the root, and stay recoverable after a restart", async () => {
+test("Slack bot-root replies never wait for the root text; later replies quote it once fetched", async () => {
+	const f = await fixture();
+	try {
+		const root = "1700000001.000000";
+		let lookups = 0;
+		const { promise: rootFetched, resolve: releaseRoot } = Promise.withResolvers<void>();
+		f.api.conversationsReplies = async (_channel: string, ts: string, options?: { oldest?: string }) => {
+			// Thread recovery reads the root too (from `oldest`); count only the header lookup.
+			if (options?.oldest === undefined) lookups++;
+			await rootFetched;
+			return {
+				messages: ts === root ? [{ type: "message", user: "UBOT", ts: root, text: "IOPS-1 work\nthread" }] : [],
+				has_more: false,
+			};
+		};
+		const reply = (ts: string, text: string) => inbound({ ts, text, thread_ts: root, parent_user_id: "UBOT" });
+		// The lookup is still pending: both replies are delivered at once, without a quote.
+		await f.event({ ...reply("1700000002.000001", "first") });
+		await f.event({ ...reply("1700000003.000001", "second") });
+		expect(chatSends(f.client).map((send) => (send.engagement as { replyTo?: unknown }).replyTo)).toEqual([
+			{ messageId: `C1:${root}`, authorId: "UBOT", fromSelf: true },
+			{ messageId: `C1:${root}`, authorId: "UBOT", fromSelf: true },
+		]);
+		expect(lookups).toBe(1);
+		releaseRoot();
+		await Bun.sleep(0);
+		await f.event({ ...reply("1700000004.000001", "third") });
+		expect((chatSends(f.client).at(-1)?.engagement as { replyTo?: unknown } | undefined)?.replyTo).toEqual({
+			messageId: `C1:${root}`,
+			authorId: "UBOT",
+			fromSelf: true,
+			excerpt: "IOPS-1 work thread",
+		});
+		expect(lookups).toBe(1);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("Slack bot-root threads keep their thread session and stay recoverable after a restart", async () => {
 	for (const initial of ["live", "recovered"]) {
 		const channels = { C1: { engagement: "mention-open" as const } };
 		const f = await fixture(channels, { autoRecover: false });
@@ -1956,7 +2028,7 @@ test("Slack bot-root threads keep their thread session, quote the root, and stay
 			expect(await f.recoverMissedMessages()).toBe(true);
 			expect(chatSends(f.client).find((send) => send.text === "@UBOT first reply")).toMatchObject({
 				origin: threadOrigin,
-				engagement: { replyTo: { fromSelf: true, excerpt: "bot parent" } },
+				engagement: { replyTo: { fromSelf: true } },
 			});
 			const saved = await loadRecoveryCursors(f.recoveryCursorPath);
 			expect(saved.recoveredThrough.C1).toBe("1700000050.000001");
