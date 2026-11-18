@@ -370,6 +370,9 @@ async function applyConfigReload(
 	runtime.personaSessions.setStallTimeoutMs(result.config.stallTimeoutMs);
 	runtime.personaSessions.setHostLimits(result.config.sessions);
 	options.broker?.setMaxPoolSize(result.config.sessions?.maxLiveHosts ?? DEFAULT_SESSIONS_MAX_LIVE_HOSTS);
+	if (result.changed.includes("locale")) {
+		runtime.personaSessions.setDefaultLocale(result.config.locale ?? "en");
+	}
 	console.info(
 		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
 	);
@@ -1032,6 +1035,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		brokerAvailable: () => options.broker?.isAvailable ?? true,
 		// biome-ignore lint/style/noNonNullAssertion: broker is non-null when lambda is called
 		brokerLiveness: options.broker ? () => options.broker!.judgeLiveness() : undefined,
+		defaultLocale: (options.config.locale as "en" | "ko" | undefined) ?? "en",
 		onBindHold: ({ originKey, trigger, notice, reason }: PersonaBindHoldInput) => {
 			let origin: OriginRef;
 			try {
@@ -3490,7 +3494,10 @@ async function createInboundTurnLifecycle(
 			console.error(
 				`gateway handoff refused origin=${key} target=${safeDiagnosticField(handoff.target)}: ${relay.reason}`,
 			);
-			deliverTerminalLine(renderHandoffFailure(handoff.target, relay.reason), deliveredParts.length);
+			deliverTerminalLine(
+				renderHandoffFailure(handoff.target, relay.reason, runtime.personaSessions.localizationResolver, userText),
+				deliveredParts.length,
+			);
 			return;
 		}
 		const provenance = relayProvenance(relay.chain);
@@ -3521,7 +3528,10 @@ async function createInboundTurnLifecycle(
 				.notifyInbound(relay.originKey)
 				.catch((error) => console.error(`gateway handoff dispatch deferred to recovery: ${diagnostic(error)}`));
 		}
-		deliverTerminalLine(renderHandoffPointer(handoff.target), deliveredParts.length);
+		deliverTerminalLine(
+			renderHandoffPointer(handoff.target, runtime.personaSessions.localizationResolver, userText),
+			deliveredParts.length,
+		);
 	};
 	/**
 	 * Every handoff block of one final answer. Spellings that resolve to the same
@@ -3551,7 +3561,10 @@ async function createInboundTurnLifecycle(
 		const relay = planRelay(line.target);
 		if (!relay.ok) {
 			console.error(`gateway wake refused origin=${key} target=${safeDiagnosticField(line.target)}: ${relay.reason}`);
-			deliverTerminalLine(renderWakeFailure(line.target, relay.reason), deliveredParts.length);
+			deliverTerminalLine(
+				renderWakeFailure(line.target, relay.reason, runtime.personaSessions.localizationResolver, userText),
+				deliveredParts.length,
+			);
 			return;
 		}
 		const provenance = relayProvenance(relay.chain);
@@ -3590,18 +3603,29 @@ async function createInboundTurnLifecycle(
 	const watch = (line: WatchLine) => {
 		const relay = resolveHandoffTarget(line.target, runtime.config);
 		if (!relay.ok) {
-			deliverTerminalLine(renderWatchFailure(line.target, relay.reason), deliveredParts.length);
+			deliverTerminalLine(
+				renderWatchFailure(line.target, relay.reason, runtime.personaSessions.localizationResolver, userText),
+				deliveredParts.length,
+			);
 			return;
 		}
 		const ttl = parseWatchTtl(line.ttl);
 		if (!ttl.ok) {
-			deliverTerminalLine(renderWatchFailure(line.target, ttl.reason), deliveredParts.length);
+			deliverTerminalLine(
+				renderWatchFailure(line.target, ttl.reason, runtime.personaSessions.localizationResolver, userText),
+				deliveredParts.length,
+			);
 			return;
 		}
 		const reason = stripControlCharacters(line.reason).replace(/\s+/g, " ").trim();
 		if (!reason || Array.from(reason).length > WATCH_REASON_MAX_LENGTH) {
 			deliverTerminalLine(
-				renderWatchFailure(line.target, `reason must be 1-${WATCH_REASON_MAX_LENGTH} characters after trimming`),
+				renderWatchFailure(
+					line.target,
+					`reason must be 1-${WATCH_REASON_MAX_LENGTH} characters after trimming`,
+					runtime.personaSessions.localizationResolver,
+					userText,
+				),
 				deliveredParts.length,
 			);
 			return;
@@ -3611,6 +3635,8 @@ async function createInboundTurnLifecycle(
 				renderWatchFailure(
 					line.target,
 					`${relay.originKey} is already in this handoff chain (${incomingHandoff.chain.join(" -> ")})`,
+					runtime.personaSessions.localizationResolver,
+					userText,
 				),
 				deliveredParts.length,
 			);
@@ -3618,7 +3644,10 @@ async function createInboundTurnLifecycle(
 		}
 		const hop = extendHandoffChain(incomingHandoff?.chain ?? [], relay.originKey, key);
 		if (!hop.ok) {
-			deliverTerminalLine(renderWatchFailure(line.target, hop.reason), deliveredParts.length);
+			deliverTerminalLine(
+				renderWatchFailure(line.target, hop.reason, runtime.personaSessions.localizationResolver, userText),
+				deliveredParts.length,
+			);
 			return;
 		}
 		const registeredAtDate = new Date();
@@ -3663,7 +3692,12 @@ async function createInboundTurnLifecycle(
 			return;
 		}
 		deliverTerminalLine(
-			renderWatchRegistered(line.target, outcome.registration.watch.expires_at),
+			renderWatchRegistered(
+				line.target,
+				outcome.registration.watch.expires_at,
+				runtime.personaSessions.localizationResolver,
+				userText,
+			),
 			deliveredParts.length,
 		);
 	};

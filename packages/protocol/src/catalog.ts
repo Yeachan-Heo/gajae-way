@@ -1467,6 +1467,7 @@ export const EVENTS_V01 = [
 	"chat.progress",
 	"gateway.restart.superseded",
 	"gateway.stopping",
+	"gateway.notice.agent_run",
 	"monitor.event",
 ] as const;
 
