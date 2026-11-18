@@ -1991,17 +1991,15 @@ export class MonitorPropagator {
 		});
 	}
 	/**
-	 * The fresh authoring turn's own response text. The turn-scoped transcript
-	 * read uses the SAME boundary `#readAuthoringResult` uses — the operation's
-	 * reported start, else the earliest fire of the batch's events — so a late
-	 * `[SILENT]` from an async-result wake-up can never become the monitor's
-	 * answer (#809). A port without `fetchAssistantSince` has no turn-scoped
-	 * evidence at all and keeps the pre-#809 `requestResult.assistant` fallback.
-	 * A failed or empty turn-scoped read is an UNREADABLE result, not a license
-	 * for that heuristic: the failure is logged with its sanitized detail, the
-	 * authoring pointer survives, and the retry harvests the operation's own
-	 * `turn.result` (#702 path) — the last-assistant heuristic can never
-	 * silently resurrect a lost answer from whoever spoke last.
+	 * The fresh authoring turn's own response text. The response is read from the
+	 * operation's own `turn.result` via opRef, binding the selection to this
+	 * specific operation (#809). A late `[SILENT]` from an async-result wake-up
+	 * appended to the session's transcript can never become the monitor's answer,
+	 * and a prior event's response can never be mistaken for this operation's.
+	 * A failed or unreadable operation-scoped read is a durable failure that keeps
+	 * the authoring pointer for retry: the failure is logged with its sanitized
+	 * detail, and the retry re-attempts the same read path rather than falling
+	 * back to a heuristic that cannot prove the row belongs to this operation.
 	 */
 	async #responseFromTurn(
 		requestResult: SessionRequestResult,
@@ -2013,28 +2011,33 @@ export class MonitorPropagator {
 			typeof startedAt === "number" && Number.isFinite(startedAt)
 				? startedAt
 				: Math.min(...rows.map((row) => Date.parse(row.fired_at)));
-		if (this.#sessionPort.fetchAssistantSince === undefined) return requestResult.assistant.text;
-		let assistantSince: Awaited<ReturnType<NonNullable<SessionPort["fetchAssistantSince"]>>> | undefined;
 		try {
-			assistantSince = await this.#sessionPort.fetchAssistantSince({
+			const output = await this.#sessionPort.fetchWorkerOutput({
 				sessionId: turn.sessionId,
 				repo: this.#repo,
+				opRef: turn.opRef,
 				notBeforeMs,
-				preferSpoken: true,
+				terminalIdentity: requestResult.status.status,
 			});
+			if (output.status === "proven") return output.text;
+			if (output.status === "absent") {
+				console.error(
+					`monitor response not yet available for turn ${turn.opRef} session=${turn.sessionId}; the authoring op's own result is recovered on retry`,
+				);
+				throw new AuthoringResultUnavailableError(output.code);
+			}
+			// unavailable status
+			console.error(
+				`monitor response unavailable for turn ${turn.opRef} session=${turn.sessionId} (${output.code}); the authoring op's own result is recovered on retry`,
+			);
+			throw new AuthoringResultUnavailableError(output.code);
 		} catch (error) {
+			if (error instanceof AuthoringResultUnavailableError) throw error;
 			console.error(
 				`monitor response read failed for turn ${turn.opRef} session=${turn.sessionId}: ${failureDetail(error)}; the authoring op's own result is recovered on retry`,
 			);
 			throw new AuthoringResultUnavailableError("transport_error");
 		}
-		if (assistantSince === undefined) {
-			console.error(
-				`monitor response read found no assistant row at/after ${notBeforeMs} for turn ${turn.opRef} session=${turn.sessionId}; the authoring op's own result is recovered on retry`,
-			);
-			throw new AuthoringResultUnavailableError("output_pending");
-		}
-		return assistantSince.text;
 	}
 
 	/**

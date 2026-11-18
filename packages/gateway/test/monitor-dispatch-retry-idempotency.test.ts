@@ -179,12 +179,38 @@ test("issue #187: a completed exhausted turn is resumed and its authored result 
 	const originalRequest = state.sessionPort.request.bind(state.sessionPort);
 	state.sessionPort.request = async (input) => {
 		// The stubbed request never registers its op with the scripted port, so
-		// the turn-scoped transcript read would have no row at/after the turn:
-		// pre-#809 that silently fell back to the empty `assistant.text`. Seed
-		// the transcript row the stub claims so the read observes the same empty
-		// answer; appendAssistant journals no send, so the recovery assertions
-		// below still see exactly the original OP_REF send.
+		// the turn-scoped result read would have no operation at/after the turn.
+		// Set up the worker output fixture so the new turn-scoped result read
+		// (via fetchWorkerOutput) observes the same empty answer; appendAssistant
+		// journals no send, so the recovery assertions below still see exactly
+		// the original OP_REF send.
 		state.sessionPort.appendAssistant(input.sessionId, "", Date.now());
+		state.sessionPort.setWorkerOutputFixture(
+			input.opRef,
+			{
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						kind: "prompt",
+						clientRef: input.opRef,
+						status: "terminal_ok",
+						startedAt: Date.now(),
+						terminalAt: Date.now(),
+						outcome: { reason: "end_turn", provenance: "agent" },
+						content: {
+							version: 1,
+							type: "text",
+							text: "",
+							truncated: false,
+							byteLength: 0,
+						},
+						receiptState: "present",
+					},
+				}),
+				stderr: "",
+			},
+		);
 		return {
 			receipt: { sessionId: input.sessionId, operationRef: input.opRef } as never,
 			status: {
