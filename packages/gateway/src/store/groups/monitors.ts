@@ -505,15 +505,16 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		if (this.#db.prepare("SELECT 1 FROM broker_quarantine WHERE kind = 'monitor' AND subject_id = ?").get(eventId))
 			throw new Error("broker authority: quarantined");
 		// A silent author on an already-authored row is a no-op. Only allow re-authoring from non-authored, non-terminal stages.
-		// The stage check is atomic in the WHERE clause to prevent late [SILENT] from replacing an already-authored answer.
+		// The stage check and authored_outputs guard are atomic in the WHERE clause to prevent overwriting an already-authored answer.
 		const changes = this.#db
 			.prepare(
-				`UPDATE monitor_events SET stage = ?, updated_at = ? WHERE event_id = ? AND stage NOT IN ('authored','delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet') AND ${leasePredicate}`,
+				`UPDATE monitor_events SET stage = ?, updated_at = ? WHERE event_id = ? AND stage NOT IN ('authored','delivered','authored_no_delivery','failed_no_retry','skipped','contract_unmet') AND NOT EXISTS (SELECT 1 FROM authored_outputs WHERE event_id = ?) AND ${leasePredicate}`,
 			)
 			.run(
 				tx,
 				noDelivery ? "authored_no_delivery" : "authored",
 				new Date(now).toISOString(),
+				eventId,
 				eventId,
 				...leaseParams,
 			).changes;
@@ -896,7 +897,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		this.#core.assertNotQuarantined("monitor", eventId);
 		this.#db
 			.prepare(
-				"INSERT INTO authored_outputs (event_id, output_text, authored_at) VALUES (?, ?, ?) ON CONFLICT(event_id) DO UPDATE SET output_text = excluded.output_text, authored_at = excluded.authored_at",
+				"INSERT INTO authored_outputs (event_id, output_text, authored_at) VALUES (?, ?, ?) ON CONFLICT(event_id) DO NOTHING",
 			)
 			.run(tx, eventId, outputText, new Date().toISOString());
 	}
