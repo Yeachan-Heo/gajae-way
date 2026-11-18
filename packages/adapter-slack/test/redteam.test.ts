@@ -603,10 +603,7 @@ test("RT-SLACK-19 credential prefixes fail without secrets, relative files resol
 	const loaded = await loadSlackAdapterConfig({ GAJAEWAY_HOME: home });
 	expect(loaded.botTokenFile).toBe(join(home, "bot"));
 	expect(loaded.appTokenFile).toBe(join(home, "app"));
-	for (const [file, good] of [
-		["bot", "xoxb-good"] as const,
-		["app", "xapp-good"] as const,
-	]) {
+	for (const [file, good] of [["bot", "xoxb-good"] as const, ["app", "xapp-good"] as const]) {
 		const secret = "wrong-prefix-sensitive-token";
 		await Bun.write(join(home, file), secret);
 		let error: unknown;
