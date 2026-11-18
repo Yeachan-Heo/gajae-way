@@ -31,6 +31,7 @@ import {
 	envelopeErrorCode,
 	GjcCliError,
 	hasNewCommit,
+	isValidIntegrationRef,
 	type LaneJobRecord,
 	newOpRef,
 	OpRefRejectedError,
@@ -1228,6 +1229,9 @@ export class WorkLaneManager {
 				branch: facts?.branch ?? managedLaneBranchName(input.name),
 				worktreePath,
 				baselineSha: createdWorktree?.baseSha ?? facts?.headSha,
+				// Persist the lane's selected integration branch so reclamation can
+				// prove landing against exactly that remote ref (issue #834 review).
+				...(createdWorktree?.baseBranchRef !== undefined ? { integrationRef: createdWorktree.baseBranchRef } : {}),
 				...(input.repo !== undefined ? { repository: input.repo } : {}),
 				...(repositoryPath !== undefined ? { repositoryPath } : {}),
 			});
@@ -4109,7 +4113,25 @@ type CreatedRepoWorktree = {
 	readonly worktreePath: string;
 	readonly repositoryPath: string;
 	readonly baseSha: string;
+	/** Branch name the base resolved through; absent for SHA or tag bases. */
+	readonly baseBranchRef?: string;
 };
+/**
+ * The branch name a resolved base belongs to: `refs/heads/<ref>` must exist and
+ * point at the same commit the base resolved to. A tag (or any other ref kind)
+ * sharing the name keeps the base unrecorded, so reclamation fails closed
+ * instead of fetching an unrelated tip.
+ */
+async function branchWithSha(repositoryPath: string, baseRef: string): Promise<string | undefined> {
+	const baseSha = (
+		await runGit(["rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`], { cwd: repositoryPath })
+	).stdout.trim();
+	if (!/^[0-9a-f]{40}$/.test(baseSha)) return undefined;
+	const branchSha = (
+		await runGit(["rev-parse", "--verify", "--quiet", `refs/heads/${baseRef}^{commit}`], { cwd: repositoryPath })
+	).stdout.trim();
+	return branchSha === baseSha ? baseRef : undefined;
+}
 
 function isGitRemoteUrl(value: string): boolean {
 	try {
@@ -4456,6 +4478,12 @@ async function createWorktreeFromRepo(
 			});
 		}
 
+		// The integration branch is the ref the base actually resolved through:
+		// a branch name (possibly rewritten from `origin/<branch>`), never a
+		// SHA or tag. The reclaimer re-fetches exactly this remote branch ref,
+		// so only a clean ref name that also resolves as refs/heads/<name> is
+		// recorded; SHA and tag bases stay unrecorded and fail closed later.
+		const baseBranchRef = isValidIntegrationRef(baseRef) ? await branchWithSha(repositoryPath, baseRef) : undefined;
 		const baseResult = await runGit(["rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`], {
 			cwd: repositoryPath,
 			timeoutMs: timeouts.local,
@@ -4484,6 +4512,11 @@ async function createWorktreeFromRepo(
 			worktreePath,
 			repositoryPath,
 			baseSha,
+			// Record the exact ref the base resolved through so reclamation later
+			// fetches the lane's own integration branch instead of guessing. A
+			// SHA or tag base resolves through a raw sha, not a branch, and stays
+			// unrecorded: the reclaimer then fails closed (issue #834 review).
+			...(baseBranchRef !== undefined ? { baseBranchRef } : {}),
 		};
 	} catch (error) {
 		let partialWorktreeCleanupFailed = false;

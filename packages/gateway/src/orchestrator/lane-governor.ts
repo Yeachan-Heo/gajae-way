@@ -543,6 +543,19 @@ export class LaneGovernor {
 						return { reclaimed: true, eligible: true, bytes: 0, dirty: false, unpushed: false };
 					}
 					if (record.state === "attempt_ended") {
+						// Fail cheap and local first: a dirty worktree is retained on
+						// its own evidence, before any remote proof is consulted.
+						const status = await runGit(["status", "--porcelain", "--untracked-files=all"], {
+							cwd: worktreePath,
+						});
+						if (status.exitCode !== 0) {
+							this.#log(`lane_reclaim_skipped name=${name} reason=git_status_failed`, "warn");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+						}
+						if (status.stdout.length > 0) {
+							this.#log(`lane_reclaim_skipped name=${name} reason=dirty`, "warn");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: true, unpushed: false };
+						}
 						const head = await runGit(["rev-parse", "--verify", "HEAD^{commit}"], { cwd: worktreePath });
 						if (head.exitCode !== 0 || !/^[0-9a-f]{40}\s*$/.test(head.stdout)) {
 							this.#log(`lane_reclaim_skipped name=${name} reason=git_head_failed`, "warn");
@@ -560,17 +573,6 @@ export class LaneGovernor {
 								dirty: false,
 								unpushed: merged.reason === "unpushed",
 							};
-						}
-						const status = await runGit(["status", "--porcelain", "--untracked-files=all"], {
-							cwd: worktreePath,
-						});
-						if (status.exitCode !== 0) {
-							this.#log(`lane_reclaim_skipped name=${name} reason=git_status_failed`, "warn");
-							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
-						}
-						if (status.stdout.length > 0) {
-							this.#log(`lane_reclaim_skipped name=${name} reason=dirty`, "warn");
-							return { reclaimed: false, eligible: false, bytes: 0, dirty: true, unpushed: false };
 						}
 					}
 					if (existsSync(worktreePath)) {
@@ -619,7 +621,10 @@ export class LaneGovernor {
 		let filesystemFreeBytes: number | null = null;
 		let filesystemTotalBytes: number | null = null;
 		try {
-			const stats = statfsSync(laneRoot);
+			// Probe the filesystem that holds the worktrees (`lanes`), not the
+			// lane root's parent: the two can be different mounts, and a full
+			// lane mount must never report healthy headroom (issue #834 review).
+			const stats = statfsSync(lanesPath);
 			filesystemFreeBytes = stats.bavail * stats.bsize;
 			filesystemTotalBytes = stats.blocks * stats.bsize;
 		} catch {
@@ -634,7 +639,7 @@ export class LaneGovernor {
 			path: lanesPath,
 			totalBytes: tree?.totalBytes ?? null,
 			reclaimableBytes:
-				tree === undefined
+				tree === undefined || tree.totalBytes === null
 					? null
 					: eligiblePaths.reduce((sum, path) => sum + (tree.worktrees.get(resolve(path)) ?? 0), 0),
 			filesystemFreeBytes,
@@ -689,9 +694,9 @@ export class LaneGovernor {
 	 *
 	 * The lane record stores the base tip the worktree started at
 	 * (`baselineSha`), and `work.start` materializes that base branch locally in
-	 * the managed repository. Branches are immutable pointers here, so the base
-	 * branch is the only one still pointing at that sha; none means the recorded
-	 * base is unknown and the caller falls back to the remote default.
+	 * the managed repository. Branches are immutable pointers here, so at most
+	 * one branch still points at that sha; none or an ambiguous match means the
+	 * recorded base is unknown and the caller fails closed.
 	 */
 	async #recordedBaseBranch(record: LaneJobRecord, repositoryPath: string): Promise<string | undefined> {
 		const { baselineSha } = record;
@@ -711,12 +716,16 @@ export class LaneGovernor {
 	 * Merged signal for reclaiming an expired `attempt_ended` lane (issue #833,
 	 * issuecomment-6960912321/6966669378/6967618377).
 	 *
-	 * The integration base is the lane's recorded base branch when it can be
-	 * recovered from the record (see #recordedBaseBranch), else the remote's
-	 * default branch. Its tip is fetched into a scratch namespace
-	 * (`+<base-ref>:refs/remotes/origin-fresh/HEAD`), so the branch name is
-	 * never hardcoded — gajae-way lands on `dev`, others on `main`) and the lane counts
-	 * as merged only when one of these holds, checked in order:
+	 * The integration base is the lane's OWN recorded integration ref
+	 * (`integrationRef`, persisted by `work.start` from the exact ref the base
+	 * resolved through); for records written before that field existed, the
+	 * branch still pointing at the recorded `baselineSha` is accepted as that
+	 * recorded ref (#recordedBaseBranch — branches are immutable pointers, so
+	 * at most one matches). Its remote tip is fetched from exactly that
+	 * branch ref into a scratch namespace
+	 * (`+refs/heads/<base>:refs/remotes/origin-fresh/HEAD`), never from a
+	 * guessed `origin/HEAD` or first tracking ref, and the lane counts as
+	 * merged only when one of these holds, checked in order:
 	 *
 	 * 1. the lane head is an ancestor of the base tip (regular merge), or
 	 * 2. `git cherry` lists every lane commit `-` against the base (each commit's
@@ -726,8 +735,11 @@ export class LaneGovernor {
 	 *    (a squash of several lane commits).
 	 *
 	 * Anything else — including a clean push to the lane's own remote branch —
-	 * fails closed: the worktree keeps its commits and stays resumable. Every
-	 * git failure also fails closed with a distinct logged reason.
+	 * fails closed: the worktree keeps its commits and stays resumable. A lane
+	 * whose base cannot be identified (SHA/tag base, legacy record) has no
+	 * recorded integration ref and is never validated against an unrelated
+	 * branch: it fails closed with `integration_ref_unrecorded`. Every git
+	 * failure also fails closed with a distinct logged reason.
 	 */
 	async #laneMergedIntoBase(
 		name: string,
@@ -737,39 +749,22 @@ export class LaneGovernor {
 	): Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string }> {
 		const origin = await runGit(["config", "remote.origin.url"], { cwd: repositoryPath });
 		if (origin.exitCode !== 0 || !origin.stdout.trim()) return { ok: false, reason: "remote_url_missing" };
-		// The integration base is the lane's recorded base branch when it can be
-		// recovered from the record (the branch the worktree was created from,
-		// still pointing at its recorded baseline sha). gajae-way's default branch
-		// is `main` while lanes land on `dev`; comparing against the remote
-		// default would only recognize a squash-merged lane after the next
-		// dev->main release. Fall back to the remote's default branch, never a
-		// hardcoded name: prefer the upstream's symbolic HEAD, else `origin/HEAD`
-		// as recorded by the last full clone/fetch. `HEAD` is unresolvable when
-		// the upstream never set a default-branch symbol (a bare `git init`
-		// points `master` at nothing), so only fetch a ref that exists.
-		const recordedBase = await this.#recordedBaseBranch(record, repositoryPath);
-		let fetchRef: string;
-		if (recordedBase !== undefined) {
-			fetchRef = `refs/heads/${recordedBase}`;
-			const resolved = await runGit(["rev-parse", "--verify", "--quiet", `${fetchRef}^{commit}`], {
-				cwd: repositoryPath,
-			});
-			if (resolved.exitCode !== 0) return { ok: false, reason: "base_ref_unresolved" };
-		} else {
-			const baseTip = await runGit(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], { cwd: repositoryPath });
-			const originHead = baseTip.exitCode === 0 ? baseTip.stdout.trim() : "";
-			fetchRef = originHead.startsWith("refs/remotes/origin/") ? originHead.slice("refs/remotes/".length) : "HEAD";
-			// The upstream has no default-branch symbol: fall back to the last branch
-			// this lane repository fetched (`origin/HEAD` is equally absent here).
-			if (fetchRef === "HEAD") {
-				const heads = await runGit(["for-each-ref", "--format=%(refname)", "--count=1", "refs/remotes/origin/"], {
-					cwd: repositoryPath,
-				});
-				const first = heads.stdout.trim();
-				if (heads.exitCode === 0 && first.startsWith("refs/remotes/origin/"))
-					fetchRef = `refs/heads/${first.slice("refs/remotes/origin/".length)}`;
-			}
-		}
+		// The integration ref is the lane's OWN record: what `work.start`
+		// selected (persisted as `integrationRef`), or for legacy records the
+		// unique branch still pointing at the recorded baseline sha. The remote's
+		// default branch is not a substitute: lanes land on `dev` while `main`
+		// stays behind, so only the lane's own ref can prove landing. There is
+		// NO remote-ref fallback: guessing from `origin/HEAD` or the first
+		// tracking ref either stalls eligible lanes forever or "proves" a lane
+		// merged onto an unrelated branch. No recorded ref (SHA/tag base, legacy
+		// record) fails closed with a distinct reason.
+		const recordedBase = record.integrationRef ?? (await this.#recordedBaseBranch(record, repositoryPath));
+		if (recordedBase === undefined) return { ok: false, reason: "integration_ref_unrecorded" };
+		const fetchRef = `refs/heads/${recordedBase}`;
+		const resolved = await runGit(["rev-parse", "--verify", "--quiet", `${fetchRef}^{commit}`], {
+			cwd: repositoryPath,
+		});
+		if (resolved.exitCode !== 0) return { ok: false, reason: "base_ref_unresolved" };
 		// Refresh only that base tip into a scratch namespace; a packed ref survives
 		// this no-op fetch, so the base is always resolved with
 		// `rev-parse --verify --quiet` below, never via ref files on disk.
@@ -1231,9 +1226,21 @@ export class LaneGovernor {
 }
 
 interface LaneTreeBytes {
-	readonly totalBytes: number;
+	readonly totalBytes: number | null;
 	readonly worktrees: ReadonlyMap<string, number>;
 }
+
+/**
+ * The census repeats every maintenance tick, and lane content is
+ * attacker-influenced (a worker can create any regular tree), so the walk is
+ * bounded: a global entry budget, a depth cap, and a wall-clock budget. Any
+ * budget exhaustion marks the WHOLE census unknown (`totalBytes: null`) — a
+ * partial number is never reported as complete. `withFileTypes` dirents never
+ * follow symlinks: a symlinked tree is counted as the link itself, one entry.
+ */
+const CENSUS_MAX_ENTRIES = 20_000;
+const CENSUS_MAX_DEPTH = 32;
+const CENSUS_BUDGET_MS = 2_000;
 
 async function scanLaneTree(path: string): Promise<LaneTreeBytes> {
 	let rootStat: Awaited<ReturnType<typeof lstat>>;
@@ -1244,23 +1251,64 @@ async function scanLaneTree(path: string): Promise<LaneTreeBytes> {
 		throw error;
 	}
 	if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("lane root is not a real directory");
-	let totalBytes = allocatedBytes(rootStat);
+	const deadline = Date.now() + CENSUS_BUDGET_MS;
+	let visited = 0;
+	let exhausted = false;
 	const worktrees = new Map<string, number>();
-	for (const name of await readdir(path)) {
-		const entryPath = join(path, name);
-		const bytes = await pathAllocatedBytes(entryPath);
-		totalBytes += bytes;
-		worktrees.set(resolve(entryPath), bytes);
+	// Iterative stack of pending directories; `owner` is the resolved top-level
+	// entry the directory's contents accumulate on ("" = the census root).
+	type Frame = { readonly dir: string; readonly depth: number; readonly owner: string };
+	let rootBytes = allocatedBytes(rootStat);
+	const stack: Frame[] = [{ dir: path, depth: 0, owner: "" }];
+	const owners = new Map<string, number>([["", 0]]);
+	while (stack.length > 0) {
+		if (visited >= CENSUS_MAX_ENTRIES || Date.now() > deadline) {
+			exhausted = true;
+			break;
+		}
+		const frame = stack.pop()!;
+		const entries = await readdir(frame.dir, { withFileTypes: true }).catch(() => undefined);
+		if (entries === undefined) {
+			exhausted = true;
+			break;
+		}
+		for (const entry of entries) {
+			if (visited >= CENSUS_MAX_ENTRIES || Date.now() > deadline) {
+				exhausted = true;
+				break;
+			}
+			visited++;
+			const entryPath = join(frame.dir, entry.name);
+			let stat: Awaited<ReturnType<typeof lstat>>;
+			try {
+				stat = await lstat(entryPath);
+			} catch (error) {
+				if (isMissingPath(error)) continue;
+				throw error;
+			}
+			const bytes = allocatedBytes(stat);
+			rootBytes += bytes;
+			owners.set(frame.owner, (owners.get(frame.owner) ?? 0) + bytes);
+			if (stat.isDirectory() && !stat.isSymbolicLink()) {
+				if (frame.depth >= CENSUS_MAX_DEPTH) {
+					exhausted = true;
+					break;
+				}
+				// A top-level directory is one managed worktree; everything below
+				// it, the directory's own allocation included, accumulates on it.
+				const owner = frame.owner === "" ? resolve(entryPath) : frame.owner;
+				if (!owners.has(owner)) owners.set(owner, 0);
+				owners.set(owner, (owners.get(owner) ?? 0) + bytes);
+				stack.push({ dir: entryPath, depth: frame.depth + 1, owner });
+			}
+		}
+		if (exhausted) break;
 	}
-	return { totalBytes, worktrees };
-}
-
-async function pathAllocatedBytes(path: string): Promise<number> {
-	const stat = await lstat(path);
-	let total = allocatedBytes(stat);
-	if (!stat.isDirectory() || stat.isSymbolicLink()) return total;
-	for (const name of await readdir(path)) total += await pathAllocatedBytes(join(path, name));
-	return total;
+	if (exhausted) return { totalBytes: null, worktrees: new Map() };
+	for (const [owner, bytes] of owners) {
+		if (owner !== "") worktrees.set(owner, bytes);
+	}
+	return { totalBytes: rootBytes, worktrees };
 }
 
 function allocatedBytes(stat: Awaited<ReturnType<typeof lstat>>): number {

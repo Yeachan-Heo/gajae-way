@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync, statfsSync } from "node:fs";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ProtocolError } from "@gajae-gateway/protocol";
@@ -169,7 +169,7 @@ async function fixture(options: Partial<ConstructorParameters<typeof LaneGoverno
 async function managedWorktree(
 	f: Awaited<ReturnType<typeof fixture>>,
 	name: string,
-	options: { readonly baseBranch?: string } = {},
+	options: { readonly baseBranch?: string; readonly integrationRef?: string } = {},
 ) {
 	const upstream = join(f.directory, `upstream-${name}.git`);
 	const seed = join(f.directory, `seed-${name}`);
@@ -186,6 +186,9 @@ async function managedWorktree(
 	git(["remote", "add", "origin", upstream], seed);
 	if (options.baseBranch !== undefined) git(["branch", options.baseBranch, "refs/heads/main"], seed);
 	git(["push", "-u", "origin", options.baseBranch ?? "main"], seed);
+	// A hosting provider points the bare upstream's HEAD at its default branch;
+	// do the same so the lane repository's bare clone records `origin/HEAD`.
+	git(["symbolic-ref", "HEAD", `refs/heads/${options.baseBranch ?? "main"}`], upstream);
 	git(["clone", "--bare", upstream, repositoryPath]);
 	git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], repositoryPath);
 	git(["config", "user.name", "Lane Reclaimer Test"], repositoryPath);
@@ -194,7 +197,16 @@ async function managedWorktree(
 	const worktreeBase = `refs/remotes/origin/${options.baseBranch ?? "main"}`;
 	git(["worktree", "add", "-b", branch, worktreePath, worktreeBase], repositoryPath);
 	const baselineSha = git(["rev-parse", worktreeBase], repositoryPath).trim();
-	return { upstream, repositoryPath, worktreePath, branch, baselineSha };
+	return {
+		upstream,
+		repositoryPath,
+		worktreePath,
+		branch,
+		baselineSha,
+		// The branch `work.start` would have recorded as the lane's integration
+		// ref; absent for SHA/tag bases.
+		integrationRef: options.baseBranch ?? (options.integrationRef === undefined ? "main" : undefined),
+	};
 }
 
 function persistJob(
@@ -203,10 +215,14 @@ function persistJob(
 	paths: Awaited<ReturnType<typeof managedWorktree>>,
 	state: "done" | "attempt_ended" | "awaiting_operator" | "running",
 	updatedAt: number,
-	options: { readonly baselineSha?: string } = {},
+	options: { readonly baselineSha?: string; readonly integrationRef?: string | false } = {},
 ): LaneJobRecord {
 	const identity = laneJobIdentity(name);
 	const updatedAtIso = new Date(updatedAt).toISOString();
+	// `false` forces a legacy record with no integration ref (SHA/tag base or
+	// pre-#834 record); default records the branch the worktree was created from.
+	const integrationRef =
+		options.integrationRef === false ? undefined : (options.integrationRef ?? paths.integrationRef);
 	let record = createLaneJobRecord({
 		jobId: identity.jobId,
 		branch: paths.branch,
@@ -215,6 +231,7 @@ function persistJob(
 		repositoryPath: paths.repositoryPath,
 		baselineSha: options.baselineSha ?? paths.baselineSha,
 		now: () => new Date(updatedAt),
+		...(integrationRef !== undefined ? { integrationRef } : {}),
 	});
 	if (state === "attempt_ended" || state === "awaiting_operator" || state === "running") {
 		const opRef = newOpRef(`reclaimer-${name}`);
@@ -345,7 +362,9 @@ test("git evidence errors keep an expired attempt_ended worktree", async () => {
 		await rm(join(paths.worktreePath, ".git"));
 		expect(await f.governor.reclaimTerminalWorktrees(NOW)).toBe(0);
 		expect(existsSync(paths.worktreePath)).toBe(true);
-		expect(f.logs).toContain("lane_reclaim_skipped name=ended-git-error reason=git_head_failed");
+		// Dirty-state evidence is checked before remote proof, so removing .git
+		// surfaces as a status failure, not a HEAD failure.
+		expect(f.logs).toContain("lane_reclaim_skipped name=ended-git-error reason=git_status_failed");
 	} finally {
 		await f.close();
 	}
@@ -756,6 +775,217 @@ test("work.start rejects reclaimed lane even inside lock (race with reclamation)
 		await expect(manager.start({ name: "race-reclaimed", text: "work", repo: paths.upstream })).rejects.toMatchObject({
 			detail: { reasonCode: "lane_reclaimed" },
 		});
+	} finally {
+		await f.close();
+	}
+});
+
+test("SHA-base lane with no recorded branch is NOT reclaimed even when origin/HEAD contains its work (issue #834 review, finding 1)", async () => {
+	const f = await fixture();
+	try {
+		const paths = await managedWorktree(f, "sha-base-unrecorded", { integrationRef: undefined });
+		setUpstreamDefaultBranch(paths);
+		await addCommit(paths.worktreePath, "sha-based lane work");
+		await pushHead(paths);
+		// The work IS squash-merged onto origin/HEAD's target, and the lane repo
+		// also carries a first tracking ref — the old fallbacks would accept both.
+		await advanceBaseWithUnrelatedCommit(paths);
+		squashMergeLaneToBase(paths);
+		// Legacy record: a SHA base and no baseline match at all (the base commit
+		// is not any local branch tip), so nothing identifies an integration ref.
+		persistJob(f.database, "sha-base-unrecorded", paths, "attempt_ended", NOW - DAY * 7, {
+			integrationRef: false,
+			baselineSha: "1".repeat(40),
+		});
+		expect(await f.governor.reclaimTerminalWorktrees(NOW)).toBe(0);
+		expect(existsSync(paths.worktreePath)).toBe(true);
+		expect(savedJob(f.database, "sha-base-unrecorded").reclaimedAt).toBeUndefined();
+		expect(f.logs).toContain("lane_reclaim_skipped name=sha-base-unrecorded reason=integration_ref_unrecorded");
+	} finally {
+		await f.close();
+	}
+});
+
+test("SHA-base lane is NOT reclaimed against an unrelated tracking branch (issue #834 review, finding 1)", async () => {
+	const f = await fixture();
+	try {
+		// origin/HEAD points at `main`; an unrelated tracking branch `side` is
+		// the first tracking ref and CONTAINS the lane's squash-merged work, so
+		// the old first-tracking-ref fallback would have "proven" this lane
+		// merged and deleted it. With no recorded integration ref, nothing may.
+		const paths = await managedWorktree(f, "sha-base-unrelated", { integrationRef: undefined });
+		const upstream = upstreamOf(paths);
+		await addCommit(paths.worktreePath, "unrelated-branch lane work");
+		await pushHead(paths);
+		const tempDir = await mkdtemp(join(tmpdir(), "temp-side-branch-"));
+		try {
+			git(["clone", "--quiet", "--shared", upstream, tempDir]);
+			git(["config", "user.name", "Lane Reclaimer Test"], tempDir);
+			git(["config", "user.email", "lane-reclaimer@example.test"], tempDir);
+			git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], tempDir);
+			git(["checkout", "-q", "-B", "side", "origin/main"], tempDir);
+			git(["merge", "--squash", "--quiet", `origin/${paths.branch}`], tempDir);
+			git(["commit", "-m", "squash the lane onto side"], tempDir);
+			git(["push", "--quiet", "origin", "HEAD:refs/heads/side"], tempDir);
+		} finally {
+			await rm(tempDir, { recursive: true, force: true });
+		}
+		git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], paths.repositoryPath);
+		// The unrelated `side` tip contains the lane's squashed patch (same
+		// patch-id as the lane's combined diff), while main does not.
+		const squash = await mkdtemp(join(tmpdir(), "temp-side-verify-"));
+		try {
+			git(["clone", "--quiet", "--shared", upstreamOf(paths), squash]);
+			const laneDiff = Bun.spawnSync(
+				["git", "diff", `refs/remotes/origin/main...refs/remotes/origin/${paths.branch}`],
+				{ cwd: squash, stdout: "pipe" },
+			).stdout.toString();
+			const sideDiff = Bun.spawnSync(["git", "diff", "refs/remotes/origin/main...refs/remotes/origin/side"], {
+				cwd: squash,
+				stdout: "pipe",
+			}).stdout.toString();
+			const patchId = (diff: string): string => {
+				const proc = Bun.spawnSync(["git", "patch-id", "--stable"], {
+					cwd: squash,
+					stdin: new Response(diff).body as ReadableStream,
+					stdout: "pipe",
+				});
+				return proc.stdout.toString();
+			};
+			const laneId = patchId(laneDiff);
+			const sideId = patchId(sideDiff);
+			expect(laneId.split(/\s+/)[0]).toBe(sideId.split(/\s+/)[0]);
+		} finally {
+			await rm(squash, { recursive: true, force: true });
+		}
+		// ...and origin/HEAD still points at main, whose tip does NOT hold it
+		// (the symref a hosting provider records after a default-branch clone).
+		git(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"], paths.repositoryPath);
+		expect(git(["symbolic-ref", "refs/remotes/origin/HEAD"], paths.repositoryPath).trim()).toBe(
+			"refs/remotes/origin/main",
+		);
+		persistJob(f.database, "sha-base-unrelated", paths, "attempt_ended", NOW - DAY * 7, {
+			integrationRef: false,
+			baselineSha: "2".repeat(40),
+		});
+		expect(await f.governor.reclaimTerminalWorktrees(NOW)).toBe(0);
+		expect(existsSync(paths.worktreePath)).toBe(true);
+		expect(f.logs).toContain("lane_reclaim_skipped name=sha-base-unrelated reason=integration_ref_unrecorded");
+	} finally {
+		await f.close();
+	}
+});
+
+test("branch-recorded lane squash-merged onto its RECORDED branch is reclaimed while origin/HEAD differs (issue #834 review, finding 1)", async () => {
+	const f = await fixture();
+	try {
+		// Lane created from `dev`; origin/HEAD points at `main`, which never
+		// receives the lane's work. The lane record carries its own
+		// `integrationRef: dev`, and reclaim proof must fetch exactly that ref.
+		const paths = await managedWorktree(f, "recorded-dev", { baseBranch: "dev" });
+		const upstream = upstreamOf(paths);
+		git(["branch", "main", "refs/heads/dev"], upstream);
+		git(["symbolic-ref", "HEAD", "refs/heads/main"], upstream);
+		git(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"], paths.repositoryPath);
+		await addCommit(paths.worktreePath, "recorded-dev lane work");
+		await pushHead(paths);
+		await advanceBaseWithUnrelatedCommit(paths, "dev");
+		squashMergeLaneToBase(paths, "dev");
+		git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], paths.repositoryPath);
+		// main (the remote default) never advanced past the fork point.
+		expect(git(["rev-parse", "refs/remotes/origin/main"], paths.repositoryPath).trim()).toBe(paths.baselineSha);
+		persistJob(f.database, "recorded-dev", paths, "attempt_ended", NOW - DAY * 7, {
+			integrationRef: "dev",
+		});
+		expect(await f.governor.reclaimTerminalWorktrees(NOW)).toBe(1);
+		expect(existsSync(paths.worktreePath)).toBe(false);
+		expect(savedJob(f.database, "recorded-dev").reclaimedAt).toBeDefined();
+	} finally {
+		await f.close();
+	}
+});
+
+test("branch-recorded lane whose work only landed on origin/HEAD is NOT reclaimed against its recorded branch (issue #834 review, finding 1)", async () => {
+	const f = await fixture();
+	try {
+		// The lane's recorded integration branch is `dev`; the work landed on
+		// `main` (origin/HEAD) only. The recorded ref must be checked, not the
+		// remote default, so the lane stays.
+		const paths = await managedWorktree(f, "recorded-vs-head", { baseBranch: "dev" });
+		const upstream = upstreamOf(paths);
+		git(["branch", "main", "refs/heads/dev"], upstream);
+		git(["symbolic-ref", "HEAD", "refs/heads/main"], upstream);
+		git(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"], paths.repositoryPath);
+		await addCommit(paths.worktreePath, "landed-on-main-only work");
+		await pushHead(paths);
+		// Squash-merge onto `main` (origin/HEAD), leaving `dev` untouched.
+		squashMergeLaneToBase(paths, "main");
+		git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], paths.repositoryPath);
+		persistJob(f.database, "recorded-vs-head", paths, "attempt_ended", NOW - DAY * 7, {
+			integrationRef: "dev",
+		});
+		expect(await f.governor.reclaimTerminalWorktrees(NOW)).toBe(0);
+		expect(existsSync(paths.worktreePath)).toBe(true);
+		expect(f.logs).toContain("lane_reclaim_skipped name=recorded-vs-head reason=work_not_merged_into_base");
+	} finally {
+		await f.close();
+	}
+});
+
+test("census over the entry budget reports unknown instead of a partial number (issue #834 review, finding 2)", async () => {
+	const f = await fixture();
+	try {
+		const paths = await managedWorktree(f, "census-budget");
+		// A high-fanout tree inside the lane worktree blows the entry budget.
+		const fanDir = join(paths.worktreePath, "fan");
+		await mkdir(join(fanDir, "keep"), { recursive: true });
+		for (let i = 0; i < 25_000; i++) await writeFile(join(fanDir, `f${i}`), "x");
+		persistJob(f.database, "census-budget", paths, "done", NOW - DAY - 1);
+		await f.governor.reclaimTerminalWorktrees(NOW);
+		const snapshot = f.governor.laneDiskSnapshot;
+		expect(snapshot?.totalBytes).toBeNull();
+		expect(snapshot?.reclaimableBytes).toBeNull();
+	} finally {
+		await f.close();
+	}
+});
+
+test("census does not follow symlinks and counts the link itself (issue #834 review, finding 2)", async () => {
+	const f = await fixture();
+	try {
+		const paths = await managedWorktree(f, "census-symlink");
+		const outside = join(f.directory, "outside-target");
+		await mkdir(outside);
+		// 1 MiB regular file OUTSIDE the lane tree, reachable only via a symlink
+		// inside the worktree. Following it would add ~1 MiB to the census.
+		await writeFile(join(outside, "big.bin"), "0".repeat(1024 * 1024));
+		await mkdir(join(paths.worktreePath, "linked"), { recursive: true });
+		await symlink(join(outside, "big.bin"), join(paths.worktreePath, "linked", "escape.bin"));
+		persistJob(f.database, "census-symlink", paths, "done", NOW - DAY - 1);
+		await f.governor.reclaimTerminalWorktrees(NOW);
+		const snapshot = f.governor.laneDiskSnapshot;
+		expect(snapshot?.totalBytes).toBeNumber();
+		// The whole managed tree (seed worktree) is far below 1 MiB; a followed
+		// symlink would push the total over it.
+		expect(snapshot?.totalBytes ?? Number.MAX_SAFE_INTEGER).toBeLessThan(1024 * 1024);
+	} finally {
+		await f.close();
+	}
+});
+
+test("capacity is probed on the lanes path, not its parent (issue #834 review, finding 3)", async () => {
+	const f = await fixture({ lowDiskFreeBytes: Number.MAX_SAFE_INTEGER });
+	try {
+		const paths = await managedWorktree(f, "fs-probe");
+		persistJob(f.database, "fs-probe", paths, "done", NOW - DAY - 1);
+		await f.governor.reclaimTerminalWorktrees(NOW);
+		// The probe path equals the snapshot's lanes path; the numbers must be
+		// the filesystem that holds the worktrees.
+		const snapshot = f.governor.laneDiskSnapshot;
+		expect(snapshot?.path).toBe(join(f.laneRoot, "lanes"));
+		const stats = statfsSync(join(f.laneRoot, "lanes"));
+		expect(snapshot?.filesystemTotalBytes).toBe(stats.blocks * stats.bsize);
+		expect(snapshot?.filesystemFreeBytes).toBe(stats.bavail * stats.bsize);
 	} finally {
 		await f.close();
 	}
