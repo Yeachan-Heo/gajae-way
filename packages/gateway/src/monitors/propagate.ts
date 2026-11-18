@@ -717,23 +717,32 @@ export class MonitorPropagator {
 				if (this.#closing) break;
 				if ((TERMINAL_STAGES as readonly string[]).includes(row.stage)) continue;
 				const output = this.#database.monitors.authoredOutput(row.event_id);
-				const hasMemory = this.#database.memory.coversEvent(row.event_id);
+				// A row that already holds persisted output is NEVER re-authored: the
+				// stored answer is authoritative and immutable (snowykr on #842).
+				// Route it through the same stored-answer repair as every reconcile
+				// path, so a stage regression (authored -> failed via eventFencedFail,
+				// then a reclaim) cannot strand the note at `failed` while a fresh
+				// dispatch answers [SILENT] over it. #author repairs the stage to
+				// `authored` (or `authored_no_delivery` for a silent stored note),
+				// restores the memory intent from the STORED answer, and re-enqueues
+				// it for delivery — no fresh authoring turn is sent. Lease-guarded: a
+				// row whose dispatch lease another attempt holds is left alone, so a
+				// live authoring turn still completes and fences on its own lease.
+				if (output) {
+					if (this.#database.monitors.eventLiveLeaseOwner(row.event_id, this.#now())) continue;
+					this.#author(row.event_id, output, row.stage === "authored_no_delivery" || isSilentOutput(output), row);
+					continue;
+				}
 				// A silent note is never delivered, so `authored` would wait forever for a
 				// confirmation that cannot come (#94): settle it as authored_no_delivery.
-				if (output && !hasMemory && row.stage !== "authored")
-					this.#author(row.event_id, output, row.stage === "authored_no_delivery" || isSilentOutput(output), row);
-				else if (output && !hasMemory && row.stage === "authored" && !isSilentOutput(output))
-					// Idempotent re-authoring for memory repair: already-authored non-silent events
-					this.#author(row.event_id, output, false, row);
-				else if (output && row.stage === "authored" && isSilentOutput(output)) {
-					if (!hasMemory)
-						// Repair or ensure the intent from the stored output before terminalization
-						this.#author(row.event_id, output, true, row);
-					// Transition row to authored_no_delivery
+				// The stored output is gone but the memory intent may still name a
+				// silent reply (a pre-#842 row whose authored_outputs was swept):
+				// terminalize those the same way instead of authored-forever.
+				if (row.stage === "authored" && this.#sweptIntentWasSilent(row.event_id))
 					this.#database.transaction((tx) =>
 						this.#database.monitors.eventUpdate(tx, row.event_id, "authored_no_delivery"),
 					);
-				} else if (!output && this.#recoverable(row)) {
+				if (this.#recoverable(row)) {
 					// Red-team blocker 1: a live dispatch lease owned by ANOTHER attempt
 					// means the authoring turn may still complete elsewhere; a new
 					// process must not re-author concurrently. Only unclaimed events
@@ -2825,11 +2834,20 @@ export class MonitorPropagator {
 						}),
 					});
 				if (reportable && monitor) this.#enqueueMonitorReport(tx, monitor, eventRow, note);
-			} else if (!this.#database.memory.get(intentId)) {
-				// Row update failed (authorFenced returned false): for memory repair, create missing intent
-				// with STORED output only, never enqueue a report or notify.
+			} else {
+				// Row update failed (authorFenced returned false): persisted output
+				// already exists and is immutable (snowykr on #842). The STORED
+				// answer is authoritative — never the fresh note. Restore a missing
+				// memory intent from the stored answer, re-enqueue the STORED answer
+				// for its reportTo delivery (the report message id is deterministic,
+				// so a duplicate enqueue is a no-op), and repair the stage
+				// regression: a failed/dispatched row that already holds output
+				// returns to `authored` (or `authored_no_delivery` when the stored
+				// note is a silence token).
 				const storedOutput = this.#database.monitors.authoredOutput(eventId);
-				if (storedOutput)
+				if (!storedOutput) return false;
+				const silentStored = isSilentOutput(storedOutput);
+				if (!this.#database.memory.get(intentId))
 					this.#database.memory.createIntent(tx, {
 						id: intentId,
 						kind: "monitor-event",
@@ -2841,16 +2859,69 @@ export class MonitorPropagator {
 							replyText: storedOutput,
 						}),
 					});
+				const stageBefore = this.#database.monitors.eventGet(eventId)?.stage;
+				if (
+					reportable &&
+					monitor &&
+					!silentStored &&
+					(stageBefore === "failed" || stageBefore === "dispatched" || stageBefore === "batched")
+				)
+					this.#enqueueMonitorReport(tx, monitor, eventRow, storedOutput);
+
+				const stageAfterIntent = this.#database.monitors.eventGet(eventId)?.stage;
+				if (
+					stageAfterIntent === "admitted" ||
+					stageAfterIntent === "batched" ||
+					stageAfterIntent === "dispatched" ||
+					stageAfterIntent === "failed" ||
+					(stageAfterIntent === "authored" && silentStored)
+				)
+					this.#database.monitors.eventUpdate(tx, eventId, silentStored ? "authored_no_delivery" : "authored");
 			}
 			return updated;
 		});
 		// Wake the closure queue for the intent (always, even if row update failed).
 		this.#memory.enqueueExistingId(intentId);
+		// A refused row update re-enqueued its STORED answer above; wake its
+		// reportTo conversation so the recovered note is actually delivered.
+		if (
+			!result &&
+			reportable &&
+			monitor?.reportTo &&
+			this.#database.inbox.messageExists(`${MONITOR_REPORT_MESSAGE_ID_PREFIX}${eventId}`)
+		)
+			this.#notifyMonitorReport(monitor.reportTo);
 		// Only notify if the row was successfully updated and is reportable.
 		if (result && reportable && monitor?.reportTo) this.#notifyMonitorReport(monitor.reportTo);
 		// Only emit stage if the row was actually updated.
 		if (result) this.#emitStage(eventRow, noDelivery ? "authored_no_delivery" : "authored");
 	}
+	/**
+	 * True when a row's persisted authored_outputs is gone but its memory intent
+	 * still records a silent reply: the pre-#842 shape of an event authored
+	 * [SILENT] whose output row was swept. Such a row stranded at `authored`
+	 * waits forever for a delivery confirmation that cannot come (#94), so
+	 * reconcile terminalizes it as authored_no_delivery instead.
+	 */
+	#sweptIntentWasSilent(eventId: string): boolean {
+		const intent = this.#database.memory.get(`monitor-event-intent:${eventId}`);
+		if (!intent) return false;
+		try {
+			const parsed: unknown = JSON.parse(intent.payload_json);
+			// A well-formed intent carries the reply in `replyText`. A legacy
+			// intent whose payload is a bare string predates the structured
+			// payload: `coversEvent` matches it by substring, so its content
+			// proves nothing about the note. The only bare payload that counts as
+			// a silent note is the literal silence token itself.
+			const replyText = (parsed as { replyText?: unknown } | null)?.replyText;
+			if (typeof replyText === "string") return isSilentOutput(replyText);
+			return typeof parsed === "string" && isSilentOutput(parsed);
+		} catch {
+			// A non-JSON payload says nothing about the note; never invent silence.
+			return false;
+		}
+	}
+
 	#recordReadinessSuccess(originKey: string): void {
 		try {
 			this.#onReadinessSuccess?.({ originKey, at: this.#now() });
