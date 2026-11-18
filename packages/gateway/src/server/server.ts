@@ -3488,16 +3488,6 @@ async function createInboundTurnLifecycle(
 				}),
 		at: row.received_at,
 	});
-	const getLastHumanMessage = (): string | undefined => {
-		const recent = recentConversation(
-			options.database,
-			key,
-			origin.conversationId,
-			1,
-			new Date(Date.now() - RECENT_HISTORY_WINDOW_MS).toISOString(),
-		);
-		return recent.length > 0 ? recent[recent.length - 1].body : undefined;
-	};
 	const handOff = async (handoff: HandoffReply) => {
 		const relay = planRelay(handoff.target);
 		if (!relay.ok) {

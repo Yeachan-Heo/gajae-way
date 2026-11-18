@@ -1,13 +1,13 @@
 import { test } from "bun:test";
 import { strict as assert } from "node:assert";
-import { detectLanguage, EN_CATALOG, KO_CATALOG, LocalizationResolver } from "../src/server/localization";
 import {
-	renderWatchRegistered,
-	renderWatchFailure,
-	renderWakeFailure,
-	renderHandoffPointer,
 	renderHandoffFailure,
+	renderHandoffPointer,
+	renderWakeFailure,
+	renderWatchFailure,
+	renderWatchRegistered,
 } from "../src/server/handoff";
+import { detectLanguage, EN_CATALOG, KO_CATALOG, LocalizationResolver } from "../src/server/localization";
 
 test("detectLanguage detects Korean with Hangul characters", () => {
 	// Korean text with significant Hangul ratio
