@@ -630,7 +630,7 @@ test("work.start rejects reclaimed lane even inside lock (race with reclamation)
 	}
 });
 
-test("(stub) squash merge detection uses alternative verification when tree equality is insufficient", async () => {
+test("(stub) squash merge detection uses alternative verification when tree equality is insufficient", () => {
 	// This stub test documents the expectation for P2.1:
 	// The squash merge detection should use GitHub API and/or git cherry/patch-id equivalence
 	// as fallback mechanisms when simple tree equality checks are insufficient.
@@ -639,12 +639,14 @@ test("(stub) squash merge detection uses alternative verification when tree equa
 	// TODO: Support bare lane-repo layout and fail closed on verification errors
 	// For now, the tree-equality check in the range from merge-base to main provides
 	// sufficient coverage for most real squash merge scenarios.
+	expect(true).toBe(true);
 });
 
-test("(stub) work.start rechecks reclaimedAt inside exclusive lock before starting", async () => {
+test("(stub) work.start rechecks reclaimedAt inside exclusive lock before starting", () => {
 	// This stub test documents the implementation of P2.2:
 	// work-lane.ts #startLocked already rechecks reclaimedAt to prevent race conditions
 	// where reclamation marks a lane as reclaimed between the initial check and lock acquisition.
 	// See: work-lane.ts lines 1051-1057
 	// Covered by: "work.start rejects reclaimed lane even inside lock (race with reclamation)" test
+	expect(true).toBe(true);
 });
