@@ -500,6 +500,27 @@ export class ModelNotSelectedError extends Error {
 }
 
 /**
+ * A fixed-text assertion failure from the session-port send-step invariant checks.
+ * These errors indicate contract violations in the SDK's control responses where
+ * expected fields are malformed or missing. All messages are fixed text with no
+ * interpolated user or session data; the closed message type keeps it that way,
+ * because monitor failure details record this class's message verbatim.
+ */
+export type SessionContractMessage =
+	| "model.profile.set succeeded without a changed receipt"
+	| "model.set succeeded without a changed receipt"
+	| "thinking.set succeeded without a changed receipt"
+	| "service_tier.set succeeded without a changed receipt"
+	| "session request completed without a result";
+
+export class SessionContractError extends Error {
+	constructor(message: SessionContractMessage) {
+		super(message);
+		this.name = "SessionContractError";
+	}
+}
+
+/**
  * The pre-send busy wait saw the host report `busy` with no progress evidence
  * (activity stamp and transcript size/mtime unchanged) for `silentMs`. The
  * busy refusal is already durable, so the prompt was provably never accepted.
@@ -1721,7 +1742,8 @@ export class BrokerSessionPort implements SessionPort {
 					"model.profile.set",
 				);
 				const changed = typeof activation === "boolean" ? activation : activation?.changed;
-				if (typeof changed !== "boolean") throw new Error("model.profile.set succeeded without a changed receipt");
+				if (typeof changed !== "boolean")
+					throw new SessionContractError("model.profile.set succeeded without a changed receipt");
 				return { changed };
 			});
 		}
@@ -1734,7 +1756,8 @@ export class BrokerSessionPort implements SessionPort {
 				await sdk("control", "model.set", { id: model }),
 				"model.set",
 			);
-			if (typeof result?.changed !== "boolean") throw new Error("model.set succeeded without a changed receipt");
+			if (typeof result?.changed !== "boolean")
+				throw new SessionContractError("model.set succeeded without a changed receipt");
 			const thinkingChanged = thinking ? await this.#setThinking(sdk, thinking) : false;
 			return { changed: result.changed || thinkingChanged };
 		});
@@ -1745,7 +1768,8 @@ export class BrokerSessionPort implements SessionPort {
 			await sdk("control", "thinking.set", { level }),
 			"thinking.set",
 		);
-		if (typeof applied?.changed !== "boolean") throw new Error("thinking.set succeeded without a changed receipt");
+		if (typeof applied?.changed !== "boolean")
+			throw new SessionContractError("thinking.set succeeded without a changed receipt");
 		return applied.changed;
 	}
 
@@ -1761,7 +1785,8 @@ export class BrokerSessionPort implements SessionPort {
 				await sdk("control", "service_tier.set", { tier: input.tier }),
 				"service_tier.set",
 			);
-			if (typeof result?.changed !== "boolean") throw new Error("service_tier.set succeeded without a changed receipt");
+			if (typeof result?.changed !== "boolean")
+				throw new SessionContractError("service_tier.set succeeded without a changed receipt");
 			return { changed: result.changed };
 		});
 	}
@@ -2291,7 +2316,7 @@ export class BrokerSessionPort implements SessionPort {
 		}
 		if (requestFailed) throw requestError;
 		if (cleanupFailed) throw markSessionRequestStep(cleanupError, "close");
-		if (result === undefined) throw new Error("session request completed without a result");
+		if (result === undefined) throw new SessionContractError("session request completed without a result");
 		return result;
 	}
 

@@ -1785,6 +1785,196 @@ test("Slack retains a failed image job's slot until its sibling download settles
 	}
 });
 
+test("Slack recovery advances past a live-delivered image without downloading it again", async () => {
+	let downloads = 0;
+	const f = await fixture(
+		{ C1: { engagement: "open" } },
+		{
+			autoRecover: false,
+			imageFetch: async () => {
+				downloads++;
+				return downloads === 1 ? new Response(ONE_PIXEL_PNG) : new Response("expired", { status: 404 });
+			},
+		},
+	);
+	const message = inbound({
+		ts: "1700000040.000001",
+		files: [{ name: "photo.png", mimetype: "image/png", url_private: "https://files.slack.com/photo.png" }],
+	});
+	try {
+		await f.event({ ...message });
+		f.api.history.C1 = [{ ...message }];
+		expect(await f.recoverMissedMessages()).toBe(true);
+		expect(downloads).toBe(1);
+		expect(chatSends(f.client)).toHaveLength(1);
+		const cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.recoveredThrough.C1).toBe(message.ts);
+		expect(cursors.deadLetters).toHaveLength(0);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("Slack recovery skips acknowledged images when a budget-limited pass is retried", async () => {
+	let clock = 0;
+	const monotonic = spyOn(performance, "now").mockImplementation(() => clock);
+	let downloads = 0;
+	const f = await fixture(
+		{ C1: { engagement: "open" } },
+		{
+			autoRecover: false,
+			imageFetch: async () => {
+				downloads++;
+				return new Response(ONE_PIXEL_PNG);
+			},
+		},
+	);
+	try {
+		f.client.engaged = false;
+		f.api.history.C1 = Array.from({ length: 9 }, (_, index) => ({
+			...inbound({ ts: `17000000${String(40 + index)}.000001` }),
+			files: [{ name: "photo.png", mimetype: "image/png", url_private: "https://files.slack.com/photo.png" }],
+		})).reverse();
+		expect(await f.recoverMissedMessages()).toBe(false);
+		expect(downloads).toBe(8);
+		expect((await loadRecoveryCursors(f.recoveryCursorPath)).recoveredThrough.C1).toBeUndefined();
+		expect(await f.recoverMissedMessages()).toBe(false);
+		expect(downloads).toBe(8);
+		clock = 60_001;
+		expect(await f.recoverMissedMessages()).toBe(true);
+		expect(downloads).toBe(9);
+		expect(chatSends(f.client)).toHaveLength(9);
+		expect((await loadRecoveryCursors(f.recoveryCursorPath)).recoveredThrough.C1).toBe("1700000048.000001");
+	} finally {
+		f.socket.stop();
+		monotonic.mockRestore();
+	}
+});
+
+test.each([true, false])("Slack recovery joins live image preparation, success=%s", async (succeeds) => {
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let started!: () => void;
+	const downloading = new Promise<void>((resolve) => {
+		started = resolve;
+	});
+	let downloads = 0;
+	const f = await fixture(
+		{ C1: { engagement: "open" } },
+		{
+			autoRecover: false,
+			imageFetch: async () => {
+				downloads++;
+				started();
+				await held;
+				return succeeds || downloads > 1 ? new Response(ONE_PIXEL_PNG) : new Response("unavailable", { status: 503 });
+			},
+		},
+	);
+	const message = inbound({
+		ts: "1700000040.000001",
+		files: [{ name: "photo.png", mimetype: "image/png", url_private: "https://files.slack.com/photo.png" }],
+	});
+	try {
+		await f.handleEvent({ ...message });
+		await downloading;
+		let joined!: () => void;
+		const joining = new Promise<void>((resolve) => {
+			joined = resolve;
+		});
+		const requestPrepared = f.gateway.requestPrepared.bind(f.gateway);
+		spyOn(f.gateway, "requestPrepared").mockImplementation((...args) => {
+			const result = requestPrepared(...args);
+			joined();
+			return result;
+		});
+		f.api.history.C1 = [{ ...message }];
+		const recovery = f.recoverMissedMessages();
+		await joining;
+		expect(downloads).toBe(1);
+		expect(chatSends(f.client)).toHaveLength(0);
+		expect((await loadRecoveryCursors(f.recoveryCursorPath)).recoveredThrough.C1).toBeUndefined();
+		release();
+		expect(await recovery).toBe(succeeds);
+		await f.ingress.drain();
+		if (!succeeds) {
+			expect((await loadRecoveryCursors(f.recoveryCursorPath)).recoveredThrough.C1).toBeUndefined();
+			expect(await f.recoverMissedMessages()).toBe(true);
+		}
+		expect(downloads).toBe(succeeds ? 1 : 2);
+		expect(chatSends(f.client)).toHaveLength(1);
+		expect((await loadRecoveryCursors(f.recoveryCursorPath)).recoveredThrough.C1).toBe(message.ts);
+	} finally {
+		release();
+		await f.ingress.drain();
+		f.socket.stop();
+	}
+});
+
+test.each([404, 503])("Slack live image survives recovery's failed snapshot, status=%s", async (status) => {
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let started!: () => void;
+	const downloading = new Promise<void>((resolve) => {
+		started = resolve;
+	});
+	const urls: string[] = [];
+	const f = await fixture(
+		{ C1: { engagement: "open" } },
+		{
+			autoRecover: false,
+			imageFetch: async (input) => {
+				urls.push(String(input));
+				if (String(input).endsWith("/old.png")) {
+					started();
+					await held;
+					return new Response("unavailable", { status });
+				}
+				return new Response(ONE_PIXEL_PNG);
+			},
+		},
+	);
+	const image = { name: "photo.png", mimetype: "image/png" };
+	const message = inbound({
+		ts: "1700000040.000001",
+		files: [{ ...image, url_private: "https://files.slack.com/old.png" }],
+	});
+	try {
+		f.api.history.C1 = [{ ...message }];
+		const recovery = f.recoverMissedMessages();
+		await downloading;
+		let joined!: () => void;
+		const joining = new Promise<void>((resolve) => {
+			joined = resolve;
+		});
+		const requestPrepared = f.gateway.requestPrepared.bind(f.gateway);
+		spyOn(f.gateway, "requestPrepared").mockImplementation((...args) => {
+			const result = requestPrepared(...args);
+			joined();
+			return result;
+		});
+		await f.handleEvent({ ...message, files: [{ ...image, url_private: "https://files.slack.com/new.png" }] });
+		await joining;
+		release();
+		expect(await recovery).toBe(false);
+		await f.ingress.drain();
+		expect(urls).toEqual(["https://files.slack.com/old.png", "https://files.slack.com/new.png"]);
+		expect(chatSends(f.client)).toHaveLength(1);
+		expect(await f.recoverMissedMessages()).toBe(true);
+		const cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.recoveredThrough.C1).toBe(message.ts);
+		expect(cursors.deadLetters).toHaveLength(0);
+	} finally {
+		release();
+		await f.ingress.drain();
+		f.socket.stop();
+	}
+});
+
 test("Slack recovery bounds terminal image failures before discarding", async () => {
 	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false });
 	try {
