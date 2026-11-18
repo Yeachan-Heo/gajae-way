@@ -94,6 +94,25 @@ async function squashMergeLaneToBase(
 	git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], paths.repositoryPath);
 }
 
+/** Cherry-pick each lane commit onto the base one-by-one (rebase merge) and delete the remote lane branch. */
+async function rebaseMergeLaneToBase(paths: Awaited<ReturnType<typeof managedWorktree>>): Promise<void> {
+	const upstream = upstreamOf(paths);
+	const tempDir = await mkdtemp(join(tmpdir(), "temp-rebase-merge-"));
+	try {
+		git(["clone", "--quiet", "--shared", upstream, tempDir]);
+		git(["config", "user.name", "Lane Reclaimer Test"], tempDir);
+		git(["config", "user.email", "lane-reclaimer@example.test"], tempDir);
+		git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], tempDir);
+		git(["checkout", "-q", "-B", "rebase-merge", "origin/main"], tempDir);
+		git(["cherry-pick", `origin/main...origin/${paths.branch}`, "--right-only"], tempDir);
+		git(["push", "--quiet", "origin", "HEAD:refs/heads/main"], tempDir);
+	} finally {
+		await rm(tempDir, { recursive: true, force: true });
+	}
+	gitAllow(["push", "origin", "--delete", paths.branch], paths.worktreePath);
+	git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], paths.repositoryPath);
+}
+
 /** Fire-and-report git call for fixtures that intentionally drive git into a failure state. */
 function gitAllow(args: readonly string[], cwd?: string): { exitCode: number; stdout: string; stderr: string } {
 	const result = Bun.spawnSync(["git", ...args], {
@@ -543,6 +562,24 @@ test("squash-merged lane is reclaimed against a base that moved on (issue #833)"
 		expect(existsSync(paths.worktreePath)).toBe(false);
 		const job = savedJob(f.database, "true-squash-merged");
 		expect(job).toMatchObject({ state: "attempt_ended", reclaimedAt: expect.any(String) });
+	} finally {
+		await f.close();
+	}
+});
+
+test("two-commit lane rebase-merged onto a moved base is reclaimed via git cherry (issue #834)", async () => {
+	const f = await fixture();
+	try {
+		const paths = await managedWorktree(f, "rebase-merged");
+		setUpstreamDefaultBranch(paths);
+		await addCommit(paths.worktreePath, "rebase first");
+		await addCommit(paths.worktreePath, "rebase second");
+		await pushHead(paths);
+		await advanceBaseWithUnrelatedCommit(paths);
+		await rebaseMergeLaneToBase(paths);
+		persistJob(f.database, "rebase-merged", paths, "attempt_ended", NOW - DAY * 7);
+		expect(await f.governor.reclaimTerminalWorktrees(NOW)).toBe(1);
+		expect(existsSync(paths.worktreePath)).toBe(false);
 	} finally {
 		await f.close();
 	}
