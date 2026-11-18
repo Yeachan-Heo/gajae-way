@@ -64,7 +64,7 @@ async function writeReceipt(home: string, value: unknown): Promise<void> {
 describe("durable SLO evidence", () => {
 	test("evaluates only fully elapsed UTC days and fails closed on missing or partial coverage", async () => {
 		const { store } = await fixture();
-		const oct7 = Date.UTC(2026, 9, 7);
+		const _oct7 = Date.UTC(2026, 9, 7);
 		const oct8 = Date.UTC(2026, 9, 8);
 		const oct9 = Date.UTC(2026, 9, 9);
 		setAlive(store, "2026-10-08", [[oct8, oct8 + DAY_MS]]);

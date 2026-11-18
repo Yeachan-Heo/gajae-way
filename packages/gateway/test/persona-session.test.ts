@@ -126,7 +126,7 @@ async function harness(
 		modelRefusal?: (input: PersonaFailureInput) => void;
 		effectiveModel?: string;
 		imagesFor?: (triggerMessageId: string) => readonly PromptImage[] | undefined;
-		onFrame?: (frame: TailFrame) => boolean | void;
+		onFrame?: (frame: TailFrame) => boolean;
 		contextMessageIds?: readonly string[];
 	} = {},
 	log?: (line: string) => void,

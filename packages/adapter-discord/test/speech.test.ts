@@ -226,8 +226,8 @@ test("the cap never leaves a lone surrogate", () => {
 
 test("markup-heavy input does not backtrack pathologically", () => {
 	const start = Date.now();
-	speakable("*".repeat(5_000) + "끝");
-	speakable("```" + "a".repeat(20_000));
+	speakable(`${"*".repeat(5_000)}끝`);
+	speakable(`\`\`\`${"a".repeat(20_000)}`);
 	expect(Date.now() - start).toBeLessThan(1_000);
 });
 

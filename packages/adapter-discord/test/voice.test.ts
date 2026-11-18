@@ -119,7 +119,8 @@ test("a voice message is fetched and transcribed", async () => {
 	});
 	expect(calls[0]?.url).toBe(URL);
 	expect(calls[1]?.url).toBe("https://api.elevenlabs.io/v1/speech-to-text");
-	expect((calls[1]?.init?.headers as Record<string, string>)["xi-api-key"]).toBe("test-key");
+	const headers = calls[1]?.init?.headers as Record<string, string> | undefined;
+	expect(headers?.["xi-api-key"]).toBe("test-key");
 });
 
 test("no language is pinned by default, because auto-detection handles mixed-language servers", async () => {
@@ -133,7 +134,8 @@ test("no language is pinned by default, because auto-detection handles mixed-lan
 test("a pinned language is forwarded when the operator asked for one", async () => {
 	const { fetch, calls } = stubFetch([audio(), Response.json({ text: "ok" })]);
 	await transcribeVoiceMessage(URL, { ...KEY, languageCode: "ko" }, { fetch });
-	expect((calls[1]?.init?.body as FormData).get("language_code")).toBe("ko");
+	const body = calls[1]?.init?.body as FormData | undefined;
+	expect(body?.get("language_code")).toBe("ko");
 });
 
 test("a failed attachment download fails open instead of losing the message", async () => {

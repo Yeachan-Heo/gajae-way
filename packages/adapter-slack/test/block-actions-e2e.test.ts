@@ -6,7 +6,9 @@ import { approvalPanelBlocks, askUserPanelBlocks } from "../src/panels";
 function click(message: ChatMessagePayload, approval = false): SlackBlockAction {
 	const blocks = approval ? approvalPanelBlocks(message) : askUserPanelBlocks(message);
 	const actions = blocks.find((block) => block.type === "actions");
-	const button = (actions?.elements as Array<{ action_id: string; value: string }>)[0];
+	const elements = actions?.elements as Array<{ action_id: string; value: string }> | undefined;
+	const button = elements?.[0];
+	if (!button) throw new Error("No button found in actions block");
 	return {
 		type: "block_actions",
 		actions: [{ type: "button", action_id: button.action_id, value: button.value }],
@@ -90,6 +92,6 @@ test("malformed rendered action metadata is rejected instead of guessing origin 
 		},
 	};
 	const event = click(message);
-	event.actions[0]!.value = "opt_a";
+	if (event.actions[0]) event.actions[0].value = "opt_a";
 	expect(describePanelResponse(event)).toBeNull();
 });

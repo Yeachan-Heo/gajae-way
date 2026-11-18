@@ -518,7 +518,7 @@ export class LaneGovernor {
 			// Instead, revalidate current liveness and running jobs; the abandonment intent is persisted in the terminal reason.
 			let isAlreadySettledAbandon = false;
 			let retryRunningJobsEmpty = true;
-			if (lastAttempt && lastAttempt.endedAt && liveness.live === true && !liveness.disowned) {
+			if (lastAttempt?.endedAt && liveness.live === true && !liveness.disowned) {
 				// Check if the attempt was settled with operator_abandoned reason
 				const runtime = this.#database.work.workAttemptGet(lastAttempt.opRef);
 				if (runtime && runtime.terminal?.reasonCode === "operator_abandoned") {

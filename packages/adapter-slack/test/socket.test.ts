@@ -216,7 +216,9 @@ test("interactive block_actions are acknowledged after handoff and duplicate env
 			options: [{ id: "option_a", label: "A" }],
 		},
 	});
-	const button = (blocks.find((block) => block.type === "actions")?.elements as unknown[])[0];
+	const elements = blocks.find((block) => block.type === "actions")?.elements;
+	const button = (elements as unknown[])?.[0];
+	if (!button) throw new Error("No button found in actions block");
 	const payload = {
 		type: "block_actions",
 		user: { id: "U1", name: "User" },
@@ -582,7 +584,7 @@ test("#710: a connections.open that never answers is abandoned and the reconnect
 		await flush();
 		expect(opens).toBe(1);
 		expect(timers.map((timer) => timer.ms)).toEqual([30_000]);
-		timers[0]!.work();
+		timers[0]?.work();
 		await flush();
 		await start;
 		expect(logs).toContain("Slack socket connection failed: connections.open timed out after 30000ms");
@@ -593,9 +595,9 @@ test("#710: a connections.open that never answers is abandoned and the reconnect
 		expect(sockets).toHaveLength(1);
 		// An answered request clears its own bound.
 		expect(timers).toHaveLength(2);
-		expect(timers[1]!.cleared).toBe(true);
-		sockets[0]!.open();
-		sockets[0]!.message({ type: "hello" });
+		expect(timers[1]?.cleared).toBe(true);
+		sockets[0]?.open();
+		sockets[0]?.message({ type: "hello" });
 		expect(mode.connected).toBe(true);
 	} finally {
 		mode.stop();

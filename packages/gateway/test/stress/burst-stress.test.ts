@@ -36,7 +36,7 @@ if (!stress) {
 					respond: async (_sessionId, prompt) => {
 						turns++;
 						return JSON.stringify(
-							(JSON.parse(prompt.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>).map(({ eventId }) => ({
+							(JSON.parse(prompt.match(/\[.*\]$/s)?.[0]) as Array<{ eventId: string }>).map(({ eventId }) => ({
 								eventId,
 								note: `receipted ${eventId}`,
 							})),
