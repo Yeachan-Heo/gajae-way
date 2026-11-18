@@ -12,7 +12,12 @@ import {
 	type ProtocolFailureReason,
 	parseOriginKey,
 } from "@gajae-gateway/protocol";
-import { envelopeErrorCode, GjcCliError, type StatusReport } from "@gajae-gateway/subsession";
+import {
+	envelopeErrorCode,
+	GjcCliError,
+	type StatusReport,
+	TranscriptIncompleteError,
+} from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
@@ -28,7 +33,12 @@ import {
 	sessionRequestStep,
 	type WorkerOutputResult,
 } from "../orchestrator/session-port";
-import { RelayClosedError, RelayHelloError, RelayRefusedError } from "../orchestrator/tail-runner";
+import {
+	isRelayTransportFailure,
+	RelayClosedError,
+	RelayHelloError,
+	RelayRefusedError,
+} from "../orchestrator/tail-runner";
 import { BrokerAuthorityError, type Store } from "../store";
 import { isBrokerPromptBusyRefusal } from "../store/groups/bindings";
 import {
@@ -1913,7 +1923,9 @@ export class MonitorPropagator {
 				const failureClass =
 					error instanceof LastAssistantUnreadableError ||
 					error instanceof AuthoringResultUnavailableError ||
-					sessionRequestStep(error) === "last_assistant"
+					error instanceof TranscriptIncompleteError ||
+					sessionRequestStep(error) === "last_assistant" ||
+					(isRelayTransportFailure(error) && sessionRequestStep(error) === undefined)
 						? "executor"
 						: classifyAuthoringFailure(error);
 				const protocolFailure =
@@ -1979,10 +1991,17 @@ export class MonitorPropagator {
 		});
 	}
 	/**
-	 * Extract the response text for the authoring turn, respecting the turn boundary.
-	 * Uses fetchAssistantSince to avoid picking up stale [SILENT] markers from earlier
-	 * operations. Falls back to requestResult.assistant if fetchAssistantSince is
-	 * unavailable or returns nothing.
+	 * The fresh authoring turn's own response text. The turn-scoped transcript
+	 * read uses the SAME boundary `#readAuthoringResult` uses — the operation's
+	 * reported start, else the earliest fire of the batch's events — so a late
+	 * `[SILENT]` from an async-result wake-up can never become the monitor's
+	 * answer (#809). A port without `fetchAssistantSince` has no turn-scoped
+	 * evidence at all and keeps the pre-#809 `requestResult.assistant` fallback.
+	 * A failed or empty turn-scoped read is an UNREADABLE result, not a license
+	 * for that heuristic: the failure is logged with its sanitized detail, the
+	 * authoring pointer survives, and the retry harvests the operation's own
+	 * `turn.result` (#702 path) — the last-assistant heuristic can never
+	 * silently resurrect a lost answer from whoever spoke last.
 	 */
 	async #responseFromTurn(
 		requestResult: SessionRequestResult,
@@ -1994,18 +2013,28 @@ export class MonitorPropagator {
 			typeof startedAt === "number" && Number.isFinite(startedAt)
 				? startedAt
 				: Math.min(...rows.map((row) => Date.parse(row.fired_at)));
+		if (this.#sessionPort.fetchAssistantSince === undefined) return requestResult.assistant.text;
+		let assistantSince: Awaited<ReturnType<NonNullable<SessionPort["fetchAssistantSince"]>>> | undefined;
 		try {
-			const assistantSince = await this.#sessionPort.fetchAssistantSince?.({
+			assistantSince = await this.#sessionPort.fetchAssistantSince({
 				sessionId: turn.sessionId,
 				repo: this.#repo,
 				notBeforeMs,
 				preferSpoken: true,
 			});
-			if (assistantSince !== undefined) return assistantSince.text;
-		} catch {
-			// Fall through to default if fetch fails
+		} catch (error) {
+			console.error(
+				`monitor response read failed for turn ${turn.opRef} session=${turn.sessionId}: ${failureDetail(error)}; the authoring op's own result is recovered on retry`,
+			);
+			throw new AuthoringResultUnavailableError("transport_error");
 		}
-		return requestResult.assistant.text;
+		if (assistantSince === undefined) {
+			console.error(
+				`monitor response read found no assistant row at/after ${notBeforeMs} for turn ${turn.opRef} session=${turn.sessionId}; the authoring op's own result is recovered on retry`,
+			);
+			throw new AuthoringResultUnavailableError("output_pending");
+		}
+		return assistantSince.text;
 	}
 
 	/**
@@ -2913,7 +2942,9 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass, phase:
 	if (
 		error instanceof LastAssistantUnreadableError ||
 		error instanceof AuthoringResultUnavailableError ||
-		step === "last_assistant"
+		error instanceof TranscriptIncompleteError ||
+		step === "last_assistant" ||
+		(isRelayTransportFailure(error) && step === undefined)
 	)
 		return "authoring_result_unreadable";
 	if (isSessionHostUnavailable(error)) return "session_host_unavailable";

@@ -177,8 +177,15 @@ test("issue #187: a completed exhausted turn is resumed and its authored result 
 		contextFailureRollThreshold: 1,
 	});
 	const originalRequest = state.sessionPort.request.bind(state.sessionPort);
-	state.sessionPort.request = async (input) =>
-		({
+	state.sessionPort.request = async (input) => {
+		// The stubbed request never registers its op with the scripted port, so
+		// the turn-scoped transcript read would have no row at/after the turn:
+		// pre-#809 that silently fell back to the empty `assistant.text`. Seed
+		// the transcript row the stub claims so the read observes the same empty
+		// answer; appendAssistant journals no send, so the recovery assertions
+		// below still see exactly the original OP_REF send.
+		state.sessionPort.appendAssistant(input.sessionId, "", Date.now());
+		return {
 			receipt: { sessionId: input.sessionId, operationRef: input.opRef } as never,
 			status: {
 				operationRef: input.opRef,
@@ -186,7 +193,8 @@ test("issue #187: a completed exhausted turn is resumed and its authored result 
 				summaryCompleted: true,
 			},
 			assistant: { text: "", pages: 1, complete: true },
-		}) satisfies SessionRequestResult;
+		} satisfies SessionRequestResult;
+	};
 	const contextFailureId = await state.pipeline.submitAwaitable(state.monitor.monitorId, "test.undeclared", {});
 	state.sessionPort.request = originalRequest;
 	expect(state.pipeline.sessionSafetyState(state.sessionOriginKey).pendingRoll).toBe(

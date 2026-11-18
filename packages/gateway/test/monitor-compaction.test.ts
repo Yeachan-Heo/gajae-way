@@ -99,6 +99,10 @@ async function realBrokerMonitorHarness(directory: string) {
 	const repo = join(directory, "workspace");
 	const control = { tokens: undefined as number | undefined, goneSession: "" };
 	let creates = 0;
+	// The host transcript, in arrival order. `transcript.list` serves it; the
+	// propagator's turn-scoped response read rides the CLI after request() has
+	// closed its own relay.
+	const transcript: Array<{ ts: string; body: string }> = [];
 	const cli: CliRunner = async (args) => {
 		if (args.includes("turn.result")) {
 			const opRef = JSON.parse(args[args.indexOf("--json-input") + 1]!).clientRef as string;
@@ -164,6 +168,17 @@ async function realBrokerMonitorHarness(directory: string) {
 				),
 				stderr: "",
 			};
+		if (args.includes("transcript.list"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					page: {
+						items: transcript.map((row) => ({ role: "assistant", ts: row.ts, body: row.body })),
+						complete: true,
+					},
+				}),
+				stderr: "",
+			};
 		throw new Error(`unexpected CLI command ${args.join(" ")}`);
 	};
 	const prompts: string[] = [];
@@ -174,6 +189,7 @@ async function realBrokerMonitorHarness(directory: string) {
 		if (request.operation === "turn.prompt") {
 			prompts.push(String(request.input.text));
 			lastResponse = echoNotes(String(request.input.text));
+			transcript.push({ ts: new Date().toISOString(), body: lastResponse });
 			output.set(String(request.input.clientRef), lastResponse);
 			started.set(String(request.input.clientRef), Date.now());
 			return { ok: true, result: { accepted: true, clientRef: request.input.clientRef } };
@@ -3719,6 +3735,14 @@ test("a roll digest survives real BrokerSessionPort poisoned-create epoch recove
 					stdout: JSON.stringify({
 						ok: true,
 						result: { session: { sessionId: args.at(-1), live: true, deleted: false, locator: { cwd: repo } } },
+					}),
+					stderr: "",
+				};
+			if (args.includes("transcript.list"))
+				return {
+					exitCode: 0,
+					stdout: JSON.stringify({
+						page: { items: [{ role: "assistant", ts: new Date(clock).toISOString(), body: response }], complete: true },
 					}),
 					stderr: "",
 				};

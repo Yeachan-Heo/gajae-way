@@ -1,0 +1,284 @@
+import { expect, spyOn, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { type OriginRef, originKey } from "@gajae-gateway/protocol";
+import type { CliResult, CliRunner } from "@gajae-gateway/subsession";
+import { DeliveryService } from "../src/delivery/delivery";
+import { MonitorPropagator } from "../src/monitors/propagate";
+import { MonitorRegistry } from "../src/monitors/registry";
+import { BrokerSessionPort } from "../src/orchestrator/session-port";
+import { TailRunner } from "../src/orchestrator/tail-runner";
+import { Store } from "../src/store";
+import {
+	initializeTestBrokerAuthority,
+	type ScriptedRelayReply,
+	type ScriptedRelayRequest,
+	scriptedRelay,
+} from "./session-port.fake";
+
+const target: OriginRef = { platform: "discord", kind: "channel", conversationId: "report-room" };
+
+function eventsFromPrompt(text: string): Array<{ eventId: string }> {
+	const match = text.match(/\[.*\]$/s);
+	if (!match) throw new Error("prompt has no event array");
+	return JSON.parse(match[0]) as Array<{ eventId: string }>;
+}
+
+/**
+ * A real BrokerSessionPort as boot.ts builds it: the broker's CLI runner plus a
+ * resident-relay TailRunner. A relay the request opened is always closed by the
+ * time request() returns, so every propagator follow-up read goes over the CLI.
+ */
+async function brokerPortHarness(
+	directory: string,
+	relay: (request: ScriptedRelayRequest) => ScriptedRelayReply | Promise<ScriptedRelayReply>,
+	cliTranscript: (args: readonly string[]) => CliResult | undefined = () => undefined,
+) {
+	const database = await Store.open(join(directory, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(directory, "agent"));
+	const repo = join(directory, "workspace");
+	const cli: CliRunner = async (args) => {
+		const extra = cliTranscript(args);
+		if (extra) return extra;
+		if (args.includes("session.create"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: { sessionId: "broker-session-1" } }),
+				stderr: "",
+			};
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: { session: { sessionId: args.at(-1), live: true, deleted: false, locator: { cwd: repo } } },
+				}),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ").slice(0, 90)}`);
+	};
+	const sessionPort = new BrokerSessionPort({
+		database,
+		authority,
+		cli,
+		tailRunner: new TailRunner({
+			stream: (sessionId) => scriptedRelay(relay).spawn(sessionId),
+			repo,
+		}),
+	});
+	return { database, sessionPort, repo };
+}
+
+function turnFixture(): { outputs: Map<string, string>; started: Map<string, number> } {
+	return { outputs: new Map(), started: new Map() };
+}
+
+/** The turn.prompt / turn.result / session.last_assistant half of the host, shared by both tests. */
+function hostTurnHandlers(
+	realAnswer: string,
+	outputs: Map<string, string>,
+	started: Map<string, number>,
+	onAnswer: (answer: string) => void,
+): (request: ScriptedRelayRequest) => ScriptedRelayReply {
+	return (request) => {
+		if (request.operation === "turn.prompt") {
+			const clientRef = String(request.input.clientRef);
+			const answer = JSON.stringify(
+				eventsFromPrompt(String(request.input.text)).map(({ eventId }) => ({ eventId, note: realAnswer })),
+			);
+			outputs.set(clientRef, answer);
+			started.set(clientRef, Date.now());
+			onAnswer(answer);
+			return { ok: true, result: { accepted: true, clientRef } };
+		}
+		if (request.operation === "turn.result")
+			return {
+				ok: true,
+				result: {
+					kind: "prompt",
+					clientRef: request.input.clientRef,
+					status: "terminal_ok",
+					receiptState: "present",
+					startedAt: started.get(String(request.input.clientRef)),
+					terminalAt: Date.now(),
+					outcome: { reason: "end_turn", provenance: "agent" },
+					content: {
+						version: 1,
+						type: "text",
+						text: outputs.get(String(request.input.clientRef)) ?? "",
+						truncated: false,
+						byteLength: Buffer.byteLength(outputs.get(String(request.input.clientRef)) ?? ""),
+					},
+				},
+			};
+		throw new Error(`unexpected relay request ${request.operation}`);
+	};
+}
+
+/**
+ * Issue #809 regression on the REAL MonitorPropagator request path
+ * (dispatch -> SessionPort.request -> parse -> author), through a real
+ * BrokerSessionPort. The authoring turn answers correctly; before the monitor
+ * selects the response, an async-result wake-up appends `[SILENT]`, which
+ * becomes the session's LAST assistant message. `requestResult.assistant`
+ * (session.last_assistant) then reads the marker and would author `[SILENT]`;
+ * the turn-scoped transcript read must return the real answer instead, so the
+ * event is authored with it and its monitor report is enqueued.
+ */
+test("a late [SILENT] after the authoring answer never replaces the monitor response (request path)", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-late-silent-request-"));
+	let pipeline: MonitorPropagator | undefined;
+	try {
+		const realAnswer = "Deploy finished: 3 services rolled, 0 failures.";
+		const { outputs, started } = turnFixture();
+		// The host transcript. The late wake-up's `[SILENT]` row lands right
+		// after the authoring answer, exactly as in the production race.
+		const transcript: Array<{ ts: string; body: string }> = [];
+		let silentRowAppended = false;
+		const { database, sessionPort, repo } = await brokerPortHarness(
+			directory,
+			(request) => {
+				const turn = hostTurnHandlers(realAnswer, outputs, started, (answer) => {
+					transcript.push({ ts: new Date().toISOString(), body: answer });
+					// The wake-up appends its silent row while the port sits between
+					// the terminal status and the final assistant read.
+					transcript.push({ ts: new Date().toISOString(), body: "[SILENT]" });
+					silentRowAppended = true;
+				});
+				if (request.operation === "session.last_assistant")
+					return { ok: true, page: { items: [transcript.at(-1)?.body ?? ""], complete: true } };
+				return turn(request);
+			},
+			(args) => {
+				if (!args.includes("transcript.list")) return undefined;
+				return {
+					exitCode: 0,
+					stdout: JSON.stringify({
+						page: {
+							items: transcript.map((row) => ({ role: "assistant", ts: row.ts, body: row.body })),
+							complete: true,
+						},
+					}),
+					stderr: "",
+				};
+			},
+		);
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "late-silent-watch",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["late.silent"],
+			burstPolicy: "serialize",
+			reportTo: target,
+		});
+		const notifications: string[] = [];
+		pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort,
+			repo,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			notifyInbound: async (key) => {
+				notifications.push(key);
+			},
+		});
+
+		const eventId = await pipeline.submitAwaitable(monitor.monitorId, "late.silent", { run: 1 });
+
+		// The late silent row landed before the response was selected.
+		expect(silentRowAppended).toBe(true);
+		// The event is authored with the REAL monitor answer — never the marker.
+		expect(database.monitors.authoredOutput(eventId)).toBe(realAnswer);
+		expect(database.monitors.eventGet(eventId)?.stage).toBe("authored_no_delivery");
+
+		// The monitor report was enqueued for its reportTo conversation and the
+		// owner was woken: a [SILENT] authorship would have suppressed both.
+		const report = database.inbox.pendingOldest(originKey(target));
+		expect(report).toMatchObject({
+			message_id: `monitor-report:${eventId}`,
+			source: "lane_report",
+			origin_key: originKey(target),
+			state: "pending",
+		});
+		expect(report?.body.endsWith(realAnswer)).toBe(true);
+		expect(notifications).toEqual([originKey(target)]);
+	} finally {
+		pipeline?.dispose();
+		await pipeline?.drain();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+/**
+ * A failed turn-scoped transcript read is a structured failure with a logged
+ * warning — never a silent slide back into the session's last assistant
+ * message, which the late wake-up has already replaced with `[SILENT]`.
+ */
+test("a failed turn-scoped transcript read is a structured warning, not a silent last-assistant fallback", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-late-silent-tear-"));
+	let pipeline: MonitorPropagator | undefined;
+	try {
+		const realAnswer = "Backup verified: snapshot consistent.";
+		const { outputs, started } = turnFixture();
+		const { database, sessionPort, repo } = await brokerPortHarness(
+			directory,
+			(request) => {
+				const turn = hostTurnHandlers(realAnswer, outputs, started, () => {});
+				if (request.operation === "session.last_assistant")
+					// The hazard in full: by the time the final read runs, the
+					// session's last assistant message is the wake-up's marker.
+					return { ok: true, page: { items: ["[SILENT]"], complete: true } };
+				if (request.operation === "transcript.list")
+					// Torn relay: the transcript read never answers, so the request
+					// times out (a transport failure the port surfaces verbatim).
+					return new Promise<never>(() => {});
+				return turn(request);
+			},
+			(args) => {
+				if (!args.includes("transcript.list")) return undefined;
+				// The CLI restart after a torn relay is torn as well (the whole
+				// transcript surface is down): the port's error reaches
+				// #responseFromTurn instead of an empty-but-valid answer.
+				throw new Error("broker transcript surface unavailable");
+			},
+		);
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "late-silent-tear",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["late.silent"],
+			burstPolicy: "serialize",
+			reportTo: target,
+		});
+		pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort,
+			repo,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+		});
+
+		const warnings = spyOn(console, "error").mockImplementation(() => {});
+		let eventId: string;
+		try {
+			eventId = await pipeline.submitAwaitable(monitor.monitorId, "late.silent", { run: 1 });
+			expect(warnings.mock.calls.some(([line]) => String(line).includes("monitor response read failed"))).toBe(true);
+		} finally {
+			warnings.mockRestore();
+		}
+		// Unreadable is a recorded failure with evidence, never a guessed answer:
+		// the pre-fix behaviour would have authored `[SILENT]` here.
+		expect(database.monitors.authoredOutput(eventId)).toBeUndefined();
+		expect(database.monitors.failure(eventId)?.code).toBe("authoring_result_unreadable");
+		expect(database.inbox.pendingOldest(originKey(target))).toBeUndefined();
+	} finally {
+		pipeline?.dispose();
+		await pipeline?.drain();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
