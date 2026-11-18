@@ -411,6 +411,17 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 				: `agent_disk: ${path} free=${gib(freeBytes)}GiB total=${gib(totalBytes)}GiB`,
 		);
 	}
+	if (cycle.laneDisk === null) lines.push("lane_disk: not observed");
+	else if (cycle.laneDisk === undefined) {
+		// Gateway omits laneDisk during staged update with --no-restart; older gateway
+		// version does not yet support work-lane reclaim reporting. Restart to upgrade.
+		lines.push("lane_disk: unsupported (restart gateway to upgrade)");
+	} else {
+		const disk = cycle.laneDisk;
+		lines.push(
+			`lane_disk: path=${disk.path} used_bytes=${disk.totalBytes ?? "unknown"} reclaimable_bytes=${disk.reclaimableBytes ?? "unknown"} free_bytes=${disk.filesystemFreeBytes ?? "unknown"} filesystem_bytes=${disk.filesystemTotalBytes ?? "unknown"} dirty_attempt_ended=${disk.dirtyAttemptEnded} unpushed_attempt_ended=${disk.unpushedAttemptEnded} low_free=${disk.lowFreeDisk}`,
+		);
+	}
 	if (cycle.brokerAgent !== null) {
 		lines.push(`broker_agent: ${cycle.brokerAgent.status}`);
 		for (const entry of cycle.brokerAgent.entries)

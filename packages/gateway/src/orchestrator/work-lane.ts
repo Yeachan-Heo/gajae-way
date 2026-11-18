@@ -31,6 +31,7 @@ import {
 	envelopeErrorCode,
 	GjcCliError,
 	hasNewCommit,
+	isValidIntegrationRef,
 	type LaneJobRecord,
 	newOpRef,
 	OpRefRejectedError,
@@ -945,7 +946,14 @@ export class WorkLaneManager {
 		const caller = this.#resolveCaller(input, mode);
 		const parent = mode === "start" ? caller : null;
 		const context: StartContext = { parent, authorizationOwner: this.#callerAuthorizationOwner(caller), runCall };
-		if (this.#job(input.name)) return await this.#startAdmitted(input, mode, context);
+		const existing = this.#job(input.name);
+		if (existing?.reclaimedAt !== undefined)
+			throw new ProtocolError("invalid_params", "work lane worktree was reclaimed; use a new lane name", {
+				reasonCode: "lane_reclaimed",
+				name: input.name,
+				reclaimedAt: existing.reclaimedAt,
+			});
+		if (existing) return await this.#startAdmitted(input, mode, context);
 		const admitting = this.#admissions.get(input.name);
 		// Do not queue another admission behind an in-flight start of this name.
 		if (admitting && admitting.failedAt === undefined)
@@ -1037,6 +1045,17 @@ export class WorkLaneManager {
 	}
 	async #startLocked(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
 		this.#live();
+		// Recheck reclaimedAt inside the lock to prevent race with reclamation.
+		// A start may have read an unmarked record before reclamation acquired the lock,
+		// then reclamation removes the worktree and sets reclaimedAt, and then start acquires
+		// the lock. We must reject this stale view before proceeding.
+		const currentRecord = this.#job(input.name);
+		if (currentRecord?.reclaimedAt !== undefined)
+			throw new ProtocolError("invalid_params", "work lane worktree was reclaimed; use a new lane name", {
+				reasonCode: "lane_reclaimed",
+				name: input.name,
+				reclaimedAt: currentRecord.reclaimedAt,
+			});
 		if (input.successorOf) {
 			const expected = input.successorOf;
 			this.#job(expected.name, true);
@@ -1210,6 +1229,9 @@ export class WorkLaneManager {
 				branch: facts?.branch ?? managedLaneBranchName(input.name),
 				worktreePath,
 				baselineSha: createdWorktree?.baseSha ?? facts?.headSha,
+				// Persist the lane's selected integration branch so reclamation can
+				// prove landing against exactly that remote ref (issue #834 review).
+				...(createdWorktree?.baseBranchRef !== undefined ? { integrationRef: createdWorktree.baseBranchRef } : {}),
 				...(input.repo !== undefined ? { repository: input.repo } : {}),
 				...(repositoryPath !== undefined ? { repositoryPath } : {}),
 			});
@@ -1464,6 +1486,12 @@ export class WorkLaneManager {
 				admission: { ...admission },
 			};
 		const job = this.#job(name, true)!;
+		if (job?.reclaimedAt !== undefined)
+			throw new ProtocolError("invalid_params", "work lane worktree was reclaimed; use a new lane name", {
+				reasonCode: "lane_reclaimed",
+				name,
+				reclaimedAt: job.reclaimedAt,
+			});
 		const key = workSessionKey(name);
 		const binding = this.#db.bindings.getSessionRecord(key);
 		const attempt = job.attempts.at(-1);
@@ -4086,7 +4114,25 @@ type CreatedRepoWorktree = {
 	readonly worktreePath: string;
 	readonly repositoryPath: string;
 	readonly baseSha: string;
+	/** Branch name the base resolved through; absent for SHA or tag bases. */
+	readonly baseBranchRef?: string;
 };
+/**
+ * The branch name a resolved base belongs to: `refs/heads/<ref>` must exist and
+ * point at the same commit the base resolved to. A tag (or any other ref kind)
+ * sharing the name keeps the base unrecorded, so reclamation fails closed
+ * instead of fetching an unrelated tip.
+ */
+async function branchWithSha(repositoryPath: string, baseRef: string): Promise<string | undefined> {
+	const baseSha = (
+		await runGit(["rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`], { cwd: repositoryPath })
+	).stdout.trim();
+	if (!/^[0-9a-f]{40}$/.test(baseSha)) return undefined;
+	const branchSha = (
+		await runGit(["rev-parse", "--verify", "--quiet", `refs/heads/${baseRef}^{commit}`], { cwd: repositoryPath })
+	).stdout.trim();
+	return branchSha === baseSha ? baseRef : undefined;
+}
 
 function isGitRemoteUrl(value: string): boolean {
 	try {
@@ -4433,6 +4479,12 @@ async function createWorktreeFromRepo(
 			});
 		}
 
+		// The integration branch is the ref the base actually resolved through:
+		// a branch name (possibly rewritten from `origin/<branch>`), never a
+		// SHA or tag. The reclaimer re-fetches exactly this remote branch ref,
+		// so only a clean ref name that also resolves as refs/heads/<name> is
+		// recorded; SHA and tag bases stay unrecorded and fail closed later.
+		const baseBranchRef = isValidIntegrationRef(baseRef) ? await branchWithSha(repositoryPath, baseRef) : undefined;
 		const baseResult = await runGit(["rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`], {
 			cwd: repositoryPath,
 			timeoutMs: timeouts.local,
@@ -4461,6 +4513,11 @@ async function createWorktreeFromRepo(
 			worktreePath,
 			repositoryPath,
 			baseSha,
+			// Record the exact ref the base resolved through so reclamation later
+			// fetches the lane's own integration branch instead of guessing. A
+			// SHA or tag base resolves through a raw sha, not a branch, and stays
+			// unrecorded: the reclaimer then fails closed (issue #834 review).
+			...(baseBranchRef !== undefined ? { baseBranchRef } : {}),
 		};
 	} catch (error) {
 		let partialWorktreeCleanupFailed = false;

@@ -51,6 +51,7 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		latestCutoverAt: null,
 		addressedSinceCutover: new Set(),
 		agentDisk: null,
+		laneDisk: null,
 		gjcVersion: undefined,
 		monitorTerminalStreak: 0,
 		brokerRespawnChurn: false,

@@ -1095,6 +1095,7 @@ export type CycleGateReason =
 	| "monitor_settlement_stuck"
 	| "monitor_authoring_lost"
 	| "lane_capacity_exhausted"
+	| "lane_disk_headroom"
 	| "inbound_starved"
 	| "agent_disk_headroom"
 	| "gjc_unverified_version"
@@ -1144,6 +1145,20 @@ export interface AgentDiskView {
 	readonly path: string;
 	readonly freeBytes: number | null;
 	readonly totalBytes: number | null;
+}
+
+/** Disk census for gateway-owned work-lane worktrees and their filesystem headroom. */
+export interface LaneDiskView {
+	readonly path: string;
+	/** Allocated bytes below the lane worktree root; null when scanning failed. */
+	readonly totalBytes: number | null;
+	/** Bytes currently safe to reclaim from stale terminal lanes. */
+	readonly reclaimableBytes: number | null;
+	readonly filesystemFreeBytes: number | null;
+	readonly filesystemTotalBytes: number | null;
+	readonly dirtyAttemptEnded: number;
+	readonly unpushedAttemptEnded: number;
+	readonly lowFreeDisk: boolean;
 }
 
 export interface CycleSessionView {
@@ -1289,6 +1304,8 @@ export interface OpsCycleResult {
 	readonly contextDiff: ConversationContextDiagnostics;
 	/** Worker-lane census against the configured admission cap. */
 	readonly lanes: { readonly active: number; readonly max: number };
+	/** Worktree disk census from the latest lane-governor maintenance pass. */
+	readonly laneDisk: LaneDiskView | null;
 	/** Agent-directory disk headroom; null when no broker agent directory is bound. */
 	readonly agentDisk: AgentDiskView | null;
 	/** Broker-owned copy of the operator's allowlisted GJC agent inputs. */

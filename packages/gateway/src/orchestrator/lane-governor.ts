@@ -1,9 +1,17 @@
-import { existsSync, lstatSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync, rmSync, statfsSync } from "node:fs";
+import { lstat, readdir } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import type { LogLevel } from "@gajae-gateway/log";
 import { type LaneCapacityDetail, ProtocolError } from "@gajae-gateway/protocol";
 import { type LaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
-import { DEFAULT_WORK_IDLE_RETIRE_MS, DEFAULT_WORK_MAX_LANES } from "../config";
+import {
+	DEFAULT_WORK_ATTEMPT_ENDED_RECLAIM_AFTER_MS,
+	DEFAULT_WORK_DONE_RECLAIM_GRACE_MS,
+	DEFAULT_WORK_IDLE_RETIRE_MS,
+	DEFAULT_WORK_LOW_DISK_FREE_BYTES,
+	DEFAULT_WORK_LOW_DISK_FREE_RATIO,
+	DEFAULT_WORK_MAX_LANES,
+} from "../config";
 import type { Store } from "../store";
 import { runGit } from "./git-command";
 import { sanitizeDiagnostic } from "./rebind";
@@ -21,6 +29,8 @@ const TERMINAL_JOB_STATES = new Set(["done", "aborted"]);
  * such a lane needs runtime evidence; only `completed` is broker-proven.
  */
 const UNPROVEN_END_STATES = new Set(["attempt_ended", "terminal_uncertain", "terminal_missing_receipt", "failed"]);
+/** Deadline for the fresh-remote fetch that proves a lane's work landed on its integration base. */
+const RECLAIM_REMOTE_FETCH_TIMEOUT_MS = 10_000;
 
 /**
  * Durable identity of one work lane job. The jobId is INJECTIVE: each
@@ -95,8 +105,25 @@ export interface LaneGovernorOptions {
 	readonly laneRoot?: string;
 	readonly maxLanes?: number;
 	readonly idleRetireMs?: number;
+	readonly doneReclaimGraceMs?: number;
+	readonly attemptEndedReclaimAfterMs?: number;
+	readonly lowDiskFreeBytes?: number;
+	readonly lowDiskFreeRatio?: number;
 	readonly now?: () => number;
 	readonly log?: (line: string, level?: LogLevel) => void;
+}
+
+export interface LaneDiskSnapshot {
+	readonly path: string;
+	/** Allocated bytes below `path/lanes`; null when the walk failed. */
+	readonly totalBytes: number | null;
+	/** Bytes still eligible for safe reclamation after the latest pass. */
+	readonly reclaimableBytes: number | null;
+	readonly filesystemFreeBytes: number | null;
+	readonly filesystemTotalBytes: number | null;
+	readonly dirtyAttemptEnded: number;
+	readonly unpushedAttemptEnded: number;
+	readonly lowFreeDisk: boolean;
 }
 
 /**
@@ -119,7 +146,13 @@ export class LaneGovernor {
 	#recoveryGate?: () => Promise<void>;
 	#forceRetireSettlement?: ForceRetireSettlement;
 	#stopped = false;
-	readonly #mutations = new Set<Promise<LaneRetireOutcome>>();
+	readonly #mutations = new Set<Promise<unknown>>();
+	readonly #doneReclaimGraceMs: number;
+	readonly #attemptEndedReclaimAfterMs: number;
+	readonly #lowDiskFreeBytes: number;
+	readonly #lowDiskFreeRatio: number;
+	#laneDiskSnapshot: LaneDiskSnapshot | null = null;
+	#reclaimPass: Promise<number> | undefined;
 
 	constructor(options: LaneGovernorOptions) {
 		this.#database = options.database;
@@ -127,8 +160,30 @@ export class LaneGovernor {
 		this.#laneRoot = options.laneRoot === undefined ? undefined : resolve(options.laneRoot);
 		this.maxLanes = positiveInteger(options.maxLanes, DEFAULT_WORK_MAX_LANES, "maxLanes");
 		this.idleRetireMs = positiveInteger(options.idleRetireMs, DEFAULT_WORK_IDLE_RETIRE_MS, "idleRetireMs");
+		this.#doneReclaimGraceMs = positiveInteger(
+			options.doneReclaimGraceMs,
+			DEFAULT_WORK_DONE_RECLAIM_GRACE_MS,
+			"doneReclaimGraceMs",
+		);
+		this.#attemptEndedReclaimAfterMs = positiveInteger(
+			options.attemptEndedReclaimAfterMs,
+			DEFAULT_WORK_ATTEMPT_ENDED_RECLAIM_AFTER_MS,
+			"attemptEndedReclaimAfterMs",
+		);
+		this.#lowDiskFreeBytes = positiveInteger(
+			options.lowDiskFreeBytes,
+			DEFAULT_WORK_LOW_DISK_FREE_BYTES,
+			"lowDiskFreeBytes",
+		);
+		this.#lowDiskFreeRatio = options.lowDiskFreeRatio ?? DEFAULT_WORK_LOW_DISK_FREE_RATIO;
+		if (!Number.isFinite(this.#lowDiskFreeRatio) || this.#lowDiskFreeRatio <= 0 || this.#lowDiskFreeRatio > 1)
+			throw new RangeError("lowDiskFreeRatio must be greater than 0 and at most 1");
 		this.#now = options.now ?? (() => Date.now());
 		this.#log = options.log ?? ((line, level) => console[level ?? "info"](line));
+	}
+
+	get laneDiskSnapshot(): LaneDiskSnapshot | null {
+		return this.#laneDiskSnapshot;
 	}
 
 	/** Installed by the sole attempt owner; recovery registration precedes retirement. */
@@ -373,6 +428,398 @@ export class LaneGovernor {
 			}
 		}
 		return retired;
+	}
+
+	/** Removes only stale, terminal, gateway-managed worktrees under the existing maintenance tick. */
+	reclaimTerminalWorktrees(now = this.#now()): Promise<number> {
+		if (this.#stopped || this.#laneRoot === undefined) return Promise.resolve(0);
+		if (this.#reclaimPass) return this.#reclaimPass;
+		const task = this.#reclaimTerminalWorktrees(now);
+		this.#reclaimPass = task;
+		this.#mutations.add(task);
+		void task.then(
+			() => {
+				this.#mutations.delete(task);
+				if (this.#reclaimPass === task) this.#reclaimPass = undefined;
+			},
+			() => {
+				this.#mutations.delete(task);
+				if (this.#reclaimPass === task) this.#reclaimPass = undefined;
+			},
+		);
+		return task;
+	}
+
+	async #reclaimTerminalWorktrees(now: number): Promise<number> {
+		const laneRoot = this.#laneRoot;
+		if (!laneRoot || this.#stopped) return 0;
+		const lanesPath = join(laneRoot, "lanes");
+		const eligiblePaths: string[] = [];
+		let dirtyAttemptEnded = 0;
+		let unpushedAttemptEnded = 0;
+		let reclaimed = 0;
+		for (const row of this.#database.work.laneJobRows()) {
+			if (!row.lane_key.startsWith("work-")) continue;
+			const name = row.lane_key.slice("work-".length);
+			if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) continue;
+			if (this.#stopped) break;
+			try {
+				const outcome = await this.#port.runExclusive(workSessionKey(name), async () => {
+					if (this.#stopped || this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
+						return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+					const record = this.#job(name);
+					if (!record || record === "corrupt" || record.reclaimedAt !== undefined)
+						return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+					const graceMs =
+						record.state === "done"
+							? this.#doneReclaimGraceMs
+							: record.state === "attempt_ended"
+								? this.#attemptEndedReclaimAfterMs
+								: undefined;
+					if (graceMs === undefined || now - Date.parse(record.updatedAt) < graceMs)
+						return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+					if (record.attempts.some((attempt) => attempt.endedAt === undefined)) {
+						this.#log(`lane_reclaim_skipped name=${name} reason=attempt_open`, "warn");
+						return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+					}
+					if (this.activeLanes().some((lane) => lane.name === name)) {
+						this.#log(`lane_reclaim_skipped name=${name} reason=live`, "info");
+						return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+					}
+					const repositoryPath = record.lane.repositoryPath;
+					const worktreePath = record.lane.worktreePath;
+					if (!repositoryPath || !this.#managedLanePaths(name, record)) {
+						this.#log(`lane_reclaim_skipped name=${name} reason=unmanaged_path`, "warn");
+						return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+					}
+					try {
+						assertManagedRepositoryPath(laneRoot, name, repositoryPath);
+						assertManagedWorktreeLocation(laneRoot, name, worktreePath);
+					} catch (error) {
+						this.#log(
+							`lane_reclaim_skipped name=${name} reason=path_validation detail=${sanitizeDiagnostic(diagnostic(error))}`,
+							"warn",
+						);
+						return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+					}
+					if (!existsSync(worktreePath)) {
+						try {
+							let stillRegistered = !(await worktreeIsUnregistered(repositoryPath, worktreePath));
+							// If stale registration remains after external deletion (interrupted git worktree remove),
+							// prune it and verify it was unregistered.
+							if (stillRegistered) {
+								const pruneResult = await runGit(["worktree", "prune"], { cwd: repositoryPath });
+								if (pruneResult.exitCode !== 0) {
+									this.#log(
+										`lane_reclaim_failed name=${name} reason=git_worktree_prune_failed detail=${sanitizeDiagnostic(pruneResult.stderr.trim() || "unknown error")}`,
+										"error",
+									);
+									return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+								}
+								stillRegistered = !(await worktreeIsUnregistered(repositoryPath, worktreePath));
+								if (stillRegistered) {
+									this.#log(
+										`lane_reclaim_failed name=${name} reason=missing_worktree_still_registered_after_prune`,
+										"error",
+									);
+									return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+								}
+							}
+						} catch (error) {
+							this.#log(
+								`lane_reclaim_failed name=${name} reason=git_worktree_verify_failed detail=${sanitizeDiagnostic(diagnostic(error))}`,
+								"error",
+							);
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+						}
+						if (!this.#markReclaimed(name, record, now)) {
+							this.#log(`lane_reclaim_failed name=${name} reason=job_changed_after_remove`, "error");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+						}
+						this.#log(
+							`lane_worktree_reclaimed name=${name} state=${record.state} reclaimed_at=${new Date(now).toISOString()}`,
+							"info",
+						);
+						return { reclaimed: true, eligible: true, bytes: 0, dirty: false, unpushed: false };
+					}
+					if (record.state === "attempt_ended") {
+						// Fail cheap and local first: a dirty worktree is retained on
+						// its own evidence, before any remote proof is consulted.
+						const status = await runGit(["status", "--porcelain", "--untracked-files=all"], {
+							cwd: worktreePath,
+						});
+						if (status.exitCode !== 0) {
+							this.#log(`lane_reclaim_skipped name=${name} reason=git_status_failed`, "warn");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+						}
+						if (status.stdout.length > 0) {
+							this.#log(`lane_reclaim_skipped name=${name} reason=dirty`, "warn");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: true, unpushed: false };
+						}
+						const head = await runGit(["rev-parse", "--verify", "HEAD^{commit}"], { cwd: worktreePath });
+						if (head.exitCode !== 0 || !/^[0-9a-f]{40}\s*$/.test(head.stdout)) {
+							this.#log(`lane_reclaim_skipped name=${name} reason=git_head_failed`, "warn");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+						}
+						// A lane is reclaimable-as-merged only when its work provably landed on
+						// the integration base (issuecomment-6960912321): see #laneMergedIntoBase.
+						const merged = await this.#laneMergedIntoBase(name, record, head.stdout.trim(), repositoryPath);
+						if (!merged.ok) {
+							this.#log(`lane_reclaim_skipped name=${name} reason=${merged.reason}`, "warn");
+							return {
+								reclaimed: false,
+								eligible: false,
+								bytes: 0,
+								dirty: false,
+								unpushed: merged.reason === "unpushed",
+							};
+						}
+					}
+					if (existsSync(worktreePath)) {
+						const removed = await runGit(["worktree", "remove", "--", worktreePath], { cwd: repositoryPath });
+						if (removed.exitCode !== 0) {
+							this.#log(`lane_reclaim_failed name=${name} reason=git_worktree_remove_failed`, "error");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+						}
+					}
+					try {
+						if (existsSync(worktreePath) || !(await worktreeIsUnregistered(repositoryPath, worktreePath))) {
+							this.#log(`lane_reclaim_failed name=${name} reason=worktree_remains`, "error");
+							return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+						}
+					} catch (error) {
+						this.#log(
+							`lane_reclaim_failed name=${name} reason=git_worktree_verify_failed detail=${sanitizeDiagnostic(diagnostic(error))}`,
+							"error",
+						);
+						return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+					}
+					if (!this.#markReclaimed(name, record, now)) {
+						this.#log(`lane_reclaim_failed name=${name} reason=job_changed_after_remove`, "error");
+						return { reclaimed: false, eligible: false, bytes: 0, dirty: false, unpushed: false };
+					}
+					const at = new Date(now).toISOString();
+					this.#log(`lane_worktree_reclaimed name=${name} state=${record.state} reclaimed_at=${at}`, "info");
+					return { reclaimed: true, eligible: true, bytes: 0, dirty: false, unpushed: false };
+				});
+				if (outcome.eligible) eligiblePaths.push(managedLaneWorktreePath(laneRoot, name));
+				if (outcome.reclaimed) {
+					reclaimed++;
+				}
+				if (outcome.dirty) dirtyAttemptEnded++;
+				if (outcome.unpushed) unpushedAttemptEnded++;
+			} catch (error) {
+				this.#log(`lane_reclaim_failed name=${name} reason=${sanitizeDiagnostic(diagnostic(error))}`, "error");
+			}
+		}
+		let tree: LaneTreeBytes | undefined;
+		try {
+			tree = await scanLaneTree(lanesPath);
+		} catch (error) {
+			this.#log(`lane_disk_scan_failed path=${lanesPath} reason=${sanitizeDiagnostic(diagnostic(error))}`, "warn");
+		}
+		let filesystemFreeBytes: number | null = null;
+		let filesystemTotalBytes: number | null = null;
+		try {
+			// Probe the filesystem that holds the worktrees (`lanes`), not the
+			// lane root's parent: the two can be different mounts, and a full
+			// lane mount must never report healthy headroom (issue #834 review).
+			const stats = statfsSync(lanesPath);
+			filesystemFreeBytes = stats.bavail * stats.bsize;
+			filesystemTotalBytes = stats.blocks * stats.bsize;
+		} catch {
+			// Missing headroom evidence is exposed as low, never guessed healthy.
+		}
+		const lowFreeDisk =
+			filesystemFreeBytes === null ||
+			filesystemTotalBytes === null ||
+			filesystemFreeBytes < this.#lowDiskFreeBytes ||
+			filesystemFreeBytes < filesystemTotalBytes * this.#lowDiskFreeRatio;
+		this.#laneDiskSnapshot = {
+			path: lanesPath,
+			totalBytes: tree?.totalBytes ?? null,
+			reclaimableBytes:
+				tree === undefined || tree.totalBytes === null
+					? null
+					: eligiblePaths.reduce((sum, path) => sum + (tree.worktrees.get(resolve(path)) ?? 0), 0),
+			filesystemFreeBytes,
+			filesystemTotalBytes,
+			dirtyAttemptEnded,
+			unpushedAttemptEnded,
+			lowFreeDisk,
+		};
+		return reclaimed;
+	}
+
+	#managedLanePaths(name: string, record: LaneJobRecord): boolean {
+		return (
+			this.#laneRoot !== undefined &&
+			resolve(record.lane.worktreePath) === managedLaneWorktreePath(this.#laneRoot, name) &&
+			record.lane.repositoryPath !== undefined &&
+			resolve(record.lane.repositoryPath) === managedLaneRepositoryPath(this.#laneRoot, name)
+		);
+	}
+
+	#markReclaimed(name: string, expected: LaneJobRecord, now: number): boolean {
+		const current = this.#job(name);
+		if (
+			!current ||
+			current === "corrupt" ||
+			current.reclaimedAt !== undefined ||
+			current.state !== expected.state ||
+			current.updatedAt !== expected.updatedAt ||
+			current.attempts.some((attempt) => attempt.endedAt === undefined) ||
+			this.activeLanes().some((lane) => lane.name === name)
+		)
+			return false;
+		const at = new Date(now).toISOString();
+		const reclaimedRecord: LaneJobRecord = { ...current, updatedAt: at, reclaimedAt: at };
+		const { laneKey } = laneJobIdentity(name);
+		this.#database.transaction((tx) =>
+			this.#database.work.putLaneJob(tx, {
+				jobId: reclaimedRecord.jobId,
+				laneKey,
+				state: reclaimedRecord.state,
+				createdAt: reclaimedRecord.createdAt,
+				updatedAt: reclaimedRecord.updatedAt,
+				lane: reclaimedRecord.lane,
+				json: JSON.stringify(reclaimedRecord),
+			}),
+		);
+		return true;
+	}
+
+	/**
+	 * Recovers the branch this lane's worktree was created from, when known.
+	 *
+	 * The lane record stores the base tip the worktree started at
+	 * (`baselineSha`), and `work.start` materializes that base branch locally in
+	 * the managed repository. Branches are immutable pointers here, so at most
+	 * one branch still points at that sha; none or an ambiguous match means the
+	 * recorded base is unknown and the caller fails closed.
+	 */
+	async #recordedBaseBranch(record: LaneJobRecord, repositoryPath: string): Promise<string | undefined> {
+		const { baselineSha } = record;
+		if (baselineSha === undefined) return undefined;
+		const branches = await runGit(["for-each-ref", "refs/heads/", "--format=%(objectname) %(refname)"], {
+			cwd: repositoryPath,
+		});
+		if (branches.exitCode !== 0) return undefined;
+		const matches = branches.stdout
+			.split("\n")
+			.map((line) => line.trim())
+			.filter((line) => line.startsWith(`${baselineSha} refs/heads/`));
+		return matches.length === 1 ? matches[0].slice(`${baselineSha} refs/heads/`.length) : undefined;
+	}
+
+	/**
+	 * Merged signal for reclaiming an expired `attempt_ended` lane (issue #833,
+	 * issuecomment-6960912321/6966669378/6967618377).
+	 *
+	 * The integration base is the lane's OWN recorded integration ref
+	 * (`integrationRef`, persisted by `work.start` from the exact ref the base
+	 * resolved through); for records written before that field existed, the
+	 * branch still pointing at the recorded `baselineSha` is accepted as that
+	 * recorded ref (#recordedBaseBranch — branches are immutable pointers, so
+	 * at most one matches). Its remote tip is fetched from exactly that
+	 * branch ref into a scratch namespace
+	 * (`+refs/heads/<base>:refs/remotes/origin-fresh/HEAD`), never from a
+	 * guessed `origin/HEAD` or first tracking ref, and the lane counts as
+	 * merged only when one of these holds, checked in order:
+	 *
+	 * 1. the lane head is an ancestor of the base tip (regular merge), or
+	 * 2. `git cherry` lists every lane commit `-` against the base (each commit's
+	 *    patch-id exists on the base side; rebase/cherry-pick merges), or
+	 * 3. the combined `git diff merge-base..lane-head` patch-id equals the
+	 *    patch-id of a single commit introduced on base since the merge-base
+	 *    (a squash of several lane commits).
+	 *
+	 * Anything else — including a clean push to the lane's own remote branch —
+	 * fails closed: the worktree keeps its commits and stays resumable. A lane
+	 * whose base cannot be identified (SHA/tag base, legacy record) has no
+	 * recorded integration ref and is never validated against an unrelated
+	 * branch: it fails closed with `integration_ref_unrecorded`. Every git
+	 * failure also fails closed with a distinct logged reason.
+	 */
+	async #laneMergedIntoBase(
+		name: string,
+		record: LaneJobRecord,
+		headSha: string,
+		repositoryPath: string,
+	): Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string }> {
+		const origin = await runGit(["config", "remote.origin.url"], { cwd: repositoryPath });
+		if (origin.exitCode !== 0 || !origin.stdout.trim()) return { ok: false, reason: "remote_url_missing" };
+		// The integration ref is the lane's OWN record: what `work.start`
+		// selected (persisted as `integrationRef`), or for legacy records the
+		// unique branch still pointing at the recorded baseline sha. The remote's
+		// default branch is not a substitute: lanes land on `dev` while `main`
+		// stays behind, so only the lane's own ref can prove landing. There is
+		// NO remote-ref fallback: guessing from `origin/HEAD` or the first
+		// tracking ref either stalls eligible lanes forever or "proves" a lane
+		// merged onto an unrelated branch. No recorded ref (SHA/tag base, legacy
+		// record) fails closed with a distinct reason.
+		const recordedBase = record.integrationRef ?? (await this.#recordedBaseBranch(record, repositoryPath));
+		if (recordedBase === undefined) return { ok: false, reason: "integration_ref_unrecorded" };
+		const fetchRef = `refs/heads/${recordedBase}`;
+		const resolved = await runGit(["rev-parse", "--verify", "--quiet", `${fetchRef}^{commit}`], {
+			cwd: repositoryPath,
+		});
+		if (resolved.exitCode !== 0) return { ok: false, reason: "base_ref_unresolved" };
+		// Refresh only that base tip into a scratch namespace; a packed ref survives
+		// this no-op fetch, so the base is always resolved with
+		// `rev-parse --verify --quiet` below, never via ref files on disk.
+		const fetch = await runGit(["fetch", "origin", `+${fetchRef}:refs/remotes/origin-fresh/HEAD`], {
+			cwd: repositoryPath,
+			timeoutMs: RECLAIM_REMOTE_FETCH_TIMEOUT_MS,
+		});
+		if (fetch.exitCode !== 0) return { ok: false, reason: "remote_unreachable" };
+		const base = await runGit(["rev-parse", "--verify", "--quiet", "refs/remotes/origin-fresh/HEAD^{commit}"], {
+			cwd: repositoryPath,
+		});
+		const baseSha = base.stdout.trim();
+		if (base.exitCode !== 0 || !/^[0-9a-f]{40}$/.test(baseSha)) return { ok: false, reason: "base_ref_unresolved" };
+		if (baseSha === headSha) return { ok: true };
+		const ancestor = await runGit(["merge-base", "--is-ancestor", headSha, baseSha], { cwd: repositoryPath });
+		if (ancestor.exitCode === 0) return { ok: true };
+		const mergeBase = await runGit(["merge-base", headSha, baseSha], { cwd: repositoryPath });
+		const mergeBaseSha = mergeBase.stdout.trim();
+		if (mergeBase.exitCode !== 0 || !/^[0-9a-f]{40}$/.test(mergeBaseSha))
+			return { ok: false, reason: "head_not_in_base_history" };
+		// Patch-id equivalence per lane commit: every `-` line means that commit's
+		// changes already exist on the base side of the merge-base. The lane's
+		// commits are compared against the BASE side (`baseSha`, not the
+		// merge-base): `git cherry <merge-base> <head>` has no upstream commits to
+		// subtract and marks every lane commit `+` forever, so the per-commit
+		// patch-id path could never succeed.
+		const cherry = await runGit(["cherry", baseSha, headSha], { cwd: repositoryPath });
+		if (cherry.exitCode !== 0) return { ok: false, reason: "git_cherry_failed" };
+		const laneCommits = cherry.stdout
+			.split("\n")
+			.map((line) => line.trim())
+			.filter((line) => line.length > 0);
+		if (laneCommits.length > 0 && laneCommits.every((line) => line.startsWith("-"))) return { ok: true };
+		// Squash of several lane commits: the combined diff since the merge-base
+		// must equal the patch-id of a single commit introduced on base.
+		const laneDiff = await runGit(["diff", `${mergeBaseSha}..${headSha}`], { cwd: repositoryPath });
+		if (laneDiff.exitCode !== 0) return { ok: false, reason: "lane_diff_failed" };
+		const lanePatch = await runGit(["patch-id", "--stable"], { stdin: laneDiff.stdout, cwd: repositoryPath });
+		if (lanePatch.exitCode !== 0 || lanePatch.stdout.trim().length === 0)
+			return { ok: false, reason: "git_patch_id_failed" };
+		const lanePatchId = lanePatch.stdout.trim().split(/\s+/)[0];
+		if (!lanePatchId) return { ok: false, reason: "git_patch_id_failed" };
+		const baseLog = await runGit(["log", "--no-merges", "--format=medium", "-p", `${mergeBaseSha}..${baseSha}`], {
+			cwd: repositoryPath,
+		});
+		if (baseLog.exitCode !== 0) return { ok: false, reason: "git_patch_id_failed" };
+		const basePatchIds = await runGit(["patch-id", "--stable"], { stdin: baseLog.stdout, cwd: repositoryPath });
+		if (basePatchIds.exitCode !== 0) return { ok: false, reason: "git_patch_id_failed" };
+		const known = patchIdsFromGitLog(basePatchIds.stdout);
+		if (known.has(lanePatchId)) return { ok: true };
+		this.#log(
+			`lane_reclaim_merged_check name=${name} lane_commits=${laneCommits.length} lane_patch_id=${lanePatchId.slice(0, 12)}`,
+			"info",
+		);
+		return { ok: false, reason: "work_not_merged_into_base" };
 	}
 
 	/**
@@ -778,6 +1225,137 @@ export class LaneGovernor {
 	}
 }
 
+interface LaneTreeBytes {
+	readonly totalBytes: number | null;
+	readonly worktrees: ReadonlyMap<string, number>;
+}
+
+/**
+ * The census repeats every maintenance tick, and lane content is
+ * attacker-influenced (a worker can create any regular tree), so the walk is
+ * bounded: a global entry budget, a depth cap, and a wall-clock budget. Any
+ * budget exhaustion marks the WHOLE census unknown (`totalBytes: null`) — a
+ * partial number is never reported as complete. `withFileTypes` dirents never
+ * follow symlinks: a symlinked tree is counted as the link itself, one entry.
+ */
+const CENSUS_MAX_ENTRIES = 20_000;
+const CENSUS_MAX_DEPTH = 32;
+const CENSUS_BUDGET_MS = 2_000;
+
+async function scanLaneTree(path: string): Promise<LaneTreeBytes> {
+	let rootStat: Awaited<ReturnType<typeof lstat>>;
+	try {
+		rootStat = await lstat(path);
+	} catch (error) {
+		if (isMissingPath(error)) return { totalBytes: 0, worktrees: new Map() };
+		throw error;
+	}
+	if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("lane root is not a real directory");
+	const deadline = Date.now() + CENSUS_BUDGET_MS;
+	let visited = 0;
+	let exhausted = false;
+	const worktrees = new Map<string, number>();
+	// Iterative stack of pending directories; `owner` is the resolved top-level
+	// entry the directory's contents accumulate on ("" = the census root).
+	type Frame = { readonly dir: string; readonly depth: number; readonly owner: string };
+	let rootBytes = allocatedBytes(rootStat);
+	const stack: Frame[] = [{ dir: path, depth: 0, owner: "" }];
+	const owners = new Map<string, number>([["", 0]]);
+	while (stack.length > 0) {
+		if (visited >= CENSUS_MAX_ENTRIES || Date.now() > deadline) {
+			exhausted = true;
+			break;
+		}
+		const frame = stack.pop()!;
+		const entries = await readdir(frame.dir, { withFileTypes: true }).catch(() => undefined);
+		if (entries === undefined) {
+			exhausted = true;
+			break;
+		}
+		for (const entry of entries) {
+			if (visited >= CENSUS_MAX_ENTRIES || Date.now() > deadline) {
+				exhausted = true;
+				break;
+			}
+			visited++;
+			const entryPath = join(frame.dir, entry.name);
+			let stat: Awaited<ReturnType<typeof lstat>>;
+			try {
+				stat = await lstat(entryPath);
+			} catch (error) {
+				if (isMissingPath(error)) continue;
+				throw error;
+			}
+			const bytes = allocatedBytes(stat);
+			rootBytes += bytes;
+			owners.set(frame.owner, (owners.get(frame.owner) ?? 0) + bytes);
+			if (stat.isDirectory() && !stat.isSymbolicLink()) {
+				if (frame.depth >= CENSUS_MAX_DEPTH) {
+					exhausted = true;
+					break;
+				}
+				// A top-level directory is one managed worktree; everything below
+				// it, the directory's own allocation included, accumulates on it.
+				const owner = frame.owner === "" ? resolve(entryPath) : frame.owner;
+				if (!owners.has(owner)) owners.set(owner, 0);
+				owners.set(owner, (owners.get(owner) ?? 0) + bytes);
+				stack.push({ dir: entryPath, depth: frame.depth + 1, owner });
+			}
+		}
+		if (exhausted) break;
+	}
+	if (exhausted) return { totalBytes: null, worktrees: new Map() };
+	for (const [owner, bytes] of owners) {
+		if (owner !== "") worktrees.set(owner, bytes);
+	}
+	return { totalBytes: rootBytes, worktrees };
+}
+
+function allocatedBytes(stat: Awaited<ReturnType<typeof lstat>>): number {
+	const blocks = typeof stat.blocks === "bigint" ? Number(stat.blocks) : stat.blocks;
+	const size = typeof stat.size === "bigint" ? Number(stat.size) : stat.size;
+	return Number.isFinite(blocks) ? blocks * 512 : size;
+}
+
+function isMissingPath(error: unknown): boolean {
+	return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+async function worktreeIsUnregistered(repositoryPath: string, worktreePath: string): Promise<boolean> {
+	const result = await runGit(["worktree", "list", "--porcelain"], { cwd: repositoryPath });
+	if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "git worktree list failed");
+	const expected = canonicalPathIncludingMissing(worktreePath);
+	for (const line of result.stdout.split(/\r?\n/)) {
+		if (!line.startsWith("worktree ")) continue;
+		if (canonicalPathIncludingMissing(line.slice("worktree ".length)) === expected) return false;
+	}
+	return true;
+}
+
+function assertManagedWorktreeLocation(laneRoot: string, name: string, worktreePath: string): void {
+	if (resolve(worktreePath) !== managedLaneWorktreePath(laneRoot, name))
+		throw new Error("managed worktree path does not match its lane name");
+	const lanesRoot = join(laneRoot, "lanes");
+	const lanesStat = lstatSync(lanesRoot);
+	if (!lanesStat.isDirectory() || lanesStat.isSymbolicLink()) throw new Error("lane directory is not a real directory");
+	const canonicalLaneRoot = realpathSync(laneRoot);
+	const canonicalLanesRoot = realpathSync(lanesRoot);
+	const laneRootPrefix = canonicalLaneRoot.endsWith(sep) ? canonicalLaneRoot : `${canonicalLaneRoot}${sep}`;
+	const expectedCanonicalPath = join(canonicalLanesRoot, Buffer.from(name, "utf8").toString("hex"));
+	if (!canonicalLanesRoot.startsWith(laneRootPrefix)) throw new Error("lane directory escapes its configured root");
+	if (canonicalPathIncludingMissing(worktreePath) !== expectedCanonicalPath)
+		throw new Error("managed worktree path escapes its configured lane root");
+	try {
+		const worktreeStat = lstatSync(worktreePath);
+		if (!worktreeStat.isDirectory() || worktreeStat.isSymbolicLink())
+			throw new Error("managed worktree path is not a real directory");
+		if (realpathSync(worktreePath) !== expectedCanonicalPath)
+			throw new Error("managed worktree path resolves outside its lane identity");
+	} catch (error) {
+		if (!isMissingPath(error)) throw error;
+	}
+}
+
 function assertManagedRepositoryPath(laneRoot: string | undefined, name: string, repository: string): void {
 	if (laneRoot === undefined) throw new Error("configured lane root is unavailable for managed repository cleanup");
 	const expectedPath = managedLaneRepositoryPath(laneRoot, name);
@@ -819,6 +1397,21 @@ function canonicalPathIncludingMissing(target: string): string {
 			current = parent;
 		}
 	}
+}
+
+/**
+ * Patch ids from a `git patch-id --stable` run over a `git log -p` feed:
+ * the leading hash of every line whose second field (the commit it came
+ * from) is a full 40-hex sha. Empty-diff lines (`0000…`) carry no commit
+ * and are dropped.
+ */
+function patchIdsFromGitLog(stdout: string): Set<string> {
+	const ids = new Set<string>();
+	for (const line of stdout.split("\n")) {
+		const [patchId, commit] = line.trim().split(/\s+/);
+		if (patchId && commit && /^[0-9a-f]{40}$/.test(commit)) ids.add(patchId);
+	}
+	return ids;
 }
 
 function positiveInteger(value: number | undefined, fallback: number, name: string): number {

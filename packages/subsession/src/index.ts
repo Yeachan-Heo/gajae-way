@@ -36,6 +36,7 @@ export {
 	closeAttempt,
 	createLaneJobRecord,
 	hasNewCommit,
+	isValidIntegrationRef,
 	type JobAttempt,
 	type JobCheckpoint,
 	LANE_JOB_SCHEMA_VERSION,

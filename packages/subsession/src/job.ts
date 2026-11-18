@@ -54,11 +54,12 @@ export class LaneJobError extends Error {
 
 /**
  * Wire/storage version of the persisted LaneJobRecord. Version 2 added the
- * optional repository identity; version 3 adds the managed repository path.
- * Version-1 and version-2 records remain readable without newer fields.
+ * optional repository identity; version 3 adds the managed repository path;
+ * version 4 records terminal-worktree reclamation. Earlier records remain
+ * readable without newer fields.
  */
-export const LANE_JOB_SCHEMA_VERSION = 3 as const;
-const READABLE_LANE_JOB_SCHEMA_VERSIONS: readonly unknown[] = [1, 2, LANE_JOB_SCHEMA_VERSION];
+export const LANE_JOB_SCHEMA_VERSION = 4 as const;
+const READABLE_LANE_JOB_SCHEMA_VERSIONS: readonly unknown[] = [1, 2, 3, LANE_JOB_SCHEMA_VERSION];
 
 /** Issue #9's exact evidence vocabulary. No synonyms. */
 export type WorkEvidenceClass = "work_committed_report_lost" | "work_in_progress_uncommitted" | "no_work_produced";
@@ -160,6 +161,10 @@ export type LaneJobRecord = {
 	 * checkpoints only ever record moves BEYOND this SHA.
 	 */
 	readonly baselineSha?: string;
+	/** Set only after the lane worktree has been removed; prevents resume from recreating it. */
+	readonly reclaimedAt?: string;
+	/** The integration branch this lane's work lands on (recorded by work.start). */
+	readonly integrationRef?: string;
 	/**
 	 * Present while the job is in a PR-checks cycle: always in `awaiting_checks`,
 	 * and kept through a re-steered attempt so its retries carry over.
@@ -174,6 +179,8 @@ export type CreateLaneJobInput = {
 	readonly sessionId?: string;
 	/** The worktree HEAD at creation; the baseline progress is measured against. */
 	readonly baselineSha?: string;
+	/** The integration branch the worktree was created from; omitted for SHA/tag bases. */
+	readonly integrationRef?: string;
 	/** Repository identity (absolute local path or Git URL) used for worktree creation and push target (issue #480). */
 	readonly repository?: string;
 	/** Gateway-owned bare clone path associated with this lane's repository identity. */
@@ -197,6 +204,7 @@ export function createLaneJobRecord(input: CreateLaneJobInput): LaneJobRecord {
 	if (input.baselineSha !== undefined && !/^[0-9a-f]{40}$/.test(input.baselineSha)) {
 		throw new LaneJobError(`baselineSha is not a full commit sha`);
 	}
+	if (input.integrationRef !== undefined) assertIntegrationRef(input.integrationRef);
 	if (input.repository !== undefined && typeof input.repository !== "string") {
 		throw new LaneJobError(`repository must be a string`);
 	}
@@ -223,6 +231,7 @@ export function createLaneJobRecord(input: CreateLaneJobInput): LaneJobRecord {
 		checkpoints: Object.freeze([]),
 		stalledContinuations: 0,
 		...(input.baselineSha !== undefined ? { baselineSha: input.baselineSha } : {}),
+		...(input.integrationRef !== undefined ? { integrationRef: input.integrationRef } : {}),
 		escalations: Object.freeze([]),
 	});
 }
@@ -242,6 +251,29 @@ function assertSessionIdShape(sessionId: string): string {
 }
 
 const SLASH_SAFE_BRANCH = /^[A-Za-z0-9._/-]+$/;
+/**
+ * A git ref we will pass to `git fetch` verbatim. Beyond the branch charset,
+ * option-like and traversal shapes are rejected: the ref must never become a
+ * git flag or escape its namespace.
+ */
+export function isValidIntegrationRef(value: string): boolean {
+	return (
+		typeof value === "string" &&
+		SLASH_SAFE_BRANCH.test(value) &&
+		value.length > 0 &&
+		value.length <= 200 &&
+		!value.startsWith("-") &&
+		!value.startsWith("/") &&
+		!value.endsWith("/") &&
+		!value.includes("..") &&
+		!/\s/.test(value)
+	);
+}
+
+function assertIntegrationRef(value: string): string {
+	if (!isValidIntegrationRef(value)) throw new LaneJobError(`integrationRef is not a valid ref name`);
+	return value;
+}
 
 /**
  * Parses persisted JSON fail-closed.
@@ -303,9 +335,19 @@ export function parseLaneJobRecord(raw: string): LaneJobRecord {
 	const stalledContinuations = parseCounter(record.stalledContinuations, "stalledContinuations");
 	const escalations = parseEscalations(record.escalations);
 	const awaitingChecks = record.awaitingChecks === undefined ? undefined : parseAwaitingChecks(record.awaitingChecks);
+	const reclaimedAt =
+		record.reclaimedAt === undefined ? undefined : assertRequiredTimestamp(record.reclaimedAt, "reclaimedAt");
+	const integrationRef =
+		record.integrationRef === undefined ? undefined : assertIntegrationRef(asString(record.integrationRef));
 	if (record.state === "awaiting_checks" && awaitingChecks === undefined) {
 		throw new LaneJobError("awaiting_checks job is missing its awaitingChecks block");
 	}
+	if (
+		reclaimedAt !== undefined &&
+		((record.state !== "done" && record.state !== "attempt_ended") ||
+			attempts.some((attempt) => attempt.endedAt === undefined))
+	)
+		throw new LaneJobError("reclaimed lane must be a settled done or attempt_ended job");
 
 	return Object.freeze({
 		schemaVersion: LANE_JOB_SCHEMA_VERSION,
@@ -328,7 +370,9 @@ export function parseLaneJobRecord(raw: string): LaneJobRecord {
 		...(record.baselineSha === undefined
 			? {}
 			: { baselineSha: assertFullSha(asString(record.baselineSha), "baselineSha") }),
+		...(reclaimedAt === undefined ? {} : { reclaimedAt }),
 		escalations,
+		...(integrationRef === undefined ? {} : { integrationRef }),
 		...(awaitingChecks === undefined ? {} : { awaitingChecks }),
 	});
 }

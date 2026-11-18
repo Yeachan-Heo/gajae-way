@@ -152,7 +152,7 @@ describe("durable record schema: versioned, frozen, fail-closed", () => {
 			now: () => NOW,
 		});
 		const parsed = parseLaneJobRecord(JSON.stringify(created));
-		expect(parsed.schemaVersion).toBe(3);
+		expect(parsed.schemaVersion).toBe(4);
 		expect(parsed.lane.repository).toBe("https://example.test/project.git");
 		expect(parsed.lane.repositoryPath).toBe("/home/user/.gajaeway/repositories/lane-jobs");
 	});
@@ -162,7 +162,7 @@ describe("durable record schema: versioned, frozen, fail-closed", () => {
 		expect(() => parseLaneJobRecord(raw)).toThrow(/schemaVersion/);
 	});
 
-	test("reads a version-1 record as version 3 without repository metadata", () => {
+	test("reads a version-1 record as version 4 without repository metadata", () => {
 		const raw = JSON.stringify({ ...JSON.parse(JSON.stringify(record())), schemaVersion: 1 });
 		const parsed = parseLaneJobRecord(raw);
 		expect(parsed.schemaVersion).toBe(LANE_JOB_SCHEMA_VERSION);

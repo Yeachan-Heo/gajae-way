@@ -34,6 +34,7 @@ export {
 	isSilentOutput,
 	isWorkRefusalCause,
 	type LaneCapacityDetail,
+	type LaneDiskView,
 	type MemoryAuditResult,
 	type MemoryAutolinkResult,
 	type MemoryOperationAccepted,
