@@ -6569,27 +6569,18 @@ test("a notice during a gateway turn steers its gateway framing without lane-rep
 	expect(f.port.steers[0]!.text).not.toContain("Internal lane report");
 });
 
-test("model selection transitions are not skipped by cache collisions between string and object representations", async () => {
+test("model selection cache distinguishes a preset object from its colliding string rendering on the next turn", async () => {
 	const port = new ScriptedSessionPort();
-	const terminal: string[] = [];
-	await harness(port, {
-		terminal: (text) => terminal.push(text),
-		modelRefusal: () => {
-			/* noop */
-		},
-	});
-	enqueue("test-turn", "test message");
+	const hooks: { effectiveModel?: string } = {};
+	await harness(port, hooks);
+	await manager!.rebindModel(KEY, { preset: "foo" });
+	const sessionId = port.models[0]!.sessionId;
+	hooks.effectiveModel = "preset:foo";
+	enqueue("colliding-string-turn", "send with the string model");
 	await manager!.notifyInbound(KEY);
-	await eventually(() => port.sends.length > 0, "no sends were made");
-	const sessionId = port.sends[0]!.sessionId;
-	const setModelsAtStart = port.models.filter((m) => m.sessionId === sessionId).length;
-	// Rebind to a preset (object) model
-	await manager!.rebindModel(KEY, { preset: "gpt-4" });
-	const afterPreset = port.models.filter((m) => m.sessionId === sessionId).length;
-	// Rebind to a string model - should not be skipped even though it could collide
-	await manager!.rebindModel(KEY, "provider/claude-opus");
-	const afterString = port.models.filter((m) => m.sessionId === sessionId).length;
-	// Verify all transitions happened (all three different model calls succeeded)
-	expect(afterPreset).toBe(setModelsAtStart + 1);
-	expect(afterString).toBe(setModelsAtStart + 2);
+	await eventually(() => port.sends.length === 1, "the inherited session did not send its turn");
+	expect(port.models.filter((model) => model.sessionId === sessionId).map((model) => model.selection)).toEqual([
+		{ preset: "foo" },
+		"preset:foo",
+	]);
 });
