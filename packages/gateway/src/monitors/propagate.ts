@@ -709,11 +709,15 @@ export class MonitorPropagator {
 				else if (output && !hasMemory && row.stage === "authored" && !isSilentOutput(output))
 					// Idempotent re-authoring for memory repair: already-authored non-silent events
 					this.#author(row.event_id, output, false, row);
-				else if (output && row.stage === "authored" && isSilentOutput(output))
+				else if (output && row.stage === "authored" && isSilentOutput(output)) {
+					if (!hasMemory)
+						// Repair or ensure the intent from the stored output before terminalization
+						this.#author(row.event_id, output, true, row);
+					// Transition row to authored_no_delivery
 					this.#database.transaction((tx) =>
 						this.#database.monitors.eventUpdate(tx, row.event_id, "authored_no_delivery"),
 					);
-				else if (!output && this.#recoverable(row)) {
+				} else if (!output && this.#recoverable(row)) {
 					// Red-team blocker 1: a live dispatch lease owned by ANOTHER attempt
 					// means the authoring turn may still complete elsewhere; a new
 					// process must not re-author concurrently. Only unclaimed events

@@ -167,12 +167,15 @@ test("REGRESSION: MonitorPropagator rejects late SILENT on authored row via reco
 
 		// Call reconcile - this will find the event with SILENT output and no memory
 		// Since stage === "authored" && output IS silent && !hasMemory,
-		// it will NOT call #author but will update stage to authored_no_delivery (line 712-714 in reconcile)
+		// it will call #author to repair the memory intent, then update stage to authored_no_delivery
 		// No report should be enqueued in this case
 		await propagator.reconcile();
 
 		// Verify the event stage changed to authored_no_delivery
 		expect(database.monitors.eventGet(eventId)?.stage).toBe("authored_no_delivery");
+
+		// Verify the memory intent was created from the stored output
+		expect(database.memory.coversEvent(eventId)).toBe(true);
 
 		// Verify no extra reports were enqueued
 		const finalReports = database.inbox.pendingByOrigin();
