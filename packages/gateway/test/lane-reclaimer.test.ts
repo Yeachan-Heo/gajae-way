@@ -50,8 +50,11 @@ function setUpstreamDefaultBranch(paths: Awaited<ReturnType<typeof managedWorktr
 	git(["symbolic-ref", "HEAD", "refs/heads/main"], upstreamOf(paths));
 }
 
-/** Move the base forward with an unrelated commit and refresh the lane repo's tracking refs. */
-async function advanceBaseWithUnrelatedCommit(paths: Awaited<ReturnType<typeof managedWorktree>>): Promise<void> {
+/** Move a base branch forward with an unrelated commit and refresh the lane repo's tracking refs. */
+async function advanceBaseWithUnrelatedCommit(
+	paths: Awaited<ReturnType<typeof managedWorktree>>,
+	baseBranch = "main",
+): Promise<void> {
 	const upstream = upstreamOf(paths);
 	const tempDir = await mkdtemp(join(tmpdir(), "temp-base-advance-"));
 	try {
@@ -61,15 +64,18 @@ async function advanceBaseWithUnrelatedCommit(paths: Awaited<ReturnType<typeof m
 		await writeFile(join(tempDir, "base-only.txt"), "unrelated base work\n");
 		git(["add", "base-only.txt"], tempDir);
 		git(["commit", "-m", "unrelated base work"], tempDir);
-		git(["push", "--quiet", "origin", "HEAD:refs/heads/main"], tempDir);
+		git(["push", "--quiet", "origin", `HEAD:refs/heads/${baseBranch}`], tempDir);
 	} finally {
 		await rm(tempDir, { recursive: true, force: true });
 	}
 	git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], paths.repositoryPath);
 }
 
-/** Squash-merge the lane branch into the upstream base and delete the remote lane branch. */
-async function squashMergeLaneToBase(paths: Awaited<ReturnType<typeof managedWorktree>>): Promise<void> {
+/** Squash-merge the lane branch onto a named base branch and delete the remote lane branch. */
+async function squashMergeLaneToBase(
+	paths: Awaited<ReturnType<typeof managedWorktree>>,
+	baseBranch = "main",
+): Promise<void> {
 	const upstream = upstreamOf(paths);
 	const tempDir = await mkdtemp(join(tmpdir(), "temp-squash-merge-"));
 	try {
@@ -77,9 +83,10 @@ async function squashMergeLaneToBase(paths: Awaited<ReturnType<typeof managedWor
 		git(["config", "user.name", "Lane Reclaimer Test"], tempDir);
 		git(["config", "user.email", "lane-reclaimer@example.test"], tempDir);
 		git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], tempDir);
+		git(["checkout", "-q", "-B", "squash-merge", `origin/${baseBranch}`], tempDir);
 		git(["merge", "--squash", "--quiet", `origin/${paths.branch}`], tempDir);
 		git(["commit", "-m", `Squash-merge ${paths.branch} onto the integration base`], tempDir);
-		git(["push", "--quiet", "origin", "HEAD:refs/heads/main"], tempDir);
+		git(["push", "--quiet", "origin", `HEAD:refs/heads/${baseBranch}`], tempDir);
 	} finally {
 		await rm(tempDir, { recursive: true, force: true });
 	}
@@ -140,7 +147,11 @@ async function fixture(options: Partial<ConstructorParameters<typeof LaneGoverno
 	};
 }
 
-async function managedWorktree(f: Awaited<ReturnType<typeof fixture>>, name: string) {
+async function managedWorktree(
+	f: Awaited<ReturnType<typeof fixture>>,
+	name: string,
+	options: { readonly baseBranch?: string } = {},
+) {
 	const upstream = join(f.directory, `upstream-${name}.git`);
 	const seed = join(f.directory, `seed-${name}`);
 	const repositoryPath = managedLaneRepositoryPath(f.laneRoot, name);
@@ -154,14 +165,17 @@ async function managedWorktree(f: Awaited<ReturnType<typeof fixture>>, name: str
 	git(["add", "README.md"], seed);
 	git(["commit", "-m", "seed"], seed);
 	git(["remote", "add", "origin", upstream], seed);
-	git(["push", "-u", "origin", "main"], seed);
+	if (options.baseBranch !== undefined) git(["branch", options.baseBranch, "refs/heads/main"], seed);
+	git(["push", "-u", "origin", options.baseBranch ?? "main"], seed);
 	git(["clone", "--bare", upstream, repositoryPath]);
 	git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], repositoryPath);
 	git(["config", "user.name", "Lane Reclaimer Test"], repositoryPath);
 	git(["config", "user.email", "lane-reclaimer@example.test"], repositoryPath);
 	const branch = managedLaneBranchName(name);
-	git(["worktree", "add", "-b", branch, worktreePath, "refs/remotes/origin/main"], repositoryPath);
-	return { upstream, repositoryPath, worktreePath, branch };
+	const worktreeBase = `refs/remotes/origin/${options.baseBranch ?? "main"}`;
+	git(["worktree", "add", "-b", branch, worktreePath, worktreeBase], repositoryPath);
+	const baselineSha = git(["rev-parse", worktreeBase], repositoryPath).trim();
+	return { upstream, repositoryPath, worktreePath, branch, baselineSha };
 }
 
 function persistJob(
@@ -170,6 +184,7 @@ function persistJob(
 	paths: Awaited<ReturnType<typeof managedWorktree>>,
 	state: "done" | "attempt_ended" | "awaiting_operator" | "running",
 	updatedAt: number,
+	options: { readonly baselineSha?: string } = {},
 ): LaneJobRecord {
 	const identity = laneJobIdentity(name);
 	const updatedAtIso = new Date(updatedAt).toISOString();
@@ -179,6 +194,7 @@ function persistJob(
 		worktreePath: paths.worktreePath,
 		repository: paths.upstream,
 		repositoryPath: paths.repositoryPath,
+		baselineSha: options.baselineSha ?? paths.baselineSha,
 		now: () => new Date(updatedAt),
 	});
 	if (state === "attempt_ended" || state === "awaiting_operator" || state === "running") {
@@ -527,6 +543,36 @@ test("squash-merged lane is reclaimed against a base that moved on (issue #833)"
 		expect(existsSync(paths.worktreePath)).toBe(false);
 		const job = savedJob(f.database, "true-squash-merged");
 		expect(job).toMatchObject({ state: "attempt_ended", reclaimedAt: expect.any(String) });
+	} finally {
+		await f.close();
+	}
+});
+
+test("squash-merged lane created from dev is reclaimed against dev while main stays default (issue #834)", async () => {
+	const f = await fixture();
+	try {
+		// gajae-way topology: the upstream's default branch is `main`, but this
+		// lane was created from `dev` and its work lands on `dev`.
+		const paths = await managedWorktree(f, "dev-squash-merged", { baseBranch: "dev" });
+		const upstream = upstreamOf(paths);
+		// `dev` exists (the lane branched from it); point the default-branch
+		// symbol at a separate `main` that never receives the lane's work.
+		git(["branch", "main", "refs/heads/dev"], upstream);
+		git(["symbolic-ref", "HEAD", "refs/heads/main"], upstream);
+		// The clone recorded `origin/HEAD -> origin/dev` (dev was the only branch
+		// at clone time); repoint the remote's default-branch symbol at `main`.
+		git(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"], paths.repositoryPath);
+		await addCommit(paths.worktreePath, "dev lane work");
+		await pushHead(paths);
+		await advanceBaseWithUnrelatedCommit(paths, "dev");
+		squashMergeLaneToBase(paths, "dev");
+		// Default branch (`main`) never advances past the dev fork point.
+		git(["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], paths.repositoryPath);
+		expect(git(["rev-parse", "refs/remotes/origin/main"], paths.repositoryPath).trim()).toBe(paths.baselineSha);
+		persistJob(f.database, "dev-squash-merged", paths, "attempt_ended", NOW - DAY * 7);
+		expect(await f.governor.reclaimTerminalWorktrees(NOW)).toBe(1);
+		expect(existsSync(paths.worktreePath)).toBe(false);
+		expect(savedJob(f.database, "dev-squash-merged").reclaimedAt).toBeDefined();
 	} finally {
 		await f.close();
 	}

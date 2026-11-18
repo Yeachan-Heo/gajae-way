@@ -550,7 +550,7 @@ export class LaneGovernor {
 						}
 						// A lane is reclaimable-as-merged only when its work provably landed on
 						// the integration base (issuecomment-6960912321): see #laneMergedIntoBase.
-						const merged = await this.#laneMergedIntoBase(name, head.stdout.trim(), repositoryPath);
+						const merged = await this.#laneMergedIntoBase(name, record, head.stdout.trim(), repositoryPath);
 						if (!merged.ok) {
 							this.#log(`lane_reclaim_skipped name=${name} reason=${merged.reason}`, "warn");
 							return {
@@ -685,12 +685,37 @@ export class LaneGovernor {
 	}
 
 	/**
+	 * Recovers the branch this lane's worktree was created from, when known.
+	 *
+	 * The lane record stores the base tip the worktree started at
+	 * (`baselineSha`), and `work.start` materializes that base branch locally in
+	 * the managed repository. Branches are immutable pointers here, so the base
+	 * branch is the only one still pointing at that sha; none means the recorded
+	 * base is unknown and the caller falls back to the remote default.
+	 */
+	async #recordedBaseBranch(record: LaneJobRecord, repositoryPath: string): Promise<string | undefined> {
+		const { baselineSha } = record;
+		if (baselineSha === undefined) return undefined;
+		const branches = await runGit(["for-each-ref", "refs/heads/", "--format=%(objectname) %(refname)"], {
+			cwd: repositoryPath,
+		});
+		if (branches.exitCode !== 0) return undefined;
+		const matches = branches.stdout
+			.split("\n")
+			.map((line) => line.trim())
+			.filter((line) => line.startsWith(`${baselineSha} refs/heads/`));
+		return matches.length === 1 ? matches[0].slice(`${baselineSha} refs/heads/`.length) : undefined;
+	}
+
+	/**
 	 * Merged signal for reclaiming an expired `attempt_ended` lane (issue #833,
 	 * issuecomment-6960912321/6966669378/6967618377).
 	 *
-	 * The remote's integration-branch tip is fetched into a scratch namespace
-	 * (`+<base-ref>:refs/remotes/origin-fresh/HEAD`), so the branch name is never
-	 * hardcoded — gajae-way lands on `dev`, others on `main`) and the lane counts
+	 * The integration base is the lane's recorded base branch when it can be
+	 * recovered from the record (see #recordedBaseBranch), else the remote's
+	 * default branch. Its tip is fetched into a scratch namespace
+	 * (`+<base-ref>:refs/remotes/origin-fresh/HEAD`), so the branch name is
+	 * never hardcoded — gajae-way lands on `dev`, others on `main`) and the lane counts
 	 * as merged only when one of these holds, checked in order:
 	 *
 	 * 1. the lane head is an ancestor of the base tip (regular merge), or
@@ -706,32 +731,48 @@ export class LaneGovernor {
 	 */
 	async #laneMergedIntoBase(
 		name: string,
+		record: LaneJobRecord,
 		headSha: string,
 		repositoryPath: string,
 	): Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string }> {
 		const origin = await runGit(["config", "remote.origin.url"], { cwd: repositoryPath });
 		if (origin.exitCode !== 0 || !origin.stdout.trim()) return { ok: false, reason: "remote_url_missing" };
-		// The integration base is the remote's default branch, never a hardcoded
-		// name: prefer the upstream's symbolic HEAD, else `origin/HEAD` as recorded
-		// by the last full clone/fetch. `HEAD` is unresolvable when the upstream
-		// never set a default-branch symbol (a bare `git init` points `master` at
-		// nothing), so only fetch a ref that exists.
-		const baseTip = await runGit(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], { cwd: repositoryPath });
-		const originHead = baseTip.exitCode === 0 ? baseTip.stdout.trim() : "";
-		let fetchRef = originHead.startsWith("refs/remotes/origin/") ? originHead.slice("refs/remotes/".length) : "HEAD";
+		// The integration base is the lane's recorded base branch when it can be
+		// recovered from the record (the branch the worktree was created from,
+		// still pointing at its recorded baseline sha). gajae-way's default branch
+		// is `main` while lanes land on `dev`; comparing against the remote
+		// default would only recognize a squash-merged lane after the next
+		// dev->main release. Fall back to the remote's default branch, never a
+		// hardcoded name: prefer the upstream's symbolic HEAD, else `origin/HEAD`
+		// as recorded by the last full clone/fetch. `HEAD` is unresolvable when
+		// the upstream never set a default-branch symbol (a bare `git init`
+		// points `master` at nothing), so only fetch a ref that exists.
+		const recordedBase = await this.#recordedBaseBranch(record, repositoryPath);
+		let fetchRef: string;
+		if (recordedBase !== undefined) {
+			fetchRef = `refs/heads/${recordedBase}`;
+			const resolved = await runGit(["rev-parse", "--verify", "--quiet", `${fetchRef}^{commit}`], {
+				cwd: repositoryPath,
+			});
+			if (resolved.exitCode !== 0) return { ok: false, reason: "base_ref_unresolved" };
+		} else {
+			const baseTip = await runGit(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], { cwd: repositoryPath });
+			const originHead = baseTip.exitCode === 0 ? baseTip.stdout.trim() : "";
+			fetchRef = originHead.startsWith("refs/remotes/origin/") ? originHead.slice("refs/remotes/".length) : "HEAD";
+			// The upstream has no default-branch symbol: fall back to the last branch
+			// this lane repository fetched (`origin/HEAD` is equally absent here).
+			if (fetchRef === "HEAD") {
+				const heads = await runGit(["for-each-ref", "--format=%(refname)", "--count=1", "refs/remotes/origin/"], {
+					cwd: repositoryPath,
+				});
+				const first = heads.stdout.trim();
+				if (heads.exitCode === 0 && first.startsWith("refs/remotes/origin/"))
+					fetchRef = `refs/heads/${first.slice("refs/remotes/origin/".length)}`;
+			}
+		}
 		// Refresh only that base tip into a scratch namespace; a packed ref survives
 		// this no-op fetch, so the base is always resolved with
 		// `rev-parse --verify --quiet` below, never via ref files on disk.
-		if (fetchRef === "HEAD") {
-			// The upstream has no default-branch symbol: fall back to the last branch
-			// this lane repository fetched (`origin/HEAD` is equally absent here).
-			const heads = await runGit(["for-each-ref", "--format=%(refname)", "--count=1", "refs/remotes/origin/"], {
-				cwd: repositoryPath,
-			});
-			const first = heads.stdout.trim();
-			if (heads.exitCode === 0 && first.startsWith("refs/remotes/origin/"))
-				fetchRef = `refs/heads/${first.slice("refs/remotes/origin/".length)}`;
-		}
 		const fetch = await runGit(["fetch", "origin", `+${fetchRef}:refs/remotes/origin-fresh/HEAD`], {
 			cwd: repositoryPath,
 			timeoutMs: RECLAIM_REMOTE_FETCH_TIMEOUT_MS,
@@ -750,8 +791,12 @@ export class LaneGovernor {
 		if (mergeBase.exitCode !== 0 || !/^[0-9a-f]{40}$/.test(mergeBaseSha))
 			return { ok: false, reason: "head_not_in_base_history" };
 		// Patch-id equivalence per lane commit: every `-` line means that commit's
-		// changes already exist on the base side of the merge-base.
-		const cherry = await runGit(["cherry", mergeBaseSha, headSha], { cwd: repositoryPath });
+		// changes already exist on the base side of the merge-base. The lane's
+		// commits are compared against the BASE side (`baseSha`, not the
+		// merge-base): `git cherry <merge-base> <head>` has no upstream commits to
+		// subtract and marks every lane commit `+` forever, so the per-commit
+		// patch-id path could never succeed.
+		const cherry = await runGit(["cherry", baseSha, headSha], { cwd: repositoryPath });
 		if (cherry.exitCode !== 0) return { ok: false, reason: "git_cherry_failed" };
 		const laneCommits = cherry.stdout
 			.split("\n")
