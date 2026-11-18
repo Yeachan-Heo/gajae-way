@@ -101,6 +101,7 @@ test("the partition is honest and exhaustive: live, restart-only, or unconsumed"
 	expect(RELOADABLE_FIELDS).toContain("mentionAllowlist");
 	expect(RELOADABLE_FIELDS).toContain("channels");
 	expect(RELOADABLE_FIELDS).toContain("stallTimeoutMs");
+	expect(RELOADABLE_FIELDS).toContain("model");
 	expect(RELOADABLE_FIELDS).toContain("sessions");
 	// Anything bound to a listener, an open database, or the constructed gjc
 	// client is restart-only, and the sets never overlap.
@@ -308,9 +309,23 @@ test("the reload verb reports a restart-only field instead of pretending to appl
 	client.send({ v: "0.1", type: "request", id: "reload", verb: "gateway.reloadConfig" });
 	await waitFor(client.frames, 2);
 	expect(resultOf(client.frames, 1).ok).toBe(true);
-	expect(resultOf(client.frames, 1).changed).toEqual([]);
-	expect(resultOf(client.frames, 1).restartRequired).toEqual(["dbPath", "model"]);
+	expect(resultOf(client.frames, 1).changed).toEqual(["model"]);
+	expect(resultOf(client.frames, 1).restartRequired).toEqual(["dbPath"]);
 	client.close();
+});
+
+test("removing a configured model is reported as restart-required and keeps the live selection", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-reload-"));
+	await writeConfig(directory, { schemaVersion: 1, model: "provider/previous", mentionAllowlist: ["owner"] });
+	const current = await loadConfig({ home: directory });
+	await writeConfig(directory, { schemaVersion: 1, mentionAllowlist: ["owner", "newcomer"] });
+	const result = await reloadConfig(current);
+	expect(result.ok).toBe(true);
+	if (!result.ok) return;
+	expect(result.changed).toEqual(["mentionAllowlist"]);
+	expect(result.restartRequired).toEqual(["model"]);
+	expect(result.config.model).toBe("provider/previous");
+	expect(result.config.mentionAllowlist).toEqual(["owner", "newcomer"]);
 });
 
 test("the reload verb reports failure and keeps serving on an invalid config", async () => {

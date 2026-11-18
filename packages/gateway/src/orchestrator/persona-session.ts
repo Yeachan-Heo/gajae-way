@@ -917,7 +917,7 @@ export class PersonaSessionManager {
 	readonly #instanceId: string;
 	readonly #repo: string;
 	readonly #brokerAgentDir: string | undefined;
-	readonly #sessionModel: GjcModelSelection | undefined;
+	#sessionModel: GjcModelSelection | undefined;
 	#stallTimeoutMs: number;
 	readonly #brokerGeneration: () => number;
 	readonly #brokerAvailable: (() => boolean) | undefined;
@@ -1206,6 +1206,17 @@ export class PersonaSessionManager {
 	reset(originKey: string, originRefJson: string, floorAt = new Date(this.#now()).toISOString()): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
 		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).reset(originRefJson, floorAt));
+	}
+
+	/** Publish the default for future binds and resume inherited model-refusal holds. */
+	setSessionModel(selection: GjcModelSelection): void {
+		this.#sessionModel = selection;
+		for (const actor of this.#actors.values())
+			void actor
+				.enqueue(async () => await actor.defaultModelChanged())
+				.catch((error: unknown) =>
+					this.#log(`persona model reload failed origin=${actor.originKey}: ${safeDiagnostic(error)}`, "error"),
+				);
 	}
 
 	/**
@@ -1953,7 +1964,7 @@ class OriginActor {
 			repo: this.#manager.repo,
 			selection,
 		});
-		this.#appliedModel.set(binding.sessionId, describeModel(selection));
+		this.#appliedModel.set(binding.sessionId, selectIdentity(selection));
 		this.#manager.log(
 			`persona_model origin=${this.originKey} epoch=${binding.epoch} session=${binding.sessionId} effective=${describeModel(selection)} changed=${receipt.changed} source=/model`,
 		);
@@ -1961,6 +1972,13 @@ class OriginActor {
 			this.#modelRefusalPaused = false;
 			await this.#dispatchNext();
 		}
+	}
+
+	/** Retry an inherited, proven refusal using the newly published default. */
+	async defaultModelChanged(): Promise<void> {
+		if (!this.#modelRefusalPaused || this.#manager.database.bindings.modelGet(this.originKey)) return;
+		this.#modelRefusalPaused = false;
+		await this.#dispatchNext();
 	}
 
 	async reconcile(): Promise<void> {
@@ -3047,7 +3065,7 @@ class OriginActor {
 		// prompt can have landed, so holding the BOUND row as an ambiguous send
 		// would brick the origin. Release it to plain pending and retry with
 		// backoff instead.
-		const modelKey = describeModel(lifecycle.effectiveModel);
+		const modelKey = selectIdentity(lifecycle.effectiveModel);
 		let modelReceipt: { readonly changed: boolean } | undefined;
 		let applyingModel = false;
 		try {
@@ -3734,7 +3752,7 @@ class OriginActor {
 			...(this.#manager.sessionModel ? { model: this.#manager.sessionModel } : {}),
 		});
 		if (binding.startupModelApplied && this.#manager.sessionModel)
-			this.#appliedModel.set(binding.sessionId, describeModel(this.#manager.sessionModel));
+			this.#appliedModel.set(binding.sessionId, selectIdentity(this.#manager.sessionModel));
 		return binding;
 	}
 
@@ -6166,6 +6184,13 @@ function describeModel(selection: GjcModelSelection | undefined): string {
 		: typeof selection === "string"
 			? selection
 			: `preset:${selection.preset}`;
+}
+
+/** Generates a type-tagged unique identity for a model selection to avoid cache collisions. */
+function selectIdentity(selection: GjcModelSelection | undefined): string {
+	if (selection === undefined) return "undefined";
+	if (typeof selection === "string") return `string:${selection}`;
+	return `object:preset:${selection.preset}`;
 }
 
 function sameRecoveryAuthority(left: BrokerSession | undefined, right: BrokerSession | undefined): boolean {

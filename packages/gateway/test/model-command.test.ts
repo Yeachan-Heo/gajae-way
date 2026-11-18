@@ -2,8 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { GatewayConfig } from "../src/config";
+import { type GatewayConfig, loadConfig } from "../src/config";
+import { MonitorRegistry } from "../src/monitors/registry";
 import { GlobalGjcClient, parseListModelsOutput } from "../src/orchestrator/broker";
+import { ModelNotSelectedError } from "../src/orchestrator/session-port";
 import {
 	applyModelCommand,
 	listModelChoices,
@@ -14,7 +16,7 @@ import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import type { GjcModelSelection } from "../src/store/groups/bindings";
 import type { WriteTx } from "../src/store/tx";
-import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort, sessionPortFromScript } from "./session-port.fake";
 
 function store(initial?: GjcModelSelection) {
 	let current = initial;
@@ -660,6 +662,245 @@ test("session.modelChoices keeps the named choices when the provider listing fai
 		console.error = previousError;
 	}
 	expect(errors).toContain("model_choices_provider_list_failed reason=gjc --list-models exited 1");
+});
+
+test("#798 reload rebinds persisted default sessions without changing overrides or history", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-default-rebind-"));
+	const agentDir = join(home, "agent");
+	const writeConfig = (model: string) =>
+		Bun.write(join(home, "config.json"), JSON.stringify({ schemaVersion: 1, gjc: { agentDir }, model }));
+	await writeConfig("provider/model-a");
+	const config = await loadConfig({ home });
+	const database = await Store.open(config.dbPath);
+	const port = attachTestBrokerOwnership(database, new ScriptedSessionPort(), agentDir);
+	let server: GatewayServer | undefined;
+	let client: Awaited<ReturnType<typeof connect>> | undefined;
+	try {
+		server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
+		client = await connect(config.socketPath);
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		const inherited = { platform: "loopback", kind: "loopback", conversationId: "inherited" };
+		const overridden = { platform: "loopback", kind: "loopback", conversationId: "overridden" };
+		const fresh = { platform: "loopback", kind: "loopback", conversationId: "fresh" };
+		database.transaction((tx) => database.bindings.modelSet(tx, "loopback/loopback/overridden", "provider/override"));
+		for (const [id, origin] of [
+			["first", inherited],
+			["override-first", overridden],
+		] as const) {
+			await requestOverSocket(client, id, "chat.send", { origin, messageId: id, text: id });
+		}
+		await waitFor(() => port.sends.length === 2, "initial sessions did not start");
+		const inheritedId = database.bindings.getSessionRecord("loopback/loopback/inherited")?.sessionId;
+		const overriddenId = database.bindings.getSessionRecord("loopback/loopback/overridden")?.sessionId;
+		if (!inheritedId || !overriddenId) throw new Error("initial session bindings were not recorded");
+		const initial = [...port.sends];
+		const initialModels = [...port.models];
+		const overrideCalls = port.models.filter((entry) => entry.sessionId === overriddenId).length;
+		await writeConfig("provider/model-b");
+		expect(await requestOverSocket(client, "reload", "gateway.reloadConfig")).toMatchObject({
+			result: { ok: true, changed: ["model"], restartRequired: [] },
+		});
+		// Reload never mutates a session during an accepted turn.
+		expect(port.models).toEqual(initialModels);
+		for (const turn of initial) port.complete(turn.opRef, "retained transcript");
+		await waitFor(
+			() => initial.every((turn) => database.inbox.turnRow(turn.opRef)?.turn_state === "done"),
+			"initial sessions did not settle",
+		);
+		for (const [id, origin] of [
+			["second", inherited],
+			["override-second", overridden],
+			["new", fresh],
+		] as const) {
+			await requestOverSocket(client, id, "chat.send", { origin, messageId: id, text: id });
+		}
+		await waitFor(() => port.sends.length === 5, "turns after reload did not start");
+		expect(database.bindings.getSessionRecord("loopback/loopback/inherited")?.sessionId).toBe(inheritedId);
+		expect(database.bindings.getSessionRecord("loopback/loopback/overridden")?.sessionId).toBe(overriddenId);
+		expect(port.transcript(inheritedId)).toContain("retained transcript");
+		expect(port.models.filter((entry) => entry.sessionId === inheritedId).at(-1)?.selection).toBe("provider/model-b");
+		expect(port.models.filter((entry) => entry.sessionId === overriddenId)).toHaveLength(overrideCalls);
+		expect(port.models.filter((entry) => entry.sessionId === overriddenId).at(-1)?.selection).toBe("provider/override");
+		expect(port.binds.find((entry) => entry.originKey === "loopback/loopback/fresh")?.model).toBe("provider/model-b");
+		for (const turn of port.sends.slice(2)) port.complete(turn.opRef, "done");
+	} finally {
+		client?.close();
+		try {
+			await server?.stop();
+		} finally {
+			if (!server) database.close();
+			await rm(home, { recursive: true, force: true });
+		}
+	}
+});
+
+test("#798 reload retries a model-refused inherited turn without unpausing an override", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-default-refusal-"));
+	const agentDir = join(home, "agent");
+	const writeConfig = (model?: string) =>
+		Bun.write(join(home, "config.json"), JSON.stringify({ schemaVersion: 1, gjc: { agentDir }, model }));
+	await writeConfig();
+	const config = await loadConfig({ home });
+	const database = await Store.open(config.dbPath);
+	class RefusingPort extends ScriptedSessionPort {
+		repaired = false;
+		override async send(input: Parameters<ScriptedSessionPort["send"]>[0]) {
+			if (!this.repaired) {
+				this.sendAttempts.push(input);
+				throw new ModelNotSelectedError(input.opRef);
+			}
+			return await super.send(input);
+		}
+	}
+	const port = attachTestBrokerOwnership(database, new RefusingPort(), agentDir);
+	let server: GatewayServer | undefined;
+	let client: Awaited<ReturnType<typeof connect>> | undefined;
+	try {
+		server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
+		client = await connect(config.socketPath);
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		const inherited = { platform: "loopback", kind: "loopback", conversationId: "inherited-refusal" };
+		const overridden = { platform: "loopback", kind: "loopback", conversationId: "overridden-refusal" };
+		const inheritedKey = "loopback/loopback/inherited-refusal";
+		const overriddenKey = "loopback/loopback/overridden-refusal";
+		database.transaction((tx) => database.bindings.modelSet(tx, overriddenKey, "provider/override"));
+		await requestOverSocket(client, "inherited-refusal", "chat.send", {
+			origin: inherited,
+			messageId: "inherited-refusal",
+			text: "retry me",
+		});
+		await requestOverSocket(client, "override-refusal", "chat.send", {
+			origin: overridden,
+			messageId: "override-refusal",
+			text: "stay paused",
+		});
+		await waitFor(
+			() =>
+				port.sendAttempts.length === 2 &&
+				database.inbox.pendingOldest(inheritedKey)?.state === "pending" &&
+				database.inbox.pendingOldest(overriddenKey)?.state === "pending",
+			"both refusals were not durably requeued",
+		);
+		const sessionId = database.bindings.getSessionRecord(inheritedKey)?.sessionId;
+		const overriddenId = database.bindings.getSessionRecord(overriddenKey)?.sessionId;
+		if (!sessionId || !overriddenId) throw new Error("refused session bindings were not recorded");
+		const overrideCalls = port.models.filter((entry) => entry.sessionId === overriddenId).length;
+		port.repaired = true;
+		await writeConfig("provider/repaired");
+		expect(await requestOverSocket(client, "reload-refusal", "gateway.reloadConfig")).toMatchObject({
+			result: { ok: true, changed: ["model"], restartRequired: [] },
+		});
+		await waitFor(() => port.sends.length === 1, "inherited refusal did not resume after reload");
+		expect(port.sends[0]).toMatchObject({ sessionId, text: expect.stringContaining("retry me") });
+		expect(port.models.filter((entry) => entry.sessionId === sessionId).at(-1)?.selection).toBe("provider/repaired");
+		expect(port.models.filter((entry) => entry.sessionId === overriddenId)).toHaveLength(overrideCalls);
+		await requestOverSocket(client, "override-later", "chat.send", {
+			origin: overridden,
+			messageId: "override-later",
+			text: "still paused",
+		});
+		await waitFor(() => database.inbox.pendingCount(overriddenKey) === 2, "override messages were not queued");
+		expect(port.sendAttempts).toHaveLength(3);
+		expect(database.inbox.pendingOldest(overriddenKey)?.message_id).toBe("override-refusal");
+		const resumed = port.sends[0];
+		if (!resumed) throw new Error("resumed turn was not sent");
+		port.complete(resumed.opRef, "done");
+	} finally {
+		client?.close();
+		try {
+			await server?.stop();
+		} finally {
+			if (!server) database.close();
+			await rm(home, { recursive: true, force: true });
+		}
+	}
+});
+
+test("#798 reload updates monitor defaults while preserving per-monitor models", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-reload-"));
+	const agentDir = join(home, "agent");
+	const writeConfig = (model: string) =>
+		Bun.write(join(home, "config.json"), JSON.stringify({ schemaVersion: 1, gjc: { agentDir }, model }));
+	await writeConfig("provider/model-a");
+	const config = await loadConfig({ home });
+	const database = await Store.open(config.dbPath);
+	const port = attachTestBrokerOwnership(
+		database,
+		sessionPortFromScript({
+			bind: async (origin) => ({ sessionId: origin }),
+			respond: async (_id, prompt) => {
+				const serialized = prompt.match(/\[.*\]$/s)?.[0];
+				if (!serialized) throw new Error("monitor prompt has no event array");
+				const events = JSON.parse(serialized) as Array<{ eventId: string }>;
+				return JSON.stringify(events.map(({ eventId }) => ({ eventId, note: "ok" })));
+			},
+		}),
+		agentDir,
+	);
+	const registry = new MonitorRegistry(database);
+	const inherited = registry.add({
+		name: "inherited",
+		trigger: { kind: "cron", schedule: "* * * * *" },
+		eventTypes: ["inherit.tick"],
+		burstPolicy: "serialize",
+	});
+	const overridden = registry.add({
+		name: "overridden",
+		trigger: { kind: "cron", schedule: "* * * * *" },
+		eventTypes: ["override.tick"],
+		burstPolicy: "serialize",
+		model: "provider/override",
+	});
+	const bind = port.bind.bind(port);
+	port.bind = async (input) => {
+		const existing = database.bindings.getSessionRecord(input.originKey)?.sessionId;
+		const result = await bind(input);
+		return existing ? { ...result, startupModelApplied: false } : result;
+	};
+	const applied: Array<{ sessionId: string; selection: GjcModelSelection }> = [];
+	const setModel = port.setModel.bind(port);
+	port.setModel = async (input) => {
+		applied.push({ sessionId: input.sessionId, selection: input.selection });
+		return await setModel(input);
+	};
+	let server: GatewayServer | undefined;
+	let client: Awaited<ReturnType<typeof connect>> | undefined;
+	try {
+		server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
+		client = await connect(config.socketPath);
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		const monitorClient = client;
+		const fire = async (id: string, monitorId: string) => {
+			const response = await requestOverSocket(monitorClient, id, "monitor.test", { monitorId });
+			const eventId = (response.result as { eventId: string }).eventId;
+			await waitFor(() => database.monitors.authoredOutput(eventId) === "ok", `monitor ${id} did not finish`);
+		};
+		await fire("inherited-before", inherited.monitorId);
+		await fire("override-before", overridden.monitorId);
+		await writeConfig("provider/model-b");
+		expect(await requestOverSocket(client, "reload-monitor", "gateway.reloadConfig")).toMatchObject({
+			result: { ok: true, changed: ["model"], restartRequired: [] },
+		});
+		await fire("inherited-after", inherited.monitorId);
+		await fire("override-after", overridden.monitorId);
+		expect(port.binds.map((entry) => entry.model)).toEqual([
+			"provider/model-a",
+			"provider/override",
+			"provider/model-b",
+			"provider/override",
+		]);
+		expect(applied).toEqual([
+			{ sessionId: `monitor/eventtype/inherit.tick/parent=${inherited.monitorId}`, selection: "provider/model-b" },
+		]);
+	} finally {
+		client?.close();
+		try {
+			await server?.stop();
+		} finally {
+			if (!server) database.close();
+			await rm(home, { recursive: true, force: true });
+		}
+	}
 });
 
 test("session.modelChoices lists nothing to anyone but the owner (#796)", async () => {
