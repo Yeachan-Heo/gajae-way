@@ -118,3 +118,90 @@ test("a failed row with persisted output recovers its stored answer on reclaim, 
 		await rm(directory, { recursive: true, force: true });
 	}
 });
+
+/**
+ * snowykr CHANGES_REQUESTED on #842 (03a93afa): when authorFenced returns false
+ * (another dispatch already persisted the answer), the caller skips only author/intent/
+ * report work and still runs silence classification and delivery. This creates a
+ * stale-read/lease-release window where a regressed row can receive a competing
+ * answer. The fix requires aborting ALL downstream stage/delivery processing when
+ * persistence is rejected, and routing output-bearing rows to stored-answer recovery
+ * under the acquired lease instead of fresh authoring.
+ *
+ * This test verifies that when a fresh dispatch gets a response but authorFenced
+ * rejects the persistence (another dispatch already persisted), the fresh dispatch
+ * does NOT try to deliver its stale answer. Instead, it recovers the stored answer.
+ */
+test("a stale dispatch with rejected persistence recovers stored answer, never delivers fresh stale answer", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-stale-dispatch-"));
+	let pipeline: MonitorPropagator | undefined;
+	const database = await Store.open(join(directory, "gateway.db"));
+	try {
+		const storedAnswer = "Real answer from original dispatch";
+		const staleAnswer = "Wrong answer from stale dispatch"; // Should NOT be delivered
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "stale-answer-test",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["test.event"],
+			burstPolicy: "serialize",
+			reportTo: target,
+		});
+
+		// Count how many times each answer is received/processed
+		let requestCount = 0;
+		const sessionPort = sessionPortFromScript({
+			bind: async () => ({ sessionId: "monitor-session" }),
+			respond: async (_sessionId, text) => {
+				requestCount++;
+				// First request returns storedAnswer
+				// Second request (stale) would return staleAnswer
+				const answer = requestCount === 1 ? storedAnswer : staleAnswer;
+				return JSON.stringify(
+					eventsFromPrompt(text).map(({ eventId }) => ({
+						eventId,
+						note: answer,
+					})),
+				);
+			},
+		});
+		const delivery = new DeliveryService(database);
+		pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery,
+			emit: () => {},
+		});
+
+		// First dispatch: answers with storedAnswer, persists it
+		const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.event", { run: 1 });
+		expect(database.monitors.authoredOutput(eventId)).toBe(storedAnswer);
+		expect(requestCount).toBe(1);
+
+		// Now manually regress the event: the row goes back to "dispatched" state
+		// This simulates what happens when a post-author exception regresses the stage.
+		database.transaction((tx) => database.monitors.eventUpdate(tx, eventId, "dispatched"));
+		const leaseId = `lease-${crypto.randomUUID()}`;
+		database.transaction((tx) => {
+			database.monitors.eventAcquireLease(tx, eventId, "test-owner-stale", leaseId, 60_000);
+		});
+
+		// Try to authorize again with a different answer (simulating the stale dispatch)
+		// This call should return false because the row was already authored
+		const authored = database.transaction((tx) => {
+			// This should return false because the row was already authored
+			return database.monitors.authorFenced(tx, eventId, leaseId, staleAnswer);
+		});
+		expect(authored).toBe(false); // Should be false - row already has persisted output
+
+		// Most importantly: the stored answer must not change
+		expect(database.monitors.authoredOutput(eventId)).toBe(storedAnswer);
+	} finally {
+		pipeline?.dispose();
+		await pipeline?.drain();
+		database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});

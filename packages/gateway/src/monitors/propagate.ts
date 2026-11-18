@@ -1765,6 +1765,7 @@ export class MonitorPropagator {
 					if (!seenIds.has(id)) throw new Error(`authoring response omits event ${id}`);
 				}
 				protocolValidationActive = false;
+				const successfullyAuthoredIds = new Set<string>();
 				for (const entry of authored)
 					if (
 						typeof entry.eventId === "string" &&
@@ -1798,7 +1799,13 @@ export class MonitorPropagator {
 							if (reportable) this.#enqueueMonitorReport(tx, monitor, row, entry.note as string);
 							return true;
 						});
-						if (!authoredOk) continue;
+						if (!authoredOk) {
+							// Persistence was rejected: another dispatch already persisted the answer.
+							// Skip further processing (do not deliver stale response). The stored answer
+							// will be delivered by its owning dispatch, not this stale attempt.
+							continue;
+						}
+						successfullyAuthoredIds.add(entry.eventId);
 						// Wake the closure queue so the atomically admitted intent is
 						// processed in the same run (no restart needed).
 						this.#memory.enqueueExistingId(intentId);
@@ -1821,6 +1828,10 @@ export class MonitorPropagator {
 				if (!target) {
 					let noDeliveryRecorded = false;
 					for (const row of fenced) {
+						if (!successfullyAuthoredIds.has(row.event_id)) {
+							// Skip rows whose persistence was rejected: they were not authored by this dispatch
+							continue;
+						}
 						if (this.#database.monitors.authoredOutput(row.event_id) === undefined) continue;
 						const updated = this.#database.transaction((tx) =>
 							this.#database.monitors.eventFencedUpdate(tx, row.event_id, leaseId, "authored_no_delivery", batchId),
@@ -1839,11 +1850,13 @@ export class MonitorPropagator {
 				const deliveryId = crypto.randomUUID();
 				// Evaluate silence PER NOTE BEFORE joining: a silent note in a batch
 				// must not leak, and a real note must not be swallowed by a neighbour's marker.
+				// Only process entries that were successfully authored (persistence accepted).
 				const nonSilentEntries = authored
 					.filter(
 						(entry): entry is { eventId: string; note: string } =>
 							typeof entry.eventId === "string" &&
 							typeof entry.note === "string" &&
+							successfullyAuthoredIds.has(entry.eventId) &&
 							fenced.some((row) => row.event_id === entry.eventId),
 					)
 					.filter((entry) => !isSilentOutput(entry.note));
@@ -1852,6 +1865,7 @@ export class MonitorPropagator {
 						(entry): entry is { eventId: string; note: string } =>
 							typeof entry.eventId === "string" &&
 							typeof entry.note === "string" &&
+							successfullyAuthoredIds.has(entry.eventId) &&
 							fenced.some((row) => row.event_id === entry.eventId),
 					)
 					.filter((entry) => isSilentOutput(entry.note));
