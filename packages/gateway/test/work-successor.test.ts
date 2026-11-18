@@ -481,16 +481,21 @@ test("a child report drained after the parent's hold lands is retained instead o
 		};
 	};
 	try {
-		// Wait for status to be queried (observable event that triggers state transition).
+		// Wait deterministically for status to be queried (observable event that triggers state transition).
 		// Use longer timeout since observer scheduling may be delayed on loaded systems like darwin-arm64.
-		await Promise.race([
-			statusQueryPromise.then(() => {}),
-			new Promise<void>((resolve) => setTimeout(resolve, 5000)),
-		]);
-		// After status is queried or timeout, verify state changed.
-		for (let i = 0; i < 100 && f.job("steady").state !== "awaiting_operator"; i++) await Bun.sleep(5);
+		const statusReceived = new Promise<void>((resolve, reject) => {
+			const timeout = setTimeout(() => reject(new Error("Status query not received within timeout")), 10000);
+			statusQueryPromise.then(() => {
+				clearTimeout(timeout);
+				resolve();
+			});
+		});
+		await statusReceived;
+		// After status is queried, verify state changed with deterministic assertion.
+		await until(() => f.job("steady").state === "awaiting_operator");
 		// The hold is durable without any proof that the native execution ended.
-		const parked = f.db.work.workAttemptGet(parent.opRef)!;
+		const parked = f.db.work.workAttemptGet(parent.opRef);
+		if (!parked) throw new Error("parked work not found");
 		expect(parked.terminal).toBeNull();
 		expect(parked.turnEndObservedAt).toBeUndefined();
 	} finally {
