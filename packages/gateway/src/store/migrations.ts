@@ -233,8 +233,7 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 		host.withTransaction(() => {
 			// Issue #20: per-conversation model override. This lives beside session
 			// state rather than in config.json, because config is the owner's file
-			// (a slash command must not race their editor) and `model` is not a
-			// reloadable field, so a config write would not be read until restart.
+			// (a slash command must not race their editor).
 			host.database.execute(
 				"CREATE TABLE IF NOT EXISTS conversation_model (origin_key TEXT PRIMARY KEY, selection_json TEXT NOT NULL, set_by TEXT, updated_at TEXT NOT NULL)",
 			);

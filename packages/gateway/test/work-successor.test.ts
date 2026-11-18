@@ -429,7 +429,7 @@ test("a child report drained after the parent's hold lands is retained instead o
 	};
 	const firstChild = await child("first-child");
 	const secondChild = await child("second-child");
-	// One drain snapshot must carry both reports, so the second admission reuses the first's job read.
+	// Keep both reports behind one drain snapshot, while making their admission order explicit.
 	let steers = 0;
 	let steered!: () => void;
 	let release!: () => void;
@@ -451,8 +451,13 @@ test("a child report drained after the parent's hold lands is retained instead o
 	};
 	await f.port.runExclusive(workSessionKey("steady"), async () => {
 		f.port.complete(firstChild.opRef, "first child result");
+		await until(() => f.db.work.laneReportsByParent("steady").some((row) => row.child_op_ref === firstChild.opRef));
 		f.port.complete(secondChild.opRef, "second child result");
 		await until(() => f.db.work.laneReportsByParent("steady").length === 2);
+		expect(f.db.work.laneReportsByParent("steady").map((row) => row.child_op_ref)).toEqual([
+			firstChild.opRef,
+			secondChild.opRef,
+		]);
 	});
 	await steering;
 	// The parent's observer holds the lane outside this session lock while the first steer is out.
