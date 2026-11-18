@@ -351,33 +351,51 @@ interface InboundContext {
  * publishing and returns the previous config on any error, so a failed reload
  * cannot leave the daemon half-applied. Every outcome is logged with the fields
  * applied and the fields refused as restart-only.
+ * Serializes concurrent reloads to ensure each computes against the latest
+ * published config and applies atomically.
  */
 async function applyConfigReload(
 	runtime: Runtime,
 	options: GatewayServerOptions,
 	trigger: string,
 ): Promise<ReloadResult> {
-	const result = await reloadConfig(runtime.config, options.overrides);
-	if (!result.ok) {
-		console.error(
-			`gateway config reload (${trigger}) FAILED; keeping the previous config: ${result.diagnostics
-				.map((diagnostic) => `${diagnostic.code}: ${diagnostic.message}`)
-				.join("; ")}`,
+	// Wait for any in-flight reload to complete before starting this one.
+	// This ensures each reload computes against the latest published config.
+	let resolveChain: (() => void) | undefined;
+	const chainPromise = new Promise<void>((resolve) => {
+		resolveChain = resolve;
+	});
+	const previousChain = runtime.reloadMutex.current;
+	runtime.reloadMutex.current = previousChain.then(() => chainPromise);
+
+	try {
+		// Wait for prior reload to complete.
+		await previousChain;
+
+		const result = await reloadConfig(runtime.config, options.overrides);
+		if (!result.ok) {
+			console.error(
+				`gateway config reload (${trigger}) FAILED; keeping the previous config: ${result.diagnostics
+					.map((diagnostic) => `${diagnostic.code}: ${diagnostic.message}`)
+					.join("; ")}`,
+			);
+			return result;
+		}
+		runtime.config = result.config;
+		runtime.personaSessions.setStallTimeoutMs(result.config.stallTimeoutMs);
+		runtime.personaSessions.setHostLimits(result.config.sessions);
+		if (result.changed.includes("model") && result.config.model) {
+			runtime.personaSessions.setSessionModel(result.config.model);
+			runtime.monitors.setDefaultModel(result.config.model);
+		}
+		options.broker?.setMaxPoolSize(result.config.sessions?.maxLiveHosts ?? DEFAULT_SESSIONS_MAX_LIVE_HOSTS);
+		console.info(
+			`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
 		);
 		return result;
+	} finally {
+		resolveChain?.();
 	}
-	runtime.config = result.config;
-	runtime.personaSessions.setStallTimeoutMs(result.config.stallTimeoutMs);
-	runtime.personaSessions.setHostLimits(result.config.sessions);
-	if (result.changed.includes("model") && result.config.model) {
-		runtime.personaSessions.setSessionModel(result.config.model);
-		runtime.monitors.setDefaultModel(result.config.model);
-	}
-	options.broker?.setMaxPoolSize(result.config.sessions?.maxLiveHosts ?? DEFAULT_SESSIONS_MAX_LIVE_HOSTS);
-	console.info(
-		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
-	);
-	return result;
 }
 
 /**
@@ -469,6 +487,8 @@ function startMemoryOperation(runtime: Runtime, opRef: string, work: () => Promi
 interface Runtime {
 	/** The live config republished by SIGHUP/reload. */
 	config: GatewayConfig;
+	/** Serializes concurrent reload operations to prevent stale config application. */
+	readonly reloadMutex: { current: Promise<void> };
 	/** Canonical persona workspace shared by session binding and outbound file checks. */
 	readonly workspace: string;
 	readonly delivery: DeliveryService;
@@ -1358,6 +1378,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	}
 	runtime = {
 		config: options.config,
+		reloadMutex: { current: Promise.resolve() },
 		stopping: false,
 		workspace,
 		delivery,

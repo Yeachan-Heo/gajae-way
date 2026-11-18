@@ -1964,7 +1964,7 @@ class OriginActor {
 			repo: this.#manager.repo,
 			selection,
 		});
-		this.#appliedModel.set(binding.sessionId, describeModel(selection));
+		this.#appliedModel.set(binding.sessionId, selectIdentity(selection));
 		this.#manager.log(
 			`persona_model origin=${this.originKey} epoch=${binding.epoch} session=${binding.sessionId} effective=${describeModel(selection)} changed=${receipt.changed} source=/model`,
 		);
@@ -3065,7 +3065,7 @@ class OriginActor {
 		// prompt can have landed, so holding the BOUND row as an ambiguous send
 		// would brick the origin. Release it to plain pending and retry with
 		// backoff instead.
-		const modelKey = describeModel(lifecycle.effectiveModel);
+		const modelKey = selectIdentity(lifecycle.effectiveModel);
 		let modelReceipt: { readonly changed: boolean } | undefined;
 		let applyingModel = false;
 		try {
@@ -3752,7 +3752,7 @@ class OriginActor {
 			...(this.#manager.sessionModel ? { model: this.#manager.sessionModel } : {}),
 		});
 		if (binding.startupModelApplied && this.#manager.sessionModel)
-			this.#appliedModel.set(binding.sessionId, describeModel(this.#manager.sessionModel));
+			this.#appliedModel.set(binding.sessionId, selectIdentity(this.#manager.sessionModel));
 		return binding;
 	}
 
@@ -6184,6 +6184,13 @@ function describeModel(selection: GjcModelSelection | undefined): string {
 		: typeof selection === "string"
 			? selection
 			: `preset:${selection.preset}`;
+}
+
+/** Generates a type-tagged unique identity for a model selection to avoid cache collisions. */
+function selectIdentity(selection: GjcModelSelection | undefined): string {
+	if (selection === undefined) return "undefined";
+	if (typeof selection === "string") return `string:${selection}`;
+	return `object:preset:${selection.preset}`;
 }
 
 function sameRecoveryAuthority(left: BrokerSession | undefined, right: BrokerSession | undefined): boolean {

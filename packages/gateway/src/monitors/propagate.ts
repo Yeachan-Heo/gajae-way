@@ -1362,11 +1362,7 @@ export class MonitorPropagator {
 					boundSessionId = sessionId;
 					boundSessionEpoch = binding.epoch;
 					dispatchPhase = "configure";
-					const modelKey = effectiveModel
-						? typeof effectiveModel === "string"
-							? effectiveModel
-							: `preset:${effectiveModel.preset}`
-						: undefined;
+					const modelKey = selectIdentity(effectiveModel);
 					if (effectiveModel && !binding.startupModelApplied && this.#appliedModels.get(sessionId) !== modelKey) {
 						dispatchOperation = "setModel";
 						dispatchOperationArgs = {
@@ -3355,4 +3351,11 @@ export function failureDetail(error: unknown): string {
 		...(causeCode && causeCode !== code ? { causeCode } : {}),
 		...(message ? { message } : {}),
 	});
+}
+
+/** Generates a type-tagged unique identity for a model selection to avoid cache collisions. */
+function selectIdentity(selection: GjcModelSelection | undefined): string {
+	if (selection === undefined) return "undefined";
+	if (typeof selection === "string") return `string:${selection}`;
+	return `object:preset:${selection.preset}`;
 }

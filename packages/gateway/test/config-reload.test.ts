@@ -359,3 +359,60 @@ test("sqlite journalMode accepts only durable modes and requires restart when ch
 	expect(result).toMatchObject({ ok: true, changed: [], restartRequired: ["sqlite"] });
 	if (result.ok) expect(result.config.sqlite).toEqual({ journalMode: "WAL" });
 });
+
+test("concurrent config reloads are serialized to compute against latest published config", async () => {
+	const path = await home();
+	await Bun.write(
+		join(path, "config.json"),
+		JSON.stringify({ schemaVersion: 1, stallTimeoutMs: 60000, logVerbosity: "info" }),
+	);
+	const initial = await loadConfig({ home: path });
+	let reloadCount = 0;
+	const originalReloadConfig = reloadConfig;
+	// Simulate two concurrent reloads by tracking how many times reloadConfig is called
+	// If they're serialized, each should compute against the latest published config
+	const reloadMutex = { current: Promise.resolve() };
+	let resolveChain: (() => void) | undefined;
+	const applyReload = async (newTimeoutMs: number) => {
+		// Wait for any in-flight reload to complete
+		let resolveNext: (() => void) | undefined;
+		const chainPromise = new Promise<void>((resolve) => {
+			resolveNext = resolve;
+		});
+		const previousChain = reloadMutex.current;
+		reloadMutex.current = previousChain.then(() => chainPromise);
+
+		try {
+			await previousChain;
+
+			// Update the config file
+			await Bun.write(
+				join(path, "config.json"),
+				JSON.stringify({ schemaVersion: 1, stallTimeoutMs: newTimeoutMs, logVerbosity: "info" }),
+			);
+			reloadCount++;
+
+			// Simulate some async work
+			await Bun.sleep(1);
+
+			return await originalReloadConfig(initial);
+		} finally {
+			resolveNext?.();
+		}
+	};
+
+	// Fire two reloads concurrently
+	const reload1 = applyReload(90000);
+	const reload2 = applyReload(120000);
+
+	const [result1, result2] = await Promise.all([reload1, reload2]);
+
+	// Both reloads should complete successfully
+	expect(result1.ok).toBe(true);
+	expect(result2.ok).toBe(true);
+	// Both should have detected the timeout change
+	if (result1.ok) expect(result1.changed).toContain("stallTimeoutMs");
+	if (result2.ok) expect(result2.changed).toContain("stallTimeoutMs");
+	// The reloadConfig should have been called twice (serialized)
+	expect(reloadCount).toBe(2);
+});

@@ -6568,3 +6568,31 @@ test("a notice during a gateway turn steers its gateway framing without lane-rep
 	expect(f.port.steers[0]!.text).toContain("[Gateway notice]");
 	expect(f.port.steers[0]!.text).not.toContain("Internal lane report");
 });
+
+test("model selection transitions are not skipped by cache collisions between string and object representations", async () => {
+	const port = new ScriptedSessionPort();
+	const terminal: string[] = [];
+	await harness(
+		port,
+		{
+			terminal: (text) => terminal.push(text),
+			modelRefusal: () => {
+				/* noop */
+			},
+		},
+	);
+	enqueue("test-turn", "test message");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length > 0, "no sends were made");
+	const sessionId = port.sends[0]!.sessionId;
+	const setModelsAtStart = port.models.filter((m) => m.sessionId === sessionId).length;
+	// Rebind to a preset (object) model
+	await manager!.rebindModel(KEY, { preset: "gpt-4" });
+	const afterPreset = port.models.filter((m) => m.sessionId === sessionId).length;
+	// Rebind to a string model - should not be skipped even though it could collide
+	await manager!.rebindModel(KEY, "provider/claude-opus");
+	const afterString = port.models.filter((m) => m.sessionId === sessionId).length;
+	// Verify all transitions happened (all three different model calls succeeded)
+	expect(afterPreset).toBe(setModelsAtStart + 1);
+	expect(afterString).toBe(setModelsAtStart + 2);
+});
