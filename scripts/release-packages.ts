@@ -158,10 +158,18 @@ async function readPublishedVersions(name: string, cwd: string): Promise<string[
 // instead of hiding it. The version list and the dist-tag pointer come from the same
 // registry document, so a cache stale for one can be stale for the other; what this
 // removes is authorizing a write from the pointer alone.
-async function channelTarget(name: string, version: string, tag: string, cwd: string): Promise<string> {
+async function channelTarget(
+	name: string,
+	version: string,
+	tag: string,
+	cwd: string,
+	afterOwnPublish = false,
+): Promise<string> {
 	const channel = CHANNEL_FLOORS.get(tag);
 	if (channel === undefined) return version;
-	const published = await readPublishedVersions(name, cwd);
+	const published = afterOwnPublish
+		? await readPublishedVersionsListing(name, version, cwd)
+		: await readPublishedVersions(name, cwd);
 	let highest: string | undefined;
 	try {
 		highest = highestPublishedVersion(published, channel);
@@ -170,6 +178,32 @@ async function channelTarget(name: string, version: string, tag: string, cwd: st
 	}
 	if (highest === undefined) return version;
 	return forwardTarget(version, highest, `npm published-version list for ${name}`);
+}
+
+// npm accepts a publish before the registry has processed it ("may take a few minutes to
+// become available"): until then the packument still lists neither the version nor the
+// tag `npm publish` wrote. A document that does not reflect this run's own publish is not
+// evidence that the channel tag is behind, and repairing from it would issue a dist-tag
+// write the publish already made. The reconcile therefore waits until the version is
+// listed; the tag map lives in the same packument. A registry that never catches up
+// fails the run, and a rerun resumes the already-published version.
+const PUBLISH_VISIBILITY_ATTEMPTS = 40;
+const PUBLISH_VISIBILITY_POLL_MS = 15_000;
+
+async function readPublishedVersionsListing(name: string, version: string, cwd: string): Promise<string[]> {
+	for (let attempt = 1; ; attempt++) {
+		const published = await readPublishedVersions(name, cwd);
+		if (published.includes(version)) return published;
+		if (attempt >= PUBLISH_VISIBILITY_ATTEMPTS) {
+			throw new Error(
+				`${name}@${version} is still missing from the registry's published-version list after ${(PUBLISH_VISIBILITY_ATTEMPTS * PUBLISH_VISIBILITY_POLL_MS) / 1000}s; rerun the release to resume once the registry has processed it`,
+			);
+		}
+		console.log(
+			`\nwaiting for the registry to list ${name}@${version} (attempt ${attempt}/${PUBLISH_VISIBILITY_ATTEMPTS})`,
+		);
+		await Bun.sleep(PUBLISH_VISIBILITY_POLL_MS);
+	}
 }
 
 // The version this tag may end up on: a candidate that already points past this version
@@ -479,7 +513,7 @@ const CONVERGENCE_ATTEMPTS = 3;
 
 async function reconcileChannel(name: string, version: string, tag: string, cwd: string): Promise<void> {
 	for (let attempt = 0; attempt < CONVERGENCE_ATTEMPTS; attempt++) {
-		const target = await channelTarget(name, version, tag, cwd);
+		const target = await channelTarget(name, version, tag, cwd, true);
 		const pointer = await readDistTagVersion(name, tag, cwd);
 		if (pointer !== undefined && semverOrderOrThrow(pointer, target, `npm dist-tag ${tag} for ${name}`) >= 0) return;
 		console.log(`\n${name}@${tag} stays with ${target}; converged forward while ${version} was being released.`);
@@ -500,7 +534,7 @@ async function reconcileChannel(name: string, version: string, tag: string, cwd:
 		let floor: string;
 		let pointer: string | undefined;
 		try {
-			floor = await channelTarget(name, version, tag, cwd);
+			floor = await channelTarget(name, version, tag, cwd, true);
 			pointer = await readDistTagVersion(name, tag, cwd);
 		} catch (error) {
 			readFailure = `dist-tag ${tag} for ${name} could not be read after ${CONVERGENCE_ATTEMPTS} convergence attempts: ${error instanceof Error ? error.message : String(error)}`;
