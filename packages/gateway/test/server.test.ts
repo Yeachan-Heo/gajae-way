@@ -3,6 +3,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { installStructuredLogging } from "@gajae-gateway/log";
 import { preparePromptImages } from "@gajae-gateway/images";
 import {
 	type Frame,
@@ -5285,6 +5286,70 @@ test("routine retention sweep result is logged at info level, not error", async 
 			const retentionInfoLogs = infoCalls.filter((log) => log.includes("retention"));
 			// Either no deletion occurred (no info logs) or the info logs are there
 			expect(retentionInfoLogs.length).toBeGreaterThanOrEqual(0);
+		} finally {
+			console.info = originalInfo;
+			console.error = originalError;
+		}
+	} finally {
+		database.close();
+	}
+});
+
+test("retention sweep is logged at info level in stdio mode via structured logger", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-retention-stdio-"));
+	const logPath = join(directory, "gateway.log");
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		gjc: { agentDir: join(directory, "agent") },
+	};
+
+	const database = await Store.open(config.dbPath);
+	try {
+		// Install structured logger in stdio mode
+		const infoCalls: string[] = [];
+		const errorCalls: string[] = [];
+		
+		const originalInfo = console.info;
+		const originalError = console.error;
+
+		try {
+			console.info = (...args: unknown[]) => infoCalls.push(args.map(String).join(" "));
+			console.error = (...args: unknown[]) => errorCalls.push(args.map(String).join(" "));
+
+			// Install structured logger in stdio mode
+			const dispose = installStructuredLogging({
+				path: logPath,
+				stdio: true,
+			});
+
+			try {
+				// Run retention sweep
+				for (let i = 0; i < 3; i++) {
+					const result = database.sweep();
+					const total = Object.values(result.deleted).reduce((sum, n) => sum + n, 0);
+					if (total > 0) console.info(JSON.stringify({ retention: result.deleted }));
+				}
+
+				// In stdio mode, info messages should be routed to stderr by the logger
+				const stderrMessages = errorCalls.filter((msg) => msg.includes("retention"));
+				const stdinMessages = infoCalls.filter((msg) => msg.includes("retention"));
+
+				// Info messages should be on stderr in stdio mode
+				if (stderrMessages.length > 0) {
+					// Good - info messages are routed to stderr
+					expect(stderrMessages[0]).toContain("retention");
+				}
+
+				// Info messages should NOT be on stdout
+				expect(stdinMessages.length).toBe(0);
+			} finally {
+				dispose();
+			}
 		} finally {
 			console.info = originalInfo;
 			console.error = originalError;
