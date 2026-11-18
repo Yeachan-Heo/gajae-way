@@ -22,6 +22,7 @@ import {
 	isSessionBusy,
 	LastAssistantUnreadableError,
 	type SessionPort,
+	type SessionRequestResult,
 	SessionRequestTimeoutError,
 	SessionTerminalError,
 	sessionRequestStep,
@@ -1610,7 +1611,7 @@ export class MonitorPropagator {
 				const requestResult = reusedOpRef === undefined ? await this.#sessionPort.request(requestInput) : undefined;
 				const response =
 					requestResult !== undefined
-						? requestResult.assistant.text
+						? await this.#responseFromTurn(requestResult, turn, claimed)
 						: await this.#harvestAuthoringTurn(requestInput, turn, claimed, pendingTurn);
 				protocolResponseByteLength = Buffer.byteLength(response, "utf8");
 				dispatchPhase = "validate";
@@ -1977,6 +1978,36 @@ export class MonitorPropagator {
 			}
 		});
 	}
+	/**
+	 * Extract the response text for the authoring turn, respecting the turn boundary.
+	 * Uses fetchAssistantSince to avoid picking up stale [SILENT] markers from earlier
+	 * operations. Falls back to requestResult.assistant if fetchAssistantSince is
+	 * unavailable or returns nothing.
+	 */
+	async #responseFromTurn(
+		requestResult: SessionRequestResult,
+		turn: AuthoringTurnPointer,
+		rows: readonly MonitorEventDbRow[],
+	): Promise<string> {
+		const startedAt = requestResult.status.status.startedAt;
+		const notBeforeMs =
+			typeof startedAt === "number" && Number.isFinite(startedAt)
+				? startedAt
+				: Math.min(...rows.map((row) => Date.parse(row.fired_at)));
+		try {
+			const assistantSince = await this.#sessionPort.fetchAssistantSince?.({
+				sessionId: turn.sessionId,
+				repo: this.#repo,
+				notBeforeMs,
+				preferSpoken: true,
+			});
+			if (assistantSince !== undefined) return assistantSince.text;
+		} catch {
+			// Fall through to default if fetch fails
+		}
+		return requestResult.assistant.text;
+	}
+
 	/**
 	 * The result of a saved authoring turn this dispatch reuses (#187, #702). A
 	 * turn still running is awaited under its own clientRef (a duplicate send is
