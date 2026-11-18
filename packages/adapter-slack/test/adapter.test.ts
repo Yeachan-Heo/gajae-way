@@ -222,37 +222,36 @@ test("Slack partial chunk success makes a later definitive failure uncertain", a
 	]);
 });
 
-test("Slack remembers the text of a top-level post so replies under it can quote it", async () => {
+test("Slack reports every post, plain or panel, with its origin to the posted-message hook", async () => {
 	const client = new Gateway();
 	const api = new Api();
-	const remembered: [string, string, string][] = [];
-	const roots = { remember: (channel: string, ts: string, text: string) => remembered.push([channel, ts, text]) };
+	const remembered: unknown[][] = [];
+	const posted = { remember: (...args: unknown[]) => void remembered.push(args) };
 	let next = 0;
 	api.postMessage = async (channel) => ({ channel, ts: `${++next}.000` });
-	await settleSlackDelivery(
-		client,
-		api,
-		delivery({ text: "x".repeat(9000) }),
-		console,
-		undefined,
-		undefined,
-		undefined,
-		roots,
+	const settle = (message: ChatMessagePayload) =>
+		settleSlackDelivery(client, api, message, console, undefined, undefined, undefined, posted);
+	await settle(delivery({ text: "x".repeat(9000) }));
+	// Each chunk is recorded; the first, a possible thread root, carries the whole text.
+	expect(remembered[0]).toEqual([origin, "C1", "1.000", "x".repeat(9000), undefined]);
+	expect(remembered).toHaveLength(next);
+	expect(remembered.slice(1).every(([recorded, , , text]) => recorded === origin && text !== "x".repeat(9000))).toBe(
+		true,
 	);
-	// Only the first chunk can be a thread root.
-	expect(remembered).toEqual([["C1", "1.000", "x".repeat(9000)]]);
 	const threaded = { platform: "slack" as const, kind: "thread" as const, conversationId: "C1:1.000", parentId: "C1" };
-	await settleSlackDelivery(
-		client,
-		api,
-		delivery({ origin: threaded }),
-		console,
-		undefined,
-		undefined,
-		undefined,
-		roots,
+	await settle(delivery({ origin: threaded, text: "in thread" }));
+	expect(remembered.at(-1)).toEqual([threaded, "C1", `${next}.000`, "in thread", "1.000"]);
+	await settle(
+		delivery({
+			askUserPanel: {
+				panelId: "q_1",
+				question: "Choose",
+				expiresAt: "2099-01-01T00:00:00Z",
+				options: [{ id: "a", label: "A" }],
+			},
+		}),
 	);
-	expect(remembered).toHaveLength(1);
+	expect(remembered.at(-1)).toEqual([origin, "C1", `${next}.000`, expect.stringContaining("Choose"), undefined]);
 });
 
 test("Slack complete settlements serialize one origin while unrelated origins continue after failure", async () => {
@@ -1443,6 +1442,30 @@ test("Slack inbound reactions carry action metadata and ignore the bot", async (
 				params: { origin, targetMessageId: "C1:1.000", emoji: "👍", action, engagement },
 			})),
 		);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("Slack reactions follow the session their target message was routed to", async () => {
+	const f = await fixture();
+	try {
+		const root = "1700000001.000000";
+		const thread = { platform: "slack", kind: "thread", conversationId: `C1:${root}`, parentId: "C1" };
+		await f.event({ ...inbound({ ts: "1700000002.000001", text: "reply", thread_ts: root, parent_user_id: "UBOT" }) });
+		const react = (ts: string) =>
+			f.event({
+				type: "reaction_added",
+				user: "U1",
+				reaction: "+1",
+				item: { type: "message", channel: "C1", ts },
+				event_ts: "1700000009.000000",
+			});
+		await react("1700000002.000001");
+		// A message the adapter never routed keeps the channel fallback.
+		await react("1700000003.000001");
+		const reactions = f.client.requests.filter((request) => request.verb === "engagement.reaction");
+		expect(reactions.map((request) => (request.params as { origin: unknown }).origin)).toEqual([thread, origin]);
 	} finally {
 		f.socket.stop();
 	}

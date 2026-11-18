@@ -366,6 +366,14 @@ async function sendSlackImageNotice(
 	}
 }
 
+/**
+ * Told of every message this adapter posts: what it posted, where, and for which origin.
+ * Replies under a top-level post quote it, and reactions to any post follow its session.
+ */
+export interface SlackPostedMessages {
+	remember(origin: OriginRef, channel: string, ts: string, text: string, threadTs: string | undefined): void;
+}
+
 export async function settleSlackDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	api: Pick<SlackWebApi, "postMessage" | "addReaction" | "removeReaction"> & Partial<Pick<SlackWebApi, "uploadFile">>,
@@ -374,7 +382,7 @@ export async function settleSlackDelivery(
 	status?: Pick<WorkingStatus, "clear" | "reassert">,
 	mentions?: MentionDirectory,
 	live?: LiveReplyTracker,
-	roots?: Pick<SlackRootTexts, "remember">,
+	posted?: SlackPostedMessages,
 ): Promise<void> {
 	if (message.origin.platform !== "slack" || !message.deliveryId) return;
 	if (message.reaction) {
@@ -403,14 +411,16 @@ export async function settleSlackDelivery(
 		if (message.askUserPanel) {
 			const blocks = askUserPanelBlocks(message);
 			const fallback = askUserPanelFallback(message);
-			await api.postMessage(channel, fallback || message.text, threadTs, "delivery", blocks);
+			const sent = await api.postMessage(channel, fallback || message.text, threadTs, "delivery", blocks);
+			posted?.remember(message.origin, sent.channel || channel, sent.ts, fallback || message.text, threadTs);
 			await gateway.request("delivery.confirm", { deliveryId });
 			return;
 		}
 		if (message.approvalPanel) {
 			const blocks = approvalPanelBlocks(message);
 			const fallback = approvalPanelFallback(message);
-			await api.postMessage(channel, fallback || message.text, threadTs, "delivery", blocks);
+			const sent = await api.postMessage(channel, fallback || message.text, threadTs, "delivery", blocks);
+			posted?.remember(message.origin, sent.channel || channel, sent.ts, fallback || message.text, threadTs);
 			await gateway.request("delivery.confirm", { deliveryId });
 			return;
 		}
@@ -433,15 +443,24 @@ export async function settleSlackDelivery(
 				final: message.final,
 			});
 			if (outcome.kind !== "untracked") {
+				// A posted live message may become a thread root; a fold changes what it says.
+				if (outcome.kind === "posted" || outcome.kind === "folded")
+					posted?.remember(message.origin, outcome.message.channel, outcome.message.ts, outcome.message.text, threadTs);
 				await gateway.request("delivery.confirm", { deliveryId });
 				return;
 			}
 		}
 		// Every chunk must stay in the same Slack thread, not just the first chunk.
 		for (const chunk of chunkSlackMessage(text)) {
-			const posted = await api.postMessage(channel, chunk, threadTs);
-			// A top-level post may become a thread root; its replies quote it (root-text.ts).
-			if (!visibleTextPosted && threadTs === undefined) roots?.remember(posted.channel || channel, posted.ts, repaired);
+			const sent = await api.postMessage(channel, chunk, threadTs);
+			// Every chunk is recorded for reactions; only the first can be a thread root.
+			posted?.remember(
+				message.origin,
+				sent.channel || channel,
+				sent.ts,
+				visibleTextPosted ? chunk : repaired,
+				threadTs,
+			);
 			visibleTextPosted = true;
 		}
 		// voiceText is intentionally ignored: Slack has no bot voice messages.
@@ -590,13 +609,13 @@ export function subscribeSlackDeliveries(
 	status?: Pick<WorkingStatus, "clear" | "reassert">,
 	mentions?: MentionDirectory,
 	live?: LiveReplyTracker,
-	roots?: Pick<SlackRootTexts, "remember">,
+	posted?: SlackPostedMessages,
 ): () => void {
 	const queue = settlementQueue(gateway);
 	return gateway.onChatMessage((message) => {
 		if (message.origin.platform !== "slack") return;
 		queue.run(settlementKey(message.origin), async () => {
-			await settleSlackDelivery(gateway, api, message, log, status, mentions, live, roots).catch((error) =>
+			await settleSlackDelivery(gateway, api, message, log, status, mentions, live, posted).catch((error) =>
 				log.error(`Slack delivery settlement request failed: ${errorText(error)}`),
 			);
 		});
@@ -675,7 +694,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 		private readonly monitorIntervals = { healthy: 30_000, degraded: 5_000 },
 		private readonly reconnectDelayMs = 500,
 		readonly live?: LiveReplyTracker,
-		readonly roots?: SlackRootTexts,
+		readonly posted?: SlackPostedMessages,
 	) {
 		if (initialClient) this.adoptClient(initialClient);
 	}
@@ -695,7 +714,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 		this.#deliveryOff?.();
 		// Old in-flight Slack writes still own their place across a gateway reconnect.
 		settlementQueues.set(client, this.#settlements);
-		const off = subscribeSlackDeliveries(client, this.api, console, this.status, this.mentions, this.live, this.roots);
+		const off = subscribeSlackDeliveries(client, this.api, console, this.status, this.mentions, this.live, this.posted);
 		const progressOff =
 			this.status || this.live ? subscribeSlackProgress(client, this.status, console, this.live) : undefined;
 		const handlersOff = client.onChatMessage((message) => {
@@ -1029,25 +1048,8 @@ export async function startSlackAdapter(
 	const directory = new SlackDirectory(api);
 	const status = new WorkingStatus(api, log);
 	const live = config.liveReplies === true ? new LiveReplyTracker(api, log) : undefined;
-	const roots = new SlackRootTexts(api, (text) => normalizeSlackText(text, directory));
-	const gateway = new ReconnectingGateway(
-		config.gatewaySocket ?? join(adapterHome(), "gateway.sock"),
-		api,
-		undefined,
-		status,
-		directory,
-		{ healthy: 30_000, degraded: 5_000 },
-		500,
-		live,
-		roots,
-	);
-	const ingress = new OrderedIngress();
-	const imageBudget = new ImagePreparationBudget();
-	const prepareImages = (files: SlackFileCarrier["files"]) =>
-		(files ?? []).some(isSlackNativeImage)
-			? imageBudget.run(() => prepareSlackImages(files, config.botToken, ports.imageFetch))
-			: prepareSlackImages(files, config.botToken, ports.imageFetch);
-	// Preserve the first observed routing decision across successive mention edits.
+	// Preserve the first observed routing decision across successive mention edits, and
+	// the session each message this adapter posted belongs to, so reactions follow it.
 	// This cache is bounded like inbound identity memory; previous_message supplies
 	// the original snapshot when the adapter did not observe the message live.
 	const messageOrigins = new Map<string, OriginRef>();
@@ -1058,6 +1060,30 @@ export async function startSlackAdapter(
 		if (messageOrigins.size > 10_000) messageOrigins.delete(messageOrigins.keys().next().value as string);
 		return original;
 	};
+	const roots = new SlackRootTexts(api, (text) => normalizeSlackText(text, directory));
+	const posted: SlackPostedMessages = {
+		remember: (origin, channel, ts, text, threadTs) => {
+			rememberOrigin(slackMessageId(channel, ts), origin);
+			if (threadTs === undefined) roots.remember(channel, ts, text);
+		},
+	};
+	const gateway = new ReconnectingGateway(
+		config.gatewaySocket ?? join(adapterHome(), "gateway.sock"),
+		api,
+		undefined,
+		status,
+		directory,
+		{ healthy: 30_000, degraded: 5_000 },
+		500,
+		live,
+		posted,
+	);
+	const ingress = new OrderedIngress();
+	const imageBudget = new ImagePreparationBudget();
+	const prepareImages = (files: SlackFileCarrier["files"]) =>
+		(files ?? []).some(isSlackNativeImage)
+			? imageBudget.run(() => prepareSlackImages(files, config.botToken, ports.imageFetch))
+			: prepareSlackImages(files, config.botToken, ports.imageFetch);
 	const now = ports.now ?? Date.now;
 	const cursorPath = ports.recoveryCursorPath ?? recoveryCursorPath();
 	let cursors: RecoveryCursorState | undefined;
@@ -1220,7 +1246,9 @@ export async function startSlackAdapter(
 			// Our own presence markers are not engagement, even if the identity check
 			// ever misses (e.g. a legacy bot user id): never report them inbound.
 			if (reaction.user === identity.botUserId && isPresenceReaction(reaction.reaction)) return;
-			const description = describeSlackReaction(reaction, identity.botUserId, directory);
+			const description = describeSlackReaction(reaction, identity.botUserId, directory, (id) =>
+				messageOrigins.get(id),
+			);
 			if (description) gateway.sendReaction(description);
 		} else if (event.type === "block_actions") {
 			const blockAction = event as unknown as SlackBlockAction;

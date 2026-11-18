@@ -41,11 +41,14 @@ const tracker = (api: LiveApi, now: () => number = Date.now) => new LiveReplyTra
 test("live reply posts the first mid-turn part and folds later parts in order", async () => {
 	const api = new LiveApi();
 	const live = tracker(api);
-	expect(await live.deliver(part())).toEqual({ kind: "posted" });
+	expect(await live.deliver(part())).toEqual({ kind: "posted", message: { channel: "C1", ts: "1.001", text: "one" } });
 	expect(api.posts).toEqual([["C1", "one", undefined]]);
-	expect(await live.deliver(part({ deliveryId: "d2", text: "two" }))).toEqual({ kind: "folded" });
+	expect(await live.deliver(part({ deliveryId: "d2", text: "two" }))).toEqual({
+		kind: "folded",
+		message: { channel: "C1", ts: "1.001", text: "one\n\ntwo" },
+	});
 	expect(api.updates).toEqual([["C1", "1.001", "one\n\ntwo"]]);
-	expect(await live.deliver(part({ deliveryId: "d3", text: "three", final: true }))).toEqual({ kind: "folded" });
+	expect(await live.deliver(part({ deliveryId: "d3", text: "three", final: true }))).toMatchObject({ kind: "folded" });
 	expect(api.updates.at(-1)).toEqual(["C1", "1.001", "one\n\ntwo\n\nthree"]);
 	expect(live.tracked("turn")).toBe(false);
 	// The turn is over: a further part posts as an ordinary message.
@@ -131,7 +134,7 @@ test("a first-part post failure drops the reservation so a retry can re-open", a
 	await expect(live.deliver(part())).rejects.toThrow("post rejected");
 	api.postFailure = undefined;
 	// The ledger retries the same delivery: it opens a fresh live message.
-	expect(await live.deliver(part())).toEqual({ kind: "posted" });
+	expect(await live.deliver(part())).toMatchObject({ kind: "posted" });
 	// The stub records the refused attempt too: rejection, then the retry's post.
 	expect(api.posts).toHaveLength(2);
 });
@@ -170,9 +173,9 @@ test("close drains an opening post and queued edits before sealing and preservin
 	await Promise.resolve();
 	expect(closed).toBe(false);
 	release();
-	expect(await opening).toEqual({ kind: "posted" });
-	expect(await second).toEqual({ kind: "folded" });
-	expect(await third).toEqual({ kind: "folded" });
+	expect(await opening).toMatchObject({ kind: "posted" });
+	expect(await second).toMatchObject({ kind: "folded" });
+	expect(await third).toMatchObject({ kind: "folded" });
 	await closing;
 	expect(await late).toEqual({ kind: "untracked" });
 	expect(api.updates.map((update) => update[2])).toEqual(["one\n\ntwo", "one\n\ntwo\n\nthree"]);
@@ -217,7 +220,7 @@ test("entries expire after the TTL and the table evicts the least recently touch
 	await live.deliver(part({ turnId: "old" }));
 	clock += LIVE_REPLY_TTL_MS + 1;
 	// The sweep runs on the next deliver; the expired turn opens a fresh message.
-	expect(await live.deliver(part({ turnId: "old", deliveryId: "d2", text: "again" }))).toEqual({
+	expect(await live.deliver(part({ turnId: "old", deliveryId: "d2", text: "again" }))).toMatchObject({
 		kind: "posted",
 	});
 	expect(api.posts).toHaveLength(2);
@@ -227,10 +230,10 @@ test("entries expire after the TTL and the table evicts the least recently touch
 	// The table is at capacity: the next open evicts the least recently touched
 	// turn, while a turn still inside the table keeps folding.
 	await live.deliver(part({ turnId: "one-more", deliveryId: "m1", text: "x" }));
-	expect(await live.deliver(part({ turnId: "one-more", deliveryId: "m2", text: "y" }))).toEqual({
+	expect(await live.deliver(part({ turnId: "one-more", deliveryId: "m2", text: "y" }))).toMatchObject({
 		kind: "folded",
 	});
-	expect(await live.deliver(part({ turnId: "fill-0", deliveryId: "f0b", text: "z" }))).toEqual({
+	expect(await live.deliver(part({ turnId: "fill-0", deliveryId: "f0b", text: "z" }))).toMatchObject({
 		kind: "posted",
 	});
 });
@@ -392,4 +395,27 @@ test("the final progress tick closes the live entry even without a terminal deli
 	for (let attempt = 0; attempt < 100 && live.tracked("turn"); attempt++) await Bun.sleep(5);
 	expect(live.tracked("turn")).toBe(false);
 	expect(await live.deliver(part({ deliveryId: "d2", text: "late" }))).toEqual({ kind: "untracked" });
+});
+
+test("a live message is reported to the posted-message hook when it opens and each time it folds", async () => {
+	const api = new LiveApi();
+	const live = tracker(api);
+	const remembered: unknown[][] = [];
+	const posted = { remember: (...args: unknown[]) => void remembered.push(args) };
+	const requests: unknown[] = [];
+	const gateway = { request: async (verb: string, params: unknown) => void requests.push([verb, params]) } as never;
+	const message = (deliveryId: string, text: string, final = false): ChatMessagePayload => ({
+		turnId: "turn",
+		origin,
+		role: "assistant",
+		text,
+		final,
+		deliveryId,
+	});
+	await settleSlackDelivery(gateway, api, message("d1", "one"), console, undefined, undefined, live, posted);
+	await settleSlackDelivery(gateway, api, message("d2", "two"), console, undefined, undefined, live, posted);
+	expect(remembered).toEqual([
+		[origin, "C1", "1.001", "one", undefined],
+		[origin, "C1", "1.001", "one\n\ntwo", undefined],
+	]);
 });

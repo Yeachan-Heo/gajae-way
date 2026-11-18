@@ -28,9 +28,16 @@ type Entry = {
 	chain: Promise<unknown>;
 };
 
+/** Where the live message is and what it now says, after it was posted or edited. */
+export interface LiveMessage {
+	readonly channel: string;
+	readonly ts: string;
+	readonly text: string;
+}
+
 export type LiveDeliveryResult =
-	| { readonly kind: "posted" }
-	| { readonly kind: "folded" }
+	| { readonly kind: "posted"; readonly message: LiveMessage }
+	| { readonly kind: "folded"; readonly message: LiveMessage }
 	| { readonly kind: "replayed" }
 	| { readonly kind: "untracked" };
 
@@ -166,7 +173,7 @@ export class LiveReplyTracker {
 		entry.parts.push({ deliveryId: input.deliveryId, text: tail.text, applied: true });
 		this.#touch(input.turnId, entry);
 		this.#sweep();
-		return { kind: "posted" };
+		return { kind: "posted", message: { channel: entry.channel, ts: tail.ts, text: tail.text } };
 	}
 
 	/** A failed opening post removes the reservation so the next part starts clean. */
@@ -210,7 +217,7 @@ export class LiveReplyTracker {
 		}
 		part.applied = true;
 		if (input.final) entry.open = false;
-		return { kind: "folded" };
+		return { kind: "folded", message: { channel: entry.channel, ts: entry.ts, text: rendered } };
 	}
 
 	#touch(turnId: string, entry: Entry): void {

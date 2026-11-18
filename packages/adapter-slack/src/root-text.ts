@@ -3,6 +3,12 @@ import { parseSlackMessageId, slackMessageId } from "./origin";
 
 /** Bot-rooted threads whose root text is remembered for the reply header. */
 export const ROOT_TEXT_CACHE_LIMIT = 500;
+/**
+ * Cold-root lookups in flight at once. They share `conversations.replies` quota with
+ * recovery, so a burst across many threads is shed instead of queued: the next reply
+ * in a shed thread asks again.
+ */
+export const ROOT_TEXT_MAX_IN_FLIGHT = 4;
 /** Kept well under the protocol's "short single-line" excerpt; the header clips further. */
 export const ROOT_TEXT_LIMIT = 300;
 
@@ -13,8 +19,8 @@ export const ROOT_TEXT_LIMIT = 300;
  * (the bot usually posted it from another session). Quoting the root in the reply header
  * tells that session what the thread is about. The protocol forbids delaying inbound
  * handling to fetch an excerpt, so `excerpt` only answers from memory: roots this adapter
- * posted are remembered as they post, and an unknown root is fetched in the background so
- * later replies in that thread carry it.
+ * posted (plain, live, or panel posts) are remembered as they post, and an unknown root is
+ * fetched in the background so later replies in that thread carry it.
  */
 export class SlackRootTexts {
 	readonly #texts = new Map<string, string>();
@@ -44,7 +50,7 @@ export class SlackRootTexts {
 	}
 
 	#fetch(rootId: string): void {
-		if (this.#inFlight.has(rootId)) return;
+		if (this.#inFlight.has(rootId) || this.#inFlight.size >= ROOT_TEXT_MAX_IN_FLIGHT) return;
 		const fetched = this.#load(rootId).finally(() => this.#inFlight.delete(rootId));
 		this.#inFlight.set(rootId, fetched);
 	}
