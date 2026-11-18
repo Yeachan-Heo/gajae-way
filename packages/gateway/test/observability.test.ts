@@ -63,8 +63,8 @@ test("persistent-session control-plane logs use grep-stable fields", async () =>
 			onTurnStart: ({ trigger }) => ({ text: trigger.body }),
 		});
 		expect(
-			database?.transaction((tx) =>
-				database?.inbox.enqueue(tx, {
+			database!.transaction((tx) =>
+				database!.inbox.enqueue(tx, {
 					messageId: "m-1",
 					originKey,
 					originRefJson: JSON.stringify(origin),
@@ -77,8 +77,8 @@ test("persistent-session control-plane logs use grep-stable fields", async () =>
 		await eventually(() => port.sends.length === 1, "initial persistent operation was not sent");
 		const first = port.sends[0]!;
 		expect(
-			database?.transaction((tx) =>
-				database?.inbox.enqueue(tx, {
+			database!.transaction((tx) =>
+				database!.inbox.enqueue(tx, {
 					messageId: "m-2",
 					originKey,
 					originRefJson: JSON.stringify(origin),

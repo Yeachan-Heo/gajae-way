@@ -407,11 +407,11 @@ for (const protection of ["jobs", "active_run", "pending_notice"] as const)
 			const kind = protection === "active_run" ? "agent_start" : "agent_end";
 			if (protection === "pending_notice")
 				h.port
-					.tailsOf(sessionId)[0]
-					?.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
+					.tailsOf(sessionId)[0]!
+					.emit({ kind: "agent_start", rawKind: "agent_start", payload: {}, idle: false, steerEcho: false });
 			h.port
-				.tailsOf(sessionId)[0]
-				?.emit({ kind, rawKind: kind, payload: {}, idle: kind === "agent_end", steerEcho: false });
+				.tailsOf(sessionId)[0]!
+				.emit({ kind, rawKind: kind, payload: {}, idle: kind === "agent_end", steerEcho: false });
 			await Bun.sleep(10);
 		}
 		await h.send("b", "b1");

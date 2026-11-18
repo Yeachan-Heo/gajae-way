@@ -126,7 +126,7 @@ async function harness(
 		modelRefusal?: (input: PersonaFailureInput) => void;
 		effectiveModel?: string;
 		imagesFor?: (triggerMessageId: string) => readonly PromptImage[] | undefined;
-		onFrame?: (frame: TailFrame) => boolean;
+		onFrame?: (frame: TailFrame) => boolean | void;
 		contextMessageIds?: readonly string[];
 	} = {},
 	log?: (line: string) => void,
@@ -1091,6 +1091,7 @@ test("a held turn in recovery_hold must not absorb new inbound as steers; new in
 	enqueue("first-msg", "initial message");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sendAttempts.length === 1, "first send attempt did not start");
+	const firstOpRef = port.sendAttempts[0]!.opRef;
 
 	// The first send failed with ambiguous error (timeout)
 	expect(port.sends).toHaveLength(0);

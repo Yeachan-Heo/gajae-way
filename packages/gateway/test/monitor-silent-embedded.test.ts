@@ -84,12 +84,12 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use the clos
 			},
 		);
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
-		for (let attempt = 0; attempt < 100 && db?.monitors.authoredOutput(eventId) === undefined; attempt++)
+		for (let attempt = 0; attempt < 100 && db!.monitors.authoredOutput(eventId) === undefined; attempt++)
 			await Bun.sleep(10);
 		await propagator.drain();
-		expect(db?.monitors.authoredOutput(eventId)).toBe("Nothing new since last sweep.\n\n[SILENT]");
+		expect(db!.monitors.authoredOutput(eventId)).toBe("Nothing new since last sweep.\n\n[SILENT]");
 		expect(stage(db!, eventId)).toBe("authored_no_delivery");
-		expect(db?.outbox.rows()).toHaveLength(0);
+		expect(db!.outbox.rows()).toHaveLength(0);
 		expect(readinessSuccesses).toHaveLength(1);
 		expect(Number.isFinite(readinessSuccesses[0]?.at)).toBe(true);
 	});
@@ -130,12 +130,12 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use the clos
 			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
 		);
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
-		for (let attempt = 0; attempt < 100 && db?.monitors.authoredOutput(eventId) === undefined; attempt++)
+		for (let attempt = 0; attempt < 100 && db!.monitors.authoredOutput(eventId) === undefined; attempt++)
 			await Bun.sleep(10);
 		await propagator.drain();
-		expect(db?.monitors.authoredOutput(eventId)).toBe("Please see [SILENT] in docs for details");
+		expect(db!.monitors.authoredOutput(eventId)).toBe("Please see [SILENT] in docs for details");
 		expect(stage(db!, eventId)).not.toBe("authored_no_delivery");
-		expect(db?.outbox.rows()).toHaveLength(1);
+		expect(db!.outbox.rows()).toHaveLength(1);
 	});
 
 	test("only [SILENT] token (exact match) is also silent", async () => {
@@ -148,11 +148,11 @@ describe("isSilentOutput integration (issue #338: propagate.ts must use the clos
 			{ ownerTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } } },
 		);
 		const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });
-		for (let attempt = 0; attempt < 100 && db?.monitors.authoredOutput(eventId) === undefined; attempt++)
+		for (let attempt = 0; attempt < 100 && db!.monitors.authoredOutput(eventId) === undefined; attempt++)
 			await Bun.sleep(10);
 		await propagator.drain();
-		expect(db?.monitors.authoredOutput(eventId)).toBe("[SILENT]");
+		expect(db!.monitors.authoredOutput(eventId)).toBe("[SILENT]");
 		expect(stage(db!, eventId)).toBe("authored_no_delivery");
-		expect(db?.outbox.rows()).toHaveLength(0);
+		expect(db!.outbox.rows()).toHaveLength(0);
 	});
 });

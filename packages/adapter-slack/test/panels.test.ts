@@ -26,7 +26,7 @@ describe("askUserPanelBlocks", () => {
 		expect(blocks.length).toBeGreaterThan(0);
 		expect(blocks[0].type).toBe("section");
 		// Should have buttons in actions blocks
-		const actionBlocks = blocks.filter((b) => (b as Record<string, unknown>).type === "actions");
+		const actionBlocks = blocks.filter((b: any) => b.type === "actions");
 		expect(actionBlocks.length).toBeGreaterThan(0);
 	});
 
@@ -50,10 +50,10 @@ describe("askUserPanelBlocks", () => {
 		};
 
 		const blocks = askUserPanelBlocks(message);
-		const actionBlocks = blocks.filter((b) => (b as Record<string, unknown>).type === "actions");
+		const actionBlocks = blocks.filter((b: any) => b.type === "actions");
 		expect(actionBlocks.length).toBe(0); // No action blocks for expired panels
 		// Should have a section indicating expiration
-		const expiredText = blocks.some((b) => (b as Record<string, unknown>).text?.text?.includes("expired"));
+		const expiredText = blocks.some((b: any) => b.text?.text?.includes("expired"));
 		expect(expiredText).toBe(true);
 	});
 
@@ -91,9 +91,9 @@ describe("approvalPanelBlocks", () => {
 		expect(blocks.length).toBeGreaterThan(0);
 		expect(blocks[0].type).toBe("section");
 		// Should have allow/deny buttons
-		const actionBlocks = blocks.filter((b) => (b as Record<string, unknown>).type === "actions");
+		const actionBlocks = blocks.filter((b: any) => b.type === "actions");
 		expect(actionBlocks.length).toBe(1);
-		const buttons = actionBlocks[0].elements as unknown[];
+		const buttons = actionBlocks[0].elements as any[];
 		expect(buttons.length).toBe(2);
 		expect(buttons[0].text.text).toBe("Allow");
 		expect(buttons[1].text.text).toBe("Deny");
@@ -120,12 +120,12 @@ describe("approvalPanelBlocks", () => {
 
 		const blocks = approvalPanelBlocks(message);
 		expect(blocks.length).toBeGreaterThan(0);
-		const actionBlocks = blocks.filter((b) => (b as Record<string, unknown>).type === "actions");
+		const actionBlocks = blocks.filter((b: any) => b.type === "actions");
 		expect(actionBlocks.length).toBeGreaterThan(0);
-		const buttons = actionBlocks[0].elements as unknown[];
+		const buttons = actionBlocks[0].elements as any[];
 		expect(buttons.length).toBe(2);
-		expect(buttons.map((b) => (b as Record<string, unknown>).text.text)).toContain("Allow once");
-		expect(buttons.map((b) => (b as Record<string, unknown>).text.text)).toContain("Reject once");
+		expect(buttons.map((b: any) => b.text.text)).toContain("Allow once");
+		expect(buttons.map((b: any) => b.text.text)).toContain("Reject once");
 	});
 
 	it("renders expired approval panel without buttons", () => {
@@ -144,7 +144,7 @@ describe("approvalPanelBlocks", () => {
 		};
 
 		const blocks = approvalPanelBlocks(message);
-		const actionBlocks = blocks.filter((b) => (b as Record<string, unknown>).type === "actions");
+		const actionBlocks = blocks.filter((b: any) => b.type === "actions");
 		expect(actionBlocks.length).toBe(0); // No action blocks for expired panels
 	});
 

@@ -1413,7 +1413,7 @@ test("working status is a reaction gradient on the triggering message and clears
 	// Inside the window: coalesced.
 	await status.update({ turnId: "t", origin, elapsedMs: 125_000, toolCalls: 3, outputTokens: 1250 });
 	expect(reacted).toHaveLength(4);
-	const _requests: Array<{ verb: string; params: unknown }> = [];
+	const requests: Array<{ verb: string; params: unknown }> = [];
 	let emit: ((progress: ChatProgressPayload) => void) | undefined;
 	const gateway: GatewayClientLike = {
 		request: async <T>() => ({}) as T,
@@ -2193,11 +2193,11 @@ test("rapid consecutive messages in one thread: only latest carries status react
 });
 
 test("typing indicator is idempotent: multiple begin calls on same conversation update deadline without error", async () => {
-	let _channelFetched = 0;
+	let channelFetched = 0;
 	const typing = new TypingIndicator({
 		channels: {
 			fetch: async () => {
-				_channelFetched++;
+				channelFetched++;
 				return {
 					sendTyping: async () => {
 						// Mock successful typing send
@@ -2209,7 +2209,7 @@ test("typing indicator is idempotent: multiple begin calls on same conversation 
 	} as any);
 	// Multiple begin calls on same conversation should be idempotent
 	typing.begin("conv-1");
-	const _firstCallTime = Date.now();
+	const firstCallTime = Date.now();
 	await Bun.sleep(10);
 	typing.begin("conv-1");
 	await Bun.sleep(10);
@@ -2260,7 +2260,7 @@ test("channel mention should set mentioned flag for thread creation logic", () =
 });
 
 test("thread reply message stays in thread", () => {
-	const _botUser = { id: "bot-1" };
+	const botUser = { id: "bot-1" };
 	const threadMessage = {
 		id: "msg-2",
 		author: { id: "user-1" },
@@ -2287,7 +2287,7 @@ test("channel mention with default policy (unset threadOnMention) creates thread
 		channel: { id: "channel-1", type: 0 },
 		mentions: { has: () => true },
 		content: "<@bot-1> hello",
-		startThread: async ({ name, _autoArchiveDuration }: { name: string; autoArchiveDuration: number }) => ({
+		startThread: async ({ name }: { name: string; autoArchiveDuration: number }) => ({
 			id: "thread-new-1",
 		}),
 	};
@@ -2315,7 +2315,7 @@ test("channel mention with threadOnMention: true creates thread", async () => {
 		channel: { id: "channel-2", type: 0 },
 		mentions: { has: () => true },
 		content: "<@bot-1> hello",
-		startThread: async ({ name, _autoArchiveDuration }: { name: string; autoArchiveDuration: number }) => ({
+		startThread: async ({ name }: { name: string; autoArchiveDuration: number }) => ({
 			id: "thread-new-2",
 		}),
 	};
@@ -2345,7 +2345,7 @@ test("channel mention with threadOnMention: false skips thread creation", async 
 		channel: { id: "channel-3", type: 0 },
 		mentions: { has: () => true },
 		content: "<@bot-1> hello",
-		startThread: async ({ name, _autoArchiveDuration }: { name: string; autoArchiveDuration: number }) => {
+		startThread: async ({ name }: { name: string; autoArchiveDuration: number }) => {
 			threadCreated = true;
 			return { id: "thread-new-3" };
 		},

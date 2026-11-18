@@ -563,7 +563,7 @@ function channelHarness(
 								resolve(emoji: string) {
 									return {
 										users: {
-											async remove(_userId: string) {
+											async remove(userId: string) {
 												removed.push(emoji);
 											},
 										},

@@ -139,11 +139,7 @@ describe("panel actions", () => {
 			new Date(Date.now() - 60_000).toISOString(),
 		]) {
 			const base = message();
-			const ask = {
-				...base,
-				duplicateWarning: true,
-				askUserPanel: base.askUserPanel ? { ...base.askUserPanel, expiresAt } : undefined,
-			};
+			const ask = { ...base, duplicateWarning: true, askUserPanel: { ...base.askUserPanel!, expiresAt } };
 			const approval = {
 				...ask,
 				askUserPanel: undefined,
