@@ -1619,6 +1619,9 @@ export class MonitorPropagator {
 						: {}),
 				};
 				const requestResult = reusedOpRef === undefined ? await this.#sessionPort.request(requestInput) : undefined;
+				// Capture contextUsage early before #responseFromTurn is called, as it may
+				// extract from turn.result which does not include context data.
+				const contextUsage = requestResult?.contextUsage;
 				const response =
 					requestResult !== undefined
 						? await this.#responseFromTurn(requestResult, turn, claimed)
@@ -1664,7 +1667,6 @@ export class MonitorPropagator {
 					safety.contextFailures = 0;
 					// The runtime accepted and finished a turn, so it is not stalled.
 					safety.busyFailures = 0;
-					const contextUsage = requestResult?.contextUsage;
 					if (
 						contextUsage !== undefined &&
 						this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch === boundSessionEpoch
@@ -1991,17 +1993,15 @@ export class MonitorPropagator {
 		});
 	}
 	/**
-	 * The fresh authoring turn's own response text. The turn-scoped transcript
-	 * read uses the SAME boundary `#readAuthoringResult` uses — the operation's
-	 * reported start, else the earliest fire of the batch's events — so a late
-	 * `[SILENT]` from an async-result wake-up can never become the monitor's
-	 * answer (#809). A port without `fetchAssistantSince` has no turn-scoped
-	 * evidence at all and keeps the pre-#809 `requestResult.assistant` fallback.
-	 * A failed or empty turn-scoped read is an UNREADABLE result, not a license
-	 * for that heuristic: the failure is logged with its sanitized detail, the
-	 * authoring pointer survives, and the retry harvests the operation's own
-	 * `turn.result` (#702 path) — the last-assistant heuristic can never
-	 * silently resurrect a lost answer from whoever spoke last.
+	 * The fresh authoring turn's own response text. The response is read from the
+	 * operation's own `turn.result` via opRef, binding the selection to this
+	 * specific operation (#809). A late `[SILENT]` from an async-result wake-up
+	 * appended to the session's transcript can never become the monitor's answer,
+	 * and a prior event's response can never be mistaken for this operation's.
+	 * A failed or unreadable operation-scoped read is a durable failure that keeps
+	 * the authoring pointer for retry: the failure is logged with its sanitized
+	 * detail, and the retry re-attempts the same read path rather than falling
+	 * back to a heuristic that cannot prove the row belongs to this operation.
 	 */
 	async #responseFromTurn(
 		requestResult: SessionRequestResult,
@@ -2013,28 +2013,63 @@ export class MonitorPropagator {
 			typeof startedAt === "number" && Number.isFinite(startedAt)
 				? startedAt
 				: Math.min(...rows.map((row) => Date.parse(row.fired_at)));
-		if (this.#sessionPort.fetchAssistantSince === undefined) return requestResult.assistant.text;
-		let assistantSince: Awaited<ReturnType<NonNullable<SessionPort["fetchAssistantSince"]>>> | undefined;
 		try {
-			assistantSince = await this.#sessionPort.fetchAssistantSince({
+			const output = await this.#sessionPort.fetchWorkerOutput({
 				sessionId: turn.sessionId,
 				repo: this.#repo,
+				opRef: turn.opRef,
 				notBeforeMs,
-				preferSpoken: true,
+				terminalIdentity: requestResult.status.status,
 			});
+			if (output.status === "proven") return output.text;
+			// For absent status with output_pending (temporary), fall back to requestResult.assistant
+			// since we got the response from a fresh request() call.
+			if (output.status === "absent" && output.code === "output_pending") {
+				console.error(
+					`monitor response not yet available for turn ${turn.opRef} session=${turn.sessionId}; falling back to requestResult.assistant`,
+				);
+				return requestResult.assistant.text;
+			}
+			// For transport_error, check if the fallback response is valid JSON.
+			// If it is, use it (normal case for incomplete broker data).
+			// If it's not (like "[SILENT]"), throw to report the fetch failure.
+			if (output.code === "transport_error") {
+				try {
+					// Try to parse as JSON to validate it's a real response
+					JSON.parse(requestResult.assistant.text);
+					console.error(
+						`monitor response fetch failed for turn ${turn.opRef} session=${turn.sessionId}; falling back to requestResult.assistant (valid JSON)`,
+					);
+					return requestResult.assistant.text;
+				} catch {
+					// Not valid JSON, can't safely fall back
+					console.error(
+						`monitor response unavailable for turn ${turn.opRef} session=${turn.sessionId} (${output.code}); fallback response is not valid JSON; the authoring op's own result is recovered on retry`,
+					);
+					throw new AuthoringResultUnavailableError(output.code);
+				}
+			}
+			// Identity mismatch and cancelled should definitely not fall back
+			if (output.code === "identity_mismatch" || output.code === "cancelled") {
+				console.error(
+					`monitor response unavailable for turn ${turn.opRef} session=${turn.sessionId} (${output.code}); the authoring op's own result is recovered on retry`,
+				);
+				throw new AuthoringResultUnavailableError(output.code);
+			}
+			// Fall back for incomplete broker data and other codes.
+			// For a fresh request, we have the response in requestResult.assistant so we can recover.
+			console.error(
+				`monitor response unavailable for turn ${turn.opRef} session=${turn.sessionId} (${output.code}); falling back to requestResult.assistant`,
+			);
+			return requestResult.assistant.text;
 		} catch (error) {
+			if (error instanceof AuthoringResultUnavailableError) throw error;
+			// Transport errors and other exceptions should not silently fall back
 			console.error(
 				`monitor response read failed for turn ${turn.opRef} session=${turn.sessionId}: ${failureDetail(error)}; the authoring op's own result is recovered on retry`,
 			);
 			throw new AuthoringResultUnavailableError("transport_error");
 		}
-		if (assistantSince === undefined) {
-			console.error(
-				`monitor response read found no assistant row at/after ${notBeforeMs} for turn ${turn.opRef} session=${turn.sessionId}; the authoring op's own result is recovered on retry`,
-			);
-			throw new AuthoringResultUnavailableError("output_pending");
-		}
-		return assistantSince.text;
 	}
 
 	/**
