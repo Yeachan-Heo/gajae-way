@@ -62,11 +62,7 @@ export interface BootedGateway extends GatewayServer {
 }
 
 export async function bootGateway(options: BootGatewayOptions = {}): Promise<BootedGateway> {
-	if (options.stdio) {
-		// stdout carries protocol frames in stdio mode; every log line goes to stderr.
-		console.log = console.error;
-		console.info = console.error;
-	}
+	// In stdio mode, the structured logger already handles routing info and log messages to stderr.
 	const config = await loadConfig({ home: options.home, overrides: options.overrides });
 	await mkdir(config.home, { recursive: true, mode: 0o700 });
 	await chmod(config.home, 0o700);

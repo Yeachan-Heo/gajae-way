@@ -36,6 +36,8 @@ export interface StructuredLoggingOptions {
 	readonly console?: Pick<Console, ConsoleMethod>;
 	readonly setInterval?: (handler: () => void, delayMs: number) => unknown;
 	readonly clearInterval?: (timer: unknown) => void;
+	/** In stdio mode, info and log messages route to stderr to preserve stdout for protocol. */
+	readonly stdio?: boolean;
 }
 
 interface PendingRun {
@@ -93,6 +95,7 @@ export function installStructuredLogging(options: StructuredLoggingOptions): () 
 	const details = options.heartbeatDetails;
 	const target = options.console ?? console;
 	const fs = options.filesystem ?? DEFAULT_FILE_SYSTEM;
+	const stdio = options.stdio ?? false;
 	let liveBytes = 0;
 	const startedAtMs = now();
 	let disposed = false;
@@ -178,7 +181,12 @@ export function installStructuredLogging(options: StructuredLoggingOptions): () 
 			const prefixed = messageLines(message)
 				.map((line) => `${timestamp} ${method === "log" ? "info" : method} ${line}`)
 				.join("\n");
-			originalMethods[method].call(target, prefixed);
+			// In stdio mode, info and log messages route to stderr to preserve stdout for protocol.
+			if (stdio && (method === "info" || method === "log")) {
+				originalError.call(target, prefixed);
+			} else {
+				originalMethods[method].call(target, prefixed);
+			}
 		} catch {
 			// A hostile test double must not disable the owned sink.
 		}

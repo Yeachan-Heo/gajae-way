@@ -12,6 +12,7 @@ import {
 	assertNoPrivateWorkspaceDeps,
 	highestPublishedVersion,
 	isPrereleaseVersion,
+	parseDistTagsJson,
 	parseNpmViewResult,
 	RELEASE_ORDER,
 	scratchTag,
@@ -166,6 +167,32 @@ describe("npm registry checks", () => {
 			error: "E_TIMEOUT",
 		});
 	});
+
+	test("parseDistTagsJson reads the npm 11 tag map", () => {
+		expect({ ...parseDistTagsJson("p", '{"latest":"0.5.0","next":"0.6.0-rc.1"}') }).toEqual({
+			latest: "0.5.0",
+			next: "0.6.0-rc.1",
+		});
+	});
+
+	test("parseDistTagsJson unwraps the npm 12 one-element array", () => {
+		expect({ ...parseDistTagsJson("p", '[\n  {\n    "latest": "0.5.0"\n  }\n]') }).toEqual({ latest: "0.5.0" });
+	});
+
+	test("parseDistTagsJson rejects ambiguous or malformed shapes", () => {
+		expect(() => parseDistTagsJson("p", '[{"latest":"0.5.0"},{"latest":"0.4.0"}]')).toThrow("unexpected data");
+		expect(() => parseDistTagsJson("p", "[]")).toThrow("unexpected data");
+		expect(() => parseDistTagsJson("p", '["0.5.0"]')).toThrow("unexpected data");
+		expect(() => parseDistTagsJson("p", '[[{"latest":"0.5.0"}]]')).toThrow("unexpected data");
+		expect(() => parseDistTagsJson("p", '{"latest":""}')).toThrow("unexpected data");
+		expect(() => parseDistTagsJson("p", "not json")).toThrow("invalid JSON");
+	});
+
+	test("parseDistTagsJson keeps a __proto__ tag as data", () => {
+		const tags = parseDistTagsJson("p", '[{"__proto__":"1.0.0"}]');
+		expect(Object.getPrototypeOf(tags)).toBeNull();
+		expect(Object.entries(tags)).toEqual([["__proto__", "1.0.0"]]);
+	});
 });
 
 const RELEASE_FIXTURES = [
@@ -230,32 +257,42 @@ if (tool === "bun") {
     const afterWrite = JSON.parse(process.env.PUBLISHED_VERSIONS_AFTER_WRITE);
     const growth = JSON.parse(process.env.PUBLISHED_VERSIONS_GROWTH);
     const name = args[1];
+    const publishedState = join(process.env.FIXTURE_ROOT, "published-versions.json");
+    // A version the registry already holds, or one this run has published, is always
+    // listed once the registry has processed it: the scenario lists only model the other
+    // releases in the channel. PUBLISH_LAG holds a fresh publish out of that many reads.
+    const lag = JSON.parse(process.env.PUBLISH_LAG)[name] ?? 0;
+    const lagState = join(process.env.FIXTURE_ROOT, "publish-lag-state.json");
+    const lagReads = existsSync(lagState) ? JSON.parse(readFileSync(lagState, "utf8")) : {};
+    const lagging = existsSync(publishedState) && (lagReads[name] ?? 0) < lag;
+    if (lagging) {
+      lagReads[name] = (lagReads[name] ?? 0) + 1;
+      writeFileSync(lagState, JSON.stringify(lagReads));
+    }
+    const listed = JSON.parse(process.env.EXISTING_PACKAGES)
+      .concat(existsSync(publishedState) && !lagging ? JSON.parse(readFileSync(publishedState, "utf8")) : [])
+      .filter((ref) => ref.startsWith(name + "@"))
+      .map((ref) => ref.slice(name.length + 1));
+    function emitVersions(versions, modeled = true) {
+      const all = versions.concat(listed.filter((version) => !versions.includes(version)));
+      if (!modeled && all.length === 0) {
+        console.error("404 Not Found");
+        process.exit(1);
+      }
+      console.log(JSON.stringify(all));
+      process.exit(0);
+    }
     if (existsSync(process.env.WRITTEN_MARKER) && growth[name]) {
       const counts = existsSync(process.env.GROWTH_STATE)
         ? JSON.parse(readFileSync(process.env.GROWTH_STATE, "utf8"))
         : {};
       counts[name] = (counts[name] ?? 0) + 1;
       writeFileSync(process.env.GROWTH_STATE, JSON.stringify(counts));
-      console.log(JSON.stringify(growth[name].base.concat(growth[name].grow.slice(0, counts[name]))));
-      process.exit(0);
+      emitVersions(growth[name].base.concat(growth[name].grow.slice(0, counts[name])));
     }
-    if (existsSync(process.env.WRITTEN_MARKER) && Array.isArray(afterWrite[name])) {
-      console.log(JSON.stringify(afterWrite[name]));
-      process.exit(0);
-    }
-    if (existsSync(process.env.PUBLISHED_MARKER) && Array.isArray(afterPublish[name])) {
-      console.log(JSON.stringify(afterPublish[name]));
-      process.exit(0);
-    }
-    const versions = overrides[name] ?? JSON.parse(process.env.EXISTING_PACKAGES)
-      .filter((ref) => ref.startsWith(name + "@"))
-      .map((ref) => ref.slice(name.length + 1));
-    if (versions.length === 0) {
-      console.error("404 Not Found");
-      process.exit(1);
-    }
-    console.log(JSON.stringify(versions));
-    process.exit(0);
+    if (existsSync(process.env.WRITTEN_MARKER) && Array.isArray(afterWrite[name])) emitVersions(afterWrite[name]);
+    if (existsSync(process.env.PUBLISHED_MARKER) && Array.isArray(afterPublish[name])) emitVersions(afterPublish[name]);
+    emitVersions(overrides[name] ?? [], Array.isArray(overrides[name]));
   }
   if (args[0] === "view" && args[2] === "dist-tags" && args[3] === "--json") {
     const staleTags = JSON.parse(readFileSync(process.env.STALE_TAGS, "utf8"));
@@ -387,6 +424,9 @@ if (tool === "bun") {
       tags[packed.name + "@" + args[tagIndex + 1]] = packed.version;
       writeFileSync(process.env.TAG_STATE, JSON.stringify(tags));
       writeFileSync(process.env.PUBLISHED_MARKER, "1");
+      const publishedState = join(process.env.FIXTURE_ROOT, "published-versions.json");
+      const published = existsSync(publishedState) ? JSON.parse(readFileSync(publishedState, "utf8")) : [];
+      writeFileSync(publishedState, JSON.stringify(published.concat(packed.name + "@" + packed.version)));
     }
     process.exit(0);
   }
@@ -420,6 +460,7 @@ async function withReleaseFixture(
 		tagsError?: string;
 		tagsEmpty?: string;
 		staleTags?: Record<string, { afterWrites: number; payload: string; fired?: boolean }>;
+		publishLag?: Record<string, number>;
 	},
 	run: (fixture: {
 		root: string;
@@ -509,6 +550,7 @@ async function withReleaseFixture(
 						VERSIONS_ERROR: options.versionsError ?? "",
 						TAGS_ERROR: options.tagsError ?? "",
 						TAGS_EMPTY: options.tagsEmpty ?? "",
+						PUBLISH_LAG: JSON.stringify(options.publishLag ?? {}),
 					},
 					stdout: "pipe",
 					stderr: "pipe",
@@ -641,6 +683,27 @@ describe("release script subprocess behavior", () => {
 			);
 		});
 	}, 30_000);
+
+	test("waits for the registry to list a fresh publish before reconciling its channel", async () => {
+		const protocol = RELEASE_FIXTURES[0];
+		await withReleaseFixture({ publishLag: { [protocol.name]: 1 } }, async ({ root, execute }) => {
+			const result = await execute("--publish", "--tag", "latest");
+			expect(result.code).toBe(0);
+			expect(result.output).toContain(`waiting for the registry to list ${packageRef(protocol)} (attempt 1/`);
+			const npm = result.commands.filter((command) => command.tool === "npm").map((command) => command.args);
+			// The lagging packument must not be read as a stale tag: no repair write is issued.
+			expect(npm.some((args) => args[0] === "dist-tag")).toBe(false);
+			expect(npm.slice(0, 7)).toEqual([
+				["view", packageRef(protocol), "version"],
+				["view", protocol.name, "dist-tags", "--json"],
+				["view", protocol.name, "versions", "--json"],
+				["publish", join(root, "dist-packed", "gajae-gateway-protocol.tgz"), "--access", "public", "--tag", "latest"],
+				["view", protocol.name, "versions", "--json"],
+				["view", protocol.name, "versions", "--json"],
+				["view", protocol.name, "dist-tags", "--json"],
+			]);
+		});
+	}, 60_000);
 
 	test("registry check failure stops the release before publishing that package", async () => {
 		const failed = packageRef(RELEASE_FIXTURES[1]);

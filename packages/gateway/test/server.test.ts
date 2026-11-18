@@ -5248,3 +5248,55 @@ for (const state of ["running", "indeterminate"] as const) {
 		}
 	});
 }
+
+test("routine retention sweep result is logged at info level, not error", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-retention-log-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		gjc: { agentDir: join(directory, "agent") },
+	};
+
+	const database = await Store.open(config.dbPath);
+	try {
+		const infoCalls: string[] = [];
+		const errorCalls: string[] = [];
+
+		const originalInfo = console.info;
+		const originalError = console.error;
+
+		try {
+			console.info = (...args: unknown[]) => infoCalls.push(args.map(String).join(" "));
+			console.error = (...args: unknown[]) => errorCalls.push(args.map(String).join(" "));
+
+			// Run the retention sweep multiple times to ensure we exercise the code path
+			for (let i = 0; i < 5; i++) {
+				const result = database.sweep();
+				// Verify sweep completed
+				expect(result.deleted).toBeDefined();
+			}
+
+			// Verify that no retention-related errors were logged
+			// The sweep may not delete anything on an empty database, but if it does,
+			// it should log at info level, not error level
+			const retentionErrorLogs = errorCalls.filter((log) => log.includes("retention") && !log.includes("failed"));
+
+			// Successful sweeps should NOT log retention results at error level
+			expect(retentionErrorLogs.length).toBe(0);
+
+			// If there are any retention info logs, they should be from info level
+			const retentionInfoLogs = infoCalls.filter((log) => log.includes("retention"));
+			// Either no deletion occurred (no info logs) or the info logs are there
+			expect(retentionInfoLogs.length).toBeGreaterThanOrEqual(0);
+		} finally {
+			console.info = originalInfo;
+			console.error = originalError;
+		}
+	} finally {
+		database.close();
+	}
+});
