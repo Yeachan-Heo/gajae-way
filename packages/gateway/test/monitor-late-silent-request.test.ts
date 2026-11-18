@@ -18,6 +18,7 @@ import {
 } from "./session-port.fake";
 
 const target: OriginRef = { platform: "discord", kind: "channel", conversationId: "report-room" };
+const notifications: string[] = [];
 
 function eventsFromPrompt(text: string): Array<{ eventId: string }> {
 	const match = text.match(/\[.*\]$/s);
@@ -213,7 +214,7 @@ test("a late [SILENT] after the authoring answer never replaces the monitor resp
 			burstPolicy: "serialize",
 			reportTo: target,
 		});
-		const notifications: string[] = [];
+		notifications.length = 0;
 		pipeline = new MonitorPropagator({
 			database,
 			registry,
@@ -272,23 +273,34 @@ test("a failed turn-scoped transcript read is a structured warning, not a silent
 					// The hazard in full: by the time the final read runs, the
 					// session's last assistant message is the wake-up's marker.
 					return { ok: true, page: { items: ["[SILENT]"], complete: true } };
+				if (request.operation === "turn.result")
+					// The op's terminal receipt exists but its body never attached
+					// (a late agent_end, #248): the invocation-owned read is
+					// structured-absent, not authorable.
+					return {
+						ok: true,
+						result: {
+							kind: "prompt",
+							clientRef: request.input.clientRef,
+							status: "terminal_ok",
+							receiptState: "absent",
+							outcome: { reason: "end_turn", provenance: "agent" },
+						},
+					};
 				if (request.operation === "transcript.list")
-					// Torn relay: the transcript read never answers, so the request
-					// times out (a transport failure the port surfaces verbatim).
-					return new Promise<never>(() => {});
+					// The transcript surface is torn entirely (CLI variant below).
+					return { ok: false, error: { code: "relay_torn", message: "surface torn" } };
 				return turn(request);
 			},
 			(args) => {
 				if (args.includes("query") && args.includes("turn.result")) {
-					// The CLI restart after a torn relay is torn as well (the whole
-					// transcript surface is down): the port's error reaches
+					// The CLI recovery transport after a torn relay is torn as well
+					// (the whole result surface is down): the port's error reaches
 					// #responseFromTurn instead of an empty-but-valid answer.
 					throw new Error("broker turn.result surface unavailable");
 				}
 				if (!args.includes("transcript.list")) return undefined;
-				// The CLI restart after a torn relay is torn as well (the whole
-				// transcript surface is down): the port's error reaches
-				// #responseFromTurn instead of an empty-but-valid answer.
+				// The CLI recovery transport after a torn relay is torn as well.
 				throw new Error("broker transcript surface unavailable");
 			},
 		);
@@ -439,6 +451,120 @@ test("late [SILENT] after valid answer in same operation keeps the answer", asyn
 		// The event must be authored with the real answer, not the late [SILENT]
 		expect(database.monitors.authoredOutput(eventId)).toBe(realAnswer);
 		expect(database.monitors.eventGet(eventId)?.stage).toBe("authored_no_delivery");
+	} finally {
+		pipeline?.dispose();
+		await pipeline?.drain();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+/**
+ * snowflake CHANGES_REQUESTED on #842 (5e3d7ffcc): a PRIOR event's spoken
+ * response poisons the transcript for the CURRENT turn — its row sits
+ * timestamped after the current event's fired_at (and within the 2s slack
+ * before startedAt) while the current op's own turn.result holds the valid
+ * answer for the CURRENT event, and the last assistant message is `[SILENT]`.
+ * The timestamp-floor + preferSpoken transcript read picked the prior row,
+ * the consumer then rejected the mismatched event IDs and retried. The
+ * op-ref-bound read must author the current event with its own answer on the
+ * first dispatch — through the REAL request path, no store-method faking.
+ */
+test("a prior event's spoken response is never selected for the current silent turn", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-prior-spoken-"));
+	let pipeline: MonitorPropagator | undefined;
+	try {
+		const priorAnswer = "Prior answer for the EARLIER event only.";
+		const realAnswer = "Current answer for THIS event.";
+		const { outputs, started } = turnFixture();
+		// The current event's own valid answer, stored under its op-ref: the
+		// invocation-owned turn.result body the host reports.
+		const transcript: Array<{ ts: string; body: string }> = [];
+		const { database, sessionPort, repo } = await brokerPortHarness(
+			directory,
+			(request) => {
+				const turn = hostTurnHandlers(realAnswer, outputs, started, (answer) => {
+					const entries = JSON.parse(answer) as Array<{ eventId: string }>;
+					// The host transcript keeps the PRIOR event's spoken answer as its
+					// newest row, stamped after the current event's fired_at and inside
+					// the 2s slack: the timestamp-floor heuristic would pick it.
+					const priorEntry = JSON.stringify([{ eventId: entries[0]?.eventId, note: priorAnswer }]);
+					transcript.push({ ts: new Date(Date.now() + 1500).toISOString(), body: priorEntry });
+					transcript.push({ ts: new Date(Date.now() + 1600).toISOString(), body: "[SILENT]" });
+				});
+				if (request.operation === "session.last_assistant")
+					// The session's last assistant message is the wake-up's marker.
+					return { ok: true, page: { items: ["[SILENT]"], complete: true } };
+				return turn(request);
+			},
+			(args) => {
+				// Pre-#809-fix sources have no op-scoped CLI read: 3c5885f22 selects a
+				// transcript row (its fetchAssistantSince picks the prior event's
+				// spoken answer via timestamp-floor + preferSpoken) and 031a61f7b falls
+				// back to requestResult.assistant (the last message, the `[SILENT]`
+				// marker). Both must fail this test, so the op-owned CLI read answers
+				// only on sources that actually perform it.
+				if (args.includes("transcript.list")) {
+					// The timestamp-floor + preferSpoken transcript read sees the
+					// poisoned transcript: the prior event's spoken answer is the
+					// newest spoken row, followed by the `[SILENT]` marker.
+					return {
+						exitCode: 0,
+						stdout: JSON.stringify({
+							page: {
+								items: transcript.map((row) => ({ role: "assistant", ts: row.ts, body: row.body })),
+								complete: true,
+							},
+						}),
+						stderr: "",
+					};
+				}
+				// The CLI recovery transport cannot serve `turn.result` (hosts whose
+				// durable-result surface is relay-only): the op-owned read must ride
+				// the request's own relay. A source without the relay-borne read
+				// (031a61f7b) falls back to `requestResult.assistant` — the last
+				// message, the `[SILENT]` marker — and fails this test; 3c5885f22 has
+				// no op-scoped read at all and picks the poisoned transcript row.
+				if (args.includes("query") && args.includes("turn.result"))
+					throw new Error("CLI turn.result surface unavailable");
+				return undefined;
+			},
+		);
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "prior-spoken-watch",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["prior.spoken"],
+			burstPolicy: "serialize",
+			reportTo: target,
+		});
+		pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort,
+			repo,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			notifyInbound: async (key) => {
+				notifications.push(key);
+			},
+		});
+
+		notifications.length = 0;
+		const eventId = await pipeline.submitAwaitable(monitor.monitorId, "prior.spoken", { run: 1 });
+
+		// The transcript poisoning actually happened on the request path.
+		expect(transcript.some((row) => row.body.includes(priorAnswer))).toBe(true);
+		expect(transcript.at(-1)?.body).toBe("[SILENT]");
+		// The current event is authored with ITS OWN answer on the first dispatch —
+		// never the prior event's spoken response (a mismatched-ID retry would
+		// surface as authoring_response_invalid, not authorship).
+		expect(database.monitors.authoredOutput(eventId)).toBe(realAnswer);
+		expect(database.monitors.failure(eventId)).toBeUndefined();
+		expect(database.monitors.eventGet(eventId)?.stage).toBe("authored_no_delivery");
+		const report = database.inbox.pendingOldest(originKey(target));
+		expect(report?.body.endsWith(realAnswer)).toBe(true);
+		expect(notifications).toEqual([originKey(target)]);
 	} finally {
 		pipeline?.dispose();
 		await pipeline?.drain();

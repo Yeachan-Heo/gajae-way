@@ -1614,14 +1614,14 @@ export class MonitorPropagator {
 					originKey: sessionOriginKey,
 					text: prompt,
 					opRef,
+					// Bind the answer to this operation (#809): request() reads the
+					// op-owned turn.result over its own relay before closing it.
+					fetchWorkerOutput: true,
 					...(reusedOpRef === undefined && this.#registry.get(monitor.monitorId)?.contextRollTokens !== undefined
 						? { sampleContext: true }
 						: {}),
 				};
 				const requestResult = reusedOpRef === undefined ? await this.#sessionPort.request(requestInput) : undefined;
-				// Capture contextUsage early before #responseFromTurn is called, as it may
-				// extract from turn.result which does not include context data.
-				const contextUsage = requestResult?.contextUsage;
 				const response =
 					requestResult !== undefined
 						? await this.#responseFromTurn(requestResult, turn, claimed)
@@ -1667,6 +1667,9 @@ export class MonitorPropagator {
 					safety.contextFailures = 0;
 					// The runtime accepted and finished a turn, so it is not stalled.
 					safety.busyFailures = 0;
+					// Sampled inside request(); #responseFromTurn reads the op-owned
+					// turn.result and does not carry context data.
+					const contextUsage = requestResult?.contextUsage;
 					if (
 						contextUsage !== undefined &&
 						this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch === boundSessionEpoch
@@ -2014,57 +2017,30 @@ export class MonitorPropagator {
 				? startedAt
 				: Math.min(...rows.map((row) => Date.parse(row.fired_at)));
 		try {
-			const output = await this.#sessionPort.fetchWorkerOutput({
-				sessionId: turn.sessionId,
-				repo: this.#repo,
-				opRef: turn.opRef,
-				notBeforeMs,
-				terminalIdentity: requestResult.status.status,
-			});
+			// The in-request read rode the request's own relay while it was up
+			// (`SessionRequestInput.fetchWorkerOutput`); a proven read is the
+			// invocation-owned answer. Unproven or missing, the read is retried
+			// over the CLI recovery transport after the request closed the relay.
+			const output =
+				requestResult.workerOutput ??
+				(await this.#sessionPort.fetchWorkerOutput({
+					sessionId: turn.sessionId,
+					repo: this.#repo,
+					opRef: turn.opRef,
+					notBeforeMs,
+					terminalIdentity: requestResult.status.status,
+				}));
 			if (output.status === "proven") return output.text;
-			// For absent status with output_pending (temporary), fall back to requestResult.assistant
-			// since we got the response from a fresh request() call.
-			if (output.status === "absent" && output.code === "output_pending") {
-				console.error(
-					`monitor response not yet available for turn ${turn.opRef} session=${turn.sessionId}; falling back to requestResult.assistant`,
-				);
-				return requestResult.assistant.text;
-			}
-			// For transport_error, check if the fallback response is valid JSON.
-			// If it is, use it (normal case for incomplete broker data).
-			// If it's not (like "[SILENT]"), throw to report the fetch failure.
-			if (output.code === "transport_error") {
-				try {
-					// Try to parse as JSON to validate it's a real response
-					JSON.parse(requestResult.assistant.text);
-					console.error(
-						`monitor response fetch failed for turn ${turn.opRef} session=${turn.sessionId}; falling back to requestResult.assistant (valid JSON)`,
-					);
-					return requestResult.assistant.text;
-				} catch {
-					// Not valid JSON, can't safely fall back
-					console.error(
-						`monitor response unavailable for turn ${turn.opRef} session=${turn.sessionId} (${output.code}); fallback response is not valid JSON; the authoring op's own result is recovered on retry`,
-					);
-					throw new AuthoringResultUnavailableError(output.code);
-				}
-			}
-			// Identity mismatch and cancelled should definitely not fall back
-			if (output.code === "identity_mismatch" || output.code === "cancelled") {
-				console.error(
-					`monitor response unavailable for turn ${turn.opRef} session=${turn.sessionId} (${output.code}); the authoring op's own result is recovered on retry`,
-				);
-				throw new AuthoringResultUnavailableError(output.code);
-			}
-			// Fall back for incomplete broker data and other codes.
-			// For a fresh request, we have the response in requestResult.assistant so we can recover.
+			// Unavailable/absent is never a verdict about the answer: the session's
+			// last message can be a later turn's text (a late `[SILENT]`, a prior
+			// event's response), so falling back to `requestResult.assistant`
+			// reopens #809. The authoring pointer is kept and the read is retried.
 			console.error(
-				`monitor response unavailable for turn ${turn.opRef} session=${turn.sessionId} (${output.code}); falling back to requestResult.assistant`,
+				`monitor response unavailable for turn ${turn.opRef} session=${turn.sessionId} (${output.code}); the authoring op's own result is recovered on retry`,
 			);
-			return requestResult.assistant.text;
+			throw new AuthoringResultUnavailableError(output.code);
 		} catch (error) {
 			if (error instanceof AuthoringResultUnavailableError) throw error;
-			// Transport errors and other exceptions should not silently fall back
 			console.error(
 				`monitor response read failed for turn ${turn.opRef} session=${turn.sessionId}: ${failureDetail(error)}; the authoring op's own result is recovered on retry`,
 			);

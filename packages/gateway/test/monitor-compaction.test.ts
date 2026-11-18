@@ -3738,6 +3738,36 @@ test("a roll digest survives real BrokerSessionPort poisoned-create epoch recove
 					}),
 					stderr: "",
 				};
+			if (args.includes("turn.result")) {
+				// `fetchWorkerOutput` rides the CLI after `request()` closed its relay
+				// (regression guard for #809's op-ref-bound read): the same
+				// invocation-owned body the relay above answers with.
+				const atIdx = args.indexOf("--json-input");
+				const parsed = JSON.parse(args[atIdx + 1]!) as { clientRef: string };
+				return {
+					exitCode: 0,
+					stdout: JSON.stringify({
+						ok: true,
+						result: {
+							kind: "prompt",
+							clientRef: parsed.clientRef,
+							status: "terminal_ok",
+							receiptState: "present",
+							startedAt: Date.now() - 2,
+							terminalAt: Date.now(),
+							outcome: { reason: "end_turn", provenance: "agent" },
+							content: {
+								version: 1,
+								type: "text",
+								text: response,
+								truncated: false,
+								byteLength: Buffer.byteLength(response),
+							},
+						},
+					}),
+					stderr: "",
+				};
+			}
 			if (args.includes("transcript.list"))
 				return {
 					exitCode: 0,
@@ -3748,6 +3778,7 @@ test("a roll digest survives real BrokerSessionPort poisoned-create epoch recove
 				};
 			throw new Error(`unexpected command ${args.join(" ")}`);
 		};
+		const startedAtByRef = new Map<string, number>();
 		const prompts: string[] = [];
 		let response = "";
 		const relay = scriptedRelay((request) => {
@@ -3755,6 +3786,7 @@ test("a roll digest survives real BrokerSessionPort poisoned-create epoch recove
 				const text = String(request.input.text);
 				prompts.push(text);
 				response = echoNotes(text);
+				startedAtByRef.set(String(request.input.clientRef), Date.now());
 				return { ok: true, result: { accepted: true, clientRef: request.input.clientRef } };
 			}
 			if (request.operation === "turn.result")
@@ -3765,7 +3797,16 @@ test("a roll digest survives real BrokerSessionPort poisoned-create epoch recove
 						clientRef: request.input.clientRef,
 						status: "terminal_ok",
 						receiptState: "present",
+						startedAt: startedAtByRef.get(String(request.input.clientRef)),
+						terminalAt: Date.now(),
 						outcome: { reason: "end_turn", provenance: "agent" },
+						content: {
+							version: 1,
+							type: "text",
+							text: response,
+							truncated: false,
+							byteLength: Buffer.byteLength(response),
+						},
 					},
 				};
 			if (request.operation === "session.last_assistant")
