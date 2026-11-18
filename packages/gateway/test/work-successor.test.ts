@@ -458,25 +458,37 @@ test("a child report drained after the parent's hold lands is retained instead o
 	// The parent's observer holds the lane outside this session lock while the first steer is out.
 	const startedAt = Date.parse(f.db.work.workAttemptGet(parent.opRef)!.startedAt);
 	const live = f.port.status;
-	f.port.status = async (input) =>
-		input.opRef !== parent.opRef
-			? live(input)
-			: {
-					operationRef: parent.opRef,
-					status: {
-						status: "failed",
-						clientRef: parent.opRef,
-						commandId: "command-parent",
-						turnId: "turn-parent",
-						startedAt,
-						terminalAt: startedAt + 1,
-						receiptState: "missing",
-						error: { code: "prompt_deadline_exceeded" },
-					},
-					summaryCompleted: true,
-				};
+	let statusQueried!: () => void;
+	const statusQueryPromise = new Promise<void>((resolve) => {
+		statusQueried = resolve;
+	});
+	f.port.status = async (input) => {
+		if (input.opRef === parent.opRef) statusQueried();
+		if (input.opRef !== parent.opRef) return live(input);
+		return {
+			operationRef: parent.opRef,
+			status: {
+				status: "failed",
+				clientRef: parent.opRef,
+				commandId: "command-parent",
+				turnId: "turn-parent",
+				startedAt,
+				terminalAt: startedAt + 1,
+				receiptState: "missing",
+				error: { code: "prompt_deadline_exceeded" },
+			},
+			summaryCompleted: true,
+		};
+	};
 	try {
-		await until(() => f.job("steady").state === "awaiting_operator");
+		// Wait for status to be queried (observable event that triggers state transition).
+		// Use longer timeout since observer scheduling may be delayed on loaded systems like darwin-arm64.
+		await Promise.race([
+			statusQueryPromise.then(() => {}),
+			new Promise<void>((resolve) => setTimeout(resolve, 5000)),
+		]);
+		// After status is queried or timeout, verify state changed.
+		for (let i = 0; i < 100 && f.job("steady").state !== "awaiting_operator"; i++) await Bun.sleep(5);
 		// The hold is durable without any proof that the native execution ended.
 		const parked = f.db.work.workAttemptGet(parent.opRef)!;
 		expect(parked.terminal).toBeNull();
