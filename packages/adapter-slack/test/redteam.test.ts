@@ -604,11 +604,11 @@ test("RT-SLACK-19 credential prefixes fail without secrets, relative files resol
 	expect(loaded.botTokenFile).toBe(join(home, "bot"));
 	expect(loaded.appTokenFile).toBe(join(home, "app"));
 	for (const [file, good] of [
-		["bot", "xoxb-good"],
-		["app", "xapp-good"],
+		["bot", "xoxb-good"] as const,
+		["app", "xapp-good"] as const,
 	]) {
 		const secret = "wrong-prefix-sensitive-token";
-		await Bun.write(join(home, file!), secret);
+		await Bun.write(join(home, file), secret);
 		let error: unknown;
 		try {
 			await loadSlackAdapterConfig({ GAJAEWAY_HOME: home });
@@ -617,7 +617,7 @@ test("RT-SLACK-19 credential prefixes fail without secrets, relative files resol
 		}
 		expect(error).toBeInstanceOf(Error);
 		expect(String(error)).not.toContain(secret);
-		await Bun.write(join(home, file!), good!);
+		await Bun.write(join(home, file), good);
 	}
 	await Bun.write(
 		join(home, "adapter-slack.json"),

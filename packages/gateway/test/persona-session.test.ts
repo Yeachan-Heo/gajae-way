@@ -1091,7 +1091,6 @@ test("a held turn in recovery_hold must not absorb new inbound as steers; new in
 	enqueue("first-msg", "initial message");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sendAttempts.length === 1, "first send attempt did not start");
-	const firstOpRef = port.sendAttempts[0]!.opRef;
 
 	// The first send failed with ambiguous error (timeout)
 	expect(port.sends).toHaveLength(0);
@@ -6572,15 +6571,12 @@ test("a notice during a gateway turn steers its gateway framing without lane-rep
 test("model selection transitions are not skipped by cache collisions between string and object representations", async () => {
 	const port = new ScriptedSessionPort();
 	const terminal: string[] = [];
-	await harness(
-		port,
-		{
-			terminal: (text) => terminal.push(text),
-			modelRefusal: () => {
-				/* noop */
-			},
+	await harness(port, {
+		terminal: (text) => terminal.push(text),
+		modelRefusal: () => {
+			/* noop */
 		},
-	);
+	});
 	enqueue("test-turn", "test message");
 	await manager!.notifyInbound(KEY);
 	await eventually(() => port.sends.length > 0, "no sends were made");
