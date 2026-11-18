@@ -1366,7 +1366,7 @@ export class MonitorPropagator {
 					if (effectiveModel && !binding.startupModelApplied && this.#appliedModels.get(sessionId) !== modelKey) {
 						dispatchOperation = "setModel";
 						dispatchOperationArgs = {
-							model: modelKey,
+							model: modelSelector(effectiveModel),
 						};
 						await this.#sessionPort.setModel({ sessionId, repo: this.#repo, selection: effectiveModel });
 						this.#appliedModels.set(sessionId, modelKey!);
@@ -3358,4 +3358,11 @@ function selectIdentity(selection: GjcModelSelection | undefined): string {
 	if (selection === undefined) return "undefined";
 	if (typeof selection === "string") return `string:${selection}`;
 	return `object:preset:${selection.preset}`;
+}
+
+/** Converts a model selection to its user-visible selector format. */
+function modelSelector(selection: GjcModelSelection | undefined): string {
+	if (selection === undefined) return "undefined";
+	if (typeof selection === "string") return selection;
+	return `preset:${selection.preset}`;
 }
