@@ -1220,9 +1220,26 @@ export class MonitorPropagator {
 				this.#database.transaction((tx) => this.#database.monitors.eventReleaseLease(tx, row.event_id, leaseId));
 			return;
 		}
+		// Snowykr on #842 (claim-time recheck): a row this attempt just leased may
+		// already hold persisted authored output — an earlier attempt authored it,
+		// then its dispatch failed and the row regressed. The stored answer is
+		// authoritative and immutable, so a fresh authoring turn could answer
+		// [SILENT] over a persisted spoken answer. Under the lease THIS attempt
+		// holds, route such rows through the same stored-answer recovery as
+		// reconcile (#author's refusal branch repairs the stage and re-enqueues
+		// the STORED answer) and never claim them for fresh authoring.
+		const staleAuthoredRows: Array<{ row: MonitorEventDbRow; output: string }> = [];
+		for (const row of leased) {
+			const output = this.#database.monitors.authoredOutput(row.event_id);
+			if (output !== undefined) staleAuthoredRows.push({ row, output });
+		}
+		for (const stale of staleAuthoredRows)
+			this.#author(stale.row.event_id, stale.output, isSilentOutput(stale.output), stale.row);
+		const recovered = new Set(staleAuthoredRows.map((stale) => stale.row.event_id));
 		// Fence the initial stage claim: only rows we still own transition.
 		const claimed: typeof leased = [];
 		for (const row of leased) {
+			if (recovered.has(row.event_id)) continue;
 			if (this.#fencedUpdate(row.event_id, leaseId, batchId, now())) claimed.push(row);
 		}
 		if (!claimed.length || (resumeTurn && claimed.length !== leased.length)) {
@@ -1800,9 +1817,16 @@ export class MonitorPropagator {
 							return true;
 						});
 						if (!authoredOk) {
-							// Persistence was rejected: another dispatch already persisted the answer.
-							// Skip further processing (do not deliver stale response). The stored answer
-							// will be delivered by its owning dispatch, not this stale attempt.
+							// Persistence was rejected: a stored answer this attempt never produced
+							// already holds the row (the owning dispatch failed and the row
+							// regressed before this reclaim). Nothing of this fresh response is
+							// delivered or reported. Under the lease this attempt still holds,
+							// route the row through #author stored-answer recovery: it repairs
+							// the stage to authored (authored_no_delivery for a silent stored
+							// note), restores the memory intent from the STORED answer, and
+							// re-enqueues it via the deterministic monitor-report:<eventId> id.
+							const storedNote = this.#database.monitors.authoredOutput(entry.eventId);
+							if (storedNote !== undefined) this.#author(entry.eventId, storedNote, isSilentOutput(storedNote), row);
 							continue;
 						}
 						successfullyAuthoredIds.add(entry.eventId);
