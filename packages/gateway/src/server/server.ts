@@ -164,6 +164,7 @@ import {
 	watchWakeMessageId,
 } from "./handoff";
 import { InterimSpeechGate } from "./interim-speech";
+import { buildLanguageInstruction, checkKanaGuard, detectLanguageFromText } from "./language-guard";
 import { applyModelCommand, listModelChoices, ProviderModelCatalog } from "./model-command";
 import { checkOutboundFile, deterministicFileDeliveryId } from "./outbound-files";
 import { type PanelResponseKind, PermissionPanels } from "./permission-panels";
@@ -3288,6 +3289,27 @@ async function editChat(
 	await runtime.personaSessions.notifyInbound(key);
 }
 
+/**
+ * Detect the conversation language from the user message text and recent conversation history.
+ * Returns 'ko' for Korean conversations, undefined otherwise.
+ */
+function detectConversationLanguage(
+	currentText: string,
+	recentMessages: Array<{ author: string; body: string }>,
+): "ko" | undefined {
+	// First try the current user message
+	const currentLang = detectLanguageFromText(currentText);
+	if (currentLang === "ko") return "ko";
+
+	// Fall back to recent messages (most recent first to bias toward current language)
+	for (const msg of recentMessages) {
+		const lang = detectLanguageFromText(msg.body);
+		if (lang === "ko") return "ko";
+	}
+
+	return undefined;
+}
+
 async function createInboundTurnLifecycle(
 	input: PersonaTurnStartInput,
 	options: GatewayServerOptions,
@@ -3431,12 +3453,35 @@ async function createInboundTurnLifecycle(
 	// context may not hold it. The bootstrap and a changed-AGENTS.md section are
 	// one-shot and ride their own send.
 	const sessionBootstrap = [bootstrap?.text, agentsMdSection].filter(Boolean).join("\n\n");
+
+	// Detect conversation language from recent messages and current message
+	const recentMessagesForLanguage: Array<{ author: string; body: string }> = [];
+	if (nonLoopback) {
+		// Collect recent messages for language detection
+		const isFreshSession = bootstrapPending;
+		if (isFreshSession) {
+			const recent = recentConversation(
+				options.database,
+				key,
+				origin.conversationId,
+				RECENT_HISTORY_MAX,
+				new Date(Date.now() - RECENT_HISTORY_WINDOW_MS).toISOString(),
+			);
+			recentMessagesForLanguage.push(...recent);
+		}
+	}
+	// Detect language from current message and recent messages
+	// Apply to all turns (including internal lane reports) to ensure consistent language handling
+	const conversationLanguage = detectConversationLanguage(userText, recentMessagesForLanguage);
+	const languageInstruction = buildLanguageInstruction(conversationLanguage);
+
 	const systemPreamble = [
 		await runtime.persona.systemPreamble(),
 		currentConversationNotice(origin),
 		ATTACHMENT_SCOPE_NOTICE,
 		ACTION_GUARD_SYSTEM_NOTICE,
 		SECRET_GUARD_SYSTEM_NOTICE,
+		...(languageInstruction ? [languageInstruction] : []),
 	].join("\n\n");
 	const modelOverride = options.database.bindings.modelGet(key)?.selection;
 	const effectiveModel = modelOverride ?? runtime.config.model;
@@ -4287,6 +4332,28 @@ async function createInboundTurnLifecycle(
 			// answer for the same trigger finds every slot unowned and posts. The
 			// former "same text → skip" shortcut left that hole whenever the
 			// finalized frame arrived on the tail before onTerminal.
+			// Apply kana guard: check if Korean conversation has too much kana
+			const kanaGuardViolation = checkKanaGuard(text, conversationLanguage);
+			if (kanaGuardViolation) {
+				console.error(`gateway kana guard blocked response (${turnId}): ${kanaGuardViolation.reason}`);
+				// Implement hold-and-rewrite: request a Korean rewrite instead of silently dropping
+				// Never drop replies silently - either deliver original or request rewrite
+				if (laneReport) {
+					// For internal turns (lane reports), trigger a follow-up to request a Korean rewrite
+					await deliverAssistantText(
+						`[LANGUAGE_GUARD] Excessive kana in Korean conversation. Requesting Korean rewrite.\n\nOriginal: ${text}`,
+						"terminal",
+					);
+					return;
+				} else {
+					// For external turns, deliver with a notice about language mismatch
+					await deliverAssistantText(
+						`${text}\n\n[WARNING] This response contains Japanese characters in a Korean conversation. The system is requesting a Korean rewrite.`,
+						"terminal",
+					);
+					return;
+				}
+			}
 			await deliverAssistantText(text, "terminal");
 			if (deliveredParts.length === 0) {
 				if (reactionTokensSeen)
