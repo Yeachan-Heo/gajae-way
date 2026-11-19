@@ -9,6 +9,13 @@ export const ROOT_TEXT_CACHE_LIMIT = 500;
  * in a shed thread asks again.
  */
 export const ROOT_TEXT_MAX_IN_FLIGHT = 4;
+/**
+ * Cold-root lookups started per window. `conversations.replies` is Tier 3 (about 50 a
+ * minute) and recovery walks threads with it, so lookups keep well under half of it;
+ * one past the budget is shed and the next engaged reply under that root asks again.
+ */
+export const ROOT_TEXT_LOOKUPS_PER_WINDOW = 20;
+export const ROOT_TEXT_WINDOW_MS = 60_000;
 /** Kept well under the protocol's "short single-line" excerpt; the header clips further. */
 export const ROOT_TEXT_LIMIT = 300;
 
@@ -26,10 +33,13 @@ export const ROOT_TEXT_LIMIT = 300;
 export class SlackRootTexts {
 	readonly #texts = new Map<string, string>();
 	readonly #inFlight = new Map<string, Promise<void>>();
+	/** Start times of lookups inside the current window, oldest first. */
+	readonly #started: number[] = [];
 
 	constructor(
 		readonly api: Pick<SlackWebApi, "conversationsReplies">,
 		readonly normalize: (text: string) => string = (text) => text,
+		readonly now: () => number = Date.now,
 	) {}
 
 	/** Records a root the bot just posted at the top level of a channel. */
@@ -54,6 +64,10 @@ export class SlackRootTexts {
 
 	#fetch(rootId: string): void {
 		if (this.#inFlight.has(rootId) || this.#inFlight.size >= ROOT_TEXT_MAX_IN_FLIGHT) return;
+		const now = this.now();
+		while (this.#started.length > 0 && now - (this.#started[0] ?? now) >= ROOT_TEXT_WINDOW_MS) this.#started.shift();
+		if (this.#started.length >= ROOT_TEXT_LOOKUPS_PER_WINDOW) return;
+		this.#started.push(now);
 		const fetched = this.#load(rootId).finally(() => this.#inFlight.delete(rootId));
 		this.#inFlight.set(rootId, fetched);
 	}
