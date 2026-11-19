@@ -574,3 +574,55 @@ test("a database that recorded migration 25 before the AGENTS.md columns were ad
 		await rm(directory, { recursive: true, force: true });
 	}
 });
+
+test("migrations 43 and 44 are idempotent when a partially upgraded database already has their columns and index", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-migration-monitor-epoch-partial-"));
+	const path = join(directory, "gateway.db");
+	try {
+		const initial = await Store.open(path);
+		initial.close();
+		// The torn state the migration-25 drill covers for sessions, applied to
+		// this PR's own migrations: version rows recorded while the objects they
+		// add are missing.
+		const torn = new Database(path);
+		torn.exec(
+			"DROP INDEX IF EXISTS monitor_events_origin_epoch_recent; ALTER TABLE monitor_events DROP COLUMN escalation_epoch; ALTER TABLE monitor_events DROP COLUMN session_origin_key; DELETE FROM schema_migrations WHERE version >= 43;",
+		);
+		torn.close();
+
+		const upgraded = await Store.open(path);
+		expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+		upgraded.close();
+		const raw = new Database(path, { readonly: true });
+		const monitorEventColumns = raw
+			.query<{ name: string }, []>("PRAGMA table_info(monitor_events)")
+			.all()
+			.map((column) => column.name);
+		const index = raw
+			.query<{ name: string }, []>(
+				"SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'monitor_events_origin_epoch_recent'",
+			)
+			.all();
+		raw.close();
+		expect(monitorEventColumns).toContain("session_origin_key");
+		expect(monitorEventColumns).toContain("escalation_epoch");
+		expect(index).toHaveLength(1);
+
+		// Reopening a fully-upgraded database re-runs neither migration: the guard
+		// columns exist, the ALTER statements are skipped, and each version row is
+		// recorded exactly once.
+		const reopened = await Store.open(path);
+		expect(reopened.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+		reopened.close();
+		const versions = new Database(path, { readonly: true });
+		const recorded = versions
+			.query<{ version: number }, []>(
+				"SELECT version FROM schema_migrations WHERE version IN (43, 44) ORDER BY version",
+			)
+			.all();
+		versions.close();
+		expect(recorded).toEqual([{ version: 43 }, { version: 44 }]);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
