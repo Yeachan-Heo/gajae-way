@@ -33,18 +33,12 @@ export function slackMessageOrigin(event: SlackMessageOriginShape): OriginRef {
 }
 
 /** Resolve the session origin after engagement and command handling are known. */
-export function resolveSlackMessageOrigin(
-	message: SlackMessageOriginShape,
-	botUserId: string,
-	mentioned: boolean,
-): OriginRef {
+export function resolveSlackMessageOrigin(message: SlackMessageOriginShape, mentioned: boolean): OriginRef {
 	const origin = slackMessageOrigin(message);
-	if (origin.kind === "dm") return origin;
-	if (message.thread_ts && message.thread_ts !== message.ts) {
-		return message.parent_user_id === botUserId
-			? { platform: "slack", kind: "channel", conversationId: message.channel }
-			: origin;
-	}
+	// Every reply keeps its own thread session, including a thread rooted at the bot's own
+	// message: folding those into the channel session piled every work thread the bot opened
+	// into one session, so threads leaked into each other and compacted together.
+	if (origin.kind !== "channel") return origin;
 	if (!mentioned || !message.ts) return origin;
 	return {
 		platform: "slack",

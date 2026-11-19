@@ -222,6 +222,38 @@ test("Slack partial chunk success makes a later definitive failure uncertain", a
 	]);
 });
 
+test("Slack reports every post, plain or panel, with its origin to the posted-message hook", async () => {
+	const client = new Gateway();
+	const api = new Api();
+	const remembered: unknown[][] = [];
+	const posted = { remember: (...args: unknown[]) => void remembered.push(args) };
+	let next = 0;
+	api.postMessage = async (channel) => ({ channel, ts: `${++next}.000` });
+	const settle = (message: ChatMessagePayload) =>
+		settleSlackDelivery(client, api, message, console, undefined, undefined, undefined, posted);
+	await settle(delivery({ text: "x".repeat(9000) }));
+	// Each chunk is recorded; the first, a possible thread root, carries the whole text.
+	expect(remembered[0]).toEqual([origin, "C1", "1.000", "x".repeat(9000), undefined]);
+	expect(remembered).toHaveLength(next);
+	expect(remembered.slice(1).every(([recorded, , , text]) => recorded === origin && text !== "x".repeat(9000))).toBe(
+		true,
+	);
+	const threaded = { platform: "slack" as const, kind: "thread" as const, conversationId: "C1:1.000", parentId: "C1" };
+	await settle(delivery({ origin: threaded, text: "in thread" }));
+	expect(remembered.at(-1)).toEqual([threaded, "C1", `${next}.000`, "in thread", "1.000"]);
+	await settle(
+		delivery({
+			askUserPanel: {
+				panelId: "q_1",
+				question: "Choose",
+				expiresAt: "2099-01-01T00:00:00Z",
+				options: [{ id: "a", label: "A" }],
+			},
+		}),
+	);
+	expect(remembered.at(-1)).toEqual([origin, "C1", `${next}.000`, expect.stringContaining("Choose"), undefined]);
+});
+
 test("Slack complete settlements serialize one origin while unrelated origins continue after failure", async () => {
 	const client = new Gateway();
 	const api = new Api();
@@ -649,9 +681,8 @@ for (const shape of [
 			await f.event({ ...inbound(shape) });
 			const dm = shape.channel === "D1";
 			const thread = "thread_ts" in shape;
-			// A thread rooted at the bot's own message routes to the channel session (see decideInbound),
-			// while replyTo still names the thread so the answer lands where the human wrote.
-			const threadSession = thread && shape.parent_user_id !== "UBOT";
+			// Every reply keeps its thread session, including one under the bot's own message.
+			const threadSession = thread;
 			expect(f.client.requests).toEqual([
 				{
 					verb: "chat.send",
@@ -982,16 +1013,21 @@ test("Slack mention, open-channel and parent-bot promotion; bot authors remain m
 	});
 });
 
-test("Slack thread reply under the bot's own message continues the channel session; a human-rooted thread stays isolated", () => {
-	// Reply threaded under the bot's answer: origin collapses to the channel (same session), while
-	// replyTo still names the thread so the answer lands where the human wrote.
+test("Slack thread replies keep their own thread session whoever posted the root", () => {
+	// Reply threaded under the bot's answer: its own thread session, never the channel's, and
+	// replyTo marks the root as ours.
 	const underBot = decideInbound(
 		inbound({ ts: "1700000002.000000", thread_ts: "1700000001.000000", parent_user_id: "UBOT", text: "and then?" }),
 		identity,
 		names,
 		undefined,
 	);
-	expect(underBot?.origin).toEqual({ platform: "slack", kind: "channel", conversationId: "C1" });
+	expect(underBot?.origin).toEqual({
+		platform: "slack",
+		kind: "thread",
+		conversationId: "C1:1700000001.000000",
+		parentId: "C1",
+	});
 	expect(underBot?.engagement.replyTo).toEqual({ messageId: "C1:1700000001.000000", authorId: "UBOT", fromSelf: true });
 	expect(underBot?.engagement.mentioned).toBe(true);
 	expect(underBot?.engagement.explicitMention).toBe(false);
@@ -1399,6 +1435,30 @@ test("Slack inbound reactions carry action metadata and ignore the bot", async (
 				params: { origin, targetMessageId: "C1:1.000", emoji: "👍", action, engagement },
 			})),
 		);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("Slack reactions follow the session their target message was routed to", async () => {
+	const f = await fixture();
+	try {
+		const root = "1700000001.000000";
+		const thread = { platform: "slack", kind: "thread", conversationId: `C1:${root}`, parentId: "C1" };
+		await f.event({ ...inbound({ ts: "1700000002.000001", text: "reply", thread_ts: root, parent_user_id: "UBOT" }) });
+		const react = (ts: string) =>
+			f.event({
+				type: "reaction_added",
+				user: "U1",
+				reaction: "+1",
+				item: { type: "message", channel: "C1", ts },
+				event_ts: "1700000009.000000",
+			});
+		await react("1700000002.000001");
+		// A message the adapter never routed keeps the channel fallback.
+		await react("1700000003.000001");
+		const reactions = f.client.requests.filter((request) => request.verb === "engagement.reaction");
+		expect(reactions.map((request) => (request.params as { origin: unknown }).origin)).toEqual([thread, origin]);
 	} finally {
 		f.socket.stop();
 	}
@@ -2114,12 +2174,72 @@ test("Slack recovery joins a still-pending live send instead of calling it a dup
 	}
 });
 
-test("Slack bot-root threads remain recoverable after a restart and the root leaves channel history", async () => {
+test("Slack never looks up a cold root for a reply the gateway refused", async () => {
+	const f = await fixture();
+	try {
+		let lookups = 0;
+		f.api.conversationsReplies = async (_channel: string, _ts: string, options?: { oldest?: string }) => {
+			if (options?.oldest === undefined) lookups++;
+			return { messages: [], has_more: false };
+		};
+		f.client.engaged = false;
+		await f.event({
+			...inbound({ ts: "1700000002.000001", text: "hi", thread_ts: "1700000001.000000", parent_user_id: "UBOT" }),
+		});
+		await Bun.sleep(0);
+		expect(chatSends(f.client)).toHaveLength(1);
+		expect(lookups).toBe(0);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("Slack bot-root replies never wait for the root text; later replies quote it once fetched", async () => {
+	const f = await fixture();
+	try {
+		const root = "1700000001.000000";
+		let lookups = 0;
+		const { promise: rootFetched, resolve: releaseRoot } = Promise.withResolvers<void>();
+		f.api.conversationsReplies = async (_channel: string, ts: string, options?: { oldest?: string }) => {
+			// Thread recovery reads the root too (from `oldest`); count only the header lookup.
+			if (options?.oldest === undefined) lookups++;
+			await rootFetched;
+			return {
+				messages: ts === root ? [{ type: "message", user: "UBOT", ts: root, text: "IOPS-1 work\nthread" }] : [],
+				has_more: false,
+			};
+		};
+		const reply = (ts: string, text: string) => inbound({ ts, text, thread_ts: root, parent_user_id: "UBOT" });
+		// The lookup is still pending: both replies are delivered at once, without a quote.
+		await f.event({ ...reply("1700000002.000001", "first") });
+		await f.event({ ...reply("1700000003.000001", "second") });
+		expect(chatSends(f.client).map((send) => (send.engagement as { replyTo?: unknown }).replyTo)).toEqual([
+			{ messageId: `C1:${root}`, authorId: "UBOT", fromSelf: true },
+			{ messageId: `C1:${root}`, authorId: "UBOT", fromSelf: true },
+		]);
+		expect(lookups).toBe(1);
+		releaseRoot();
+		await Bun.sleep(0);
+		await f.event({ ...reply("1700000004.000001", "third") });
+		expect((chatSends(f.client).at(-1)?.engagement as { replyTo?: unknown } | undefined)?.replyTo).toEqual({
+			messageId: `C1:${root}`,
+			authorId: "UBOT",
+			fromSelf: true,
+			excerpt: "IOPS-1 work thread",
+		});
+		expect(lookups).toBe(1);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("Slack bot-root threads keep their thread session and stay recoverable after a restart", async () => {
 	for (const initial of ["live", "recovered"]) {
 		const channels = { C1: { engagement: "mention-open" as const } };
 		const f = await fixture(channels, { autoRecover: false });
 		let resumed: Awaited<ReturnType<typeof fixture>> | undefined;
 		const root = "1700000001.000000";
+		const threadOrigin = { platform: "slack", kind: "thread", conversationId: `C1:${root}`, parentId: "C1" };
 		const rootMessage = { type: "message", user: "UBOT", ts: root, text: "bot parent", reply_count: 1 };
 		const firstReply = inbound({
 			ts: "1700000030.000001",
@@ -2135,7 +2255,10 @@ test("Slack bot-root threads remain recoverable after a restart and the root lea
 			if (initial === "live") await f.event({ ...firstReply });
 			f.api.history.C1 = [{ ...inbound({ ts: "1700000050.000001", text: "later channel context" }) }, rootMessage];
 			expect(await f.recoverMissedMessages()).toBe(true);
-			expect(chatSends(f.client).find((send) => send.text === "@UBOT first reply")).toMatchObject({ origin });
+			expect(chatSends(f.client).find((send) => send.text === "@UBOT first reply")).toMatchObject({
+				origin: threadOrigin,
+				engagement: { replyTo: { fromSelf: true } },
+			});
 			const saved = await loadRecoveryCursors(f.recoveryCursorPath);
 			expect(saved.recoveredThrough.C1).toBe("1700000050.000001");
 			expect(saved.participatedThreads[`C1:${root}`]).toBeDefined();
@@ -2152,7 +2275,7 @@ test("Slack bot-root threads remain recoverable after a restart and the root lea
 			});
 			expect(await resumed.recoverMissedMessages()).toBe(true);
 			expect(chatSends(resumed.client)).toHaveLength(1);
-			expect(chatSends(resumed.client)[0]).toMatchObject({ origin, text: "@UBOT late reply" });
+			expect(chatSends(resumed.client)[0]).toMatchObject({ origin: threadOrigin, text: "@UBOT late reply" });
 			const recovered = await loadRecoveryCursors(resumed.recoveryCursorPath);
 			expect(recovered.participatedThreads[`C1:${root}`]?.through).toBe("1700000060.000001");
 		} finally {
