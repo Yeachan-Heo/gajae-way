@@ -124,6 +124,7 @@ async function harness(
 		failure?: (message: string, forceFailureNotice?: boolean) => void;
 		failureError?: (error: Error) => void;
 		modelRefusal?: (input: PersonaFailureInput) => void;
+		effectiveModel?: string;
 		imagesFor?: (triggerMessageId: string) => readonly PromptImage[] | undefined;
 		onFrame?: (frame: TailFrame) => boolean | void;
 		contextMessageIds?: readonly string[];
@@ -158,6 +159,7 @@ async function harness(
 			const images = hooks.imagesFor?.(trigger.message_id);
 			return {
 				text: trigger.body,
+				...(hooks.effectiveModel ? { effectiveModel: hooks.effectiveModel } : {}),
 				...(images ? { images } : {}),
 				...(hooks.contextMessageIds ? { contextMessageIds: new Set(hooks.contextMessageIds) } : {}),
 				...(hooks.onFrame ? { onFrame: (input) => hooks.onFrame?.(input.frame) } : {}),
@@ -538,6 +540,96 @@ test("oversized text plus images is a local terminal failure and does not hold a
 	);
 	port.complete(port.sends[0]!.opRef, "next reply");
 	await manager!.tick(KEY);
+});
+
+test("model-not-found settles the turn and a transient model.set failure still retries", async () => {
+	const selection = "google-antigravity/gemini-4-hydrogen-xhigh";
+	class ModelSetFailurePort extends ScriptedSessionPort {
+		modelAttempts = 0;
+
+		constructor() {
+			super({
+				onBind: (input) => `model-session-${input.epoch}`,
+				onSend: (input, scripted) => scripted.complete(input.opRef, "model recovered"),
+			});
+		}
+
+		override async setModel(input: Parameters<ScriptedSessionPort["setModel"]>[0]) {
+			this.modelAttempts++;
+			if (this.modelAttempts === 1) {
+				const message = `Model "${selection}" was not found.`;
+				throw new GjcCliError(
+					`gjc sdk model.set reported failure: ${JSON.stringify({ code: "invalid_input", message })}`,
+					0,
+					"",
+					{ code: "invalid_input", message },
+				);
+			}
+			if (this.modelAttempts === 2)
+				throw new GjcCliError("gjc sdk model.set reported failure: timeout", 0, "", {
+					code: "timeout",
+					message: "SDK session Router startup timed out.",
+				});
+			return await super.setModel(input);
+		}
+	}
+
+	const port = new ModelSetFailurePort();
+	const notices: string[] = [];
+	const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
+	await harness(
+		port,
+		{
+			effectiveModel: selection,
+			failureError: (error) => notices.push(formatFailureNotice(error)),
+		},
+		undefined,
+		{
+			setTimeout: (work, delayMs) => {
+				const timer = { work, delayMs };
+				timers.push(timer);
+				return timer;
+			},
+			clearTimeout: () => {},
+		},
+	);
+
+	enqueue("model-not-found", "fail before send");
+	await manager!.notifyInbound(KEY);
+	const failedOpRef = latestOpRef;
+	await eventually(
+		() => database!.inbox.turnRow(failedOpRef)?.turn_state === "done",
+		"the model-not-found turn did not settle",
+	);
+	expect(database!.inbox.turnRow(failedOpRef)).toMatchObject({
+		state: "done",
+		turn_state: "done",
+		terminal_delivery_id: JSON.stringify({ none: "turn_failed" }),
+	});
+	expect(port.modelAttempts).toBe(1);
+	expect(timers).toEqual([]);
+	expect(notices).toHaveLength(1);
+	expect(notices[0]).toContain(selection);
+	expect(notices[0]).toContain("/model");
+
+	enqueue("model-after-not-found", "send after the failure");
+	await manager!.notifyInbound(KEY);
+	await eventually(
+		() => port.modelAttempts === 2 && timers.length === 1,
+		"transient model.set failure was not retried",
+	);
+	expect(port.sends).toEqual([]);
+	expect(timers.map((timer) => timer.delayMs)).toEqual([2_000]);
+
+	timers[0]!.work();
+	await eventually(() => port.sends.length === 1, "model.set retry did not dispatch the later message");
+	expect(port.modelAttempts).toBe(3);
+	expect(port.sends.map((send) => send.text)).toEqual(["send after the failure"]);
+	expect(notices).toHaveLength(1);
+	await eventually(
+		() => database!.inbox.turnRow(port.sends[0]!.opRef)?.turn_state === "done",
+		"the later message did not finish after the transient retry",
+	);
 });
 
 test("actual relay envelope rejection is durable before actor error handling and survives restart", async () => {
@@ -6475,4 +6567,20 @@ test("a notice during a gateway turn steers its gateway framing without lane-rep
 	await eventually(() => f.port.steers.length === 1, "notice was not steered");
 	expect(f.port.steers[0]!.text).toContain("[Gateway notice]");
 	expect(f.port.steers[0]!.text).not.toContain("Internal lane report");
+});
+
+test("model selection cache distinguishes a preset object from its colliding string rendering on the next turn", async () => {
+	const port = new ScriptedSessionPort();
+	const hooks: { effectiveModel?: string } = {};
+	await harness(port, hooks);
+	await manager!.rebindModel(KEY, { preset: "foo" });
+	const sessionId = port.models[0]!.sessionId;
+	hooks.effectiveModel = "preset:foo";
+	enqueue("colliding-string-turn", "send with the string model");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "the inherited session did not send its turn");
+	expect(port.models.filter((model) => model.sessionId === sessionId).map((model) => model.selection)).toEqual([
+		{ preset: "foo" },
+		"preset:foo",
+	]);
 });

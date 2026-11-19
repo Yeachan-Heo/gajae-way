@@ -198,3 +198,31 @@ test("disposer restores every console method and an uninstalled console spy sees
 		await rm(sink.directory, { recursive: true, force: true });
 	}
 });
+
+test("stdio mode echoes info and log lines on stderr while recording them at info severity", async () => {
+	const sink = await temporarySink();
+	try {
+		const { console: output, echoed } = target();
+		const dispose = installStructuredLogging({
+			path: sink.path,
+			console: output,
+			stdio: true,
+			heartbeatIntervalMs: 0,
+			now: () => Date.parse("2026-09-18T00:00:00.000Z"),
+		});
+		output.info('{"retention":{"events":3}}');
+		output.log("routine sweep");
+		output.warn("recovery_hold opRef=op-2");
+		dispose();
+
+		const lines = (await readFile(sink.path, "utf8")).trimEnd().split("\n");
+		expect(lines.map((line) => line.replace(/^\S+ /, ""))).toEqual([
+			'info {"retention":{"events":3}}',
+			"info routine sweep",
+			"warn recovery_hold opRef=op-2",
+		]);
+		expect(echoed.map(({ level }) => level)).toEqual(["error", "error", "warn"]);
+	} finally {
+		await rm(sink.directory, { recursive: true, force: true });
+	}
+});
