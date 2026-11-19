@@ -1368,6 +1368,9 @@ export interface SlashInteractionLike {
 	} | null;
 	readonly channel?: DiscordMessageOriginShape["channel"] | null;
 	reply(options: { content: string; ephemeral?: boolean }): Promise<unknown>;
+	/** Optional so existing test doubles stay valid; real interactions always have it. */
+	deferReply?(options: { ephemeral?: boolean }): Promise<unknown>;
+	editReply?(options: { content: string }): Promise<unknown>;
 }
 
 /** Same precedence as messages, for a slash command's invoking user. */
@@ -1403,6 +1406,11 @@ export async function handleSlashCommand(
 		}
 		const origin = discordMessageOrigin({ author: { id: interaction.user.id }, channel: interaction.channel });
 		const interactionServerTag = resolveServerTag(interaction.user);
+		// Discord expires an unacknowledged interaction after 3 seconds, and a gateway
+		// turn can run far longer. Acknowledge first, then answer through editReply so a
+		// slow turn cannot fail as "Unknown interaction".
+		const canDefer = typeof interaction.deferReply === "function";
+		if (canDefer) await interaction.deferReply({ ephemeral: true });
 		const result = await gateway.requestInbound(`slash-${interaction.id}`, origin, text, {
 			mentioned: true,
 			group: origin.kind !== "dm",
@@ -1416,11 +1424,16 @@ export async function handleSlashCommand(
 		// Honest ack: the gateway allowlist may decline the command (non-owner in a
 		// group surface) — never claim a reset that did not happen. `/model` never
 		// resets the session; the gateway posts the resulting selection itself.
-		await interaction.reply(
-			result?.engaged
-				? { content: command === "model" ? "🦞 model command accepted" : "🦞 session reset", ephemeral: true }
-				: { content: "not authorized for session commands here", ephemeral: true },
-		);
+		const content = result?.engaged
+			? command === "model"
+				? "🦞 model command accepted"
+				: "🦞 session reset"
+			: "not authorized for session commands here";
+		if (canDefer && typeof interaction.editReply === "function") {
+			await interaction.editReply({ content });
+		} else {
+			await interaction.reply({ content, ephemeral: true });
+		}
 	} catch (error) {
 		log.error(`Discord slash command failed: ${error instanceof Error ? error.message : String(error)}`);
 	}

@@ -643,6 +643,39 @@ test("slash commands /new and /reset map to gateway session resets with the invo
 	expect(sent).toHaveLength(1);
 });
 
+test("slash commands acknowledge before the gateway turn so a slow turn cannot expire as Unknown interaction", async () => {
+	const calls: string[] = [];
+	const gateway = {
+		async requestInbound() {
+			calls.push("gateway");
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			return { engaged: true };
+		},
+	};
+	let edited = "";
+	const interaction = {
+		isChatInputCommand: () => true,
+		commandName: "model",
+		id: "itx-defer",
+		user: { id: "owner-1", username: "bellman" },
+		channel: { id: "channel-9", type: 0 },
+		options: { getSubcommand: () => "show", getString: () => undefined },
+		reply: async () => {
+			calls.push("reply");
+		},
+		deferReply: async () => {
+			calls.push("defer");
+		},
+		editReply: async (options: { content: string }) => {
+			edited = options.content;
+			calls.push("edit");
+		},
+	};
+	await handleSlashCommand(interaction as never, gateway as never, { error: () => {} });
+	expect(calls).toEqual(["defer", "gateway", "edit"]);
+	expect(edited).toContain("model command accepted");
+});
+
 test("/model is registered with show/set/clear and set autocompletes its choice", () => {
 	const model = DISCORD_SLASH_COMMANDS.find((command) => command.name === "model");
 	expect(model?.options?.map((option) => option.name)).toEqual(["show", "set", "clear"]);
