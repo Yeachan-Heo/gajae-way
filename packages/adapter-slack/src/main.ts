@@ -1083,6 +1083,13 @@ export async function startSlackAdapter(
 		if (messageOrigins.size > 10_000) messageOrigins.delete(messageOrigins.keys().next().value as string);
 		return original;
 	};
+	const rememberOwnThreadPost = (message: SlackInboundMessage): void => {
+		const own = message.user === identity.botUserId || (identity.botId && message.bot_id === identity.botId);
+		if (!own || !message.channel || !message.ts || !message.thread_ts || message.thread_ts === message.ts) return;
+		if (!parseSlackMessageId(`${message.channel}:${message.ts}`)) return;
+		if (!parseSlackMessageId(`${message.channel}:${message.thread_ts}`)) return;
+		rememberOrigin(slackMessageId(message.channel, message.ts), slackMessageOrigin(message));
+	};
 	const roots = new SlackRootTexts(api, (text) => normalizeSlackText(text, directory));
 	const posted: SlackPostedMessages = {
 		remember: (origin, channel, ts, text, threadTs) => {
@@ -1201,6 +1208,10 @@ export async function startSlackAdapter(
 				envelope.subtype === "message_changed" && envelope.message
 					? { ...envelope.message, channel: envelope.channel }
 					: envelope;
+			// The bot's own posts are never admitted, but one inside a thread names its thread:
+			// recording it lets a reaction to a post with no receipt (a file share) follow that
+			// thread's session instead of falling back to the channel.
+			if (envelope.subtype !== "message_changed") rememberOwnThreadPost(message);
 			const admitted = decideInbound(message, identity, directory, config.channels);
 			if (!admitted) return;
 			const messageId = slackMessageId(message.channel, message.ts);

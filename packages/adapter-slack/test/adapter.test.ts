@@ -1464,6 +1464,36 @@ test("Slack reactions follow the session their target message was routed to", as
 	}
 });
 
+test("Slack reactions to the bot's own thread post without a receipt follow that thread", async () => {
+	const f = await fixture();
+	try {
+		const root = "1700000001.000000";
+		const thread = { platform: "slack", kind: "thread", conversationId: `C1:${root}`, parentId: "C1" };
+		// A file share is posted through files.completeUploadExternal, which returns no message ts;
+		// Slack's own message event for it is the only record of where it landed.
+		await f.event({
+			...inbound({ ts: "1700000004.000001", text: "", thread_ts: root, user: "UBOT" }),
+			subtype: "file_share",
+		});
+		await f.event({ ...inbound({ ts: "1700000005.000001", text: "top", user: "UBOT" }) });
+		const react = (ts: string) =>
+			f.event({
+				type: "reaction_added",
+				user: "U1",
+				reaction: "+1",
+				item: { type: "message", channel: "C1", ts },
+				event_ts: "1700000009.000000",
+			});
+		await react("1700000004.000001");
+		await react("1700000005.000001");
+		expect(chatSends(f.client)).toHaveLength(0);
+		const reactions = f.client.requests.filter((request) => request.verb === "engagement.reaction");
+		expect(reactions.map((request) => (request.params as { origin: unknown }).origin)).toEqual([thread, origin]);
+	} finally {
+		f.socket.stop();
+	}
+});
+
 test("Slack reaction request rejection does not reconnect the healthy client", async () => {
 	const log = spyOn(console, "error").mockImplementation(() => {});
 	try {
