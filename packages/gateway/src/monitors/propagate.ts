@@ -354,7 +354,7 @@ export class MonitorPropagator {
 	/** Per-origin serialization lives in SessionPort, shared with all SDK callers. */
 	readonly #repo: string;
 	readonly #memoryDebloat: { readonly root: string; readonly thresholdBytes: number } | undefined;
-	readonly #model: GjcModelSelection | undefined;
+	#model: GjcModelSelection | undefined;
 	readonly #serviceTier: GjcServiceTier | undefined;
 	readonly #appliedModels = new Map<string, string>();
 	readonly #appliedServiceTiers = new Map<string, GjcServiceTier>();
@@ -462,6 +462,11 @@ export class MonitorPropagator {
 			options.protocolFailureRollThreshold ?? MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD;
 		this.#repo = options.repo ?? process.cwd();
 		this.#memoryDebloat = options.memoryDebloat;
+	}
+
+	/** Future monitor turns inherit the latest gateway default unless explicitly overridden. */
+	setDefaultModel(model: GjcModelSelection): void {
+		this.#model = model;
 	}
 
 	/**
@@ -1552,18 +1557,16 @@ export class MonitorPropagator {
 					boundSessionId = sessionId;
 					boundSessionEpoch = binding.epoch;
 					dispatchPhase = "configure";
-					if (effectiveModel) {
-						const modelKey = typeof effectiveModel === "string" ? effectiveModel : `preset:${effectiveModel.preset}`;
-						if (!binding.startupModelApplied && this.#appliedModels.get(sessionId) !== modelKey) {
-							dispatchOperation = "setModel";
-							dispatchOperationArgs = {
-								model: modelKey,
-							};
-							await this.#sessionPort.setModel({ sessionId, repo: this.#repo, selection: effectiveModel });
-							this.#appliedModels.set(sessionId, modelKey);
-						} else if (binding.startupModelApplied) {
-							this.#appliedModels.set(sessionId, modelKey);
-						}
+					const modelKey = selectIdentity(effectiveModel);
+					if (effectiveModel && !binding.startupModelApplied && this.#appliedModels.get(sessionId) !== modelKey) {
+						dispatchOperation = "setModel";
+						dispatchOperationArgs = {
+							model: modelSelector(effectiveModel),
+						};
+						await this.#sessionPort.setModel({ sessionId, repo: this.#repo, selection: effectiveModel });
+						this.#appliedModels.set(sessionId, modelKey!);
+					} else if (effectiveModel && binding.startupModelApplied) {
+						this.#appliedModels.set(sessionId, modelKey!);
 					}
 					if (effectiveServiceTier && this.#appliedServiceTiers.get(sessionId) !== effectiveServiceTier) {
 						dispatchOperation = "setServiceTier";
@@ -3821,6 +3824,7 @@ export function failureDetail(error: unknown): string {
 		"AuthoringResultUnavailableError",
 		"BrokerAuthorityError",
 		"ModelNotSelectedError",
+		"SessionContractError",
 	]);
 	const allowedCodes = new Set([
 		"broker_unavailable",
@@ -3911,7 +3915,7 @@ export function failureDetail(error: unknown): string {
 	// A top-level message is recorded only for classes that build it from fixed
 	// text and numbers. Every other message can carry operation ids or remote
 	// text (SessionTerminalError, RelayRefusedError, plain Error).
-	const messageSourceClasses = new Set(["RelayHelloError", "ModelNotSelectedError"]);
+	const messageSourceClasses = new Set(["RelayHelloError", "ModelNotSelectedError", "SessionContractError"]);
 	const message =
 		causes
 			.slice()
@@ -3985,4 +3989,18 @@ export function failureDetail(error: unknown): string {
 		...(causeCode && causeCode !== code ? { causeCode } : {}),
 		...(message ? { message } : {}),
 	});
+}
+
+/** Generates a type-tagged unique identity for a model selection to avoid cache collisions. */
+function selectIdentity(selection: GjcModelSelection | undefined): string {
+	if (selection === undefined) return "undefined";
+	if (typeof selection === "string") return `string:${selection}`;
+	return `object:preset:${selection.preset}`;
+}
+
+/** Converts a model selection to its user-visible selector format. */
+function modelSelector(selection: GjcModelSelection | undefined): string {
+	if (selection === undefined) return "undefined";
+	if (typeof selection === "string") return selection;
+	return `preset:${selection.preset}`;
 }

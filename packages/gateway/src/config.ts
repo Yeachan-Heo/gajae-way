@@ -935,11 +935,19 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
 				: { code: "config_invalid" as const, message: "configuration reload failed" };
 		return { ok: false, config: current, diagnostics: [diagnostic] };
 	}
-	const changed = RELOADABLE_FIELDS.filter((field) => !Bun.deepEquals(candidate[field], current[field]));
-	const restartRequired = RESTART_REQUIRED_FIELDS.filter((field) => !Bun.deepEquals(candidate[field], current[field]));
+	// The SDK cannot reset a live session to an unspecified GJC default.
+	const modelRemoval = current.model !== undefined && candidate.model === undefined;
+	const changed = RELOADABLE_FIELDS.filter(
+		(field) => !(field === "model" && modelRemoval) && !Bun.deepEquals(candidate[field], current[field]),
+	);
+	const restartRequired: string[] = RESTART_REQUIRED_FIELDS.filter(
+		(field) => !Bun.deepEquals(candidate[field], current[field]),
+	);
+	if (modelRemoval) restartRequired.push("model");
 	const ignored = UNCONSUMED_FIELDS.filter((field) => !Bun.deepEquals(candidate[field], current[field]));
 	const next: Record<string, unknown> = { ...current };
 	for (const field of RELOADABLE_FIELDS) {
+		if (field === "model" && modelRemoval) continue;
 		if (candidate[field] === undefined) delete next[field];
 		else next[field] = candidate[field];
 	}
@@ -951,13 +959,16 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
  * engagement/policy.ts), channels (engagement gates), `botAudience` (bot budgets,
  * resolved per inbound message), `stallTimeoutMs` (tail liveness alarms) and
  * `sessions` (persona host cap, host retirement, and idle session reset, applied
- * to the next bind and sweep), and `restartNotice` (read when the next restart
- * drain starts or closes). Each applies to the next actor event.
+ * to the next bind and sweep), `model` (applied to inherited sessions at their
+ * next turn), and `restartNotice` (read when the next restart drain starts or
+ * closes). Removing a configured model requires restart because GJC has no
+ * live reset to its unspecified default.
  */
 export const RELOADABLE_FIELDS = [
 	"mentionAllowlist",
 	"channels",
 	"stallTimeoutMs",
+	"model",
 	"dmPolicy",
 	"botAudience",
 	"handoffTargets",
@@ -969,7 +980,6 @@ export const RELOADABLE_FIELDS = [
 export const RESTART_REQUIRED_FIELDS = [
 	"socketPath",
 	"dbPath",
-	"model",
 	"serviceTier",
 	"credentials",
 	"webhook",
