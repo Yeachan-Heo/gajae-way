@@ -17,7 +17,7 @@ test("a root the bot posted is quoted from memory without a lookup", () => {
 	expect(calls).toEqual([]);
 });
 
-test("an unknown root answers nothing now, is fetched once, and is quoted afterwards", async () => {
+test("an unknown root answers nothing, is fetched once when warmed, and is quoted afterwards", async () => {
 	const calls: string[] = [];
 	const { promise, resolve } = Promise.withResolvers<void>();
 	const roots = new SlackRootTexts(
@@ -30,7 +30,11 @@ test("an unknown root answers nothing now, is fetched once, and is quoted afterw
 		},
 		(text) => text.replace("<@U1>", "@alice"),
 	);
+	// Reading never fetches: only an engaged reply warms the root.
 	expect(roots.excerpt("C1:1.0")).toBeUndefined();
+	expect(calls).toEqual([]);
+	roots.warm("C1:1.0");
+	roots.warm("C1:1.0");
 	expect(roots.excerpt("C1:1.0")).toBeUndefined();
 	resolve();
 	await roots.idle();
@@ -48,13 +52,14 @@ test("a failed lookup is retried by a later reply; a root without text is not re
 			return page(ts, undefined);
 		},
 	});
-	expect(roots.excerpt("C1:1.0")).toBeUndefined();
+	roots.warm("C1:1.0");
 	await roots.idle();
 	fail = false;
-	expect(roots.excerpt("C1:1.0")).toBeUndefined();
+	roots.warm("C1:1.0");
+	await roots.idle();
+	roots.warm("C1:1.0");
 	await roots.idle();
 	expect(roots.excerpt("C1:1.0")).toBeUndefined();
-	await roots.idle();
 	expect(calls).toBe(2);
 });
 
@@ -76,12 +81,13 @@ test("a burst of cold roots is shed past the in-flight bound and asked again lat
 		},
 	});
 	const ids = Array.from({ length: ROOT_TEXT_MAX_IN_FLIGHT + 2 }, (_, index) => `C1:${index + 1}.0`);
-	for (const id of ids) expect(roots.excerpt(id)).toBeUndefined();
+	for (const id of ids) roots.warm(id);
 	expect(calls).toHaveLength(ROOT_TEXT_MAX_IN_FLIGHT);
 	resolve();
 	await roots.idle();
 	const shed = ids.at(-1) ?? "";
 	expect(roots.excerpt(shed)).toBeUndefined();
+	roots.warm(shed);
 	await roots.idle();
 	expect(roots.excerpt(shed)).toBe(`root ${shed.slice(3)}`);
 });

@@ -28,7 +28,7 @@ import { describeInboundBody, isSlackNativeImage, prepareSlackImages, type Slack
 import { SlackDirectory } from "./author";
 import { adapterHome, type LoadedSlackAdapterConfig, loadSlackAdapterConfig } from "./config";
 import { describePanelResponse, type SlackBlockAction } from "./interactions";
-import { LiveReplyTracker } from "./live-reply";
+import { type LiveMessage, LiveReplyTracker } from "./live-reply";
 
 import { type MentionDirectory, repairMentions } from "./mentions";
 import { chunkSlackMessage, markdownToMrkdwn } from "./mrkdwn";
@@ -422,10 +422,17 @@ export async function settleSlackDelivery(
 				...(threadTs === undefined ? {} : { threadTs }),
 				text,
 				final: message.final,
+				// Every opening chunk is recorded as it lands, even if a later chunk fails.
+				...(posted
+					? {
+							onPosted: (sent: LiveMessage) =>
+								posted.remember(message.origin, sent.channel, sent.ts, sent.text, threadTs),
+						}
+					: {}),
 			});
 			if (outcome.kind !== "untracked") {
-				// A posted live message may become a thread root; a fold changes what it says.
-				if (outcome.kind === "posted" || outcome.kind === "folded")
+				// A fold changes what the live message says.
+				if (outcome.kind === "folded")
 					posted?.remember(message.origin, outcome.message.channel, outcome.message.ts, outcome.message.text, threadTs);
 				await gateway.request("delivery.confirm", { deliveryId });
 				return;
@@ -1160,12 +1167,18 @@ export async function startSlackAdapter(
 		if (!threadId) return Promise.resolve();
 		return mutate((state) => rememberParticipatedThread(state, threadId, now()));
 	};
-	// Optional context only: never awaited, so a cold root never delays this message.
+	// Optional context only: answered from memory, so a cold root never delays this message.
 	const withRootExcerpt = (engagement: EngagementContext): EngagementContext => {
 		const replyTo = engagement.replyTo;
 		if (replyTo?.fromSelf !== true || replyTo.excerpt !== undefined) return engagement;
 		const excerpt = roots.excerpt(replyTo.messageId);
 		return excerpt ? { ...engagement, replyTo: { ...replyTo, excerpt } } : engagement;
+	};
+	// A cold root is looked up only after the gateway engaged a reply under it, so a message
+	// the gateway refuses never spends Slack quota.
+	const warmRoot = (engagement: EngagementContext): void => {
+		if (engagement.replyTo?.fromSelf === true && engagement.replyTo.excerpt === undefined)
+			roots.warm(engagement.replyTo.messageId);
 	};
 	const prime = async (message: SlackInboundMessage): Promise<void> => {
 		await Promise.all([
@@ -1259,6 +1272,7 @@ export async function startSlackAdapter(
 					return;
 				}
 				if (sent.verdict === "acked" && sent.result?.engaged) {
+					warmRoot(engagement);
 					await rememberThread(origin, message);
 				}
 			});
@@ -1421,6 +1435,7 @@ export async function startSlackAdapter(
 				// after the grace period expires. Only clear once the grace period has passed.
 				if (!isWithinGrace) await mutate((state) => clearAttempt(state, messageId));
 				if (sent.verdict === "acked" && sent.result?.engaged) {
+					warmRoot(engagement);
 					await rememberThread(origin, message);
 				}
 				return sent.verdict;

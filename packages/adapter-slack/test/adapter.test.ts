@@ -2174,6 +2174,26 @@ test("Slack recovery joins a still-pending live send instead of calling it a dup
 	}
 });
 
+test("Slack never looks up a cold root for a reply the gateway refused", async () => {
+	const f = await fixture();
+	try {
+		let lookups = 0;
+		f.api.conversationsReplies = async (_channel: string, _ts: string, options?: { oldest?: string }) => {
+			if (options?.oldest === undefined) lookups++;
+			return { messages: [], has_more: false };
+		};
+		f.client.engaged = false;
+		await f.event({
+			...inbound({ ts: "1700000002.000001", text: "hi", thread_ts: "1700000001.000000", parent_user_id: "UBOT" }),
+		});
+		await Bun.sleep(0);
+		expect(chatSends(f.client)).toHaveLength(1);
+		expect(lookups).toBe(0);
+	} finally {
+		f.socket.stop();
+	}
+});
+
 test("Slack bot-root replies never wait for the root text; later replies quote it once fetched", async () => {
 	const f = await fixture();
 	try {

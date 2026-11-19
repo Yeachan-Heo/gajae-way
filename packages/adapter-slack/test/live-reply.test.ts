@@ -419,3 +419,23 @@ test("a live message is reported to the posted-message hook when it opens and ea
 		[origin, "C1", "1.001", "one\n\ntwo", undefined],
 	]);
 });
+
+test("every chunk of a long live opening is reported as it lands, even when a later chunk fails", async () => {
+	const api = new LiveApi();
+	const live = tracker(api);
+	const landed: unknown[] = [];
+	let posts = 0;
+	const post = api.postMessage.bind(api);
+	api.postMessage = async (channel: string, text: string, threadTs?: string) => {
+		if (++posts === 3) throw new SlackApiError(200, "ratelimited");
+		return post(channel, text, threadTs);
+	};
+	const long = "x".repeat(SLACK_MESSAGE_LIMIT * 2 + 10);
+	await expect(live.deliver(part({ text: long, onPosted: (message) => void landed.push(message) }))).rejects.toThrow(
+		"partially posted",
+	);
+	expect(landed).toEqual([
+		{ channel: "C1", ts: "1.001", text: expect.any(String) },
+		{ channel: "C1", ts: "1.002", text: expect.any(String) },
+	]);
+});

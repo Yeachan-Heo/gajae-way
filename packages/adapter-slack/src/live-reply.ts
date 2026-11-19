@@ -50,6 +50,11 @@ export interface LiveDeliveryInput {
 	readonly text: string;
 	/** True on the turn's terminal delivery; the entry stops folding afterwards. */
 	readonly final: boolean;
+	/**
+	 * Called for each Slack message the opening post creates, as soon as it is visible:
+	 * an opening longer than one message posts several, and a later chunk may still fail.
+	 */
+	readonly onPosted?: (message: LiveMessage) => void;
 }
 
 /**
@@ -149,6 +154,7 @@ export class LiveReplyTracker {
 			for (const chunk of chunks) {
 				const sent = await this.api.postMessage(input.channel, chunk, input.threadTs);
 				tail = { ts: sent.ts, text: chunk };
+				input.onPosted?.({ channel: input.channel, ts: sent.ts, text: chunk });
 			}
 		} catch (error) {
 			// The reservation must not pin the turn to untracked mode: dropping

@@ -19,8 +19,9 @@ export const ROOT_TEXT_LIMIT = 300;
  * (the bot usually posted it from another session). Quoting the root in the reply header
  * tells that session what the thread is about. The protocol forbids delaying inbound
  * handling to fetch an excerpt, so `excerpt` only answers from memory: roots this adapter
- * posted (plain, live, or panel posts) are remembered as they post, and an unknown root is
- * fetched in the background so later replies in that thread carry it.
+ * posted (plain, live, or panel posts) are remembered as they post. An unknown root is
+ * fetched in the background by `warm`, which the adapter calls only once the gateway
+ * engaged a reply under it: a message the gateway refuses never spends Slack quota.
  */
 export class SlackRootTexts {
 	readonly #texts = new Map<string, string>();
@@ -36,12 +37,14 @@ export class SlackRootTexts {
 		this.#store(slackMessageId(channel, ts), text);
 	}
 
-	/** The remembered root text, or undefined while it is unknown (a fetch is then started). */
+	/** The remembered root text, or undefined while it is unknown. Never fetches. */
 	excerpt(rootId: string): string | undefined {
-		const known = this.#texts.get(rootId);
-		if (known !== undefined) return known || undefined;
-		this.#fetch(rootId);
-		return undefined;
+		return this.#texts.get(rootId) || undefined;
+	}
+
+	/** Starts a background lookup of an unknown root, for later replies under it. */
+	warm(rootId: string): void {
+		if (!this.#texts.has(rootId)) this.#fetch(rootId);
 	}
 
 	/** Resolves once background fetches settle. */
