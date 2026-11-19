@@ -17,12 +17,13 @@ const OWNER = "owner";
 const SLACK_CHANNEL = { platform: "slack", kind: "channel", conversationId: "C0SHUTUP" } as const;
 /** Root of a Slack thread started on the persona's own message; replies stay on the channel session. */
 const SLACK_BOT_ROOT = "C0SHUTUP:1700000000.000100";
-const SLACK_BOT_THREAD_KEY = originKey({
+const SLACK_BOT_THREAD = {
 	platform: "slack",
 	kind: "thread",
 	conversationId: SLACK_BOT_ROOT,
 	parentId: SLACK_CHANNEL.conversationId,
-});
+} as const;
+const SLACK_BOT_THREAD_KEY = originKey(SLACK_BOT_THREAD);
 
 let directory = "";
 let server: GatewayServer | undefined;
@@ -157,7 +158,13 @@ async function fixture(
 async function send(
 	client: Client,
 	id: string,
-	origin: typeof THREAD | typeof OTHER_THREAD | typeof CHANNEL | typeof OWNER_DM | typeof SLACK_CHANNEL,
+	origin:
+		| typeof THREAD
+		| typeof OTHER_THREAD
+		| typeof CHANNEL
+		| typeof OWNER_DM
+		| typeof SLACK_CHANNEL
+		| typeof SLACK_BOT_THREAD,
 	engagement: {
 		mentioned: boolean;
 		explicitMention?: boolean;
@@ -309,6 +316,35 @@ test("SHUTUP mutes a Slack thread that is carried by its channel session", async
 		expect(f.database.inbox.isThreadMuted(SLACK_BOT_THREAD_KEY)).toBe(false);
 		await waitForTurn(f, 4);
 		expect((await send(f.client, "slack-after-unmute", SLACK_CHANNEL, botThreadReply)).result.engaged).toBe(true);
+	} finally {
+		f.client.close();
+	}
+});
+
+test("a legacy Slack reply under the persona's own root stays muted until an explicit mention", async () => {
+	const f = await fixture("mention-open");
+	const thread = SLACK_BOT_THREAD;
+	// An adapter that predates explicitMention sets `mentioned` on every reply under the
+	// persona's own root: that is thread membership, not a mention.
+	const legacyReply = {
+		mentioned: true,
+		group: true,
+		authorId: OWNER,
+		replyTo: { messageId: SLACK_BOT_ROOT, fromSelf: true },
+	};
+	try {
+		await send(f.client, "slack-legacy-trigger", thread, { ...legacyReply, explicitMention: true });
+		await waitForTurn(f, 1);
+		await waitUntil(() => f.database.inbox.isThreadMuted(originKey(thread)));
+
+		expect((await send(f.client, "slack-legacy-reply", thread, legacyReply)).result.engaged).toBe(false);
+		expect(f.database.inbox.isThreadMuted(originKey(thread))).toBe(true);
+		expect(f.turns).toHaveLength(1);
+
+		const mention = { ...legacyReply, explicitMention: true };
+		expect((await send(f.client, "slack-legacy-unmute", thread, mention)).result.engaged).toBe(true);
+		expect(f.database.inbox.isThreadMuted(originKey(thread))).toBe(false);
+		await waitForTurn(f, 2);
 	} finally {
 		f.client.close();
 	}

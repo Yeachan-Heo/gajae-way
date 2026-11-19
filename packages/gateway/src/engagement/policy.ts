@@ -280,7 +280,8 @@ export function threadMuteKey(
  * message and it says nothing about addressing. Slack's `replyTo` always names
  * the thread root, so in a thread rooted at the persona's own message every reply
  * carries `replyTo.fromSelf`: that is thread membership, not a reply, and only a
- * mention unmutes it.
+ * mention unmutes it. The Slack adapter also sets `mentioned` on every such reply, so
+ * there the legacy fallback says nothing either and only `explicitMention` counts.
  */
 export function threadMuteAddressed(
 	engagement: EngagementContext | undefined,
@@ -291,10 +292,16 @@ export function threadMuteAddressed(
 	if (
 		engagement?.explicitMention === undefined &&
 		engagement?.mentioned === true &&
+		!slackBotRootThreadReply(engagement, origin) &&
 		resolveChannelPolicy(origin, config)?.engagement !== "open"
 	)
 		return true;
 	return origin.kind === "thread" && origin.platform !== "slack" && engagement?.replyTo?.fromSelf === true;
+}
+
+/** A reply in a Slack thread rooted at the persona's own message, where `mentioned` is set by membership. */
+function slackBotRootThreadReply(engagement: EngagementContext, origin: Pick<OriginRef, "platform" | "kind">): boolean {
+	return origin.platform === "slack" && origin.kind === "thread" && engagement.replyTo?.fromSelf === true;
 }
 
 /** The inbound-ledger surface the follow-up signal needs; narrowed so tests need no database. */
