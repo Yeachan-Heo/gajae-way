@@ -38,9 +38,13 @@ import type { WriteTx } from "../store/tx";
 import { type BrokerLivenessProbe, type BrokerLivenessVerdict, describeBindHold } from "./broker-liveness";
 import type { FailedTurnEvidence } from "./failed-turn-evidence";
 import { isSessionGoneCode } from "./gjc-contract";
-import { GjcRuntimeError, sanitizeDiagnostic } from "./rebind";
+import { GjcRuntimeError, sanitizeDiagnostic, sanitizeDiagnosticDetail } from "./rebind";
 import {
+	isPermanentBindFailure,
+	isPermanentRefusal,
 	ModelNotSelectedError,
+	ModelPartiallyAppliedError,
+	modelRefusalCode,
 	type SessionBinding,
 	SessionBusyStalledError,
 	type SessionContextUsage,
@@ -57,6 +61,19 @@ import {
 } from "./tail-runner";
 
 export const DEFAULT_STALL_TIMEOUT_MS = 120_000;
+
+/**
+ * What gjc answered a `/model` selection. Only `applied` is recorded. `refused`
+ * left the live model untouched; `partial` changed the model but refused its
+ * thinking level; `unbound` could not open the session and `unavailable`
+ * found the bound session gone, so in both the selection was never applied.
+ * Each carries gjc's stable error code.
+ */
+export type ModelApplyResult =
+	| { readonly kind: "applied" }
+	| { readonly kind: "refused" | "partial" | "unbound" | "unavailable"; readonly code: string };
+/** Applies a selection to the origin's live session and runs `commit` once gjc accepted it. */
+export type ModelApply = (selection: GjcModelSelection, commit: () => void) => Promise<ModelApplyResult>;
 /** Graceful shutdown gives accepted persona turns time to finish before their relays close. */
 const PERSONA_SHUTDOWN_DRAIN_MS = 15_000;
 /** Maximum silence after a tail stall before a still-nonterminal operation is cut off. */
@@ -1220,13 +1237,19 @@ export class PersonaSessionManager {
 	}
 
 	/**
-	 * `/model` is serialized by this same mailbox. Idle binds and controls the
-	 * existing epoch immediately; running waits behind its accepted send and never
-	 * aborts, retires, or changes that in-flight operation.
+	 * Runs one `/model` command inside this origin's mailbox, so reading the
+	 * stored override, applying the selection, and recording it happen in one
+	 * serialized step that no other `/model` or turn dispatch can interleave.
+	 * Idle binds and controls the existing epoch immediately; running waits
+	 * behind its accepted send and never aborts, retires, or changes that
+	 * in-flight operation. Resolves undefined when the manager is stopped.
 	 */
-	rebindModel(originKey: string, selection: GjcModelSelection): Promise<void> {
-		if (this.#stopped) return Promise.resolve();
-		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).rebindModel(selection));
+	runModelCommand<T>(originKey: string, command: (apply: ModelApply) => Promise<T>): Promise<T | undefined> {
+		if (this.#stopped) return Promise.resolve(undefined);
+		const actor = this.#actor(originKey);
+		return actor.enqueue(
+			async () => await command(async (selection, commit) => await actor.applyModel(selection, commit)),
+		);
 	}
 
 	/**
@@ -1955,23 +1978,96 @@ class OriginActor {
 		await this.#dispatchNext();
 	}
 
-	/** Mailbox-serialized live rebind. The caller supplies a verified concrete selection. */
-	async rebindModel(selection: GjcModelSelection): Promise<void> {
-		const binding = await this.#ensureSession(this.#epoch());
+	/**
+	 * Mailbox-serialized live rebind. `commit` records the selection and runs
+	 * only after gjc accepted it, so a selection gjc refuses is never stored. A
+	 * condition replaying the command cannot fix (refused selection, partially
+	 * applied selection, session that cannot be opened, bound session the
+	 * broker no longer hosts) is returned, not thrown, so the platform message
+	 * is answered instead of replayed. Any failure that may have changed the
+	 * live model drops the applied cache so the next turn re-applies the stored
+	 * or default selection.
+	 */
+	async applyModel(selection: GjcModelSelection, commit: () => void): Promise<ModelApplyResult> {
+		const selectionLabel = sanitizeDiagnosticDetail(describeModel(selection), 120);
+		let binding: SessionBinding;
+		try {
+			binding = await this.#ensureSession(this.#epoch());
+		} catch (error) {
+			if (!isPermanentBindFailure(error)) throw error;
+			const code = modelRefusalCode(error);
+			this.#manager.log(
+				`persona_model_unbound origin=${this.originKey} selection=${selectionLabel} code=${code} source=/model`,
+				"error",
+			);
+			return { kind: "unbound", code };
+		}
 		this.#touchHost(binding.sessionId);
-		const receipt = await this.#manager.port.setModel({
-			sessionId: binding.sessionId,
-			repo: this.#manager.repo,
-			selection,
-		});
+		let receipt: { readonly changed: boolean };
+		try {
+			receipt = await this.#manager.port.setModel({
+				sessionId: binding.sessionId,
+				repo: this.#manager.repo,
+				selection,
+			});
+		} catch (error) {
+			const outcome = this.#modelControlFailure(error, binding, selectionLabel);
+			if (outcome) return outcome;
+			throw error;
+		}
+		try {
+			commit();
+		} catch (error) {
+			this.#appliedModel.delete(binding.sessionId);
+			throw error;
+		}
 		this.#appliedModel.set(binding.sessionId, selectIdentity(selection));
 		this.#manager.log(
 			`persona_model origin=${this.originKey} epoch=${binding.epoch} session=${binding.sessionId} effective=${describeModel(selection)} changed=${receipt.changed} source=/model`,
 		);
+		// The change is recorded; resuming a refused turn is that turn's own
+		// work, queued behind this command so its failure is never reported as a
+		// failure of `/model`.
 		if (this.#modelRefusalPaused) {
 			this.#modelRefusalPaused = false;
-			await this.#dispatchNext();
+			void this.enqueue(async () => await this.#dispatchNext()).catch((error: unknown) =>
+				this.#manager.log(`persona model resume failed origin=${this.originKey}: ${safeDiagnostic(error)}`, "error"),
+			);
 		}
+		return { kind: "applied" };
+	}
+
+	/** A permanent answer to a `/model` control, or undefined when the failure must be retried. */
+	#modelControlFailure(error: unknown, binding: SessionBinding, selectionLabel: string): ModelApplyResult | undefined {
+		if (error instanceof ModelPartiallyAppliedError) {
+			this.#appliedModel.delete(binding.sessionId);
+			this.#manager.log(
+				`persona_model_partial origin=${this.originKey} epoch=${binding.epoch} session=${binding.sessionId} selection=${selectionLabel} code=${error.code} source=/model`,
+				"error",
+			);
+			return { kind: "partial", code: error.code };
+		}
+		if (isPermanentRefusal(error)) {
+			const code = modelRefusalCode(error);
+			this.#manager.log(
+				`persona_model_refused origin=${this.originKey} epoch=${binding.epoch} session=${binding.sessionId} selection=${selectionLabel} code=${code} source=/model`,
+				"error",
+			);
+			return { kind: "refused", code };
+		}
+		// Anything else may have changed the live model: re-verify before the next turn.
+		this.#appliedModel.delete(binding.sessionId);
+		// The bound session is gone. Rebinding belongs to the turn path, which
+		// fences it against in-flight work, pending creates and host admission;
+		// `/model` only answers, so the platform does not replay it forever.
+		if (sdkStatusErrorCode(error) === "session_unavailable") {
+			this.#manager.log(
+				`persona_model_unbound origin=${this.originKey} epoch=${binding.epoch} session=${binding.sessionId} selection=${selectionLabel} code=session_unavailable source=/model`,
+				"error",
+			);
+			return { kind: "unavailable", code: "session_unavailable" };
+		}
+		return undefined;
 	}
 
 	/** Retry an inherited, proven refusal using the newly published default. */
@@ -3117,6 +3213,8 @@ class OriginActor {
 				await this.#settleLocalPreflightRejection(current, MODEL_NOT_FOUND_REJECTION_CODE);
 				return;
 			}
+			// The control may have changed the live model before failing; re-verify on the next attempt.
+			if (applyingModel) this.#appliedModel.delete(binding.sessionId);
 			await tail.close();
 			const sessionGone = sdkStatusErrorCode(error) === "session_unavailable";
 			const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
@@ -3745,14 +3843,16 @@ class OriginActor {
 	}
 
 	async #bindSession(epoch: number): Promise<SessionBinding> {
+		// A config reload can replace the default while bind is in flight; cache only what bind was sent.
+		const startupModel = this.#manager.sessionModel;
 		const binding = await this.#manager.port.bind({
 			originKey: this.originKey,
 			epoch,
 			repo: this.#manager.repo,
-			...(this.#manager.sessionModel ? { model: this.#manager.sessionModel } : {}),
+			...(startupModel ? { model: startupModel } : {}),
 		});
-		if (binding.startupModelApplied && this.#manager.sessionModel)
-			this.#appliedModel.set(binding.sessionId, selectIdentity(this.#manager.sessionModel));
+		if (binding.startupModelApplied && startupModel)
+			this.#appliedModel.set(binding.sessionId, selectIdentity(startupModel));
 		return binding;
 	}
 

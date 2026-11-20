@@ -4684,7 +4684,7 @@ test("successful /model resumes the refused trigger on its existing session", as
 	enqueue("refused-before-model", "replay after model selection");
 	await manager!.notifyInbound(KEY);
 	const refusedOpRef = latestOpRef;
-	await manager!.rebindModel(KEY, "provider/model");
+	await manager!.runModelCommand(KEY, async (apply) => await apply("provider/model", () => {}));
 	await eventually(() => terminal.length === 1, "successful model selection did not resume the pending trigger");
 	expect(port.models).toContainEqual({
 		sessionId: "session-e0",
@@ -4731,7 +4731,7 @@ test("an accepted turn resumed after an authenticated refusal reports its submis
 	expect(port.sends).toHaveLength(0);
 	expect(notices).toHaveLength(1);
 
-	await manager!.rebindModel(KEY, "provider/model");
+	await manager!.runModelCommand(KEY, async (apply) => await apply("provider/model", () => {}));
 	await eventually(
 		() => failures.length === 1 && manager!.state(KEY) === "idle",
 		"resumed submission failure did not settle through the ordinary failure path",
@@ -4773,7 +4773,9 @@ test("failed /model keeps the pending refusal paused", async () => {
 	enqueue("failed-model-selection", "must stay pending");
 	await manager!.notifyInbound(KEY);
 	const refusedOpRef = latestOpRef;
-	await expect(manager!.rebindModel(KEY, "provider/model")).rejects.toThrow("selection unavailable");
+	await expect(manager!.runModelCommand(KEY, async (apply) => await apply("provider/model", () => {}))).rejects.toThrow(
+		"selection unavailable",
+	);
 	port.modelFailure = undefined;
 	port.repaired = true;
 	enqueue("after-failed-model", "also waits");
@@ -6573,7 +6575,7 @@ test("model selection cache distinguishes a preset object from its colliding str
 	const port = new ScriptedSessionPort();
 	const hooks: { effectiveModel?: string } = {};
 	await harness(port, hooks);
-	await manager!.rebindModel(KEY, { preset: "foo" });
+	await manager!.runModelCommand(KEY, async (apply) => await apply({ preset: "foo" }, () => {}));
 	const sessionId = port.models[0]!.sessionId;
 	hooks.effectiveModel = "preset:foo";
 	enqueue("colliding-string-turn", "send with the string model");
@@ -6583,4 +6585,223 @@ test("model selection cache distinguishes a preset object from its colliding str
 		{ preset: "foo" },
 		"preset:foo",
 	]);
+});
+
+const PERMANENT_MODEL_REFUSAL = {
+	code: "usage",
+	category: "usage",
+	message: "The command arguments are invalid.",
+	retryability: "no",
+	outcomeCertainty: "not-applied",
+	references: [],
+};
+
+/** A port whose live model control answers the selections in `answers` with the given failure. */
+class ModelAnswerPort extends ScriptedSessionPort {
+	readonly answers = new Map<string, Error>();
+
+	override async setModel(input: Parameters<ScriptedSessionPort["setModel"]>[0]) {
+		const failure = typeof input.selection === "string" ? this.answers.get(input.selection) : undefined;
+		if (failure) throw failure;
+		return await super.setModel(input);
+	}
+}
+
+/** Binds the origin on `provider/a` through one completed turn, so the live model is cached. */
+async function modelCachedOnFirstTurn(): Promise<{ port: ModelAnswerPort; hooks: { effectiveModel?: string } }> {
+	const port = new ModelAnswerPort();
+	const hooks: { effectiveModel?: string } = { effectiveModel: "provider/a" };
+	await harness(port, hooks);
+	enqueue("model-cache-first", "first");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "the first turn did not send");
+	port.complete(port.sends[0]!.opRef, "first reply");
+	await eventually(() => manager!.state(KEY) === "idle", "the first turn did not settle");
+	return { port, hooks };
+}
+
+async function nextTurnModels(port: ModelAnswerPort, messageId: string): Promise<unknown[]> {
+	const before = port.sends.length;
+	enqueue(messageId, "next");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === before + 1, "the next turn did not send");
+	return port.models.map((model) => model.selection);
+}
+
+test("a permanent /model refusal is returned, records nothing, and leaves the cached live model in place", async () => {
+	const { port } = await modelCachedOnFirstTurn();
+	port.answers.set(
+		"provider/bad",
+		new GjcCliError("gjc sdk model.set reported failure", 0, "", PERMANENT_MODEL_REFUSAL),
+	);
+	let commits = 0;
+	const result = await manager!.runModelCommand(KEY, async (apply) => await apply("provider/bad", () => commits++));
+	expect(result).toEqual({ kind: "refused", code: "usage" });
+	expect(commits).toBe(0);
+	// gjc applied nothing, so the cached `provider/a` is still the live model and is not re-sent.
+	expect(await nextTurnModels(port, "after-refusal")).toEqual(["provider/a"]);
+});
+
+test("a retryable not-applied answer is a failure, not a refusal the owner is told about", async () => {
+	const { port } = await modelCachedOnFirstTurn();
+	port.answers.set(
+		"provider/busy",
+		new GjcCliError("gjc sdk model.set reported failure", 0, "", {
+			...PERMANENT_MODEL_REFUSAL,
+			code: "busy",
+			retryability: "yes",
+		}),
+	);
+	let commits = 0;
+	await expect(
+		manager!.runModelCommand(KEY, async (apply) => await apply("provider/busy", () => commits++)),
+	).rejects.toThrow("model.set reported failure");
+	expect(commits).toBe(0);
+});
+
+test("an uncertain /model failure drops the applied-model cache so the next turn re-applies the stored model", async () => {
+	const { port } = await modelCachedOnFirstTurn();
+	port.answers.set(
+		"provider/b",
+		new GjcCliError("gjc sdk model.set reply lost", 0, "", {
+			code: "operation_failed",
+			outcomeCertainty: "unknown",
+		}),
+	);
+	let commits = 0;
+	await expect(
+		manager!.runModelCommand(KEY, async (apply) => await apply("provider/b", () => commits++)),
+	).rejects.toThrow("model.set reply lost");
+	expect(commits).toBe(0);
+	expect(await nextTurnModels(port, "after-uncertain")).toEqual(["provider/a", "provider/a"]);
+});
+
+test("a /model whose record fails after gjc applied it re-applies the stored model on the next turn", async () => {
+	const { port } = await modelCachedOnFirstTurn();
+	await expect(
+		manager!.runModelCommand(
+			KEY,
+			async (apply) =>
+				await apply("provider/c", () => {
+					throw new Error("database is locked");
+				}),
+		),
+	).rejects.toThrow("database is locked");
+	expect(await nextTurnModels(port, "after-commit-failure")).toEqual(["provider/a", "provider/c", "provider/a"]);
+});
+
+test("a failing resumed turn is not reported as a failure of the /model that resumed it", async () => {
+	// The resumed turn is refused again and its tail cleanup throws: that is the
+	// turn's failure, logged by the actor, never the answer to `/model`.
+	class RefusingAgainPort extends ModelNotSelectedPort {
+		override async setModel(input: Parameters<ScriptedSessionPort["setModel"]>[0]) {
+			const receipt = await super.setModel(input);
+			this.repaired = false;
+			return receipt;
+		}
+	}
+	const port = new RefusingAgainPort();
+	const attach = port.attachTail.bind(port);
+	let tails = 0;
+	port.attachTail = async (input) => {
+		const tail = await attach(input);
+		const close = tail.close.bind(tail);
+		const ordinal = ++tails;
+		tail.close = async () => {
+			if (ordinal === 2) throw new Error("resumed tail close failed");
+			await close();
+		};
+		return tail;
+	};
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line));
+	enqueue("refused-then-resume-fails", "resume me");
+	await manager!.notifyInbound(KEY);
+	expect(port.sendAttempts).toHaveLength(1);
+	let commits = 0;
+	const result = await manager!.runModelCommand(KEY, async (apply) => await apply("provider/model", () => commits++));
+	expect(result).toEqual({ kind: "applied" });
+	expect(commits).toBe(1);
+	await eventually(
+		() =>
+			logs.some((line) => line.includes("persona model resume failed") && line.includes("resumed tail close failed")),
+		"the resumed turn failure was not logged by the actor",
+	);
+	expect(port.sendAttempts).toHaveLength(2);
+});
+
+test("an uncertain turn-preflight model failure drops the cache so a default reverted before the retry is re-applied", async () => {
+	const { port, hooks } = await modelCachedOnFirstTurn();
+	port.answers.set(
+		"provider/b",
+		new GjcCliError("gjc sdk model.set reply lost", 0, "", { code: "operation_failed", outcomeCertainty: "unknown" }),
+	);
+	hooks.effectiveModel = "provider/b";
+	enqueue("preflight-uncertain", "second");
+	await manager!.notifyInbound(KEY);
+	expect(port.sends).toHaveLength(1);
+	// The default goes back to A before the retry; B may be live, so A must be sent again.
+	hooks.effectiveModel = "provider/a";
+	// The pre-send failure schedules its own retry after the 2 s backoff.
+	await Bun.sleep(2_100);
+	await eventually(() => port.sends.length === 2, "the retried turn did not send");
+	expect(port.models.map((model) => model.selection)).toEqual(["provider/a", "provider/a"]);
+});
+
+test("/model on a bound session the broker no longer hosts is answered without rebinding or recording", async () => {
+	class DisownedIdlePort extends ScriptedSessionPort {
+		readonly goneSessions = new Set<string>();
+
+		override async setModel(input: Parameters<ScriptedSessionPort["setModel"]>[0]) {
+			if (this.goneSessions.has(input.sessionId))
+				throw new GjcCliError("gjc sdk model.set reported failure", 0, "", { code: "endpoint_stale" });
+			return await super.setModel(input);
+		}
+	}
+	const port = new DisownedIdlePort({ onBind: (input) => `session-e${input.epoch}` });
+	await harness(port, {});
+	expect(await manager!.runModelCommand(KEY, async (apply) => await apply("provider/a", () => {}))).toEqual({
+		kind: "applied",
+	});
+	port.goneSessions.add("session-e0");
+	const binds = port.binds.length;
+
+	let commits = 0;
+	expect(await manager!.runModelCommand(KEY, async (apply) => await apply("provider/b", () => commits++))).toEqual({
+		kind: "unavailable",
+		code: "session_unavailable",
+	});
+	expect(commits).toBe(0);
+	// Rebinding is left to the turn path and its fences: no epoch rotation and no new session here.
+	expect(database!.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
+	expect(port.binds).toHaveLength(binds);
+});
+
+test("/model on a refusal-paused origin whose session is gone answers unavailable and leaves the pause and pending trigger for /new", async () => {
+	class GoneAfterRefusalPort extends ModelNotSelectedPort {
+		gone = false;
+
+		override async setModel(input: Parameters<ScriptedSessionPort["setModel"]>[0]) {
+			if (this.gone) throw new GjcCliError("gjc sdk model.set reported failure", 0, "", { code: "endpoint_stale" });
+			return await super.setModel(input);
+		}
+	}
+	const port = new GoneAfterRefusalPort();
+	await harness(port, {});
+	enqueue("paused-then-gone", "waits for a model");
+	await manager!.notifyInbound(KEY);
+	expect(port.sendAttempts).toHaveLength(1);
+	port.gone = true;
+	let commits = 0;
+	expect(await manager!.runModelCommand(KEY, async (apply) => await apply("provider/model", () => commits++))).toEqual({
+		kind: "unavailable",
+		code: "session_unavailable",
+	});
+	expect(commits).toBe(0);
+	expect(database!.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
+	// Still paused: the trigger stays pending and no new prompt is attempted until /new or a successful /model.
+	enqueue("after-gone-model", "also waits");
+	await manager!.notifyInbound(KEY);
+	expect(database!.inbox.pendingOldest(KEY)?.message_id).toBe("paused-then-gone");
+	expect(port.sendAttempts).toHaveLength(1);
 });
