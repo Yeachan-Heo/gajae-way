@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { SlackHistoryPage } from "../src/api";
+import { type SlackHistoryPage, SlackWebApi } from "../src/api";
 import {
 	ROOT_TEXT_LIMIT,
 	ROOT_TEXT_LOOKUPS_PER_WINDOW,
@@ -129,4 +129,35 @@ test("cold-root lookups past the per-window budget are shed until the window mov
 	roots.warm(shed);
 	await roots.idle();
 	expect(roots.excerpt(shed)).toBe(`root ${shed.slice(3)}`);
+});
+
+test("a rate-limited cold lookup makes one HTTP attempt and pauses lookups for its Retry-After", async () => {
+	let clock = 0;
+	let attempts = 0;
+	let limited = true;
+	const api = new SlackWebApi("xoxb-test", {
+		fetcher: async () => {
+			attempts++;
+			if (limited) return new Response("", { status: 429, headers: { "retry-after": "30" } });
+			return Response.json({ ok: true, messages: [{ ts: "2.0", text: "root" }], has_more: false });
+		},
+		sleep: async () => {},
+	});
+	const roots = new SlackRootTexts(api, undefined, () => clock);
+	roots.warm("C1:1.0");
+	await roots.idle();
+	expect(attempts).toBe(1);
+
+	// Slack asked for 30 s: no cold lookup goes out before then, for any root.
+	clock += 29_999;
+	roots.warm("C1:2.0");
+	await roots.idle();
+	expect(attempts).toBe(1);
+
+	limited = false;
+	clock += 1;
+	roots.warm("C1:2.0");
+	await roots.idle();
+	expect(attempts).toBe(2);
+	expect(roots.excerpt("C1:2.0")).toBe("root");
 });

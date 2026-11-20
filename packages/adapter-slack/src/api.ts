@@ -204,6 +204,7 @@ export class SlackWebApi {
 		parameters: Record<string, unknown> = {},
 		token?: string,
 		signal?: AbortSignal,
+		rateLimitRetries = RATE_LIMIT_MAX_RETRIES,
 	): Promise<T> {
 		// Response URLs are already credentials: never forward the bot token to them.
 		const responseUrl = method.startsWith("https://");
@@ -243,7 +244,7 @@ export class SlackWebApi {
 				RATE_LIMIT_MAX_WAIT_MS,
 				Number.isFinite(header) && header > 0 ? header * 1000 : RATE_LIMIT_DEFAULT_WAIT_MS,
 			);
-			if (attempt >= RATE_LIMIT_MAX_RETRIES) throw new SlackRateLimitedError(retryAfterMs, attempt + 1);
+			if (attempt >= rateLimitRetries) throw new SlackRateLimitedError(retryAfterMs, attempt + 1);
 			await this.#sleep(retryAfterMs);
 		}
 		// Slash-command responses may return plain text rather than a Web API envelope.
@@ -412,9 +413,24 @@ export class SlackWebApi {
 	async conversationsReplies(
 		channel: string,
 		ts: string,
-		options: { oldest?: string; cursor?: string; limit?: number } = {},
+		options: {
+			oldest?: string;
+			cursor?: string;
+			limit?: number;
+			/** Retries after a 429; 0 makes one HTTP attempt and surfaces the limit to the caller. */
+			rateLimitRetries?: number;
+		} = {},
 	): Promise<SlackHistoryPage> {
-		return historyPage(await this.call<HistoryResponse>("conversations.replies", { channel, ts, ...options }));
+		const { rateLimitRetries, ...query } = options;
+		return historyPage(
+			await this.call<HistoryResponse>(
+				"conversations.replies",
+				{ channel, ts, ...query },
+				undefined,
+				undefined,
+				rateLimitRetries,
+			),
+		);
 	}
 
 	connectionsOpen(appToken: string, signal?: AbortSignal): Promise<{ readonly url: string }> {
