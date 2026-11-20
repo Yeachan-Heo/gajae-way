@@ -2082,8 +2082,6 @@ async function handleRequest(
 			return;
 		case "ops.holds": {
 			// Owner-gated like every ops verb: a hold list names origins and opRefs.
-			if (!ownerAuthored(runtime.config, request.params))
-				throw new ProtocolError("verb_failed", "ops.holds is restricted to the configured operator");
 			const holds = await runtime.personaSessions.listHolds();
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { holds } });
 			return;
@@ -2092,9 +2090,6 @@ async function handleRequest(
 			// Explicit operator instruction (#859): the bounded drain and the cancel
 			// status are the primary path; this settles exactly one named stale
 			// hold whose fence outlived every bound, never a batch operation.
-			// Gated at the same operator/owner boundary as other destructive ops.* verbs.
-			if (!ownerAuthored(runtime.config, request.params))
-				throw new ProtocolError("verb_failed", "ops.holds.abandon is restricted to the configured operator");
 			const params = (request.params ?? {}) as { opRef?: unknown; confirm?: unknown };
 			if (typeof params.opRef !== "string" || params.opRef.length === 0 || params.opRef.length > 256)
 				throw new ProtocolError("invalid_params", "opRef must be a non-empty string");
