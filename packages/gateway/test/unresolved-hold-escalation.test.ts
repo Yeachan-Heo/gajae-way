@@ -2306,3 +2306,43 @@ test("a fresh, live unsettled turn still blocks the restart drain past any bound
 		await f.manager.stop();
 	}
 });
+
+test("an aged escalated hold whose status is in_flight still blocks the drain (#860)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("restart-drain-aged-inflight", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		newerMessage: false,
+		clock,
+		retiredHoldAbandonMs: 120 * MINUTE,
+	});
+	staleHold(f);
+	try {
+		await f.manager.recover();
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBe("1");
+		// First drain attempt: status unreadable, hold blocks.
+		await expect(f.manager.drainForRestart("aged-inflight-drain", 20)).resolves.toBe("timed_out");
+		// Advance past the age threshold.
+		await clock.advance(121 * MINUTE);
+		// Now make the status readable as in_flight (host revived).
+		// Keep attachTail as failing (detached hold), but make status readable.
+		f.port.status = async (input) => {
+			if (input.opRef === f.heldOpRef) {
+				return {
+					operationRef: f.heldOpRef,
+					status: { status: "in_flight" as const },
+					summaryCompleted: false,
+				};
+			}
+			throw endpointStale();
+		};
+		// Second drain attempt: status now shows in_flight (host revived).
+		// Even though the hold is now aged, the latest probe found it in_flight (live).
+		// The drain must still timeout, it cannot skip the hold just because it's old.
+		await expect(f.manager.drainForRestart("aged-inflight-drain", 20)).resolves.toBe("timed_out");
+		// Verify the hold is still escalated (not exempted just for being old).
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBe("1");
+	} finally {
+		await f.manager.stop();
+	}
+});

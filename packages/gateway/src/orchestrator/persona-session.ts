@@ -1935,8 +1935,34 @@ class OriginActor {
 				this.#manager.database.core.metaGet(retiredHoldFirstSeenKey(bound.turn.opRef)),
 			);
 			if (heldSinceMs !== undefined && this.#manager.now() - heldSinceMs >= this.#manager.retiredHoldAbandonMs) {
-				bound.restartDrainVerdict = undefined;
-				continue;
+				// A stale escalated hold stops refusing the drain once its operator bound has elapsed,
+				// but only after checking the current operation status: exempt only when the latest probe
+				// still shows the hold unreadable. If the host revived or status became readable as
+				// accepted/in_flight, the aged hold must still block the drain.
+				try {
+					const statusReport = await beforeDeadline(
+						this.#statusForRecovery(bound.sessionId, bound.turn.opRef),
+						deadlineMs,
+					);
+					if (statusReport === undefined) return true;
+					if (this.#stopped || this.#manager.stopped) return true;
+					// If status is readable and shows accepted/in_flight, don't exempt
+					if (
+						statusReport.operationRef === bound.turn.opRef &&
+						(statusReport.status.status === "accepted" || statusReport.status.status === "in_flight")
+					) {
+						bound.restartDrainVerdict = { checkedAtMs: this.#manager.now(), blocked: true };
+						if (report) await this.#reportHold(bound, report.blockers, escalated);
+						return true;
+					}
+					// Status is unreadable or settled - safe to exempt
+					bound.restartDrainVerdict = undefined;
+					continue;
+				} catch {
+					// Status is unreadable (endpoint_stale, etc.) - safe to exempt aged hold
+					bound.restartDrainVerdict = undefined;
+					continue;
+				}
 			}
 			// Only a blocked verdict is cached. An exemption is re-proven on every
 			// drain poll, because it lets the restart go ahead while this turn's
@@ -2061,10 +2087,12 @@ class OriginActor {
 		}
 		for (const bound of this.#retired.values()) {
 			const escalated = this.#manager.database.core.metaGet(escalatedHoldKey(bound.turn.opRef)) !== undefined;
-			if (bound.answerWanted !== true || bound.detached !== true || !escalated) {
+			if (bound.answerWanted !== true || !escalated) {
 				await this.#reportHold(bound, into, escalated);
 				return;
 			}
+			// At this point: escalated && answerWanted, so this is an escalated hold.
+			// Check if it's old enough to exempt from blocking.
 			const heldSinceMs = parseRetiredHoldFirstSeen(
 				this.#manager.database.core.metaGet(retiredHoldFirstSeenKey(bound.turn.opRef)),
 			);
@@ -2072,6 +2100,7 @@ class OriginActor {
 				continue;
 			// Report from durable facts only: #holdReport would re-probe the host,
 			// and this path runs after the drain already gave up on probing.
+			// This applies to both detached and reattached escalated holds.
 			const database = this.#manager.database;
 			const trigger = database.inbox.turnRow(bound.turn.opRef);
 			const heldSinceMs2 = parseRetiredHoldFirstSeen(database.core.metaGet(retiredHoldFirstSeenKey(bound.turn.opRef)));
