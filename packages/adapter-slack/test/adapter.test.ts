@@ -1464,18 +1464,45 @@ test("Slack reactions follow the session their target message was routed to", as
 	}
 });
 
-test("Slack reactions to the bot's own thread post without a receipt follow that thread", async () => {
+test("Slack reactions to the bot's own file share follow the delivery that uploaded it", async () => {
+	const { mkdtemp, writeFile, realpath, rm } = await import("node:fs/promises");
+	const home = await mkdtemp(join(tmpdir(), "slack-file-share-"));
 	const f = await fixture();
 	try {
+		const path = join(home, "reply.txt");
+		await writeFile(path, "file");
+		const file = { path: await realpath(path), name: "reply.txt", size: 4 };
+		const uploads: (string | undefined)[] = [];
+		f.api.uploadFile = async (_channel: string, _file: unknown, threadTs?: string) => {
+			uploads.push(threadTs);
+		};
 		const root = "1700000001.000000";
-		const thread = { platform: "slack", kind: "thread", conversationId: `C1:${root}`, parentId: "C1" };
-		// A file share is posted through files.completeUploadExternal, which returns no message ts;
-		// Slack's own message event for it is the only record of where it landed.
-		await f.event({
-			...inbound({ ts: "1700000004.000001", text: "", thread_ts: root, user: "UBOT" }),
-			subtype: "file_share",
-		});
-		await f.event({ ...inbound({ ts: "1700000005.000001", text: "top", user: "UBOT" }) });
+		const thread = { platform: "slack", kind: "thread", conversationId: `C1:${root}`, parentId: "C1" } as const;
+		const push = (message: ChatMessagePayload) => {
+			for (const handler of f.client.handlers) handler(message);
+		};
+		// A thread-session upload, and a channel-session turn replying inside that same physical thread.
+		const uploaded = async (count: number) => {
+			for (let i = 0; i < 200 && uploads.length < count; i++) await Bun.sleep(5);
+		};
+		// Sequential on purpose: two origins uploading the same name into one thread at once are
+		// indistinguishable to Slack's event, and the claim is first-registered-first-served.
+		push(delivery({ deliveryId: "thread-file", origin: thread, file }));
+		await uploaded(1);
+		push(delivery({ deliveryId: "channel-file", replyToMessageId: `C1:${root}`, file }));
+		await uploaded(2);
+		expect(uploads).toEqual([root, root]);
+		// files.completeUploadExternal returns no ts: Slack's own message events are the only record.
+		const share = (ts: string) =>
+			f.event({
+				...inbound({ ts, text: "", thread_ts: root, user: "UBOT" }),
+				subtype: "file_share",
+				files: [{ name: "reply.txt" }],
+			});
+		await share("1700000004.000001");
+		await share("1700000004.000002");
+		// An own share with no recorded upload stays unknown.
+		await share("1700000004.000003");
 		const react = (ts: string) =>
 			f.event({
 				type: "reaction_added",
@@ -1485,12 +1512,18 @@ test("Slack reactions to the bot's own thread post without a receipt follow that
 				event_ts: "1700000009.000000",
 			});
 		await react("1700000004.000001");
-		await react("1700000005.000001");
+		await react("1700000004.000002");
+		await react("1700000004.000003");
 		expect(chatSends(f.client)).toHaveLength(0);
 		const reactions = f.client.requests.filter((request) => request.verb === "engagement.reaction");
-		expect(reactions.map((request) => (request.params as { origin: unknown }).origin)).toEqual([thread, origin]);
+		expect(reactions.map((request) => (request.params as { origin: unknown }).origin)).toEqual([
+			thread,
+			origin,
+			origin,
+		]);
 	} finally {
 		f.socket.stop();
+		await rm(home, { recursive: true, force: true });
 	}
 });
 
