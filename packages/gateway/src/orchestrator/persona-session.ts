@@ -1984,6 +1984,30 @@ class OriginActor {
 		return false;
 	}
 
+	/**
+	 * Whether an escalated hold that exceeded its operator bound should still block based on cached drain verdict.
+	 * Returns true if the hold should block, false if it's safe to exempt (#859).
+	 * Uses the cached verdict only if it was checked after the hold became aged.
+	 */
+	#shouldAgedHoldBlock(bound: BoundTurn): boolean {
+		const verdict = bound.restartDrainVerdict;
+		const heldSinceMs = parseRetiredHoldFirstSeen(
+			this.#manager.database.core.metaGet(retiredHoldFirstSeenKey(bound.turn.opRef)),
+		);
+		const now = this.#manager.now();
+		// If the hold is aged (past the abandon threshold)
+		if (heldSinceMs !== undefined && now - heldSinceMs >= this.#manager.retiredHoldAbandonMs) {
+			// Only trust a verdict that was checked AFTER the hold became aged
+			if (verdict && verdict.blocked && verdict.checkedAtMs >= heldSinceMs + this.#manager.retiredHoldAbandonMs) {
+				return true; // Recent verdict after age threshold says it blocks
+			}
+			return false; // No fresh verdict after age threshold, safe to exempt
+		}
+		// Hold is not aged yet; trust any recent verdict that says it blocks
+		if (verdict && verdict.blocked) return true;
+		return false;
+	}
+
 	/** Explains one drain-blocking bound for `restart-stack --status` (#859). */
 	async #reportHold(bound: BoundTurn, into: GatewayHoldReport[], escalated: boolean): Promise<void> {
 		if (!escalated) {
@@ -2025,9 +2049,13 @@ class OriginActor {
 			...(deadMark === undefined ? {} : { deadSinceMs: now - deadMark.at }),
 			noticeConfirmed: database.core.metaGet(escalationNoticeConfirmedKey(opRef)) !== undefined,
 		};
-		// Mirror the drain's skip rule: a bound-elapsed hold would be exempted, a
-		// host-proven-exited one is exempted by the probe itself.
-		if (bounded) return { ...fresh, wouldBlockDrain: false };
+		// Mirror the drain's skip rule: a bound-elapsed hold would be exempted, unless a
+		// recent drain verdict shows the status is accepted/in_flight (the hold still blocks).
+		if (bounded) {
+			// Use cached drain verdict if available; without it, conservatively report as blocking
+			if (this.#shouldAgedHoldBlock(bound)) return { ...fresh, wouldBlockDrain: true };
+			return { ...fresh, wouldBlockDrain: false };
+		}
 		try {
 			const report = await this.#statusForRecovery(bound.sessionId, bound.turn.opRef);
 			if (
@@ -2096,8 +2124,10 @@ class OriginActor {
 			const heldSinceMs = parseRetiredHoldFirstSeen(
 				this.#manager.database.core.metaGet(retiredHoldFirstSeenKey(bound.turn.opRef)),
 			);
-			if (heldSinceMs !== undefined && this.#manager.now() - heldSinceMs >= this.#manager.retiredHoldAbandonMs)
-				continue;
+			if (heldSinceMs !== undefined && this.#manager.now() - heldSinceMs >= this.#manager.retiredHoldAbandonMs) {
+				// Aged hold: use cached drain verdict to determine if it should still block
+				if (!this.#shouldAgedHoldBlock(bound)) continue;
+			}
 			// Report from durable facts only: #holdReport would re-probe the host,
 			// and this path runs after the drain already gave up on probing.
 			// This applies to both detached and reattached escalated holds.
