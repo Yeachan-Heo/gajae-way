@@ -852,9 +852,14 @@ export class BrokerSessionPort implements SessionPort {
 			if (error instanceof BrokerAuthorityError) throw error;
 			const modelError = unknownModelCreateError(error);
 			const poisonedCode = modelError === undefined ? poisonedCreateKeyCode(error, intent.operationRef) : undefined;
-			// Neither a rejected model nor a poisoned key can create a session. All
-			// other failures may have applied the operation, so keep their key for replay.
-			if (modelError !== undefined || poisonedCode !== undefined) this.#releaseOperation(intent);
+			// A permanent not-applied refusal settles only an intent this call
+			// recorded. A resumed intent's earlier attempt may have created a session
+			// whose reply was lost, and this replay's refusal says nothing about it.
+			const freshRefusal = !intent.resumed && isPermanentRefusal(error);
+			// Neither a rejected model, a fresh permanent refusal, nor a poisoned key
+			// can create a session. All other failures may have applied the
+			// operation, so keep their key for replay.
+			if (modelError !== undefined || freshRefusal || poisonedCode !== undefined) this.#releaseOperation(intent);
 			if (modelError !== undefined) throw modelError;
 			if (input.epochRecovery === false || poisonedCode === undefined) throw error;
 			const rotations = this.#createRotations(input.originKey);
@@ -1758,7 +1763,15 @@ export class BrokerSessionPort implements SessionPort {
 			);
 			if (typeof result?.changed !== "boolean")
 				throw new SessionContractError("model.set succeeded without a changed receipt");
-			const thinkingChanged = thinking ? await this.#setThinking(sdk, thinking) : false;
+			let thinkingChanged = false;
+			try {
+				if (thinking) thinkingChanged = await this.#setThinking(sdk, thinking);
+			} catch (error) {
+				// model.set already landed: a permanently refused thinking level is a
+				// partial change, never a "not applied" answer for the whole selection.
+				if (!isPermanentRefusal(error)) throw error;
+				throw new ModelPartiallyAppliedError(modelRefusalCode(error));
+			}
 			return { changed: result.changed || thinkingChanged };
 		});
 	}
@@ -2838,6 +2851,7 @@ function unknownModelCreateError(error: unknown): GjcCliError | undefined {
 }
 
 const OUTCOME_CERTAINTIES = new Set(["applied", "not-applied", "unknown"]);
+const RETRYABILITIES = new Set(["yes", "no", "unknown"]);
 
 function sanitizedDetails(details: unknown): unknown {
 	const code = stableErrorCode(envelopeErrorCode(details));
@@ -2846,6 +2860,11 @@ function sanitizedDetails(details: unknown): unknown {
 	const outcomeCertainty =
 		typeof record?.outcomeCertainty === "string" && OUTCOME_CERTAINTIES.has(record.outcomeCertainty)
 			? record.outcomeCertainty
+			: undefined;
+	// Kept so a permanent refusal stays distinguishable from a retryable one after sanitization.
+	const retryability =
+		typeof record?.retryability === "string" && RETRYABILITIES.has(record.retryability)
+			? record.retryability
 			: undefined;
 	// Only idempotency-key references survive: the gateway minted them, and
 	// poisonedCreateKeyCode matches them exactly against the key it sent.
@@ -2858,6 +2877,7 @@ function sanitizedDetails(details: unknown): unknown {
 		...(code ? { code } : {}),
 		...(message ? { message } : {}),
 		...(outcomeCertainty ? { outcomeCertainty } : {}),
+		...(retryability ? { retryability } : {}),
 		...(references.length > 0 ? { references } : {}),
 	};
 }
@@ -2904,6 +2924,57 @@ function recordOf(value: unknown): Record<string, unknown> | undefined {
 function isRefusedOutcome(error: unknown): boolean {
 	if (!(error instanceof GjcCliError)) return false;
 	return recordOf(error.details)?.outcomeCertainty === "not-applied" || isSessionGoneCode(sdkErrorCode(error));
+}
+
+/**
+ * gjc answered an operation with a definite, permanent "not applied" (for
+ * example a `usage` refusal of an unknown preset). Replaying the same request
+ * cannot change that answer: `/model` reports it to the owner instead of
+ * failing the platform message, and a refused session.create retires its
+ * intent. A retryable refusal (`busy`) stays a failure that is retried, and a
+ * gone session is not a refusal of the request: it keeps its own rebind path.
+ */
+export function isPermanentRefusal(error: unknown): error is GjcCliError {
+	if (!(error instanceof GjcCliError)) return false;
+	const details = recordOf(error.details);
+	return (
+		details?.outcomeCertainty === "not-applied" &&
+		details.retryability === "no" &&
+		!isSessionGoneCode(sdkErrorCode(error))
+	);
+}
+
+/** The runtime's stable error code of a refused model control: the only part of the refusal shown in chat. */
+export function modelRefusalCode(error: GjcCliError): string {
+	return sdkErrorCode(error) ?? "refused";
+}
+
+/**
+ * Opening the session failed in a way no replay can change: the startup model
+ * is unknown to gjc, or gjc definitely and permanently refused the bind. Any
+ * other bind failure (transport, authority, ambiguous create) stays retryable.
+ */
+export function isPermanentBindFailure(error: unknown): error is GjcCliError {
+	return error instanceof GjcCliError && (sdkErrorCode(error) === "model_not_found" || isPermanentRefusal(error));
+}
+
+/**
+ * `model.set` landed but gjc permanently refused the thinking level that came
+ * with it. The live model changed while the selection as a whole did not
+ * apply, so this is neither a refusal (nothing changed) nor retryable.
+ */
+export class ModelPartiallyAppliedError extends GjcCliError {
+	/** gjc's stable code for the refused thinking level. */
+	readonly code: string;
+
+	// Keeps GjcCliError's name and envelope shape so failure classifiers treat it as an SDK refusal.
+	constructor(code: string) {
+		super(`gjc sdk thinking.set refused (${code}) after model.set applied`, 0, "", {
+			code,
+			outcomeCertainty: "applied",
+		});
+		this.code = code;
+	}
 }
 
 /**

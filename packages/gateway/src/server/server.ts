@@ -164,7 +164,13 @@ import {
 	watchWakeMessageId,
 } from "./handoff";
 import { InterimSpeechGate } from "./interim-speech";
-import { applyModelCommand, listModelChoices, ProviderModelCatalog } from "./model-command";
+import {
+	applyModelCommand,
+	commitModelChange,
+	listModelChoices,
+	modelChangeRefusedText,
+	ProviderModelCatalog,
+} from "./model-command";
 import { checkOutboundFile, deterministicFileDeliveryId } from "./outbound-files";
 import { type PanelResponseKind, PermissionPanels } from "./permission-panels";
 import { RestartNotices, restartNoticeText } from "./restart-notice";
@@ -2664,17 +2670,27 @@ async function sendChat(
 			});
 			return;
 		}
-		const outcome = applyModelCommand(userText, key, origin, options.database, runtime.config.model);
-		if (outcome.rebind) {
-			const selection = outcome.rebind.kind === "set" ? outcome.rebind.selection : runtime.config.model;
+		// Read, apply and record inside the origin's mailbox so two `/model`
+		// commands cannot interleave. Only a selection gjc accepted is stored: a
+		// stored selection gjc refuses would fail every later turn here. A
+		// permanent refusal is answered, not thrown, because a failed request
+		// makes the adapter replay this same message forever, holding every
+		// message queued behind it.
+		const replyText = await runtime.personaSessions.runModelCommand(key, async (apply) => {
+			const outcome = applyModelCommand(userText, key, origin, options.database, runtime.config.model);
+			const change = outcome.rebind;
+			if (!change) return outcome.text;
+			const selection = change.kind === "set" ? change.selection : runtime.config.model;
 			if (!selection) throw new Error("/model clear produced a rebind without a configured gateway default");
-			await runtime.personaSessions.rebindModel(key, selection);
-		}
+			const applied = await apply(selection, () => commitModelChange(options.database, key, change));
+			return applied.kind === "applied" ? outcome.text : modelChangeRefusedText(change, applied);
+		});
+		if (replyText === undefined) throw new Error("/model was not applied because the persona session manager stopped");
 		const payload = {
 			turnId: crypto.randomUUID(),
 			origin,
 			role: "assistant" as const,
-			text: outcome.text,
+			text: replyText,
 			final: true,
 			...(replyToMessageId ? { replyToMessageId } : {}),
 		};

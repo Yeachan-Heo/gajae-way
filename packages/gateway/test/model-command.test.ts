@@ -2,12 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { GjcCliError } from "@gajae-gateway/subsession";
 import { type GatewayConfig, loadConfig } from "../src/config";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { GlobalGjcClient, parseListModelsOutput } from "../src/orchestrator/broker";
-import { ModelNotSelectedError } from "../src/orchestrator/session-port";
+import { ModelNotSelectedError, ModelPartiallyAppliedError } from "../src/orchestrator/session-port";
 import {
 	applyModelCommand,
+	commitModelChange,
 	listModelChoices,
 	ProviderModelCatalog,
 	parseModelArgument,
@@ -63,6 +65,10 @@ describe("parseModelArgument", () => {
 		expect(parseModelArgument("   ")).toEqual({ error: "empty selection" });
 		expect(parseModelArgument("gpt heavy")).toEqual({ error: "a selection cannot contain spaces" });
 	});
+
+	test("rejects a bot mention", () => {
+		expect(parseModelArgument("@gajae_way_bot")).toEqual({ error: "a mention is not a model selection" });
+	});
 });
 
 describe("/model show", () => {
@@ -87,18 +93,19 @@ describe("/model show", () => {
 });
 
 describe("/model set", () => {
-	test("stores the selection and returns a same-session rebind intent", () => {
+	test("returns a same-session rebind intent and stores nothing until it is committed", () => {
 		const s = store();
-		const out = applyModelCommand("/model set gpt-heavy", "k", CHANNEL, s, undefined);
-		expect(s.current).toEqual({ preset: "gpt-heavy" });
-		expect(out.rebind).toEqual({ kind: "set", selection: { preset: "gpt-heavy" } });
+		const out = applyModelCommand("/model set gpt-heavy", "k", CHANNEL, s, undefined, "owner-1");
+		expect(s.writes).toHaveLength(0);
+		expect(out.rebind).toEqual({ kind: "set", selection: { preset: "gpt-heavy" }, setBy: "owner-1" });
 		expect(out.text).toContain("same session");
+		commitModelChange(s, "k", out.rebind!);
+		expect(s.current).toEqual({ preset: "gpt-heavy" });
 	});
 
 	test("accepts the bare form without the set keyword", () => {
 		const s = store();
 		const out = applyModelCommand("/model glm-gpt", "k", CHANNEL, s, undefined);
-		expect(s.current).toEqual({ preset: "glm-gpt" });
 		expect(out.rebind).toEqual({ kind: "set", selection: { preset: "glm-gpt" } });
 	});
 
@@ -111,21 +118,32 @@ describe("/model set", () => {
 		expect(out.text).toContain("/model set");
 	});
 
+	test("a Telegram bot mention is refused before it can reach gjc", () => {
+		const s = store({ preset: "gpt-heavy" });
+		const out = applyModelCommand("/model @gajae_way_bot", "k", CHANNEL, s, undefined);
+		expect(s.writes).toHaveLength(0);
+		expect(out.rebind).toBeUndefined();
+		expect(out.text).toContain("a mention is not a model selection");
+	});
+
 	test("replaces an existing override rather than stacking", () => {
 		const s = store({ preset: "glm-gpt" });
-		applyModelCommand("/model set frontier-heavy", "k", CHANNEL, s, undefined);
+		const out = applyModelCommand("/model set frontier-heavy", "k", CHANNEL, s, undefined);
+		commitModelChange(s, "k", out.rebind!);
 		expect(s.current).toEqual({ preset: "frontier-heavy" });
 	});
 });
 
 describe("/model clear", () => {
-	test("removes an override and returns a clear rebind intent", () => {
+	test("returns a clear rebind intent and removes the override only when committed", () => {
 		const s = store({ preset: "gpt-heavy" });
 		const out = applyModelCommand("/model clear", "k", CHANNEL, s, "config-default");
-		expect(s.current).toBeUndefined();
+		expect(s.current).toEqual({ preset: "gpt-heavy" });
 		expect(out.rebind).toEqual({ kind: "clear" });
 		expect(out.text).toContain("config-default");
 		expect(out.text).toContain("same session");
+		commitModelChange(s, "k", out.rebind!);
+		expect(s.current).toBeUndefined();
 	});
 
 	test("does not erase a live override when no concrete default can be applied", () => {
@@ -562,6 +580,272 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 			await rm(home, { recursive: true, force: true });
 		}
 	}
+});
+
+/** gjc 0.21's answer to `model.profile.set` with an unknown preset (2026-11-20 Telegram incident). */
+const UNKNOWN_PRESET_REFUSAL = {
+	code: "usage",
+	category: "usage",
+	message: "The command arguments are invalid. See /Users/someone/.gjc/agent/models.yml",
+	retryability: "no",
+	outcomeCertainty: "not-applied",
+	references: [],
+};
+
+/** A loopback gateway whose session port answers `setModel` through `answer` before the scripted fake. */
+async function withLoopbackModelGateway(
+	answer: (selection: GjcModelSelection) => Promise<void>,
+	body: (h: {
+		port: ScriptedSessionPort;
+		database: Store;
+		request: (id: string, text: string, messageId?: string) => void;
+		send: (value: unknown) => void;
+		frames: Array<Record<string, unknown>>;
+		reply: (id: string) => Promise<string>;
+		logs: string[];
+	}) => Promise<void>,
+): Promise<void> {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-model-refused-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home,
+		gjc: { agentDir: join(home, "agent") },
+		configPath: join(home, "config.json"),
+		socketPath: join(home, "gateway.sock"),
+		dbPath: join(home, "gateway.db"),
+		logVerbosity: "info",
+		model: { preset: "base" },
+		ownerTarget: { origin: OWNER_DM },
+	};
+	const database = await Store.open(config.dbPath);
+	const port = new ScriptedSessionPort();
+	const setModel = port.setModel.bind(port);
+	port.setModel = async (input) => {
+		await answer(input.selection);
+		return await setModel(input);
+	};
+	attachTestBrokerOwnership(database, port, join(home, "agent"));
+	let server: GatewayServer | undefined;
+	let client: Awaited<ReturnType<typeof connect>> | undefined;
+	const logs: string[] = [];
+	const previous = { info: console.info, error: console.error, warn: console.warn };
+	const capture = (...values: unknown[]) => logs.push(values.map((value) => String(value)).join(" "));
+	console.info = capture;
+	console.error = capture;
+	console.warn = capture;
+	try {
+		server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
+		const connected = await connect(config.socketPath);
+		client = connected;
+		connected.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await Bun.sleep(5);
+		const origin = { platform: "loopback", kind: "loopback", conversationId: "model" };
+		await body({
+			port,
+			database,
+			frames: connected.frames,
+			logs,
+			send: (value) => connected.send(value),
+			request: (id, text, messageId) =>
+				connected.send({
+					v: "0.1",
+					type: "request",
+					id,
+					verb: "chat.send",
+					params: { origin, text, ...(messageId ? { messageId } : {}) },
+				}),
+			reply: async (id) => {
+				await waitFor(
+					() => connected.frames.some((frame) => frame.id === id && frame.event === "chat.message"),
+					`no chat reply to ${id}`,
+				);
+				return (
+					connected.frames.find((frame) => frame.id === id && frame.event === "chat.message") as {
+						payload: { text: string };
+					}
+				).payload.text;
+			},
+		});
+	} finally {
+		client?.close();
+		try {
+			await server?.stop();
+		} finally {
+			Object.assign(console, previous);
+			if (!server) database.close();
+			await rm(home, { recursive: true, force: true });
+		}
+	}
+}
+
+const MODEL_KEY = "loopback/loopback/model";
+
+test("/model with a selection gjc permanently refuses is answered, keeps the stored override, and later turns stay on it", async () => {
+	await withLoopbackModelGateway(
+		async (selection) => {
+			if (typeof selection !== "string" && selection.preset === "bogus")
+				throw new GjcCliError(
+					`gjc sdk model.profile.set reported failure: ${JSON.stringify(UNKNOWN_PRESET_REFUSAL)}`,
+					0,
+					"",
+					UNKNOWN_PRESET_REFUSAL,
+				);
+		},
+		async ({ port, database, request, frames, reply, logs }) => {
+			request("good", "/model set good");
+			expect(await reply("good")).toContain("model set to **preset good**");
+			expect(database.bindings.modelGet(MODEL_KEY)?.selection).toEqual({ preset: "good" });
+
+			request("bogus", "/model bogus");
+			const text = await reply("bogus");
+			// Answered, not failed: an adapter must not replay this message forever.
+			expect(frames.find((frame) => frame.id === "bogus" && frame.type === "response")).toMatchObject({
+				result: { engaged: true },
+			});
+			expect(text).toContain("could not set the model to **preset bogus**: gjc refused it (usage)");
+			// gjc's prose (paths, URLs) never reaches the chat.
+			expect(text).not.toContain("/Users/");
+			expect(text).not.toContain("arguments are invalid");
+			expect(database.bindings.modelGet(MODEL_KEY)?.selection).toEqual({ preset: "good" });
+			expect(logs.some((line) => line.startsWith(`persona_model_refused origin=${MODEL_KEY}`))).toBe(true);
+			expect(logs.some((line) => line.includes("/Users/someone"))).toBe(false);
+
+			request("turn", "hello", "m-1");
+			await waitFor(() => port.sends.length === 1, "the next turn did not start");
+			port.complete(port.sends[0]!.opRef, "hello back");
+			// Bind on the gateway default, then the accepted override; the refused one never reached the cache.
+			expect(port.models.map((entry) => entry.selection)).toEqual([{ preset: "base" }, { preset: "good" }]);
+		},
+	);
+});
+
+test("/model with an uncertain gjc failure fails the request so the adapter retries, and stores nothing", async () => {
+	await withLoopbackModelGateway(
+		async (selection) => {
+			if (typeof selection !== "string" && selection.preset === "flaky")
+				throw new GjcCliError("gjc sdk model.profile.set reported failure", 0, "", {
+					code: "operation_failed",
+					retryability: "unknown",
+					outcomeCertainty: "unknown",
+				});
+		},
+		async ({ database, request, frames }) => {
+			request("flaky", "/model flaky");
+			await waitFor(() => frames.some((frame) => frame.id === "flaky"), "no answer to the uncertain failure");
+			expect(frames.find((frame) => frame.id === "flaky")).toMatchObject({ type: "error" });
+			expect(database.bindings.modelGet(MODEL_KEY)).toBeUndefined();
+		},
+	);
+});
+
+test("/model clear sent while an earlier /model set is still applying waits for it and clears it", async () => {
+	let release: () => void = () => {};
+	const held = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let entered = false;
+	await withLoopbackModelGateway(
+		async (selection) => {
+			if (typeof selection !== "string" && selection.preset === "slow") {
+				entered = true;
+				await held;
+			}
+		},
+		async ({ port, database, request, reply, send, frames }) => {
+			try {
+				request("set", "/model set slow");
+				await waitFor(() => entered, "set did not reach gjc");
+				request("clear", "/model clear");
+				// Frames are handled in order: once this answers, the clear request is in flight behind the held set.
+				send({ v: "0.1", type: "request", id: "fence", verb: "gateway.status", params: {} });
+				await waitFor(() => frames.some((frame) => frame.id === "fence"), "status fence did not answer");
+				expect(frames.some((frame) => frame.id === "clear")).toBe(false);
+			} finally {
+				release();
+			}
+			expect(await reply("set")).toContain("model set to **preset slow**");
+			expect(await reply("clear")).toContain("cleared this conversation's override");
+			expect(database.bindings.modelGet(MODEL_KEY)).toBeUndefined();
+			expect(port.models.map((entry) => entry.selection)).toEqual([
+				{ preset: "base" },
+				{ preset: "slow" },
+				{ preset: "base" },
+			]);
+		},
+	);
+});
+
+test("/model whose thinking level gjc refuses after switching the model is answered, stores nothing, and the next turn re-applies the stored model", async () => {
+	await withLoopbackModelGateway(
+		async (selection) => {
+			if (selection === "provider/model:max") throw new ModelPartiallyAppliedError("usage");
+		},
+		async ({ port, database, request, reply }) => {
+			request("good", "/model set good");
+			expect(await reply("good")).toContain("model set to **preset good**");
+			request("partial", "/model provider/model:max");
+			expect(await reply("partial")).toContain("refused its thinking level (usage)");
+			expect(database.bindings.modelGet(MODEL_KEY)?.selection).toEqual({ preset: "good" });
+			request("turn", "hello", "m-1");
+			await waitFor(() => port.sends.length === 1, "the next turn did not start");
+			port.complete(port.sends[0]!.opRef, "hello back");
+			// The partial change dropped the cache, so the stored override is sent again before the turn.
+			expect(port.models.map((entry) => entry.selection)).toEqual([
+				{ preset: "base" },
+				{ preset: "good" },
+				{ preset: "good" },
+			]);
+		},
+	);
+});
+
+test("/model on a session the broker no longer hosts is answered, records nothing, and the next request is served", async () => {
+	await withLoopbackModelGateway(
+		async (selection) => {
+			if (typeof selection !== "string" && selection.preset === "gone")
+				throw new GjcCliError("gjc sdk model.profile.set reported failure", 0, "", { code: "endpoint_stale" });
+		},
+		async ({ database, request, reply, frames }) => {
+			request("gone", "/model set gone");
+			const text = await reply("gone");
+			expect(text).toContain("session is no longer running (session_unavailable)");
+			// A refusal-paused conversation does not reopen on a plain message; /new is the way out.
+			expect(text).toContain("`/new` starts a fresh session");
+			expect(frames.find((frame) => frame.id === "gone" && frame.type === "response")).toMatchObject({
+				result: { engaged: true },
+			});
+			expect(database.bindings.modelGet(MODEL_KEY)).toBeUndefined();
+			request("show", "/model");
+			expect(await reply("show")).toContain("gateway default");
+		},
+	);
+});
+
+test("/model on a conversation whose session cannot open with the gateway default is answered and later messages still flow", async () => {
+	await withLoopbackModelGateway(
+		async () => {},
+		async ({ port, database, request, reply }) => {
+			const bind = port.bind.bind(port);
+			let failBind = true;
+			port.bind = async (input) => {
+				if (failBind)
+					throw new GjcCliError('gjc sdk session.create rejected unknown model "base"', 0, "", {
+						code: "model_not_found",
+						message: 'Model "base" not found',
+					});
+				return await bind(input);
+			};
+			request("set", "/model set good");
+			const text = await reply("set");
+			expect(text).toContain("gjc does not know the gateway's default model (model_not_found)");
+			expect(database.bindings.modelGet(MODEL_KEY)).toBeUndefined();
+			expect(port.models).toEqual([]);
+			failBind = false;
+			request("retry", "/model set good");
+			expect(await reply("retry")).toContain("model set to **preset good**");
+			expect(database.bindings.modelGet(MODEL_KEY)?.selection).toEqual({ preset: "good" });
+		},
+	);
 });
 
 /** Starts a gateway owned by OWNER_ID and hands a negotiated client to `body`. */
