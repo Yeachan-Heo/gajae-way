@@ -350,6 +350,34 @@ test("a legacy Slack reply under the persona's own root stays muted until an exp
 	}
 });
 
+test("a legacy Slack bot-root reply on the channel origin stays muted until an explicit mention", async () => {
+	const f = await fixture("mention-open");
+	// An older adapter kept bot-root replies on the channel origin and omitted explicitMention;
+	// threadMuteKey maps them to the thread from replyTo.
+	const legacyReply = {
+		mentioned: true,
+		group: true,
+		authorId: OWNER,
+		replyTo: { messageId: SLACK_BOT_ROOT, fromSelf: true },
+	};
+	try {
+		await send(f.client, "slack-legacy-channel-trigger", SLACK_CHANNEL, { ...legacyReply, explicitMention: true });
+		await waitForTurn(f, 1);
+		await waitUntil(() => f.database.inbox.isThreadMuted(SLACK_BOT_THREAD_KEY));
+
+		expect((await send(f.client, "slack-legacy-channel-reply", SLACK_CHANNEL, legacyReply)).result.engaged).toBe(false);
+		expect(f.database.inbox.isThreadMuted(SLACK_BOT_THREAD_KEY)).toBe(true);
+		expect(f.turns).toHaveLength(1);
+
+		const mention = { ...legacyReply, explicitMention: true };
+		expect((await send(f.client, "slack-legacy-channel-unmute", SLACK_CHANNEL, mention)).result.engaged).toBe(true);
+		expect(f.database.inbox.isThreadMuted(SLACK_BOT_THREAD_KEY)).toBe(false);
+		await waitForTurn(f, 2);
+	} finally {
+		f.client.close();
+	}
+});
+
 test("SHUTUP mutes the Slack thread of the message steered into the turn, not the trigger's", async () => {
 	let finish!: () => void;
 	const running = new Promise<void>((resolve) => {

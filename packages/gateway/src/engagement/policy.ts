@@ -299,9 +299,13 @@ export function threadMuteAddressed(
 	return origin.kind === "thread" && origin.platform !== "slack" && engagement?.replyTo?.fromSelf === true;
 }
 
-/** A reply in a Slack thread rooted at the persona's own message, where `mentioned` is set by membership. */
-function slackBotRootThreadReply(engagement: EngagementContext, origin: Pick<OriginRef, "platform" | "kind">): boolean {
-	return origin.platform === "slack" && origin.kind === "thread" && engagement.replyTo?.fromSelf === true;
+/**
+ * A Slack reply under the persona's own root, where `mentioned` is set by membership. It
+ * arrives on the thread origin, or on the channel origin from an older adapter (the form
+ * `threadMuteKey` still maps to its thread); `replyTo.fromSelf` marks both.
+ */
+function slackBotRootThreadReply(engagement: EngagementContext, origin: Pick<OriginRef, "platform">): boolean {
+	return origin.platform === "slack" && engagement.replyTo?.fromSelf === true;
 }
 
 /** The inbound-ledger surface the follow-up signal needs; narrowed so tests need no database. */
