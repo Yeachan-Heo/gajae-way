@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { LogLevel } from "@gajae-gateway/log";
-import type { PromptImage } from "@gajae-gateway/protocol";
+import type { GatewayHoldReport, PromptImage } from "@gajae-gateway/protocol";
 import {
 	assertControlAllowed,
 	assertValidOpRef,
@@ -192,6 +192,29 @@ async function beforeDeadline<T>(work: Promise<T>, deadlineMs: number): Promise<
 function escalatedHoldKey(opRef: string): string {
 	return `escalated-hold:${opRef}`;
 }
+
+/**
+ * When a hold was first durably observed (epoch ms, decimal string). The
+ * restart drain's bounded exemption and `ops holds` read it: a hold whose
+ * operator bound long elapsed while its status stayed unreadable is recoverable
+ * after a restart - recovery re-adopts it from this marker, the escalated-hold
+ * marker and the pending trigger - so it must not refuse every restart forever.
+ * Written once at escalation or adoption; never rewritten, so a restarted
+ * actor inherits the original window.
+ */
+function retiredHoldFirstSeenKey(opRef: string): string {
+	return `retired-hold-first-seen:${opRef}`;
+}
+
+/** Parses a first-seen stamp; garbage never exempts anything. */
+function parseRetiredHoldFirstSeen(value: string | undefined): number | undefined {
+	if (value === undefined) return undefined;
+	const parsed = Number.parseInt(value, 10);
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+/** A restart-blocking hold an operator may inspect or abandon (`ops holds`); shape lives in the protocol catalog. */
+export type { GatewayHoldReport };
 
 /**
  * When an escalated retired hold was first seen with its host provably not live,
@@ -487,6 +510,7 @@ function completeInboundTurn(
 	if (changed === 1) store.core.metaDelete(relayUnavailableTrackerKey(opRef));
 	if (changed === 1) store.core.metaDelete(retiredHoldDeadSinceKey(opRef));
 	if (changed === 1) store.core.metaDelete(retiredHoldParkedKey(opRef));
+	if (changed === 1) store.core.metaDelete(retiredHoldFirstSeenKey(opRef));
 	if (changed === 1) store.core.metaDelete(escalationNoticeConfirmedKey(opRef));
 	if (changed === 1) store.core.metaDelete(escalationNoticeReissuedKey(opRef));
 	if (changed === 1 && trigger) {
@@ -1318,7 +1342,50 @@ export class PersonaSessionManager {
 		}
 	}
 
+	/** Every durable escalated hold this gateway knows, with drain-blocking detail (#859). */
+	async listHolds(): Promise<GatewayHoldReport[]> {
+		const reports: GatewayHoldReport[] = [];
+		for (const actor of this.#actors.values()) {
+			const holds = await actor.enqueue(async () => await actor.listHolds());
+			for (const hold of holds ?? []) reports.push(hold);
+		}
+		return reports;
+	}
+
+	/**
+	 * Operator abandonment (#859): clears the durable hold markers of one
+	 * pending trigger so neither recovery nor the drain keeps it. A settled or
+	 * unknown opRef is refused; only the named hold is touched.
+	 */
+	async abandonHold(opRef: string): Promise<{ readonly cleared: boolean; readonly reason?: string }> {
+		for (const actor of this.#actors.values()) {
+			const outcome = await actor.enqueue(async () => await actor.abandonHold(opRef));
+			if (outcome === undefined) continue;
+			if (outcome.cleared || outcome.reason !== "unknown_op_ref") return outcome;
+		}
+		return { cleared: false, reason: "unknown_op_ref" };
+	}
+
+	/** Blocking holds recorded by the last timed-out drainForRestart (#859). */
+	#lastDrainBlockers: GatewayHoldReport[] = [];
+
+	#describeBlockers(): string {
+		return (
+			this.#lastDrainBlockers
+				.map(
+					(hold) =>
+						`origin=${hold.originKey} opRef=${hold.opRef} session=${hold.sessionId ?? "none"} reason=stale_escalated_retired_hold heldMs=${hold.heldSinceMs ?? "unknown"} parked=${hold.parked}`,
+				)
+				.join("; ") || "unsettled_turns"
+		);
+	}
+
 	/** Pause new dispatches and wait a bounded interval for accepted turns to deliver. */
+	/** Blocking holds recorded by the last timed-out drainForRestart (#859). */
+	get lastDrainBlockers(): GatewayHoldReport[] {
+		return [...this.#lastDrainBlockers];
+	}
+
 	async drainForRestart(
 		restartId: string,
 		waitMs = PERSONA_RESTART_DRAIN_WAIT_MS,
@@ -1332,6 +1399,7 @@ export class PersonaSessionManager {
 		const firstEntry = this.#restartDrainId === undefined;
 		this.#restartDrainId = restartId;
 		const deadline = Date.now() + waitMs;
+		this.#lastDrainBlockers = [];
 		this.#log(`persona_restart_drain_started id=${restartId} waitMs=${waitMs}`);
 		if (firstEntry) this.#observeRestartDrain("start", () => this.#onRestartDrainStarted?.(restartId));
 		for (;;) {
@@ -1364,7 +1432,20 @@ export class PersonaSessionManager {
 				return "drained";
 			}
 			if (Date.now() >= deadline) {
-				this.#log(`persona_restart_drain_timed_out id=${restartId} waitMs=${waitMs}`, "warn");
+				// Record what refused the drain from the probes already taken: the
+				// report pass reuses cached verdicts and never spawns new host probes.
+				this.#lastDrainBlockers = [];
+				const detail: GatewayHoldReport[] = [];
+				await Promise.all(
+					[...this.#actors.values()].map((actor) =>
+						actor.enqueue(async () => await actor.reportCachedBlockers(detail)),
+					),
+				);
+				this.#lastDrainBlockers = detail;
+				this.#log(
+					`persona_restart_drain_timed_out id=${restartId} waitMs=${waitMs} blockers=${this.#describeBlockers()}`,
+					"warn",
+				);
 				return "timed_out";
 			}
 			await Bun.sleep(10);
@@ -1815,35 +1896,232 @@ class OriginActor {
 	 * Restart-drain check. `deadlineMs` (epoch ms) is the drain's own deadline: a
 	 * host probe still running then counts as blocked and releases this actor's
 	 * queue, so a hung status read or inspect cannot hold up the origin after
-	 * the drain has given up.
+	 * the drain has given up. With `report`, the same scan records why each
+	 * blocking bound refuses the drain, for the cancel status (#859).
 	 */
-	async hasUnsettledTurns(deadlineMs = Number.POSITIVE_INFINITY): Promise<boolean> {
-		if (this.#state !== "idle" || this.#current !== undefined) return true;
+	async hasUnsettledTurns(
+		deadlineMs = Number.POSITIVE_INFINITY,
+		report?: { blockers: GatewayHoldReport[] },
+	): Promise<boolean> {
+		if (this.#state !== "idle" || this.#current !== undefined) {
+			if (report)
+				report.blockers.push({
+					originKey: this.originKey,
+					opRef: this.#current?.turn.opRef ?? "current",
+					sessionId: this.#current?.sessionId ?? null,
+					triggerState: "other",
+					turnState: "running",
+					escalated: false,
+					parked: false,
+					noticeConfirmed: false,
+					wouldBlockDrain: true,
+				});
+			return true;
+		}
 		for (const bound of this.#retired.values()) {
-			// Only a detached escalated hold whose operation is not reported active and
-			// whose host process is proven exited by OS `ps` can be skipped: recovery
-			// readopts it from the durable marker and pending trigger, and no producer
-			// can be lost. Registry liveness alone is not process-exit evidence.
-			if (
-				bound.answerWanted !== true ||
-				bound.detached !== true ||
-				this.#manager.database.core.metaGet(escalatedHoldKey(bound.turn.opRef)) === undefined
-			) {
+			const escalated = this.#manager.database.core.metaGet(escalatedHoldKey(bound.turn.opRef)) !== undefined;
+			if (bound.answerWanted !== true || bound.detached !== true || !escalated) {
 				bound.restartDrainVerdict = undefined;
+				if (report) await this.#reportHold(bound, report.blockers, escalated);
 				return true;
+			}
+			// A stale escalated hold (#859) stops refusing the drain once its
+			// operator bound has elapsed: it is unprovable exactly because its
+			// status can never be read again, and recovery re-adopts it from the
+			// durable markers and the pending trigger after the restart, so no
+			// producer or late answer path is lost by restarting now. Only holds
+			// first seen long ago are exempt; a fresh hold is never skipped.
+			const heldSinceMs = parseRetiredHoldFirstSeen(
+				this.#manager.database.core.metaGet(retiredHoldFirstSeenKey(bound.turn.opRef)),
+			);
+			if (heldSinceMs !== undefined && this.#manager.now() - heldSinceMs >= this.#manager.retiredHoldAbandonMs) {
+				bound.restartDrainVerdict = undefined;
+				continue;
 			}
 			// Only a blocked verdict is cached. An exemption is re-proven on every
 			// drain poll, because it lets the restart go ahead while this turn's
 			// producer would be lost if the host were in fact still running.
 			const verdict = bound.restartDrainVerdict;
-			if (verdict && this.#manager.now() - verdict.checkedAtMs < STATUS_RECHECK_MIN_MS) return true;
+			if (verdict && this.#manager.now() - verdict.checkedAtMs < STATUS_RECHECK_MIN_MS) {
+				if (report) await this.#reportHold(bound, report.blockers, escalated);
+				return true;
+			}
 			const blocked = await beforeDeadline(this.#restartDrainProbe(bound), deadlineMs);
 			if (blocked === undefined) return true;
 			if (this.#stopped || this.#manager.stopped) return true;
 			bound.restartDrainVerdict = blocked ? { checkedAtMs: this.#manager.now(), blocked: true } : undefined;
-			if (blocked) return true;
+			if (blocked) {
+				if (report) await this.#reportHold(bound, report.blockers, escalated);
+				return true;
+			}
 		}
 		return false;
+	}
+
+	/** Explains one drain-blocking bound for `restart-stack --status` (#859). */
+	async #reportHold(bound: BoundTurn, into: GatewayHoldReport[], escalated: boolean): Promise<void> {
+		if (!escalated) {
+			into.push({
+				originKey: this.originKey,
+				opRef: bound.turn.opRef,
+				sessionId: bound.sessionId,
+				triggerState: "other",
+				turnState: "retired",
+				escalated: false,
+				parked: false,
+				noticeConfirmed: false,
+				wouldBlockDrain: true,
+			});
+			return;
+		}
+		into.push(await this.#holdReport(bound));
+	}
+
+	/** The durable facts of one escalated retired hold, for `ops holds` (#859). */
+	async #holdReport(bound: BoundTurn): Promise<GatewayHoldReport> {
+		const database = this.#manager.database;
+		const opRef = bound.turn.opRef;
+		const trigger = database.inbox.turnRow(opRef);
+		const now = this.#manager.now();
+		const heldSinceMs = parseRetiredHoldFirstSeen(database.core.metaGet(retiredHoldFirstSeenKey(opRef)));
+		const deadMark = parseDeadHostMark(database.core.metaGet(retiredHoldDeadSinceKey(opRef)));
+		const parked = parseParkedMark(database.core.metaGet(retiredHoldParkedKey(opRef))) !== undefined;
+		const bounded = heldSinceMs !== undefined && now - heldSinceMs >= this.#manager.retiredHoldAbandonMs;
+		const fresh = {
+			originKey: this.originKey,
+			opRef,
+			sessionId: bound.sessionId,
+			triggerState: (trigger?.state ?? "other") as GatewayHoldReport["triggerState"],
+			turnState: trigger?.turn_state ?? null,
+			...(heldSinceMs === undefined ? {} : { heldSinceMs: now - heldSinceMs }),
+			escalated: true,
+			parked,
+			...(deadMark === undefined ? {} : { deadSinceMs: now - deadMark.at }),
+			noticeConfirmed: database.core.metaGet(escalationNoticeConfirmedKey(opRef)) !== undefined,
+		};
+		// Mirror the drain's skip rule: a bound-elapsed hold would be exempted, a
+		// host-proven-exited one is exempted by the probe itself.
+		if (bounded) return { ...fresh, wouldBlockDrain: false };
+		try {
+			const report = await this.#statusForRecovery(bound.sessionId, bound.turn.opRef);
+			if (
+				report.operationRef === opRef &&
+				report.status.status !== "accepted" &&
+				report.status.status !== "in_flight"
+			) {
+				const port = this.#manager.port;
+				if (
+					port.hostExited !== undefined &&
+					(await port.hostExited({ sessionId: bound.sessionId, repo: this.#manager.repo }))
+				)
+					return { ...fresh, wouldBlockDrain: false };
+			}
+		} catch {
+			// unreadable evidence: the drain would block on this hold
+		}
+		return { ...fresh, wouldBlockDrain: true };
+	}
+
+	/** Durable escalated holds of this origin; in-memory bounds are authoritative (#859). */
+	async listHolds(): Promise<GatewayHoldReport[]> {
+		const reports: GatewayHoldReport[] = [];
+		for (const bound of [...this.#retired.values(), ...(this.#current ? [this.#current] : [])]) {
+			if (this.#manager.database.core.metaGet(escalatedHoldKey(bound.turn.opRef)) === undefined) continue;
+			reports.push(await this.#holdReport(bound));
+		}
+		return reports;
+	}
+
+	/** Holds that would refuse the drain right now, without probing toward a restart (#859). */
+	async blockingHolds(): Promise<GatewayHoldReport[]> {
+		const blockers: GatewayHoldReport[] = [];
+		await this.hasUnsettledTurns(Number.POSITIVE_INFINITY, { blockers });
+		return blockers;
+	}
+
+	/**
+	 * Blocking holds from the verdicts this drain already collected: a cached
+	 * blocked verdict is reported, anything uncached is reported as an
+	 * unsettled bound without probing again (#859).
+	 */
+	async reportCachedBlockers(into: GatewayHoldReport[]): Promise<void> {
+		if (this.#state !== "idle" || this.#current !== undefined) {
+			into.push({
+				originKey: this.originKey,
+				opRef: this.#current?.turn.opRef ?? "current",
+				sessionId: this.#current?.sessionId ?? null,
+				triggerState: "other",
+				turnState: "running",
+				escalated: false,
+				parked: false,
+				noticeConfirmed: false,
+				wouldBlockDrain: true,
+			});
+			return;
+		}
+		for (const bound of this.#retired.values()) {
+			const escalated = this.#manager.database.core.metaGet(escalatedHoldKey(bound.turn.opRef)) !== undefined;
+			if (bound.answerWanted !== true || bound.detached !== true || !escalated) {
+				await this.#reportHold(bound, into, escalated);
+				return;
+			}
+			const heldSinceMs = parseRetiredHoldFirstSeen(
+				this.#manager.database.core.metaGet(retiredHoldFirstSeenKey(bound.turn.opRef)),
+			);
+			if (heldSinceMs !== undefined && this.#manager.now() - heldSinceMs >= this.#manager.retiredHoldAbandonMs)
+				continue;
+			// Report from durable facts only: #holdReport would re-probe the host,
+			// and this path runs after the drain already gave up on probing.
+			const database = this.#manager.database;
+			const trigger = database.inbox.turnRow(bound.turn.opRef);
+			const heldSinceMs2 = parseRetiredHoldFirstSeen(database.core.metaGet(retiredHoldFirstSeenKey(bound.turn.opRef)));
+			const deadMark = parseDeadHostMark(database.core.metaGet(retiredHoldDeadSinceKey(bound.turn.opRef)));
+			into.push({
+				originKey: this.originKey,
+				opRef: bound.turn.opRef,
+				sessionId: bound.sessionId,
+				triggerState: (trigger?.state ?? "other") as GatewayHoldReport["triggerState"],
+				turnState: trigger?.turn_state ?? null,
+				...(heldSinceMs2 === undefined ? {} : { heldSinceMs: this.#manager.now() - heldSinceMs2 }),
+				escalated: true,
+				parked: parseParkedMark(database.core.metaGet(retiredHoldParkedKey(bound.turn.opRef))) !== undefined,
+				...(deadMark === undefined ? {} : { deadSinceMs: this.#manager.now() - deadMark.at }),
+				noticeConfirmed: database.core.metaGet(escalationNoticeConfirmedKey(bound.turn.opRef)) !== undefined,
+				wouldBlockDrain: true,
+			});
+		}
+	}
+
+	/**
+	 * Operator abandonment (#859): clears the durable hold markers of one
+	 * pending trigger so neither recovery nor the drain keeps it. Settled or
+	 * unknown opRefs are refused; only the named hold's fence is lifted - its
+	 * answer path is closed by the operator's explicit instruction, never by a
+	 * fallback.
+	 */
+	async abandonHold(opRef: string): Promise<{ readonly cleared: boolean; readonly reason?: string }> {
+		const database = this.#manager.database;
+		const trigger = database.inbox.turnRow(opRef);
+		if (!trigger || trigger.origin_key !== this.originKey || !openHoldTrigger(trigger))
+			return { cleared: false, reason: "unknown_op_ref" };
+		if (database.core.metaGet(escalatedHoldKey(opRef)) === undefined)
+			return { cleared: false, reason: "not_escalated" };
+		this.#manager.database.transaction((tx) => {
+			completeInboundTurn(this.#manager.database, tx, opRef, "retired");
+		});
+		for (const [key, bound] of [...this.#retired]) {
+			if (bound.turn.opRef !== opRef) continue;
+			await bound.tail?.close().catch(() => {});
+			this.#retired.delete(key);
+			this.#clearRetiredReattach(bound);
+			await this.#notifyReleased(bound);
+		}
+		if (this.#current?.turn.opRef === opRef) return { cleared: true };
+		this.#manager.log(
+			`retired_hold_abandoned origin=${this.originKey} opRef=${opRef} session=${trigger.bound_session_id ?? "none"} source=operator`,
+			"warn",
+		);
+		return { cleared: true };
 	}
 
 	/** True unless the held operation is reported settled and its host process is proven exited. */
@@ -2225,6 +2503,7 @@ class OriginActor {
 		const { nextEpoch, closedInputs } = database.transaction((tx) => {
 			const epoch = retiredEpoch ? this.#epoch() : database.bindings.rotateEpoch(tx, this.originKey);
 			database.core.metaSet(escalatedHoldKey(turn.opRef), "1");
+			database.core.metaSet(retiredHoldFirstSeenKey(turn.opRef), String(this.#manager.now()));
 			database.core.metaSet(escalationNoticeKey(this.originKey, turn.opRef), "1");
 			const claimed = database.inbox.sentContextIds(turn.opRef);
 			database.inbox.contextConsume(tx, claimed);
@@ -2291,7 +2570,13 @@ class OriginActor {
 	async #adoptEscalatedHold(turn: InboundTurn, sessionId: string): Promise<boolean> {
 		try {
 			// Adopted without a relay: the host is gone. Periodic reconcile reads
-			// its status; a reattach is tried on the bounded retired schedule.
+			// its status; a reattach is tried on the bounded retired schedule. The
+			// first-seen stamp is inherited from the escalation, or set once here
+			// for holds that predate it (#859) - never rewritten afterwards.
+			this.#manager.database.transaction(() => {
+				if (this.#manager.database.core.metaGet(retiredHoldFirstSeenKey(turn.opRef)) !== undefined) return;
+				this.#manager.database.core.metaSet(retiredHoldFirstSeenKey(turn.opRef), String(this.#manager.now()));
+			});
 			const adopted = await this.#adoptRecoveredTurn(turn, sessionId, true, true);
 			// No bounded-cadence rechecks for an escalated hold: the sweep reads it (#715).
 			adopted.tailEvidenceUnavailable = false;
