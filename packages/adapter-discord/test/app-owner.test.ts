@@ -13,20 +13,30 @@ const APPLICATION = {
 	fetch: () =>
 		Promise.resolve({
 			owner: { id: "1000000000000000001" },
-			team: null,
 		}),
 };
+
+/** Create a discord.js Collection-like object that iterates values. */
+function createMockCollection(members: Array<{ id: string; user: { id: string }; membershipState: number }>) {
+	return {
+		values() {
+			return members[Symbol.iterator]();
+		},
+		[Symbol.iterator]() {
+			return members[Symbol.iterator]();
+		},
+	};
+}
 
 const TEAM_APPLICATION = {
 	fetch: () =>
 		Promise.resolve({
-			owner: null,
-			team: {
-				members: [
-					{ id: "2000000000000000001", membershipState: 2 },
-					{ id: "2000000000000000002", membershipState: 2 },
-					{ id: "2000000000000000003", membershipState: 1 },
-				],
+			owner: {
+				members: createMockCollection([
+					{ id: "2000000000000000001", user: { id: "2000000000000000001" }, membershipState: 2 },
+					{ id: "2000000000000000002", user: { id: "2000000000000000002" }, membershipState: 2 },
+					{ id: "2000000000000000003", user: { id: "2000000000000000003" }, membershipState: 1 },
+				]),
 			},
 		}),
 };
@@ -65,17 +75,20 @@ test("no application (not ready yet) resolves to undefined", async () => {
 });
 
 test("an application that resolves neither owner nor members keeps the gate closed", async () => {
-	expect(
-		await resolveApplicationOwnerIds({ fetch: () => Promise.resolve({ owner: null, team: null }) }),
-	).toBeUndefined();
+	expect(await resolveApplicationOwnerIds({ fetch: () => Promise.resolve({ owner: null }) })).toBeUndefined();
 	expect(
 		await resolveApplicationOwnerIds({
-			fetch: () => Promise.resolve({ owner: { id: "not-a-snowflake" }, team: null }),
+			fetch: () => Promise.resolve({ owner: { id: "not-a-snowflake" } }),
 		}),
 	).toBeUndefined();
 	expect(
 		await resolveApplicationOwnerIds({
-			fetch: () => Promise.resolve({ owner: null, team: { members: [{ id: "1", membershipState: 2 }] } }),
+			fetch: () =>
+				Promise.resolve({
+					owner: {
+						members: createMockCollection([{ id: "1", user: { id: "1" }, membershipState: 2 }]),
+					},
+				}),
 		}),
 	).toBeUndefined();
 });

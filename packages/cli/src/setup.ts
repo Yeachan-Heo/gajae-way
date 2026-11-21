@@ -466,20 +466,19 @@ export async function applySetup(options: ApplySetupOptions): Promise<AppliedSet
 	const previousAllowlist = Array.isArray(base.mentionAllowlist)
 		? base.mentionAllowlist.filter((id): id is string => typeof id === "string")
 		: [];
-	const owners = [...new Set([...previousAllowlist, ...options.owners])];
-	// Prefill `ownerTarget` from the Discord application owner (#862) so a fresh
-	// install does not come up with `/model` locked for everyone. An explicit
-	// ownerTarget on either side always wins; tokens.discord proves the platform.
+	// Discord application owners (#862) are authorized via mentionAllowlist and
+	// connection.platformOwnerIds; every accepted team member is listed, not just
+	// the first one (finding 3). ownerTarget is not synthesized from team members
+	// (finding 4); a user-owned app may still have an explicit ownerTarget if set.
+	const appOwnerIds = Array.isArray(options.appOwnerIds)
+		? options.appOwnerIds.filter((id): id is string => typeof id === "string" && /^\d{17,20}$/.test(id))
+		: [];
+	const owners = [...new Set([...previousAllowlist, ...options.owners, ...appOwnerIds])];
 	const existingOwnerTarget =
 		typeof base.ownerTarget === "object" && base.ownerTarget !== null && !Array.isArray(base.ownerTarget)
 			? (base.ownerTarget as Record<string, unknown>)
 			: undefined;
-	const prefillOwner = options.appOwnerIds?.find((id) => typeof id === "string" && /^\d{1,20}$/.test(id)) ?? undefined;
-	const ownerTarget =
-		existingOwnerTarget ??
-		(prefillOwner && tokens.discord
-			? { origin: { platform: "discord", kind: "dm", conversationId: prefillOwner, peerId: prefillOwner } }
-			: undefined);
+	const ownerTarget = existingOwnerTarget ?? undefined;
 	const config = {
 		...base,
 		credentials: { ...previousCredentials, ...credentials },
@@ -491,7 +490,6 @@ export async function applySetup(options: ApplySetupOptions): Promise<AppliedSet
 	return {
 		written,
 		owners,
-		...(ownerTarget && !existingOwnerTarget ? { ownerTargetPrefilled: prefillOwner } : {}),
 	};
 }
 

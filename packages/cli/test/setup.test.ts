@@ -310,10 +310,9 @@ describe("setup writing", () => {
 				log: (l) => lines.push(l),
 			});
 			const config = JSON.parse(await readFile(join(home, "config.json"), "utf8"));
-			expect(config.ownerTarget).toEqual({
-				origin: { platform: "discord", kind: "dm", conversationId: "4242", peerId: "4242" },
-			});
-			expect(lines.join("\n")).toContain("ownerTarget prefilled from the Discord application owner");
+			// Application owners are added to mentionAllowlist, not synthesized as ownerTarget (#862, finding 3)
+			expect(config.ownerTarget).toBeUndefined();
+			expect(config.mentionAllowlist).toContain("4242");
 		});
 	});
 

@@ -1342,8 +1342,11 @@ export interface ApplicationTeamMemberLike {
 /** The slice of discord.js ClientApplication the lookup needs. */
 export interface ClientApplicationLike {
 	fetch(): Promise<{
-		readonly owner?: { readonly id?: string | number } | null;
-		readonly team?: { readonly members?: Iterable<ApplicationTeamMemberLike> | null } | null;
+		// owner is User | Team | null in discord.js ClientApplication
+		readonly owner?:
+			| { readonly id?: string | number }
+			| { readonly members?: Iterable<ApplicationTeamMemberLike> | null }
+			| null;
 	} | null>;
 }
 
@@ -1366,13 +1369,21 @@ export async function resolveApplicationOwnerIds(
 		const value = typeof id === "string" ? id : typeof id === "number" ? String(id) : "";
 		if (/^\d{17,20}$/.test(value)) ids.add(value);
 	};
-	const team = fetched.team;
-	if (team) {
-		for (const member of team.members ?? []) {
-			// TeamMemberMembershipState.Accepted === 2 (discord-api-types v10).
-			if (member.membershipState === 2) add(member.id);
+	const owner = fetched.owner;
+	if (owner && typeof owner === "object" && "members" in owner) {
+		// owner is a Team: iterate its members (a discord.js Collection)
+		const members = owner.members as unknown;
+		if (members && typeof members === "object" && "values" in members) {
+			for (const member of (members as { values: () => IterableIterator<unknown> }).values()) {
+				const m = member as { membershipState?: unknown; user?: { id?: unknown } };
+				// TeamMemberMembershipState.Accepted === 2 (discord-api-types v10).
+				if (m.membershipState === 2) add(m.user?.id);
+			}
 		}
-	} else add(fetched.owner?.id);
+	} else if (owner && typeof owner === "object" && "id" in owner) {
+		// owner is a User
+		add((owner as { id?: unknown }).id);
+	}
 	return ids.size > 0 ? [...ids] : undefined;
 }
 
@@ -1525,14 +1536,16 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		void gateway.recoverMissedMessages();
 	});
 	console.log("Discord adapter starting.");
-	await gateway.connectInitial();
 
 	await discord.login(config.token);
 
-	// Owner resolution (#862) needs the READY payload, so it happens after the
-	// login promise resolves; the next gateway hello reports what it found.
+	// Owner resolution (#862) must complete before the initial gateway hello
+	// so that the READY payload includes owners; setAppOwnerIds updates
+	// reconnect state only, not an active connection.
 	const appOwnerIds = await resolveApplicationOwnerIds(discord.application);
 	gateway.setAppOwnerIds(appOwnerIds);
+
+	await gateway.connectInitial();
 	console.log(
 		appOwnerIds
 			? `Discord application owners resolved: ${appOwnerIds.join(", ")}`
