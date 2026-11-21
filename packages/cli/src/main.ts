@@ -71,9 +71,9 @@ import { parseUpdateArgs, renderUpdate, runUpdate, type UpdateDeps } from "./upd
 
 async function connectGatewaySocket(
 	path: string,
-	options: { readonly requestTimeoutMs?: number } = {},
+	options: { readonly requestTimeoutMs?: number; readonly deadlineMs?: number } = {},
 ): Promise<GajaewayClient> {
-	return GajaewayClient.connectSocketWithBackoff(path, { ...options, deadlineMs: 30_000 });
+	return GajaewayClient.connectSocketWithBackoff(path, { ...options, deadlineMs: options.deadlineMs ?? 60_000 });
 }
 
 function successorRefusalMessage(error: unknown): string | undefined {

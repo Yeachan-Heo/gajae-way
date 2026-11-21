@@ -1311,7 +1311,7 @@ describe("work operator commands", () => {
 				},
 			]);
 			expect(output.lines).toEqual(["started: work/task/fix session=session-1 job=job-1 op=op-1"]);
-			expect(output.connectOptions).toEqual({ requestTimeoutMs: 120_000, deadlineMs: 30_000 });
+			expect(output.connectOptions).toEqual({ requestTimeoutMs: 120_000, deadlineMs: 60_000 });
 
 			expect(output.closed).toBe(true);
 		});
@@ -1669,7 +1669,7 @@ describe("work operator commands", () => {
 	test("work run remains response-only with a caller wait budget", async () => {
 		const output = await run(["run", "fix", "task"], { held: false, text: "answer" });
 		expect(output.requests).toEqual([{ verb: "work.run", params: { name: "fix", text: "task" } }]);
-		expect(output.connectOptions).toEqual({ requestTimeoutMs: 3_600_000, deadlineMs: 30_000 });
+		expect(output.connectOptions).toEqual({ requestTimeoutMs: 3_600_000, deadlineMs: 60_000 });
 		expect(output.lines).toEqual(["answer"]);
 	});
 
@@ -2148,6 +2148,37 @@ describe("memory async operations (#473)", () => {
 			console.log = originalLog;
 			listener.stop(true);
 			await rm(home, { recursive: true, force: true });
+		}
+	});
+
+	test("#865 regression: connectGatewaySocket uses 60s deadline for post-restart readiness", async () => {
+		// Issue #865: gateway negotiation times out during post-restart readiness check.
+		// When gateway is restarting and initializing (loading broker, DB operations),
+		// protocol negotiation can take 35+ seconds. The old 30s deadline caused timeout.
+		// This test verifies the fix: connectGatewaySocket now uses 60s deadline by default.
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const client: GajaewayClient = Object.create(GajaewayClient.prototype);
+		let actualOptions: { requestTimeoutMs?: number; deadlineMs?: number } = {};
+		client.request = async <T>(verb: string, params?: unknown): Promise<T> => {
+			requests.push({ verb, params });
+			return { running: true } as T;
+		};
+		client.close = async () => {};
+		const connect = spyOn(GajaewayClient, "connectSocketWithBackoff").mockImplementation(
+			async (_path: string, options?: unknown) => {
+				actualOptions = options as { requestTimeoutMs?: number; deadlineMs?: number };
+				return client;
+			},
+		);
+		const previousExit = process.exitCode;
+		try {
+			await main(["--socket", "/test/sock", "status"]);
+			// Verify the 60s deadline is passed (new fix for issue #865)
+			expect(actualOptions.deadlineMs).toBe(60_000);
+			expect(connect.mock.calls.length).toBe(1);
+		} finally {
+			connect.mockRestore();
+			process.exitCode = previousExit ?? 0;
 		}
 	});
 });
