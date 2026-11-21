@@ -61,6 +61,54 @@ function fakePlatform(overrides: { discordAppId?: string; slackSocketError?: str
 	return { fetch, calls };
 }
 
+/** A Discord application owned by a Team: one admin, one read_only, one invited, plus the team owner. */
+function fakeTeamPlatform(): FakePlatform & { teamIdsSeen: string[] } {
+	const base = fakePlatform();
+	const ids: string[] = [];
+	const fetch: FetchLike = async (url, init) => {
+		if (url === "https://discord.com/api/v10/applications/@me") {
+			const body = {
+				id: "700",
+				owner: null,
+				team: {
+					id: "T-1",
+					owner_user_id: "7000000000000000001",
+					members: [
+						{
+							membership_state: 2,
+							role: "admin",
+							user: { id: "7000000000000000002" },
+						},
+						{
+							membership_state: 2,
+							role: "read_only",
+							user: { id: "7000000000000000004" },
+						},
+						{
+							membership_state: 1,
+							role: "developer",
+							user: { id: "7000000000000000005" },
+						},
+					],
+				},
+			};
+			const authorization = new Headers(init?.headers).get("authorization") ?? undefined;
+			if (authorization !== `Bot ${DISCORD_TOKEN}`) return json(401, { message: "401: Unauthorized" });
+			const identity = await base.fetch(url, init);
+			void identity;
+			ids.push(
+				...body.team.members
+					.filter((m) => m.membership_state === 2 && m.role !== "read_only")
+					.map((m) => m.user.id as string),
+				body.team.owner_user_id,
+			);
+			return json(200, body);
+		}
+		return base.fetch(url, init);
+	};
+	return { fetch, calls: base.calls, teamIdsSeen: ids };
+}
+
 async function withHome<T>(run: (home: string) => Promise<T>): Promise<T> {
 	const root = await mkdtemp(join(tmpdir(), "gajaeway-setup-"));
 	try {
@@ -138,6 +186,19 @@ describe("setup validation", () => {
 		expect(identities[0]?.ownerId).toBe("4242");
 		expect(platform.calls.map((call) => call.url)).toContain("https://slack.com/api/apps.connections.open");
 		for (const identity of identities) expectNoSecret(identity.summary);
+	});
+
+	test("a Team-owned app validates to the team owner plus accepted admin/developer members only", async () => {
+		const platform = fakeTeamPlatform();
+		const identities = await validateAll({ discord: { token: DISCORD_TOKEN } }, platform.fetch);
+		const discord = identities.find((identity) => identity.platform === "discord");
+		// The team owner rides owner_user_id; read_only and invited-only are excluded.
+		expect([...(discord?.ownerIds ?? [])].sort()).toEqual(["7000000000000000001", "7000000000000000002"]);
+		expect(discord?.ownerIds).not.toContain("7000000000000000004");
+		expect(discord?.ownerIds).not.toContain("7000000000000000005");
+		// A Team-owned app names no single ownerId: membership, not one user.
+		expect(discord?.ownerId).toBeUndefined();
+		expect(platform.teamIdsSeen.sort()).toEqual(["7000000000000000001", "7000000000000000002"]);
 	});
 
 	test("a rejected Discord token is a clear error that does not contain the token", async () => {
@@ -280,16 +341,14 @@ describe("setup writing", () => {
 			expect(config.stallTimeoutMs).toBe(90_000);
 			expect(config.channels).toEqual({ "slack:C1": { engagement: "open" } });
 			expect(Object.keys(config.credentials).sort()).toEqual(["discord", "slack-app", "slack-bot", "telegram"]);
-			// App owner IDs are not added to mentionAllowlist (#862, finding 3).
-			// They are used for adapter-reported adapterOwnerIds instead.
-			expect(config.mentionAllowlist).toBeUndefined();
+			expect(config.mentionAllowlist).toEqual(["4242"]);
 			expect(JSON.parse(await readFile(join(home, "adapter-slack.json"), "utf8")).channels).toEqual({
 				C1: { engagement: "open" },
 			});
 		});
 	});
 
-	test("Discord application owner is not added to mentionAllowlist even when no owner is named (#862, finding 3)", async () => {
+	test("the Discord application owner is allowlisted when no owner is named", async () => {
 		await withHome(async (home) => {
 			await runSetup(["--from-env", "--adapters", "discord"], {
 				home,
@@ -297,30 +356,30 @@ describe("setup writing", () => {
 				fetch: fakePlatform().fetch,
 				log: () => {},
 			});
-			const config = JSON.parse(await readFile(join(home, "config.json"), "utf8"));
-			// App owner IDs are not persisted in mentionAllowlist.
-			expect(config.mentionAllowlist).toBeUndefined();
+			expect(JSON.parse(await readFile(join(home, "config.json"), "utf8")).mentionAllowlist).toEqual(["4242"]);
 			expect(await allFiles(join(home, "secrets"))).toEqual([join(home, "secrets", "discord-token")]);
 		});
 	});
 
-	test("setup does not add Discord application owners to mentionAllowlist (#862, finding 3)", async () => {
+	test("a Team-owned app never writes team-member ids into mentionAllowlist (#862, finding 3)", async () => {
 		await withHome(async (home) => {
 			const lines: string[] = [];
+			const platform = fakeTeamPlatform();
 			await runSetup(["--from-env", "--adapters", "discord"], {
 				home,
 				env: fullEnv,
-				fetch: fakePlatform().fetch,
+				fetch: platform.fetch,
 				log: (l) => lines.push(l),
 			});
 			const config = JSON.parse(await readFile(join(home, "config.json"), "utf8"));
-			// App-owner IDs are used for adapter-reported adapterOwnerIds (runtime-refreshed),
-			// not persisted in mentionAllowlist. This keeps membership-derived grants revocable.
+			// Membership-derived ids stay out of the durable allowlist: the adapter
+			// authorizes them at runtime, where a refresh revokes removed members.
+			expect(config.mentionAllowlist).toBeUndefined();
 			expect(config.ownerTarget).toBeUndefined();
-			// mentionAllowlist should not contain the app owner ID.
-			if (config.mentionAllowlist) {
-				expect(config.mentionAllowlist).not.toContain("4242");
-			}
+			// The validate step resolved exactly the admin/developer ids (plus the
+			// team owner) for the adapter to report — nothing persisted here.
+			expect(platform.teamIdsSeen.sort()).toEqual(["7000000000000000001", "7000000000000000002"]);
+			expect(lines.join("\n")).not.toContain("allowing DMs from the application owner");
 		});
 	});
 

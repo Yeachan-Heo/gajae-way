@@ -1327,11 +1327,15 @@ async function decodePcmWithFfmpeg(ogg: Uint8Array): Promise<Int16Array | undefi
 
 /**
  * The Discord snowflakes that own this bot's application (#862): the
- * application's `owner` user, or every ACCEPTED member of the owning Team.
- * Invited-only members are excluded — an invitation is not ownership. Guild
- * ownership is never consulted: a server owner and the bot owner are different
- * people, and only the bot owner gates owner-only verbs. Returns undefined when
- * Discord does not answer or resolves nobody, which keeps every gate closed.
+ * application's `owner` user, or — when the owner is a Team — the team owner
+ * plus every ACCEPTED member with an `admin` or `developer` role. Invited-only
+ * and `read_only` members are excluded: an invitation is not ownership, and a
+ * read-only member must never gate owner-only verbs. The team owner is added
+ * explicitly because the Discord API may report no `admin` role for them even
+ * though they administer the team. Guild ownership is never consulted: a
+ * server owner and the bot owner are different people, and only the bot owner
+ * gates owner-only verbs. Returns undefined when Discord does not answer or
+ * resolves nobody, which keeps every gate closed.
  */
 /** The slice of discord.js TeamMember the lookup needs (keeps tests stub-shaped). */
 export interface ApplicationTeamMemberLike {
@@ -1348,10 +1352,20 @@ export interface ClientApplicationLike {
 		// owner is User | Team | null in discord.js ClientApplication
 		readonly owner?:
 			| { readonly id?: string | number }
-			| { readonly members?: Iterable<ApplicationTeamMemberLike> | null }
+			| {
+					readonly ownerId?: string | number | null;
+					readonly members?: Iterable<ApplicationTeamMemberLike> | null;
+			  }
 			| null;
 	} | null>;
 }
+
+/**
+ * How often the connected adapter re-resolves its application's owners (#862,
+ * finding 3): a Team membership change must revoke access on a long-lived
+ * gateway connection, not only at the next reconnect. Injectable for tests.
+ */
+export const APP_OWNER_REFRESH_INTERVAL_MS = 10 * 60_000;
 
 export async function resolveApplicationOwnerIds(
 	application: Pick<ClientApplicationLike, "fetch"> | undefined | null,
@@ -1374,7 +1388,10 @@ export async function resolveApplicationOwnerIds(
 	};
 	const owner = fetched.owner;
 	if (owner && typeof owner === "object" && "members" in owner) {
-		// owner is a Team: iterate its members (a discord.js Collection)
+		// owner is a Team: the team owner administrates the team even when the
+		// Discord API reports no "admin" role for them, so add them explicitly.
+		add((owner as { ownerId?: unknown }).ownerId);
+		// Then iterate its members (a discord.js Collection).
 		const members = owner.members as unknown;
 		if (members && typeof members === "object" && "values" in members) {
 			for (const member of (members as { values: () => IterableIterator<unknown> }).values()) {
@@ -1522,6 +1539,13 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 	discord.on("messageReactionRemove", (reaction, user) => {
 		gateway.sendReaction(reaction, user, "remove", discord.user);
 	});
+	// Where dev has it: registered with the other listeners, before login, so an
+	// interaction arriving during login/owner-resolution/connect is answered with
+	// the gateway-unavailable retryable reply instead of being dropped (finding 2).
+	discord.on("interactionCreate", (interaction) => {
+		if (interaction.isAutocomplete()) void handleModelAutocomplete(interaction, gateway);
+		else if (interaction.isChatInputCommand()) void handleSlashCommand(interaction, gateway);
+	});
 	discord.once("ready", () => {
 		console.log("Discord adapter connected.");
 		// Slash-command mapping: /new, /reset and /model are first-class Discord
@@ -1553,13 +1577,14 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			: "Discord application owner lookup resolved nobody; /model stays owner-gated until ownerTarget is set.",
 	);
 
-	// Register interaction listeners AFTER gateway is ready (#862, finding 2)
-	// so interactions are not dropped before connectInitial() completes.
-	discord.on("interactionCreate", (interaction) => {
-		if (interaction.isAutocomplete()) void handleModelAutocomplete(interaction, gateway);
-		else if (interaction.isChatInputCommand())
-			void handleSlashCommand(interaction, gateway, console, gateway.ownerResolved);
-	});
+	// Membership-derived owners must stay revocable for the life of the process
+	// (#862, finding 3): re-resolve periodically and push changes onto the live
+	// gateway connection, not only at the next reconnect.
+	const refreshInterval = config.appOwnerRefreshIntervalMs ?? APP_OWNER_REFRESH_INTERVAL_MS;
+	const refreshTimer = setInterval(() => {
+		void gateway.refreshAppOwnerIds();
+	}, refreshInterval);
+	refreshTimer.unref?.();
 }
 
 /** Discord application-command option types used by the registration below. */
@@ -1705,7 +1730,7 @@ export function resolveInteractionDisplayName(
 
 export async function handleSlashCommand(
 	interaction: SlashInteractionLike,
-	gateway: Pick<ReconnectingGateway, "requestInbound">,
+	gateway: Pick<ReconnectingGateway, "requestInbound" | "gatewayAvailable">,
 	log: Pick<Console, "error"> = console,
 	/** False when neither `ownerTarget` nor the application lookup resolved an owner (#862). */
 	ownerResolved = true,
@@ -1714,6 +1739,16 @@ export async function handleSlashCommand(
 	const command = interaction.commandName;
 	if (command !== "new" && command !== "reset" && command !== "model") return;
 	if (!interaction.channel || !interaction.user) return;
+	// The gateway link can be down (starting up, or mid-reconnect): requestInbound
+	// then has no client and the command would look "not authorized" even for the
+	// legitimate owner (#862, finding 2). Answer retryably instead of refusing.
+	if (!gateway.gatewayAvailable()) {
+		await interaction.reply({
+			content: "gateway not ready, try again shortly",
+			ephemeral: true,
+		});
+		return;
+	}
 	// Discord fails an interaction not acknowledged within 3s ("application did
 	// not respond") even when the command still applies, so the reply is
 	// deferred before the gateway round trip and edited with the outcome.
@@ -1794,7 +1829,8 @@ export class ReconnectingGateway {
 	readonly #unreadableRecoveryTargets = new Map<string, number>();
 	#recoverableIds = new Set<string>();
 	#appOwnerIds: readonly string[] | undefined;
-	#refreshAppOwners = false;
+	/** Set once a gateway connection has been established at least once. */
+	#everConnected = false;
 
 	constructor(
 		readonly socketPath: string,
@@ -1819,16 +1855,60 @@ export class ReconnectingGateway {
 	 * The application-owner ids the adapter resolved at Discord login (#862).
 	 * Reported on every hello as `adapter.ownerIds`; undefined means the lookup
 	 * failed or resolved nobody, which the gateway reads as "no adapter owners".
-	 * On reconnect, app-owner membership is refreshed to revoke removed members (#862, finding 3).
+	 * Refreshed periodically and on every reconnect so a removed Team member is
+	 * revoked within one refresh interval, not at adapter restart (#862, finding 3).
 	 */
 	setAppOwnerIds(ids: readonly string[] | undefined): void {
 		this.#appOwnerIds = ids;
-		this.#refreshAppOwners = true;
 	}
 
 	/** True when the application lookup resolved at least one owner (#862). */
 	get ownerResolved(): boolean {
 		return (this.#appOwnerIds?.length ?? 0) > 0;
+	}
+
+	/**
+	 * True while a gateway client is connected, so a slash command can be told
+	 * "retry shortly" instead of a bogus authorization refusal (#862, finding 2).
+	 */
+	gatewayAvailable(): boolean {
+		return this.#client !== undefined;
+	}
+
+	/**
+	 * Re-resolve the application's owners and push any change onto the LIVE
+	 * gateway connection (#862, finding 3). Resolution failure fails CLOSED:
+	 * the owner set clears to undefined, because acting on stale owner evidence
+	 * after Discord stopped answering is exactly the grant revocation was meant
+	 * to remove. The push is a two-phase commit: apply locally first, then
+	 * `gateway.adapterOwners`; a failed push rolls the local set back to
+	 * undefined so the gates never run on half-updated authority.
+	 */
+	async refreshAppOwnerIds(): Promise<void> {
+		const resolved = await resolveApplicationOwnerIds(this.discord.application);
+		const changed = resolved?.join(",") !== this.#appOwnerIds?.join(",");
+		this.#appOwnerIds = resolved;
+		if (!changed) return;
+		console.log(
+			resolved
+				? `Discord application owners refreshed: ${resolved.join(", ")}`
+				: "Discord application owner refresh resolved nobody; owner gates stay closed (#862).",
+		);
+		const client = this.#client;
+		if (!client) return;
+		client.setAppOwnerIds(resolved, "discord");
+		try {
+			await client.request("gateway.adapterOwners", {
+				platform: "discord",
+				...(resolved ? { ownerIds: resolved } : {}),
+			});
+		} catch (error) {
+			console.error(
+				`Discord adapter-owner push failed: ${error instanceof Error ? error.message : String(error)}; owner set stays cleared until the next refresh or hello.`,
+			);
+			this.#appOwnerIds = undefined;
+			client.setAppOwnerIds(undefined, "discord");
+		}
 	}
 
 	/** Test seam: the link came back with this client (what connect() does after a successful socket open). */
@@ -1849,16 +1929,21 @@ export class ReconnectingGateway {
 
 	async #connect(initial: boolean): Promise<void> {
 		try {
-			// Refresh app owner membership on reconnect to revoke removed members (#862, finding 3).
-			if (!initial && this.#refreshAppOwners && this.discord.application) {
-				try {
-					this.#appOwnerIds = await resolveApplicationOwnerIds(this.discord.application);
-				} catch (error) {
-					console.error(
-						`app-owner refresh failed on reconnect: ${error instanceof Error ? error.message : String(error)}`,
+			// Refresh app-owner membership on every RE-connect (#862, finding 3):
+			// the first connection reports the set resolved at login; later
+			// connections re-pull fresh evidence first, so a removed Team member
+			// does not ride a stale hello. resolveApplicationOwnerIds fails
+			// closed: a Discord error or an empty result resolves undefined,
+			// which clears the set instead of preserving stale grants.
+			if (!initial && this.#everConnected) {
+				const refreshed = await resolveApplicationOwnerIds(this.discord.application);
+				if (refreshed?.join(",") !== this.#appOwnerIds?.join(","))
+					console.log(
+						refreshed
+							? `Discord application owners refreshed on reconnect: ${refreshed.join(", ")}`
+							: "Discord application owner refresh resolved nobody on reconnect; owner gates stay closed (#862).",
 					);
-					// Keep using the previous owners if refresh fails (fail open).
-				}
+				this.#appOwnerIds = refreshed;
 			}
 			const options = {
 				clientName: "adapter-discord",
@@ -1873,6 +1958,7 @@ export class ReconnectingGateway {
 				? await GajaewayClient.connectSocketWithBackoff(this.socketPath, options)
 				: await GajaewayClient.connectSocket(this.socketPath, options);
 			this.#client = client;
+			this.#everConnected = true;
 			this.#attempt = 0;
 			void this.downAlarm?.up();
 			this.#deliveryOff?.();

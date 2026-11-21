@@ -8,6 +8,20 @@ import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
 
+/** Create a discord.js Collection-like object that iterates values (mirrors app-owner.test.ts). */
+function createMockCollection(
+	members: Array<{ id: string; user: { id: string }; membershipState: number; role?: string }>,
+) {
+	return {
+		values() {
+			return members[Symbol.iterator]();
+		},
+		[Symbol.iterator]() {
+			return members[Symbol.iterator]();
+		},
+	};
+}
+
 /**
  * Issue #862 end to end: the adapter resolves its application's owners at
  * login, reports them on its authenticated hello, and the gateway gates
@@ -63,7 +77,7 @@ async function startGateway(): Promise<{ config: GatewayConfig; database: Store 
 function adapterFor(config: GatewayConfig, ownerIds: readonly string[] | undefined): ReconnectingGateway {
 	const gateway = new ReconnectingGateway(
 		config.socketPath,
-		{ channels: { fetch: async () => undefined } } as never,
+		{ channels: { fetch: async () => undefined }, application: undefined } as never,
 		{ tokenFile: "token", token: "redacted", configPath: "config", channels: {} } as never,
 	);
 	gateway.setAppOwnerIds(ownerIds);
@@ -189,34 +203,72 @@ test("a discord slash command carries the invoking user and routes through the s
 	expect(edits).toEqual(["🦞 model command accepted"]);
 });
 
-test("owner resolution completes before the initial gateway hello (#862, finding 2)", async () => {
-	const { config, database } = await startGateway();
-	let helloReceived = false;
-	let ownerIdsInHello: string[] | undefined;
-	const originalStartUnixServer = startUnixServer;
-	// Create a gateway that tracks when the hello is received with owner IDs
-	const gateway = new ReconnectingGateway(
-		config.socketPath,
+test("a slash command while the gateway is down answers retryable, never 'not authorized' (#862, finding 2)", async () => {
+	const { config } = await startGateway();
+	// No connect(): the adapter's gateway link is not up, which is exactly the
+	// startup window (and any later disconnect) where dev's listener was active.
+	const gateway = adapterFor(config, [APP_OWNER]);
+	const replies: Array<{ content: string; ephemeral?: boolean }> = [];
+	await handleSlashCommand(
 		{
-			user: { id: "999" },
-			channels: { fetch: async () => undefined },
-			application: {
-				fetch: async () => ({
-					owner: { id: APP_OWNER },
-				}),
+			isChatInputCommand: () => true,
+			commandName: "model",
+			id: "itx-startup",
+			user: { id: APP_OWNER, username: "owner" },
+			channel: { id: "chan-1", type: 0 },
+			options: { getSubcommand: () => "set", getString: () => "frontier-heavy" },
+			reply: async (options: { content: string; ephemeral?: boolean }) => {
+				replies.push(options);
+			},
+			deferReply: async () => {
+				throw new Error("an unavailable gateway must reply before deferring");
+			},
+			editReply: async (options: { content: string }) => {
+				replies.push(options);
 			},
 		} as never,
+		gateway,
+		{ error: () => {} },
+	);
+	expect(replies).toHaveLength(1);
+	expect(replies[0]?.ephemeral).toBe(true);
+	expect(replies[0]?.content).toContain("gateway not ready");
+	expect(replies[0]?.content).toContain("try again");
+	expect(replies[0]?.content.toLowerCase()).not.toContain("not authorized");
+});
+
+test("after a disconnect the owner set refreshes and a removed member is revoked on the live connection (#862, finding 3)", async () => {
+	const { config, database } = await startGateway();
+	let members = createMockCollection([
+		{ id: APP_OWNER, user: { id: APP_OWNER }, membershipState: 2, role: "admin" },
+		{ id: "5000000000000000005", user: { id: "5000000000000000005" }, membershipState: 2, role: "developer" },
+	]);
+	const application = {
+		fetch: async () => ({ owner: { members } }),
+	};
+	const gateway = new ReconnectingGateway(
+		config.socketPath,
+		{ channels: { fetch: async () => undefined }, application } as never,
 		{ tokenFile: "token", token: "redacted", configPath: "config", channels: {} } as never,
 	);
-	// We can't easily intercept the hello, but we can verify the gateway has owner IDs set
-	// before calling connectInitial. The test verifies that if owner resolution is deferred
-	// after connectInitial, it would fail to include owners in the READY payload.
-	const ownerIds = await resolveApplicationOwnerIds({
-		fetch: () => Promise.resolve({ owner: { id: APP_OWNER } }),
-	});
-	gateway.setAppOwnerIds(ownerIds);
-	// At this point, ownerIds should be resolved and stored in the gateway.
-	// The ownerResolved getter should return true.
-	expect(gateway.ownerResolved).toBe(true);
-	live.add(gateway);
+	gateway.setAppOwnerIds(await resolveApplicationOwnerIds(application));
+	await gateway.connect();
+	await Bun.sleep(20);
+	// The starting team: owner and developer both gate /model.
+	await expect(
+		gateway.requestInbound("m-live-owner", CHANNEL_ORIGIN, "/model set frontier-heavy", as(APP_OWNER)),
+	).resolves.toMatchObject({ engaged: true });
+
+	// Remove the developer from the stubbed team; NO reconnect happens.
+	members = createMockCollection([{ id: APP_OWNER, user: { id: APP_OWNER }, membershipState: 2, role: "admin" }]);
+	await gateway.refreshAppOwnerIds();
+
+	await expect(
+		gateway.requestInbound("m-live-removed", CHANNEL_ORIGIN, "/model set other-model", as("5000000000000000005")),
+	).resolves.toMatchObject({ engaged: false, turnId: null });
+	// The still-owner keeps authority without any reconnect.
+	await expect(
+		gateway.requestInbound("m-live-owner-2", CHANNEL_ORIGIN, "/model clear", as(APP_OWNER)),
+	).resolves.toMatchObject({ engaged: true });
+	expect(database.bindings.modelGet("discord/channel/chan-1")).toBeUndefined();
 });

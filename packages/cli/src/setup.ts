@@ -257,15 +257,25 @@ export async function validateDiscord(
 	if (credentials.appId !== undefined && appId !== credentials.appId)
 		throw new SetupError(`discord: the token belongs to application ${appId}, not ${credentials.appId}`);
 	const owner = app.body.owner as { id?: unknown } | undefined;
-	const team = app.body.team as { members?: unknown } | undefined;
-	// Team members with an accepted invitation own the app alongside its owner
-	// user (discord membership_state 2); invited-only members do not (#862).
+	const team = app.body.team as { members?: unknown; owner_user_id?: unknown } | undefined;
+	// Accepted team members carry the app alongside the owner (discord
+	// membership_state 2); invited-only members do not (#862). Only accepted
+	// members with an admin or developer role count — a read_only member must
+	// never gate owner-only verbs (finding 1) — and the team owner
+	// (`owner_user_id`) is added explicitly because the API may report no
+	// "admin" role for them.
 	const teamMemberIds = Array.isArray(team?.members)
 		? team.members
-				.map((member) => member as { membership_state?: unknown; user?: { id?: unknown } })
-				.filter((member) => member.membership_state === 2 && typeof member.user?.id === "string")
+				.map((member) => member as { membership_state?: unknown; role?: unknown; user?: { id?: unknown } })
+				.filter(
+					(member) =>
+						member.membership_state === 2 &&
+						(member.role === "admin" || member.role === "developer") &&
+						typeof member.user?.id === "string",
+				)
 				.map((member) => member.user?.id as string)
 		: [];
+	if (typeof team?.owner_user_id === "string") teamMemberIds.push(team.owner_user_id);
 	const hasTeam = team !== null && team !== undefined;
 	const ownerId = !hasTeam && typeof owner?.id === "string" ? owner.id : undefined;
 	const ownerIds = hasTeam ? [...new Set(teamMemberIds)] : ownerId ? [ownerId] : [];
@@ -389,9 +399,10 @@ export interface ApplySetupOptions {
 	readonly tokens: SetupTokens;
 	readonly owners: readonly string[];
 	/**
-	 * Discord application-owner ids resolved during validation (#862). When the
-	 * gateway config has no `ownerTarget` yet, the first resolved owner prefills
-	 * it as a Discord DM origin; an existing `ownerTarget` is never replaced.
+	 * Retained so a call site can hand setup the ids it resolved (#862), but
+	 * deliberately unused for authorization: membership- or lookup-derived ids
+	 * never persist into `mentionAllowlist` — the adapter reports them at
+	 * runtime, where they stay revocable (finding 3).
 	 */
 	readonly appOwnerIds?: readonly string[];
 }
@@ -399,8 +410,6 @@ export interface ApplySetupOptions {
 export interface AppliedSetup {
 	readonly written: readonly string[];
 	readonly owners: readonly string[];
-	/** The owner peer id prefilled into `ownerTarget`, when setup wrote one (#862). */
-	readonly ownerTargetPrefilled?: string;
 }
 
 /**
@@ -466,14 +475,13 @@ export async function applySetup(options: ApplySetupOptions): Promise<AppliedSet
 	const previousAllowlist = Array.isArray(base.mentionAllowlist)
 		? base.mentionAllowlist.filter((id): id is string => typeof id === "string")
 		: [];
-	// Discord application owners (#862) are authorized via adapter-reported adapterOwnerIds,
-	// which are runtime-refreshed on each connect to revoke removed members (finding 3).
-	// App-owner IDs are NOT added to the persistent mentionAllowlist; they are only used
-	// by the adapter for adapterOwnerIds. ownerTarget is not synthesized from team members
-	// (finding 4); a user-owned app may still have an explicit ownerTarget if set.
-	const appOwnerIds = Array.isArray(options.appOwnerIds)
-		? options.appOwnerIds.filter((id): id is string => typeof id === "string" && /^\d{17,20}$/.test(id))
-		: [];
+	// Discord application owners (#862) are authorized at runtime via
+	// adapter-reported adapterOwnerIds, refreshed by the adapter so a removed
+	// Team member is revoked without waiting for a restart (finding 3). They are
+	// deliberately NOT written into the persistent mentionAllowlist: that list
+	// holds only user-managed grants (`--owner`, kept across reruns), so rerun
+	// setup cannot resurrect a membership-derived id the adapter has revoked.
+	// ownerTarget is never synthesized from team members (finding 4).
 	const owners = [...new Set([...previousAllowlist, ...options.owners])];
 	const existingOwnerTarget =
 		typeof base.ownerTarget === "object" && base.ownerTarget !== null && !Array.isArray(base.ownerTarget)
@@ -700,9 +708,16 @@ export async function runSetup(args: readonly string[], options: RunSetupOptions
 			printDiscordBotReady(log, discordIdentity.appId, botName);
 		}
 
-		// App-owner IDs are passed separately via appOwnerIds (#862, finding 3).
-		// They are not added to mentionAllowlist to keep membership-derived grants revocable.
-		// If no owners were specified, the gateway will reject DMs until an ownerTarget is set.
+		// dev behavior restored (#862, finding D): when the user named no owner,
+		// a USER-owned application's owner is allowed to DM the bot. That id is
+		// not membership-derived — a Team's members are never allowlisted here;
+		// team-owned apps authorize their members at runtime via the adapter's
+		// revocable adapterOwnerIds (finding 3) instead of a persistent list.
+		for (const identity of identities)
+			if (identity.ownerId && owners.length === 0) {
+				owners.push(identity.ownerId);
+				log(`${identity.platform}: allowing DMs from the application owner ${identity.ownerId}`);
+			}
 		const applied = await applySetup({
 			home: options.home,
 			tokens,
@@ -710,8 +725,6 @@ export async function runSetup(args: readonly string[], options: RunSetupOptions
 			...(discordIdentity?.ownerIds ? { appOwnerIds: discordIdentity.ownerIds } : {}),
 		});
 		for (const path of applied.written) log(`wrote ${path}`);
-		if (applied.ownerTargetPrefilled)
-			log(`ownerTarget prefilled from the Discord application owner (issue #862): ${applied.ownerTargetPrefilled}`);
 		if (applied.owners.length === 0)
 			log(
 				"warning: no owner id configured; the gateway declines every DM until config.json mentionAllowlist names you (rerun setup with --owner ID)",

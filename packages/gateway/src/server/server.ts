@@ -4,6 +4,8 @@ import { readFile, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { validatePromptImages } from "@gajae-gateway/images";
 import {
+	type AdapterOwnersParams,
+	type AdapterOwnersResult,
 	CAPABILITIES,
 	type ChatMessagePayload,
 	type ChatProgressActivity,
@@ -1659,6 +1661,49 @@ async function handleRequest(
 				},
 			});
 			return;
+		case "gateway.adapterOwners": {
+			// An authenticated adapter's live replacement for its hello-announced
+			// owner set (#862 finding 3). Same authority rules as hello.adapter:
+			// the platform must be a chat platform matching the connection's own
+			// declaration, and an explicit ownerTarget still supersedes the set
+			// everywhere. Omitting or emptying ownerIds clears the stored set, so
+			// a failed re-resolution revokes instead of preserving stale grants.
+			const params = request.params as AdapterOwnersParams | undefined;
+			const platform = typeof params?.platform === "string" ? params.platform : undefined;
+			const ownerIds = Array.isArray(params?.ownerIds)
+				? [
+						...new Set(
+							(params?.ownerIds as unknown[]).filter((id): id is string => typeof id === "string" && id.length > 0),
+						),
+					]
+				: undefined;
+			if (platform === undefined)
+				throw new ProtocolError("invalid_params", "gateway.adapterOwners requires a platform string");
+			if (!isChatPlatform(platform as OriginPlatform))
+				throw new ProtocolError(
+					"invalid_params",
+					`gateway.adapterOwners requires a ${describeChatPlatforms()} platform`,
+				);
+			if (connection.platformOwnerPlatform !== platform)
+				throw new ProtocolError(
+					"invalid_params",
+					"gateway.adapterOwners platform must match the platform this connection declared on hello",
+				);
+			if (ownerIds !== undefined && ownerIds.length === 0)
+				throw new ProtocolError("invalid_params", "gateway.adapterOwners ownerIds must be omitted, not empty");
+			connection.platformOwnerIds = ownerIds;
+			const result: AdapterOwnersResult = {
+				recorded: true,
+				...(ownerIds ? { ownerIds } : {}),
+			};
+			console.log(
+				ownerIds
+					? `adapter owner set updated platform=${platform} count=${ownerIds.length}`
+					: `adapter owner set cleared platform=${platform}`,
+			);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			return;
+		}
 		case "gateway.shutdown":
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { stopping: true } });
 			await stop();

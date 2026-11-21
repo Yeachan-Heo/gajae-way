@@ -55,6 +55,23 @@ test("a team-owned application resolves to accepted admin/developer members only
 	expect(ids).not.toContain("2000000000000000003");
 });
 
+test("the team owner is included even when the API reports no admin role for them (#862, finding E)", async () => {
+	const app = {
+		fetch: () =>
+			Promise.resolve({
+				owner: {
+					ownerId: "6000000000000000001",
+					members: createMockCollection([
+						{ id: "6000000000000000002", user: { id: "6000000000000000002" }, membershipState: 2, role: "admin" },
+					]),
+				},
+			}),
+	};
+	const ids = await resolveApplicationOwnerIds(app);
+	expect(ids).toContain("6000000000000000001");
+	expect(ids).toContain("6000000000000000002");
+});
+
 test("a team-owned application excludes read_only members (#862, finding 1)", async () => {
 	const app = {
 		fetch: () =>

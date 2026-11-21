@@ -284,3 +284,76 @@ describe("adapter-reported application owners (#862)", () => {
 		);
 	});
 });
+describe("gateway.adapterOwners live refresh (#862, finding 3)", () => {
+	test("a pushed replacement revokes a removed member on the live connection", async () => {
+		await withGateway(
+			async ({ client }) => {
+				expect(
+					await requestOverSocket(client, "refresh-set", "gateway.adapterOwners", {
+						platform: "discord",
+						ownerIds: [APP_OWNER],
+					}),
+				).toMatchObject({ type: "response", result: { recorded: true, ownerIds: [APP_OWNER] } });
+
+				// The removed member loses /model authority immediately, no reconnect.
+				expect(
+					await requestOverSocket(client, "removed-set", "chat.send", {
+						origin: CHANNEL,
+						text: "/model set frontier-heavy",
+						engagement: as(TEAM_MEMBER),
+					}),
+				).toMatchObject({ type: "response", result: { turnId: null, engaged: false } });
+				// The surviving owner keeps it.
+				expect(
+					await requestOverSocket(client, "owner-set", "chat.send", {
+						origin: CHANNEL,
+						text: "/model set frontier-heavy",
+						engagement: as(APP_OWNER),
+					}),
+				).toMatchObject({ type: "response", result: { engaged: true } });
+			},
+			{ hello: { adapter: { platform: "discord", ownerIds: [APP_OWNER, TEAM_MEMBER] } }, channels: mentionOpen },
+		);
+	});
+
+	test("omitting ownerIds clears the set (fail closed)", async () => {
+		await withGateway(
+			async ({ client, database }) => {
+				expect(
+					await requestOverSocket(client, "refresh-clear", "gateway.adapterOwners", { platform: "discord" }),
+				).toMatchObject({ type: "response", result: { recorded: true } });
+				expect(
+					await requestOverSocket(client, "anyone-set", "chat.send", {
+						origin: CHANNEL,
+						text: "/model set frontier-heavy",
+						engagement: as(APP_OWNER),
+					}),
+				).toMatchObject({ type: "response", result: { turnId: null, engaged: false } });
+				expect(database.bindings.modelGet("discord/channel/public")).toBeUndefined();
+			},
+			{ hello: { adapter: { platform: "discord", ownerIds: [APP_OWNER] } }, channels: mentionOpen },
+		);
+	});
+
+	test("the verb refuses a platform the connection never declared", async () => {
+		await withGateway(
+			async ({ client }) => {
+				expect(
+					await requestOverSocket(client, "cross-platform", "gateway.adapterOwners", {
+						platform: "slack",
+						ownerIds: [APP_OWNER],
+					}),
+				).toMatchObject({ type: "error", error: { code: "invalid_params" } });
+				// The discord set is untouched by the refused push.
+				expect(
+					await requestOverSocket(client, "owner-still-ok", "chat.send", {
+						origin: CHANNEL,
+						text: "/model set frontier-heavy",
+						engagement: as(APP_OWNER),
+					}),
+				).toMatchObject({ type: "response", result: { engaged: true } });
+			},
+			{ hello: { adapter: { platform: "discord", ownerIds: [APP_OWNER] } }, channels: mentionOpen },
+		);
+	});
+});
