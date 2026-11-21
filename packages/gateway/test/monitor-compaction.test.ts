@@ -134,11 +134,18 @@ async function realBrokerMonitorHarness(directory: string) {
 					ok: true,
 					result: {
 						operationRef: opRef,
-						status: {
-							status: output.has(opRef) ? "terminal_ok" : "unknown",
-							startedAt: started.get(opRef),
-							terminalAt: Date.now(),
-						},
+						status: output.has(opRef)
+							? {
+									// The CLI `session status` carries the same canonical terminal body as
+									// `turn.result`: a completed stop is proven by receipt and outcome, not
+									// by the `terminal_ok` word alone.
+									status: "terminal_ok",
+									receiptState: "present",
+									outcome: { reason: "end_turn", provenance: "agent" },
+									startedAt: started.get(opRef),
+									terminalAt: Date.now(),
+								}
+							: { status: "unknown" },
 						summary: { completed: output.has(opRef) },
 					},
 				}),
