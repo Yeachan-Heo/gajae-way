@@ -690,6 +690,43 @@ describe("runUpdate", () => {
 			await rm(home, { recursive: true, force: true });
 		}
 	});
+
+	test("binary replacement waits for services to exit before proceeding (issue #866)", async () => {
+		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway"]);
+		const home = await homeWithConfig();
+		const extractor = extractorFor(CORE_BINARIES.map((name) => ({ name, marker: `staged-${name}` })));
+		try {
+			// Update with a very short wait timeout (services aren't running in test)
+			const result = await runUpdate({
+				args: { check: false, force: false, noRestart: false, binDir: dir },
+				home,
+				deps: {
+					fetchLatestRelease: async () => release("v0.2.0", [DARWIN_ASSET]),
+					downloadAsset: noBytes,
+					extractTarball: extractor,
+					gjcInstallRunner,
+					serviceOptions: serviceOptions(home),
+					queueRestart: async () => ({ receiptId: "r-1", supervisorPid: 42 }),
+					platform: "darwin",
+					arch: "arm64",
+					// Short timeout for the wait; services aren't actually running in test
+					waitForServicesExitMs: 50,
+				},
+			});
+			// Verify the update succeeded and binaries were installed
+			expect(result.installed).toEqual(["gajaeway", "gajaeway-gateway"]);
+			expect(result.restartQueued).toBe("r-1");
+			// Verify binaries were replaced with staged versions
+			for (const name of ["gajaeway", "gajaeway-gateway"]) {
+				const body = await readFile(join(dir, name), "utf8");
+				expect(body.startsWith(`staged-${name}\n`)).toBe(true);
+				expect((await stat(join(dir, name))).mode & 0o777).toBe(0o755);
+			}
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+			await rm(home, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("update dispatch through main", () => {

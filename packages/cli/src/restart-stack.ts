@@ -369,6 +369,80 @@ async function defaultBinaryModifiedAt(path: string): Promise<number> {
 	return (await stat(path)).mtimeMs;
 }
 
+/**
+ * Signals all installed services to stop and waits for them to fully exit.
+ * Returns true if all services exited, false if timeout was reached.
+ * This is used before binary replacement to avoid ETXTBSY errors on Linux (issue #866).
+ */
+export async function waitForServicesExit(
+	options: Readonly<{
+		platform?: ServicePlatform;
+		uid?: number;
+		timeoutMs?: number;
+		pollMs?: number;
+		sleep?: (ms: number) => Promise<void>;
+		probe?: ServiceProbe;
+		isServiceInstalled?: IsServiceInstalled;
+		env?: NodeJS.ProcessEnv;
+		unitDir?: string;
+		launchAgentsDir?: string;
+		runner?: CommandRunner;
+	}>,
+): Promise<boolean> {
+	const platform = options.platform ?? currentPlatform();
+	const probe = options.probe ?? defaultServiceProbe(platform, options.uid);
+	const isInstalled =
+		options.isServiceInstalled ??
+		defaultIsServiceInstalled({
+			platform,
+			env: options.env ?? process.env,
+			launchAgentsDir: options.launchAgentsDir,
+			unitDir: options.unitDir,
+		});
+	const sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
+	const runner = options.runner ?? defaultCommandRunner;
+	const timeoutMs = options.timeoutMs ?? 30_000;
+	const pollMs = options.pollMs ?? 500;
+	const uid = options.uid ?? process.getuid?.() ?? 0;
+
+	// First, signal all services to stop
+	for (const spec of restartOrder(platform)) {
+		if (!(await isInstalled(spec.label))) continue;
+		try {
+			let stopCommand: readonly string[];
+			if (platform === "linux") {
+				stopCommand = ["systemctl", "--user", "stop", systemdUnitName(spec)];
+			} else {
+				stopCommand = ["launchctl", "bootout", `gui/${uid}/${spec.label}`];
+			}
+			await runner(stopCommand, { allowFailure: true });
+		} catch {
+			// Ignore errors stopping services; we'll check if they exited below
+		}
+	}
+
+	// Now wait for all services to fully exit
+	const deadline = Date.now() + timeoutMs;
+	while (true) {
+		// Collect all still-running services
+		const runningServices: { label: string; pid: number }[] = [];
+		for (const spec of restartOrder(platform)) {
+			if (!(await isInstalled(spec.label))) continue;
+			const proc = await probe(spec.label);
+			if (proc !== undefined) runningServices.push({ label: spec.label, pid: proc.pid });
+		}
+
+		// If no services are running, success
+		if (runningServices.length === 0) return true;
+
+		// Check timeout
+		if (Date.now() >= deadline) return false;
+
+		// Wait before next poll
+		await sleep(pollMs);
+	}
+}
+
 async function prepareGatewayRestartDrain(
 	socketPath: string,
 	restartId: string,
