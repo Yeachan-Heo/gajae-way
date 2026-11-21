@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
 	AGENT_DISK_MIN_FREE_BYTES,
 	AGENT_DISK_MIN_FREE_RATIO,
+	BOOT_SETTLING_GRACE_MS,
 	INBOUND_STARVATION_MS,
 	MONITOR_TERMINAL_STREAK_THRESHOLD,
 	observeAgentDisk,
@@ -668,5 +669,41 @@ describe("runtime cycle projection", () => {
 			database.close();
 			await rm(directory, { recursive: true, force: true });
 		}
+	});
+
+	test("boot grace period excludes stale_session_identity, memory_closure_blocked, and monitor_settlement_stuck gates (issue #867)", () => {
+		const bootStartedAtMs = 1_000_000;
+		const withinGracePeriod = bootStartedAtMs + BOOT_SETTLING_GRACE_MS / 2;
+		const afterGracePeriod = bootStartedAtMs + BOOT_SETTLING_GRACE_MS + 1_000;
+
+		const unbound = { ...boundSession, gjc_session_id: "" };
+		const quarantinedMemory = new Map([["quarantined", 1]]);
+		const stuckMonitorEvents = new Map([["batched", 1]]);
+		const bootProneGates = sources({
+			sessionRows: [unbound],
+			memoryIntents: quarantinedMemory,
+			monitorStages: stuckMonitorEvents,
+		});
+
+		// Within boot grace period: gates should be excluded
+		const withinGrace = projectRuntimeCycle(bootProneGates, generatedAt, {}, withinGracePeriod, bootStartedAtMs);
+		expect(withinGrace.gates).not.toContain("stale_session_identity");
+		expect(withinGrace.gates).not.toContain("memory_closure_blocked");
+		expect(withinGrace.gates).not.toContain("monitor_settlement_stuck");
+		expect(withinGrace.phase).toBe("idle");
+
+		// After grace period: gates should be enforced
+		const afterGrace = projectRuntimeCycle(bootProneGates, generatedAt, {}, afterGracePeriod, bootStartedAtMs);
+		expect(afterGrace.gates).toContain("stale_session_identity");
+		expect(afterGrace.gates).toContain("memory_closure_blocked");
+		expect(afterGrace.gates).toContain("monitor_settlement_stuck");
+		expect(afterGrace.phase).toBe("degraded");
+
+		// Without boot times specified: gates should always be enforced
+		const noBootTimes = projectRuntimeCycle(bootProneGates, generatedAt);
+		expect(noBootTimes.gates).toContain("stale_session_identity");
+		expect(noBootTimes.gates).toContain("memory_closure_blocked");
+		expect(noBootTimes.gates).toContain("monitor_settlement_stuck");
+		expect(noBootTimes.phase).toBe("degraded");
 	});
 });

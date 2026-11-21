@@ -1416,6 +1416,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			gjcVersion: () => options.broker?.gjcVersion,
 			brokerRespawnChurn: () =>
 				typeof options.broker?.respawnChurn === "function" ? options.broker.respawnChurn() : false,
+			bootStartedAtMs: options.startedAt !== undefined ? Date.parse(options.startedAt) : undefined,
 		}),
 		lanes,
 		work,

@@ -89,6 +89,15 @@ export const MONITOR_FAILURE_DIAGNOSTIC_LIMIT = 5;
  */
 export const AGENT_DISK_MIN_FREE_RATIO = 0.1;
 export const AGENT_DISK_MIN_FREE_BYTES = 5 * 1024 ** 3;
+/**
+ * Boot-time grace period (issue #867): immediately after a restart, the gateway
+ * may have sessions in stale-identity state, memory intents in quarantine, and
+ * monitor events stuck at non-terminal stages as part of normal recovery. Gates
+ * associated with these conditions are excluded from the ops.cycle phase decision
+ * during this window to avoid false "degraded" reports that would block restarts.
+ * Post-grace, these gates are enforced normally as operator-visible problems.
+ */
+export const BOOT_SETTLING_GRACE_MS = 90 * 1_000;
 
 /** Filesystem headroom for the agent directory; a failed probe reports null bytes, never a guess. */
 export function observeAgentDisk(path: string): AgentDiskView {
@@ -207,6 +216,7 @@ export class RuntimeCycleProjector {
 	readonly #gjcVersion: () => string | undefined;
 	readonly #brokerRespawnChurn: () => boolean;
 	readonly #home: string | undefined;
+	readonly #bootStartedAtMs: number;
 
 	constructor(
 		database: Store,
@@ -218,6 +228,7 @@ export class RuntimeCycleProjector {
 			readonly memoryRoot?: string;
 			readonly gjcVersion?: () => string | undefined;
 			readonly brokerRespawnChurn?: () => boolean;
+			readonly bootStartedAtMs?: number;
 		} = {},
 	) {
 		this.#database = database;
@@ -228,12 +239,14 @@ export class RuntimeCycleProjector {
 		this.#memoryRoot = options.memoryRoot;
 		this.#gjcVersion = options.gjcVersion ?? (() => undefined);
 		this.#brokerRespawnChurn = options.brokerRespawnChurn ?? (() => false);
+		this.#bootStartedAtMs = options.bootStartedAtMs ?? Number.NaN;
 	}
 
 	/** Snapshots durable state and projects the runtime cycle. Read-only; no writes. */
 	project(now = new Date(), pagination: OpsCycleParams = {}): OpsCycleResult {
-		const sources = this.#sources(now.getTime());
-		return projectRuntimeCycle(sources, now.toISOString(), pagination);
+		const nowMs = now.getTime();
+		const sources = this.#sources(nowMs);
+		return projectRuntimeCycle(sources, now.toISOString(), pagination, nowMs, this.#bootStartedAtMs);
 	}
 
 	#sources(nowMs: number): RuntimeCycleSources {
@@ -352,9 +365,17 @@ export function projectRuntimeCycle(
 	sources: RuntimeCycleSources,
 	generatedAt: string,
 	pagination: OpsCycleParams = {},
+	nowMs?: number,
+	bootStartedAtMs?: number,
 ): OpsCycleResult {
 	const gates = new Set<CycleGateReason>();
 	const cutoverMs = sources.latestCutoverAt === null ? Number.NaN : Date.parse(sources.latestCutoverAt);
+	// Determine if we are in the boot settling grace period
+	const inBootGracePeriod =
+		nowMs !== undefined &&
+		bootStartedAtMs !== undefined &&
+		Number.isFinite(bootStartedAtMs) &&
+		nowMs - bootStartedAtMs < BOOT_SETTLING_GRACE_MS;
 
 	const sessionsTotal = sources.sessionRows.length;
 	const sessionsOffset = pagination.offset ?? 0;
@@ -379,7 +400,7 @@ export function projectRuntimeCycle(
 		const lastActivityMs = Date.parse(row.last_activity_at ?? row.created_at);
 		const cutoverRetired =
 			row.gjc_session_id === "" && lastActivityMs <= cutoverMs && !sources.addressedSinceCutover.has(row.origin_key);
-		if ((row.gjc_session_id === "" && !retiredLane && !cutoverRetired) || row.epoch < 0)
+		if (!inBootGracePeriod && ((row.gjc_session_id === "" && !retiredLane && !cutoverRetired) || row.epoch < 0))
 			gates.add("stale_session_identity");
 		if (index < pageStart || index >= pageEnd) return;
 		const origin = parseOriginRef(row.origin_ref_json);
@@ -420,7 +441,7 @@ export function projectRuntimeCycle(
 	const queued = sources.memoryIntents.get("queued") ?? 0;
 	const written = sources.memoryIntents.get("written") ?? 0;
 	const committed = sources.memoryIntents.get("committed") ?? 0;
-	if (quarantined > 0) gates.add("memory_closure_blocked");
+	if (!inBootGracePeriod && quarantined > 0) gates.add("memory_closure_blocked");
 	if (sources.memoryGitIndexLock) gates.add("memory_git_index_locked");
 	if (
 		sources.brokerAgent &&
@@ -434,7 +455,9 @@ export function projectRuntimeCycle(
 	if (monitorFailed > 0) gates.add("monitor_settlement_failed");
 	// Events stuck at a non-terminal stage are visibly unresolved (issue #29:
 	// `batched` rows used to strand forever while the projection stayed green).
-	if (sources.monitorStages.get("batched") || sources.monitorStages.get("dispatched"))
+	// During boot (issue #867), monitor events naturally accumulate at these stages
+	// during recovery, so we exclude this gate during the settling grace period.
+	if (!inBootGracePeriod && (sources.monitorStages.get("batched") || sources.monitorStages.get("dispatched")))
 		gates.add("monitor_settlement_stuck");
 	// Terminal pre-author loss is invisible to the stage census gates above
 	// (`failed_no_retry` is terminal), so a dead authoring lane read as healthy.
