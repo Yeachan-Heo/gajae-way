@@ -281,8 +281,8 @@ describe("setup writing", () => {
 			expect(config.channels).toEqual({ "slack:C1": { engagement: "open" } });
 			expect(Object.keys(config.credentials).sort()).toEqual(["discord", "slack-app", "slack-bot", "telegram"]);
 			// App owner IDs are not added to mentionAllowlist (#862, finding 3).
-		// They are used for adapter-reported adapterOwnerIds instead.
-		expect(config.mentionAllowlist).toBeUndefined();
+			// They are used for adapter-reported adapterOwnerIds instead.
+			expect(config.mentionAllowlist).toBeUndefined();
 			expect(JSON.parse(await readFile(join(home, "adapter-slack.json"), "utf8")).channels).toEqual({
 				C1: { engagement: "open" },
 			});

@@ -17,7 +17,9 @@ const APPLICATION = {
 };
 
 /** Create a discord.js Collection-like object that iterates values. */
-function createMockCollection(members: Array<{ id: string; user: { id: string }; membershipState: number; role?: string }>) {
+function createMockCollection(
+	members: Array<{ id: string; user: { id: string }; membershipState: number; role?: string }>,
+) {
 	return {
 		values() {
 			return members[Symbol.iterator]();
