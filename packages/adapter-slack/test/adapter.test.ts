@@ -1464,6 +1464,85 @@ test("Slack reactions follow the session their target message was routed to", as
 	}
 });
 
+test("Slack reactions to the bot's own file share follow the delivery that uploaded it, matched by file id", async () => {
+	const { mkdir, mkdtemp, writeFile, realpath, rm } = await import("node:fs/promises");
+	const home = await mkdtemp(join(tmpdir(), "slack-file-share-"));
+	const f = await fixture();
+	try {
+		// Same name and destination; only the bytes tell the two uploads apart.
+		const fileWith = async (dir: string, body: string) => {
+			await mkdir(join(home, dir));
+			const path = join(home, dir, "reply.txt");
+			await writeFile(path, body);
+			return { path: await realpath(path), name: "reply.txt", size: body.length };
+		};
+		const threadFile = await fileWith("t", "thread");
+		const channelFile = await fileWith("c", "channel");
+		const root = "1700000001.000000";
+		const thread = { platform: "slack", kind: "thread", conversationId: `C1:${root}`, parentId: "C1" } as const;
+		// Both uploads reserve an id and then hang: Slack's share events arrive before either HTTP response.
+		const pending: (() => void)[] = [];
+		const reservedOrder: string[] = [];
+		f.api.uploadFile = (
+			_channel: string,
+			upload: { readonly bytes: Uint8Array },
+			_threadTs?: string,
+			_comment?: string,
+			onReserved?: (fileId: string) => void,
+		) => {
+			const fileId = new TextDecoder().decode(upload.bytes) === "thread" ? "F1" : "F2";
+			reservedOrder.push(fileId);
+			onReserved?.(fileId);
+			const { promise, resolve } = Promise.withResolvers<void>();
+			pending.push(resolve);
+			return promise;
+		};
+		const push = (message: ChatMessagePayload) => {
+			for (const handler of f.client.handlers) handler(message);
+		};
+		// A thread-session upload, and a channel-session turn uploading the same name into that same thread.
+		push(delivery({ deliveryId: "thread-file", origin: thread, file: threadFile }));
+		push(delivery({ deliveryId: "channel-file", replyToMessageId: `C1:${root}`, file: channelFile }));
+		for (let i = 0; i < 200 && pending.length < 2; i++) await Bun.sleep(5);
+		expect(pending).toHaveLength(2);
+		const share = (ts: string, id: string) =>
+			f.event({
+				...inbound({ ts, text: "", thread_ts: root, user: "UBOT" }),
+				subtype: "file_share",
+				files: [{ id, name: "reply.txt" }],
+			});
+		// The events land in the reverse of upload order, and before either upload answers.
+		const [first = "", second = ""] = reservedOrder;
+		await share("1700000004.000001", second);
+		await share("1700000004.000002", first);
+		// An own share with no recorded upload stays unknown.
+		await share("1700000004.000003", "F9");
+		for (const resolve of pending) resolve();
+		const react = (ts: string) =>
+			f.event({
+				type: "reaction_added",
+				user: "U1",
+				reaction: "+1",
+				item: { type: "message", channel: "C1", ts },
+				event_ts: "1700000009.000000",
+			});
+		await react("1700000004.000001");
+		await react("1700000004.000002");
+		await react("1700000004.000003");
+		expect(chatSends(f.client)).toHaveLength(0);
+		const reactions = f.client.requests.filter((request) => request.verb === "engagement.reaction");
+		const originOf = (fileId: string) => (fileId === "F1" ? thread : origin);
+		expect(reactions.map((request) => (request.params as { origin: unknown }).origin)).toEqual([
+			originOf(second),
+			originOf(first),
+			origin,
+		]);
+	} finally {
+		f.socket.stop();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
 test("Slack reaction request rejection does not reconnect the healthy client", async () => {
 	const log = spyOn(console, "error").mockImplementation(() => {});
 	try {

@@ -1,6 +1,12 @@
 import { expect, test } from "bun:test";
-import type { SlackHistoryPage } from "../src/api";
-import { ROOT_TEXT_LIMIT, ROOT_TEXT_MAX_IN_FLIGHT, SlackRootTexts } from "../src/root-text";
+import { type SlackHistoryPage, SlackWebApi } from "../src/api";
+import {
+	ROOT_TEXT_LIMIT,
+	ROOT_TEXT_LOOKUPS_PER_WINDOW,
+	ROOT_TEXT_MAX_IN_FLIGHT,
+	ROOT_TEXT_WINDOW_MS,
+	SlackRootTexts,
+} from "../src/root-text";
 
 const page = (ts: string, text: unknown): SlackHistoryPage => ({ messages: [{ ts, text }], has_more: false });
 
@@ -90,4 +96,68 @@ test("a burst of cold roots is shed past the in-flight bound and asked again lat
 	roots.warm(shed);
 	await roots.idle();
 	expect(roots.excerpt(shed)).toBe(`root ${shed.slice(3)}`);
+});
+
+test("cold-root lookups past the per-window budget are shed until the window moves on", async () => {
+	let clock = 0;
+	const calls: string[] = [];
+	const roots = new SlackRootTexts(
+		{
+			conversationsReplies: async (_channel, ts) => {
+				calls.push(ts);
+				return page(ts, `root ${ts}`);
+			},
+		},
+		undefined,
+		() => clock,
+	);
+	const ids = Array.from({ length: ROOT_TEXT_LOOKUPS_PER_WINDOW + 1 }, (_, index) => `C1:${index + 1}.0`);
+	for (const id of ids) {
+		roots.warm(id);
+		await roots.idle();
+	}
+	expect(calls).toHaveLength(ROOT_TEXT_LOOKUPS_PER_WINDOW);
+	const shed = ids.at(-1) ?? "";
+	expect(roots.excerpt(shed)).toBeUndefined();
+
+	clock += ROOT_TEXT_WINDOW_MS - 1;
+	roots.warm(shed);
+	await roots.idle();
+	expect(calls).toHaveLength(ROOT_TEXT_LOOKUPS_PER_WINDOW);
+
+	clock += 1;
+	roots.warm(shed);
+	await roots.idle();
+	expect(roots.excerpt(shed)).toBe(`root ${shed.slice(3)}`);
+});
+
+test("a rate-limited cold lookup makes one HTTP attempt and pauses lookups for its Retry-After", async () => {
+	let clock = 0;
+	let attempts = 0;
+	let limited = true;
+	const api = new SlackWebApi("xoxb-test", {
+		fetcher: async () => {
+			attempts++;
+			if (limited) return new Response("", { status: 429, headers: { "retry-after": "30" } });
+			return Response.json({ ok: true, messages: [{ ts: "2.0", text: "root" }], has_more: false });
+		},
+		sleep: async () => {},
+	});
+	const roots = new SlackRootTexts(api, undefined, () => clock);
+	roots.warm("C1:1.0");
+	await roots.idle();
+	expect(attempts).toBe(1);
+
+	// Slack asked for 30 s: no cold lookup goes out before then, for any root.
+	clock += 29_999;
+	roots.warm("C1:2.0");
+	await roots.idle();
+	expect(attempts).toBe(1);
+
+	limited = false;
+	clock += 1;
+	roots.warm("C1:2.0");
+	await roots.idle();
+	expect(attempts).toBe(2);
+	expect(roots.excerpt("C1:2.0")).toBe("root");
 });
