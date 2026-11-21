@@ -16,7 +16,7 @@ import { basename, dirname, join } from "node:path";
 import { acquireLease, homeLayout, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import pkg from "../package.json";
 import { type GjcInstallRunner, installPinnedGjc } from "./gjc-install";
-import { launchRestartStack } from "./restart-stack";
+import { launchRestartStack, waitForServicesExit } from "./restart-stack";
 import {
 	type InstallServicesOptions,
 	installServices,
@@ -235,6 +235,8 @@ export interface UpdateDeps {
 	readonly gjcInstallRunner?: GjcInstallRunner;
 	readonly serviceRunner?: UpdateCommandRunner;
 	readonly serviceOptions?: UpdateServiceOptions;
+	/** Wait for services to exit before binary replacement (for issue #866). */
+	readonly waitForServicesExitMs?: number;
 }
 
 export interface RunUpdateOptions {
@@ -381,6 +383,18 @@ export async function runUpdate(options: RunUpdateOptions): Promise<UpdateResult
 			}
 			const packagePath = join(binDir, "package.json");
 			if (await exists(packagePath)) await copyFile(packagePath, join(backupDir, "package.json"));
+
+			// Wait for all services to fully exit before replacing binaries to avoid ETXTBSY on Linux (issue #866)
+			const servicesExited = await waitForServicesExit({
+				platform,
+				timeoutMs: deps.waitForServicesExitMs ?? 30_000,
+			});
+			if (!servicesExited) {
+				console.warn(
+					"services did not fully exit within timeout; binary replacement may fail with ETXTBSY if processes still running",
+				);
+			}
+
 			for (const name of toInstall) {
 				const stagedPath = join(staged.dir, name);
 				const tempPath = join(binDir, `.update-${name}`);
