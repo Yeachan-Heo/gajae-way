@@ -663,8 +663,6 @@ export function monitorFailureDecision(
 
 export class ReconnectingGateway implements GatewayClientLike {
 	#client: GatewayClientLike | undefined;
-	/** Slack-side identity hold for adapter owner ids (#862); undefined until told. */
-	#adapterOwnerIds: readonly string[] | undefined;
 	#reconnecting = false;
 	#attempt = 0;
 	#deliveryOff: (() => void) | undefined;
@@ -705,15 +703,6 @@ export class ReconnectingGateway implements GatewayClientLike {
 		readonly posted?: SlackPostedMessages,
 	) {
 		if (initialClient) this.adoptClient(initialClient);
-	}
-
-	/**
-	 * Reports the owner ids this adapter resolved for its own Slack workspace
-	 * app (#862) on the next connect's hello. The gateway trusts them only for
-	 * slack-platform origins on this connection.
-	 */
-	setAppOwnerIds(ids: readonly string[] | undefined): void {
-		this.#adapterOwnerIds = ids;
 	}
 
 	/** True while a gateway client is attached; recovery sends are pointless without one. */
@@ -783,7 +772,6 @@ export class ReconnectingGateway implements GatewayClientLike {
 			const options = {
 				clientName: "adapter-slack",
 				requiredCapabilities: ["chat.images"],
-				...(this.#adapterOwnerIds ? { adapterOwnerIds: this.#adapterOwnerIds } : {}),
 				onRetry: (attempt: number, delayMs: number, error: unknown) =>
 					console.warn(
 						`gateway_socket_waiting client=adapter-slack path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${errorText(error)}`,
@@ -1146,11 +1134,6 @@ export async function startSlackAdapter(
 		live,
 		posted,
 	);
-	// Slack app ownership is NOT resolvable from a bot token (#862): Slack has no
-	// application-owner endpoint, and the workspace admin that installed the app
-	// is not authority. Slack therefore never reports adapter owners; the gateway
-	// stays fail closed for slack unless `ownerTarget` is configured.
-	gateway.setAppOwnerIds(undefined);
 	const ingress = new OrderedIngress();
 	const imageBudget = new ImagePreparationBudget();
 	const prepareImages = (files: SlackFileCarrier["files"]) =>
