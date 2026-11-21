@@ -995,6 +995,9 @@ export async function startTelegramAdapter(config: LoadedTelegramAdapterConfig):
 		new TelegramAttachmentStore(attachmentDirectory, bot),
 	);
 	const gateway = new ReconnectingGateway(config.gatewaySocket ?? defaultGatewaySocket(), bot, state);
+	// The Bot API exposes no bot-owner endpoint, so telegram never reports
+	// adapter owners (#862): fail closed unless `ownerTarget` is configured.
+	gateway.setAppOwnerIds(undefined);
 	await gateway.connectInitial();
 
 	for (;;) {
@@ -1008,6 +1011,20 @@ export async function startTelegramAdapter(config: LoadedTelegramAdapterConfig):
 }
 
 class ReconnectingGateway implements GatewayClientLike {
+	/** Telegram-side hold for adapter owner ids (#862); undefined until told. */
+	#adapterOwnerIds: readonly string[] | undefined;
+
+	/**
+	 * Reports the owner ids this adapter resolved for its own Telegram bot
+	 * (#862) on the next connect's hello. Telegram bot ownership is NOT
+	 * discoverable from a bot token (Bot API has no owner endpoint), so the
+	 * adapter never reports owners and the gateway stays fail closed for
+	 * telegram unless `ownerTarget` is configured.
+	 */
+	setAppOwnerIds(ids: readonly string[] | undefined): void {
+		this.#adapterOwnerIds = ids;
+	}
+
 	#client: GajaewayClient | undefined;
 	#reconnecting = false;
 	#attempt = 0;
@@ -1039,6 +1056,7 @@ class ReconnectingGateway implements GatewayClientLike {
 			const options = {
 				clientName: "adapter-telegram",
 				requiredCapabilities: ["chat.images"],
+				...(this.#adapterOwnerIds ? { adapterOwnerIds: this.#adapterOwnerIds } : {}),
 				onRetry: (attempt: number, delayMs: number, error: unknown) =>
 					console.warn(
 						`gateway_socket_waiting client=adapter-telegram path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${error instanceof Error ? error.message : String(error)}`,

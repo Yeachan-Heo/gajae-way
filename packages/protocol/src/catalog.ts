@@ -438,11 +438,18 @@ export interface SessionListResult {
  * then the `provider/model` ids gjc lists (`gjc --list-models`). Fails soft: an
  * unreadable catalog yields fewer (or no) choices, never an error. Preset names
  * are private to the owner: the result is empty unless `authorId` is the
- * configured owner (`ownerTarget.origin.peerId`).
+ * configured owner (`ownerTarget.origin.peerId`) or an owner the Discord
+ * adapter resolved from the application (`adapter.ownerIds`, issue #862).
  */
 export interface SessionModelChoicesParams {
 	/** Platform user id of whoever is typing the `/model set` choice. */
 	readonly authorId?: string;
+	/**
+	 * Platform the typing user speaks on, when the caller is an adapter
+	 * (#862). Adapter-reported application owners are authority only for this
+	 * platform; omitting it still matches the configured `ownerTarget`.
+	 */
+	readonly originPlatform?: "discord";
 }
 
 export interface SessionModelChoicesResult {

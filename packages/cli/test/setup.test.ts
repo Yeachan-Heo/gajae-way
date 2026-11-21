@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main } from "../src/main";
@@ -297,6 +297,42 @@ describe("setup writing", () => {
 			});
 			expect(JSON.parse(await readFile(join(home, "config.json"), "utf8")).mentionAllowlist).toEqual(["4242"]);
 			expect(await allFiles(join(home, "secrets"))).toEqual([join(home, "secrets", "discord-token")]);
+		});
+	});
+
+	test("setup prefills ownerTarget from the Discord application owner (#862)", async () => {
+		await withHome(async (home) => {
+			const lines: string[] = [];
+			await runSetup(["--from-env", "--adapters", "discord"], {
+				home,
+				env: fullEnv,
+				fetch: fakePlatform().fetch,
+				log: (l) => lines.push(l),
+			});
+			const config = JSON.parse(await readFile(join(home, "config.json"), "utf8"));
+			expect(config.ownerTarget).toEqual({
+				origin: { platform: "discord", kind: "dm", conversationId: "4242", peerId: "4242" },
+			});
+			expect(lines.join("\n")).toContain("ownerTarget prefilled from the Discord application owner");
+		});
+	});
+
+	test("an existing ownerTarget is never replaced by the application owner", async () => {
+		await withHome(async (home) => {
+			const existing = {
+				schemaVersion: 1,
+				ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "me", peerId: "31337" } },
+			};
+			await mkdir(home, { recursive: true });
+			await writeFile(join(home, "config.json"), JSON.stringify(existing));
+			await runSetup(["--from-env", "--adapters", "discord"], {
+				home,
+				env: fullEnv,
+				fetch: fakePlatform().fetch,
+				log: () => {},
+			});
+			const config = JSON.parse(await readFile(join(home, "config.json"), "utf8"));
+			expect(config.ownerTarget).toEqual(existing.ownerTarget);
 		});
 	});
 

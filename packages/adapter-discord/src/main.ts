@@ -1324,6 +1324,58 @@ async function decodePcmWithFfmpeg(ogg: Uint8Array): Promise<Int16Array | undefi
 	return new Int16Array(raw.buffer.slice(raw.byteOffset, raw.byteOffset + usable));
 }
 
+/**
+ * The Discord snowflakes that own this bot's application (#862): the
+ * application's `owner` user, or every ACCEPTED member of the owning Team.
+ * Invited-only members are excluded — an invitation is not ownership. Guild
+ * ownership is never consulted: a server owner and the bot owner are different
+ * people, and only the bot owner gates owner-only verbs. Returns undefined when
+ * Discord does not answer or resolves nobody, which keeps every gate closed.
+ */
+/** The slice of discord.js TeamMember the lookup needs (keeps tests stub-shaped). */
+export interface ApplicationTeamMemberLike {
+	readonly id: string;
+	/** TeamMemberMembershipState: 1 = Invited, 2 = Accepted. */
+	readonly membershipState?: number;
+}
+
+/** The slice of discord.js ClientApplication the lookup needs. */
+export interface ClientApplicationLike {
+	fetch(): Promise<{
+		readonly owner?: { readonly id?: string | number } | null;
+		readonly team?: { readonly members?: Iterable<ApplicationTeamMemberLike> | null } | null;
+	} | null>;
+}
+
+export async function resolveApplicationOwnerIds(
+	application: Pick<ClientApplicationLike, "fetch"> | undefined | null,
+): Promise<readonly string[] | undefined> {
+	if (!application) return undefined;
+	let fetched: Awaited<ReturnType<ClientApplicationLike["fetch"]>>;
+	try {
+		fetched = await application.fetch();
+	} catch (error) {
+		console.error(
+			`Discord application owner lookup failed: ${error instanceof Error ? error.message : String(error)}; ownerTarget stays unset (#862).`,
+		);
+		return undefined;
+	}
+	if (!fetched) return undefined;
+	const ids = new Set<string>();
+	const add = (id: unknown): void => {
+		const value = typeof id === "string" ? id : typeof id === "number" ? String(id) : "";
+		if (/^\d{17,20}$/.test(value)) ids.add(value);
+	};
+	const team = fetched.team;
+	if (team) {
+		for (const member of team.members ?? []) {
+			// TeamMemberMembershipState.Accepted === 2 (discord-api-types v10).
+			if (member.membershipState === 2) add(member.id);
+		}
+	} else add(fetched.owner?.id);
+	return ids.size > 0 ? [...ids] : undefined;
+}
+
 export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): Promise<void> {
 	const prepareImages = createDiscordImagePreparer(new ImagePreparationBudget());
 	const discord = new Client({
@@ -1455,7 +1507,8 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 	});
 	discord.on("interactionCreate", (interaction) => {
 		if (interaction.isAutocomplete()) void handleModelAutocomplete(interaction, gateway);
-		else if (interaction.isChatInputCommand()) void handleSlashCommand(interaction, gateway);
+		else if (interaction.isChatInputCommand())
+			void handleSlashCommand(interaction, gateway, console, gateway.ownerResolved);
 	});
 	discord.once("ready", () => {
 		console.log("Discord adapter connected.");
@@ -1475,6 +1528,16 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 	await gateway.connectInitial();
 
 	await discord.login(config.token);
+
+	// Owner resolution (#862) needs the READY payload, so it happens after the
+	// login promise resolves; the next gateway hello reports what it found.
+	const appOwnerIds = await resolveApplicationOwnerIds(discord.application);
+	gateway.setAppOwnerIds(appOwnerIds);
+	console.log(
+		appOwnerIds
+			? `Discord application owners resolved: ${appOwnerIds.join(", ")}`
+			: "Discord application owner lookup resolved nobody; /model stays owner-gated until ownerTarget is set.",
+	);
 }
 
 /** Discord application-command option types used by the registration below. */
@@ -1622,6 +1685,8 @@ export async function handleSlashCommand(
 	interaction: SlashInteractionLike,
 	gateway: Pick<ReconnectingGateway, "requestInbound">,
 	log: Pick<Console, "error"> = console,
+	/** False when neither `ownerTarget` nor the application lookup resolved an owner (#862). */
+	ownerResolved = true,
 ): Promise<void> {
 	if (!interaction.isChatInputCommand?.()) return;
 	const command = interaction.commandName;
@@ -1663,14 +1728,18 @@ export async function handleSlashCommand(
 		// Honest ack: the gateway declines a command its authorization refuses
 		// (non-owner `/model`, non-allowlisted group author) — never claim a change
 		// that did not happen. `/model` never resets the session; the gateway posts
-		// the resulting selection itself.
+		// the resulting selection itself. When no owner is resolvable anywhere
+		// (no `ownerTarget` and the application lookup found nothing, #862) the
+		// refusal names the fix instead of a dead end.
 		await interaction.editReply({
 			content: result?.engaged
 				? command === "model"
 					? "🦞 model command accepted"
 					: "🦞 session reset"
 				: command === "model"
-					? "not authorized: /model is owner-only"
+					? ownerResolved
+						? "not authorized: /model is owner-only"
+						: "not authorized: /model is owner-only (no owner resolved; set ownerTarget)"
 					: "not authorized for session commands here",
 		});
 	} catch (error) {
@@ -1702,6 +1771,7 @@ export class ReconnectingGateway {
 	#retryAttempt = 0;
 	readonly #unreadableRecoveryTargets = new Map<string, number>();
 	#recoverableIds = new Set<string>();
+	#appOwnerIds: readonly string[] | undefined;
 
 	constructor(
 		readonly socketPath: string,
@@ -1720,6 +1790,20 @@ export class ReconnectingGateway {
 	) {
 		this.#client = initialClient;
 		void this.ensureCursors();
+	}
+
+	/**
+	 * The application-owner ids the adapter resolved at Discord login (#862).
+	 * Reported on every hello as `adapter.ownerIds`; undefined means the lookup
+	 * failed or resolved nobody, which the gateway reads as "no adapter owners".
+	 */
+	setAppOwnerIds(ids: readonly string[] | undefined): void {
+		this.#appOwnerIds = ids;
+	}
+
+	/** True when the application lookup resolved at least one owner (#862). */
+	get ownerResolved(): boolean {
+		return (this.#appOwnerIds?.length ?? 0) > 0;
 	}
 
 	/** Test seam: the link came back with this client (what connect() does after a successful socket open). */
@@ -1743,6 +1827,7 @@ export class ReconnectingGateway {
 			const options = {
 				clientName: "adapter-discord",
 				requiredCapabilities: ["chat.images"],
+				...(this.#appOwnerIds ? { adapterOwnerIds: this.#appOwnerIds } : {}),
 				onRetry: (attempt: number, delayMs: number, error: unknown) =>
 					console.warn(
 						`gateway_socket_waiting client=adapter-discord path=${this.socketPath} attempt=${attempt} retry_in_ms=${delayMs} detail=${error instanceof Error ? error.message : String(error)}`,
@@ -2335,7 +2420,11 @@ export class ReconnectingGateway {
 	async modelChoices(authorId: string): Promise<readonly string[]> {
 		const client = this.#client;
 		if (!client) throw new Error("gateway link not connected");
-		const result = await client.request<SessionModelChoicesResult>("session.modelChoices", { authorId });
+		const result = await client.request<SessionModelChoicesResult>("session.modelChoices", {
+			authorId,
+			// Adapter owners are authority for this adapter's platform only (#862).
+			originPlatform: "discord",
+		});
 		return result.choices;
 	}
 

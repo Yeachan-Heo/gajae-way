@@ -26,6 +26,7 @@ import {
 	OPS_CYCLE_DEFAULT_LIMIT,
 	OPS_CYCLE_MAX_LIMIT,
 	OrderedFrameWriter,
+	type OriginPlatform,
 	type OriginRef,
 	OUTBOUND_FILE_MAX_BYTES,
 	OUTBOUND_FILES_PER_TURN_CAP,
@@ -229,6 +230,16 @@ interface Connection {
 	negotiated: boolean;
 	/** Reported client identity and process generation, recorded at negotiation. */
 	client?: { readonly name: string; readonly startedAt?: string; readonly connectedAt: string };
+	/**
+	 * Platform user ids the ADAPTER resolved as owners of its own application
+	 * (issue #862), recorded at negotiation together with the platform they
+	 * belong to. Authority only for origins on that platform, and only on this
+	 * authenticated connection; an explicit `ownerTarget` supersedes it
+	 * everywhere.
+	 */
+	platformOwnerIds?: readonly string[];
+	/** The platform `platformOwnerIds` was reported for; undefined when none. */
+	platformOwnerPlatform?: string;
 	write(frame: Frame): void;
 	close(): void;
 	settle(): Promise<void>;
@@ -1529,6 +1540,17 @@ async function handleFrame(
 				});
 			connection.negotiated = true;
 			const info = hello.clientInfo;
+			// An authenticated adapter may report the platform user ids it resolved
+			// as its own application's owners (issue #862). Kept per connection:
+			// they are authority only for this adapter's own platform.
+			const reportedAdapter = hello.adapter;
+			const ownerIds = reportedAdapter?.ownerIds;
+			if (reportedAdapter && Array.isArray(ownerIds) && isChatPlatform(reportedAdapter.platform as OriginPlatform))
+				connection.platformOwnerPlatform = reportedAdapter.platform;
+			if (connection.platformOwnerPlatform !== undefined && Array.isArray(ownerIds))
+				connection.platformOwnerIds = [
+					...new Set(ownerIds.filter((id): id is string => typeof id === "string" && id.length > 0)),
+				];
 			connection.client = {
 				name: typeof info?.name === "string" && info.name ? info.name : "unidentified",
 				...(typeof info?.startedAt === "string" && info.startedAt ? { startedAt: info.startedAt } : {}),
@@ -2088,7 +2110,7 @@ async function handleRequest(
 		case "session.modelChoices": {
 			// Preset names are the owner's private configuration: anyone else typing
 			// `/model set` gets no suggestions, the same owner gate as `/model` itself.
-			if (!ownerAuthored(runtime.config, request.params)) {
+			if (!ownerAuthored(runtime.config, request.params, connection)) {
 				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { choices: [] } });
 				return;
 			}
@@ -2660,7 +2682,7 @@ async function sendChat(
 	if (userText === "/model" || userText.startsWith("/model ")) {
 		if (
 			!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp) ||
-			(origin.platform !== "loopback" && !ownerAuthored(runtime.config, params.engagement))
+			(origin.platform !== "loopback" && !ownerAuthoredOn(origin, runtime.config, params.engagement, connection))
 		) {
 			connection.write({
 				v: PROFILE_VERSION,
@@ -2719,7 +2741,7 @@ async function sendChat(
 		// and resume through recovery, so the persona keeps its transcript.
 		if (
 			!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp) ||
-			!ownerAuthored(runtime.config, params.engagement)
+			!ownerAuthoredOn(origin, runtime.config, params.engagement, connection)
 		) {
 			connection.write({
 				v: PROFILE_VERSION,
@@ -5006,14 +5028,43 @@ function ownerPeerIdOf(config: GatewayConfig): string | undefined {
 }
 
 /**
- * Whether `authorId` in an engagement or request params is the configured
- * owner (`ownerTarget.origin.peerId`). No configured owner authorises nobody.
- * Owner-only verbs (`/restart`, `/model`, `session.modelChoices`) require it.
+ * Whether `authorId` in an engagement or request params is the owner. The
+ * configured owner (`ownerTarget.origin.peerId`) always authorises, and an
+ * explicit `ownerTarget` supersedes the adapter-reported application owners
+ * entirely (#862). Without an `ownerTarget`, an id the Discord adapter resolved
+ * from its own application at login (`hello.adapter.ownerIds`) authorises a
+ * `discord`-platform author: the ids arrive over the adapter's authenticated
+ * connection, and the connection that reported them is the only one they are
+ * trusted on. No owner anywhere authorises nobody (fail closed). Owner-only
+ * verbs (`/restart`, `/model`, `session.modelChoices`) require this.
  */
-function ownerAuthored(config: GatewayConfig, carrier: unknown): boolean {
-	const owner = ownerPeerIdOf(config);
-	const authorId = (carrier as { authorId?: unknown } | undefined)?.authorId;
-	return owner !== undefined && authorId === owner;
+function ownerAuthored(config: GatewayConfig, carrier: unknown, connection?: Connection): boolean {
+	const record = (carrier ?? {}) as { authorId?: unknown; originPlatform?: unknown };
+	const authorId = record.authorId;
+	if (typeof authorId !== "string") return false;
+	if (config.ownerTarget !== undefined) return authorId === ownerPeerIdOf(config);
+	if (connection === undefined) return false;
+	// Adapter-reported owners are authority for the DECLARED platform only
+	// (#862): the originless verb (session.modelChoices) must name the platform
+	// the typing user speaks for, and it must be the platform this connection
+	// reported owners for.
+	if (record.originPlatform !== connection.platformOwnerPlatform) return false;
+	return connection.platformOwnerIds?.includes(authorId) === true;
+}
+
+/**
+ * The `ownerAuthored` gate for one chat origin: adapter-reported application
+ * owners are consulted only when the origin is on the reporting adapter's own
+ * platform (#862), so a slack or telegram author can never ride a discord
+ * adapter's hello.
+ */
+function ownerAuthoredOn(origin: OriginRef, config: GatewayConfig, carrier: unknown, connection?: Connection): boolean {
+	if (connection === undefined) return ownerAuthored(config, carrier, undefined);
+	// Consult the connection's reported owners only when the origin is on the
+	// platform that connection declared (#862).
+	if (origin.platform !== connection.platformOwnerPlatform) return ownerAuthored(config, carrier, undefined);
+	const record = (carrier ?? {}) as Record<string, unknown>;
+	return ownerAuthored(config, { ...record, originPlatform: origin.platform }, connection);
 }
 
 /**
