@@ -509,6 +509,53 @@ test("restart-stack keeps the receipt indeterminate when the replacement socket 
 	}
 });
 
+test("restart-stack succeeds at socket reattachment when it becomes ready within the increased timeout", async () => {
+	const { home, cleanup } = await tempHome();
+	const host = await fakeHost({ home });
+	let reattachAttempts = 0;
+	let originalCancelled = false;
+	const delayMs = 100;
+	const startTime = Date.now();
+	try {
+		const receipt = await runRestartStack({
+			...host.options,
+			id: "gateway-reattach-delayed-ready",
+			pollMs: 10,
+			verifyTimeoutMs: 150_000, // Allow 150 seconds instead of 90
+			now: () => Date.now(),
+			prepareRestartDrain: async (_socketPath, _restartId, _trigger, prepareOptions) => {
+				if (prepareOptions?.mode === "reattach") {
+					reattachAttempts++;
+					const elapsedMs = Date.now() - startTime;
+					// Return undefined until delayMs has passed, simulating socket binding delay
+					if (elapsedMs < delayMs) return undefined;
+					return {
+						superseded: new AbortController().signal,
+						assertActive: async () => {},
+						cancel: async () => {},
+						close: async () => {},
+					};
+				}
+				return {
+					superseded: new AbortController().signal,
+					assertActive: async () => {},
+					cancel: async () => {
+						originalCancelled = true;
+					},
+					close: async () => {},
+				};
+			},
+		});
+		expect(receipt.state).toBe("ok");
+		// Should have attempted reattachment multiple times before socket became ready
+		expect(reattachAttempts).toBeGreaterThan(1);
+		expect(originalCancelled).toBe(false);
+	} finally {
+		await host.close();
+		await cleanup();
+	}
+});
+
 test("restart-stack waits for an in-flight service command before releasing a superseded drain", async () => {
 	const { home, cleanup } = await tempHome();
 	const host = await fakeHost({ home });
