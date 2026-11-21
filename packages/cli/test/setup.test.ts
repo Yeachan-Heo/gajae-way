@@ -280,14 +280,16 @@ describe("setup writing", () => {
 			expect(config.stallTimeoutMs).toBe(90_000);
 			expect(config.channels).toEqual({ "slack:C1": { engagement: "open" } });
 			expect(Object.keys(config.credentials).sort()).toEqual(["discord", "slack-app", "slack-bot", "telegram"]);
-			expect(config.mentionAllowlist).toEqual(["4242"]);
+			// App owner IDs are not added to mentionAllowlist (#862, finding 3).
+		// They are used for adapter-reported adapterOwnerIds instead.
+		expect(config.mentionAllowlist).toBeUndefined();
 			expect(JSON.parse(await readFile(join(home, "adapter-slack.json"), "utf8")).channels).toEqual({
 				C1: { engagement: "open" },
 			});
 		});
 	});
 
-	test("the Discord application owner is allowlisted when no owner is named", async () => {
+	test("Discord application owner is not added to mentionAllowlist even when no owner is named (#862, finding 3)", async () => {
 		await withHome(async (home) => {
 			await runSetup(["--from-env", "--adapters", "discord"], {
 				home,
@@ -295,12 +297,14 @@ describe("setup writing", () => {
 				fetch: fakePlatform().fetch,
 				log: () => {},
 			});
-			expect(JSON.parse(await readFile(join(home, "config.json"), "utf8")).mentionAllowlist).toEqual(["4242"]);
+			const config = JSON.parse(await readFile(join(home, "config.json"), "utf8"));
+			// App owner IDs are not persisted in mentionAllowlist.
+			expect(config.mentionAllowlist).toBeUndefined();
 			expect(await allFiles(join(home, "secrets"))).toEqual([join(home, "secrets", "discord-token")]);
 		});
 	});
 
-	test("setup prefills ownerTarget from the Discord application owner (#862)", async () => {
+	test("setup does not add Discord application owners to mentionAllowlist (#862, finding 3)", async () => {
 		await withHome(async (home) => {
 			const lines: string[] = [];
 			await runSetup(["--from-env", "--adapters", "discord"], {
@@ -310,9 +314,13 @@ describe("setup writing", () => {
 				log: (l) => lines.push(l),
 			});
 			const config = JSON.parse(await readFile(join(home, "config.json"), "utf8"));
-			// Application owners are added to mentionAllowlist, not synthesized as ownerTarget (#862, finding 3)
+			// App-owner IDs are used for adapter-reported adapterOwnerIds (runtime-refreshed),
+			// not persisted in mentionAllowlist. This keeps membership-derived grants revocable.
 			expect(config.ownerTarget).toBeUndefined();
-			expect(config.mentionAllowlist).toContain("4242");
+			// mentionAllowlist should not contain the app owner ID.
+			if (config.mentionAllowlist) {
+				expect(config.mentionAllowlist).not.toContain("4242");
+			}
 		});
 	});
 

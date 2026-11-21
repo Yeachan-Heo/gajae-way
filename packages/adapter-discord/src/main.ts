@@ -201,6 +201,7 @@ export interface TypingPort {
 export interface DiscordClientLike {
 	user?: { id: string | number } | null;
 	channels: { fetch(id: string): Promise<unknown> };
+	application?: ClientApplicationLike | null;
 }
 
 export interface DiscordInboundMessage extends DiscordMessageOriginShape, ReplyMessageLike, AttachmentCarrier {
@@ -1375,9 +1376,12 @@ export async function resolveApplicationOwnerIds(
 		const members = owner.members as unknown;
 		if (members && typeof members === "object" && "values" in members) {
 			for (const member of (members as { values: () => IterableIterator<unknown> }).values()) {
-				const m = member as { membershipState?: unknown; user?: { id?: unknown } };
+				const m = member as { membershipState?: unknown; role?: unknown; user?: { id?: unknown } };
 				// TeamMemberMembershipState.Accepted === 2 (discord-api-types v10).
-				if (m.membershipState === 2) add(m.user?.id);
+				// Only include members with admin or developer roles, not read_only (#862, finding 1).
+				if (m.membershipState === 2 && (m.role === "admin" || m.role === "developer")) {
+					add(m.user?.id);
+				}
 			}
 		}
 	} else if (owner && typeof owner === "object" && "id" in owner) {
@@ -1516,11 +1520,6 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 	discord.on("messageReactionRemove", (reaction, user) => {
 		gateway.sendReaction(reaction, user, "remove", discord.user);
 	});
-	discord.on("interactionCreate", (interaction) => {
-		if (interaction.isAutocomplete()) void handleModelAutocomplete(interaction, gateway);
-		else if (interaction.isChatInputCommand())
-			void handleSlashCommand(interaction, gateway, console, gateway.ownerResolved);
-	});
 	discord.once("ready", () => {
 		console.log("Discord adapter connected.");
 		// Slash-command mapping: /new, /reset and /model are first-class Discord
@@ -1551,6 +1550,14 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			? `Discord application owners resolved: ${appOwnerIds.join(", ")}`
 			: "Discord application owner lookup resolved nobody; /model stays owner-gated until ownerTarget is set.",
 	);
+
+	// Register interaction listeners AFTER gateway is ready (#862, finding 2)
+	// so interactions are not dropped before connectInitial() completes.
+	discord.on("interactionCreate", (interaction) => {
+		if (interaction.isAutocomplete()) void handleModelAutocomplete(interaction, gateway);
+		else if (interaction.isChatInputCommand())
+			void handleSlashCommand(interaction, gateway, console, gateway.ownerResolved);
+	});
 }
 
 /** Discord application-command option types used by the registration below. */
@@ -1785,6 +1792,7 @@ export class ReconnectingGateway {
 	readonly #unreadableRecoveryTargets = new Map<string, number>();
 	#recoverableIds = new Set<string>();
 	#appOwnerIds: readonly string[] | undefined;
+	#refreshAppOwners = false;
 
 	constructor(
 		readonly socketPath: string,
@@ -1809,9 +1817,11 @@ export class ReconnectingGateway {
 	 * The application-owner ids the adapter resolved at Discord login (#862).
 	 * Reported on every hello as `adapter.ownerIds`; undefined means the lookup
 	 * failed or resolved nobody, which the gateway reads as "no adapter owners".
+	 * On reconnect, app-owner membership is refreshed to revoke removed members (#862, finding 3).
 	 */
 	setAppOwnerIds(ids: readonly string[] | undefined): void {
 		this.#appOwnerIds = ids;
+		this.#refreshAppOwners = true;
 	}
 
 	/** True when the application lookup resolved at least one owner (#862). */
@@ -1837,6 +1847,17 @@ export class ReconnectingGateway {
 
 	async #connect(initial: boolean): Promise<void> {
 		try {
+			// Refresh app owner membership on reconnect to revoke removed members (#862, finding 3).
+			if (!initial && this.#refreshAppOwners && this.discord.application) {
+				try {
+					this.#appOwnerIds = await resolveApplicationOwnerIds(this.discord.application);
+				} catch (error) {
+					console.error(
+						`app-owner refresh failed on reconnect: ${error instanceof Error ? error.message : String(error)}`,
+					);
+					// Keep using the previous owners if refresh fails (fail open).
+				}
+			}
 			const options = {
 				clientName: "adapter-discord",
 				requiredCapabilities: ["chat.images"],

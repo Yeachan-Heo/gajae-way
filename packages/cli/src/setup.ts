@@ -466,14 +466,15 @@ export async function applySetup(options: ApplySetupOptions): Promise<AppliedSet
 	const previousAllowlist = Array.isArray(base.mentionAllowlist)
 		? base.mentionAllowlist.filter((id): id is string => typeof id === "string")
 		: [];
-	// Discord application owners (#862) are authorized via mentionAllowlist and
-	// connection.platformOwnerIds; every accepted team member is listed, not just
-	// the first one (finding 3). ownerTarget is not synthesized from team members
+	// Discord application owners (#862) are authorized via adapter-reported adapterOwnerIds,
+	// which are runtime-refreshed on each connect to revoke removed members (finding 3).
+	// App-owner IDs are NOT added to the persistent mentionAllowlist; they are only used
+	// by the adapter for adapterOwnerIds. ownerTarget is not synthesized from team members
 	// (finding 4); a user-owned app may still have an explicit ownerTarget if set.
 	const appOwnerIds = Array.isArray(options.appOwnerIds)
 		? options.appOwnerIds.filter((id): id is string => typeof id === "string" && /^\d{17,20}$/.test(id))
 		: [];
-	const owners = [...new Set([...previousAllowlist, ...options.owners, ...appOwnerIds])];
+	const owners = [...new Set([...previousAllowlist, ...options.owners])];
 	const existingOwnerTarget =
 		typeof base.ownerTarget === "object" && base.ownerTarget !== null && !Array.isArray(base.ownerTarget)
 			? (base.ownerTarget as Record<string, unknown>)
@@ -699,11 +700,9 @@ export async function runSetup(args: readonly string[], options: RunSetupOptions
 			printDiscordBotReady(log, discordIdentity.appId, botName);
 		}
 
-		for (const identity of identities)
-			if (identity.ownerId && owners.length === 0) {
-				owners.push(identity.ownerId);
-				log(`${identity.platform}: allowing DMs from the application owner ${identity.ownerId}`);
-			}
+		// App-owner IDs are passed separately via appOwnerIds (#862, finding 3).
+		// They are not added to mentionAllowlist to keep membership-derived grants revocable.
+		// If no owners were specified, the gateway will reject DMs until an ownerTarget is set.
 		const applied = await applySetup({
 			home: options.home,
 			tokens,

@@ -17,7 +17,7 @@ const APPLICATION = {
 };
 
 /** Create a discord.js Collection-like object that iterates values. */
-function createMockCollection(members: Array<{ id: string; user: { id: string }; membershipState: number }>) {
+function createMockCollection(members: Array<{ id: string; user: { id: string }; membershipState: number; role?: string }>) {
 	return {
 		values() {
 			return members[Symbol.iterator]();
@@ -33,9 +33,9 @@ const TEAM_APPLICATION = {
 		Promise.resolve({
 			owner: {
 				members: createMockCollection([
-					{ id: "2000000000000000001", user: { id: "2000000000000000001" }, membershipState: 2 },
-					{ id: "2000000000000000002", user: { id: "2000000000000000002" }, membershipState: 2 },
-					{ id: "2000000000000000003", user: { id: "2000000000000000003" }, membershipState: 1 },
+					{ id: "2000000000000000001", user: { id: "2000000000000000001" }, membershipState: 2, role: "admin" },
+					{ id: "2000000000000000002", user: { id: "2000000000000000002" }, membershipState: 2, role: "developer" },
+					{ id: "2000000000000000003", user: { id: "2000000000000000003" }, membershipState: 1, role: "admin" },
 				]),
 			},
 		}),
@@ -45,12 +45,30 @@ test("a user-owned application resolves to the owner id", async () => {
 	expect(await resolveApplicationOwnerIds(APPLICATION)).toEqual(["1000000000000000001"]);
 });
 
-test("a team-owned application resolves to accepted members only, invited excluded", async () => {
+test("a team-owned application resolves to accepted admin/developer members only, invited and read_only excluded", async () => {
 	const ids = await resolveApplicationOwnerIds(TEAM_APPLICATION);
 	expect(ids).toHaveLength(2);
 	expect(ids).toContain("2000000000000000001");
 	expect(ids).toContain("2000000000000000002");
 	expect(ids).not.toContain("2000000000000000003");
+});
+
+test("a team-owned application excludes read_only members (#862, finding 1)", async () => {
+	const app = {
+		fetch: () =>
+			Promise.resolve({
+				owner: {
+					members: createMockCollection([
+						{ id: "3000000000000000001", user: { id: "3000000000000000001" }, membershipState: 2, role: "admin" },
+						{ id: "3000000000000000002", user: { id: "3000000000000000002" }, membershipState: 2, role: "read_only" },
+					]),
+				},
+			}),
+	};
+	const ids = await resolveApplicationOwnerIds(app);
+	expect(ids).toHaveLength(1);
+	expect(ids).toContain("3000000000000000001");
+	expect(ids).not.toContain("3000000000000000002");
 });
 
 test("a failed lookup resolves to undefined (fail closed), not an empty authority", async () => {

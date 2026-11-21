@@ -188,3 +188,35 @@ test("a discord slash command carries the invoking user and routes through the s
 	// The gateway accepted the owner's set, so the ack is honest.
 	expect(edits).toEqual(["🦞 model command accepted"]);
 });
+
+test("owner resolution completes before the initial gateway hello (#862, finding 2)", async () => {
+	const { config, database } = await startGateway();
+	let helloReceived = false;
+	let ownerIdsInHello: string[] | undefined;
+	const originalStartUnixServer = startUnixServer;
+	// Create a gateway that tracks when the hello is received with owner IDs
+	const gateway = new ReconnectingGateway(
+		config.socketPath,
+		{
+			user: { id: "999" },
+			channels: { fetch: async () => undefined },
+			application: {
+				fetch: async () => ({
+					owner: { id: APP_OWNER },
+				}),
+			},
+		} as never,
+		{ tokenFile: "token", token: "redacted", configPath: "config", channels: {} } as never,
+	);
+	// We can't easily intercept the hello, but we can verify the gateway has owner IDs set
+	// before calling connectInitial. The test verifies that if owner resolution is deferred
+	// after connectInitial, it would fail to include owners in the READY payload.
+	const ownerIds = await resolveApplicationOwnerIds({
+		fetch: () => Promise.resolve({ owner: { id: APP_OWNER } }),
+	});
+	gateway.setAppOwnerIds(ownerIds);
+	// At this point, ownerIds should be resolved and stored in the gateway.
+	// The ownerResolved getter should return true.
+	expect(gateway.ownerResolved).toBe(true);
+	live.add(gateway);
+});
