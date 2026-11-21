@@ -1338,6 +1338,8 @@ export interface ApplicationTeamMemberLike {
 	readonly id: string;
 	/** TeamMemberMembershipState: 1 = Invited, 2 = Accepted. */
 	readonly membershipState?: number;
+	/** TeamMemberRole: "admin" | "developer" | "read_only" (#862, finding 1). */
+	readonly role?: string;
 }
 
 /** The slice of discord.js ClientApplication the lookup needs. */
