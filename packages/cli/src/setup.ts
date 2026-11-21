@@ -198,6 +198,8 @@ export interface ValidatedIdentity {
 	readonly summary: string;
 	/** A user id the platform names as the app owner, when it names one. */
 	readonly ownerId?: string;
+	/** Every owner id the platform resolved for the application (#862). */
+	readonly ownerIds?: readonly string[];
 	/** Application ID (Discord only). */
 	readonly appId?: string;
 }
@@ -255,13 +257,24 @@ export async function validateDiscord(
 	if (credentials.appId !== undefined && appId !== credentials.appId)
 		throw new SetupError(`discord: the token belongs to application ${appId}, not ${credentials.appId}`);
 	const owner = app.body.owner as { id?: unknown } | undefined;
-	const hasTeam = app.body.team !== null && app.body.team !== undefined;
+	const team = app.body.team as { members?: unknown } | undefined;
+	// Team members with an accepted invitation own the app alongside its owner
+	// user (discord membership_state 2); invited-only members do not (#862).
+	const teamMemberIds = Array.isArray(team?.members)
+		? team.members
+				.map((member) => member as { membership_state?: unknown; user?: { id?: unknown } })
+				.filter((member) => member.membership_state === 2 && typeof member.user?.id === "string")
+				.map((member) => member.user?.id as string)
+		: [];
+	const hasTeam = team !== null && team !== undefined;
 	const ownerId = !hasTeam && typeof owner?.id === "string" ? owner.id : undefined;
+	const ownerIds = hasTeam ? [...new Set(teamMemberIds)] : ownerId ? [ownerId] : [];
 	return {
 		platform: "discord",
 		summary: `bot named ${String(me.body.username ?? "?")} (${String(me.body.id ?? "?")}) of application ${appId}`,
 		appId,
 		...(ownerId ? { ownerId } : {}),
+		...(ownerIds.length > 0 ? { ownerIds } : {}),
 	};
 }
 
@@ -375,11 +388,19 @@ export interface ApplySetupOptions {
 	readonly home: string;
 	readonly tokens: SetupTokens;
 	readonly owners: readonly string[];
+	/**
+	 * Discord application-owner ids resolved during validation (#862). When the
+	 * gateway config has no `ownerTarget` yet, the first resolved owner prefills
+	 * it as a Discord DM origin; an existing `ownerTarget` is never replaced.
+	 */
+	readonly appOwnerIds?: readonly string[];
 }
 
 export interface AppliedSetup {
 	readonly written: readonly string[];
 	readonly owners: readonly string[];
+	/** The owner peer id prefilled into `ownerTarget`, when setup wrote one (#862). */
+	readonly ownerTargetPrefilled?: string;
 }
 
 /**
@@ -445,15 +466,31 @@ export async function applySetup(options: ApplySetupOptions): Promise<AppliedSet
 	const previousAllowlist = Array.isArray(base.mentionAllowlist)
 		? base.mentionAllowlist.filter((id): id is string => typeof id === "string")
 		: [];
-	const owners = [...new Set([...previousAllowlist, ...options.owners])];
+	// Discord application owners (#862) are authorized via mentionAllowlist and
+	// connection.platformOwnerIds; every accepted team member is listed, not just
+	// the first one (finding 3). ownerTarget is not synthesized from team members
+	// (finding 4); a user-owned app may still have an explicit ownerTarget if set.
+	const appOwnerIds = Array.isArray(options.appOwnerIds)
+		? options.appOwnerIds.filter((id): id is string => typeof id === "string" && /^\d{17,20}$/.test(id))
+		: [];
+	const owners = [...new Set([...previousAllowlist, ...options.owners, ...appOwnerIds])];
+	const existingOwnerTarget =
+		typeof base.ownerTarget === "object" && base.ownerTarget !== null && !Array.isArray(base.ownerTarget)
+			? (base.ownerTarget as Record<string, unknown>)
+			: undefined;
+	const ownerTarget = existingOwnerTarget ?? undefined;
 	const config = {
 		...base,
 		credentials: { ...previousCredentials, ...credentials },
 		...(owners.length > 0 ? { mentionAllowlist: owners } : {}),
+		...(ownerTarget ? { ownerTarget } : {}),
 	};
 	await writePrivateFile(configPath, `${JSON.stringify(config, null, "\t")}\n`);
 	written.push(configPath);
-	return { written, owners };
+	return {
+		written,
+		owners,
+	};
 }
 
 /** Adapters with a config file in `home`, in canonical order: the compose profiles to run. */
@@ -667,8 +704,15 @@ export async function runSetup(args: readonly string[], options: RunSetupOptions
 				owners.push(identity.ownerId);
 				log(`${identity.platform}: allowing DMs from the application owner ${identity.ownerId}`);
 			}
-		const applied = await applySetup({ home: options.home, tokens, owners });
+		const applied = await applySetup({
+			home: options.home,
+			tokens,
+			owners,
+			...(discordIdentity?.ownerIds ? { appOwnerIds: discordIdentity.ownerIds } : {}),
+		});
 		for (const path of applied.written) log(`wrote ${path}`);
+		if (applied.ownerTargetPrefilled)
+			log(`ownerTarget prefilled from the Discord application owner (issue #862): ${applied.ownerTargetPrefilled}`);
 		if (applied.owners.length === 0)
 			log(
 				"warning: no owner id configured; the gateway declines every DM until config.json mentionAllowlist names you (rerun setup with --owner ID)",
