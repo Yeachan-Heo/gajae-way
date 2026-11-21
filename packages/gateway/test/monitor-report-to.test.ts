@@ -448,3 +448,129 @@ test("monitors without reportTo do not enqueue or wake an internal report", asyn
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+test("reportTo defaults to channelTarget.origin when not explicitly provided", async () => {
+	const { home, database } = await openTestStore();
+	try {
+		const registry = new MonitorRegistry(database);
+		const channelTarget = { origin: target, mentionUserIds: ["123"] };
+		const monitor = registry.add({
+			name: "defaulted-report",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["default.test"],
+			channelTarget,
+		});
+		expect(monitor.reportTo).toEqual(target);
+	} finally {
+		database.close();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("reportTo is undefined when channelTarget is not provided", async () => {
+	const { home, database } = await openTestStore();
+	try {
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "no-channel",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["nochannel.test"],
+		});
+		expect(monitor.reportTo).toBeUndefined();
+	} finally {
+		database.close();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("reportTo explicit null overrides channelTarget default", async () => {
+	const { home, database } = await openTestStore();
+	try {
+		const registry = new MonitorRegistry(database);
+		const channelTarget = { origin: target };
+		const monitor = registry.add({
+			name: "explicit-null",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["explicit.null"],
+			channelTarget,
+			reportTo: null,
+		});
+		expect(monitor.reportTo).toBeNull();
+	} finally {
+		database.close();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("reportTo update defaults when channelTarget is updated without explicit reportTo", async () => {
+	const { home, database } = await openTestStore();
+	try {
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "update-channel",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["update.channel"],
+		});
+		expect(monitor.reportTo).toBeUndefined();
+
+		const newTarget: OriginRef = { platform: "discord", kind: "channel", conversationId: "new-room" };
+		const updated = registry.update({
+			monitorId: monitor.monitorId,
+			channelTarget: { origin: newTarget },
+		});
+		expect(updated?.reportTo).toEqual(newTarget);
+	} finally {
+		database.close();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("explicit reportTo is preserved on channelTarget update", async () => {
+	const { home, database } = await openTestStore();
+	try {
+		const registry = new MonitorRegistry(database);
+		const differentTarget: OriginRef = { platform: "discord", kind: "channel", conversationId: "other-room" };
+		const monitor = registry.add({
+			name: "explicit-report",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["explicit.report"],
+			reportTo: differentTarget,
+		});
+		expect(monitor.reportTo).toEqual(differentTarget);
+
+		const newChannelTarget: OriginRef = { platform: "discord", kind: "channel", conversationId: "new-room" };
+		const updated = registry.update({
+			monitorId: monitor.monitorId,
+			channelTarget: { origin: newChannelTarget },
+		});
+		// Should keep the explicitly set reportTo, not default to the new channel
+		expect(updated?.reportTo).toEqual(differentTarget);
+	} finally {
+		database.close();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("reportTo is cleared when channelTarget is removed", async () => {
+	const { home, database } = await openTestStore();
+	try {
+		const registry = new MonitorRegistry(database);
+		const channelTarget = { origin: target };
+		const monitor = registry.add({
+			name: "remove-channel",
+			trigger: { kind: "cron", schedule: "*/5 * * * *" },
+			eventTypes: ["remove.channel"],
+			channelTarget,
+		});
+		expect(monitor.reportTo).toEqual(target);
+
+		const updated = registry.update({
+			monitorId: monitor.monitorId,
+			channelTarget: null,
+		});
+		expect(updated?.reportTo).toBeUndefined();
+	} finally {
+		database.close();
+		await rm(home, { recursive: true, force: true });
+	}
+});

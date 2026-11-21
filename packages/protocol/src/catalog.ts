@@ -586,7 +586,7 @@ export interface MonitorSpec {
 	 * seeded with the monitor digest. Unset means never roll on context size.
 	 */
 	readonly contextRollTokens?: number;
-	/** Inject each reportable authored result as an internal report into this conversation session. */
+	/** Inject each reportable authored result as an internal report into this conversation session. When a monitor has a channelTarget and reportTo is not explicitly provided, it defaults to channelTarget.origin. Set to null to suppress internal reports while keeping channel delivery. */
 	readonly reportTo?: OriginRef | null;
 	readonly enabled?: boolean;
 }
