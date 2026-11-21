@@ -355,10 +355,11 @@ export function replyThreadTs(message: Pick<ChatMessagePayload, "origin" | "repl
 export interface SlackPostedMessages {
 	remember(origin: OriginRef, channel: string, ts: string, text: string, threadTs: string | undefined): void;
 	/**
-	 * Told of a file upload before it posts, which returns no message ts: the share's own message
-	 * event is matched to this origin later. The returned function withdraws it if the upload fails.
+	 * Told of a file upload's reserved Slack file id before it completes (the upload returns no
+	 * message ts): the share's own message event is matched to this origin by that id later.
+	 * The returned function withdraws it if the upload fails.
 	 */
-	expectFileShare?(origin: OriginRef, channel: string, threadTs: string | undefined, name: string): () => void;
+	expectFileShare?(fileId: string, origin: OriginRef): () => void;
 }
 
 export async function settleSlackDelivery(
@@ -505,9 +506,12 @@ export async function settleSlackFile(
 		const threadTs = replyThreadTs(message);
 		const bytes = await readOutboundFile(message.file);
 		const initialComment = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : undefined;
-		// Registered before the upload: Slack's message event for the share can beat its HTTP response.
-		withdraw = posted?.expectFileShare?.(message.origin, channel, threadTs, message.file.name);
-		await api.uploadFile(channel, { name: message.file.name, bytes }, threadTs, initialComment);
+		// Registered when Slack reserves the file id, before completion: the share's message event
+		// can beat the upload's HTTP response.
+		const origin = message.origin;
+		await api.uploadFile(channel, { name: message.file.name, bytes }, threadTs, initialComment, (fileId) => {
+			withdraw = posted?.expectFileShare?.(fileId, origin);
+		});
 		withdraw = undefined;
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
@@ -1101,12 +1105,15 @@ export async function startSlackAdapter(
 	// where it sits; an own share with no recorded upload stays unknown (channel fallback).
 	const rememberOwnFileShare = (message: SlackInboundMessage): void => {
 		const own = message.user === identity.botUserId || (identity.botId && message.bot_id === identity.botId);
-		const name = message.files?.[0]?.name;
-		if (!own || !name || !message.channel || !message.ts) return;
+		if (!own || !message.files?.length || !message.channel || !message.ts) return;
 		if (!parseSlackMessageId(`${message.channel}:${message.ts}`)) return;
-		const threadTs = message.thread_ts && message.thread_ts !== message.ts ? message.thread_ts : undefined;
-		const origin = fileShares.claim(message.channel, threadTs, name);
-		if (origin) rememberOrigin(slackMessageId(message.channel, message.ts), origin);
+		for (const file of message.files) {
+			const origin = file.id ? fileShares.claim(file.id) : undefined;
+			if (origin) {
+				rememberOrigin(slackMessageId(message.channel, message.ts), origin);
+				return;
+			}
+		}
 	};
 	const roots = new SlackRootTexts(api, (text) => normalizeSlackText(text, directory));
 	const posted: SlackPostedMessages = {
@@ -1114,7 +1121,7 @@ export async function startSlackAdapter(
 			rememberOrigin(slackMessageId(channel, ts), origin);
 			if (threadTs === undefined) roots.remember(channel, ts, text);
 		},
-		expectFileShare: (origin, channel, threadTs, name) => fileShares.expect(origin, channel, threadTs, name),
+		expectFileShare: (fileId, origin) => fileShares.expect(fileId, origin),
 	};
 	const gateway = new ReconnectingGateway(
 		config.gatewaySocket ?? join(adapterHome(), "gateway.sock"),

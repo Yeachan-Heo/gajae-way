@@ -1,28 +1,30 @@
 import { expect, test } from "bun:test";
-import { FILE_SHARE_PENDING_TTL_MS, SlackFileShares } from "../src/file-shares";
+import { FILE_SHARE_PENDING_LIMIT, FILE_SHARE_PENDING_TTL_MS, SlackFileShares } from "../src/file-shares";
 
 const channel = { platform: "slack", kind: "channel", conversationId: "C1" } as const;
 const thread = { platform: "slack", kind: "thread", conversationId: "C1:1.0", parentId: "C1" } as const;
 
-test("a share is claimed once, by its place and name, in upload order", () => {
+test("a share is claimed once, by its own file id, whatever order the events arrive in", () => {
 	const shares = new SlackFileShares();
-	shares.expect(thread, "C1", "1.0", "a.txt");
-	shares.expect(channel, "C1", "1.0", "a.txt");
-	expect(shares.claim("C1", "1.0", "b.txt")).toBeUndefined();
-	expect(shares.claim("C1", undefined, "a.txt")).toBeUndefined();
-	expect(shares.claim("C1", "1.0", "a.txt")).toEqual(thread);
-	expect(shares.claim("C1", "1.0", "a.txt")).toEqual(channel);
-	expect(shares.claim("C1", "1.0", "a.txt")).toBeUndefined();
+	shares.expect("F1", thread);
+	shares.expect("F2", channel);
+	expect(shares.claim("F3")).toBeUndefined();
+	expect(shares.claim("F2")).toEqual(channel);
+	expect(shares.claim("F1")).toEqual(thread);
+	expect(shares.claim("F1")).toBeUndefined();
 });
 
-test("a failed upload is withdrawn and a stale one expires", () => {
+test("a failed upload is withdrawn, a stale one expires, and the pending set stays bounded", () => {
 	let clock = 0;
 	const shares = new SlackFileShares(() => clock);
-	const withdraw = shares.expect(thread, "C1", "1.0", "a.txt");
-	withdraw();
-	expect(shares.claim("C1", "1.0", "a.txt")).toBeUndefined();
+	shares.expect("F1", thread)();
+	expect(shares.claim("F1")).toBeUndefined();
 
-	shares.expect(thread, "C1", "1.0", "a.txt");
+	shares.expect("F2", thread);
 	clock += FILE_SHARE_PENDING_TTL_MS;
-	expect(shares.claim("C1", "1.0", "a.txt")).toBeUndefined();
+	expect(shares.claim("F2")).toBeUndefined();
+
+	for (let index = 0; index <= FILE_SHARE_PENDING_LIMIT; index++) shares.expect(`G${index}`, channel);
+	expect(shares.claim("G0")).toBeUndefined();
+	expect(shares.claim(`G${FILE_SHARE_PENDING_LIMIT}`)).toEqual(channel);
 });

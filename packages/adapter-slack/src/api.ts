@@ -342,6 +342,8 @@ export class SlackWebApi {
 		file: { readonly name: string; readonly bytes: Uint8Array },
 		threadTs?: string,
 		initialComment?: string,
+		/** Told the reserved Slack file id before the upload completes, so its share event can be matched. */
+		onReserved?: (fileId: string) => void,
 	): Promise<void> {
 		await this.limiter?.acquire(channel, "delivery");
 		let fileId: string;
@@ -356,6 +358,7 @@ export class SlackWebApi {
 					"invalid_upload_reservation",
 					"files.getUploadURLExternal returned no upload_url/file_id",
 				);
+			onReserved?.(reserved.file_id);
 			const sent = await this.fetcher(reserved.upload_url, {
 				method: "POST",
 				headers: { "content-type": "application/octet-stream" },

@@ -11,68 +11,49 @@ interface PendingShare {
 }
 
 /**
- * The logical origin of each file share the adapter uploads, until Slack's own message event for it arrives.
+ * The logical origin of each file the adapter uploads, until Slack's own message event for its share arrives.
  *
  * `files.completeUploadExternal` returns no message ts, so the share's message is known only from the
  * bot's own message event. Where that message sits physically (its `thread_ts`) does not say which
- * session posted it: a channel-origin turn may reply inside a thread. So the upload records the
- * delivery's own origin under the place and file name it posts to, and the event claims it. An own
- * file share with no recorded upload stays unknown and keeps the channel fallback.
+ * session posted it: a channel-origin turn may reply inside a thread. The upload records the delivery's
+ * origin under the Slack file id it reserved, before completing, and the event claims it by
+ * `files[].id`. Ids are unique, so concurrent uploads of one name into one thread cannot swap origins.
+ * An own share with no recorded upload stays unknown and keeps the channel fallback.
  */
 export class SlackFileShares {
-	readonly #pending = new Map<string, PendingShare[]>();
-	#size = 0;
+	readonly #pending = new Map<string, PendingShare>();
 
 	constructor(readonly now: () => number = Date.now) {}
 
-	/** Records an upload about to post; the returned function withdraws it when the upload fails. */
-	expect(origin: OriginRef, channel: string, threadTs: string | undefined, name: string): () => void {
+	/** Records an upload's reserved file id; the returned function withdraws it when the upload fails. */
+	expect(fileId: string, origin: OriginRef): () => void {
 		this.#prune();
-		if (this.#size >= FILE_SHARE_PENDING_LIMIT) this.#dropOldest();
-		const key = shareKey(channel, threadTs, name);
+		if (this.#pending.size >= FILE_SHARE_PENDING_LIMIT) {
+			const oldest = this.#pending.keys().next().value;
+			if (oldest !== undefined) this.#pending.delete(oldest);
+		}
 		const entry: PendingShare = { origin, at: this.now() };
-		const queue = this.#pending.get(key) ?? [];
-		queue.push(entry);
-		this.#pending.set(key, queue);
-		this.#size++;
-		return () => this.#remove(key, entry);
+		this.#pending.delete(fileId);
+		this.#pending.set(fileId, entry);
+		return () => {
+			if (this.#pending.get(fileId) === entry) this.#pending.delete(fileId);
+		};
 	}
 
-	/** The origin of the oldest live upload matching this own file-share message, consumed. */
-	claim(channel: string, threadTs: string | undefined, name: string): OriginRef | undefined {
+	/** The origin of the live upload that reserved this file id, consumed. */
+	claim(fileId: string): OriginRef | undefined {
 		this.#prune();
-		const key = shareKey(channel, threadTs, name);
-		const entry = this.#pending.get(key)?.[0];
+		const entry = this.#pending.get(fileId);
 		if (!entry) return undefined;
-		this.#remove(key, entry);
+		this.#pending.delete(fileId);
 		return entry.origin;
-	}
-
-	#remove(key: string, entry: PendingShare): void {
-		const queue = this.#pending.get(key);
-		const index = queue?.indexOf(entry) ?? -1;
-		if (!queue || index < 0) return;
-		queue.splice(index, 1);
-		this.#size--;
-		if (queue.length === 0) this.#pending.delete(key);
 	}
 
 	#prune(): void {
 		const cutoff = this.now() - FILE_SHARE_PENDING_TTL_MS;
-		for (const [key, queue] of this.#pending)
-			for (const entry of [...queue]) if (entry.at <= cutoff) this.#remove(key, entry);
-	}
-
-	#dropOldest(): void {
-		let oldest: { key: string; entry: PendingShare } | undefined;
-		for (const [key, queue] of this.#pending) {
-			const entry = queue[0];
-			if (entry && (!oldest || entry.at < oldest.entry.at)) oldest = { key, entry };
+		for (const [fileId, entry] of this.#pending) {
+			if (entry.at > cutoff) break;
+			this.#pending.delete(fileId);
 		}
-		if (oldest) this.#remove(oldest.key, oldest.entry);
 	}
-}
-
-function shareKey(channel: string, threadTs: string | undefined, name: string): string {
-	return JSON.stringify([channel, threadTs ?? "", name]);
 }

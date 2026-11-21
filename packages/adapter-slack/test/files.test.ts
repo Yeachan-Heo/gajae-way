@@ -66,7 +66,16 @@ async function fileDelivery(extra: Partial<ChatMessagePayload> = {}): Promise<Ch
 
 test("uploadFile reserves a URL, sends the bytes there without the bot token, and completes into the thread", async () => {
 	const { api, sent } = uploadFixture();
-	await api.uploadFile("C1", { name: "report.csv", bytes: new TextEncoder().encode("a,b\n") }, "1726543210.000100");
+	const reserved: string[] = [];
+	await api.uploadFile(
+		"C1",
+		{ name: "report.csv", bytes: new TextEncoder().encode("a,b\n") },
+		"1726543210.000100",
+		undefined,
+		(fileId) => reserved.push(`${fileId} after ${sent.length} request(s)`),
+	);
+	// The reserved id is reported before the bytes go out, so a share event can never beat it.
+	expect(reserved).toEqual(["F123 after 1 request(s)"]);
 	expect(sent.map((request) => request.url)).toEqual([
 		"https://slack.com/api/files.getUploadURLExternal",
 		"https://files.slack.com/upload/v1/abc",
