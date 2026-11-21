@@ -884,7 +884,8 @@ export class BrokerSessionPort implements SessionPort {
 		}
 		const persistedEpoch = this.#database.bindings.getSessionRecord(input.originKey)?.epoch;
 		if (persistedEpoch !== undefined && persistedEpoch > input.epoch) {
-			this.#releaseOperation(intent);
+			// The broker created a session, but the old epoch can no longer bind it.
+			// Keep the intent as evidence until the orphan can be reconciled.
 			throw new Error(`session bind for ${input.originKey} epoch ${input.epoch} lost to epoch ${persistedEpoch}`);
 		}
 		// Persist ownership before waiting for Router indexing, but retain the

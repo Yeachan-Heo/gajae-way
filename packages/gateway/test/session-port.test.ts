@@ -114,6 +114,21 @@ function createSuccess(sessionId: string) {
 	};
 }
 
+test("a successful create that loses its epoch retains its unreconciled intent", async () => {
+	const originKey = "work/task/epoch-race";
+	const run: CliRunner = async (args) => {
+		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
+		database!.transaction((tx) => database!.bindings.rotateEpoch(tx, originKey));
+		return createSuccess("created-after-epoch-rotation");
+	};
+	const { port, repo, database: store } = await brokerPortFixture(run);
+	await expect(port.bind({ originKey, epoch: 0, repo })).rejects.toThrow("lost to epoch 1");
+	const authority = store.bindings.brokerAuthority()!;
+	expect(store.bindings.brokerOperation(authority, "session.create", JSON.stringify([originKey, 0]))?.state).toBe(
+		"pending",
+	);
+});
+
 test("an unknown startup model fails without poisoning create keys and can be corrected", async () => {
 	let createCalls = 0;
 	const createKeys: string[] = [];
