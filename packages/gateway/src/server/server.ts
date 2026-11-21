@@ -633,6 +633,8 @@ async function waitForRestartTerminalDelivery(runtime: Runtime, terminalDelivery
 async function waitForRestartTerminalDeliveries(runtime: Runtime, database: Store, waitMs: number): Promise<boolean> {
 	const deadline = Date.now() + waitMs;
 	let probeFailureLogged = false;
+	const ACK_TIMEOUT_MS = 60 * 1_000; // must match ACK_TIMEOUT_MS in outbox.ts
+	const MIN_DELIVERY_AGE_FOR_FORCE_FAIL_MS = 2 * 1_000; // force-fail deliveries at least 2s old
 	try {
 		for (const id of database.outbox.unsettledTerminalDeliveryIds()) runtime.restartTerminalDeliveryIds.add(id);
 		const deliveries = runtime.delivery.getMany([...runtime.restartTerminalDeliveryIds]);
@@ -647,10 +649,43 @@ async function waitForRestartTerminalDeliveries(runtime: Runtime, database: Stor
 		const deliveryIds = [...runtime.restartTerminalDeliveryIds];
 		if (deliveryIds.length === 0) return true;
 		try {
+			const now = Date.now();
 			const deliveries = runtime.delivery.getMany(deliveryIds);
-			for (const delivery of deliveries)
-				if (delivery.state === "confirmed" || delivery.state === "expired")
+			for (const delivery of deliveries) {
+				if (delivery.state === "confirmed" || delivery.state === "expired") {
 					runtime.restartTerminalDeliveryIds.delete(delivery.deliveryId);
+					continue;
+				}
+				// Check if delivery is old enough and stuck in an unsettled state
+				const deliveryAge = now - Date.parse(delivery.createdAt);
+				const timeSinceUpdate = now - Date.parse(delivery.updatedAt);
+				const shouldForceFailInflight =
+					delivery.state === "inflight" && (timeSinceUpdate >= ACK_TIMEOUT_MS || deliveryAge >= ACK_TIMEOUT_MS);
+				const shouldForceFailAmbiguous =
+					delivery.state === "failed_ambiguous" && deliveryAge >= MIN_DELIVERY_AGE_FOR_FORCE_FAIL_MS;
+
+				if (shouldForceFailInflight) {
+					database.transaction((tx) =>
+						database.outbox.fail(tx, delivery.deliveryId, true, "restart drain: adapter ack timeout"),
+					);
+					console.info(
+						`restart terminal delivery failed during drain: deliveryId=${delivery.deliveryId} state=inflight age=${deliveryAge}ms updated=${timeSinceUpdate}ms`,
+					);
+					// Reload delivery state after update
+					const updated = runtime.delivery.get(delivery.deliveryId);
+					if (updated?.state === "expired") runtime.restartTerminalDeliveryIds.delete(delivery.deliveryId);
+				} else if (shouldForceFailAmbiguous) {
+					database.transaction((tx) =>
+						database.outbox.fail(tx, delivery.deliveryId, false, "restart drain: unresolved failure"),
+					);
+					console.info(
+						`restart terminal delivery failed during drain: deliveryId=${delivery.deliveryId} state=failed_ambiguous age=${deliveryAge}ms attempts=${delivery.attempts}`,
+					);
+					// Reload delivery state after update
+					const updated = runtime.delivery.get(delivery.deliveryId);
+					if (updated?.state === "expired") runtime.restartTerminalDeliveryIds.delete(delivery.deliveryId);
+				}
+			}
 			if (deliveries.length === deliveryIds.length && deliveries.every((delivery) => delivery.state === "confirmed"))
 				return true;
 		} catch (error) {
