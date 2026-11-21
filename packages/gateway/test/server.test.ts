@@ -1262,6 +1262,61 @@ test("an expired monitor delivery fails its authored events with evidence; a con
 	client.close();
 });
 
+test("expired monitor delivery escalates a terminal failure streak immediately (#781)", async () => {
+	const { client, database } = await startDeliveryServer();
+	const origin = { platform: "loopback", kind: "loopback", conversationId: "loopback" } as const;
+	const monitor = new MonitorRegistry(database).add({
+		name: "expired-streak",
+		trigger: { kind: "cron", schedule: "0 */2 * * *" },
+		eventTypes: ["test.expired"],
+		burstPolicy: "serialize",
+		channelTarget: { origin },
+	});
+	const sessionOrigin = `monitor/eventtype/test.expired/parent=${monitor.monitorId}`;
+	const now = Date.now();
+	for (let i = 0; i < 3; i++) {
+		database.transaction((tx) => {
+			database.monitors.eventCreate(tx, {
+				eventId: `expiry-streak-${i}`,
+				monitorId: monitor.monitorId,
+				eventType: "test.expired",
+				sessionOriginKey: sessionOrigin,
+				payloadJson: "{}",
+				firedAt: new Date(now + i).toISOString(),
+			});
+			database.monitors.eventUpdate(
+				tx,
+				`expiry-streak-${i}`,
+				i === 2 ? "authored" : "failed_no_retry",
+				i === 2 ? "expiry-batch" : null,
+			);
+		});
+	}
+	const deliveryId = "expiry-streak-delivery";
+	new DeliveryService(database).createPending({
+		deliveryId,
+		turnId: "expiry-batch",
+		originKey: originKey(origin),
+		payloadJson: "{}",
+	});
+	for (let attempt = 1; attempt <= 5; attempt++) {
+		const id = `expiry-streak-fail-${attempt}`;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "delivery.fail",
+			params: { deliveryId, reason: "offline", ambiguous: false },
+		});
+		await waitFrame(client.frames, id);
+	}
+	expect(database.monitors.eventGet("expiry-streak-2")?.stage).toBe("failed_no_retry");
+	const escalations = database.outbox.rows().filter((row) => row.payload_json.includes("[monitor escalation]"));
+	expect(escalations).toHaveLength(1);
+	expect(database.monitors.pendingExpiredEscalations()).toEqual([]);
+	client.close();
+});
+
 test("the sweep expires a stale unsettled row and alerts once even with no adapter connected", async () => {
 	const logs: string[] = [];
 	const originalError = console.error;

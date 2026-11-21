@@ -84,19 +84,164 @@ afterEach(async () => {
 
 async function brokerPortFixture(cli: CliRunner, instanceId = "session-port-rebind") {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-rebind-"));
-	database = await Store.open(join(home, "gateway.db"));
+	const store = await Store.open(join(home, "gateway.db"));
+	database = store;
 	const agentDir = join(home, "agent");
-	const authority = initializeTestBrokerAuthority(database, agentDir);
+	const authority = initializeTestBrokerAuthority(store, agentDir);
 	const repo = join(home, "workspace");
 	const port = new BrokerSessionPort({
 		authority,
-		database,
+		database: store,
 		cli,
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 		sleep: async () => {},
 	});
-	return { port, repo, database, agentDir };
+	return { port, repo, database: store, agentDir, authority };
 }
+
+test("pending session.create observation is scoped to its origin and epoch", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-pending-session-create-"));
+	const store = await Store.open(join(home, "gateway.db"));
+	database = store;
+	const agentDir = join(home, "agent");
+	const authority = initializeTestBrokerAuthority(store, agentDir);
+	const repo = join(home, "workspace");
+	const port = new BrokerSessionPort({
+		database: store,
+		authority,
+		cli: async () => {
+			throw new Error("the journal query must not invoke the broker CLI");
+		},
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	const originKey = "discord/dm/pending-create";
+	const scope = JSON.stringify([originKey, 7]);
+	store.transaction((tx) =>
+		store.bindings.beginBrokerOperation(tx, authority, {
+			operation: "session.create",
+			scope,
+			operationRef: "gw-test-pending-create",
+			requestJson: JSON.stringify({ cwd: repo }),
+		}),
+	);
+
+	expect(port.hasPendingSessionCreate({ originKey, epoch: 7 })).toBe(true);
+	expect(port.hasPendingSessionCreate({ originKey, epoch: 8 })).toBe(false);
+	expect(port.hasPendingSessionCreate({ originKey: `${originKey}-other`, epoch: 7 })).toBe(false);
+	const createdAt = store.bindings.pendingSessionCreateCreatedAt(authority, scope);
+	if (createdAt === undefined) throw new Error("pending create timestamp was not recorded");
+	const readinessExpiredPort = new BrokerSessionPort({
+		database: store,
+		authority,
+		cli: async () => {
+			throw new Error("the readiness query must not invoke the broker CLI");
+		},
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+		now: () => createdAt + 60_001,
+	});
+	const readinessBudgetPort = new BrokerSessionPort({
+		database: store,
+		authority,
+		cli: async () => {
+			throw new Error("the readiness query must not invoke the broker CLI");
+		},
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+		now: () => createdAt + 60_000,
+	});
+	expect(readinessExpiredPort.pendingSessionCreateExceededReadiness({ originKey, epoch: 7 })).toBe(true);
+	expect(readinessBudgetPort.pendingSessionCreateExceededReadiness({ originKey, epoch: 7 })).toBe(false);
+});
+
+test("retired-create reconciliation queries pending scopes instead of scanning every prior epoch", async () => {
+	const originKey = "discord/dm/bounded-retired-create-reconciliation";
+	const epoch = 1_000;
+	const sessionId = "fresh-bounded-reconciliation-session";
+	const { port, repo, database } = await brokerPortFixture(async (args) => {
+		if (args.includes("session.create")) return createSuccess(sessionId);
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: { session: { sessionId, live: true, deleted: false, locator: { cwd: repo } } },
+				}),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	});
+	database.transaction((tx) => {
+		for (let priorEpoch = 0; priorEpoch < epoch; priorEpoch++) database.bindings.rotateEpoch(tx, originKey);
+	});
+	const brokerOperation = database.bindings.brokerOperation.bind(database.bindings);
+	let operationLookups = 0;
+	database.bindings.brokerOperation = (authority, operation, scope) => {
+		operationLookups++;
+		return brokerOperation(authority, operation, scope);
+	};
+
+	await expect(port.bind({ originKey, epoch, repo })).resolves.toMatchObject({ sessionId, epoch });
+	expect(operationLookups).toBeLessThan(8);
+});
+
+test("binding a fresh epoch replays and retires an orphaned pending create", async () => {
+	const originKey = "discord/dm/retired-pending-create";
+	const oldScope = JSON.stringify([originKey, 0]);
+	const oldOperationRef = "gw-retired-pending-create";
+	const oldSessionId = "orphaned-old-session";
+	const freshSessionId = "fresh-epoch-session";
+	const createKeys: string[] = [];
+	const closedSessionIds: string[] = [];
+	const run: CliRunner = async (args) => {
+		if (args.includes("session.create")) {
+			const key = args[args.indexOf("--idempotency-key") + 1] ?? "";
+			createKeys.push(key);
+			return createSuccess(key === oldOperationRef ? oldSessionId : freshSessionId);
+		}
+		if (args.includes("session.close")) {
+			const request = JSON.parse(args[args.indexOf("--json-input") + 1] ?? "{}") as { sessionId?: string };
+			if (request.sessionId) closedSessionIds.push(request.sessionId);
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: {} }), stderr: "" };
+		}
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						session: { sessionId: args.at(-1), live: true, deleted: false, locator: { cwd: "/tmp/workspace" } },
+					},
+				}),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const { port, repo, database, authority } = await brokerPortFixture(run);
+	database.transaction((tx) => {
+		database.bindings.beginBrokerOperation(tx, authority, {
+			operation: "session.create",
+			scope: oldScope,
+			operationRef: oldOperationRef,
+			requestJson: JSON.stringify({ cwd: repo }),
+		});
+		database.bindings.rotateEpoch(tx, originKey);
+	});
+
+	await expect(port.bind({ originKey, epoch: 1, repo })).resolves.toMatchObject({
+		sessionId: freshSessionId,
+		epoch: 1,
+	});
+	for (
+		let attempt = 0;
+		attempt < 100 && database.bindings.brokerOperation(authority, "session.create", oldScope);
+		attempt++
+	)
+		await Bun.sleep(10);
+
+	expect(createKeys).toContain(oldOperationRef);
+	expect(closedSessionIds).toContain(oldSessionId);
+	expect(database.bindings.brokerOperation(authority, "session.create", oldScope)).toBeUndefined();
+	expect(database.bindings.getSessionRecord(originKey)).toMatchObject({ sessionId: freshSessionId, epoch: 1 });
+});
 
 function createFailure(code: string, message: string) {
 	return {
@@ -343,6 +488,20 @@ test("session.create diagnostics are sanitized before failures reach callers", a
 	expect(String((failure as Error).message)).not.toContain(secret);
 	expect(JSON.stringify((failure as GjcCliError).details)).not.toContain(secret);
 	expect((failure as GjcCliError).details).toMatchObject({ code: "invalid_params" });
+});
+
+test("a local CLI queue timeout keeps its type through the session port sanitizer (#748)", async () => {
+	const run: CliRunner = async (args) => {
+		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
+		throw new GjcCommandQueueTimeoutError(30000, 4, 16, 16, "session.create");
+	};
+	const { port, repo } = await brokerPortFixture(run);
+	const failure = await port
+		.bind({ originKey: "discord/dm/queue-timeout-bind", epoch: 0, repo })
+		.catch((error: unknown) => error);
+
+	expect(failure).toBeInstanceOf(GjcCommandQueueTimeoutError);
+	expect((failure as GjcCommandQueueTimeoutError).timeoutMs).toBe(30000);
 });
 
 test("a binding recorded under a symlinked workspace stays owned when the runtime asks with the resolved path", async () => {
@@ -759,6 +918,31 @@ test("generic inspect errors preserve saved authority and do not trigger a repla
 	});
 	expect(calls).toHaveLength(1);
 	expect(database.bindings.getSessionRecord("generic-inspect-error")).toMatchObject({ sessionId: "saved-1", epoch: 0 });
+});
+
+test("queue congestion during saved-session inspection cannot fabricate a ready binding", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-inspect-queue-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "saved-1",
+		repo,
+		originKey: "inspect-queue",
+		epoch: 0,
+	});
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: async () => {
+			throw new GjcCommandQueueTimeoutError(30);
+		},
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	await expect(port.bind({ originKey: "inspect-queue", epoch: 0, repo })).rejects.toBeInstanceOf(
+		GjcCommandQueueTimeoutError,
+	);
+	expect(database.bindings.getSessionRecord("inspect-queue")).toEqual({ sessionId: "saved-1", epoch: 0 });
 });
 
 test("structured nonzero session failures survive normalization at the global lifecycle route", async () => {

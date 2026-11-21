@@ -122,6 +122,7 @@ export interface MonitorEventDbRow {
 	readonly event_id: string;
 	readonly monitor_id: string;
 	readonly event_type: string;
+	readonly session_origin_key: string | null;
 	readonly payload_json: string;
 	readonly fired_at: string;
 	readonly stage: string;
@@ -130,6 +131,8 @@ export interface MonitorEventDbRow {
 	readonly skipped_by: string | null;
 	readonly updated_at: string;
 	readonly procedure_json: string | null;
+	/** Epoch of the origin's session binding at admission; 0 when the origin had no binding. */
+	readonly escalation_epoch: number;
 }
 
 const REPLAYABLE_MONITOR =
@@ -344,6 +347,7 @@ export class MonitorsGroup {
 			eventId: string;
 			monitorId: string;
 			eventType: string;
+			sessionOriginKey?: string;
 			payloadJson: string;
 			firedAt: string;
 			overlap?: "queue" | "skip";
@@ -354,21 +358,40 @@ export class MonitorsGroup {
 			row.overlap === "skip"
 				? `(SELECT event_id FROM monitor_events WHERE monitor_id = ? AND stage IN (${IN_FLIGHT_MONITOR_STAGES}) AND ${REPLAYABLE_MONITOR} ORDER BY fired_at, rowid LIMIT 1)`
 				: "NULL";
+		// Event rows carry the epoch of their origin's session binding at admission
+		// time so the failure-streak count can be scoped to that epoch even after the
+		// binding rotates. COALESCE covers targetless events (no binding row) with 0.
 		const inserted = this.#db
 			.prepare(
-				`INSERT INTO monitor_events (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, skipped_by, updated_at) SELECT ?, ?, ?, ?, ?, CASE WHEN p.id IS NULL THEN 'admitted' ELSE 'skipped' END, NULL, p.id, ? FROM (SELECT ${predecessor} AS id) AS p RETURNING skipped_by`,
+				`INSERT INTO monitor_events (event_id, monitor_id, event_type, session_origin_key, escalation_epoch, payload_json, fired_at, stage, batch_id, skipped_by, updated_at) SELECT ?, ?, ?, ?, COALESCE((SELECT epoch FROM sessions WHERE origin_key = ?), 0), ?, ?, CASE WHEN p.id IS NULL THEN 'admitted' ELSE 'skipped' END, NULL, p.id, ? FROM (SELECT ${predecessor} AS id) AS p RETURNING skipped_by`,
 			)
 			.getWithWrite(
 				tx,
 				row.eventId,
 				row.monitorId,
 				row.eventType,
+				row.sessionOriginKey ?? null,
+				row.sessionOriginKey ?? null,
 				row.payloadJson,
 				row.firedAt,
 				new Date().toISOString(),
 				...(row.overlap === "skip" ? [row.monitorId] : []),
 			) as { skipped_by: string | null } | null;
 		return inserted?.skipped_by ?? undefined;
+	}
+
+	/** Capture an event's dispatch scope once; a later monitor update cannot reassign it. */
+	eventSetSessionOrigin(tx: WriteTx, eventId: string, sessionOriginKey: string): boolean {
+		const row = this.#db
+			.prepare("SELECT session_origin_key FROM monitor_events WHERE event_id = ?")
+			.getWithWrite(tx, eventId) as { session_origin_key: string | null } | null;
+		if (!row) return false;
+		if (row.session_origin_key !== null) return row.session_origin_key === sessionOriginKey;
+		return (
+			this.#db
+				.prepare("UPDATE monitor_events SET session_origin_key = ? WHERE event_id = ? AND session_origin_key IS NULL")
+				.run(tx, sessionOriginKey, eventId).changes === 1
+		);
 	}
 
 	#supersedeFailedPredecessors(tx: WriteTx, monitorId: string, successorId: string): void {
@@ -754,7 +777,18 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				`delivery ${deliveryId} expired after ${attempts} attempts: ${reason}`,
 			);
 		}
+		for (const { event_id } of events) this.#core.metaSet(`monitor_escalation_pending:${event_id}`, "1");
 		return events.map((row) => row.event_id);
+	}
+
+	/** Durable work left when delivery expiry commits before escalation is checked. */
+	pendingExpiredEscalations(): string[] {
+		const prefix = "monitor_escalation_pending:";
+		return this.#core.metaKeysInRange(prefix, `${prefix}\uffff`).map((key) => key.slice(prefix.length));
+	}
+
+	clearExpiredEscalation(eventId: string): void {
+		this.#core.metaDelete(`monitor_escalation_pending:${eventId}`);
 	}
 
 	eventIncrementAttempts(tx: WriteTx, eventId: string): number {
@@ -779,6 +813,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		order: "newest" | "oldest" = "newest",
 		includeQuarantined = false,
 		limit?: number,
+		offset = 0,
 	): MonitorEventDbRow[] {
 		const direction = order === "oldest" ? "ASC" : "DESC";
 		const terms = [
@@ -787,12 +822,32 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		];
 		const where = terms.filter((term) => term !== undefined).join(" AND ") || "1=1";
 		const params: Array<string | number> = monitorId === undefined ? [] : [monitorId];
-		if (limit !== undefined) params.push(limit);
+		if (limit !== undefined) params.push(limit, offset);
 		return this.#db
 			.prepare(
-				`SELECT * FROM monitor_events WHERE ${where} ORDER BY fired_at ${direction}, rowid ${direction}${limit === undefined ? "" : " LIMIT ?"}`,
+				`SELECT * FROM monitor_events WHERE ${where} ORDER BY fired_at ${direction}, rowid ${direction}${limit === undefined ? "" : " LIMIT ? OFFSET ?"}`,
 			)
 			.all(...params) as MonitorEventDbRow[];
+	}
+
+	/**
+	 * Epoch-scoped variant: a success from a different epoch than `epoch` does NOT
+	 * reopen a streak for the marker minted in `epoch`, because a rotation is a
+	 * recovery boundary per issue #780 P2 #2.
+	 */
+	successAfterEventInEpoch(monitorId: string, sessionOriginKey: string, eventId: string, epoch: number): boolean {
+		return Boolean(
+			this.#db
+				.prepare(
+					`SELECT 1 FROM monitor_events WHERE monitor_id = ? AND session_origin_key = ?
+					 AND stage IN ('delivered', 'authored_no_delivery') AND ${REPLAYABLE_MONITOR}
+					 AND escalation_epoch = ?
+					 AND (fired_at > (SELECT fired_at FROM monitor_events WHERE event_id = ?)
+					 OR (fired_at = (SELECT fired_at FROM monitor_events WHERE event_id = ?)
+					 AND rowid > (SELECT rowid FROM monitor_events WHERE event_id = ?))) LIMIT 1`,
+				)
+				.get(monitorId, sessionOriginKey, epoch, eventId, eventId, eventId),
+		);
 	}
 
 	eventGet(eventId: string, includeQuarantined = false): MonitorEventDbRow | undefined {
@@ -1059,6 +1114,7 @@ ORDER BY monitor_failures.rowid DESC LIMIT ?`,
 			slotAt: string;
 			eventId: string;
 			eventType: string;
+			sessionOriginKey?: string;
 			payloadJson: string;
 			overlap?: "queue" | "skip";
 		},
@@ -1073,6 +1129,7 @@ ORDER BY monitor_failures.rowid DESC LIMIT ?`,
 			eventId: row.eventId,
 			monitorId: row.monitorId,
 			eventType: row.eventType,
+			sessionOriginKey: row.sessionOriginKey,
 			payloadJson: row.payloadJson,
 			firedAt: row.slotAt,
 			...(row.overlap ? { overlap: row.overlap } : {}),
