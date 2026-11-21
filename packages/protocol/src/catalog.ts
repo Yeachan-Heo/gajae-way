@@ -1230,6 +1230,46 @@ export interface OpsCycleParams {
 export const OPS_CYCLE_DEFAULT_LIMIT = 100;
 export const OPS_CYCLE_MAX_LIMIT = 500;
 
+/**
+ * One durable escalated hold an operator can inspect (`ops.holds`) (#859).
+ * Mirrors the gateway's drain-blocking analysis: `wouldBlockDrain` holds are
+ * the ones refusing `ops restart-stack`; the others are exempt by their
+ * elapsed bound or proven host exit and recover after a restart.
+ */
+export interface GatewayHoldReport {
+	readonly originKey: string;
+	readonly opRef: string;
+	readonly sessionId: string | null;
+	readonly triggerState: "pending" | "done" | "other";
+	readonly turnState: string | null;
+	/** Epoch ms since the hold was first durably observed; undefined when unstampable. */
+	readonly heldSinceMs?: number;
+	readonly escalated: boolean;
+	readonly parked: boolean;
+	/** Epoch ms since the hold's host was first read not live. */
+	readonly deadSinceMs?: number;
+	/** The escalation notice was confirmed delivered: the user was told. */
+	readonly noticeConfirmed: boolean;
+	readonly wouldBlockDrain: boolean;
+}
+
+export interface OpsHoldsResult {
+	readonly holds: readonly GatewayHoldReport[];
+}
+
+export interface OpsHoldsAbandonParams {
+	/** The op-ref of the hold to abandon; only one hold is touched. */
+	readonly opRef: string;
+	/** Must be true: abandonment discards the hold's pending-answer fence. */
+	readonly confirm: true;
+}
+
+export interface OpsHoldsAbandonResult {
+	readonly cleared: true;
+	readonly opRef: string;
+	readonly holds: readonly GatewayHoldReport[];
+}
+
 export interface OpsCycleResult {
 	/** Aggregate runtime phase; "degraded" is emitted whenever gates is non-empty. */
 	readonly phase: CyclePhase;
@@ -1407,6 +1447,8 @@ export interface VerbCatalogV01 {
 	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
 	"engagement.panel_response": { params: EngagementPanelResponseParams; result: EngagementPanelResponseResult };
 	"ops.slo": { params: OpsSloParams; result: OpsSloResult };
+	"ops.holds": { params: undefined; result: OpsHoldsResult };
+	"ops.holds.abandon": { params: OpsHoldsAbandonParams; result: OpsHoldsAbandonResult };
 
 	"ops.cycle": { params: OpsCycleParams | undefined; result: OpsCycleResult };
 }
@@ -1461,6 +1503,8 @@ export const VERBS_V01 = [
 	"gateway.reloadConfig",
 	"ops.slo",
 	"ops.cycle",
+	"ops.holds",
+	"ops.holds.abandon",
 ] as const;
 export const EVENTS_V01 = [
 	"chat.message",

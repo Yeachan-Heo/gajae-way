@@ -12,6 +12,7 @@ import {
 	encodeFrame,
 	type Frame,
 	FrameDecoder,
+	type GatewayHoldReport,
 	type HelloPayload,
 	isChatPlatform,
 	isPlatformMessageId,
@@ -1674,11 +1675,22 @@ async function handleRequest(
 					runtime.restartDrainOwners.delete(restartId);
 					throw new ProtocolError("gateway_shutting_down", "gateway stopped before persona turns drained");
 				}
-				if (outcome === "timed_out")
-					throw new ProtocolError(
-						"verb_failed",
-						"persona turn delivery was not confirmed before the restart drain deadline",
-					);
+				if (outcome === "timed_out") {
+					// The cancel status must say WHAT refused the drain (#859): the
+					// manager logged the detail, the receipt carries it, and
+					// `ops holds` lists the same holds for the operator.
+					const blockers = runtime.personaSessions.lastDrainBlockers;
+					const detail =
+						blockers.length > 0
+							? `persona turn delivery was not confirmed before the restart drain deadline; blocking: ${blockers
+									.map(
+										(hold) =>
+											`origin=${hold.originKey} opRef=${hold.opRef} session=${hold.sessionId ?? "none"} reason=stale_escalated_retired_hold heldMs=${hold.heldSinceMs ?? "unknown"}`,
+									)
+									.join("; ")} (run: gajaeway ops holds)`
+							: "persona turn delivery was not confirmed before the restart drain deadline";
+					throw new ProtocolError("verb_failed", detail);
+				}
 				connection.write({
 					v: PROFILE_VERSION,
 					type: "response",
@@ -2074,6 +2086,39 @@ async function handleRequest(
 				result: integrityDatabase(options.database.core),
 			});
 			return;
+		case "ops.holds": {
+			// Owner-gated like every ops verb: a hold list names origins and opRefs.
+			const holds = await runtime.personaSessions.listHolds();
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { holds } });
+			return;
+		}
+		case "ops.holds.abandon": {
+			// Explicit operator instruction (#859): the bounded drain and the cancel
+			// status are the primary path; this settles exactly one named stale
+			// hold whose fence outlived every bound, never a batch operation.
+			const params = (request.params ?? {}) as { opRef?: unknown; confirm?: unknown };
+			if (typeof params.opRef !== "string" || params.opRef.length === 0 || params.opRef.length > 256)
+				throw new ProtocolError("invalid_params", "opRef must be a non-empty string");
+			if (params.confirm !== true)
+				throw new ProtocolError(
+					"invalid_params",
+					"abandoning a hold discards its pending answer fence; rerun with --confirm",
+				);
+			const outcome = await runtime.personaSessions.abandonHold(params.opRef);
+			if (!outcome.cleared)
+				throw new ProtocolError(
+					"verb_failed",
+					`hold ${params.opRef} was not abandoned: ${outcome.reason ?? "unknown"}`,
+				);
+			const holds: GatewayHoldReport[] = [];
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { cleared: true, opRef: params.opRef, holds },
+			});
+			return;
+		}
 		case "session.list": {
 			const sessions = options.database.bindings.sessionRows().map((row) => ({
 				origin: row.origin_ref_json ? JSON.parse(row.origin_ref_json) : LOOPBACK_ORIGIN,
