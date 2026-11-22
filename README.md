@@ -105,7 +105,7 @@ bun -e 'import { installPinnedGjc } from "./packages/cli/src/gjc-install.ts"; co
 ./dist/gajaeway-gateway config check
 ```
 
-Setup asks which adapters to configure and for your platform user ID(s). The default `dmPolicy` is `allowlist`: without any owner/allowlist IDs, all DMs are declined. Discord setup can infer the application owner; Slack and Telegram users should supply their own IDs. Complete each platform's app installation and permissions before chatting.
+Setup asks which adapters to configure and for your platform user ID(s). The default `dmPolicy` is `allowlist`: without any owner/allowlist IDs, all DMs are declined. Discord setup can infer the application owner — for a user-owned app it allows DMs from that owner; for a Team-owned app the members are authorized at runtime by the adapter instead, refreshed every 10 minutes so removing someone from the Team revokes their access without a restart (issue #862); Slack and Telegram users should supply their own IDs. Complete each platform's app installation and permissions before chatting.
 
 Start the broker, gateway, and each configured adapter in separate terminals, in that order. Set the same `GAJAEWAY_HOME` in every terminal and run from the checkout:
 
