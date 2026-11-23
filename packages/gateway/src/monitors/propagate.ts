@@ -2461,7 +2461,9 @@ export class MonitorPropagator {
 				return;
 			}
 			let held: string | undefined;
-			// Independent observations in turn, queue, jobs order do not reserve an idle host.
+			// Independent observations in turn, queue, jobs order do not reserve an idle host;
+			// they only skip a close that would be refused. gjc's idle-fenced close below is
+			// the authority: it checks idleness and fences prompt admission atomically.
 			for (const probe of ["turnRunning", "queueEmpty", "runningJobs"] as const) {
 				if (probe === "queueEmpty" && !this.#sessionPort.queueEmpty) continue;
 				try {
@@ -2498,9 +2500,22 @@ export class MonitorPropagator {
 			});
 			if (!authorized) return;
 			try {
-				await this.#sessionPort.close({ sessionId, repo: this.#repo });
+				// Never forced: work that started after the last probe makes gjc refuse with
+				// `busy` instead of being aborted.
+				await this.#sessionPort.close({ sessionId, repo: this.#repo, ifIdle: true });
 				outcome = "closed";
 			} catch (error) {
+				if (isSessionBusy(error)) {
+					// Not applied and retryable: the host stays live and the record stays for a
+					// later pass, with the diagnostic closing phase cleared. No forced fallback.
+					const { phase: _phase, closeStartedAt: _closeStartedAt, ...idle } = record;
+					const idleRaw = JSON.stringify(idle);
+					this.#database.transaction(() => {
+						if (this.#database.core.metaGet(key) === raw) this.#database.core.metaSet(key, idleRaw);
+					});
+					outcome = "held:busy";
+					return;
+				}
 				const brokerCode =
 					error instanceof GjcCliError && error.exitCode === 0 ? envelopeErrorCode(error.details) : undefined;
 				const code =
