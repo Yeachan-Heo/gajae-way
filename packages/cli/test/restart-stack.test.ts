@@ -1354,7 +1354,7 @@ test("a nonzero systemd-run result fails the receipt and cannot be replayed as a
 		expect(receipt?.state).toBe("failed");
 		expect(receipt?.detail).toContain("systemd-run exited with status 23");
 		expect(receipt?.steps.every((step) => step.result === "skipped")).toBe(true);
-		await expect(runRestartStack({ home, id: receipt!.id })).rejects.toThrow(
+		await expect(runRestartStack({ home, id: receipt?.id ?? "" })).rejects.toThrow(
 			"receipt is failed; refusing to start worker",
 		);
 	} finally {
@@ -1475,28 +1475,28 @@ test("update restart flips gjc pin before broker step and restores on failure", 
 	const { home, cleanup } = await tempHome();
 	const binDir = join(home, "bin");
 	await mkdir(binDir);
-	
+
 	// Set up gjc symlinks and versions
 	const gjcPrefix = join(home, "gjc");
 	await mkdir(gjcPrefix);
 	const oldVersion = "0.19.0";
 	const newVersion = "0.21.0";
-	
+
 	for (const version of [oldVersion, newVersion]) {
 		const versionDir = join(gjcPrefix, version, "bin");
 		await mkdir(versionDir, { recursive: true });
 		await writeFile(join(versionDir, "gjc"), `gjc ${version}`);
 	}
-	
+
 	// Point current symlink to old version initially
 	const currentLink = join(gjcPrefix, "current");
 	await symlink(oldVersion, currentLink, "dir");
-	
+
 	let brokerStepExecuted = false;
 	let pinFlippedBeforeBroker = false;
-	
+
 	try {
-		const receipt = await runRestartStack({
+		const _receipt = await runRestartStack({
 			home,
 			id: "update-with-pin-flip",
 			trigger: "update",
@@ -1524,7 +1524,7 @@ test("update restart flips gjc pin before broker step and restores on failure", 
 			verifyTimeoutMs: 100,
 			sleep: async () => {},
 		});
-		
+
 		// Verify pin was flipped before broker step
 		expect(brokerStepExecuted).toBe(true);
 		expect(pinFlippedBeforeBroker).toBe(true);
@@ -1539,23 +1539,23 @@ test("update restart with pin flip restores pin on drain failure", async () => {
 	const { home, cleanup } = await tempHome();
 	const binDir = join(home, "bin");
 	await mkdir(binDir);
-	
+
 	// Set up gjc symlinks and versions
 	const gjcPrefix = join(home, "gjc");
 	await mkdir(gjcPrefix);
 	const oldVersion = "0.19.0";
 	const newVersion = "0.21.0";
-	
+
 	for (const version of [oldVersion, newVersion]) {
 		const versionDir = join(gjcPrefix, version, "bin");
 		await mkdir(versionDir, { recursive: true });
 		await writeFile(join(versionDir, "gjc"), `gjc ${version}`);
 	}
-	
+
 	// Point current symlink to old version initially
 	const currentLink = join(gjcPrefix, "current");
 	await symlink(oldVersion, currentLink, "dir");
-	
+
 	try {
 		const receipt = await runRestartStack({
 			home,
@@ -1573,7 +1573,7 @@ test("update restart with pin flip restores pin on drain failure", async () => {
 			runner: async () => 0,
 			probe: async () => undefined,
 		});
-		
+
 		// Verify pin stayed on old version since drain failed
 		expect(receipt.state).toBe("failed");
 		expect(receipt.detail).toContain("drain preparation failed");

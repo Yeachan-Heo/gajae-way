@@ -840,43 +840,40 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					// has to come back, so it must not need the gateway to answer first.
 					// It also runs detached: restarting the gateway kills a persona turn that
 					// invoked it, which must not end the sequence half-applied (issue #54).
-				const usage = "usage: gajaeway ops restart-stack [--status]|--recover --confirm-service-manager-settled";
-				const home = gatewayHome();
-				const flag = parsed.rest[1];
-				if (flag === "--run" && parsed.rest.length === 3 && parsed.rest[2]) {
-					// Resolve gjc version to pin after broker restart
-					let gjcVersionToPinAfterBrokerRestart: string | undefined =
-						process.env.GAJAEWAY_GJC_VERSION_TO_PIN;
-					if (gjcVersionToPinAfterBrokerRestart === undefined) {
-						// Try to read from release package.json if present
-						const binDir = process.env.GAJAEWAY_BIN_DIR;
-						if (binDir !== undefined) {
-							const packagePath = join(binDir, "package.json");
-							try {
-								const pkg = JSON.parse(await readFile(packagePath, "utf8")) as {
-									gjc?: { version?: string };
-								};
-								if (typeof pkg.gjc?.version === "string") {
-									gjcVersionToPinAfterBrokerRestart = pkg.gjc.version;
+					const usage = "usage: gajaeway ops restart-stack [--status]|--recover --confirm-service-manager-settled";
+					const home = gatewayHome();
+					const flag = parsed.rest[1];
+					if (flag === "--run" && parsed.rest.length === 3 && parsed.rest[2]) {
+						// Resolve gjc version to pin after broker restart
+						let gjcVersionToPinAfterBrokerRestart: string | undefined = process.env.GAJAEWAY_GJC_VERSION_TO_PIN;
+						if (gjcVersionToPinAfterBrokerRestart === undefined) {
+							// Try to read from release package.json if present
+							const binDir = process.env.GAJAEWAY_BIN_DIR;
+							if (binDir !== undefined) {
+								const packagePath = join(binDir, "package.json");
+								try {
+									const pkg = JSON.parse(await readFile(packagePath, "utf8")) as {
+										gjc?: { version?: string };
+									};
+									if (typeof pkg.gjc?.version === "string") {
+										gjcVersionToPinAfterBrokerRestart = pkg.gjc.version;
+									}
+								} catch {
+									// If we can't read the package.json, continue without the version
 								}
-							} catch {
-								// If we can't read the package.json, continue without the version
 							}
 						}
-					}
 
-					const receipt = await runRestartStack({
-						...options.restartStack?.run,
-						home,
-						id: parsed.rest[2],
-						gatewaySocketPath: parsed.socket,
-						...(process.env.GAJAEWAY_LAUNCH_AGENTS_DIR === undefined
-							? {}
-							: { launchAgentsDir: process.env.GAJAEWAY_LAUNCH_AGENTS_DIR }),
-						...(gjcVersionToPinAfterBrokerRestart === undefined
-							? {}
-							: { gjcVersionToPinAfterBrokerRestart }),
-					});
+						const receipt = await runRestartStack({
+							...options.restartStack?.run,
+							home,
+							id: parsed.rest[2],
+							gatewaySocketPath: parsed.socket,
+							...(process.env.GAJAEWAY_LAUNCH_AGENTS_DIR === undefined
+								? {}
+								: { launchAgentsDir: process.env.GAJAEWAY_LAUNCH_AGENTS_DIR }),
+							...(gjcVersionToPinAfterBrokerRestart === undefined ? {} : { gjcVersionToPinAfterBrokerRestart }),
+						});
 						for (const line of renderRestartReceipt(receipt)) console.log(line);
 						if (receipt.state !== "ok") process.exitCode = 1;
 					} else if (flag === "--status" && parsed.rest.length === 2) {

@@ -774,7 +774,7 @@ async function runRestartStackWithLease(
 	let gatewayRestartAttempted = false;
 	let pinFlippedVersion: string | undefined;
 	let previousPinVersion: string | undefined;
-	
+
 	// Flip the gjc pin before broker restart if requested (issue #876)
 	// This must happen before broker-host verification so it accepts the new version
 	if (options.gjcVersionToPinAfterBrokerRestart !== undefined && receipt.trigger === "update") {
@@ -800,7 +800,7 @@ async function runRestartStackWithLease(
 			return receipt;
 		}
 	}
-	
+
 	for (const step of receipt.steps) {
 		if (receipt.state !== "running") {
 			step.result = "skipped";
