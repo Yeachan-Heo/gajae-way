@@ -8,6 +8,9 @@ import { GjcCliError } from "@gajae-gateway/subsession";
 import {
 	AGENT_RUN_GRACE_MS,
 	AGENT_RUN_MAX_MS,
+	COMPACTION_HOLD_ESCALATED,
+	COMPACTION_UNRESOLVED_ATTEMPTS,
+	deterministicBindHoldDeliveryId,
 	freshTurnAttempt,
 	PERSONA_COMPACTION_TOKENS,
 	PERSONA_PREAMBLE_REFRESH_SENDS,
@@ -17,11 +20,13 @@ import {
 	resetFailedTurn,
 	retryInboundTurn,
 	STALLED_TURN_TERMINAL_TIMEOUT_MS,
+	UNRESOLVED_HOLD_ESCALATED,
 } from "../src/orchestrator/persona-session";
 import { formatFailureNotice } from "../src/orchestrator/rebind";
 import {
 	BrokerSessionPort,
 	ModelNotSelectedError,
+	type SessionBindInput,
 	type SessionCompactionInput,
 	type SessionCompactionResult,
 	type SessionCompactionStatus,
@@ -5640,8 +5645,9 @@ class ContextUsagePort extends ScriptedSessionPort {
 	/** How many sends had been made when each compaction ran. */
 	readonly compactedAfterSends: number[] = [];
 
-	constructor() {
+	constructor(options: { onBind?: (input: SessionBindInput) => string } = {}) {
 		super({
+			...options,
 			onSend: (input, port) => {
 				if (this.failing.has(input.text)) port.fail(input.opRef, "post-start failure");
 				else if (this.autoComplete) port.complete(input.opRef, "ok");
@@ -5649,7 +5655,7 @@ class ContextUsagePort extends ScriptedSessionPort {
 		});
 	}
 
-	async contextUsage(): Promise<SessionContextUsage | undefined> {
+	async contextUsage(_input?: { sessionId: string }): Promise<SessionContextUsage | undefined> {
 		const scripted = this.nextUsageReads.shift();
 		if (scripted === "throw") throw new Error("context read failed");
 		if (scripted === "undefined") return undefined;
@@ -5676,7 +5682,7 @@ async function preambleHarness(
 	port: ScriptedSessionPort,
 	lifecycle: { persona: () => string; bootstrap?: () => string | undefined },
 	log?: (line: string) => void,
-	timers?: Pick<ConstructorParameters<typeof PersonaSessionManager>[0], "setTimeout" | "clearTimeout">,
+	timers?: Pick<ConstructorParameters<typeof PersonaSessionManager>[0], "setTimeout" | "clearTimeout" | "onBindHold">,
 ): Promise<void> {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-preamble-"));
 	database = await Store.open(join(home, "gateway.db"));
@@ -5971,41 +5977,339 @@ for (const read of ["throw", "undefined", "above"] as const) {
 	});
 }
 
-test("behind an unresolved compaction, refused or unanswered runs keep holding and a host answer releases the send with the persona", async () => {
+test("behind an unresolved compaction, refused runs keep holding and an answered failure over a context still above the line sends without claiming compaction", async () => {
 	const port = new ContextUsagePort();
 	const logs: string[] = [];
 	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
 	port.percent = 5;
 	expect(await sendTurn(port, "first")).toBe(PERSONA);
-	// None of these prove the first run ended: another unanswered run, a frame
-	// never written, and a refusal before the host's ordered dispatch. The
-	// dispatcher's own failure (e.g. already compacted) does, and the earlier run
-	// may have compacted, so the persona goes back in.
+	// Neither a frame never written nor a refusal before the host's ordered
+	// dispatch proves the first run ended, and neither is left pending, so each
+	// retry sends one barrier. The dispatcher's own failure (e.g. already
+	// compacted) clears the chain; the context is read again and is still above
+	// the line, so the turn is not reported compacted.
 	await heldByUnresolvedCompaction(
 		port,
 		logs,
 		"held",
 		{ status: "failed", code: "timeout", outcomeUnknown: true },
-		{ status: "failed", outcomeUnknown: true },
 		{ status: "failed", code: "relay_unwritten" },
 		{ status: "failed", code: "session_quiescing" },
 		{ status: "failed", code: "internal", answered: true },
 	);
 	await eventually(() => port.sends.length === 2 && manager!.state(KEY) === "idle", "held turn was not sent");
-	expect(port.sends[1]).toMatchObject({ text: "held", systemPreamble: PERSONA });
-	expect(port.compactedAfterSends).toEqual([1, 1, 1, 1, 1]);
-	expect(logs.filter((line) => line.startsWith("send_pre_send_requeue stage=prepare_context"))).toHaveLength(4);
+	expect(port.sends[1]).toMatchObject({ text: "held" });
+	expect(port.sends[1]!.systemPreamble).toBeUndefined();
+	expect(port.compactedAfterSends).toEqual([1, 1, 1, 1]);
+	expect(logs.filter((line) => line.startsWith("send_pre_send_requeue stage=prepare_context"))).toHaveLength(3);
 	expect(
 		logs
 			.filter((line) => line.startsWith("persona_compaction "))
 			.map((line) => line.match(/status=\w+( code=\w+)?/)?.[0]),
 	).toEqual([
 		"status=failed code=timeout",
-		"status=failed",
 		"status=failed code=relay_unwritten",
 		"status=failed code=session_quiescing",
 		"status=failed code=internal",
 	]);
+	expect(
+		logs.some(
+			(line) =>
+				line.startsWith("persona_compaction_resolved ") &&
+				line.includes("evidence=barrier_answered") &&
+				line.includes("context=above_line"),
+		),
+	).toBe(true);
+	expect(logs.some((line) => line.startsWith("persona_preamble ") && line.includes("reason=compacted"))).toBe(false);
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeUndefined();
+});
+
+test("an answered barrier over a context now below the line sends with the persona", async () => {
+	class ShrinkingBarrierPort extends ContextUsagePort {
+		override async runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult> {
+			const first = this.compactedAfterSends.length === 0;
+			const result = await super.runCompaction(input);
+			// The barrier's own run compacted the session.
+			if (!first) this.percent = 3;
+			return result;
+		}
+	}
+	const port = new ShrinkingBarrierPort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	await heldByUnresolvedCompaction(
+		port,
+		logs,
+		"held",
+		{ status: "failed", code: "timeout", outcomeUnknown: true },
+		{ status: "failed", code: "internal", answered: true },
+	);
+	await eventually(() => port.sends.length === 2 && manager!.state(KEY) === "idle", "held turn was not sent");
+	expect(port.sends[1]).toMatchObject({ text: "held", systemPreamble: PERSONA });
+	expect(port.compactedAfterSends).toEqual([1, 1]);
+	expect(
+		logs.some(
+			(line) =>
+				line.startsWith("persona_compaction_resolved ") &&
+				line.includes("evidence=barrier_answered") &&
+				line.includes("tokens=30000") &&
+				!line.includes("context=above_line"),
+		),
+	).toBe(true);
+	expect(logs.some((line) => line.startsWith("persona_preamble ") && line.includes("reason=compacted"))).toBe(true);
+});
+
+test("an unanswered barrier is never stacked, and after the bound of unresolved retries the turn moves to a fresh session with one notice", async () => {
+	class StuckSessionPort extends ContextUsagePort {
+		override async contextUsage(input?: { sessionId: string }): Promise<SessionContextUsage | undefined> {
+			// Only the stuck session stays above the line; a fresh one is small.
+			if (input && input.sessionId !== "session-e0") return { percent: 1, tokens: 10_000 };
+			return await super.contextUsage(input);
+		}
+	}
+	const port = new StuckSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	const holds: { reason: string; notice: string; message: string }[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), {
+		...FAST_RETRY,
+		onBindHold: ({ reason, notice, trigger }) => {
+			holds.push({ reason, notice, message: trigger.message_id });
+		},
+	});
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	// The first run and its barrier both go unanswered by a host whose relay stays up.
+	await heldByUnresolvedCompaction(
+		port,
+		logs,
+		"held",
+		{ status: "failed", code: "timeout", outcomeUnknown: true },
+		{ status: "failed", outcomeUnknown: true },
+	);
+	await eventually(
+		() => port.sends.length === 2 && manager!.state(KEY) === "idle",
+		"the turn did not move to a fresh session",
+	);
+	// Two runs only: once the barrier went unanswered, retries just read the context.
+	expect(port.compactedAfterSends).toEqual([1, 1]);
+	expect(logs.filter((line) => line.startsWith("persona_compaction_held "))).toHaveLength(
+		COMPACTION_UNRESOLVED_ATTEMPTS - 2,
+	);
+	expect(logs.filter((line) => line.startsWith("send_pre_send_requeue stage=prepare_context"))).toHaveLength(
+		COMPACTION_UNRESOLVED_ATTEMPTS - 1,
+	);
+	expect(
+		logs.filter(
+			(line) =>
+				line.startsWith("persona_compaction_escalated ") &&
+				line.includes("session=session-e0") &&
+				line.includes("nextEpoch=1") &&
+				line.includes(`attempts=${COMPACTION_UNRESOLVED_ATTEMPTS}`),
+		),
+	).toHaveLength(1);
+	// Never sent into the stuck session; the fresh session gets it with the persona.
+	expect(port.sendAttempts.filter((attempt) => attempt.text === "held").map((attempt) => attempt.sessionId)).toEqual([
+		"session-e1",
+	]);
+	expect(port.sends[1]).toMatchObject({ text: "held", sessionId: "session-e1", systemPreamble: PERSONA });
+	expect(database!.bindings.getSessionRecord(KEY)).toMatchObject({ sessionId: "session-e1", epoch: 1 });
+	expect(
+		logs.some(
+			(line) =>
+				line.startsWith("retired_session_host ") &&
+				line.includes("session=session-e0") &&
+				line.includes("reason=compaction_unresolved"),
+		),
+	).toBe(true);
+	expect(holds).toEqual([
+		{ reason: COMPACTION_HOLD_ESCALATED, notice: expect.stringContaining("fresh session"), message: "m-held" },
+	]);
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeUndefined();
+});
+
+test("a barrier left unanswered before a gateway restart is not sent again by the recovered actor", async () => {
+	const port = new ContextUsagePort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	await heldByUnresolvedCompaction(
+		port,
+		logs,
+		"held",
+		{ status: "failed", code: "timeout", outcomeUnknown: true },
+		{ status: "failed", outcomeUnknown: true },
+	);
+	await eventually(() => port.compactedAfterSends.length === 2, "no barrier was run");
+	await eventually(
+		() => JSON.parse(database!.core.metaGet(`compaction-unresolved:${KEY}`) ?? "{}").barrier === true,
+		"the unanswered barrier was not recorded as pending",
+	);
+
+	await manager!.stop();
+	database!.close();
+	database = await Store.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		log: (line) => logs.push(line),
+		...FAST_RETRY,
+		onTurnStart: ({ trigger }) => ({ text: trigger.body, systemPreamble: PERSONA }),
+	});
+	const heldBefore = logs.filter((line) => line.startsWith("persona_compaction_held ")).length;
+	await manager.recover();
+	await eventually(
+		() => logs.filter((line) => line.startsWith("persona_compaction_held ")).length > heldBefore,
+		"the recovered actor did not hold on the pending barrier",
+	);
+	expect(port.compactedAfterSends).toEqual([1, 1]);
+	expect(port.sends).toHaveLength(1);
+
+	// The pending barrier lands: the context reads below the line and the turn goes with the persona.
+	port.percent = 3;
+	await eventually(() => port.sends.length === 2 && manager!.state(KEY) === "idle", "held turn was not sent");
+	expect(port.sends[1]).toMatchObject({ text: "held", systemPreamble: PERSONA });
+	expect(port.compactedAfterSends).toEqual([1, 1]);
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeUndefined();
+});
+
+test("a barrier left pending when its host died starts over on the resumed host instead of counting toward escalation", async () => {
+	class DyingBarrierPort extends ContextUsagePort {
+		killed = false;
+		override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
+			const result = await super.liveness(input);
+			// The requeue after the unanswered barrier still sees the host live; it dies
+			// right after, so the next dispatch resumes the same session on a new host.
+			if (!this.killed && this.compactedAfterSends.length === 2) {
+				this.killed = true;
+				await this.close(input);
+			}
+			return result;
+		}
+	}
+	const port = new DyingBarrierPort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	const sessionId = database!.bindings.getSessionRecord(KEY)!.sessionId;
+	await heldByUnresolvedCompaction(
+		port,
+		logs,
+		"held",
+		{ status: "failed", code: "timeout", outcomeUnknown: true },
+		{ status: "failed", outcomeUnknown: true },
+	);
+	await eventually(() => port.sends.length === 2 && manager!.state(KEY) === "idle", "held turn was not sent");
+	// One barrier on the resumed host proves its chain clear; the turn stays in the same session.
+	expect(port.resumes.map((resume) => resume.sessionId)).toEqual([sessionId]);
+	expect(port.compactedAfterSends).toEqual([1, 1, 1]);
+	expect(port.sends[1]).toMatchObject({ text: "held", sessionId, systemPreamble: PERSONA });
+	expect(
+		logs.some((line) => line.startsWith("persona_compaction_reset ") && line.includes("reason=host_resumed")),
+	).toBe(true);
+	expect(logs.some((line) => line.startsWith("persona_compaction_escalated "))).toBe(false);
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeUndefined();
+});
+
+test("a barrier that compacted sends with the persona even if the context still reads above the line", async () => {
+	const port = new ContextUsagePort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	await heldByUnresolvedCompaction(
+		port,
+		logs,
+		"held",
+		{ status: "failed", code: "timeout", outcomeUnknown: true },
+		{ status: "succeeded", answered: true },
+	);
+	await eventually(() => port.sends.length === 2 && manager!.state(KEY) === "idle", "held turn was not sent");
+	expect(port.sends[1]).toMatchObject({ text: "held", systemPreamble: PERSONA });
+	expect(logs.some((line) => line.startsWith("persona_preamble ") && line.includes("reason=compacted"))).toBe(true);
+});
+
+test("a compaction escalation notice whose hook failed is posted by recovery after a restart", async () => {
+	class StuckSessionPort extends ContextUsagePort {
+		override async contextUsage(input?: { sessionId: string }): Promise<SessionContextUsage | undefined> {
+			if (input && input.sessionId !== "session-e0") return { percent: 1, tokens: 10_000 };
+			return await super.contextUsage(input);
+		}
+	}
+	const port = new StuckSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	const holds: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), {
+		...FAST_RETRY,
+		onBindHold: () => {
+			throw new Error("delivery hook down");
+		},
+	});
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	await heldByUnresolvedCompaction(
+		port,
+		logs,
+		"held",
+		{ status: "failed", code: "timeout", outcomeUnknown: true },
+		{ status: "failed", outcomeUnknown: true },
+	);
+	await eventually(() => port.sends.length === 2 && manager!.state(KEY) === "idle", "held turn was not sent");
+	expect(logs.some((line) => line.startsWith("persona_bind_hold_notice_failed "))).toBe(true);
+	const intents = () =>
+		database!.core.metaKeysInRange("compaction-escalation-notice:", "compaction-escalation-notice:\uffff");
+	expect(intents()).toHaveLength(1);
+
+	await manager!.stop();
+	database!.close();
+	database = await Store.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		log: (line) => logs.push(line),
+		onBindHold: ({ reason, trigger }) => {
+			holds.push(`${reason}:${trigger.message_id}`);
+		},
+		onTurnStart: ({ trigger }) => ({ text: trigger.body, systemPreamble: PERSONA }),
+	});
+	await manager.recover();
+	await eventually(() => holds.length === 1, "the notice was not replayed");
+	expect(holds).toEqual([`${COMPACTION_HOLD_ESCALATED}:m-held`]);
+	expect(intents()).toEqual([]);
+	expect(port.sends).toHaveLength(2);
+});
+
+test("a compaction escalation notice has its own delivery id, apart from other hold notices for the trigger", () => {
+	const ids = new Set(
+		["host_capacity", UNRESOLVED_HOLD_ESCALATED, COMPACTION_HOLD_ESCALATED].map((reason) =>
+			deterministicBindHoldDeliveryId(KEY, "m-1", reason),
+		),
+	);
+	expect(ids.size).toBe(3);
+});
+
+test("a hold stored as a bare session id still holds that session until a barrier answers", async () => {
+	const port = new ContextUsagePort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	database!.core.metaSet(`compaction-unresolved:${KEY}`, database!.bindings.getSessionRecord(KEY)!.sessionId);
+	port.percent = COMPACTION_PERCENT + 5;
+	// The barrier is answered (and compacts): the turn goes with the persona.
+	expect(await sendTurn(port, "held")).toBe(PERSONA);
+	expect(port.compactedAfterSends).toEqual([1]);
+	expect(logs.some((line) => line.startsWith("persona_compaction ") && line.includes("after=unresolved"))).toBe(true);
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeUndefined();
 });
 
 test("an unresolved compaction keeps holding the send after a gateway restart until the host answers", async () => {
@@ -6074,10 +6378,11 @@ test("the unresolved-compaction hold is stored before the first run, so a gatewa
 	await eventually(() => port.compactedAfterSends.length === 1, "compaction did not start");
 	// While the host is compacting, the durable hold already names the session;
 	// a restarted gateway reads it (see the restart test) instead of sending.
-	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBe(
-		database!.bindings.getSessionRecord(KEY)?.sessionId,
-	);
-	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeDefined();
+	expect(JSON.parse(database!.core.metaGet(`compaction-unresolved:${KEY}`) ?? "null")).toEqual({
+		sessionId: database!.bindings.getSessionRecord(KEY)?.sessionId,
+		attempts: 0,
+		barrier: false,
+	});
 	releaseCompaction();
 	await eventually(() => port.sends.length === 1 && manager!.state(KEY) === "idle", "compacted send did not follow");
 	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeUndefined();
