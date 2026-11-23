@@ -668,6 +668,11 @@ test.each<{
 		responses: ["ok", "bad-request"],
 		ambiguous: true,
 	},
+	{
+		name: "a refused plain-text retry of the first chunk is definitive",
+		responses: ["entity", "bad-request"],
+		ambiguous: false,
+	},
 ])("$name", async ({ responses, ambiguous }) => {
 	const home = await temporaryHome();
 	try {
@@ -1159,9 +1164,9 @@ test("progress eviction bounds a cache holding only partly delivered deliveries,
 		Array.from({ length: total }, (_, index) => `partial-${index}`).filter((id) => progress.get(id) !== undefined);
 	for (let index = 0; index < 300; index++) progress.remember(`partial-${index}`, partial());
 	const kept = survivors(300);
-	// With no completed entry to drop, the unresolved pass must still bound the map.
-	expect(kept.length).toBeGreaterThan(0);
-	expect(kept.length).toBeLessThan(300);
+	// With no completed entry to drop, the unresolved pass must still bound the map
+	// at TELEGRAM_PROGRESS_LIMIT.
+	expect(kept).toHaveLength(256);
 	expect(kept).toEqual(Array.from({ length: kept.length }, (_, index) => `partial-${300 - kept.length + index}`));
 	// Remembering an entry again makes it the newest, so the next eviction takes
 	// the one after it.

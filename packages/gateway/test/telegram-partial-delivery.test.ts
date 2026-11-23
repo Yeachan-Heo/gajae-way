@@ -133,10 +133,13 @@ test("an adapter restart before every retry still expires a reply whose later ch
 });
 
 let server: GatewayServer | undefined;
+let database: Store | undefined;
 let home = "";
 afterEach(async () => {
 	await server?.stop();
 	server = undefined;
+	database?.close();
+	database = undefined;
 	if (home) await rm(home, { recursive: true, force: true });
 	home = "";
 });
@@ -158,14 +161,17 @@ test("a socket reconnect resumes a partly delivered reply without reposting its 
 		channels: {},
 		dmPolicy: "open",
 	};
-	const database = await Store.open(config.dbPath);
+	const store = await Store.open(config.dbPath);
+	database = store;
 	const sessionPort = attachTestBrokerOwnership(
-		database,
+		store,
 		sessionPortFromScript({ respond: async () => "unused" }),
 		join(home, "agent"),
 	);
-	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
-	const ledger = new DeliveryService(database);
+	// The store outlives each server so the gateway can restart on the same ledger.
+	const start = () => startUnixServer({ config, database: store, sessionPort });
+	server = await start();
+	const ledger = new DeliveryService(store);
 	const deliveryId = ledger.prepare("turn", origin, reply)?.deliveryId;
 	if (!deliveryId) throw new Error("delivery was not prepared");
 	const state = await TelegramAdapterState.load(home);
@@ -188,13 +194,17 @@ test("a socket reconnect resumes a partly delivered reply without reposting its 
 	expect(ledger.get(deliveryId)).toMatchObject({ state: "pending", attempts: 1 });
 	expect(posted).toHaveLength(1);
 	expect(count(posted, "A")).toBe(4000);
-	// A reconnect (the path the reconnect timer takes) opens a new socket and a new
-	// subscription; the gateway replays the row again on its hello.
+	// The gateway restarts, so the adapter's socket drops. The next request fails
+	// and the adapter's own reconnect timer opens a new socket and subscription;
+	// the restarted gateway replays the row on its hello.
 	refuse = false;
-	await gateway.connect();
+	await server.stop();
+	server = await start();
+	await expect(gateway.request("gateway.status")).rejects.toThrow();
 	await until(() => ledger.get(deliveryId)?.state === "confirmed");
 	expect(ledger.get(deliveryId)?.state).toBe("confirmed");
+	// Resumed at chunk 2: chunk 1 was posted once, before the reconnect.
+	expect(posted).toHaveLength(3);
+	expect(posted[1]).toStartWith("B");
 	expect(posted.join("")).toBe(reply);
-	expect(count(posted, "A")).toBe(4000);
-	expect(posted.join("")).not.toContain("[recovered - may be a duplicate]");
 });
