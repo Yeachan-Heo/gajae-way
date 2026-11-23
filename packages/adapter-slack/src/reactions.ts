@@ -79,16 +79,20 @@ export function describeSlackReaction(
 	event: SlackReactionEvent,
 	botUserId: string,
 	names?: { userName(id: string): string | undefined; channelName(id: string): string | undefined },
+	knownOrigin?: (messageId: string) => OriginRef | undefined,
 ): SlackReactionDescription | undefined {
 	if (event.item.type !== "message" || event.user === botUserId || !event.item.channel || !event.item.ts)
 		return undefined;
-	// Slack reactions carry no thread_ts, so thread reactions resolve to their parent channel.
-	const origin = slackMessageOrigin({ channel: event.item.channel, user: event.user });
+	const targetMessageId = slackMessageId(event.item.channel, event.item.ts);
+	// Slack reactions carry no thread_ts. A reaction follows the session its target message
+	// was routed to or posted from when that is known; otherwise it resolves to the channel.
+	const known = knownOrigin?.(targetMessageId);
+	const origin = known ?? slackMessageOrigin({ channel: event.item.channel, user: event.user });
 	const authorName = names?.userName(event.user);
 	const channelLabel = names?.channelName(event.item.channel);
 	return {
 		origin,
-		targetMessageId: slackMessageId(event.item.channel, event.item.ts),
+		targetMessageId,
 		emoji: reactionFromSlackName(event.reaction)?.emoji ?? `:${event.reaction}:`,
 		action: event.type === "reaction_added" ? "add" : "remove",
 		engagement: {

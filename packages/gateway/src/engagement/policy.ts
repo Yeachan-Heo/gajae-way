@@ -256,9 +256,9 @@ export function decideEngagement(
 
 /**
  * The durable mute key of the visible thread a message belongs to, or undefined
- * when the message is not in a thread. A Slack reply under the persona's own
- * message keeps the channel session (adapter-slack `decideInbound`), so its
- * thread is named by `replyTo.messageId` (`channel:thread_ts`), which is exactly
+ * when the message is not in a thread. Older Slack adapters kept a reply under the
+ * persona's own message on the channel session, and rows recorded that way still
+ * name their thread by `replyTo.messageId` (`channel:thread_ts`), which is exactly
  * the conversation id a thread origin for that root carries.
  */
 export function threadMuteKey(
@@ -277,10 +277,11 @@ export function threadMuteKey(
  * A channel's open policy is not an explicit mention. An adapter that predates
  * `explicitMention` reports a mention only as `mentioned`, which is honoured
  * except in an `open` channel, where such an adapter sets `mentioned` on every
- * message and it says nothing about addressing. A Slack thread kept on the
- * channel session is rooted at the persona's own message, so every reply in it
- * carries `replyTo.fromSelf`: that is thread membership, not a reply, and only
- * a mention unmutes it.
+ * message and it says nothing about addressing. Slack's `replyTo` always names
+ * the thread root, so in a thread rooted at the persona's own message every reply
+ * carries `replyTo.fromSelf`: that is thread membership, not a reply, and only a
+ * mention unmutes it. The Slack adapter also sets `mentioned` on every such reply, so
+ * there the legacy fallback says nothing either and only `explicitMention` counts.
  */
 export function threadMuteAddressed(
 	engagement: EngagementContext | undefined,
@@ -291,10 +292,20 @@ export function threadMuteAddressed(
 	if (
 		engagement?.explicitMention === undefined &&
 		engagement?.mentioned === true &&
+		!slackBotRootThreadReply(engagement, origin) &&
 		resolveChannelPolicy(origin, config)?.engagement !== "open"
 	)
 		return true;
-	return origin.kind === "thread" && engagement?.replyTo?.fromSelf === true;
+	return origin.kind === "thread" && origin.platform !== "slack" && engagement?.replyTo?.fromSelf === true;
+}
+
+/**
+ * A Slack reply under the persona's own root, where `mentioned` is set by membership. It
+ * arrives on the thread origin, or on the channel origin from an older adapter (the form
+ * `threadMuteKey` still maps to its thread); `replyTo.fromSelf` marks both.
+ */
+function slackBotRootThreadReply(engagement: EngagementContext, origin: Pick<OriginRef, "platform">): boolean {
+	return origin.platform === "slack" && engagement.replyTo?.fromSelf === true;
 }
 
 /** The inbound-ledger surface the follow-up signal needs; narrowed so tests need no database. */

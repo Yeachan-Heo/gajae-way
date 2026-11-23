@@ -13,12 +13,18 @@ export interface ModelOverrideStore {
 }
 
 export type ModelRebindIntent =
-	| { readonly kind: "set"; readonly selection: GjcModelSelection }
+	| { readonly kind: "set"; readonly selection: GjcModelSelection; readonly setBy?: string }
 	| { readonly kind: "clear" };
 
 export interface ModelCommandOutcome {
+	/** The reply once any change is applied; a refused change is answered by `modelChangeRefusedText`. */
 	readonly text: string;
-	/** A same-session control transition the per-origin actor must serialize. */
+	/**
+	 * A same-session control transition the per-origin actor must serialize.
+	 * Nothing is persisted yet: the caller records it with
+	 * `commitModelChange` only after gjc accepted the selection, so a
+	 * refused selection can never become the conversation's stored model.
+	 */
 	readonly rebind?: ModelRebindIntent;
 }
 
@@ -151,6 +157,8 @@ export function parseModelArgument(argument: string): GjcModelSelection | { read
 	const raw = argument.trim();
 	if (raw === "") return { error: "empty selection" };
 	if (/\s/.test(raw)) return { error: "a selection cannot contain spaces" };
+	// Telegram autocompletes `/model @bot` in groups; a mention is never a preset.
+	if (raw.startsWith("@")) return { error: "a mention is not a model selection" };
 	const forcedPreset = /^preset:(.+)$/.exec(raw);
 	if (forcedPreset?.[1]) return { preset: forcedPreset[1] };
 	const forcedModel = /^model:(.+)$/.exec(raw);
@@ -160,8 +168,9 @@ export function parseModelArgument(argument: string): GjcModelSelection | { read
 
 /**
  * Executes `/model`, `/model <choice>`, `/model set <choice>` or
- * `/model clear`. A change returns a same-session rebind intent; the actor
- * applies it through `model.set` without changing the conversation epoch.
+ * `/model clear`. A change returns a same-session rebind intent without
+ * writing it; the actor applies it through `model.set` without changing the
+ * conversation epoch, and only an accepted change is committed.
  */
 export function applyModelCommand(
 	text: string,
@@ -189,9 +198,8 @@ export function applyModelCommand(
 			return {
 				text: "cannot live-clear this override because no gateway default model is configured. Set a gateway model or choose an explicit model instead.",
 			};
-		store.transaction((tx) => store.bindings.modelClear(tx, originKey));
 		return {
-			text: `🦞 cleared this conversation's override. ${showEffective()} The model applies from the next turn on this same session.`,
+			text: `🦞 cleared this conversation's override. 🦞 model: **${describeSelection(configModel)}** (gateway default) The model applies from the next turn on this same session.`,
 			rebind: { kind: "clear" },
 		};
 	}
@@ -202,10 +210,43 @@ export function applyModelCommand(
 		return {
 			text: `could not read that selection (${parsed.error}). usage: \`/model\`, \`/model set <preset-or-selector>\`, \`/model clear\``,
 		};
-	store.transaction((tx) => store.bindings.modelSet(tx, originKey, parsed, setBy));
 	const scope = origin.platform === "loopback" ? "this session" : "this conversation";
 	return {
 		text: `🦞 model set to **${describeSelection(parsed)}** for ${scope}. It applies from the next turn on this same session.`,
-		rebind: { kind: "set", selection: parsed },
+		rebind: { kind: "set", selection: parsed, ...(setBy === undefined ? {} : { setBy }) },
 	};
+}
+
+/** Records a change gjc has accepted as the conversation's stored model. */
+export function commitModelChange(store: ModelOverrideStore, originKey: string, change: ModelRebindIntent): void {
+	store.transaction((tx) => {
+		if (change.kind === "set") store.bindings.modelSet(tx, originKey, change.selection, change.setBy);
+		else store.bindings.modelClear(tx, originKey);
+	});
+}
+
+/**
+ * The reply when gjc did not accept a change. Nothing was stored in any case.
+ * Only gjc's stable error code is shown; its prose can carry paths or URLs and
+ * this reply is visible to the whole chat.
+ */
+export function modelChangeRefusedText(
+	change: ModelRebindIntent,
+	result: { readonly kind: "refused" | "partial" | "unbound" | "unavailable"; readonly code: string },
+): string {
+	const what =
+		change.kind === "set" ? `set the model to **${describeSelection(change.selection)}**` : "clear the override";
+	const usage = "usage: `/model`, `/model set <preset-or-selector>`, `/model clear`";
+	switch (result.kind) {
+		case "refused":
+			return `could not ${what}: gjc refused it (${result.code}). The previous model stays in effect. Pick a preset from \`models.yml\` or a \`provider/model\` id. ${usage}`;
+		case "partial":
+			return `could not ${what}: gjc accepted the model but refused its thinking level (${result.code}). Nothing was stored; the next turn re-applies this conversation's stored or default model, and with neither the session may keep the new model at its previous thinking level. ${usage}`;
+		case "unbound":
+			return result.code === "model_not_found"
+				? `could not ${what}: the session could not be opened because gjc does not know the gateway's default model (${result.code}), so the selection was not tried. Fix the gateway's model setting first.`
+				: `could not ${what}: gjc refused to open the session (${result.code}), so the selection was not tried.`;
+		case "unavailable":
+			return `could not ${what}: this conversation's session is no longer running (${result.code}), so nothing was changed. Send a message to reopen it, then run the command again. If messages here are waiting for a model to be selected, \`/new\` starts a fresh session instead (it discards those waiting messages).`;
+	}
 }
