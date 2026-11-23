@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.5.2] - Unreleased
+## [0.5.2] - 2026-11-23
 
 ### Deps
 - **gateway**: Pin GJC 0.22.0 and raise `VERIFIED_GJC_THROUGH` to 0.22; the live contract test (`gjc-contract.e2e.test.ts`) passes on 0.22.0
