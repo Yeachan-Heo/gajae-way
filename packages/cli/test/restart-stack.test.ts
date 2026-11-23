@@ -1720,6 +1720,137 @@ test("update restart restores the pin when the broker start command fails", asyn
 	}
 });
 
+test("manual restart after failed drain flips the pin if it differs from current", async () => {
+	const { home, cleanup } = await tempHome();
+	const binDir = join(home, "bin");
+	await mkdir(binDir);
+
+	// Set up gjc symlinks and versions, simulating post-failed-update state
+	const gjcPrefix = join(home, "gjc");
+	await mkdir(gjcPrefix);
+	const oldVersion = "0.19.0";
+	const newVersion = "0.21.0";
+
+	for (const version of [oldVersion, newVersion]) {
+		const versionDir = join(gjcPrefix, version, "bin");
+		await mkdir(versionDir, { recursive: true });
+		await writeFile(join(versionDir, "gjc"), `gjc ${version}`);
+	}
+
+	// Point current symlink to old version (from before the failed update)
+	const currentLink = join(gjcPrefix, "current");
+	await symlink(oldVersion, currentLink, "dir");
+
+	// Create a release manifest with the new version (from the failed update)
+	const packageJson = join(binDir, "package.json");
+	await writeFile(packageJson, JSON.stringify({ gjc: { version: newVersion } }, null, 2));
+
+	let brokerStepExecuted = false;
+	let pinFlippedBeforeBroker = false;
+	let brokerLease: Lease | undefined;
+
+	try {
+		// Simulate a manual restart-stack after the failed drain.
+		// The trigger is manual, but gjcVersionToPinAfterBrokerRestart is read from binDir.
+		const receipt = await runRestartStack({
+			home,
+			id: "manual-restart-after-failed-drain",
+			trigger: "manual",
+			platform: "darwin",
+			uid: 501,
+			binDir,
+			// Not passing gjcVersionToPinAfterBrokerRestart; it will be read from binDir
+			env: { HOME: home },
+			launchAgentsDir: join(home, "agents"),
+			runner: async (command) => {
+				const joined = command.join(" ");
+				if (joined.includes("dev.gajaeway.broker")) {
+					brokerStepExecuted = true;
+					// Verify pin has been flipped BEFORE broker step
+					const currentTarget = await readlink(currentLink).catch(() => undefined);
+					if (currentTarget === newVersion) {
+						pinFlippedBeforeBroker = true;
+					}
+					// Acquire the lease when the service starts to pass verification
+					if (joined.includes("bootstrap") || joined.includes("kickstart")) {
+						brokerLease = await acquireLease(home, "broker");
+					}
+				}
+				return 0;
+			},
+			probe: async (label) => (label === "dev.gajaeway.broker" ? { pid: process.pid } : undefined),
+			isServiceInstalled: async (label) => label === "dev.gajaeway.broker",
+			binaryModifiedAt: async () => Date.now() - 1000,
+			verifyTimeoutMs: 100,
+			sleep: async () => {},
+		});
+
+		// Verify pin was flipped before broker step
+		expect(brokerStepExecuted).toBe(true);
+		expect(pinFlippedBeforeBroker).toBe(true);
+		const finalPin = await readlink(currentLink);
+		expect(finalPin).toBe(newVersion);
+		// Restart should complete successfully
+		expect(receipt.state).toBe("ok");
+	} finally {
+		await brokerLease?.release();
+		await cleanup();
+	}
+});
+
+test("manual restart fails if pinned version is not installed", async () => {
+	const { home, cleanup } = await tempHome();
+	const binDir = join(home, "bin");
+	await mkdir(binDir);
+
+	// Set up gjc symlinks and versions
+	const gjcPrefix = join(home, "gjc");
+	await mkdir(gjcPrefix);
+	const oldVersion = "0.19.0";
+	const newVersion = "0.21.0";
+
+	// Only install the old version
+	const versionDir = join(gjcPrefix, oldVersion, "bin");
+	await mkdir(versionDir, { recursive: true });
+	await writeFile(join(versionDir, "gjc"), `gjc ${oldVersion}`);
+
+	// Point current symlink to old version
+	const currentLink = join(gjcPrefix, "current");
+	await symlink(oldVersion, currentLink, "dir");
+
+	// Create a release manifest with the new version (not installed)
+	const packageJson = join(binDir, "package.json");
+	await writeFile(packageJson, JSON.stringify({ gjc: { version: newVersion } }, null, 2));
+
+	try {
+		const receipt = await runRestartStack({
+			home,
+			id: "manual-restart-missing-pin",
+			trigger: "manual",
+			platform: "darwin",
+			uid: 501,
+			binDir,
+			env: { HOME: home },
+			launchAgentsDir: join(home, "agents"),
+			runner: async () => 0,
+			probe: async () => undefined,
+		});
+
+		// Restart should fail because the pinned version is not installed
+		expect(receipt.state).toBe("failed");
+		expect(receipt.detail).toContain("pinned gjc version");
+		expect(receipt.detail).toContain("is not installed");
+		expect(receipt.detail).toContain(newVersion);
+		expect(receipt.detail).toContain(oldVersion);
+		// All steps should be skipped
+		for (const step of receipt.steps) {
+			expect(step.result).toBe("skipped");
+		}
+	} finally {
+		await cleanup();
+	}
+});
+
 test("supervisorArgv escapes the gateway cgroup on systemd without bootout", () => {
 	const worker = ["/opt/bin/gajaeway", "ops", "restart-stack", "--run", "r1"];
 	expect(supervisorArgv("darwin", worker, "/h", "r1")).toEqual(worker);

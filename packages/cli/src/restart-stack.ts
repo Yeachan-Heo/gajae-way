@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { constants } from "node:fs";
 import { access, mkdir, readFile, readlink, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -29,6 +30,7 @@ import {
 	systemdUnitName,
 	systemdUnitPath,
 } from "./services";
+import { readPinnedGjcVersion } from "./update";
 
 /**
  * `gajaeway ops restart-stack` (issue #54).
@@ -777,29 +779,63 @@ async function runRestartStackWithLease(
 	/** True once the broker step's start command for the new broker has succeeded. */
 	let brokerStepStartedNewBroker = false;
 
-	// Flip the gjc pin before broker restart if requested (issue #876)
-	// This must happen before broker-host verification so it accepts the new version
-	if (options.gjcVersionToPinAfterBrokerRestart !== undefined && receipt.trigger === "update") {
+	// Flip the gjc pin before broker restart if deferred (issue #876).
+	// After an update whose drain failed, binaries and release manifest are new but gjc/current is old.
+	// Any later restart-stack, including manual, must apply the pending pin if it differs from current.
+	// This must happen before broker-host verification so it accepts the new version.
+	let pinnedGjcVersion = options.gjcVersionToPinAfterBrokerRestart;
+	if (pinnedGjcVersion === undefined && binDir !== undefined) {
 		try {
-			// Preserve the previous version to restore on failure
-			const layout = homeLayout(options.home);
-			try {
-				const currentLink = await readlink(layout.gjcCurrent);
-				if (typeof currentLink === "string" && currentLink.includes("/") === false) {
-					previousPinVersion = currentLink;
-				}
-			} catch {
-				// If we can't read the current link, we can't restore it
+			pinnedGjcVersion = await readPinnedGjcVersion(join(binDir, "package.json"));
+		} catch {
+			// Without a readable release manifest, restart without a pin flip.
+		}
+	}
+
+	if (pinnedGjcVersion !== undefined) {
+		const layout = homeLayout(options.home);
+		let currentVersion: string | undefined;
+		try {
+			const currentLink = await readlink(layout.gjcCurrent);
+			if (typeof currentLink === "string" && currentLink.includes("/") === false) {
+				currentVersion = currentLink;
+				previousPinVersion = currentLink;
 			}
-			await flipGjcPin({ home: options.home, version: options.gjcVersionToPinAfterBrokerRestart });
-			pinFlippedVersion = options.gjcVersionToPinAfterBrokerRestart;
-		} catch (error) {
-			receipt.state = "failed";
-			receipt.finishedAt = new Date(now()).toISOString();
-			receipt.detail = `gjc pin flip failed before broker restart: ${error instanceof Error ? error.message : String(error)}`;
-			for (const step of receipt.steps) step.result = "skipped";
-			await writeReceipt(options.home, receipt);
-			return receipt;
+		} catch {
+			// If we can't read the current link, we can't restore it
+		}
+
+		// Only flip if the pinned version differs from current
+		if (pinnedGjcVersion !== currentVersion) {
+			const versionDir = join(layout.gjcPrefix, pinnedGjcVersion);
+			let versionExists = false;
+			try {
+				await access(versionDir, constants.F_OK);
+				versionExists = true;
+			} catch {
+				// Version not installed
+			}
+
+			if (!versionExists) {
+				receipt.state = "failed";
+				receipt.finishedAt = new Date(now()).toISOString();
+				receipt.detail = `pinned gjc version ${pinnedGjcVersion} is not installed (current: ${currentVersion ?? "unknown"})`;
+				for (const step of receipt.steps) step.result = "skipped";
+				await writeReceipt(options.home, receipt);
+				return receipt;
+			}
+
+			try {
+				await flipGjcPin({ home: options.home, version: pinnedGjcVersion });
+				pinFlippedVersion = pinnedGjcVersion;
+			} catch (error) {
+				receipt.state = "failed";
+				receipt.finishedAt = new Date(now()).toISOString();
+				receipt.detail = `gjc pin flip failed before broker restart: ${error instanceof Error ? error.message : String(error)}`;
+				for (const step of receipt.steps) step.result = "skipped";
+				await writeReceipt(options.home, receipt);
+				return receipt;
+			}
 		}
 	}
 
