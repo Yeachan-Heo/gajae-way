@@ -2206,8 +2206,11 @@ export class BrokerSessionPort implements SessionPort {
 				brokerGeneration: 0,
 				repo: input.repo,
 				...(input.originKey ? { originKey: input.originKey } : {}),
-				onFrame: () => {
-					lastActivityAt = this.#now();
+				// Same rule as the handle's stall clock: uncorrelated lifecycle/idle
+				// broadcasts reach every relay on the session and are only status
+				// hints, so they must not extend this turn's wait.
+				onFrame: (frame) => {
+					if (frame.commandId !== undefined || frame.turnId !== undefined) lastActivityAt = this.#now();
 				},
 				onStall: ({ elapsedMs }) =>
 					console.warn(`session stall sessionId=${input.sessionId} opRef=${input.opRef} silentMs=${elapsedMs}`),

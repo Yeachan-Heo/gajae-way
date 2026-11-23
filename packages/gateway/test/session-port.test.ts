@@ -2172,8 +2172,11 @@ test("request keeps observing an accepted op on the CLI when its relay tears mid
 // tool activity the whole way, and were killed as SessionRequestTimeoutError
 // at the 1800 s mark with the work still landing. The wait is an inactivity
 // lease: frames attributed to the turn refresh it; silence still ends it.
-for (const progressing of [true, false]) {
-	test(`request wait is an activity lease: a turn that keeps emitting ${progressing ? "survives past" : "is not spared when silent for"} waitTimeoutMs`, async () => {
+// Uncorrelated session broadcasts (lifecycle/idle hints that reach every relay)
+// are not the turn's activity and must not extend it.
+for (const traffic of ["correlated", "silent", "uncorrelated"] as const) {
+	const progressing = traffic === "correlated";
+	test(`request wait is an activity lease: a turn with ${traffic} traffic ${progressing ? "survives past" : "is not spared past"} waitTimeoutMs`, async () => {
 		home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 		database = await Store.open(join(home, "gateway.db"));
 		const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
@@ -2210,8 +2213,12 @@ for (const progressing of [true, false]) {
 			now: () => clock,
 			sleep: async (ms) => {
 				clock += ms;
-				if (progressing)
+				if (traffic === "correlated")
 					relay.streams[0]!.host({ type: "event", kind: "tool_execution_update", ...ids, payload: { event: {} } });
+				else if (traffic === "uncorrelated") {
+					relay.streams[0]!.host({ type: "agent_end" });
+					relay.streams[0]!.host({ type: "activity", state: "idle" });
+				}
 				// Let the pushed frame reach the handle before the next deadline check.
 				await Bun.sleep(1);
 			},
