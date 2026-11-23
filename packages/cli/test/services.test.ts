@@ -55,7 +55,10 @@ test("a linux install writes one bound systemd user unit per service", async () 
 			expect(unit).toContain(`Environment="GAJAEWAY_HOME=${home}"`);
 			if (spec.id === "broker") {
 				expect(unit).toContain(`ConditionPathExists=${join(home, "broker", "provision", "manifest.json")}\n`);
-				expect(unit).toContain(`EnvironmentFile=-${join(home, "broker.env")}\n`);
+				// broker.env reaches the child only through the host's validated read, never the
+				// service manager, so it cannot replace GAJAEWAY_HOME before config loads.
+				expect(unit).not.toContain("EnvironmentFile");
+				expect(unit).not.toContain("broker.env");
 				expect(unit).toContain("Restart=always");
 				expect(unit).toContain("RestartSec=2s");
 				expect(unit).toContain("KillMode=control-group");

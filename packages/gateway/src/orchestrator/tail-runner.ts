@@ -991,7 +991,8 @@ class ManagedTailHandle implements TailHandle {
 			this.#unknownDiagnostics++;
 			this.#input.onDiagnostic?.(`unknown_runtime_event session=${this.sessionId} kind=${frame.rawKind}`, "warn");
 		}
-		if (frame.commandId === undefined && frame.turnId === undefined) {
+		const correlated = frame.commandId !== undefined || frame.turnId !== undefined;
+		if (!correlated) {
 			// The SDK sends content to the original submitting connection, or an
 			// uncorrelated copy to explicitly negotiated session observers. Never
 			// invent an attempt correlation for that copy, even on a running handle.
@@ -1002,7 +1003,7 @@ class ManagedTailHandle implements TailHandle {
 					this.#input.onDiagnostic?.(`tail_session_activity_failed session=${this.sessionId}`, "warn");
 				}
 			}
-			// Lifecycle/idle broadcasts retain their existing actor semantics.
+			// Lifecycle/idle broadcasts still reach the actor as a status hint.
 			if (!frame.idle) return;
 		} else if (!this.#matchesTurn(frame)) {
 			if (this.#droppedForeign++ === 0)
@@ -1013,9 +1014,13 @@ class ManagedTailHandle implements TailHandle {
 			return;
 		}
 		// Only the turn's own activity moves the stall clock: hello, request
-		// replies and unrelated notifications say nothing about the turn.
-		this.#lastEventAt = this.#runner.now();
-		this.#stallReported = false;
+		// replies, unrelated notifications and uncorrelated lifecycle/idle
+		// broadcasts (which reach every relay on the session) say nothing about
+		// the turn. A stray uncorrelated end during a stall must not restart it.
+		if (correlated) {
+			this.#lastEventAt = this.#runner.now();
+			this.#stallReported = false;
+		}
 		if (!frame.idle) this.#input.onTurnActivity?.();
 		this.#deliveries = this.#deliveries
 			.then(async () => {

@@ -31,6 +31,7 @@ export const BROKER_ENV_PROTECTED_KEYS = [
 	...LIVE_BROKER_ENV_KEYS,
 	"GJC_CODING_AGENT_DIR",
 	"GJC_SDK_BROKER_AUTOSTART",
+	"GAJAEWAY_HOME",
 ] as const;
 const AUTH_BROKER_URL_KEY = "auth.broker.url";
 

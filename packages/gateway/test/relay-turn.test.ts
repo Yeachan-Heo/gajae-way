@@ -969,6 +969,50 @@ test("request replies do not count as turn progress: a silent turn still stalls 
 	await handle.close();
 });
 
+test("an uncorrelated lifecycle end during a stall is only a status hint: it never restarts the stall clock (#733)", async () => {
+	let now = 0;
+	const relay = new FakeRelay();
+	const stalls: number[] = [];
+	const frames: string[] = [];
+	const tail = runner(() => relay, { now: () => now, stallTimeoutMs: 1_000 });
+	const handle = await tail.attach({
+		sessionId: "s1",
+		brokerGeneration: 1,
+		repo: "/tmp/repo",
+		onFrame: (frame) => {
+			frames.push(`${frame.rawKind}:${frame.commandId ?? "-"}`);
+		},
+		onStall: ({ elapsedMs }) => {
+			stalls.push(elapsedMs);
+		},
+	});
+	handle.beginTurn("op-1", CORRELATION);
+	handle.setTurnRunning(true);
+	now = 1_000;
+	tail.checkStalls();
+	expect(stalls).toEqual([1_000]);
+	// Session broadcasts with no correlation reach every relay on the session.
+	relay.host({ type: "agent_end" });
+	relay.host({ type: "agent_failed" });
+	relay.host({ type: "activity", state: "idle" });
+	await Bun.sleep(5);
+	expect(frames).toEqual(["agent_end:-", "agent_failed:-", "activity:-"]);
+	now = 2_000;
+	tail.checkStalls();
+	expect(stalls).toEqual([1_000]);
+	// The turn's own correlated end does count as activity and re-arms the clock.
+	relay.host({ type: "agent_end", ...CORRELATION });
+	await Bun.sleep(5);
+	expect(frames.at(-1)).toBe(`agent_end:${CORRELATION.commandId}`);
+	now = 2_999;
+	tail.checkStalls();
+	expect(stalls).toEqual([1_000]);
+	now = 3_000;
+	tail.checkStalls();
+	expect(stalls).toEqual([1_000, 1_000]);
+	await handle.close();
+});
+
 test("a spawner that throws counts toward give-up like a relay that dies", async () => {
 	let spawns = 0;
 	const dead: unknown[] = [];

@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { acquireLease, homeLayout } from "@gajae-gateway/home";
 import { credentialFingerprint } from "../src/broker-agent/agent-db";
 import { resolveBrokerAgentSource } from "../src/broker-agent/allowlist";
@@ -82,7 +82,7 @@ async function installFakeGjc(
 		"#!/bin/sh",
 		'if [ "$1" = "--version" ]; then printf \'gjc %s\\n\' ' + shellQuote(version) + "; exit 0; fi",
 		`printf '%s\\n' "$@" > ${shellQuote(argsPath)}`,
-		`printf '%s\\n%s\\n%s\\n' "$GJC_CODING_AGENT_DIR" "$GJC_SDK_BROKER_AUTOSTART" "$MODEL_PROVIDER_KEY" > ${shellQuote(envPath)}`,
+		`printf '%s\\n%s\\n%s\\n%s\\n' "$GJC_CODING_AGENT_DIR" "$GJC_SDK_BROKER_AUTOSTART" "$MODEL_PROVIDER_KEY" "$GAJAEWAY_HOME" > ${shellQuote(envPath)}`,
 		`trap 'printf forwarded > ${shellQuote(termPath)}; exit 23' TERM`,
 		wait,
 	].join("\n");
@@ -183,7 +183,7 @@ describe("foreground broker host", () => {
 		const exit = await runBrokerHost(await configFor(f));
 		expect(exit).toBe(0);
 		expect(await readFile(fake.argsPath, "utf8")).toBe(`sdk\nbroker\nrun\n--agent-dir\n${f.agentDir}\n`);
-		expect(await readFile(fake.envPath, "utf8")).toBe(`${f.agentDir}\n0\n\n`);
+		expect(await readFile(fake.envPath, "utf8")).toBe(`${f.agentDir}\n0\n\n${resolve(f.home)}\n`);
 	});
 
 	test("lease contention, invalid target, and missing manifest refuse without spawning", async () => {
@@ -205,7 +205,7 @@ describe("foreground broker host", () => {
 	test("a verified minor or newer patch cannot bypass the production host's exact pin", async () => {
 		const f = await fixture();
 		await provision(f);
-		for (const version of ["0.19.1", "0.20.1", "0.22.0"]) {
+		for (const version of ["0.19.1", "0.21.1", "0.23.0"]) {
 			const fake = await installFakeGjc(f, { version });
 			expect(await runBrokerHost(await configFor(f))).toBe(1);
 			expect(await Bun.file(fake.argsPath).exists()).toBe(false);
@@ -240,6 +240,17 @@ describe("foreground broker host", () => {
 		expect(await Bun.file(fake.argsPath).exists()).toBe(false);
 		await writeFile(brokerEnv, "MODEL_PROVIDER_KEY=literal $HOME value\n", { mode: 0o644 });
 		await chmod(brokerEnv, 0o644);
+		expect(await runBrokerHost(await configFor(f))).toBe(1);
+		expect(await Bun.file(fake.argsPath).exists()).toBe(false);
+	});
+
+	test("broker.env setting GAJAEWAY_HOME is refused before foreground spawn", async () => {
+		const f = await fixture();
+		await provision(f);
+		const fake = await installFakeGjc(f);
+		const brokerEnv = join(f.home, "broker.env");
+		await writeFile(brokerEnv, "GAJAEWAY_HOME=/tmp/other-gajaeway-home\n", { mode: 0o600 });
+		await chmod(brokerEnv, 0o600);
 		expect(await runBrokerHost(await configFor(f))).toBe(1);
 		expect(await Bun.file(fake.argsPath).exists()).toBe(false);
 	});
@@ -313,7 +324,7 @@ describe("foreground broker host", () => {
 		await writeFile(brokerEnv, "MODEL_PROVIDER_KEY=literal $HOME value\n", { mode: 0o600 });
 		await chmod(brokerEnv, 0o600);
 		expect(await runBrokerHost(await configFor(f))).toBe(0);
-		expect(await readFile(fake.envPath, "utf8")).toBe(`${f.agentDir}\n0\nliteral $HOME value\n`);
+		expect(await readFile(fake.envPath, "utf8")).toBe(`${f.agentDir}\n0\nliteral $HOME value\n${resolve(f.home)}\n`);
 	});
 	test("an interrupted swap is recovered before the host launches the broker", async () => {
 		const f = await fixture();

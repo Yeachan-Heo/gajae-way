@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { markdownToTelegramHtml, splitTelegramHtml, telegramHtmlToPlainText } from "../src/format";
+import {
+	markdownToTelegramHtml,
+	splitTelegramHtml,
+	TELEGRAM_MESSAGE_LIMIT,
+	telegramHtmlToPlainText,
+} from "../src/format";
 import { renderTelegramDelivery } from "../src/main";
 
 function expectSafeChunks(chunks: string[], visible: string, max = 4096): void {
@@ -61,14 +66,25 @@ test("plain-text recovery drops tags and decodes entities", () => {
 });
 
 test("plain and formatted chunk boundaries preserve surrogate pairs", () => {
-	for (const [markdown, visible] of [
-		[`${"a".repeat(4095)}😀`, `${"a".repeat(4095)}😀`],
-		[`**${"😀".repeat(2500)}**`, "😀".repeat(2500)],
-	] as const) {
-		const chunks = renderTelegramDelivery(markdown);
-		expect(chunks).toHaveLength(2);
-		expectSafeChunks(chunks, visible);
-	}
+	// Delivery chunks leave room for the duplicate-warning prefix, so the effective
+	// budget is the message limit minus that prefix. Derive it from the renderer so
+	// a budget change cannot move the pair off the boundary again.
+	const prefix = renderTelegramDelivery("x", true)[0]?.slice(0, -1) ?? "";
+	expect(prefix).toBe("[recovered - may be a duplicate] ");
+	const budget = TELEGRAM_MESSAGE_LIMIT - prefix.length;
+	expect(renderTelegramDelivery("a".repeat(budget + 1)).map((chunk) => chunk.length)).toEqual([budget, 1]);
+	const straddling = `${"a".repeat(budget - 1)}😀tail`;
+	const chunks = renderTelegramDelivery(straddling);
+	expect(chunks).toEqual(["a".repeat(budget - 1), "😀tail"]);
+	expectSafeChunks(chunks, straddling, budget);
+	// The warned first chunk still fits Telegram's limit.
+	const warned = renderTelegramDelivery(straddling, true);
+	expect(warned[0]).toBe(`${prefix}${"a".repeat(budget - 1)}`);
+	expectSafeChunks(warned, `${prefix}${straddling}`);
+
+	const formatted = renderTelegramDelivery(`**${"😀".repeat(2500)}**`);
+	expect(formatted).toHaveLength(2);
+	expectSafeChunks(formatted, "😀".repeat(2500), budget);
 });
 
 test("link labels resolve protected inline code without leaking placeholders", () => {

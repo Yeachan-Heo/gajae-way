@@ -134,7 +134,13 @@ class SendTurnNoLongerBoundError extends Error {}
 
 /** The pre-send compaction may still be running on the host; the send must wait for evidence it is over. */
 class CompactionUnresolvedError extends Error {
-	constructor(code: string | undefined) {
+	constructor(
+		code: string | undefined,
+		/** Unresolved retries so far, this one included. */
+		readonly attempts: number,
+		/** The bound is reached: the origin leaves the session instead of retrying on it. */
+		readonly escalate: boolean,
+	) {
 		super(`compaction may still be running${code ? ` (${code})` : ""}`);
 		this.name = "CompactionUnresolvedError";
 	}
@@ -262,7 +268,7 @@ function escalationNoticeDeliveryKey(deliveryId: string): string {
 
 /** Deterministic delivery id of a bind-hold or escalation notice, so a replayed notice posts once. */
 export function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string, reason: string): string {
-	const kind = reason === UNRESOLVED_HOLD_ESCALATED ? UNRESOLVED_HOLD_ESCALATED : "bind_hold";
+	const kind = reason === UNRESOLVED_HOLD_ESCALATED || reason === COMPACTION_HOLD_ESCALATED ? reason : "bind_hold";
 	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|${kind}`).digest("hex").slice(0, 32)}`;
 }
 
@@ -345,6 +351,64 @@ function parseDeadHostMark(value: string | undefined): DeadHostMark | undefined 
 /** Session of an origin whose last pre-send compaction may still be running. */
 function unresolvedCompactionKey(originKey: string): string {
 	return `compaction-unresolved:${originKey}`;
+}
+
+/**
+ * Pre-send attempts (the first run included) that may end with a compaction
+ * still unresolved on one session before the origin moves to a fresh one. With the 5 min run budget
+ * and the retry backoff this is about 11 minutes of a host that keeps its
+ * relay up but answers neither run.
+ */
+export const COMPACTION_UNRESOLVED_ATTEMPTS = 6;
+
+/** The durable `compaction-unresolved:<origin>` record. */
+interface UnresolvedCompaction {
+	readonly sessionId: string;
+	/** Pre-send attempts on this session that ended with a run still unresolved, the first run included. */
+	readonly attempts: number;
+	/** A barrier run was written behind the unresolved one and has no answer yet. */
+	readonly barrier: boolean;
+}
+
+/** A value that is not a record (a bare session id) holds that session with nothing counted yet. */
+function parseUnresolvedCompaction(value: string | undefined): UnresolvedCompaction | undefined {
+	if (value === undefined) return undefined;
+	try {
+		const record = JSON.parse(value) as Partial<UnresolvedCompaction>;
+		if (
+			typeof record === "object" &&
+			record !== null &&
+			typeof record.sessionId === "string" &&
+			Number.isSafeInteger(record.attempts) &&
+			typeof record.barrier === "boolean"
+		)
+			return { sessionId: record.sessionId, attempts: Math.max(0, record.attempts!), barrier: record.barrier };
+	} catch {}
+	return { sessionId: value, attempts: 0, barrier: false };
+}
+
+/** Bind-hold reason for a turn whose pre-send compaction stayed unresolved past the bound. */
+export const COMPACTION_HOLD_ESCALATED = "compaction_unresolved_escalated";
+const COMPACTION_HOLD_NOTICE =
+	"[turn held] I could not confirm that compacting this conversation's session finished, so I did not send your message into it. It continues in a fresh session.";
+
+const COMPACTION_NOTICE_PREFIX = "compaction-escalation-notice:";
+
+/**
+ * Durable intent to post a compaction escalation notice (the value is the
+ * trigger's message id), written with the epoch rotation and deleted once the
+ * notice hook accepted it, so a crash or a failed hook still tells the origin
+ * why it moved to a fresh session.
+ */
+function compactionNoticeKey(originKey: string, opRef: string): string {
+	return `${COMPACTION_NOTICE_PREFIX}${originKey}#${opRef}`;
+}
+
+/** Origins holding an unposted compaction escalation notice; op-refs never contain `#`. */
+function compactionNoticeOrigins(store: Store): string[] {
+	return store.core
+		.metaKeysInRange(COMPACTION_NOTICE_PREFIX, `${COMPACTION_NOTICE_PREFIX}\uffff`)
+		.map((key) => key.slice(COMPACTION_NOTICE_PREFIX.length, key.lastIndexOf("#")));
 }
 
 /** Track relay unavailable events for a turn to detect unresponsive relays even on live hosts (#766). */
@@ -1262,6 +1326,7 @@ export class PersonaSessionManager {
 		if (this.#stopped) return Promise.resolve();
 		const origins = new Set<string>([
 			...escalationNoticeOrigins(this.#database),
+			...compactionNoticeOrigins(this.#database),
 			...this.#database.inbox.nonterminalOrigins(),
 			...this.#database.inbox.pendingOrigins(),
 			...this.#database.inbox.heldSteerOrigins(),
@@ -2085,6 +2150,7 @@ class OriginActor {
 	async recover(): Promise<void> {
 		this.#recoveryScanned = true;
 		await this.#emitEscalationNotices();
+		await this.#emitCompactionNotices();
 		const turns = this.#manager.database.inbox.nonterminalTurns(this.originKey);
 		const open = new Set(turns.map((turn) => turn.opRef));
 		for (const key of this.#loggedRecoveryHolds) {
@@ -2437,6 +2503,31 @@ class OriginActor {
 				trigger,
 				reason: UNRESOLVED_HOLD_ESCALATED,
 				notice: UNRESOLVED_HOLD_NOTICE,
+				verdict: undefined,
+			});
+			if (delivered) database.core.metaDelete(key);
+		}
+	}
+
+	/** Posts every compaction escalation notice whose intent is durable; replayed by recovery. */
+	async #emitCompactionNotices(): Promise<void> {
+		const database = this.#manager.database;
+		const prefix = compactionNoticeKey(this.originKey, "");
+		for (const key of database.core.metaKeysInRange(prefix, `${prefix}\uffff`)) {
+			const opRef = key.slice(prefix.length);
+			const triggerId = database.core.metaGet(key);
+			const trigger = triggerId === undefined ? undefined : database.inbox.messageRow(triggerId, this.originKey);
+			if (!trigger) {
+				// Without its trigger the notice has no message to answer.
+				database.core.metaDelete(key);
+				this.#manager.log(`compaction_notice_unresolvable origin=${this.originKey} opRef=${opRef}`, "warn");
+				continue;
+			}
+			const delivered = await this.#manager.emitBindHold({
+				originKey: this.originKey,
+				trigger,
+				reason: COMPACTION_HOLD_ESCALATED,
+				notice: COMPACTION_HOLD_NOTICE,
 				verdict: undefined,
 			});
 			if (delivered) database.core.metaDelete(key);
@@ -2850,11 +2941,36 @@ class OriginActor {
 		opRef: string,
 		error: unknown,
 	): Promise<void> {
-		const sessionGone = await this.#sessionProvablyGone(sessionId, error);
-		const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => ({
-			attempt: retryInboundTurn(this.#manager.database, tx, opRef),
-			nextEpoch: sessionGone ? this.#manager.database.bindings.rotateEpoch(tx, this.originKey) : undefined,
-		}));
+		// A compaction left unresolved past the bound moves the origin to a fresh
+		// session, like an escalated unresolved hold: the turn was never sent, so it
+		// goes there, and the old host and its stuck controls are ended.
+		const escalated = error instanceof CompactionUnresolvedError && error.escalate ? error : undefined;
+		const escalate = escalated !== undefined;
+		const sessionGone = escalate || (await this.#sessionProvablyGone(sessionId, error));
+		// Read before the requeue, which unlinks the trigger from its op-ref.
+		const triggerId = escalate ? this.#manager.database.inbox.turnRow(opRef)?.message_id : undefined;
+		const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
+			if (escalate) {
+				this.#manager.database.core.metaDelete(unresolvedCompactionKey(this.originKey));
+				if (triggerId !== undefined)
+					this.#manager.database.core.metaSet(compactionNoticeKey(this.originKey, opRef), triggerId);
+			}
+			return {
+				attempt: retryInboundTurn(this.#manager.database, tx, opRef),
+				nextEpoch: sessionGone ? this.#manager.database.bindings.rotateEpoch(tx, this.originKey) : undefined,
+			};
+		});
+		if (escalated) {
+			this.#manager.log(
+				`persona_compaction_escalated origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} session=${sessionId} attempts=${escalated.attempts} action=fresh_session`,
+				"warn",
+			);
+			// The notice goes first: ending the host can take seconds.
+			await this.#emitCompactionNotices();
+			await this.#terminateRetiredSession(sessionId, "compaction_unresolved");
+			await this.#dispatchNext();
+			return;
+		}
 		if (sessionGone) {
 			this.#bindFailures += 1;
 			const attempts = this.#bindFailures;
@@ -3828,6 +3944,7 @@ class OriginActor {
 					this.#manager.log(
 						`session_resumed origin=${this.originKey} epoch=${epoch} session=${existing.sessionId} reason=idle_dead_binding`,
 					);
+					this.#resetUnresolvedCompaction(existing.sessionId);
 					return binding;
 				} catch (error) {
 					this.#manager.log(
@@ -3840,6 +3957,24 @@ class OriginActor {
 			// whose rebind policy owns condemnation (SessionRebinder), not this actor.
 		}
 		return undefined;
+	}
+
+	/**
+	 * The dead host took its runs with it: nothing is queued on the resumed one,
+	 * so the count and a pending barrier start over. The hold itself stays, and
+	 * the next retry proves the chain clear with one barrier on the new host.
+	 */
+	#resetUnresolvedCompaction(sessionId: string): void {
+		const key = unresolvedCompactionKey(this.originKey);
+		const held = parseUnresolvedCompaction(this.#manager.database.core.metaGet(key));
+		if (held?.sessionId !== sessionId || (held.attempts === 0 && !held.barrier)) return;
+		this.#manager.database.core.metaSet(
+			key,
+			JSON.stringify({ sessionId, attempts: 0, barrier: false } satisfies UnresolvedCompaction),
+		);
+		this.#manager.log(
+			`persona_compaction_reset origin=${this.originKey} session=${sessionId} attempts=${held.attempts} reason=host_resumed`,
+		);
 	}
 
 	async #bindSession(epoch: number): Promise<SessionBinding> {
@@ -4145,8 +4280,7 @@ class OriginActor {
 					!frame.idle ||
 					frame.assistantText !== undefined ||
 					frame.payload.toolCallStarted === true ||
-					frame.rawKind === "agent_end" ||
-					frame.rawKind === "agent_failed"
+					ownedTerminalFrame(frame)
 				)
 					activity.version += 1;
 				await this.enqueue(async () => {
@@ -4538,11 +4672,9 @@ class OriginActor {
 		} else {
 			// Tail activity after a stall resumes the ordinary live path. If it goes
 			// quiet again, the tail will raise another stall and restart status checks.
-			if (
-				!bound.stallHostTerminated &&
-				!bound.stallHostTerminating &&
-				(!frame.idle || frame.rawKind === "agent_end" || frame.rawKind === "agent_failed")
-			)
+			// An uncorrelated end is a session broadcast, not the turn's activity: it
+			// only wakes a status reconcile and leaves the stall path armed.
+			if (!bound.stallHostTerminated && !bound.stallHostTerminating && (!frame.idle || ownedTerminalFrame(frame)))
 				this.#clearStallReconciliation(bound);
 			if (frame.assistantText && !frame.steerEcho) bound.lastAssistantText = frame.assistantText;
 			if (frame.rawKind === "tool_execution_start" || frame.payload.toolCallStarted === true)
@@ -4582,9 +4714,7 @@ class OriginActor {
 		// never saw the final message. Like an `idle` activity broadcast, such an end
 		// only wakes a status reconcile. Treating it as tail evidence settled the turn
 		// with its last mid-work line as the answer (#228).
-		const ownedTerminal =
-			(frame.rawKind === "agent_end" || frame.rawKind === "agent_failed") &&
-			(frame.commandId !== undefined || frame.turnId !== undefined);
+		const ownedTerminal = ownedTerminalFrame(frame);
 		if (ownedTerminal && !bound.tailEvidenceUnavailable) bound.tailTerminalObserved = true;
 		if (ownedTerminal || frame.idle) await this.#reconcileBound(bound);
 	}
@@ -5170,17 +5300,29 @@ class OriginActor {
 	 * behind it on the session's ordered controls and times out as an ambiguous
 	 * send. The turn goes back to pending, and each retry needs evidence that
 	 * the run is over: a readable context below the line (it landed), or the
-	 * host's answer to a second `compaction.run` sent on the relay, which gjc's
-	 * ordered dispatcher runs only after the first. An unreadable context, a
-	 * refusal before dispatch and a missing reply are not evidence.
+	 * host's answer to a second `compaction.run` (the barrier) sent on the
+	 * relay, which gjc's ordered dispatcher runs only after the first. An
+	 * unreadable context, a refusal before dispatch and a missing reply are not
+	 * evidence.
+	 *
+	 * At most one barrier is outstanding: once one goes unanswered, retries only
+	 * read the context, since another run would queue behind it. After
+	 * COMPACTION_UNRESOLVED_ATTEMPTS unresolved retries the origin moves to a
+	 * fresh session (see #requeuePreSend). An answered barrier proves the chain
+	 * is clear, not that the context shrank, so the context is read again and
+	 * the turn counts as compacted only below the line or when unreadable.
 	 */
 	async #prepareContext(sessionId: string, epoch: number, opRef: string, tail: TailHandle): Promise<PreparedContext> {
+		const database = this.#manager.database;
 		// Durable, so a restarted gateway keeps holding until the run is proven over.
 		const unresolvedKey = unresolvedCompactionKey(this.originKey);
-		const unresolvedOn = this.#manager.database.core.metaGet(unresolvedKey);
+		let held = parseUnresolvedCompaction(database.core.metaGet(unresolvedKey));
 		// A run left unresolved on another session says nothing about this one.
-		if (unresolvedOn !== undefined && unresolvedOn !== sessionId) this.#manager.database.core.metaDelete(unresolvedKey);
-		const unresolved = unresolvedOn === sessionId;
+		if (held !== undefined && held.sessionId !== sessionId) {
+			database.core.metaDelete(unresolvedKey);
+			held = undefined;
+		}
+		const unresolved = held !== undefined;
 		let usage: SessionContextUsage | undefined;
 		try {
 			usage = await this.#manager.port.contextUsage?.({ sessionId, repo: this.#manager.repo, relay: tail });
@@ -5194,16 +5336,31 @@ class OriginActor {
 		const belowLine = usage !== undefined && usage.tokens < PERSONA_COMPACTION_TOKENS;
 		if (unresolved && belowLine) {
 			// The earlier run landed: the context is compacted and the persona goes back in.
-			this.#manager.database.core.metaDelete(unresolvedKey);
+			database.core.metaDelete(unresolvedKey);
 			this.#manager.log(
 				`persona_compaction_resolved origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage!.tokens} evidence=context_below_line`,
 			);
 			return { compacted: true };
 		}
 		if (!unresolved && (usage === undefined || belowLine)) return { ...(usage ? { usage } : {}), compacted: false };
+		if (held && (held.barrier || held.attempts >= COMPACTION_UNRESOLVED_ATTEMPTS)) {
+			// A barrier is already queued behind the unresolved run; another would
+			// stack on the host's ordered controls without proving anything more.
+			const reason = held.barrier ? "barrier_pending" : "bound_reached";
+			const error = this.#compactionStillUnresolved(held, held.barrier, reason);
+			this.#manager.log(
+				`persona_compaction_held origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage?.tokens ?? "unknown"} attempts=${error.attempts} reason=${reason}`,
+				"warn",
+			);
+			throw error;
+		}
 		// Written ahead of the run: a gateway that stops while it is in flight must
-		// come back holding, since the host keeps compacting regardless.
-		if (!unresolved) this.#manager.database.core.metaSet(unresolvedKey, sessionId);
+		// come back holding, since the host keeps compacting regardless. A barrier
+		// is marked pending before it is written, so a restart never stacks another.
+		database.core.metaSet(
+			unresolvedKey,
+			JSON.stringify(held ? { ...held, barrier: true } : { sessionId, attempts: 0, barrier: false }),
+		);
 		const startedAt = this.#manager.now();
 		const { status, code, outcomeUnknown, answered } = await this.#manager.port.runCompaction({
 			sessionId,
@@ -5217,18 +5374,71 @@ class OriginActor {
 		// Behind an unresolved run, only the host dispatcher's answer to this run
 		// proves the earlier one is over (gjc orders them): a refusal before
 		// dispatch or a reply that never came does not. The hold lasts until such
-		// an answer, a readable context below the line, the host's death or /new.
-		// A receipt is the host's answer on either path, and a host without
-		// compaction.run cannot have one running.
+		// an answer, a readable context below the line, the bound, the host's
+		// death or /new. A receipt is the host's answer on either path, and a host
+		// without compaction.run cannot have one running.
 		const settled = answered === true || status === "succeeded" || status === "skipped" || status === "unavailable";
-		if (outcomeUnknown || (unresolved && !settled)) throw new CompactionUnresolvedError(code);
+		if (outcomeUnknown || (unresolved && !settled))
+			// A barrier refused before dispatch never reached the host: only an
+			// unanswered one stays pending.
+			throw this.#compactionStillUnresolved(
+				held ?? { sessionId, attempts: 0, barrier: false },
+				unresolved && outcomeUnknown === true,
+				code,
+			);
 		// Answered, or a first run that never reached the host (refused before
 		// dispatch, frame never written): nothing is left compacting.
-		this.#manager.database.core.metaDelete(unresolvedKey);
-		// The earlier run may have compacted even if this one failed ("already
-		// compacted"): resolve it as compacted so the persona goes back in.
-		if (unresolved || status === "succeeded") return { compacted: true };
+		database.core.metaDelete(unresolvedKey);
+		// A barrier that compacted put the persona out of the context whatever its size.
+		if (unresolved && status !== "succeeded") return await this.#contextAfterBarrier(sessionId, epoch, opRef, tail);
+		if (unresolved) return { compacted: true };
+		if (status === "succeeded") return { compacted: true };
 		return { ...(usage ? { usage } : {}), compacted: false };
+	}
+
+	/**
+	 * Counts one more unresolved retry in the durable record. At the bound the
+	 * record is kept for #requeuePreSend, which drops it with the epoch rotation.
+	 */
+	#compactionStillUnresolved(
+		held: UnresolvedCompaction,
+		barrier: boolean,
+		code: string | undefined,
+	): CompactionUnresolvedError {
+		const attempts = held.attempts + 1;
+		this.#manager.database.core.metaSet(
+			unresolvedCompactionKey(this.originKey),
+			JSON.stringify({ sessionId: held.sessionId, attempts, barrier } satisfies UnresolvedCompaction),
+		);
+		return new CompactionUnresolvedError(code, attempts, attempts >= COMPACTION_UNRESOLVED_ATTEMPTS);
+	}
+
+	/**
+	 * The barrier answered, so nothing is compacting any more, but its run may
+	 * have failed ("already compacted") over a context that is still large. The
+	 * persona goes back in unless a fresh read shows the context still above the
+	 * line; an unreadable context is treated as compacted.
+	 */
+	async #contextAfterBarrier(
+		sessionId: string,
+		epoch: number,
+		opRef: string,
+		tail: TailHandle,
+	): Promise<PreparedContext> {
+		let usage: SessionContextUsage | undefined;
+		try {
+			usage = await this.#manager.port.contextUsage?.({ sessionId, repo: this.#manager.repo, relay: tail });
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			this.#manager.log(
+				`persona_context_unreadable origin=${this.originKey} session=${sessionId} detail=${safeDiagnostic(error)}`,
+			);
+		}
+		const aboveLine = usage !== undefined && usage.tokens >= PERSONA_COMPACTION_TOKENS;
+		this.#manager.log(
+			`persona_compaction_resolved origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage?.tokens ?? "unknown"} evidence=barrier_answered${aboveLine ? " context=above_line" : ""}`,
+		);
+		return aboveLine ? { usage, compacted: false } : { compacted: true };
 	}
 
 	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {
@@ -6311,6 +6521,18 @@ function steerClientRef(instanceId: string, originKey: string, epoch: number, me
 
 function retiredKey(bound: Pick<BoundTurn, "epoch" | "turn">): string {
 	return `${bound.epoch}:${bound.turn.opRef}`;
+}
+
+/**
+ * A lifecycle end the tail admitted with correlation belongs to the turn: the
+ * tail drops correlated frames that do not match it. An uncorrelated end is an
+ * idle broadcast that reaches every relay on the session (#733).
+ */
+function ownedTerminalFrame(frame: TailFrame): boolean {
+	return (
+		(frame.rawKind === "agent_end" || frame.rawKind === "agent_failed") &&
+		(frame.commandId !== undefined || frame.turnId !== undefined)
+	);
 }
 
 function positiveInteger(value: number | undefined, fallback: number, name: string): number {
