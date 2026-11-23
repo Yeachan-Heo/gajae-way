@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.2] - Unreleased
+
+### Deps
+- **gateway**: Pin GJC 0.22.0 and raise `VERIFIED_GJC_THROUGH` to 0.22; the live contract test (`gjc-contract.e2e.test.ts`) passes on 0.22.0
+
+### Fixes
+- **gateway**: `gajaeway work status <name>` returns the ledger state when the lane's GJC host is gone instead of throwing `status_unavailable` (#836, #837)
+- **gateway**: Store a `/model` choice only after GJC accepts it, and answer permanent failures (#861)
+- **gateway**: Default the `/model` owner to the Discord application owner (#871)
+- **gateway**: Log routine retention sweep results at info level (#838)
+- **adapter-slack**: Give a thread rooted at the bot's own message its own session (#854); keep the legacy mute fallback, attribute file-share reactions to their origin, and bound the root lookup (#858)
+- **docs**: Correct the lane cap default, the build binary list and broker signals (#855)
+
 ## [0.5.1] - 2026-11-18
 
 ### Deps
