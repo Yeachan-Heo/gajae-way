@@ -1007,7 +1007,7 @@ export async function startTelegramAdapter(config: LoadedTelegramAdapterConfig):
 	}
 }
 
-class ReconnectingGateway implements GatewayClientLike {
+export class ReconnectingGateway implements GatewayClientLike {
 	#client: GajaewayClient | undefined;
 	#reconnecting = false;
 	#attempt = 0;
