@@ -774,6 +774,8 @@ async function runRestartStackWithLease(
 	let gatewayRestartAttempted = false;
 	let pinFlippedVersion: string | undefined;
 	let previousPinVersion: string | undefined;
+	/** True once the broker step's start command for the new broker has succeeded. */
+	let brokerStepStartedNewBroker = false;
 
 	// Flip the gjc pin before broker restart if requested (issue #876)
 	// This must happen before broker-host verification so it accepts the new version
@@ -877,7 +879,12 @@ async function runRestartStackWithLease(
 					if (startStatus !== 0) {
 						step.result = "failed";
 						step.detail = `${startCommand.join(" ")} exited with status ${startStatus}`;
-					} else await verifyStep(step, issuedAt);
+					} else {
+						// The new broker start command succeeded; every later step runs on
+						// the flipped pin, so the pin must not roll back (#876).
+						brokerStepStartedNewBroker = true;
+						await verifyStep(step, issuedAt);
+					}
 				} else {
 					delete step.command;
 					step.exitStatus = provisionStatus;
@@ -924,8 +931,17 @@ async function runRestartStackWithLease(
 		}
 		if (receipt.state !== "indeterminate" && step.result !== "ok" && step.result !== "skipped") {
 			receipt.state = step.result === "stale" ? "stale" : "failed";
-			// If a step failed after we flipped the gjc pin, restore the previous version
-			if (pinFlippedVersion !== undefined && previousPinVersion !== undefined && receipt.state === "failed") {
+			// Restore the pin only when the broker step failed before it started the
+			// new broker (stop, provision, or start command failure); once the
+			// start command succeeded the new broker runs on the flipped pin, so a
+			// later failure must not roll the pin back (#876).
+			if (
+				pinFlippedVersion !== undefined &&
+				previousPinVersion !== undefined &&
+				receipt.state === "failed" &&
+				step.label === "dev.gajaeway.broker" &&
+				!brokerStepStartedNewBroker
+			) {
 				try {
 					await flipGjcPin({ home: options.home, version: previousPinVersion });
 					if (step.detail !== undefined) {

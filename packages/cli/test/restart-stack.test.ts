@@ -1584,6 +1584,142 @@ test("update restart with pin flip restores pin on drain failure", async () => {
 	}
 });
 
+test("update restart keeps the flipped pin when the broker restarts and a later step fails", async () => {
+	const { home, cleanup } = await tempHome();
+	const binDir = join(home, "bin");
+	await mkdir(binDir);
+
+	// Set up gjc symlinks and versions
+	const gjcPrefix = join(home, "gjc");
+	await mkdir(gjcPrefix);
+	const oldVersion = "0.19.0";
+	const newVersion = "0.21.0";
+
+	for (const version of [oldVersion, newVersion]) {
+		const versionDir = join(gjcPrefix, version, "bin");
+		await mkdir(versionDir, { recursive: true });
+		await writeFile(join(versionDir, "gjc"), `gjc ${version}`);
+	}
+
+	// Point current symlink to old version initially
+	const currentLink = join(gjcPrefix, "current");
+	await symlink(oldVersion, currentLink, "dir");
+
+	// The broker must see the flipped pin through gjc/current when it starts.
+	let brokerSawNewPin = false;
+
+	// The fixture's "start" re-registers the service's lease owner, mimicking the
+	// fresh process a real launchctl bootstrap/kickstart produces.
+	const refreshLease = async (home: string, name: LeaseName): Promise<void> => {
+		await rm(join(home, "leases", name), { force: true });
+		await acquireLease(home, name);
+	};
+
+	try {
+		const receipt = await runRestartStack({
+			home,
+			id: "update-adapter-failure",
+			trigger: "update",
+			platform: "darwin",
+			uid: 501,
+			binDir,
+			gjcVersionToPinAfterBrokerRestart: newVersion,
+			env: { HOME: home },
+			launchAgentsDir: join(home, "agents"),
+			runner: async (command) => {
+				const joined = command.join(" ");
+				if (joined.includes("dev.gajaeway.broker")) {
+					// The broker host launches gjc through gjc/current; the pin must already
+					// be flipped when the stop/bootstrap commands run for the broker.
+					const pin = await readlink(currentLink);
+					if (pin === newVersion) brokerSawNewPin = true;
+				}
+				// A successful launchctl start re-registers the service's lease owner,
+				// mimicking the fresh process a real bootstrap/kickstart produces.
+				if (joined.includes("bootstrap") || joined.includes("kickstart")) {
+					await refreshLease(home, joined.includes("dev.gajaeway.broker") ? "broker" : "adapter-discord");
+				}
+				// The first adapter step fails after the broker restarted on the new pin.
+				if (joined.includes("kickstart") && joined.includes("dev.gajaeway.adapter-discord")) return 1;
+				return 0;
+			},
+			probe: async (label) =>
+				label === "dev.gajaeway.broker" || label === "dev.gajaeway.adapter-discord" ? { pid: process.pid } : undefined,
+			isServiceInstalled: async (label) => label === "dev.gajaeway.broker" || label === "dev.gajaeway.adapter-discord",
+			binaryModifiedAt: async () => Date.now() - 1000,
+			verifyTimeoutMs: 100,
+			sleep: async () => {},
+		});
+
+		expect(brokerSawNewPin).toBe(true);
+		// The adapter kickstart exits 1 and the lease has no owner: failed, not stale.
+		expect(receipt.state).toBe("failed");
+		const failedAdapter = receipt.steps.find((step) => step.label === "dev.gajaeway.adapter-discord");
+		expect(failedAdapter?.result).toBe("failed");
+		// The broker already restarted on the new gjc, so the pin must stay new.
+		expect(await readlink(currentLink)).toBe(newVersion);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("update restart restores the pin when the broker start command fails", async () => {
+	const { home, cleanup } = await tempHome();
+	const binDir = join(home, "bin");
+	await mkdir(binDir);
+
+	// Set up gjc symlinks and versions
+	const gjcPrefix = join(home, "gjc");
+	await mkdir(gjcPrefix);
+	const oldVersion = "0.19.0";
+	const newVersion = "0.21.0";
+
+	for (const version of [oldVersion, newVersion]) {
+		const versionDir = join(gjcPrefix, version, "bin");
+		await mkdir(versionDir, { recursive: true });
+		await writeFile(join(versionDir, "gjc"), `gjc ${version}`);
+	}
+
+	// Point current symlink to old version initially
+	const currentLink = join(gjcPrefix, "current");
+	await symlink(oldVersion, currentLink, "dir");
+
+	// The broker step requires the provision manifest and an installed unit.
+	await mkdir(join(home, "broker", "provision"), { recursive: true });
+	await writeFile(join(home, "broker", "provision", "manifest.json"), "{}\n");
+
+	try {
+		const receipt = await runRestartStack({
+			home,
+			id: "update-broker-start-failure",
+			trigger: "update",
+			platform: "darwin",
+			uid: 501,
+			binDir,
+			gjcVersionToPinAfterBrokerRestart: newVersion,
+			env: { HOME: home },
+			launchAgentsDir: join(home, "agents"),
+			runner: async (command) => {
+				const joined = command.join(" ");
+				// Any broker step command that fails leaves the new broker unstarted.
+				if (joined.includes("dev.gajaeway.broker") && !joined.includes("bootout")) return 1;
+				return 0;
+			},
+			probe: async () => undefined,
+			isServiceInstalled: async (label) => label === "dev.gajaeway.broker",
+		});
+
+		const brokerStep = receipt.steps.find((step) => step.label === "dev.gajaeway.broker");
+		expect(brokerStep?.result).toBe("failed");
+		expect(brokerStep?.detail).toContain("exited with status 1");
+		// The new broker never started, so the pin is rolled back to the old version.
+		expect(brokerStep?.detail).toContain(`gjc pin restored to ${oldVersion}`);
+		expect(await readlink(currentLink)).toBe(oldVersion);
+	} finally {
+		await cleanup();
+	}
+});
+
 test("supervisorArgv escapes the gateway cgroup on systemd without bootout", () => {
 	const worker = ["/opt/bin/gajaeway", "ops", "restart-stack", "--run", "r1"];
 	expect(supervisorArgv("darwin", worker, "/h", "r1")).toEqual(worker);
