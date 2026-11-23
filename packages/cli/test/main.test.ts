@@ -2069,19 +2069,88 @@ describe("memory async operations (#473)", () => {
 		const errors: string[] = [];
 		const originalErr = console.error;
 		console.error = (line: unknown) => errors.push(String(line));
+		let clockMs = 50_000;
+		const sleeps: number[] = [];
 		let polls = 0;
 		const client: Pick<GajaewayClient, "request"> = {
 			request: async <T>() => {
 				polls++;
-				return { status: "pending", elapsedMs: polls * 15 } as T;
+				return { status: "pending", elapsedMs: polls * 1_500 } as T;
 			},
 		};
 		try {
-			const result = await pollMemoryOp(client, "gw-ml-still-running", 20, 10);
-			expect(result.status).toBe("still_running");
-			expect(result.elapsedMs).toBeGreaterThanOrEqual(20);
-			expect(polls).toBeGreaterThan(0);
-			expect(errors.join("\n")).toContain("gajaeway memory status gw-ml-still-running");
+			const result = await pollMemoryOp(client, "gw-ml-still-running", 3_000, 1_000, {
+				now: () => clockMs,
+				sleep: async (ms) => {
+					sleeps.push(ms);
+					clockMs += ms;
+				},
+			});
+			expect(result).toEqual({ status: "still_running", elapsedMs: 4_500 });
+			expect(polls).toBe(3);
+			expect(sleeps).toEqual([1_000, 1_000, 1_000]);
+			const stderr = errors.join("\n");
+			expect(stderr).toContain("5s operation elapsed; CLI wait ended after 3s");
+			expect(stderr).toContain("gajaeway memory status gw-ml-still-running");
+		} finally {
+			console.error = originalErr;
+		}
+	});
+
+	test("memory operation polling stops exactly at its wait deadline", async () => {
+		const errors: string[] = [];
+		const originalErr = console.error;
+		console.error = (line: unknown) => errors.push(String(line));
+		try {
+			// One tick before the deadline still polls, so a result that lands there is returned.
+			let beforeMs = 0;
+			let beforePolls = 0;
+			const completesLate: Pick<GajaewayClient, "request"> = {
+				request: async <T>() => {
+					beforePolls++;
+					return (
+						beforeMs === 19
+							? { status: "completed", elapsedMs: 19, result: { ok: true } }
+							: { status: "pending", elapsedMs: beforeMs }
+					) as T;
+				},
+			};
+			const completed = await pollMemoryOp(completesLate, "gw-ml-before-deadline", 20, 19, {
+				now: () => beforeMs,
+				sleep: async (ms) => {
+					beforeMs += ms;
+				},
+			});
+			expect(completed).toEqual({ status: "completed", elapsedMs: 19, result: { ok: true } });
+			expect(beforePolls).toBe(2);
+			expect(errors).toEqual([]);
+
+			// Reaching the deadline exactly does not poll again, even if the next poll would complete.
+			let atMs = 0;
+			let atPolls = 0;
+			const atSleeps: number[] = [];
+			const completesAtDeadline: Pick<GajaewayClient, "request"> = {
+				request: async <T>() => {
+					atPolls++;
+					return (
+						atMs >= 20
+							? { status: "completed", elapsedMs: atMs, result: { ok: true } }
+							: { status: "pending", elapsedMs: 15 }
+					) as T;
+				},
+			};
+			// The first wait lands exactly on the deadline; the operation reported only 15ms so far.
+			const stillRunning = await pollMemoryOp(completesAtDeadline, "gw-ml-at-deadline", 20, 10, {
+				now: () => atMs,
+				sleep: async (ms) => {
+					atSleeps.push(ms);
+					atMs = 20;
+				},
+			});
+			expect(stillRunning).toEqual({ status: "still_running", elapsedMs: 15 });
+			expect(atPolls).toBe(1);
+			expect(atSleeps).toEqual([10]);
+			expect(errors.join("\n")).toContain("gajaeway memory status gw-ml-at-deadline");
 		} finally {
 			console.error = originalErr;
 		}

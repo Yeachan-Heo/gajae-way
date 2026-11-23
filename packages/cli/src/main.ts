@@ -674,6 +674,13 @@ async function chat(socket: string): Promise<void> {
 	}
 }
 
+export interface PollMemoryOpClock {
+	/** Epoch ms used for the CLI wait deadline. Defaults to Date.now. */
+	readonly now?: () => number;
+	/** Wait between status polls. Defaults to setTimeout. */
+	readonly sleep?: (ms: number) => Promise<void>;
+}
+
 /**
  * Poll for memory operation completion. Memory operations (audit, autolink) are
  * long-running and return an opRef immediately; this function polls for the result.
@@ -684,11 +691,14 @@ export async function pollMemoryOp(
 	opRef: string,
 	maxWaitMs = 300_000, // 5 min default CLI timeout
 	pollIntervalMs = 1_000,
+	clock: PollMemoryOpClock = {},
 ): Promise<{ status: "completed" | "failed" | "still_running"; elapsedMs: number; result?: unknown; error?: string }> {
-	const startTime = Date.now();
+	const now = clock.now ?? Date.now;
+	const sleep = clock.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+	const startTime = now();
 	let operationElapsedMs = 0;
 
-	while (Date.now() - startTime < maxWaitMs) {
+	while (now() - startTime < maxWaitMs) {
 		const status = await client.request<{
 			status: "pending" | "completed" | "failed";
 			elapsedMs: number;
@@ -706,11 +716,11 @@ export async function pollMemoryOp(
 		}
 
 		// Wait before polling again
-		await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+		await sleep(pollIntervalMs);
 	}
 
 	// CLI wait expired, but operation may still be running on the server
-	const waitedMs = Date.now() - startTime;
+	const waitedMs = now() - startTime;
 	console.error(
 		`memory operation still running (${Math.round(operationElapsedMs / 1000)}s operation elapsed; CLI wait ended after ${Math.round(waitedMs / 1000)}s).\nCheck status: gajaeway memory status ${opRef}`,
 	);
