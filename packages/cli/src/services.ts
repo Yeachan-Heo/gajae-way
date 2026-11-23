@@ -268,7 +268,7 @@ export function systemdUnitName(spec: ServiceSpec): string {
 }
 
 /**
- * `EnvironmentFile=` and `ConditionPathExists=` take one literal absolute path:
+ * `ConditionPathExists=` takes one literal absolute path:
  * systemd does not unquote them, so a quoted value is "not absolute" and the
  * directive is silently ignored. Only `%` specifiers need escaping.
  */
@@ -276,10 +276,6 @@ function unitPath(path: string): string {
 	if (!path.startsWith("/") || /[\n\r\0]/.test(path))
 		throw new Error(`unit path must be absolute and single-line: ${path}`);
 	return path.replaceAll("%", "%%");
-}
-
-function unitEnvironmentFile(path: string): string {
-	return `EnvironmentFile=-${unitPath(path)}`;
 }
 
 export function renderSystemdUnit(spec: ServiceSpec, binDir: string, home: string, path: string): string {
@@ -300,7 +296,8 @@ export function renderSystemdUnit(spec: ServiceSpec, binDir: string, home: strin
 		`WorkingDirectory=${binDir}`,
 		unitEnvironment("GAJAEWAY_HOME", home),
 		unitEnvironment("PATH", path),
-		...(spec.id === "broker" ? [unitEnvironmentFile(join(home, "broker.env"))] : []),
+		// No `EnvironmentFile=` for broker.env: systemd would apply it over GAJAEWAY_HOME before
+		// the host loads config. The host reads and validates broker.env itself (as on launchd).
 		"Restart=always",
 		spec.id === "broker" ? "RestartSec=2s" : "RestartSec=2",
 		...(spec.id === "broker"
