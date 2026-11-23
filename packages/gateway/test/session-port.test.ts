@@ -2449,8 +2449,7 @@ test("runCompaction gives gjc's own request the compaction budget and reports a 
 	// One five-minute deadline end to end: the process bound (CLI slot wait included)
 	// is the whole budget, and gjc's request ends a little earlier so its reply is read.
 	expect(calls[0]!.timeoutMs).toBe(300_000);
-	expect(requestBudgetMs).toBeGreaterThan(40_000);
-	expect(requestBudgetMs).toBeLessThan(calls[0]!.timeoutMs!);
+	expect(requestBudgetMs).toBe(285_000);
 
 	// gjc's request timeout settles only the client; the host may still be compacting.
 	respond = async () => ({ exitCode: 1, stdout: commandError("timeout", "unknown"), stderr: "" });
@@ -2518,7 +2517,7 @@ test("runCompaction on the relay reports whether the host's ordered dispatcher a
 	reply = async () => ({ ok: false, error: { code: "internal", message: "Control operation failed." } });
 	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "internal", answered: true });
 	// Refused before ordered dispatch: the run never started and proves nothing about earlier ones.
-	for (const code of ["session_quiescing", "not_activated", "operation_not_session_owned"]) {
+	for (const code of ["session_quiescing", "not_activated", "operation_not_session_owned", "operation_prohibited"]) {
 		reply = async () => ({ ok: false, error: { code, message: "refused" } });
 		expect(await port.runCompaction(target)).toEqual({ status: "failed", code });
 	}
