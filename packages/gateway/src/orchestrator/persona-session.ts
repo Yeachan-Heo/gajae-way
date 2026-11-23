@@ -4280,8 +4280,7 @@ class OriginActor {
 					!frame.idle ||
 					frame.assistantText !== undefined ||
 					frame.payload.toolCallStarted === true ||
-					frame.rawKind === "agent_end" ||
-					frame.rawKind === "agent_failed"
+					ownedTerminalFrame(frame)
 				)
 					activity.version += 1;
 				await this.enqueue(async () => {
@@ -4673,11 +4672,9 @@ class OriginActor {
 		} else {
 			// Tail activity after a stall resumes the ordinary live path. If it goes
 			// quiet again, the tail will raise another stall and restart status checks.
-			if (
-				!bound.stallHostTerminated &&
-				!bound.stallHostTerminating &&
-				(!frame.idle || frame.rawKind === "agent_end" || frame.rawKind === "agent_failed")
-			)
+			// An uncorrelated end is a session broadcast, not the turn's activity: it
+			// only wakes a status reconcile and leaves the stall path armed.
+			if (!bound.stallHostTerminated && !bound.stallHostTerminating && (!frame.idle || ownedTerminalFrame(frame)))
 				this.#clearStallReconciliation(bound);
 			if (frame.assistantText && !frame.steerEcho) bound.lastAssistantText = frame.assistantText;
 			if (frame.rawKind === "tool_execution_start" || frame.payload.toolCallStarted === true)
@@ -4717,9 +4714,7 @@ class OriginActor {
 		// never saw the final message. Like an `idle` activity broadcast, such an end
 		// only wakes a status reconcile. Treating it as tail evidence settled the turn
 		// with its last mid-work line as the answer (#228).
-		const ownedTerminal =
-			(frame.rawKind === "agent_end" || frame.rawKind === "agent_failed") &&
-			(frame.commandId !== undefined || frame.turnId !== undefined);
+		const ownedTerminal = ownedTerminalFrame(frame);
 		if (ownedTerminal && !bound.tailEvidenceUnavailable) bound.tailTerminalObserved = true;
 		if (ownedTerminal || frame.idle) await this.#reconcileBound(bound);
 	}
@@ -6526,6 +6521,18 @@ function steerClientRef(instanceId: string, originKey: string, epoch: number, me
 
 function retiredKey(bound: Pick<BoundTurn, "epoch" | "turn">): string {
 	return `${bound.epoch}:${bound.turn.opRef}`;
+}
+
+/**
+ * A lifecycle end the tail admitted with correlation belongs to the turn: the
+ * tail drops correlated frames that do not match it. An uncorrelated end is an
+ * idle broadcast that reaches every relay on the session (#733).
+ */
+function ownedTerminalFrame(frame: TailFrame): boolean {
+	return (
+		(frame.rawKind === "agent_end" || frame.rawKind === "agent_failed") &&
+		(frame.commandId !== undefined || frame.turnId !== undefined)
+	);
 }
 
 function positiveInteger(value: number | undefined, fallback: number, name: string): number {
