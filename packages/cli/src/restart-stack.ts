@@ -14,6 +14,7 @@ import {
 import { ProtocolError } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 
+import { flipGjcPin } from "./gjc-install";
 import {
 	adapterConfigPath,
 	BROKER_UNIT,
@@ -105,6 +106,8 @@ export interface RunRestartOptions {
 	readonly id: string;
 	/** Gateway socket override passed through the detached supervisor. */
 	readonly gatewaySocketPath?: string;
+	/** For update trigger, the new gjc version to pin after broker restart succeeds. */
+	readonly gjcVersionToPinAfterBrokerRestart?: string;
 	/** Test seam for the gateway's durable persona-turn drain. */
 	readonly prepareRestartDrain?: (
 		socketPath: string,
@@ -852,6 +855,14 @@ async function runRestartStackWithLease(
 					step.result = "failed";
 					step.detail = `broker-agent provision exited with unexpected status ${provisionStatus}`;
 				}
+				if (step.result === "ok" && options.gjcVersionToPinAfterBrokerRestart !== undefined) {
+					try {
+						await flipGjcPin({ home: options.home, version: options.gjcVersionToPinAfterBrokerRestart });
+					} catch (error) {
+						step.detail = `${step.detail ?? "broker restarted successfully"} but pin flip failed: ${error instanceof Error ? error.message : String(error)}`;
+						step.result = "failed";
+					}
+				}
 			} else {
 				if (step.command !== undefined) {
 					if (step.label === "dev.gajaeway.gateway") gatewayRestartAttempted = true;
@@ -1043,6 +1054,8 @@ export interface LaunchRestartOptions {
 	readonly binDir?: string;
 	/** LaunchAgents directory on darwin. */
 	readonly launchAgentsDir?: string;
+	/** For update trigger, the new gjc version to pin after broker restart succeeds. */
+	readonly gjcVersionToPinAfterBrokerRestart?: string;
 	/** Argv that re-enters the CLI; `--run <id>` is appended. */
 	readonly worker?: readonly string[];
 	readonly env?: NodeJS.ProcessEnv;
@@ -1074,7 +1087,15 @@ export async function launchRestartStack(
 	const worker = [...(options.worker ?? [...cliCommand(), "ops", "restart-stack"]), "--run", receipt.id];
 	const workerEnv = options.env ?? process.env;
 	const gatewaySocketPath = options.gatewaySocketPath ?? workerEnv.GAJAEWAY_SOCKET_PATH;
-	const argv = supervisorArgv(platform, worker, options.home, receipt.id, options.binDir, gatewaySocketPath);
+	const argv = supervisorArgv(
+		platform,
+		worker,
+		options.home,
+		receipt.id,
+		options.binDir,
+		gatewaySocketPath,
+		options.gjcVersionToPinAfterBrokerRestart,
+	);
 	const spawnOptions = {
 		detached: true,
 		stdin: "ignore" as const,
@@ -1086,6 +1107,9 @@ export async function launchRestartStack(
 			...(options.gatewaySocketPath === undefined ? {} : { GAJAEWAY_SOCKET_PATH: options.gatewaySocketPath }),
 			...(options.binDir === undefined ? {} : { GAJAEWAY_BIN_DIR: options.binDir }),
 			...(options.launchAgentsDir === undefined ? {} : { GAJAEWAY_LAUNCH_AGENTS_DIR: options.launchAgentsDir }),
+			...(options.gjcVersionToPinAfterBrokerRestart === undefined
+				? {}
+				: { GAJAEWAY_GJC_VERSION_TO_PIN: options.gjcVersionToPinAfterBrokerRestart }),
 		},
 	};
 	let child: Bun.Subprocess;
@@ -1159,6 +1183,7 @@ export function supervisorArgv(
 	id: string,
 	binDir?: string,
 	gatewaySocketPath?: string,
+	gjcVersionToPinAfterBrokerRestart?: string,
 ): string[] {
 	if (platform === "darwin") return [...worker];
 	return [
@@ -1171,6 +1196,9 @@ export function supervisorArgv(
 		`--setenv=GAJAEWAY_HOME=${home}`,
 		...(binDir === undefined ? [] : [`--setenv=GAJAEWAY_BIN_DIR=${binDir}`]),
 		...(gatewaySocketPath === undefined ? [] : [`--setenv=GAJAEWAY_SOCKET_PATH=${gatewaySocketPath}`]),
+		...(gjcVersionToPinAfterBrokerRestart === undefined
+			? []
+			: [`--setenv=GAJAEWAY_GJC_VERSION_TO_PIN=${gjcVersionToPinAfterBrokerRestart}`]),
 		"--",
 		...worker,
 	];
