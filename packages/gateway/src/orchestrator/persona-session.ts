@@ -354,8 +354,8 @@ function unresolvedCompactionKey(originKey: string): string {
 }
 
 /**
- * Pre-send retries that may end with a compaction still unresolved on one
- * session before the origin moves to a fresh one. With the 5 min run budget
+ * Pre-send attempts (the first run included) that may end with a compaction
+ * still unresolved on one session before the origin moves to a fresh one. With the 5 min run budget
  * and the retry backoff this is about 11 minutes of a host that keeps its
  * relay up but answers neither run.
  */
@@ -364,7 +364,7 @@ export const COMPACTION_UNRESOLVED_ATTEMPTS = 6;
 /** The durable `compaction-unresolved:<origin>` record. */
 interface UnresolvedCompaction {
 	readonly sessionId: string;
-	/** Pre-send retries that ended with a run still unresolved. */
+	/** Pre-send attempts on this session that ended with a run still unresolved, the first run included. */
 	readonly attempts: number;
 	/** A barrier run was written behind the unresolved one and has no answer yet. */
 	readonly barrier: boolean;
@@ -391,6 +391,25 @@ function parseUnresolvedCompaction(value: string | undefined): UnresolvedCompact
 export const COMPACTION_HOLD_ESCALATED = "compaction_unresolved_escalated";
 const COMPACTION_HOLD_NOTICE =
 	"[turn held] I could not confirm that compacting this conversation's session finished, so I did not send your message into it. It continues in a fresh session.";
+
+const COMPACTION_NOTICE_PREFIX = "compaction-escalation-notice:";
+
+/**
+ * Durable intent to post a compaction escalation notice (the value is the
+ * trigger's message id), written with the epoch rotation and deleted once the
+ * notice hook accepted it, so a crash or a failed hook still tells the origin
+ * why it moved to a fresh session.
+ */
+function compactionNoticeKey(originKey: string, opRef: string): string {
+	return `${COMPACTION_NOTICE_PREFIX}${originKey}#${opRef}`;
+}
+
+/** Origins holding an unposted compaction escalation notice; op-refs never contain `#`. */
+function compactionNoticeOrigins(store: Store): string[] {
+	return store.core
+		.metaKeysInRange(COMPACTION_NOTICE_PREFIX, `${COMPACTION_NOTICE_PREFIX}\uffff`)
+		.map((key) => key.slice(COMPACTION_NOTICE_PREFIX.length, key.lastIndexOf("#")));
+}
 
 /** Track relay unavailable events for a turn to detect unresponsive relays even on live hosts (#766). */
 function relayUnavailableTrackerKey(opRef: string): string {
@@ -1307,6 +1326,7 @@ export class PersonaSessionManager {
 		if (this.#stopped) return Promise.resolve();
 		const origins = new Set<string>([
 			...escalationNoticeOrigins(this.#database),
+			...compactionNoticeOrigins(this.#database),
 			...this.#database.inbox.nonterminalOrigins(),
 			...this.#database.inbox.pendingOrigins(),
 			...this.#database.inbox.heldSteerOrigins(),
@@ -2130,6 +2150,7 @@ class OriginActor {
 	async recover(): Promise<void> {
 		this.#recoveryScanned = true;
 		await this.#emitEscalationNotices();
+		await this.#emitCompactionNotices();
 		const turns = this.#manager.database.inbox.nonterminalTurns(this.originKey);
 		const open = new Set(turns.map((turn) => turn.opRef));
 		for (const key of this.#loggedRecoveryHolds) {
@@ -2482,6 +2503,31 @@ class OriginActor {
 				trigger,
 				reason: UNRESOLVED_HOLD_ESCALATED,
 				notice: UNRESOLVED_HOLD_NOTICE,
+				verdict: undefined,
+			});
+			if (delivered) database.core.metaDelete(key);
+		}
+	}
+
+	/** Posts every compaction escalation notice whose intent is durable; replayed by recovery. */
+	async #emitCompactionNotices(): Promise<void> {
+		const database = this.#manager.database;
+		const prefix = compactionNoticeKey(this.originKey, "");
+		for (const key of database.core.metaKeysInRange(prefix, `${prefix}\uffff`)) {
+			const opRef = key.slice(prefix.length);
+			const triggerId = database.core.metaGet(key);
+			const trigger = triggerId === undefined ? undefined : database.inbox.messageRow(triggerId, this.originKey);
+			if (!trigger) {
+				// Without its trigger the notice has no message to answer.
+				database.core.metaDelete(key);
+				this.#manager.log(`compaction_notice_unresolvable origin=${this.originKey} opRef=${opRef}`, "warn");
+				continue;
+			}
+			const delivered = await this.#manager.emitBindHold({
+				originKey: this.originKey,
+				trigger,
+				reason: COMPACTION_HOLD_ESCALATED,
+				notice: COMPACTION_HOLD_NOTICE,
 				verdict: undefined,
 			});
 			if (delivered) database.core.metaDelete(key);
@@ -2901,9 +2947,14 @@ class OriginActor {
 		const escalated = error instanceof CompactionUnresolvedError && error.escalate ? error : undefined;
 		const escalate = escalated !== undefined;
 		const sessionGone = escalate || (await this.#sessionProvablyGone(sessionId, error));
-		const trigger = escalate ? this.#manager.database.inbox.turnRow(opRef) : undefined;
+		// Read before the requeue, which unlinks the trigger from its op-ref.
+		const triggerId = escalate ? this.#manager.database.inbox.turnRow(opRef)?.message_id : undefined;
 		const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
-			if (escalate) this.#manager.database.core.metaDelete(unresolvedCompactionKey(this.originKey));
+			if (escalate) {
+				this.#manager.database.core.metaDelete(unresolvedCompactionKey(this.originKey));
+				if (triggerId !== undefined)
+					this.#manager.database.core.metaSet(compactionNoticeKey(this.originKey, opRef), triggerId);
+			}
 			return {
 				attempt: retryInboundTurn(this.#manager.database, tx, opRef),
 				nextEpoch: sessionGone ? this.#manager.database.bindings.rotateEpoch(tx, this.originKey) : undefined,
@@ -2914,15 +2965,9 @@ class OriginActor {
 				`persona_compaction_escalated origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} session=${sessionId} attempts=${escalated.attempts} action=fresh_session`,
 				"warn",
 			);
+			// The notice goes first: ending the host can take seconds.
+			await this.#emitCompactionNotices();
 			await this.#terminateRetiredSession(sessionId, "compaction_unresolved");
-			if (trigger)
-				await this.#manager.emitBindHold({
-					originKey: this.originKey,
-					trigger,
-					reason: COMPACTION_HOLD_ESCALATED,
-					notice: COMPACTION_HOLD_NOTICE,
-					verdict: undefined,
-				});
 			await this.#dispatchNext();
 			return;
 		}
@@ -3899,6 +3944,7 @@ class OriginActor {
 					this.#manager.log(
 						`session_resumed origin=${this.originKey} epoch=${epoch} session=${existing.sessionId} reason=idle_dead_binding`,
 					);
+					this.#resetUnresolvedCompaction(existing.sessionId);
 					return binding;
 				} catch (error) {
 					this.#manager.log(
@@ -3911,6 +3957,24 @@ class OriginActor {
 			// whose rebind policy owns condemnation (SessionRebinder), not this actor.
 		}
 		return undefined;
+	}
+
+	/**
+	 * The dead host took its runs with it: nothing is queued on the resumed one,
+	 * so the count and a pending barrier start over. The hold itself stays, and
+	 * the next retry proves the chain clear with one barrier on the new host.
+	 */
+	#resetUnresolvedCompaction(sessionId: string): void {
+		const key = unresolvedCompactionKey(this.originKey);
+		const held = parseUnresolvedCompaction(this.#manager.database.core.metaGet(key));
+		if (held?.sessionId !== sessionId || (held.attempts === 0 && !held.barrier)) return;
+		this.#manager.database.core.metaSet(
+			key,
+			JSON.stringify({ sessionId, attempts: 0, barrier: false } satisfies UnresolvedCompaction),
+		);
+		this.#manager.log(
+			`persona_compaction_reset origin=${this.originKey} session=${sessionId} attempts=${held.attempts} reason=host_resumed`,
+		);
 	}
 
 	async #bindSession(epoch: number): Promise<SessionBinding> {
@@ -5287,9 +5351,10 @@ class OriginActor {
 		if (held && (held.barrier || held.attempts >= COMPACTION_UNRESOLVED_ATTEMPTS)) {
 			// A barrier is already queued behind the unresolved run; another would
 			// stack on the host's ordered controls without proving anything more.
-			const error = this.#compactionStillUnresolved(held, held.barrier, "barrier_pending");
+			const reason = held.barrier ? "barrier_pending" : "bound_reached";
+			const error = this.#compactionStillUnresolved(held, held.barrier, reason);
 			this.#manager.log(
-				`persona_compaction_held origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage?.tokens ?? "unknown"} attempts=${error.attempts} reason=barrier_pending`,
+				`persona_compaction_held origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage?.tokens ?? "unknown"} attempts=${error.attempts} reason=${reason}`,
 				"warn",
 			);
 			throw error;
@@ -5329,7 +5394,9 @@ class OriginActor {
 		// Answered, or a first run that never reached the host (refused before
 		// dispatch, frame never written): nothing is left compacting.
 		database.core.metaDelete(unresolvedKey);
-		if (unresolved) return await this.#contextAfterBarrier(sessionId, epoch, opRef, tail);
+		// A barrier that compacted put the persona out of the context whatever its size.
+		if (unresolved && status !== "succeeded") return await this.#contextAfterBarrier(sessionId, epoch, opRef, tail);
+		if (unresolved) return { compacted: true };
 		if (status === "succeeded") return { compacted: true };
 		return { ...(usage ? { usage } : {}), compacted: false };
 	}

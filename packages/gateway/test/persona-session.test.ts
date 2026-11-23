@@ -10,6 +10,7 @@ import {
 	AGENT_RUN_MAX_MS,
 	COMPACTION_HOLD_ESCALATED,
 	COMPACTION_UNRESOLVED_ATTEMPTS,
+	deterministicBindHoldDeliveryId,
 	freshTurnAttempt,
 	PERSONA_COMPACTION_TOKENS,
 	PERSONA_PREAMBLE_REFRESH_SENDS,
@@ -19,6 +20,7 @@ import {
 	resetFailedTurn,
 	retryInboundTurn,
 	STALLED_TURN_TERMINAL_TIMEOUT_MS,
+	UNRESOLVED_HOLD_ESCALATED,
 } from "../src/orchestrator/persona-session";
 import { formatFailureNotice } from "../src/orchestrator/rebind";
 import {
@@ -6174,6 +6176,125 @@ test("a barrier left unanswered before a gateway restart is not sent again by th
 	expect(port.sends[1]).toMatchObject({ text: "held", systemPreamble: PERSONA });
 	expect(port.compactedAfterSends).toEqual([1, 1]);
 	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeUndefined();
+});
+
+test("a barrier left pending when its host died starts over on the resumed host instead of counting toward escalation", async () => {
+	class DyingBarrierPort extends ContextUsagePort {
+		killed = false;
+		override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
+			const result = await super.liveness(input);
+			// The requeue after the unanswered barrier still sees the host live; it dies
+			// right after, so the next dispatch resumes the same session on a new host.
+			if (!this.killed && this.compactedAfterSends.length === 2) {
+				this.killed = true;
+				await this.close(input);
+			}
+			return result;
+		}
+	}
+	const port = new DyingBarrierPort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	const sessionId = database!.bindings.getSessionRecord(KEY)!.sessionId;
+	await heldByUnresolvedCompaction(
+		port,
+		logs,
+		"held",
+		{ status: "failed", code: "timeout", outcomeUnknown: true },
+		{ status: "failed", outcomeUnknown: true },
+	);
+	await eventually(() => port.sends.length === 2 && manager!.state(KEY) === "idle", "held turn was not sent");
+	// One barrier on the resumed host proves its chain clear; the turn stays in the same session.
+	expect(port.resumes.map((resume) => resume.sessionId)).toEqual([sessionId]);
+	expect(port.compactedAfterSends).toEqual([1, 1, 1]);
+	expect(port.sends[1]).toMatchObject({ text: "held", sessionId, systemPreamble: PERSONA });
+	expect(
+		logs.some((line) => line.startsWith("persona_compaction_reset ") && line.includes("reason=host_resumed")),
+	).toBe(true);
+	expect(logs.some((line) => line.startsWith("persona_compaction_escalated "))).toBe(false);
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeUndefined();
+});
+
+test("a barrier that compacted sends with the persona even if the context still reads above the line", async () => {
+	const port = new ContextUsagePort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	await heldByUnresolvedCompaction(
+		port,
+		logs,
+		"held",
+		{ status: "failed", code: "timeout", outcomeUnknown: true },
+		{ status: "succeeded", answered: true },
+	);
+	await eventually(() => port.sends.length === 2 && manager!.state(KEY) === "idle", "held turn was not sent");
+	expect(port.sends[1]).toMatchObject({ text: "held", systemPreamble: PERSONA });
+	expect(logs.some((line) => line.startsWith("persona_preamble ") && line.includes("reason=compacted"))).toBe(true);
+});
+
+test("a compaction escalation notice whose hook failed is posted by recovery after a restart", async () => {
+	class StuckSessionPort extends ContextUsagePort {
+		override async contextUsage(input?: { sessionId: string }): Promise<SessionContextUsage | undefined> {
+			if (input && input.sessionId !== "session-e0") return { percent: 1, tokens: 10_000 };
+			return await super.contextUsage(input);
+		}
+	}
+	const port = new StuckSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	const holds: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), {
+		...FAST_RETRY,
+		onBindHold: () => {
+			throw new Error("delivery hook down");
+		},
+	});
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	await heldByUnresolvedCompaction(
+		port,
+		logs,
+		"held",
+		{ status: "failed", code: "timeout", outcomeUnknown: true },
+		{ status: "failed", outcomeUnknown: true },
+	);
+	await eventually(() => port.sends.length === 2 && manager!.state(KEY) === "idle", "held turn was not sent");
+	expect(logs.some((line) => line.startsWith("persona_bind_hold_notice_failed "))).toBe(true);
+	const intents = () =>
+		database!.core.metaKeysInRange("compaction-escalation-notice:", "compaction-escalation-notice:\uffff");
+	expect(intents()).toHaveLength(1);
+
+	await manager!.stop();
+	database!.close();
+	database = await Store.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		log: (line) => logs.push(line),
+		onBindHold: ({ reason, trigger }) => {
+			holds.push(`${reason}:${trigger.message_id}`);
+		},
+		onTurnStart: ({ trigger }) => ({ text: trigger.body, systemPreamble: PERSONA }),
+	});
+	await manager.recover();
+	await eventually(() => holds.length === 1, "the notice was not replayed");
+	expect(holds).toEqual([`${COMPACTION_HOLD_ESCALATED}:m-held`]);
+	expect(intents()).toEqual([]);
+	expect(port.sends).toHaveLength(2);
+});
+
+test("a compaction escalation notice has its own delivery id, apart from other hold notices for the trigger", () => {
+	const ids = new Set(
+		["host_capacity", UNRESOLVED_HOLD_ESCALATED, COMPACTION_HOLD_ESCALATED].map((reason) =>
+			deterministicBindHoldDeliveryId(KEY, "m-1", reason),
+		),
+	);
+	expect(ids.size).toBe(3);
 });
 
 test("a hold stored as a bare session id still holds that session until a barrier answers", async () => {
