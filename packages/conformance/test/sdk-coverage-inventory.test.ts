@@ -26,6 +26,8 @@ const GJC_VENDOR_OPS = new Set([
 	"session.resume",
 	"session.last_assistant",
 	"session.close",
+	// Broker-operation journal kind for gjc's `session.close` sent with `ifIdle: true`.
+	"session.close_if_idle",
 	"session.get_endpoint",
 ]);
 
