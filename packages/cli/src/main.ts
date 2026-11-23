@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 import type {
 	MonitorEventOperatorResult,
@@ -67,7 +67,7 @@ import {
 	serviceUsage,
 } from "./services";
 import { type RunSetupOptions, runSetup } from "./setup";
-import { parseUpdateArgs, renderUpdate, runUpdate, type UpdateDeps } from "./update";
+import { parseUpdateArgs, readPinnedGjcVersion, renderUpdate, runUpdate, type UpdateDeps } from "./update";
 
 async function connectGatewaySocket(
 	path: string,
@@ -843,6 +843,20 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					const home = gatewayHome();
 					const flag = parsed.rest[1];
 					if (flag === "--run" && parsed.rest.length === 3 && parsed.rest[2]) {
+						// Resolve the gjc version to pin after broker restart: the explicit
+						// env override wins, otherwise read the release manifest's pin.
+						let gjcVersionToPinAfterBrokerRestart = process.env.GAJAEWAY_GJC_VERSION_TO_PIN;
+						if (gjcVersionToPinAfterBrokerRestart === undefined) {
+							const binDir = process.env.GAJAEWAY_BIN_DIR;
+							if (binDir !== undefined) {
+								try {
+									gjcVersionToPinAfterBrokerRestart = await readPinnedGjcVersion(join(binDir, "package.json"));
+								} catch {
+									// Without a readable release manifest, restart without a pin flip.
+								}
+							}
+						}
+
 						const receipt = await runRestartStack({
 							...options.restartStack?.run,
 							home,
@@ -851,6 +865,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 							...(process.env.GAJAEWAY_LAUNCH_AGENTS_DIR === undefined
 								? {}
 								: { launchAgentsDir: process.env.GAJAEWAY_LAUNCH_AGENTS_DIR }),
+							...(gjcVersionToPinAfterBrokerRestart === undefined ? {} : { gjcVersionToPinAfterBrokerRestart }),
 						});
 						for (const line of renderRestartReceipt(receipt)) console.log(line);
 						if (receipt.state !== "ok") process.exitCode = 1;
