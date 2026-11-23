@@ -228,19 +228,24 @@ test("seeded self-ops restart docs carry the escalated-hold drain exception and 
 
 test("operator docs state the current schema as LATEST_SCHEMA_VERSION", async () => {
 	const root = join(import.meta.dir, "..", "..", "..");
-	const files = [
+	const claim = /\b(?:current schema (?:is )?(?:version )?|currently schema )(\d+)/gi;
+	const files = ["docs/**/*.md", "README*.md", "packages/gateway/src/persona/self-ops/*.md"]
+		.flatMap((pattern) => [...new Bun.Glob(pattern).scanSync({ cwd: root })])
+		.sort();
+	const stated: { file: string; version: number }[] = [];
+	for (const file of files) {
+		for (const match of (await readFile(join(root, file), "utf8")).matchAll(claim))
+			stated.push({ file, version: Number(match[1]) });
+	}
+	// The files known to state it must keep doing so; a dropped statement would pass an equality check.
+	for (const file of [
 		"docs/runbooks/gajaeway-v1.md",
 		"docs/deployment.md",
 		"docs/architecture.md",
 		"packages/gateway/src/persona/self-ops/config-and-restarts.md",
-	];
-	const claim = /\b(?:current schema (?:is )?(?:version )?|currently schema )(\d+)/g;
-	for (const file of files) {
-		const stated = [...(await readFile(join(root, file), "utf8")).matchAll(claim)].map((match) => Number(match[1]));
-		// A file that silently drops its statement would pass a pure equality check.
-		expect({ file, found: stated.length > 0 }).toEqual({ file, found: true });
-		expect({ file, stated }).toEqual({ file, stated: stated.map(() => LATEST_SCHEMA_VERSION) });
-	}
+	])
+		expect({ file, found: stated.some((entry) => entry.file === file) }).toEqual({ file, found: true });
+	expect(stated).toEqual(stated.map(({ file }) => ({ file, version: LATEST_SCHEMA_VERSION })));
 });
 
 test("persona workspace maps relative memory writes to the canonical corpus", async () => {
