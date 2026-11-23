@@ -4021,13 +4021,16 @@ for (const owned of [false, true]) {
 
 		clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
 		let terminations = 0;
+		let authorized: boolean | undefined;
 		port.terminateHost = async (input) => {
 			terminations++;
-			if (input.shouldTerminate) expect(await input.shouldTerminate()).toBe(true);
+			authorized = await input.shouldTerminate?.();
 			return { outcome: "terminated", pid: 123 };
 		};
-		await manager!.tick(KEY).catch(() => {});
+		if (owned) await manager!.tick(KEY);
+		else await manager!.tick(KEY).catch(() => {});
 		expect(terminations).toBe(owned ? 0 : 1);
+		if (!owned) expect(authorized).toBe(true);
 	});
 }
 
