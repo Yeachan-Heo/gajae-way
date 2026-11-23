@@ -1851,6 +1851,68 @@ test("manual restart fails if pinned version is not installed", async () => {
 	}
 });
 
+test("manual restart does not roll back the pin when broker verification fails after a successful start", async () => {
+	const { home, cleanup } = await tempHome();
+	const binDir = join(home, "bin");
+	await mkdir(binDir);
+
+	// Set up gjc symlinks and versions
+	const gjcPrefix = join(home, "gjc");
+	await mkdir(gjcPrefix);
+	const oldVersion = "0.19.0";
+	const newVersion = "0.21.0";
+
+	for (const version of [oldVersion, newVersion]) {
+		const versionDir = join(gjcPrefix, version, "bin");
+		await mkdir(versionDir, { recursive: true });
+		await writeFile(join(versionDir, "gjc"), `gjc ${version}`);
+	}
+
+	// Point current symlink to old version initially
+	const currentLink = join(gjcPrefix, "current");
+	await symlink(oldVersion, currentLink, "dir");
+
+	// Create the binary that verification will check
+	await writeFile(join(binDir, "gajaeway-gateway"), "#!/bin/sh\necho binary");
+
+	// The broker step requires an installed unit.
+	await mkdir(join(home, "broker", "provision"), { recursive: true });
+	await writeFile(join(home, "broker", "provision", "manifest.json"), "{}");
+
+	// Create a release manifest with the new version
+	const packageJson = join(binDir, "package.json");
+	await writeFile(packageJson, JSON.stringify({ gjc: { version: newVersion } }, null, 2));
+
+	try {
+		const receipt = await runRestartStack({
+			home,
+			id: "manual-broker-verify-failure",
+			trigger: "manual",
+			platform: "darwin",
+			uid: 501,
+			binDir,
+			env: { HOME: home },
+			launchAgentsDir: join(home, "agents"),
+			// The runner succeeds, allowing the start command to complete
+			runner: async () => 0,
+			// The probe fails, causing the verification to fail even though the start succeeded
+			probe: async () => undefined,
+			isServiceInstalled: async (label) => label === "dev.gajaeway.broker",
+			binaryModifiedAt: async () => Date.now() - 1000,
+			verifyTimeoutMs: 10, // Short timeout to quickly fail verification
+		});
+
+		const brokerStep = receipt.steps.find((step) => step.label === "dev.gajaeway.broker");
+		expect(brokerStep?.result).toBe("failed");
+		// The broker start command succeeded, so the pin must NOT be rolled back,
+		// even though the verification failed (#883)
+		expect(brokerStep?.detail).not.toContain("gjc pin restored");
+		expect(await readlink(currentLink)).toBe(newVersion);
+	} finally {
+		await cleanup();
+	}
+});
+
 test("supervisorArgv escapes the gateway cgroup on systemd without bootout", () => {
 	const worker = ["/opt/bin/gajaeway", "ops", "restart-stack", "--run", "r1"];
 	expect(supervisorArgv("darwin", worker, "/h", "r1")).toEqual(worker);

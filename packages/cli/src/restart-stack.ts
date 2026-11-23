@@ -943,6 +943,10 @@ async function runRestartStackWithLease(
 					if (status !== 0) {
 						step.result = "failed";
 						step.detail = `${command.join(" ")} exited with status ${status}`;
+					} else if (step.label === "dev.gajaeway.broker") {
+						// The broker start command succeeded; every later step runs on
+						// the flipped pin, so the pin must not roll back (#876, #883).
+						brokerStepStartedNewBroker = true;
 					}
 				}
 				if (step.result === "pending") await verifyStep(step, issuedAt);
