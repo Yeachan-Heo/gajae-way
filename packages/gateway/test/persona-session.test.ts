@@ -3988,6 +3988,49 @@ test("tail activity that resumes after the stall deadline cancels the cutoff", a
 	expect(port.closes).toHaveLength(0);
 });
 
+for (const owned of [false, true]) {
+	test(`${owned ? "an owned correlated" : "a stray uncorrelated"} agent_end during a stall ${owned ? "cancels" : "keeps"} the cutoff (#733)`, async () => {
+		const port = new ScriptedSessionPort();
+		const clock = { now: Date.now() };
+		await harness(port, {}, undefined, { now: () => clock.now });
+		enqueue(`stall-end-${owned}`, "keep working");
+		await manager!.notifyInbound(KEY);
+		await eventually(() => port.sends.length === 1, "persona turn did not start");
+		const send = port.sends[0]!;
+		port.setActivity(send.sessionId, "tool", clock.now);
+		const readsBeforeStall = port.statusReads.length;
+		port.emitStall(send.sessionId);
+		await eventually(() => port.statusReads.length > readsBeforeStall, "stall did not check operation status");
+
+		// The operation is still in flight when the end arrives, so status cannot settle it.
+		const readsBeforeEnd = port.statusReads.length;
+		if (owned) port.emitTurnEnd(send.sessionId, send.opRef, "agent_end");
+		else
+			for (const tail of port.tailsOf(send.sessionId))
+				tail.emit({
+					kind: "agent_end",
+					rawKind: "agent_end",
+					payload: { outcome: { reason: "end_turn" } },
+					steerEcho: false,
+					idle: true,
+				});
+		// Either end still wakes a status reconcile.
+		await eventually(() => port.statusReads.length > readsBeforeEnd, "agent_end did not reconcile status");
+		await manager!.reconcile(KEY);
+		expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("accepted");
+
+		clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+		let terminations = 0;
+		port.terminateHost = async (input) => {
+			terminations++;
+			if (input.shouldTerminate) expect(await input.shouldTerminate()).toBe(true);
+			return { outcome: "terminated", pid: 123 };
+		};
+		await manager!.tick(KEY).catch(() => {});
+		expect(terminations).toBe(owned ? 0 : 1);
+	});
+}
+
 test("resumed activity clears an unknown-status recovery hold before a later stall", async () => {
 	class UnknownStatusPort extends ScriptedSessionPort {
 		unknown = false;
