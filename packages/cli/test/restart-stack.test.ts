@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1466,6 +1466,119 @@ test("#621 regression: restart-stack-worker fixture fails if GAJAEWAY_LAUNCH_AGE
 		expect(exitCode).not.toBe(0);
 		expect(stderr).toContain("GAJAEWAY_LAUNCH_AGENTS_DIR");
 		expect(stderr).toContain("prevent touching real system files");
+	} finally {
+		await cleanup();
+	}
+});
+
+test("update restart flips gjc pin before broker step and restores on failure", async () => {
+	const { home, cleanup } = await tempHome();
+	const binDir = join(home, "bin");
+	await mkdir(binDir);
+	
+	// Set up gjc symlinks and versions
+	const gjcPrefix = join(home, "gjc");
+	await mkdir(gjcPrefix);
+	const oldVersion = "0.19.0";
+	const newVersion = "0.21.0";
+	
+	for (const version of [oldVersion, newVersion]) {
+		const versionDir = join(gjcPrefix, version, "bin");
+		await mkdir(versionDir, { recursive: true });
+		await writeFile(join(versionDir, "gjc"), `gjc ${version}`);
+	}
+	
+	// Point current symlink to old version initially
+	const currentLink = join(gjcPrefix, "current");
+	await symlink(oldVersion, currentLink, "dir");
+	
+	let brokerStepExecuted = false;
+	let pinFlippedBeforeBroker = false;
+	
+	try {
+		const receipt = await runRestartStack({
+			home,
+			id: "update-with-pin-flip",
+			trigger: "update",
+			platform: "darwin",
+			uid: 501,
+			binDir,
+			gjcVersionToPinAfterBrokerRestart: newVersion,
+			env: { HOME: home },
+			launchAgentsDir: join(home, "agents"),
+			runner: async (command) => {
+				const label = command.at(-1)?.split("/").at(-1);
+				if (label === "dev.gajaeway.broker") {
+					brokerStepExecuted = true;
+					// Verify pin has been flipped BEFORE broker step
+					const currentTarget = await readlink(currentLink).catch(() => undefined);
+					if (currentTarget === newVersion) {
+						pinFlippedBeforeBroker = true;
+					}
+				}
+				return 0;
+			},
+			probe: async (label) => (label === "dev.gajaeway.broker" ? { pid: process.pid } : undefined),
+			isServiceInstalled: async (label) => label === "dev.gajaeway.broker",
+			binaryModifiedAt: async () => Date.now() - 1000,
+			verifyTimeoutMs: 100,
+			sleep: async () => {},
+		});
+		
+		// Verify pin was flipped before broker step
+		expect(brokerStepExecuted).toBe(true);
+		expect(pinFlippedBeforeBroker).toBe(true);
+		const finalPin = await readlink(currentLink);
+		expect(finalPin).toBe(newVersion);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("update restart with pin flip restores pin on drain failure", async () => {
+	const { home, cleanup } = await tempHome();
+	const binDir = join(home, "bin");
+	await mkdir(binDir);
+	
+	// Set up gjc symlinks and versions
+	const gjcPrefix = join(home, "gjc");
+	await mkdir(gjcPrefix);
+	const oldVersion = "0.19.0";
+	const newVersion = "0.21.0";
+	
+	for (const version of [oldVersion, newVersion]) {
+		const versionDir = join(gjcPrefix, version, "bin");
+		await mkdir(versionDir, { recursive: true });
+		await writeFile(join(versionDir, "gjc"), `gjc ${version}`);
+	}
+	
+	// Point current symlink to old version initially
+	const currentLink = join(gjcPrefix, "current");
+	await symlink(oldVersion, currentLink, "dir");
+	
+	try {
+		const receipt = await runRestartStack({
+			home,
+			id: "update-drain-failure",
+			trigger: "update",
+			platform: "darwin",
+			uid: 501,
+			binDir,
+			gjcVersionToPinAfterBrokerRestart: newVersion,
+			env: { HOME: home },
+			launchAgentsDir: join(home, "agents"),
+			prepareRestartDrain: async () => {
+				throw new Error("drain preparation failed");
+			},
+			runner: async () => 0,
+			probe: async () => undefined,
+		});
+		
+		// Verify pin stayed on old version since drain failed
+		expect(receipt.state).toBe("failed");
+		expect(receipt.detail).toContain("drain preparation failed");
+		const finalPin = await readlink(currentLink);
+		expect(finalPin).toBe(oldVersion);
 	} finally {
 		await cleanup();
 	}

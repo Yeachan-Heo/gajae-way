@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { access, mkdir, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readlink, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
@@ -772,6 +772,35 @@ async function runRestartStackWithLease(
 	}
 	let issuedAt = now();
 	let gatewayRestartAttempted = false;
+	let pinFlippedVersion: string | undefined;
+	let previousPinVersion: string | undefined;
+	
+	// Flip the gjc pin before broker restart if requested (issue #876)
+	// This must happen before broker-host verification so it accepts the new version
+	if (options.gjcVersionToPinAfterBrokerRestart !== undefined && receipt.trigger === "update") {
+		try {
+			// Preserve the previous version to restore on failure
+			const layout = homeLayout(options.home);
+			try {
+				const currentLink = await readlink(layout.gjcCurrent);
+				if (typeof currentLink === "string" && currentLink.includes("/") === false) {
+					previousPinVersion = currentLink;
+				}
+			} catch {
+				// If we can't read the current link, we can't restore it
+			}
+			await flipGjcPin({ home: options.home, version: options.gjcVersionToPinAfterBrokerRestart });
+			pinFlippedVersion = options.gjcVersionToPinAfterBrokerRestart;
+		} catch (error) {
+			receipt.state = "failed";
+			receipt.finishedAt = new Date(now()).toISOString();
+			receipt.detail = `gjc pin flip failed before broker restart: ${error instanceof Error ? error.message : String(error)}`;
+			for (const step of receipt.steps) step.result = "skipped";
+			await writeReceipt(options.home, receipt);
+			return receipt;
+		}
+	}
+	
 	for (const step of receipt.steps) {
 		if (receipt.state !== "running") {
 			step.result = "skipped";
@@ -855,14 +884,6 @@ async function runRestartStackWithLease(
 					step.result = "failed";
 					step.detail = `broker-agent provision exited with unexpected status ${provisionStatus}`;
 				}
-				if (step.result === "ok" && options.gjcVersionToPinAfterBrokerRestart !== undefined) {
-					try {
-						await flipGjcPin({ home: options.home, version: options.gjcVersionToPinAfterBrokerRestart });
-					} catch (error) {
-						step.detail = `${step.detail ?? "broker restarted successfully"} but pin flip failed: ${error instanceof Error ? error.message : String(error)}`;
-						step.result = "failed";
-					}
-				}
 			} else {
 				if (step.command !== undefined) {
 					if (step.label === "dev.gajaeway.gateway") gatewayRestartAttempted = true;
@@ -903,6 +924,20 @@ async function runRestartStackWithLease(
 		}
 		if (receipt.state !== "indeterminate" && step.result !== "ok" && step.result !== "skipped") {
 			receipt.state = step.result === "stale" ? "stale" : "failed";
+			// If a step failed after we flipped the gjc pin, restore the previous version
+			if (pinFlippedVersion !== undefined && previousPinVersion !== undefined && receipt.state === "failed") {
+				try {
+					await flipGjcPin({ home: options.home, version: previousPinVersion });
+					if (step.detail !== undefined) {
+						step.detail = `${step.detail}; gjc pin restored to ${previousPinVersion}`;
+					}
+					pinFlippedVersion = undefined;
+				} catch (restoreError) {
+					if (step.detail !== undefined) {
+						step.detail = `${step.detail}; gjc pin restoration failed: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`;
+					}
+				}
+			}
 		}
 		await writeReceipt(options.home, receipt);
 	}

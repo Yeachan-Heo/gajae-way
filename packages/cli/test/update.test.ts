@@ -278,9 +278,9 @@ describe("runUpdate", () => {
 			});
 			expect(await readFile(join(dir, ".gajaeway-release"), "utf8")).toBe("0.2.0\n");
 			// The gjc version is installed but pin is not flipped until after restart succeeds.
-			// Verify the new version is installed (not the old pin).
+			// Verify the pin still points to the previous version until the restart completes.
 			const gjcCurrent = await readlink(homeLayout(home).gjcCurrent).catch(() => undefined);
-			expect(gjcCurrent).not.toBe(PINNED_GJC);
+			expect(gjcCurrent).toBeUndefined();
 			const backups = (await readdir(dir)).filter((name) => name.startsWith("backup-0.1.1-"));
 			expect(backups).toHaveLength(1);
 			for (const name of ["gajaeway", "gajaeway-gateway", "gajaeway-slack"])
