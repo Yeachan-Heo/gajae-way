@@ -725,14 +725,18 @@ test("bind clears a stale pending close when inspection confirms a resumed host 
 	const sessionId = "sdk-live-after-resume";
 	const originKey = "lane/live-after-resume";
 	await createOwnedSessionFixture(database!, authority, { sessionId, repo, originKey, epoch: 0 });
-	database!.transaction((tx) =>
-		database!.bindings.beginBrokerOperation(tx, authority, {
-			operation: "session.close",
-			scope: sessionId,
-			operationRef: "gw-close-stale",
-			requestJson: JSON.stringify({ sessionId }),
-		}),
-	);
+	for (const [operation, operationRef] of [
+		["session.close", "gw-close-stale"],
+		["session.close_if_idle", "gw-close-idle-stale"],
+	] as const)
+		database!.transaction((tx) =>
+			database!.bindings.beginBrokerOperation(tx, authority, {
+				operation,
+				scope: sessionId,
+				operationRef,
+				requestJson: JSON.stringify({ sessionId }),
+			}),
+		);
 	const closeKeys: string[] = [];
 	const cli: CliRunner = async (args) => {
 		if (args.includes("inspect"))
@@ -756,6 +760,10 @@ test("bind clears a stale pending close when inspection confirms a resumed host 
 	await port.close({ sessionId, repo });
 	expect(closeKeys).toHaveLength(1);
 	expect(closeKeys[0]).not.toBe("gw-close-stale");
+	expect(database!.bindings.brokerOperation(authority, "session.close_if_idle", sessionId)).toBeUndefined();
+	await port.close({ sessionId, repo, ifIdle: true });
+	expect(closeKeys).toHaveLength(2);
+	expect(closeKeys[1]).not.toBe("gw-close-idle-stale");
 });
 
 test("a finished create is never served to a later bind after the lane's session died", async () => {
@@ -2251,7 +2259,10 @@ test("releaseBrokerOperation drops only the row of the exact ref, pending or com
 test("pruneBrokerOperations honors each cutoff and retains pending creates and prompts at any age", async () => {
 	const { path, authority } = await setup();
 	const store = database!;
-	const begin = (operation: "session.create" | "turn.prompt" | "session.close", scope: string) =>
+	const begin = (
+		operation: "session.create" | "turn.prompt" | "session.close" | "session.close_if_idle",
+		scope: string,
+	) =>
 		store.transaction((tx) =>
 			store.bindings.beginBrokerOperation(tx, authority, {
 				operation,
@@ -2265,9 +2276,12 @@ test("pruneBrokerOperations honors each cutoff and retains pending creates and p
 	begin("session.close", "close-pending");
 	begin("turn.prompt", "prompt-done");
 	begin("session.close", "close-done");
+	begin("session.close_if_idle", "idle-close-pending");
+	begin("session.close_if_idle", "idle-close-done");
 	for (const [operation, scope] of [
 		["turn.prompt", "prompt-done"],
 		["session.close", "close-done"],
+		["session.close_if_idle", "idle-close-done"],
 	] as const)
 		store.transaction((tx) =>
 			store.bindings.completeBrokerOperation(tx, authority, operation, scope, `ref-${scope}`, "{}"),
@@ -2277,18 +2291,19 @@ test("pruneBrokerOperations honors each cutoff and retains pending creates and p
 
 	// Cutoffs before every row: nothing is old enough.
 	expect(prune(at(-60_000), at(-60_000))).toBe(0);
-	expect(journalRows(path)).toHaveLength(5);
+	expect(journalRows(path)).toHaveLength(7);
 
 	// Only the completed cutoff has passed: completed rows go, every pending intent stays.
-	expect(prune(at(60_000), at(-60_000))).toBe(2);
+	expect(prune(at(60_000), at(-60_000))).toBe(3);
 	expect(journalRows(path)).toEqual([
 		{ operation: "session.close", scope: "close-pending", state: "pending" },
+		{ operation: "session.close_if_idle", scope: "idle-close-pending", state: "pending" },
 		{ operation: "session.create", scope: "create-pending", state: "pending" },
 		{ operation: "turn.prompt", scope: "prompt-pending", state: "pending" },
 	]);
 
-	// Only pending close intents expire; a prompt's missing reconciliation record never authorizes a resend.
-	expect(prune(at(60_000), at(60_000))).toBe(1);
+	// Only pending close intents (forced and idle-fenced) expire; a prompt's missing reconciliation record never authorizes a resend.
+	expect(prune(at(60_000), at(60_000))).toBe(2);
 	expect(journalRows(path)).toEqual([
 		{ operation: "session.create", scope: "create-pending", state: "pending" },
 		{ operation: "turn.prompt", scope: "prompt-pending", state: "pending" },
