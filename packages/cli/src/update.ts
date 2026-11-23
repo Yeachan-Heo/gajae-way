@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { acquireLease, homeLayout, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import pkg from "../package.json";
-import { type GjcInstallRunner, installPinnedGjc } from "./gjc-install";
+import { flipGjcPin, type GjcInstallRunner, installPinnedGjcWithoutFlip } from "./gjc-install";
 import { launchRestartStack } from "./restart-stack";
 import {
 	type InstallServicesOptions,
@@ -211,7 +211,12 @@ export interface RestartQueueReceipt {
 export type ReleaseFetcher = (repo: string) => Promise<ReleaseInfo>;
 export type AssetDownloader = (asset: ReleaseAsset) => Promise<Uint8Array>;
 export type TarballExtractor = (tarball: Uint8Array, intoDir: string) => Promise<void>;
-export type RestartQueuer = (home: string, binDir: string, trigger: "update") => Promise<RestartQueueReceipt>;
+export type RestartQueuer = (
+	home: string,
+	binDir: string,
+	trigger: "update",
+	gjcVersion?: string,
+) => Promise<RestartQueueReceipt>;
 export interface UpdateCommandOptions {
 	readonly allowFailure?: boolean;
 }
@@ -366,7 +371,7 @@ export async function runUpdate(options: RunUpdateOptions): Promise<UpdateResult
 			await assertStagedBinariesUsable(staged, toInstall);
 
 			const gjcVersion = await readPinnedGjcVersion(join(staged.dir, "package.json"));
-			await installPinnedGjc({
+			await installPinnedGjcWithoutFlip({
 				home: options.home,
 				version: gjcVersion,
 				...(deps.gjcInstallRunner === undefined ? {} : { runner: deps.gjcInstallRunner }),
@@ -399,14 +404,22 @@ export async function runUpdate(options: RunUpdateOptions): Promise<UpdateResult
 				noRestart: options.args.noRestart,
 				deps,
 			});
-			return { toInstall, backupDir, brokerNotEnabled };
+			return { toInstall, backupDir, brokerNotEnabled, gjcVersion };
 		} finally {
 			if (staged !== undefined) await rm(staged.dir, { recursive: true, force: true });
 			await lease.release();
 		}
 	})();
 
-	if (options.args.noRestart)
+	if (options.args.noRestart) {
+		// When not restarting, flip the pin immediately since restart-stack won't do it
+		try {
+			await flipGjcPin({ home: options.home, version: installed.gjcVersion });
+		} catch (error) {
+			console.error(
+				`warning: gjc pin flip failed: ${error instanceof Error ? error.message : String(error)}; run 'gajaeway ops restart-stack' to retry`,
+			);
+		}
 		return {
 			current,
 			latest,
@@ -419,9 +432,10 @@ export async function runUpdate(options: RunUpdateOptions): Promise<UpdateResult
 			brokerNotEnabled: installed.brokerNotEnabled,
 			restartSkipped: true,
 		};
+	}
 	const receipt = deps.queueRestart
-		? await deps.queueRestart(options.home, binDir, "update")
-		: await defaultQueueRestart(options.home, binDir, "update", options.gatewaySocketPath);
+		? await deps.queueRestart(options.home, binDir, "update", installed.gjcVersion)
+		: await defaultQueueRestart(options.home, binDir, "update", options.gatewaySocketPath, installed.gjcVersion);
 
 	return {
 		current,
@@ -533,7 +547,14 @@ async function defaultQueueRestart(
 	binDir: string,
 	trigger: "update",
 	gatewaySocketPath?: string,
+	gjcVersion?: string,
 ): Promise<RestartQueueReceipt> {
-	const { receipt, supervisorPid } = await launchRestartStack({ home, binDir, trigger, gatewaySocketPath });
+	const { receipt, supervisorPid } = await launchRestartStack({
+		home,
+		binDir,
+		trigger,
+		gatewaySocketPath,
+		gjcVersionToPinAfterBrokerRestart: gjcVersion,
+	});
 	return { receiptId: receipt.id, supervisorPid };
 }

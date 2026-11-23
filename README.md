@@ -78,7 +78,7 @@ For how memory, monitors, and the gateway work end to end, see [the documentatio
 
 **Local installation from source**
 
-Requirements: Bun ≥1.4.0 and an authenticated GJC source profile at `~/.gjc/agent` (credentials and model configuration). The runtime uses the exact GJC version pinned in [`packages/gateway/package.json`](packages/gateway/package.json), currently 0.21.0, installed privately under `$GAJAEWAY_HOME/gjc`; a `gjc` on your PATH is not sufficient.
+Requirements: Bun ≥1.4.0 and an authenticated GJC source profile at `~/.gjc/agent` (credentials and model configuration). The runtime uses the exact GJC version pinned in [`packages/gateway/package.json`](packages/gateway/package.json), currently 0.22.0, installed privately under `$GAJAEWAY_HOME/gjc`; a `gjc` on your PATH is not sufficient.
 
 ```sh
 # Clone and enter the repository
@@ -105,7 +105,7 @@ bun -e 'import { installPinnedGjc } from "./packages/cli/src/gjc-install.ts"; co
 ./dist/gajaeway-gateway config check
 ```
 
-Setup asks which adapters to configure and for your platform user ID(s). The default `dmPolicy` is `allowlist`: without any owner/allowlist IDs, all DMs are declined. Discord setup can infer the application owner; Slack and Telegram users should supply their own IDs. Complete each platform's app installation and permissions before chatting.
+Setup asks which adapters to configure and for your platform user ID(s). The default `dmPolicy` is `allowlist`: without any owner/allowlist IDs, all DMs are declined. Discord setup can infer the application owner — for a user-owned app it allows DMs from that owner; for a Team-owned app the members are authorized at runtime by the adapter instead, refreshed every 10 minutes so removing someone from the Team revokes their access without a restart (issue #862); Slack and Telegram users should supply their own IDs. Complete each platform's app installation and permissions before chatting.
 
 Start the broker, gateway, and each configured adapter in separate terminals, in that order. Set the same `GAJAEWAY_HOME` in every terminal and run from the checkout:
 

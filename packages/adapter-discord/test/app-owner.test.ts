@@ -1,0 +1,131 @@
+import { expect, test } from "bun:test";
+import { resolveApplicationOwnerIds } from "../src/main";
+
+/**
+ * Issue #862: the adapter resolves its own application's owners at login —
+ * the `owner` user, or every ACCEPTED team member when the owner is a Team.
+ * Accepted semantics come from discord.js (`TeamMemberMembershipState.Accepted
+ * === 2`); guild ownership is never consulted; failure resolves to undefined
+ * so every gate stays closed.
+ */
+
+const APPLICATION = {
+	fetch: () =>
+		Promise.resolve({
+			owner: { id: "1000000000000000001" },
+		}),
+};
+
+/** Create a discord.js Collection-like object that iterates values. */
+function createMockCollection(
+	members: Array<{ id: string; user: { id: string }; membershipState: number; role?: string }>,
+) {
+	return {
+		values() {
+			return members[Symbol.iterator]();
+		},
+		[Symbol.iterator]() {
+			return members[Symbol.iterator]();
+		},
+	};
+}
+
+const TEAM_APPLICATION = {
+	fetch: () =>
+		Promise.resolve({
+			owner: {
+				members: createMockCollection([
+					{ id: "2000000000000000001", user: { id: "2000000000000000001" }, membershipState: 2, role: "admin" },
+					{ id: "2000000000000000002", user: { id: "2000000000000000002" }, membershipState: 2, role: "developer" },
+					{ id: "2000000000000000003", user: { id: "2000000000000000003" }, membershipState: 1, role: "admin" },
+				]),
+			},
+		}),
+};
+
+test("a user-owned application resolves to the owner id", async () => {
+	expect(await resolveApplicationOwnerIds(APPLICATION)).toEqual(["1000000000000000001"]);
+});
+
+test("a team-owned application resolves to accepted admin/developer members only, invited and read_only excluded", async () => {
+	const ids = await resolveApplicationOwnerIds(TEAM_APPLICATION);
+	expect(ids).toHaveLength(2);
+	expect(ids).toContain("2000000000000000001");
+	expect(ids).toContain("2000000000000000002");
+	expect(ids).not.toContain("2000000000000000003");
+});
+
+test("the team owner is included even when the API reports no admin role for them (#862, finding E)", async () => {
+	const app = {
+		fetch: () =>
+			Promise.resolve({
+				owner: {
+					ownerId: "6000000000000000001",
+					members: createMockCollection([
+						{ id: "6000000000000000002", user: { id: "6000000000000000002" }, membershipState: 2, role: "admin" },
+					]),
+				},
+			}),
+	};
+	const ids = await resolveApplicationOwnerIds(app);
+	expect(ids).toContain("6000000000000000001");
+	expect(ids).toContain("6000000000000000002");
+});
+
+test("a team-owned application excludes read_only members (#862, finding 1)", async () => {
+	const app = {
+		fetch: () =>
+			Promise.resolve({
+				owner: {
+					members: createMockCollection([
+						{ id: "3000000000000000001", user: { id: "3000000000000000001" }, membershipState: 2, role: "admin" },
+						{ id: "3000000000000000002", user: { id: "3000000000000000002" }, membershipState: 2, role: "read_only" },
+					]),
+				},
+			}),
+	};
+	const ids = await resolveApplicationOwnerIds(app);
+	expect(ids).toHaveLength(1);
+	expect(ids).toContain("3000000000000000001");
+	expect(ids).not.toContain("3000000000000000002");
+});
+
+test("a failed lookup resolves to undefined (fail closed), not an empty authority", async () => {
+	const errors: string[] = [];
+	const original = console.error;
+	console.error = (...values: unknown[]) => errors.push(values.map(String).join(" "));
+	try {
+		expect(
+			await resolveApplicationOwnerIds({
+				fetch: () => Promise.reject(new Error("DiscordAPIError: 500")),
+			}),
+		).toBeUndefined();
+	} finally {
+		console.error = original;
+	}
+	expect(errors.join("\n")).toContain("application owner lookup failed");
+});
+
+test("no application (not ready yet) resolves to undefined", async () => {
+	expect(await resolveApplicationOwnerIds(undefined)).toBeUndefined();
+	expect(await resolveApplicationOwnerIds(null)).toBeUndefined();
+});
+
+test("an application that resolves neither owner nor members keeps the gate closed", async () => {
+	expect(await resolveApplicationOwnerIds({ fetch: () => Promise.resolve({ owner: null }) })).toBeUndefined();
+	expect(
+		await resolveApplicationOwnerIds({
+			fetch: () => Promise.resolve({ owner: { id: "not-a-snowflake" } }),
+		}),
+	).toBeUndefined();
+	expect(
+		await resolveApplicationOwnerIds({
+			fetch: () =>
+				Promise.resolve({
+					owner: {
+						members: createMockCollection([{ id: "1", user: { id: "1" }, membershipState: 2 }]),
+					},
+				}),
+		}),
+	).toBeUndefined();
+});

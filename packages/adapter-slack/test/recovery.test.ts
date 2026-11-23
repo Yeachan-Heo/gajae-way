@@ -270,9 +270,8 @@ describe("Slack conversation replay", () => {
 				},
 			});
 			expect(seen.map((msg) => msg.parent_user_id)).toEqual([parent, parent]);
-			expect(seen.map((msg) => resolveSlackMessageOrigin(msg, "BOT", true).kind)).toEqual(
-				parent === "BOT" ? ["channel", "channel"] : ["thread", "thread"],
-			);
+			// Bot-rooted or not, every recovered reply keeps its thread session.
+			expect(seen.map((msg) => resolveSlackMessageOrigin(msg, true).kind)).toEqual(["thread", "thread"]);
 		}
 	});
 
@@ -298,9 +297,8 @@ describe("Slack conversation replay", () => {
 			expect(requests.map((request) => request.oldest)).toEqual(["0.0", "2.0", "2.0"]);
 			expect(result.advancedTo).toBe("4.0");
 			expect(seen.map((msg) => msg.parent_user_id)).toEqual([parent, parent]);
-			expect(seen.map((msg) => resolveSlackMessageOrigin(msg, "BOT", true).kind)).toEqual(
-				parent === "BOT" ? ["channel", "channel"] : ["thread", "thread"],
-			);
+			// Bot-rooted or not, every recovered reply keeps its thread session.
+			expect(seen.map((msg) => resolveSlackMessageOrigin(msg, true).kind)).toEqual(["thread", "thread"]);
 		}
 	});
 

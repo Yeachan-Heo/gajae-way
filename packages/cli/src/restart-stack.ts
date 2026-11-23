@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { access, mkdir, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, mkdir, readFile, readlink, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
@@ -14,6 +15,7 @@ import {
 import { ProtocolError } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 
+import { flipGjcPin } from "./gjc-install";
 import {
 	adapterConfigPath,
 	BROKER_UNIT,
@@ -28,6 +30,7 @@ import {
 	systemdUnitName,
 	systemdUnitPath,
 } from "./services";
+import { readPinnedGjcVersion } from "./update";
 
 /**
  * `gajaeway ops restart-stack` (issue #54).
@@ -105,6 +108,8 @@ export interface RunRestartOptions {
 	readonly id: string;
 	/** Gateway socket override passed through the detached supervisor. */
 	readonly gatewaySocketPath?: string;
+	/** For update trigger, the new gjc version to pin after broker restart succeeds. */
+	readonly gjcVersionToPinAfterBrokerRestart?: string;
 	/** Test seam for the gateway's durable persona-turn drain. */
 	readonly prepareRestartDrain?: (
 		socketPath: string,
@@ -769,6 +774,71 @@ async function runRestartStackWithLease(
 	}
 	let issuedAt = now();
 	let gatewayRestartAttempted = false;
+	let pinFlippedVersion: string | undefined;
+	let previousPinVersion: string | undefined;
+	/** True once the broker step's start command for the new broker has succeeded. */
+	let brokerStepStartedNewBroker = false;
+
+	// Flip the gjc pin before broker restart if deferred (issue #876).
+	// After an update whose drain failed, binaries and release manifest are new but gjc/current is old.
+	// Any later restart-stack, including manual, must apply the pending pin if it differs from current.
+	// This must happen before broker-host verification so it accepts the new version.
+	let pinnedGjcVersion = options.gjcVersionToPinAfterBrokerRestart;
+	if (pinnedGjcVersion === undefined && binDir !== undefined) {
+		try {
+			pinnedGjcVersion = await readPinnedGjcVersion(join(binDir, "package.json"));
+		} catch {
+			// Without a readable release manifest, restart without a pin flip.
+		}
+	}
+
+	if (pinnedGjcVersion !== undefined) {
+		const layout = homeLayout(options.home);
+		let currentVersion: string | undefined;
+		try {
+			const currentLink = await readlink(layout.gjcCurrent);
+			if (typeof currentLink === "string" && currentLink.includes("/") === false) {
+				currentVersion = currentLink;
+				previousPinVersion = currentLink;
+			}
+		} catch {
+			// If we can't read the current link, we can't restore it
+		}
+
+		// Only flip if the pinned version differs from current
+		if (pinnedGjcVersion !== currentVersion) {
+			const versionDir = join(layout.gjcPrefix, pinnedGjcVersion);
+			let versionExists = false;
+			try {
+				await access(versionDir, constants.F_OK);
+				versionExists = true;
+			} catch {
+				// Version not installed
+			}
+
+			if (!versionExists) {
+				receipt.state = "failed";
+				receipt.finishedAt = new Date(now()).toISOString();
+				receipt.detail = `pinned gjc version ${pinnedGjcVersion} is not installed (current: ${currentVersion ?? "unknown"})`;
+				for (const step of receipt.steps) step.result = "skipped";
+				await writeReceipt(options.home, receipt);
+				return receipt;
+			}
+
+			try {
+				await flipGjcPin({ home: options.home, version: pinnedGjcVersion });
+				pinFlippedVersion = pinnedGjcVersion;
+			} catch (error) {
+				receipt.state = "failed";
+				receipt.finishedAt = new Date(now()).toISOString();
+				receipt.detail = `gjc pin flip failed before broker restart: ${error instanceof Error ? error.message : String(error)}`;
+				for (const step of receipt.steps) step.result = "skipped";
+				await writeReceipt(options.home, receipt);
+				return receipt;
+			}
+		}
+	}
+
 	for (const step of receipt.steps) {
 		if (receipt.state !== "running") {
 			step.result = "skipped";
@@ -845,7 +915,12 @@ async function runRestartStackWithLease(
 					if (startStatus !== 0) {
 						step.result = "failed";
 						step.detail = `${startCommand.join(" ")} exited with status ${startStatus}`;
-					} else await verifyStep(step, issuedAt);
+					} else {
+						// The new broker start command succeeded; every later step runs on
+						// the flipped pin, so the pin must not roll back (#876).
+						brokerStepStartedNewBroker = true;
+						await verifyStep(step, issuedAt);
+					}
 				} else {
 					delete step.command;
 					step.exitStatus = provisionStatus;
@@ -868,6 +943,10 @@ async function runRestartStackWithLease(
 					if (status !== 0) {
 						step.result = "failed";
 						step.detail = `${command.join(" ")} exited with status ${status}`;
+					} else if (step.label === "dev.gajaeway.broker") {
+						// The broker start command succeeded; every later step runs on
+						// the flipped pin, so the pin must not roll back (#876, #883).
+						brokerStepStartedNewBroker = true;
 					}
 				}
 				if (step.result === "pending") await verifyStep(step, issuedAt);
@@ -892,6 +971,29 @@ async function runRestartStackWithLease(
 		}
 		if (receipt.state !== "indeterminate" && step.result !== "ok" && step.result !== "skipped") {
 			receipt.state = step.result === "stale" ? "stale" : "failed";
+			// Restore the pin only when the broker step failed before it started the
+			// new broker (stop, provision, or start command failure); once the
+			// start command succeeded the new broker runs on the flipped pin, so a
+			// later failure must not roll the pin back (#876).
+			if (
+				pinFlippedVersion !== undefined &&
+				previousPinVersion !== undefined &&
+				receipt.state === "failed" &&
+				step.label === "dev.gajaeway.broker" &&
+				!brokerStepStartedNewBroker
+			) {
+				try {
+					await flipGjcPin({ home: options.home, version: previousPinVersion });
+					if (step.detail !== undefined) {
+						step.detail = `${step.detail}; gjc pin restored to ${previousPinVersion}`;
+					}
+					pinFlippedVersion = undefined;
+				} catch (restoreError) {
+					if (step.detail !== undefined) {
+						step.detail = `${step.detail}; gjc pin restoration failed: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`;
+					}
+				}
+			}
 		}
 		await writeReceipt(options.home, receipt);
 	}
@@ -1043,6 +1145,8 @@ export interface LaunchRestartOptions {
 	readonly binDir?: string;
 	/** LaunchAgents directory on darwin. */
 	readonly launchAgentsDir?: string;
+	/** For update trigger, the new gjc version to pin after broker restart succeeds. */
+	readonly gjcVersionToPinAfterBrokerRestart?: string;
 	/** Argv that re-enters the CLI; `--run <id>` is appended. */
 	readonly worker?: readonly string[];
 	readonly env?: NodeJS.ProcessEnv;
@@ -1074,7 +1178,15 @@ export async function launchRestartStack(
 	const worker = [...(options.worker ?? [...cliCommand(), "ops", "restart-stack"]), "--run", receipt.id];
 	const workerEnv = options.env ?? process.env;
 	const gatewaySocketPath = options.gatewaySocketPath ?? workerEnv.GAJAEWAY_SOCKET_PATH;
-	const argv = supervisorArgv(platform, worker, options.home, receipt.id, options.binDir, gatewaySocketPath);
+	const argv = supervisorArgv(
+		platform,
+		worker,
+		options.home,
+		receipt.id,
+		options.binDir,
+		gatewaySocketPath,
+		options.gjcVersionToPinAfterBrokerRestart,
+	);
 	const spawnOptions = {
 		detached: true,
 		stdin: "ignore" as const,
@@ -1086,6 +1198,9 @@ export async function launchRestartStack(
 			...(options.gatewaySocketPath === undefined ? {} : { GAJAEWAY_SOCKET_PATH: options.gatewaySocketPath }),
 			...(options.binDir === undefined ? {} : { GAJAEWAY_BIN_DIR: options.binDir }),
 			...(options.launchAgentsDir === undefined ? {} : { GAJAEWAY_LAUNCH_AGENTS_DIR: options.launchAgentsDir }),
+			...(options.gjcVersionToPinAfterBrokerRestart === undefined
+				? {}
+				: { GAJAEWAY_GJC_VERSION_TO_PIN: options.gjcVersionToPinAfterBrokerRestart }),
 		},
 	};
 	let child: Bun.Subprocess;
@@ -1159,6 +1274,7 @@ export function supervisorArgv(
 	id: string,
 	binDir?: string,
 	gatewaySocketPath?: string,
+	gjcVersionToPinAfterBrokerRestart?: string,
 ): string[] {
 	if (platform === "darwin") return [...worker];
 	return [
@@ -1171,6 +1287,9 @@ export function supervisorArgv(
 		`--setenv=GAJAEWAY_HOME=${home}`,
 		...(binDir === undefined ? [] : [`--setenv=GAJAEWAY_BIN_DIR=${binDir}`]),
 		...(gatewaySocketPath === undefined ? [] : [`--setenv=GAJAEWAY_SOCKET_PATH=${gatewaySocketPath}`]),
+		...(gjcVersionToPinAfterBrokerRestart === undefined
+			? []
+			: [`--setenv=GAJAEWAY_GJC_VERSION_TO_PIN=${gjcVersionToPinAfterBrokerRestart}`]),
 		"--",
 		...worker,
 	];

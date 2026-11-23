@@ -144,7 +144,7 @@ export class ScriptedSessionPort implements SessionPort {
 	readonly inspections: Array<{ sessionId: string; repo: string }> = [];
 	readonly models: Array<{ sessionId: string; repo: string; selection: GjcModelSelection }> = [];
 	readonly serviceTiers: Array<{ sessionId: string; repo: string; tier: GjcServiceTier }> = [];
-	readonly closes: Array<{ sessionId: string; repo: string }> = [];
+	readonly closes: Array<{ sessionId: string; repo: string; ifIdle?: boolean }> = [];
 	/** Per-session close attempts: errors preserve the live host; undefined succeeds. */
 	readonly closeOutcomes = new Map<string, Array<Error | undefined>>();
 	readonly statusReads: Array<{ sessionId: string; repo: string; opRef: string; relayUsed: boolean }> = [];
@@ -215,7 +215,7 @@ export class ScriptedSessionPort implements SessionPort {
 		return this.#sessionStates.get(input.sessionId);
 	}
 
-	async close(input: { sessionId: string; repo: string }): Promise<void> {
+	async close(input: { sessionId: string; repo: string; ifIdle?: boolean }): Promise<void> {
 		this.closes.push(input);
 		const outcome = this.closeOutcomes.get(input.sessionId)?.shift();
 		if (outcome) throw outcome;

@@ -44,6 +44,24 @@ export interface GatewayReadinessResult {
 	readonly failure: FunctionalReadinessFailure | null;
 }
 
+/**
+ * `gateway.adapterOwners` (#862 finding 3): an authenticated adapter's live
+ * replacement for the owner set it announced on hello. Sent only by the
+ * adapter that reported those owners; the gateway keeps it per connection.
+ */
+export interface AdapterOwnersParams {
+	/** Platform the ids belong to; must match the connection's declared platform. */
+	readonly platform: string;
+	/** The replacement owner ids. Omitted (or empty) clears the set: revocation fails closed. */
+	readonly ownerIds?: readonly string[];
+}
+
+export interface AdapterOwnersResult {
+	readonly recorded: true;
+	/** The set the gateway now holds: the filtered ids, or undefined when cleared. */
+	readonly ownerIds?: readonly string[];
+}
+
 export interface GatewayStatusResult {
 	readonly profileVersion: string;
 	readonly capabilities: readonly string[];
@@ -438,11 +456,18 @@ export interface SessionListResult {
  * then the `provider/model` ids gjc lists (`gjc --list-models`). Fails soft: an
  * unreadable catalog yields fewer (or no) choices, never an error. Preset names
  * are private to the owner: the result is empty unless `authorId` is the
- * configured owner (`ownerTarget.origin.peerId`).
+ * configured owner (`ownerTarget.origin.peerId`) or an owner the Discord
+ * adapter resolved from the application (`adapter.ownerIds`, issue #862).
  */
 export interface SessionModelChoicesParams {
 	/** Platform user id of whoever is typing the `/model set` choice. */
 	readonly authorId?: string;
+	/**
+	 * Platform the typing user speaks on, when the caller is an adapter
+	 * (#862). Adapter-reported application owners are authority only for this
+	 * platform; omitting it still matches the configured `ownerTarget`.
+	 */
+	readonly originPlatform?: "discord";
 }
 
 export interface SessionModelChoicesResult {
@@ -1347,6 +1372,14 @@ export interface VerbCatalogV01 {
 		params: { readonly restartId: string };
 		result: { readonly cancelled: boolean; readonly transferred?: boolean };
 	};
+	/**
+	 * An authenticated adapter replaces the application-owner set it reported on
+	 * its hello (#862 finding 3). Same authority rules as `hello.adapter`: the
+	 * platform must match the connection's declared platform, an explicit
+	 * `ownerTarget` still supersedes the set, and omitting `ownerIds` clears it
+	 * (revocation; lookup failures resolve undefined, never a stale set).
+	 */
+	"gateway.adapterOwners": { params: AdapterOwnersParams; result: AdapterOwnersResult };
 	"gateway.reloadConfig": { params: undefined; result: ConfigReloadResult };
 	"chat.send": { params: ChatSendParams; result: ChatSendResult };
 	"chat.edit": { params: ChatEditParams; result: ChatEditResult };
@@ -1425,6 +1458,7 @@ export const VERBS_V01 = [
 	"gateway.shutdown",
 	"gateway.restart.prepare",
 	"gateway.restart.cancel",
+	"gateway.adapterOwners",
 	"chat.send",
 	"chat.edit",
 	"delivery.confirm",

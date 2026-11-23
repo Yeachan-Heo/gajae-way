@@ -51,32 +51,28 @@ test("Slack message identifiers round trip and reject malformed or unsafe parts"
 
 test("final origin threads a mentioned channel root but not a command or DM", () => {
 	const message = { channel: "C1", user: "U1", ts: "1.2" };
-	expect(resolveSlackMessageOrigin(message, "BOT", true)).toEqual({
+	expect(resolveSlackMessageOrigin(message, true)).toEqual({
 		platform: "slack",
 		kind: "thread",
 		conversationId: "C1:1.2",
 		parentId: "C1",
 	});
 	// The caller passes false for an extracted command, even when it mentioned the bot.
-	expect(resolveSlackMessageOrigin(message, "BOT", false)).toEqual(slackMessageOrigin(message));
+	expect(resolveSlackMessageOrigin(message, false)).toEqual(slackMessageOrigin(message));
 	const dm = { ...message, channel: "D1", thread_ts: "1.0" };
-	expect(resolveSlackMessageOrigin(dm, "BOT", true)).toEqual(slackMessageOrigin(dm));
+	expect(resolveSlackMessageOrigin(dm, true)).toEqual(slackMessageOrigin(dm));
 });
 
-test("final origin keeps bot-parent replies in the channel and other replies in their thread", () => {
+test("final origin keeps every reply in its thread, including one under the bot's own root", () => {
 	const reply = { channel: "C1", user: "U1", ts: "2.3", thread_ts: "1.2" };
-	for (const mentioned of [true, false]) {
-		expect(resolveSlackMessageOrigin({ ...reply, parent_user_id: "BOT" }, "BOT", mentioned)).toEqual({
-			platform: "slack",
-			kind: "channel",
-			conversationId: "C1",
-		});
-		for (const parent_user_id of ["U2", undefined]) {
-			expect(resolveSlackMessageOrigin({ ...reply, parent_user_id }, "BOT", mentioned)).toEqual(
-				slackMessageOrigin(reply),
-			);
-		}
-	}
+	for (const mentioned of [true, false])
+		for (const parent_user_id of ["BOT", "U2", undefined])
+			expect(resolveSlackMessageOrigin({ ...reply, parent_user_id }, mentioned)).toEqual({
+				platform: "slack",
+				kind: "thread",
+				conversationId: "C1:1.2",
+				parentId: "C1",
+			});
 	const root = { ...reply, ts: "1.2", parent_user_id: "BOT" };
-	expect(resolveSlackMessageOrigin(root, "BOT", true).kind).toBe("thread");
+	expect(resolveSlackMessageOrigin(root, true).kind).toBe("thread");
 });

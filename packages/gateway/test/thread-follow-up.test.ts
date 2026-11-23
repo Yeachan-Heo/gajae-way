@@ -127,15 +127,34 @@ test("a muted thread engages with explicit mention (issue #625)", () => {
 });
 
 test("a muted thread engages with reply-to (issue #625)", () => {
-	const mentionOpen = config({ channels: { "slack:C1": { engagement: "mention-open" } } });
+	const discordThread = { platform: "discord" as const, kind: "thread" as const, conversationId: "T1", parentId: "C1" };
+	const mentionOpen = config({ channels: { "discord:C1": { engagement: "mention-open" } } });
 	const withReplyToBot = {
 		mentioned: false,
 		explicitMention: false,
 		group: true,
 		authorId: "U-stranger",
-		replyTo: { messageId: "C1:1700000000.000200", fromSelf: true },
+		replyTo: { messageId: "M1", fromSelf: true },
 	};
-	expect(decideEngagement(THREAD, withReplyToBot, mentionOpen, true, true).engaged).toBe(true);
+	expect(decideEngagement(discordThread, withReplyToBot, mentionOpen, true, true).engaged).toBe(true);
+});
+
+test("a muted Slack thread under the persona's own root unmutes only on a mention", () => {
+	const mentionOpen = config({ channels: { "slack:C1": { engagement: "mention-open" } } });
+	// Slack's replyTo names the thread root, so every reply in a bot-rooted thread is fromSelf.
+	const botRootReply = {
+		mentioned: true,
+		explicitMention: false,
+		group: true,
+		authorId: OWNER,
+		replyTo: { messageId: THREAD.conversationId, fromSelf: true },
+	};
+	expect(decideEngagement(THREAD, botRootReply, mentionOpen, true, true).engaged).toBe(false);
+	expect(decideEngagement(THREAD, { ...botRootReply, explicitMention: true }, mentionOpen, true, true).engaged).toBe(
+		true,
+	);
+	// Unmuted, the same reply is admitted as before.
+	expect(decideEngagement(THREAD, botRootReply, mentionOpen, true, false).engaged).toBe(true);
 });
 
 test("a legacy adapter mention unmutes except where an open channel marks every message mentioned", () => {
@@ -148,7 +167,7 @@ test("a legacy adapter mention unmutes except where an open channel marks every 
 	expect(decideEngagement(THREAD, legacyMention, config(), true, true).engaged).toBe(true);
 });
 
-test("a Slack thread kept on the channel session mutes under its own thread key", () => {
+test("a legacy Slack reply recorded on the channel session mutes under its own thread key", () => {
 	const botRootReply = {
 		mentioned: true,
 		explicitMention: false,

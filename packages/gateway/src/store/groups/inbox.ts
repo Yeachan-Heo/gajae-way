@@ -1303,6 +1303,14 @@ export class InboxGroup {
 		);
 	}
 
+	/** The inbound row of one message in this origin, whatever its state. */
+	messageRow(messageId: string, originKey: string): InboundMessageRow | undefined {
+		const row = this.#db
+			.prepare(`SELECT ${INBOUND_COLUMNS} FROM inbound_messages WHERE message_id = ? AND origin_key = ?`)
+			.get(messageId, originKey) as InboundMessageRow | null;
+		return row ?? undefined;
+	}
+
 	messageExists(messageId: string): boolean {
 		return this.#db.prepare("SELECT 1 FROM inbound_messages WHERE message_id = ?").get(messageId) !== null;
 	}

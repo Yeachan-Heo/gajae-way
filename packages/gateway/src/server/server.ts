@@ -4,6 +4,8 @@ import { readFile, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { validatePromptImages } from "@gajae-gateway/images";
 import {
+	type AdapterOwnersParams,
+	type AdapterOwnersResult,
 	CAPABILITIES,
 	type ChatMessagePayload,
 	type ChatProgressActivity,
@@ -26,6 +28,7 @@ import {
 	OPS_CYCLE_DEFAULT_LIMIT,
 	OPS_CYCLE_MAX_LIMIT,
 	OrderedFrameWriter,
+	type OriginPlatform,
 	type OriginRef,
 	OUTBOUND_FILE_MAX_BYTES,
 	OUTBOUND_FILES_PER_TURN_CAP,
@@ -164,7 +167,13 @@ import {
 	watchWakeMessageId,
 } from "./handoff";
 import { InterimSpeechGate } from "./interim-speech";
-import { applyModelCommand, listModelChoices, ProviderModelCatalog } from "./model-command";
+import {
+	applyModelCommand,
+	commitModelChange,
+	listModelChoices,
+	modelChangeRefusedText,
+	ProviderModelCatalog,
+} from "./model-command";
 import { checkOutboundFile, deterministicFileDeliveryId } from "./outbound-files";
 import { type PanelResponseKind, PermissionPanels } from "./permission-panels";
 import { RestartNotices, restartNoticeText } from "./restart-notice";
@@ -223,6 +232,16 @@ interface Connection {
 	negotiated: boolean;
 	/** Reported client identity and process generation, recorded at negotiation. */
 	client?: { readonly name: string; readonly startedAt?: string; readonly connectedAt: string };
+	/**
+	 * Platform user ids the ADAPTER resolved as owners of its own application
+	 * (issue #862), recorded at negotiation together with the platform they
+	 * belong to. Authority only for origins on that platform, and only on this
+	 * authenticated connection; an explicit `ownerTarget` supersedes it
+	 * everywhere.
+	 */
+	platformOwnerIds?: readonly string[];
+	/** The platform `platformOwnerIds` was reported for; undefined when none. */
+	platformOwnerPlatform?: string;
 	write(frame: Frame): void;
 	close(): void;
 	settle(): Promise<void>;
@@ -1524,6 +1543,17 @@ async function handleFrame(
 				});
 			connection.negotiated = true;
 			const info = hello.clientInfo;
+			// An authenticated adapter may report the platform user ids it resolved
+			// as its own application's owners (issue #862). Kept per connection:
+			// they are authority only for this adapter's own platform.
+			const reportedAdapter = hello.adapter;
+			const ownerIds = reportedAdapter?.ownerIds;
+			if (reportedAdapter && Array.isArray(ownerIds) && isChatPlatform(reportedAdapter.platform as OriginPlatform))
+				connection.platformOwnerPlatform = reportedAdapter.platform;
+			if (connection.platformOwnerPlatform !== undefined && Array.isArray(ownerIds))
+				connection.platformOwnerIds = [
+					...new Set(ownerIds.filter((id): id is string => typeof id === "string" && id.length > 0)),
+				];
 			connection.client = {
 				name: typeof info?.name === "string" && info.name ? info.name : "unidentified",
 				...(typeof info?.startedAt === "string" && info.startedAt ? { startedAt: info.startedAt } : {}),
@@ -1632,6 +1662,49 @@ async function handleRequest(
 				},
 			});
 			return;
+		case "gateway.adapterOwners": {
+			// An authenticated adapter's live replacement for its hello-announced
+			// owner set (#862 finding 3). Same authority rules as hello.adapter:
+			// the platform must be a chat platform matching the connection's own
+			// declaration, and an explicit ownerTarget still supersedes the set
+			// everywhere. Omitting or emptying ownerIds clears the stored set, so
+			// a failed re-resolution revokes instead of preserving stale grants.
+			const params = request.params as AdapterOwnersParams | undefined;
+			const platform = typeof params?.platform === "string" ? params.platform : undefined;
+			const ownerIds = Array.isArray(params?.ownerIds)
+				? [
+						...new Set(
+							(params?.ownerIds as unknown[]).filter((id): id is string => typeof id === "string" && id.length > 0),
+						),
+					]
+				: undefined;
+			if (platform === undefined)
+				throw new ProtocolError("invalid_params", "gateway.adapterOwners requires a platform string");
+			if (!isChatPlatform(platform as OriginPlatform))
+				throw new ProtocolError(
+					"invalid_params",
+					`gateway.adapterOwners requires a ${describeChatPlatforms()} platform`,
+				);
+			if (connection.platformOwnerPlatform !== platform)
+				throw new ProtocolError(
+					"invalid_params",
+					"gateway.adapterOwners platform must match the platform this connection declared on hello",
+				);
+			if (ownerIds !== undefined && ownerIds.length === 0)
+				throw new ProtocolError("invalid_params", "gateway.adapterOwners ownerIds must be omitted, not empty");
+			connection.platformOwnerIds = ownerIds;
+			const result: AdapterOwnersResult = {
+				recorded: true,
+				...(ownerIds ? { ownerIds } : {}),
+			};
+			console.log(
+				ownerIds
+					? `adapter owner set updated platform=${platform} count=${ownerIds.length}`
+					: `adapter owner set cleared platform=${platform}`,
+			);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			return;
+		}
 		case "gateway.shutdown":
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { stopping: true } });
 			await stop();
@@ -2084,7 +2157,7 @@ async function handleRequest(
 		case "session.modelChoices": {
 			// Preset names are the owner's private configuration: anyone else typing
 			// `/model set` gets no suggestions, the same owner gate as `/model` itself.
-			if (!ownerAuthored(runtime.config, request.params)) {
+			if (!ownerAuthored(runtime.config, request.params, connection)) {
 				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { choices: [] } });
 				return;
 			}
@@ -2656,7 +2729,7 @@ async function sendChat(
 	if (userText === "/model" || userText.startsWith("/model ")) {
 		if (
 			!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp) ||
-			(origin.platform !== "loopback" && !ownerAuthored(runtime.config, params.engagement))
+			(origin.platform !== "loopback" && !ownerAuthoredOn(origin, runtime.config, params.engagement, connection))
 		) {
 			connection.write({
 				v: PROFILE_VERSION,
@@ -2666,17 +2739,27 @@ async function sendChat(
 			});
 			return;
 		}
-		const outcome = applyModelCommand(userText, key, origin, options.database, runtime.config.model);
-		if (outcome.rebind) {
-			const selection = outcome.rebind.kind === "set" ? outcome.rebind.selection : runtime.config.model;
+		// Read, apply and record inside the origin's mailbox so two `/model`
+		// commands cannot interleave. Only a selection gjc accepted is stored: a
+		// stored selection gjc refuses would fail every later turn here. A
+		// permanent refusal is answered, not thrown, because a failed request
+		// makes the adapter replay this same message forever, holding every
+		// message queued behind it.
+		const replyText = await runtime.personaSessions.runModelCommand(key, async (apply) => {
+			const outcome = applyModelCommand(userText, key, origin, options.database, runtime.config.model);
+			const change = outcome.rebind;
+			if (!change) return outcome.text;
+			const selection = change.kind === "set" ? change.selection : runtime.config.model;
 			if (!selection) throw new Error("/model clear produced a rebind without a configured gateway default");
-			await runtime.personaSessions.rebindModel(key, selection);
-		}
+			const applied = await apply(selection, () => commitModelChange(options.database, key, change));
+			return applied.kind === "applied" ? outcome.text : modelChangeRefusedText(change, applied);
+		});
+		if (replyText === undefined) throw new Error("/model was not applied because the persona session manager stopped");
 		const payload = {
 			turnId: crypto.randomUUID(),
 			origin,
 			role: "assistant" as const,
-			text: outcome.text,
+			text: replyText,
 			final: true,
 			...(replyToMessageId ? { replyToMessageId } : {}),
 		};
@@ -2705,7 +2788,7 @@ async function sendChat(
 		// and resume through recovery, so the persona keeps its transcript.
 		if (
 			!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp) ||
-			!ownerAuthored(runtime.config, params.engagement)
+			!ownerAuthoredOn(origin, runtime.config, params.engagement, connection)
 		) {
 			connection.write({
 				v: PROFILE_VERSION,
@@ -3147,6 +3230,16 @@ export function messageEditId(messageId: string, text: string): string {
 	return `edit:${messageId}:${createHash("sha256").update(text).digest("hex").slice(0, 16)}`;
 }
 
+/**
+ * The channel origin an older Slack adapter recorded a reply under the persona's own thread
+ * root on, or undefined when `origin` is not such a thread reply.
+ */
+function legacySlackBotRootOrigin(origin: OriginRef, engagement: unknown): OriginRef | undefined {
+	if (origin.platform !== "slack" || origin.kind !== "thread" || !origin.parentId) return undefined;
+	const replyTo = (engagement as { replyTo?: { messageId?: unknown; fromSelf?: unknown } } | undefined)?.replyTo;
+	if (replyTo?.fromSelf !== true || replyTo.messageId !== origin.conversationId) return undefined;
+	return { platform: "slack", kind: "channel", conversationId: origin.parentId };
+}
 async function editChat(
 	connection: Connection,
 	request: RequestFrame,
@@ -3185,7 +3278,7 @@ async function editChat(
 			typeof params.engagement.authorId !== "string")
 	)
 		throw new ProtocolError("invalid_params", "non-loopback chat.edit requires engagement");
-	const key = originKey(origin);
+	let key = originKey(origin);
 	const declined = () =>
 		connection.write({
 			v: PROFILE_VERSION,
@@ -3193,6 +3286,18 @@ async function editChat(
 			id: request.id,
 			result: { turnId: null, engaged: false },
 		});
+	// Slack adapters before #854 recorded a reply under the persona's own root on the channel
+	// session; after the cutover an edit of that reply names its thread. Apply the edit where
+	// the original was recorded instead of declining it as unknown.
+	const legacy = legacySlackBotRootOrigin(origin, params.engagement);
+	if (
+		legacy &&
+		!options.database.inbox.knownMessage(key, params.messageId) &&
+		options.database.inbox.knownMessage(originKey(legacy), params.messageId)
+	) {
+		origin = legacy;
+		key = originKey(legacy);
+	}
 	if (!options.database.inbox.knownMessage(key, params.messageId)) {
 		// Never ingested: nothing to point at. Not context either - a message the
 		// gateway never saw must not appear by way of its edit.
@@ -4870,15 +4975,11 @@ export function currentConversationNotice(origin: OriginRef): string {
 			: []),
 		...(origin.kind === "thread"
 			? [
-					"To mute a thread so it stops sending you messages unless explicitly mentioned or replied to, reply with exactly [SHUTUP] and nothing else. This mutes the thread for this bot and persists across restarts; mention the bot or reply to one of its messages to unmute and resume normal engagement.",
-				]
-			: []),
-		// Slack keeps a thread rooted at the persona's own message on the channel
-		// session (adapter-slack decideInbound), so the thread notice above never
-		// reaches it.
-		...(origin.platform === "slack" && origin.kind === "channel"
-			? [
-					"Replies in a Slack thread under one of your own messages arrive in this channel session. To mute such a thread so it stops sending you messages unless you are explicitly mentioned there, answer a message from that thread with exactly [SHUTUP] and nothing else. This mutes only that thread, persists across restarts, and a mention in the thread unmutes it.",
+					// A Slack reply names only the thread root, never the message it answers, so a
+					// muted Slack thread unmutes on an explicit mention alone (policy threadMuteAddressed).
+					origin.platform === "slack"
+						? "To mute a thread so it stops sending you messages unless you are explicitly mentioned there, reply with exactly [SHUTUP] and nothing else. This mutes the thread for this bot and persists across restarts; a mention of the bot in the thread unmutes it and resumes normal engagement."
+						: "To mute a thread so it stops sending you messages unless explicitly mentioned or replied to, reply with exactly [SHUTUP] and nothing else. This mutes the thread for this bot and persists across restarts; mention the bot or reply to one of its messages to unmute and resume normal engagement.",
 				]
 			: []),
 		// Reply-threading was implemented end to end (parser, ledger, Slack/Discord
@@ -4975,14 +5076,43 @@ function ownerPeerIdOf(config: GatewayConfig): string | undefined {
 }
 
 /**
- * Whether `authorId` in an engagement or request params is the configured
- * owner (`ownerTarget.origin.peerId`). No configured owner authorises nobody.
- * Owner-only verbs (`/restart`, `/model`, `session.modelChoices`) require it.
+ * Whether `authorId` in an engagement or request params is the owner. The
+ * configured owner (`ownerTarget.origin.peerId`) always authorises, and an
+ * explicit `ownerTarget` supersedes the adapter-reported application owners
+ * entirely (#862). Without an `ownerTarget`, an id the Discord adapter resolved
+ * from its own application at login (`hello.adapter.ownerIds`) authorises a
+ * `discord`-platform author: the ids arrive over the adapter's authenticated
+ * connection, and the connection that reported them is the only one they are
+ * trusted on. No owner anywhere authorises nobody (fail closed). Owner-only
+ * verbs (`/restart`, `/model`, `session.modelChoices`) require this.
  */
-function ownerAuthored(config: GatewayConfig, carrier: unknown): boolean {
-	const owner = ownerPeerIdOf(config);
-	const authorId = (carrier as { authorId?: unknown } | undefined)?.authorId;
-	return owner !== undefined && authorId === owner;
+function ownerAuthored(config: GatewayConfig, carrier: unknown, connection?: Connection): boolean {
+	const record = (carrier ?? {}) as { authorId?: unknown; originPlatform?: unknown };
+	const authorId = record.authorId;
+	if (typeof authorId !== "string") return false;
+	if (config.ownerTarget !== undefined) return authorId === ownerPeerIdOf(config);
+	if (connection === undefined) return false;
+	// Adapter-reported owners are authority for the DECLARED platform only
+	// (#862): the originless verb (session.modelChoices) must name the platform
+	// the typing user speaks for, and it must be the platform this connection
+	// reported owners for.
+	if (record.originPlatform !== connection.platformOwnerPlatform) return false;
+	return connection.platformOwnerIds?.includes(authorId) === true;
+}
+
+/**
+ * The `ownerAuthored` gate for one chat origin: adapter-reported application
+ * owners are consulted only when the origin is on the reporting adapter's own
+ * platform (#862), so a slack or telegram author can never ride a discord
+ * adapter's hello.
+ */
+function ownerAuthoredOn(origin: OriginRef, config: GatewayConfig, carrier: unknown, connection?: Connection): boolean {
+	if (connection === undefined) return ownerAuthored(config, carrier, undefined);
+	// Consult the connection's reported owners only when the origin is on the
+	// platform that connection declared (#862).
+	if (origin.platform !== connection.platformOwnerPlatform) return ownerAuthored(config, carrier, undefined);
+	const record = (carrier ?? {}) as Record<string, unknown>;
+	return ownerAuthored(config, { ...record, originPlatform: origin.platform }, connection);
 }
 
 /**
