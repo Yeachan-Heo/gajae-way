@@ -32,6 +32,9 @@ export function editedOriginalId(inboundMessageId: string): string | undefined {
 	return /^edit:(.+):[0-9a-f]{16}$/.exec(inboundMessageId)?.[1];
 }
 
+/** Characters an edit row id adds around the original id: `edit:` plus `:` and the 16-hex hash. */
+const EDIT_ID_AFFIX_LENGTH = "edit:".length + 1 + 16;
+
 export interface CrossSessionWatchRow {
 	readonly watch_id: string;
 	readonly watcher_origin_key: string;
@@ -144,13 +147,23 @@ export class InboxGroup {
 		);
 	}
 
+	/**
+	 * Whether `messageId` joined a turn on this origin, either as itself or through an edit of
+	 * it. An edit is stored as its own row (`edit:<id>:<hash>`, see `editedOriginalId`), so a
+	 * message that only became a turn once the user edited a mention into it has no row under
+	 * its platform id; the edit row is the evidence that the persona answered it.
+	 */
 	messageJoinedTurn(originKey: string, messageId: string): boolean {
 		return (
 			this.#db
 				.prepare(
-					"SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND message_id = ? AND turn_role IN ('trigger', 'steer') LIMIT 1",
+					`SELECT 1 AS n FROM inbound_messages
+					 WHERE origin_key = ? AND turn_role IN ('trigger', 'steer')
+					   AND (message_id = ? OR (substr(message_id, 1, 5) = 'edit:'
+					        AND substr(message_id, 6, length(message_id) - ${EDIT_ID_AFFIX_LENGTH}) = ?))
+					 LIMIT 1`,
 				)
-				.get(originKey, messageId) !== null
+				.get(originKey, messageId, messageId) !== null
 		);
 	}
 
