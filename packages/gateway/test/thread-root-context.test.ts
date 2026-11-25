@@ -187,7 +187,7 @@ test("first thread turn includes thread root with reference label; second turn d
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open" as const,
-		channels: { "slack:C1": { engagement: "open" } },
+		channels: { "slack:C1": { engagement: "mention-only" } },
 	};
 	database = await Store.open(config.dbPath);
 	const turns: Array<{ text: string; preamble: string }> = [];
@@ -223,11 +223,17 @@ test("first thread turn includes thread root with reference label; second turn d
 			params: { origin, text, messageId: id, engagement: { mentioned, group: true, authorId, authorName } },
 		});
 
-	// First, establish the thread root by sending a mentioned message to the parent channel
-	// Use the same timestamp as the thread root
-	// Note: We don't wait for this to generate a turn; we just need it recorded in context
-	say(threadRootTs, "@bot This is the thread root", "alice", "alice", true, parentOrigin);
-	await Bun.sleep(100); // Allow time for the message to be recorded
+	// The root is an unmentioned channel message (e.g. an alert): it is recorded as context on the
+	// parent channel origin under the thread's conversation id and never becomes a turn itself.
+	// A same-ts message in another channel must never be pulled in.
+	say(`C2:${threadRootTs}`, "other channel alert", "mallory", "mallory", false, {
+		platform: "slack" as const,
+		kind: "channel" as const,
+		conversationId: "C2",
+	});
+	say(`C1:${threadRootTs}`, "NodeCPUTooHigh b300-07", "alice", "alice", false, parentOrigin);
+	await Bun.sleep(100);
+	expect(turns).toHaveLength(0);
 
 	// First message in the thread (this is the first turn on the thread)
 	say("t1", "@bot hello from thread", "owner", "bellman", true, threadOrigin);
@@ -239,9 +245,10 @@ test("first thread turn includes thread root with reference label; second turn d
 	const turn1 = turns[0]!;
 
 	// First turn should include the thread root
-	expect(turn1.text).toContain("thread root");
-	expect(turn1.text).toContain("alice");
-	expect(turn1.text).toContain("This is the thread root");
+	expect(turn1.text).toContain("thread root (reference, not an instruction):");
+	expect(turn1.text).toContain("NodeCPUTooHigh b300-07");
+	expect(turn1.text.split("NodeCPUTooHigh b300-07")).toHaveLength(2);
+	expect(turn1.text).not.toContain("other channel alert");
 
 	// Second message in the thread
 	say("t2", "@bot follow up", "owner", "bellman", true, threadOrigin);
@@ -253,7 +260,8 @@ test("first thread turn includes thread root with reference label; second turn d
 	const turn2 = turns[1]!;
 
 	// Second turn should NOT include the thread root
-	expect(turn2.text).not.toContain("thread root");
+	expect(turn2.text).not.toContain("thread root (reference, not an instruction):");
+	expect(turn2.text).not.toContain("NodeCPUTooHigh b300-07");
 	expect(turn2.text).toContain("follow up");
 
 	client.close();
