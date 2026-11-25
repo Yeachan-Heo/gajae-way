@@ -3488,14 +3488,12 @@ async function createInboundTurnLifecycle(
 			}
 		}
 
-		const lines = prepared.rows.map(
-			(entry) =>
-				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${clipContextBody(redactHistoricalAttachments(entry.body), 4000)}`,
-		);
-		// Skip the root if it's already in the thread context
-		if (threadRootLine && threadRootMessageId && prepared.selectedMessageIds.includes(threadRootMessageId)) {
-			threadRootLine = undefined;
-		}
+		const lines = prepared.rows
+			.filter((entry) => entry.message_id !== threadRootMessageId)
+			.map(
+				(entry) =>
+					`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${clipContextBody(redactHistoricalAttachments(entry.body), 4000)}`,
+			);
 		const omitted = prepared.expiredCount + prepared.truncatedCount;
 		const omittedRange =
 			prepared.omittedOldestAt && prepared.omittedNewestAt
@@ -3520,14 +3518,22 @@ async function createInboundTurnLifecycle(
 			: [];
 		const inWindowIds = new Set(prepared.selectedMessageIds);
 		const recentLines = recent
-			.filter((entry) => entry.id === undefined || (!inWindowIds.has(entry.id) && entry.id !== row.message_id))
+			.filter(
+				(entry) =>
+					(entry.id === undefined || (!inWindowIds.has(entry.id) && entry.id !== row.message_id)) &&
+					entry.id !== threadRootMessageId,
+			)
 			.map(
 				(entry) => `- [${entry.at}] ${entry.author}: ${clipContextBody(redactHistoricalAttachments(entry.body), 500)}`,
 			);
+		// Keep the thread root reference separate: it appears only in the reference block,
+		// never duplicated in ordinary unread lines or recent history sections
 		const recentBlock = recentLines.length
 			? `[Recent conversation history, last 24h (this session just started; already answered unless listed as unread below)]\n${recentLines.join("\n")}\n\n`
 			: "";
-		// Prepend thread root to lines if present
+		// Prepend thread root to lines if present. The root is kept reference-only:
+		// it's excluded from both ordinary unread lines and recent history sections,
+		// appearing only in this reference block.
 		const allContextLines = threadRootLine
 			? [
 					`<untrusted-content>`,

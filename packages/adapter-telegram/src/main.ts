@@ -68,6 +68,12 @@ export interface TelegramMessage extends TelegramMessageOriginShape, TelegramAtt
 	/** Media messages carry their text here instead of in `text`. */
 	readonly caption?: string;
 	readonly reply_to_message?: TelegramReplyMessageShape;
+	/** Service message: forum topic was created. */
+	readonly forum_topic_created?: {
+		readonly name: string;
+		readonly icon_color?: number;
+		readonly icon_custom_emoji_id?: string;
+	};
 }
 
 /** One entry of Telegram's `ReactionType` union; bots only ever set/read `type: "emoji"`. */
@@ -814,6 +820,33 @@ export class TelegramAdapter {
 		// A photo or file has no `text`; forwarding text alone dropped it without a trace.
 		const content = message.text ?? message.caption ?? "";
 		const attachment = telegramAttachment(message);
+		// Service message: store forum topic creation metadata before dropping empty messages.
+		// When a Telegram forum topic is created, receive a service message with forum_topic_created field.
+		// See packages/adapter-telegram/src/main.ts:814-817.
+		// Persist bounded topic metadata (name, creator) keyed by root ID format,
+		// so the first message can reference it via root lookup.
+		if (message.forum_topic_created && message.message_thread_id !== undefined && content === "" && !attachment) {
+			const origin = telegramMessageOrigin(message);
+			await this.state.rememberOrigin(origin, message.message_thread_id);
+			const topicName = message.forum_topic_created.name ?? "Topic";
+			// Topic root ID: chat_id:message_thread_id (e.g., "-100123:99")
+			try {
+				await gateway.request("chat.send", {
+					origin,
+					messageId: `${message.chat.id}:${message.message_thread_id}`,
+					text: `Forum topic: ${topicName}`,
+					engagement: {
+						mentioned: false,
+						group: true,
+						authorId: String(message.from.id ?? "unknown"),
+						authorName: message.from.first_name ?? "unknown",
+					},
+				});
+			} catch (error) {
+				console.error("Failed to store forum topic context:", error);
+			}
+			return this.state.acceptUpdate(update.update_id);
+		}
 		if (content === "" && !attachment) return this.state.acceptUpdate(update.update_id);
 		const origin = telegramMessageOrigin(message);
 		await this.state.rememberOrigin(origin, origin.kind === "topic" ? message.message_thread_id : undefined);
