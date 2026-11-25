@@ -468,6 +468,7 @@ function orderedSubscription(
 				events.push(`start text ${text}`);
 				await Bun.sleep(20);
 				events.push(`end text ${text}`);
+				return { message_id: 500 };
 			},
 			setMessageReaction: async () => {},
 			sendPhoto: upload,
@@ -512,7 +513,7 @@ test("one conversation's text and files settle in gateway order even when a late
 		"end b.png",
 	]);
 	expect(requests).toEqual([
-		{ verb: "delivery.confirm", params: { deliveryId: "text" } },
+		{ verb: "delivery.confirm", params: { deliveryId: "text", platformMessageId: "22:500" } },
 		{ verb: "delivery.confirm", params: { deliveryId: "a" } },
 		{ verb: "delivery.confirm", params: { deliveryId: "b" } },
 	]);

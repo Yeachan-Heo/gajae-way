@@ -400,6 +400,12 @@ export interface ChatMessagePayload {
 
 export interface DeliveryConfirmParams {
 	readonly deliveryId: string;
+	/**
+	 * Platform message ID of the delivered message, in the same format as inbound message IDs.
+	 * Slack: `<channel>:<timestamp>`, Discord: message id, Telegram: `<chat_id>:<message_id>`.
+	 * Optional for backward compatibility with older adapters.
+	 */
+	readonly platformMessageId?: string;
 }
 
 export interface DeliveryFailParams {

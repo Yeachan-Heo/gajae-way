@@ -345,12 +345,14 @@ async function sendTelegramHtml(
 	chatId: string,
 	html: string,
 	messageThreadId: number | undefined,
-): Promise<void> {
+): Promise<number> {
 	try {
-		await bot.sendMessage(chatId, html, messageThreadId, TELEGRAM_PARSE_MODE);
+		const result = await bot.sendMessage(chatId, html, messageThreadId, TELEGRAM_PARSE_MODE);
+		return (result as unknown as { message_id: number }).message_id;
 	} catch (error) {
 		if (!isEntityParseError(error)) throw error;
-		await bot.sendMessage(chatId, telegramHtmlToPlainText(html), messageThreadId);
+		const result = await bot.sendMessage(chatId, telegramHtmlToPlainText(html), messageThreadId);
+		return (result as unknown as { message_id: number }).message_id;
 	}
 }
 
@@ -481,19 +483,21 @@ export async function settleTelegramDelivery(
 	};
 	const startedAt = entry.sent;
 	let waitedMs = 0;
+	let firstMessageId: number | undefined;
+	const route = state.routeFor(message.origin);
 	try {
-		const route = state.routeFor(message.origin);
 		if (!route)
 			throw new TelegramApiError(400, `No persisted Telegram reply route for ${message.origin.conversationId}`);
 		while (entry.sent < entry.chunks.length) {
 			const chunk = entry.chunks[entry.sent] ?? "";
 			try {
-				await sendTelegramHtml(
+				const messageId = await sendTelegramHtml(
 					bot,
 					route.chatId,
 					entry.uncertain ? DUPLICATE_WARNING_PREFIX + chunk : chunk,
 					route.messageThreadId,
 				);
+				if (!firstMessageId) firstMessageId = messageId;
 			} catch (error) {
 				const waitMs = floodWaitMs(error);
 				if (waitMs === undefined || waitedMs + waitMs > TELEGRAM_RETRY_AFTER_BUDGET_MS) throw error;
@@ -508,7 +512,11 @@ export async function settleTelegramDelivery(
 		// A fully posted reply only absorbs replays: keep a chunkless marker
 		// (0 of 0 sent) instead of up to a megabyte of rendered text.
 		if (entry.chunks.length > 0) progress.remember(deliveryId, { chunks: [], sent: 0, uncertain: false, stalls: 0 });
-		await gateway.request("delivery.confirm", { deliveryId });
+		const platformMessageId = firstMessageId && route ? `${route.chatId}:${firstMessageId}` : undefined;
+		await gateway.request("delivery.confirm", {
+			deliveryId,
+			...(platformMessageId ? { platformMessageId } : {}),
+		});
 	} catch (error) {
 		const transport = deliveryFailureIsAmbiguous(error);
 		const posted = entry.sent === entry.chunks.length;

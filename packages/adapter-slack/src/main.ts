@@ -401,7 +401,10 @@ export async function settleSlackDelivery(
 			const fallback = askUserPanelFallback(message);
 			const sent = await api.postMessage(channel, fallback || message.text, threadTs, "delivery", blocks);
 			posted?.remember(message.origin, sent.channel || channel, sent.ts, fallback || message.text, threadTs);
-			await gateway.request("delivery.confirm", { deliveryId });
+			await gateway.request("delivery.confirm", {
+				deliveryId,
+				platformMessageId: slackMessageId(sent.channel || channel, sent.ts),
+			});
 			return;
 		}
 		if (message.approvalPanel) {
@@ -409,7 +412,10 @@ export async function settleSlackDelivery(
 			const fallback = approvalPanelFallback(message);
 			const sent = await api.postMessage(channel, fallback || message.text, threadTs, "delivery", blocks);
 			posted?.remember(message.origin, sent.channel || channel, sent.ts, fallback || message.text, threadTs);
-			await gateway.request("delivery.confirm", { deliveryId });
+			await gateway.request("delivery.confirm", {
+				deliveryId,
+				platformMessageId: slackMessageId(sent.channel || channel, sent.ts),
+			});
 			return;
 		}
 		// Mentions are repaired before Markdown → mrkdwn: a `<@U…>` the model wrapped
@@ -441,13 +447,22 @@ export async function settleSlackDelivery(
 				// A fold changes what the live message says.
 				if (outcome.kind === "folded")
 					posted?.remember(message.origin, outcome.message.channel, outcome.message.ts, outcome.message.text, threadTs);
-				await gateway.request("delivery.confirm", { deliveryId });
+				const platformId =
+					outcome.kind === "posted" || outcome.kind === "folded"
+						? slackMessageId(outcome.message.channel, outcome.message.ts)
+						: undefined;
+				await gateway.request("delivery.confirm", {
+					deliveryId,
+					...(platformId ? { platformMessageId: platformId } : {}),
+				});
 				return;
 			}
 		}
 		// Every chunk must stay in the same Slack thread, not just the first chunk.
+		let firstChunkSent: { channel: string; ts: string } | undefined;
 		for (const chunk of chunkSlackMessage(text)) {
 			const sent = await api.postMessage(channel, chunk, threadTs);
+			if (!firstChunkSent) firstChunkSent = sent;
 			// Every chunk is recorded for reactions; only the first can be a thread root.
 			posted?.remember(
 				message.origin,
@@ -459,7 +474,12 @@ export async function settleSlackDelivery(
 			visibleTextPosted = true;
 		}
 		// voiceText is intentionally ignored: Slack has no bot voice messages.
-		await gateway.request("delivery.confirm", { deliveryId });
+		await gateway.request("delivery.confirm", {
+			deliveryId,
+			platformMessageId: firstChunkSent
+				? slackMessageId(firstChunkSent.channel || channel, firstChunkSent.ts)
+				: undefined,
+		});
 	} catch (error) {
 		await gateway.request("delivery.fail", {
 			deliveryId,

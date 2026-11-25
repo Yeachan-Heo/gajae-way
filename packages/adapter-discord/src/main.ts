@@ -934,21 +934,23 @@ async function sendFirstDiscordPart(
 	channel: DiscordTextChannelLike,
 	part: { content: string; files?: readonly unknown[] },
 	reference: string | undefined,
-): Promise<void> {
-	const plain = part.files ? { files: part.files, content: part.content } : part.content;
+): Promise<string> {
+	const plain = part.files ? { content: part.content, files: part.files } : { content: part.content };
 	if (!reference) {
-		await channel.send(plain);
-		return;
+		const msg = await channel.send(plain);
+		return String((msg as { id: string }).id);
 	}
 	try {
-		await channel.send({ ...part, reply: { messageReference: reference, failIfNotExists: false } });
+		const msg = await channel.send({ ...part, reply: { messageReference: reference, failIfNotExists: false } });
+		return String((msg as { id: string }).id);
 	} catch (error) {
 		const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
 		if (code !== "50035") throw error;
 		console.log(
 			`discord reply_reference_rejected reference=${JSON.stringify(reference.slice(0, 80))}; resending without it`,
 		);
-		await channel.send(plain);
+		const msg = await channel.send(plain);
+		return String((msg as { id: string }).id);
 	}
 }
 
@@ -973,6 +975,7 @@ export async function settleDiscordDelivery(
 	// cannot be retried as if nothing was sent.
 	let sentParts = 0;
 	let resolved = false;
+	let firstMessageId: string | undefined;
 	try {
 		const { channel, notice } = await resolveDeliveryChannel(discord, message.origin, deliveryId);
 		resolved = true;
@@ -994,13 +997,13 @@ export async function settleDiscordDelivery(
 		const reference = message.replyToMessageId && !notice ? message.replyToMessageId : undefined;
 		try {
 			if (files.length > 0 && chunks.length === 0) {
-				await sendFirstDiscordPart(channel, { files, content: "" }, reference);
+				firstMessageId = await sendFirstDiscordPart(channel, { files, content: "" }, reference);
 				sentParts++;
 			} else {
 				for (let index = 0; index < chunks.length; index++) {
 					const chunk = chunks[index] as string;
 					if (index === 0)
-						await sendFirstDiscordPart(
+						firstMessageId = await sendFirstDiscordPart(
 							channel,
 							files.length > 0 ? { content: chunk, files } : { content: chunk },
 							reference,
@@ -1035,7 +1038,7 @@ export async function settleDiscordDelivery(
 		await gateway.request("delivery.fail", { deliveryId, reason: failure.reason, ambiguous: failure.ambiguous });
 		return;
 	}
-	await confirmDiscordDelivery(gateway, deliveryId);
+	await confirmDiscordDelivery(gateway, deliveryId, firstMessageId);
 }
 
 /** Pause before each re-send of a lost `delivery.confirm` (the ledger transition is idempotent). */
@@ -1046,10 +1049,14 @@ const DELIVERY_CONFIRM_RETRY_DELAYS_MS = [100, 500] as const;
  * confirm the gateway does not acknowledge is retried; once retries run out the
  * row stays inflight and the ACK-timeout replay carries the duplicate label.
  */
-async function confirmDiscordDelivery(gateway: Pick<GatewayClientLike, "request">, deliveryId: string): Promise<void> {
+async function confirmDiscordDelivery(
+	gateway: Pick<GatewayClientLike, "request">,
+	deliveryId: string,
+	platformMessageId?: string,
+): Promise<void> {
 	for (let attempt = 0; ; attempt++) {
 		try {
-			await gateway.request("delivery.confirm", { deliveryId });
+			await gateway.request("delivery.confirm", { deliveryId, ...(platformMessageId ? { platformMessageId } : {}) });
 			return;
 		} catch (error) {
 			const delay = DELIVERY_CONFIRM_RETRY_DELAYS_MS[attempt];

@@ -1371,6 +1371,43 @@ export class InboxGroup {
 			.all() as Array<{ origin_key: string; origin_ref_json: string; text: string; at: string }>;
 	}
 
+	/**
+	 * Get a specific message from conversation context.
+	 * Returns undefined if the message is not found in the conversation context.
+	 */
+	contextRowByMessage(originKey: string, messageId: string): ConversationContextRow | undefined {
+		const row = this.#db
+			.prepare(
+				"SELECT message_id, author_id, author_name, body, received_at FROM conversation_context WHERE origin_key = ? AND message_id = ?",
+			)
+			.get(originKey, messageId) as ConversationContextRow | null;
+		return row ?? undefined;
+	}
+
+	/**
+	 * Check if an origin has had any trigger or steer turns (persona is already talking).
+	 * Optionally exclude a specific message (useful when checking on the first turn before
+	 * the trigger's turn_role is finalized).
+	 */
+	hasThreadTurns(originKey: string, excludeMessageId?: string): boolean {
+		if (excludeMessageId) {
+			return (
+				this.#db
+					.prepare(
+						"SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND message_id != ? AND turn_role IN ('trigger', 'steer') LIMIT 1",
+					)
+					.get(originKey, excludeMessageId) !== null
+			);
+		}
+		return (
+			this.#db
+				.prepare(
+					"SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND turn_role IN ('trigger', 'steer') LIMIT 1",
+				)
+				.get(originKey) !== null
+		);
+	}
+
 	#assertNotQuarantined(messageId: string): void {
 		if (this.#db.prepare("SELECT 1 FROM broker_quarantine WHERE kind = 'inbound' AND subject_id = ?").get(messageId))
 			throw new BrokerAuthorityError("quarantined");
@@ -1478,5 +1515,29 @@ export class InboxGroup {
 				revision: number;
 			} | null) ?? { expired: 0, truncated: 0, oldest: null, newest: null, revision: 0 }
 		);
+	}
+
+	/**
+	 * Record an alias from a platform message ID to a post/<deliveryId> message.
+	 * Used when delivery.confirm provides platformMessageId to enable thread root lookup
+	 * for messages posted by the gateway (#892).
+	 */
+	recordMessageIdAlias(tx: WriteTx, platformMessageId: string, aliasTarget: string, originKey: string): void {
+		this.#db
+			.prepare(
+				"INSERT INTO message_id_aliases (platform_message_id, alias_target, origin_key) VALUES (?, ?, ?) ON CONFLICT(platform_message_id) DO UPDATE SET alias_target = excluded.alias_target",
+			)
+			.run(tx, platformMessageId, aliasTarget, originKey);
+	}
+
+	/**
+	 * Look up the alias target for a platform message ID, returning the post/<deliveryId>
+	 * message ID if one exists, or undefined if no alias is found.
+	 */
+	lookupMessageIdAlias(platformMessageId: string, originKey: string): string | undefined {
+		const row = this.#db
+			.prepare("SELECT alias_target FROM message_id_aliases WHERE platform_message_id = ? AND origin_key = ?")
+			.get(platformMessageId, originKey) as { alias_target: string } | null;
+		return row?.alias_target;
 	}
 }
