@@ -2,13 +2,19 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { originKey } from "@gajae-gateway/protocol";
+import { type Frame, originKey } from "@gajae-gateway/protocol";
+import type { GatewayConfig } from "../src/config";
+import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
+import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
 
 let directory = "";
 let database: Store | undefined;
+let server: GatewayServer | undefined;
 
 afterEach(async () => {
+	await server?.stop();
+	server = undefined;
 	database?.close();
 	database = undefined;
 	if (directory) await rm(directory, { recursive: true, force: true });
@@ -30,7 +36,7 @@ test("hasThreadTurns returns false when no trigger/steer turns exist on origin",
 	});
 
 	// No messages recorded yet
-	const result = database!.inbox.hasThreadTurns(threadOriginKey);
+	const result = database?.inbox.hasThreadTurns(threadOriginKey);
 	expect(result).toBe(false);
 });
 
@@ -40,8 +46,8 @@ test("contextRowByMessage retrieves a specific message from conversation context
 	const messageId = "1700000000.000100";
 
 	// Record a message
-	database!.transaction((tx) => {
-		database!.inbox.contextRecord(tx, {
+	database?.transaction((tx) => {
+		database?.inbox.contextRecord(tx, {
 			originKey: slackChannelOrigin,
 			messageId,
 			body: "This is a test message",
@@ -52,7 +58,7 @@ test("contextRowByMessage retrieves a specific message from conversation context
 	});
 
 	// Retrieve it
-	const row = database!.inbox.contextRowByMessage(slackChannelOrigin, messageId);
+	const row = database?.inbox.contextRowByMessage(slackChannelOrigin, messageId);
 	expect(row).toBeDefined();
 	expect(row?.body).toBe("This is a test message");
 	expect(row?.author_name).toBe("alice");
@@ -63,7 +69,7 @@ test("contextRowByMessage returns undefined for non-existent message", async () 
 	database = await open();
 	const slackChannelOrigin = "slack/channel/C1";
 
-	const row = database!.inbox.contextRowByMessage(slackChannelOrigin, "non-existent");
+	const row = database?.inbox.contextRowByMessage(slackChannelOrigin, "non-existent");
 	expect(row).toBeUndefined();
 });
 
@@ -74,8 +80,8 @@ test("contextRowByMessage respects origin isolation", async () => {
 	const sharedTs = "1700000000.000100";
 
 	// Record a message in C2
-	database!.transaction((tx) => {
-		database!.inbox.contextRecord(tx, {
+	database?.transaction((tx) => {
+		database?.inbox.contextRecord(tx, {
 			originKey: channel2Origin,
 			messageId: sharedTs,
 			body: "Message in different channel",
@@ -86,11 +92,11 @@ test("contextRowByMessage respects origin isolation", async () => {
 	});
 
 	// Try to fetch it from C1 - should not find it
-	const wrongChannel = database!.inbox.contextRowByMessage(channel1Origin, sharedTs);
+	const wrongChannel = database?.inbox.contextRowByMessage(channel1Origin, sharedTs);
 	expect(wrongChannel).toBeUndefined();
 
 	// But it should exist in the correct origin
-	const correct = database!.inbox.contextRowByMessage(channel2Origin, sharedTs);
+	const correct = database?.inbox.contextRowByMessage(channel2Origin, sharedTs);
 	expect(correct?.body).toBe("Message in different channel");
 });
 
@@ -106,8 +112,8 @@ test("thread root message can be retrieved from parent channel context", async (
 	});
 
 	// Record the thread root message in the parent channel context
-	database!.transaction((tx) => {
-		database!.inbox.contextRecord(tx, {
+	database?.transaction((tx) => {
+		database?.inbox.contextRecord(tx, {
 			originKey: slackChannelOrigin,
 			messageId: slackThreadRoot,
 			body: "This is the thread root message",
@@ -118,10 +124,137 @@ test("thread root message can be retrieved from parent channel context", async (
 	});
 
 	// Verify we can fetch it from the parent channel
-	const root = database!.inbox.contextRowByMessage(slackChannelOrigin, slackThreadRoot);
+	const root = database?.inbox.contextRowByMessage(slackChannelOrigin, slackThreadRoot);
 	expect(root).toBeDefined();
 	expect(root?.body).toBe("This is the thread root message");
 
 	// Verify hasThreadTurns returns false (no turns yet on thread origin)
-	expect(database!.inbox.hasThreadTurns(slackThreadOrigin)).toBe(false);
+	expect(database?.inbox.hasThreadTurns(slackThreadOrigin)).toBe(false);
+});
+
+function bindWorkFixture(key: string, epoch: number): string {
+	return `gjc/session/${key}/${epoch}`;
+}
+
+async function connect(socketPath: string): Promise<{
+	send: (frame: Frame) => void;
+	frames: Frame[];
+	close: () => void;
+}> {
+	const frames: Frame[] = [];
+	let buffered = Buffer.alloc(0);
+	let writer: any | undefined;
+	const { OrderedFrameWriter } = await import("@gajae-gateway/protocol");
+	const socket = await Bun.connect({
+		unix: socketPath,
+		socket: {
+			data(_socket: any, data: any) {
+				buffered = Buffer.concat([buffered, Buffer.from(data)]);
+				let newline = buffered.indexOf(10);
+				while (newline >= 0) {
+					const line = buffered.subarray(0, newline).toString("utf8");
+					buffered = buffered.subarray(newline + 1);
+					if (line) {
+						frames.push(JSON.parse(line));
+					}
+					newline = buffered.indexOf(10);
+				}
+			},
+		},
+	});
+	writer = new OrderedFrameWriter({ write: (bytes: any) => socket.write(bytes), close: () => socket.end() });
+	return {
+		send: (frame: Frame) => writer.write(frame),
+		frames,
+		close: () => writer.close(),
+	};
+}
+
+async function waitFor(frames: Frame[], count: number): Promise<void> {
+	for (let i = 0; i < 400 && frames.length < count; i++) {
+		await Bun.sleep(10);
+	}
+}
+
+test("first thread turn includes thread root with reference label; second turn does not", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-thread-root-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+		channels: { "slack:C1": { engagement: "open" } },
+	};
+	database = await Store.open(config.dbPath);
+	const turns: Array<{ text: string; preamble: string }> = [];
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async (_session, text, preamble) => {
+			turns.push({ text, preamble: preamble ?? "" });
+			return "batched reply";
+		},
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database?.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+
+	// Slack-style origins - for Slack, thread conversationId is C:ts format
+	const threadRootTs = "1700000000.000100";
+	const parentOrigin = { platform: "slack" as const, kind: "channel" as const, conversationId: "C1" };
+	const threadOrigin = {
+		platform: "slack" as const,
+		kind: "thread" as const,
+		conversationId: `C1:${threadRootTs}`,
+		parentId: "C1",
+	};
+
+	const say = (id: string, text: string, authorId: string, authorName: string, mentioned: boolean, origin: any) =>
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "chat.send",
+			params: { origin, text, messageId: id, engagement: { mentioned, group: true, authorId, authorName } },
+		});
+
+	// First, establish the thread root by sending a mentioned message to the parent channel
+	// Use the same timestamp as the thread root
+	// Note: We don't wait for this to generate a turn; we just need it recorded in context
+	say(threadRootTs, "@bot This is the thread root", "alice", "alice", true, parentOrigin);
+	await Bun.sleep(100); // Allow time for the message to be recorded
+
+	// First message in the thread (this is the first turn on the thread)
+	say("t1", "@bot hello from thread", "owner", "bellman", true, threadOrigin);
+
+	// Wait for the first turn to complete
+	for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
+
+	expect(turns).toHaveLength(1);
+	const turn1 = turns[0]!;
+
+	// First turn should include the thread root
+	expect(turn1.text).toContain("thread root");
+	expect(turn1.text).toContain("alice");
+	expect(turn1.text).toContain("This is the thread root");
+
+	// Second message in the thread
+	say("t2", "@bot follow up", "owner", "bellman", true, threadOrigin);
+
+	// Wait for the second turn
+	for (let attempt = 0; attempt < 400 && turns.length < 2; attempt++) await Bun.sleep(10);
+
+	expect(turns).toHaveLength(2);
+	const turn2 = turns[1]!;
+
+	// Second turn should NOT include the thread root
+	expect(turn2.text).not.toContain("thread root");
+	expect(turn2.text).toContain("follow up");
+
+	client.close();
 });

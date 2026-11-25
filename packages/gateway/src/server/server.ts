@@ -3457,7 +3457,7 @@ async function createInboundTurnLifecycle(
 		// Include thread root on first turn in a thread
 		let threadRootLine: string | undefined;
 		let threadRootMessageId: string | undefined;
-		if (origin.kind === "thread" && origin.parentId && !options.database.inbox.hasThreadTurns(key)) {
+		if (origin.kind === "thread" && origin.parentId && !options.database.inbox.hasThreadTurns(key, row.message_id)) {
 			const parentKey = originKey({
 				platform: origin.platform,
 				kind: "channel",

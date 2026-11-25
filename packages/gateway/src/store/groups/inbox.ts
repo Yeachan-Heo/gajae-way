@@ -1386,8 +1386,19 @@ export class InboxGroup {
 
 	/**
 	 * Check if an origin has had any trigger or steer turns (persona is already talking).
+	 * Optionally exclude a specific message (useful when checking on the first turn before
+	 * the trigger's turn_role is finalized).
 	 */
-	hasThreadTurns(originKey: string): boolean {
+	hasThreadTurns(originKey: string, excludeMessageId?: string): boolean {
+		if (excludeMessageId) {
+			return (
+				this.#db
+					.prepare(
+						"SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND message_id != ? AND turn_role IN ('trigger', 'steer') LIMIT 1",
+					)
+					.get(originKey, excludeMessageId) !== null
+			);
+		}
 		return (
 			this.#db
 				.prepare(
