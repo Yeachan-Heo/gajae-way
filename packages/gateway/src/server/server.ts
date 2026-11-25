@@ -3468,29 +3468,17 @@ async function createInboundTurnLifecycle(
 				conversationId: origin.parentId,
 			});
 
-			// Derive the root message ID from the origin's conversationId, handling platform differences:
-			// - Slack threads: conversationId is C:timestamp, root lookup should be timestamp
-			// - Telegram topics: conversationId is chatId.topicId, root lookup should be chatId:topicId
-			// - Gateway posts: conversationId is C:post/deliveryId, extracted part is post/deliveryId
-			let rootMessageIdToLookup = origin.conversationId;
-			if (origin.kind === "topic" && origin.platform === "telegram") {
-				// Transform Telegram topic ID from dot-separated to colon-separated format
-				// to match how inbound messages are stored (chatId:messageId)
-				rootMessageIdToLookup = origin.conversationId.replace(".", ":");
-			}
-
-			// Try to find the root message, handling both platform message IDs and gateway-authored posts
-			let rootRow = options.database.inbox.contextRowByMessage(parentKey, rootMessageIdToLookup);
-			if (!rootRow && rootMessageIdToLookup.includes(":")) {
-				// For Slack threads, extract the actual message ID (second part after colon)
-				// which might be a platform message ID or a post/<deliveryId> message ID
-				const deliveryIdMatch = rootMessageIdToLookup.match(/^[^:]+:(.+)$/);
-				if (deliveryIdMatch) {
-					const [, messageIdPart] = deliveryIdMatch;
-					// Try looking it up as-is (might already be post/<deliveryId>)
-					rootRow = options.database.inbox.contextRowByMessage(parentKey, messageIdPart);
-				}
-			}
+			// The root is stored on the parent origin under its inbound message id. A Slack thread's
+			// conversationId already is that id (`<C>:<ts>`). A Telegram topic's is
+			// `<chat>.<message_thread_id>`, and the topic root is the message whose id is the thread id,
+			// stored as `telegramInboundMessageId` = `<chat>:<message id>`. Roots the gateway itself
+			// posted are stored as `post/<deliveryId>` and cannot be matched yet: delivery.confirm
+			// carries no platform message id.
+			const rootMessageId =
+				origin.kind === "topic" && origin.platform === "telegram"
+					? origin.conversationId.replace(".", ":")
+					: origin.conversationId;
+			const rootRow = options.database.inbox.contextRowByMessage(parentKey, rootMessageId);
 
 			if (rootRow) {
 				threadRootMessageId = rootRow.message_id;
