@@ -59,7 +59,11 @@ const MONTH = "(?:0[1-9]|1[0-2])";
 export const DATED_ENTRY = new RegExp(`^(?:\\d{4}-${MONTH}/)?\\d{4}-${MONTH}-(?:0[1-9]|[12]\\d|3[01])\\.md$`);
 /** A `tree` index lists every entry; the cap only stops a runaway corpus from swamping the map. */
 export const TREE_INDEX_CAP = 200;
-/** A `recent` index lists this many newest entries per axis. */
+/**
+ * A `recent` index lists this many entries per axis: the last ones in path order,
+ * which is newest first only when entry names are dated. Axes named by subject
+ * use a `tree` index instead, or the alphabetically first entries drop off.
+ */
 export const RECENT_INDEX_CAP = 20;
 /** Hard UTF-8 byte ceiling shared by generated navigation and session bootstrap reads. */
 export const NAVIGATION_SOURCE_MAX_BYTES = 24 * 1024;
@@ -109,6 +113,8 @@ export const BUILT_IN_AXES: readonly AxisDescriptor[] = [
 	},
 	{
 		// Something that happened at a point in time; not a plan and not a rule.
+		// Stays on the recent index, which keeps the newest only when entry names
+		// start with YYYY-MM-DD; the layout stays free for existing corpora.
 		id: "events",
 		displayName: "Things that happened",
 		root: "events",
@@ -128,7 +134,7 @@ export const BUILT_IN_AXES: readonly AxisDescriptor[] = [
 		root: "tasks",
 		nesting: "nested",
 		partitions: [],
-		index: "recent",
+		index: "tree",
 		layout: "free",
 		retrievalPriority: 20,
 		orphanPolicy: "any-depth",
@@ -142,7 +148,7 @@ export const BUILT_IN_AXES: readonly AxisDescriptor[] = [
 		root: "people",
 		nesting: "nested",
 		partitions: [],
-		index: "recent",
+		index: "tree",
 		layout: "free",
 		retrievalPriority: 40,
 		orphanPolicy: "any-depth",
@@ -156,7 +162,7 @@ export const BUILT_IN_AXES: readonly AxisDescriptor[] = [
 		root: "projects",
 		nesting: "nested",
 		partitions: [],
-		index: "recent",
+		index: "tree",
 		layout: "free",
 		retrievalPriority: 50,
 		orphanPolicy: "any-depth",
@@ -170,7 +176,7 @@ export const BUILT_IN_AXES: readonly AxisDescriptor[] = [
 		root: "channels",
 		nesting: "nested",
 		partitions: [],
-		index: "recent",
+		index: "tree",
 		layout: "free",
 		retrievalPriority: 30,
 		orphanPolicy: "any-depth",
@@ -186,7 +192,7 @@ export const BUILT_IN_AXES: readonly AxisDescriptor[] = [
 		root: "decisions",
 		nesting: "nested",
 		partitions: [],
-		index: "recent",
+		index: "tree",
 		layout: "free",
 		retrievalPriority: 60,
 		orphanPolicy: "any-depth",

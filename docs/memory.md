@@ -44,7 +44,7 @@ An axis is not a name in a list. It is a **descriptor** that tells every other p
 | `root` | canonical root relative to the memory root; roots may not overlap |
 | `nesting` | `flat` (entries directly under the root) or `nested` (subdirectories at any depth) |
 | `partitions` | named subdirectories that partition a nested axis |
-| `index` | `recent` (map the newest entries) or `tree` (map the whole hierarchy, grouped) |
+| `index` | `recent` (map the last 20 entries in path order, which is newest first only for dated names) or `tree` (map the whole hierarchy, grouped). Either way the map states how many entries it left out |
 | `layout` | `dated` (`[YYYY-MM/]YYYY-MM-DD.md` only) or `free` (any `.md` name) |
 | `retrievalPriority` | higher wins when two documents score equally during recall |
 | `orphanPolicy` | `partitioned` (a file must sit in a declared partition) or `any-depth` |
@@ -96,7 +96,7 @@ The registry **fails closed**. Startup refuses to run, rather than quietly dropp
 
 `ops` and `decisions` are the pair most easily confused: **`ops` constrains current behaviour before acting; `decisions` records what was chosen at a point in time and why.**
 
-**`ops` is routable, not one growing file.** It is partitioned into `ops/rules/`, `ops/distillations/` and `ops/handoffs/`, indexed as a tree so a rule pack never scrolls off the newest-entries window, and ranked above raw capture during recall. A file directly under `ops/` is an `axis_layout_violation`: it belongs in a partition.
+**`ops` is routable, not one growing file.** It is partitioned into `ops/rules/`, `ops/distillations/` and `ops/handoffs/`, indexed as a tree so a rule pack never scrolls off the newest-entries window, and ranked above raw capture during recall. `tasks`, `people`, `projects`, `channels` and `decisions` are named by subject rather than date, so they are indexed as trees too; only `daily`, `events` and `reflections` use the `recent` window. `reflections` enforces dated names; `events` and `daily` do not, so name event files with a leading `YYYY-MM-DD` or the window keeps the wrong ones. A file directly under `ops/` is an `axis_layout_violation`: it belongs in a partition.
 
 **`reflections` is dated and append-only.** Entries are `reflections/YYYY-MM-DD.md`, optionally sharded into `reflections/YYYY-MM/`, with several entries per day allowed inside a file. Per-subject files (`reflections/tone.md`) are rejected with `axis_layout_violation`; a subject view may exist only as a generated projection, never as a second authority. One layout, not both: a writer holding a subject file edits it in place, and the correction history that makes a reflection useful is exactly what gets overwritten. A reflection promotes onward — an operating invariant to `ops/rules`, a cross-incident learning to `ops/distillations`, a project-scoped or person/channel correction to that axis.
 

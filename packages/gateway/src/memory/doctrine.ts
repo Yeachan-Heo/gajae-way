@@ -580,8 +580,10 @@ async function regenerateMapFiles(root: string, registry?: AxisRegistry): Promis
 					lines.push(`- [${path}](${path})`);
 				}
 			}
+			// Count against every file on disk, not the capped entry list, so an index
+			// cap that drops entries is stated in the map instead of happening silently.
 			const omitted = allFiles.length - allowance;
-			if (allowance < entries.length) {
+			if (omitted > 0) {
 				const noun = omitted === 1 ? "entry" : "entries";
 				if (indexPath) {
 					lines.push(`_${omitted} ${noun} omitted; see ${indexPath}_`);

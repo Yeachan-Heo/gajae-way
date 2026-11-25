@@ -173,6 +173,33 @@ test("a trimmed axis without an index states the omitted count without inventing
 	expect(section).not.toContain("ops/rules/index.md");
 });
 
+test("every project is mapped when the axis outgrows the recent window, including the alphabetically first", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-map-projects-"));
+	const root = await initializeMemory(home);
+	await writeFile(join(root, "projects/aie-zeitgeist.md"), "# first\n");
+	for (let index = 0; index < 20; index++)
+		await writeFile(join(root, `projects/p-${String(index).padStart(2, "0")}.md`), "# p\n");
+	await regenerateMap(root);
+	const map = await readFile(join(root, "MEMORY.md"), "utf8");
+	const section = map.slice(map.indexOf("## projects"), map.indexOf("## channels"));
+	expect(section).toContain("- [projects/aie-zeitgeist.md](projects/aie-zeitgeist.md)");
+	expect(section.match(/^- \[projects\//gm)).toHaveLength(21);
+	expect(section).not.toContain("omitted");
+});
+
+test("a recent axis over its cap states how many entries the map left out", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-map-recent-cap-"));
+	const root = await initializeMemory(home);
+	for (let day = 1; day <= 22; day++)
+		await writeFile(join(root, `events/2026-10-${String(day).padStart(2, "0")}.md`), "# e\n");
+	await regenerateMap(root);
+	const map = await readFile(join(root, "MEMORY.md"), "utf8");
+	const section = map.slice(map.indexOf("## events"), map.indexOf("## tasks"));
+	expect(section).toContain("- [events/2026-10-22.md](events/2026-10-22.md)");
+	expect(section).not.toContain("events/2026-10-02.md");
+	expect(section).toContain("_2 entries omitted; no index entry found_");
+});
+
 test("a small map keeps the historical rendering byte-for-byte", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-map-small-"));
 	const root = join(home, "memory");
