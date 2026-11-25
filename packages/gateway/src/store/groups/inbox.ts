@@ -1516,4 +1516,28 @@ export class InboxGroup {
 			} | null) ?? { expired: 0, truncated: 0, oldest: null, newest: null, revision: 0 }
 		);
 	}
+
+	/**
+	 * Record an alias from a platform message ID to a post/<deliveryId> message.
+	 * Used when delivery.confirm provides platformMessageId to enable thread root lookup
+	 * for messages posted by the gateway (#892).
+	 */
+	recordMessageIdAlias(tx: WriteTx, platformMessageId: string, aliasTarget: string, originKey: string): void {
+		this.#db
+			.prepare(
+				"INSERT INTO message_id_aliases (platform_message_id, alias_target, origin_key) VALUES (?, ?, ?) ON CONFLICT(platform_message_id) DO UPDATE SET alias_target = excluded.alias_target",
+			)
+			.run(tx, platformMessageId, aliasTarget, originKey);
+	}
+
+	/**
+	 * Look up the alias target for a platform message ID, returning the post/<deliveryId>
+	 * message ID if one exists, or undefined if no alias is found.
+	 */
+	lookupMessageIdAlias(platformMessageId: string, originKey: string): string | undefined {
+		const row = this.#db
+			.prepare("SELECT alias_target FROM message_id_aliases WHERE platform_message_id = ? AND origin_key = ?")
+			.get(platformMessageId, originKey) as { alias_target: string } | null;
+		return row?.alias_target;
+	}
 }

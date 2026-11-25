@@ -1794,7 +1794,8 @@ async function handleRequest(
 			return;
 		}
 		case "delivery.confirm": {
-			const id = (request.params as { deliveryId?: unknown } | undefined)?.deliveryId;
+			const params = request.params as { deliveryId?: unknown; platformMessageId?: unknown } | undefined;
+			const id = params?.deliveryId;
 			if (typeof id !== "string") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			// unknown -> invalid_params; already-terminal -> idempotent no-op ack.
 			const delivery = options.database.outbox.get(id);
@@ -1803,6 +1804,12 @@ async function handleRequest(
 				({ stage }) => stage === "failed" || stage === "failed_no_retry" || stage === "contract_unmet",
 			);
 			const authoredEvents = batchEvents.filter((row) => row.stage === "authored").map((row) => row.event_id);
+			const platformMessageId = typeof params?.platformMessageId === "string" ? params.platformMessageId : undefined;
+			if (platformMessageId && delivery) {
+				options.database.transaction((tx) => {
+					options.database.inbox.recordMessageIdAlias(tx, platformMessageId, `post/${id}`, delivery.originKey);
+				});
+			}
 			const confirmOutcome = confirmAndSettleMonitorDelivery(options.database, id, "delivered");
 			if (confirmOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			if (runtime.delivery.get(id)?.state === "confirmed") runtime.restartTerminalDeliveryIds.delete(id);
@@ -3478,7 +3485,14 @@ async function createInboundTurnLifecycle(
 				origin.kind === "topic" && origin.platform === "telegram"
 					? origin.conversationId.replace(".", ":")
 					: origin.conversationId;
-			const rootRow = options.database.inbox.contextRowByMessage(parentKey, rootMessageId);
+			let rootRow = options.database.inbox.contextRowByMessage(parentKey, rootMessageId);
+			// If not found by direct lookup, check if this platform message ID is an alias for a post/<deliveryId>
+			if (!rootRow) {
+				const aliasedMessageId = options.database.inbox.lookupMessageIdAlias(rootMessageId, parentKey);
+				if (aliasedMessageId) {
+					rootRow = options.database.inbox.contextRowByMessage(parentKey, aliasedMessageId);
+				}
+			}
 
 			if (rootRow) {
 				threadRootMessageId = rootRow.message_id;

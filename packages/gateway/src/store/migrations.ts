@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 43;
+export const LATEST_SCHEMA_VERSION = 44;
 
 export interface MigrationHost {
 	readonly database: {
@@ -961,6 +961,22 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(43, new Date().toISOString());
+		});
+	}
+	if (current < 44) {
+		// Add message ID aliasing for gateway-posted messages that use platform message IDs
+		// (#892 follow-up split from #891): when an adapter confirms delivery with platformMessageId,
+		// record an alias so thread-root lookup can find posts by their platform IDs.
+		host.withTransaction(() => {
+			host.database.execute(
+				"CREATE TABLE IF NOT EXISTS message_id_aliases (platform_message_id TEXT PRIMARY KEY, alias_target TEXT NOT NULL, origin_key TEXT NOT NULL)",
+			);
+			host.database.execute(
+				"CREATE INDEX IF NOT EXISTS message_id_aliases_target ON message_id_aliases(alias_target, origin_key)",
+			);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(44, new Date().toISOString());
 		});
 	}
 }

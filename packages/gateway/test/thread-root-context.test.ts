@@ -434,3 +434,65 @@ test("first thread turn includes thread root with reference label; second turn d
 
 	client.close();
 });
+
+test("platform message ID alias enables thread root lookup for gateway-posted messages", async () => {
+	database = await open();
+	const slackChannelOrigin = "slack/channel/C1";
+	const discordChannelOrigin = "discord/channel/CH1";
+	const slackPlatformMessageId = "C1:1700000000.000100";
+	const discordPlatformMessageId = "MSG123";
+	const slackDeliveryId = "delivery-slack-123";
+	const discordDeliveryId = "delivery-discord-456";
+	const slackPostMessageId = `post/${slackDeliveryId}`;
+	const discordPostMessageId = `post/${discordDeliveryId}`;
+
+	// Record a posted message in the Slack context
+	database.transaction((tx) => {
+		database.inbox.contextRecord(tx, {
+			originKey: slackChannelOrigin,
+			messageId: slackPostMessageId,
+			authorName: "you (posted here from somewhere)",
+			body: "This is a Slack gateway-posted message",
+		});
+	});
+
+	// Record the platform message ID alias for Slack
+	database.transaction((tx) => {
+		database.inbox.recordMessageIdAlias(tx, slackPlatformMessageId, slackPostMessageId, slackChannelOrigin);
+	});
+
+	// Verify the direct lookup by post ID works for Slack
+	const row1 = database.inbox.contextRowByMessage(slackChannelOrigin, slackPostMessageId);
+	expect(row1).toBeDefined();
+	expect(row1?.body).toBe("This is a Slack gateway-posted message");
+
+	// Verify the alias lookup works for Slack
+	const slackAliasedId = database.inbox.lookupMessageIdAlias(slackPlatformMessageId, slackChannelOrigin);
+	expect(slackAliasedId).toBe(slackPostMessageId);
+
+	// Verify the aliased lookup finds the same row for Slack
+	const row2 = slackAliasedId ? database.inbox.contextRowByMessage(slackChannelOrigin, slackAliasedId) : undefined;
+	expect(row2).toBeDefined();
+	expect(row2?.body).toBe("This is a Slack gateway-posted message");
+
+	// Verify lookup with no alias returns undefined
+	const noAlias = database.inbox.lookupMessageIdAlias("nonexistent-id", slackChannelOrigin);
+	expect(noAlias).toBeUndefined();
+
+	// Verify Discord message IDs also work
+	database.transaction((tx) => {
+		database.inbox.contextRecord(tx, {
+			originKey: discordChannelOrigin,
+			messageId: discordPostMessageId,
+			authorName: "you (posted here from somewhere)",
+			body: "This is a Discord gateway-posted message",
+		});
+		database.inbox.recordMessageIdAlias(tx, discordPlatformMessageId, discordPostMessageId, discordChannelOrigin);
+	});
+
+	const discordAlias = database.inbox.lookupMessageIdAlias(discordPlatformMessageId, discordChannelOrigin);
+	expect(discordAlias).toBe(discordPostMessageId);
+
+	const discordRow = discordAlias ? database.inbox.contextRowByMessage(discordChannelOrigin, discordAlias) : undefined;
+	expect(discordRow?.body).toBe("This is a Discord gateway-posted message");
+});

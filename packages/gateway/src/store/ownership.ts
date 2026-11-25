@@ -20,6 +20,7 @@ export const TABLE_OWNER = {
 	conversation_context: "inbox",
 	conversation_context_state: "inbox",
 	recall_snippets: "inbox",
+	message_id_aliases: "inbox",
 	lane_jobs: "work",
 	work_attempt_runtime: "work",
 	lane_reports: "work",
