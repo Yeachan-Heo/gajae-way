@@ -160,7 +160,11 @@ function localPreflightModelKey(opRef: string): string {
 
 function localPreflightRejection(store: Store, opRef: string): string | undefined {
 	const code = store.core.metaGet(localPreflightRejectionKey(opRef));
-	return code === PROMPT_TOO_LARGE_CODE || code === MODEL_NOT_FOUND_REJECTION_CODE || code === PRESET_FAILURE_REJECTION_CODE ? code : undefined;
+	return code === PROMPT_TOO_LARGE_CODE ||
+		code === MODEL_NOT_FOUND_REJECTION_CODE ||
+		code === PRESET_FAILURE_REJECTION_CODE
+		? code
+		: undefined;
 }
 
 function localPreflightPresetFailureKey(originKey: string, triggerMessageId: string, preset: string): string {
