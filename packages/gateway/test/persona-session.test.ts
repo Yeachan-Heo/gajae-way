@@ -7307,9 +7307,9 @@ for (const errorCode of ["invalid_preset", "internal"] as const) {
 		expect(notices[0]).not.toContain(`preset-${errorCode}`);
 		// Verify generic message is in conversation notice
 		expect(notices[0]).toContain("the configured model preset could not be applied");
-		// Verify operator log contains the exact preset name and diagnostic reason
-		const preflight_log = logs.find((log) => log.includes("persona_send_preflight_rejected"));
-		expect(preflight_log).toBeDefined();
-		expect(preflight_log).toContain(`preset-${errorCode}`);
+		// The operator log keeps the exact preset name
+		const preflightLog = logs.find((log) => log.includes("persona_send_preflight_rejected"));
+		expect(preflightLog).toBeDefined();
+		expect(preflightLog).toContain(`preset-${errorCode}`);
 	});
 }

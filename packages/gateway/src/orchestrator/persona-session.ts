@@ -2258,17 +2258,8 @@ class OriginActor {
 			code: errorCode,
 			message: conversationMessage,
 		});
-		// Operator-facing diagnostic includes the exact preset/model name and detailed rejection reason.
-		const diagnosticReason =
-			code === PROMPT_TOO_LARGE_CODE
-				? `prompt size (>${MAX_RELAY_REQUEST_FRAME_BYTES} bytes)`
-				: code === MODEL_NOT_FOUND_REJECTION_CODE
-					? `model not found: ${modelSelection}`
-					: code === PRESET_FAILURE_REJECTION_CODE
-						? `preset failed: ${modelSelection}`
-						: code;
 		this.#manager.log(
-			`persona_send_preflight_rejected origin=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} opRef=${opRef} reason=${diagnosticReason}`,
+			`persona_send_preflight_rejected origin=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} opRef=${opRef} reason=${code}${modelSelection ? ` selection=${modelSelection}` : ""}`,
 			"warn",
 		);
 		bound.tail?.setTurnRunning(false);
