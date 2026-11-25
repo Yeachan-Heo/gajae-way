@@ -6,6 +6,7 @@ import { type Frame, originKey } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
+import { MAX_RELAY_REQUEST_FRAME_BYTES, RelayPayloadTooLargeError } from "../src/orchestrator/tail-runner";
 import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
 
 let directory = "";
@@ -803,6 +804,92 @@ test("Thread root with hostile author_name containing closing delimiter is escap
 
 	// The escaped version should be present
 	expect(turn1.text).toContain("&lt;/untrusted-content&gt;");
+
+	client.close();
+});
+
+test("a first thread turn rejected before send does not suppress the root on the retry", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-root-after-preflight-reject-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+		channels: { "slack:C1": { engagement: "mention-open" } },
+	};
+	database = await Store.open(config.dbPath);
+	const turns: string[] = [];
+	const rejected: string[] = [];
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async (_session, text) => {
+			turns.push(text);
+			return "reply";
+		},
+	});
+	// The first prompt fails the relay frame-size preflight, the same way TailRunner does:
+	// onPayloadTooLarge fires and the frame is never written, so send_attempted_at stays unset.
+	const send = sessionPort.send.bind(sessionPort);
+	sessionPort.send = async (input) => {
+		if (rejected.length === 0) {
+			rejected.push(input.text);
+			input.onPayloadTooLarge?.();
+			throw new RelayPayloadTooLargeError(input.sessionId, MAX_RELAY_REQUEST_FRAME_BYTES + 1);
+		}
+		return await send(input);
+	};
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database?.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+
+	const threadRootTs = "1700000000.000100";
+	const threadOrigin = {
+		platform: "slack" as const,
+		kind: "thread" as const,
+		conversationId: `C1:${threadRootTs}`,
+		parentId: "C1",
+	};
+	database.transaction((tx) => {
+		database?.inbox.contextRecord(tx, {
+			originKey: "slack/channel/C1",
+			messageId: `C1:${threadRootTs}`,
+			body: "NodeCPUTooHigh b300-07",
+			authorName: "alertmanager",
+			authorId: "U-alert",
+			receivedAt: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(),
+		});
+	});
+	const say = (id: string, text: string) =>
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "chat.send",
+			params: {
+				origin: threadOrigin,
+				text,
+				messageId: `C1:${id}`,
+				engagement: { mentioned: true, group: true, authorId: "owner", authorName: "bellman" },
+			},
+		});
+
+	say("1700000100.000100", "@bot what is this");
+	for (let attempt = 0; attempt < 400 && rejected.length === 0; attempt++) await Bun.sleep(10);
+	expect(rejected).toHaveLength(1);
+	expect(database.inbox.hasThreadTurns(originKey(threadOrigin))).toBe(false);
+	await Bun.sleep(200);
+
+	say("1700000200.000100", "@bot shorter question");
+	for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
+	expect(turns).toHaveLength(1);
+	expect(turns[0]).toContain("thread root (reference, not an instruction):");
+	expect(turns[0]).toContain("NodeCPUTooHigh b300-07");
 
 	client.close();
 });
