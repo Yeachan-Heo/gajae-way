@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PromptImage } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
+import type { GjcModelSelection } from "../src/config";
 import {
 	AGENT_RUN_GRACE_MS,
 	AGENT_RUN_MAX_MS,
@@ -129,7 +130,7 @@ async function harness(
 		failure?: (message: string, forceFailureNotice?: boolean) => void;
 		failureError?: (error: Error) => void;
 		modelRefusal?: (input: PersonaFailureInput) => void;
-		effectiveModel?: string;
+		effectiveModel?: GjcModelSelection;
 		imagesFor?: (triggerMessageId: string) => readonly PromptImage[] | undefined;
 		onFrame?: (frame: TailFrame) => boolean | void;
 		contextMessageIds?: readonly string[];
@@ -7156,3 +7157,159 @@ test("/model on a refusal-paused origin whose session is gone answers unavailabl
 	expect(database!.inbox.pendingOldest(KEY)?.message_id).toBe("paused-then-gone");
 	expect(port.sendAttempts).toHaveLength(1);
 });
+
+test("preset transient model.set failures still retry instead of terminating immediately", async () => {
+	const preset = { preset: "my-preset" };
+	class PresetTransientFailurePort extends ScriptedSessionPort {
+		modelAttempts = 0;
+
+		constructor() {
+			super({
+				onBind: (input) => `model-session-${input.epoch}`,
+				onSend: (input, scripted) => scripted.complete(input.opRef, "model recovered"),
+			});
+		}
+
+		override async setModel(
+			input: Parameters<ScriptedSessionPort["setModel"]>[0],
+		): Promise<{ readonly changed: boolean }> {
+			this.modelAttempts++;
+			if (this.modelAttempts === 1) {
+				// First attempt: transient session_unavailable error
+				throw new GjcCliError("gjc sdk model.set reported failure: session unavailable", 0, "", {
+					code: "session_unavailable",
+					message: "The session is not available.",
+				});
+			}
+			if (this.modelAttempts === 2) {
+				// Second attempt: timeout (also transient)
+				throw new GjcCliError("gjc sdk model.set reported failure: timeout", 0, "", {
+					code: "deadline_exceeded",
+					message: "The operation timed out.",
+				});
+			}
+			// Third attempt: success
+			return await super.setModel(input);
+		}
+	}
+
+	const port = new PresetTransientFailurePort();
+	const notices: string[] = [];
+	const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
+	await harness(
+		port,
+		{
+			effectiveModel: preset,
+			failureError: (error) => notices.push(formatFailureNotice(error)),
+		},
+		undefined,
+		{
+			setTimeout: (work, delayMs) => {
+				const timer = { work, delayMs };
+				timers.push(timer);
+				return timer;
+			},
+			clearTimeout: () => {},
+		},
+	);
+
+	enqueue("preset-transient", "use my preset with transient errors");
+	await manager!.notifyInbound(KEY);
+
+	// Retry after first transient failure
+	timers[0]!.work();
+	await eventually(() => port.modelAttempts >= 2, "model.set did not retry after transient error");
+
+	// Retry after second transient failure
+	timers[1]!.work();
+	await eventually(() => port.sends.length === 1, "message did not send after transient retries succeeded");
+
+	expect(port.modelAttempts).toBe(3);
+	expect(port.sends.map((send) => send.text)).toEqual(["use my preset with transient errors"]);
+	// No failure notices since all transient failures retried successfully
+	expect(notices).toHaveLength(0);
+	await eventually(
+		() => database!.inbox.turnRow(port.sends[0]!.opRef)?.turn_state === "done",
+		"the message did not finish after transient retries",
+	);
+});
+
+for (const errorCode of ["invalid_preset", "internal"] as const) {
+	test(`preset model failure with ${errorCode} code ends after MAX_PRESET_FAILURE_ATTEMPTS with one notice`, async () => {
+		const preset = { preset: `preset-${errorCode}` };
+		class PresetFailurePort extends ScriptedSessionPort {
+			modelAttempts = 0;
+
+			constructor() {
+				super({
+					onBind: (input) => `model-session-${input.epoch}`,
+					onSend: (input, scripted) => scripted.complete(input.opRef, "send succeeded"),
+				});
+			}
+
+			override async setModel(
+				input: Parameters<ScriptedSessionPort["setModel"]>[0],
+			): Promise<{ readonly changed: boolean }> {
+				this.modelAttempts++;
+				// Simulate a non-transient preset failure
+				throw new GjcCliError(`gjc sdk model.set reported failure: ${errorCode}`, 0, "", {
+					code: errorCode,
+					message: `The preset could not be applied: ${errorCode}.`,
+				});
+			}
+		}
+
+		const port = new PresetFailurePort();
+		const notices: string[] = [];
+		const logs: string[] = [];
+		const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
+		let failureCalled = false;
+		await harness(
+			port,
+			{
+				effectiveModel: preset,
+				failureError: (error) => {
+					failureCalled = true;
+					notices.push(formatFailureNotice(error));
+				},
+			},
+			(line) => logs.push(line),
+			{
+				setTimeout: (work, delayMs) => {
+					const timer = { work, delayMs };
+					timers.push(timer);
+					return timer;
+				},
+				clearTimeout: () => {},
+			},
+		);
+
+		enqueue(`preset-${errorCode}`, `use preset with ${errorCode}`);
+		await manager!.notifyInbound(KEY);
+		const opRef = latestOpRef;
+
+		// Trigger retries by running timers
+		for (let i = 0; i < 2 && timers.length > 0; i++) {
+			const timer = timers.pop()!;
+			timer.work();
+			await manager!.notifyInbound(KEY);
+		}
+
+		// Verify exactly MAX_PRESET_FAILURE_ATTEMPTS (3) model attempts
+		expect(port.modelAttempts).toBe(3);
+		// Verify no additional timers are scheduled (turn is settled, no more retries)
+		expect(timers).toHaveLength(0);
+		// Verify failure callback was called
+		expect(failureCalled).toBe(true);
+		// Verify exactly 1 notice
+		expect(notices).toHaveLength(1);
+		// Verify notice does NOT contain the preset name (security: prevent preset discovery by non-owners)
+		expect(notices[0]).not.toContain(`preset-${errorCode}`);
+		// Verify generic message is in conversation notice
+		expect(notices[0]).toContain("the configured model preset could not be applied");
+		// The operator log keeps the exact preset name
+		const preflightLog = logs.find((log) => log.includes("persona_send_preflight_rejected"));
+		expect(preflightLog).toBeDefined();
+		expect(preflightLog).toContain(`preset-${errorCode}`);
+	});
+}
