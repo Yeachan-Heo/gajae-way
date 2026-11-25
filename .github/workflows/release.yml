@@ -207,11 +207,26 @@ jobs:
             arch: arm64
     steps:
       - uses: actions/checkout@v4
+      # `bun build --compile` under 1.4.0 leaves a linker-signed Mach-O whose signature does
+      # not match its contents. macOS kills it with SIGKILL (exit 137) at launch, and
+      # `gajaeway update` then replaces a working install with binaries that cannot run.
+      # 1.4.1 and later sign correctly. The darwin step below re-signs and verifies every
+      # binary so a future bun regression fails this job instead of the release.
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.4
       - run: bun install --frozen-lockfile
       - run: bun run build
+      - name: Verify darwin binary signatures
+        if: matrix.platform == 'darwin'
+        run: |
+          for bin in dist/gajaeway dist/gajaeway-*; do
+            [ -f "$bin" ] && [ -x "$bin" ] || continue
+            codesign --force --sign - "$bin"
+            codesign --verify --strict "$bin"
+          done
+          # Launching proves the kernel accepts the signature; --version exits 0.
+          dist/gajaeway --version
       - name: Package binaries
         run: |
           mkdir -p release
