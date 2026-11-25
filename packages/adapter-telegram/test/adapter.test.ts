@@ -1205,3 +1205,42 @@ test("a reply that cannot be rendered fails definitively without sending", async
 	expect(requests[0]).toMatchObject({ verb: "delivery.fail", params: { deliveryId: "delivery-1", ambiguous: false } });
 	expect((requests[0]?.params as { reason: string }).reason).toStartWith("Telegram rendering failed: ");
 });
+
+test("a forum topic creation is recorded as context-only under the topic root id", async () => {
+	const home = await temporaryHome();
+	try {
+		const adapter = new TelegramAdapter(
+			await TelegramAdapterState.load(home),
+			"agent",
+			"900",
+			{ chats: { "-100123": { engagement: "open" } } },
+			noAttachments,
+		);
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const created: TelegramUpdate = {
+			update_id: 90,
+			message: {
+				message_id: 99,
+				chat: { id: -100123, type: "supergroup" },
+				from: { id: 42 },
+				message_thread_id: 99,
+				is_topic_message: true,
+				forum_topic_created: { name: "NodeCPUTooHigh b300-07" },
+			},
+		};
+		expect(await adapter.handleUpdate(mockGateway(requests), created)).toBe(true);
+		expect(requests).toEqual([
+			{
+				verb: "chat.send",
+				params: {
+					origin: { platform: "telegram", kind: "topic", conversationId: "-100123.99", parentId: "-100123" },
+					text: "Forum topic created: NodeCPUTooHigh b300-07",
+					engagement: { mentioned: false, group: true, authorId: "42", contextOnly: true },
+					messageId: "-100123:99",
+				},
+			},
+		]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});

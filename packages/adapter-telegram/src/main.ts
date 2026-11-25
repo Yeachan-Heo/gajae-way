@@ -820,30 +820,22 @@ export class TelegramAdapter {
 		// A photo or file has no `text`; forwarding text alone dropped it without a trace.
 		const content = message.text ?? message.caption ?? "";
 		const attachment = telegramAttachment(message);
-		// Service message: store forum topic creation metadata before dropping empty messages.
-		// When a Telegram forum topic is created, receive a service message with forum_topic_created field.
-		// See packages/adapter-telegram/src/main.ts:814-817.
-		// Persist bounded topic metadata (name, creator) keyed by root ID format,
-		// so the first message can reference it via root lookup.
-		if (message.forum_topic_created && message.message_thread_id !== undefined && content === "" && !attachment) {
+		// A forum topic's creation service message is the topic root: its message id is the
+		// topic's message_thread_id. Record it as context only, so the gateway can show it as
+		// the thread root on the topic's first turn without answering the service message.
+		if (message.forum_topic_created && content === "" && !attachment) {
 			const origin = telegramMessageOrigin(message);
-			await this.state.rememberOrigin(origin, message.message_thread_id);
-			const topicName = message.forum_topic_created.name ?? "Topic";
-			// Topic root ID: chat_id:message_thread_id (e.g., "-100123:99")
+			await this.state.rememberOrigin(origin, origin.kind === "topic" ? message.message_thread_id : undefined);
 			try {
 				await gateway.request("chat.send", {
 					origin,
-					messageId: `${message.chat.id}:${message.message_thread_id}`,
-					text: `Forum topic: ${topicName}`,
-					engagement: {
-						mentioned: false,
-						group: true,
-						authorId: String(message.from.id ?? "unknown"),
-						authorName: message.from.first_name ?? "unknown",
-					},
+					text: `Forum topic created: ${message.forum_topic_created.name}`,
+					engagement: { ...engagementForMessage(message, origin, this.botUsername, this.botUserId), contextOnly: true },
+					messageId: telegramInboundMessageId(message.chat.id, message.message_id),
 				});
 			} catch (error) {
-				console.error("Failed to store forum topic context:", error);
+				if (!(error instanceof ProtocolError) || error.code !== "invalid_params") throw error;
+				return this.state.rejectUpdate(update.update_id, "chat.send");
 			}
 			return this.state.acceptUpdate(update.update_id);
 		}
