@@ -2242,17 +2242,33 @@ class OriginActor {
 				: code === PRESET_FAILURE_REJECTION_CODE
 					? "invalid_preset"
 					: code;
-		const message =
+		// Generic message for the shared conversation notice.
+		// Preset names are excluded to prevent non-owner participants from learning about
+		// preset identifiers (#895); the exact preset name is kept only in operator-facing diagnostics.
+		// Model names are included for MODEL_NOT_FOUND since users explicitly chose them.
+		const conversationMessage =
 			code === PROMPT_TOO_LARGE_CODE
 				? `the prompt exceeded the ${MAX_RELAY_REQUEST_FRAME_BYTES}-byte request limit before it was sent; reduce the text or number of images and send again`
 				: code === MODEL_NOT_FOUND_REJECTION_CODE
 					? `the selected model "${modelSelection}" was not found; choose a valid model with /model and send again`
 					: code === PRESET_FAILURE_REJECTION_CODE
-						? `the model preset "${modelSelection}" could not be applied; choose a valid preset and send again`
+						? `the configured model preset could not be applied; choose a valid preset and send again`
 						: "an unexpected error occurred; please try again";
-		const error = new GjcRuntimeError(`${errorCode}: ${message}`, { code: errorCode, message });
+		const error = new GjcRuntimeError(`${errorCode}: ${conversationMessage}`, {
+			code: errorCode,
+			message: conversationMessage,
+		});
+		// Operator-facing diagnostic includes the exact preset/model name and detailed rejection reason.
+		const diagnosticReason =
+			code === PROMPT_TOO_LARGE_CODE
+				? `prompt size (>${MAX_RELAY_REQUEST_FRAME_BYTES} bytes)`
+				: code === MODEL_NOT_FOUND_REJECTION_CODE
+					? `model not found: ${modelSelection}`
+					: code === PRESET_FAILURE_REJECTION_CODE
+						? `preset failed: ${modelSelection}`
+						: code;
 		this.#manager.log(
-			`persona_send_preflight_rejected origin=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} opRef=${opRef} reason=${code}${modelSelection ? ` selection=${modelSelection}` : ""}`,
+			`persona_send_preflight_rejected origin=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} opRef=${opRef} reason=${diagnosticReason}`,
 			"warn",
 		);
 		bound.tail?.setTurnRunning(false);

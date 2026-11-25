@@ -7261,6 +7261,7 @@ for (const errorCode of ["invalid_preset", "internal"] as const) {
 
 		const port = new PresetFailurePort();
 		const notices: string[] = [];
+		const logs: string[] = [];
 		const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
 		let failureCalled = false;
 		await harness(
@@ -7272,7 +7273,7 @@ for (const errorCode of ["invalid_preset", "internal"] as const) {
 					notices.push(formatFailureNotice(error));
 				},
 			},
-			undefined,
+			(line) => logs.push(line),
 			{
 				setTimeout: (work, delayMs) => {
 					const timer = { work, delayMs };
@@ -7302,7 +7303,13 @@ for (const errorCode of ["invalid_preset", "internal"] as const) {
 		expect(failureCalled).toBe(true);
 		// Verify exactly 1 notice
 		expect(notices).toHaveLength(1);
-		// Verify notice contains the preset name
-		expect(notices[0]).toContain(`preset-${errorCode}`);
+		// Verify notice does NOT contain the preset name (security: prevent preset discovery by non-owners)
+		expect(notices[0]).not.toContain(`preset-${errorCode}`);
+		// Verify generic message is in conversation notice
+		expect(notices[0]).toContain("the configured model preset could not be applied");
+		// Verify operator log contains the exact preset name and diagnostic reason
+		const preflight_log = logs.find((log) => log.includes("persona_send_preflight_rejected"));
+		expect(preflight_log).toBeDefined();
+		expect(preflight_log).toContain(`preset-${errorCode}`);
 	});
 }
