@@ -68,6 +68,12 @@ export interface TelegramMessage extends TelegramMessageOriginShape, TelegramAtt
 	/** Media messages carry their text here instead of in `text`. */
 	readonly caption?: string;
 	readonly reply_to_message?: TelegramReplyMessageShape;
+	/** Service message: forum topic was created. */
+	readonly forum_topic_created?: {
+		readonly name: string;
+		readonly icon_color?: number;
+		readonly icon_custom_emoji_id?: string;
+	};
 }
 
 /** One entry of Telegram's `ReactionType` union; bots only ever set/read `type: "emoji"`. */
@@ -814,6 +820,25 @@ export class TelegramAdapter {
 		// A photo or file has no `text`; forwarding text alone dropped it without a trace.
 		const content = message.text ?? message.caption ?? "";
 		const attachment = telegramAttachment(message);
+		// A forum topic's creation service message is the topic root: its message id is the
+		// topic's message_thread_id. Record it as context only, so the gateway can show it as
+		// the thread root on the topic's first turn without answering the service message.
+		if (message.forum_topic_created && content === "" && !attachment) {
+			const origin = telegramMessageOrigin(message);
+			await this.state.rememberOrigin(origin, origin.kind === "topic" ? message.message_thread_id : undefined);
+			try {
+				await gateway.request("chat.send", {
+					origin,
+					text: `Forum topic created: ${message.forum_topic_created.name}`,
+					engagement: { ...engagementForMessage(message, origin, this.botUsername, this.botUserId), contextOnly: true },
+					messageId: telegramInboundMessageId(message.chat.id, message.message_id),
+				});
+			} catch (error) {
+				if (!(error instanceof ProtocolError) || error.code !== "invalid_params") throw error;
+				return this.state.rejectUpdate(update.update_id, "chat.send");
+			}
+			return this.state.acceptUpdate(update.update_id);
+		}
 		if (content === "" && !attachment) return this.state.acceptUpdate(update.update_id);
 		const origin = telegramMessageOrigin(message);
 		await this.state.rememberOrigin(origin, origin.kind === "topic" ? message.message_thread_id : undefined);

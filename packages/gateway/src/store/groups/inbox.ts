@@ -1371,6 +1371,41 @@ export class InboxGroup {
 			.all() as Array<{ origin_key: string; origin_ref_json: string; text: string; at: string }>;
 	}
 
+	/**
+	 * Get a specific message from conversation context.
+	 * Returns undefined if the message is not found in the conversation context.
+	 */
+	contextRowByMessage(originKey: string, messageId: string): ConversationContextRow | undefined {
+		const row = this.#db
+			.prepare(
+				"SELECT message_id, author_id, author_name, body, received_at FROM conversation_context WHERE origin_key = ? AND message_id = ?",
+			)
+			.get(originKey, messageId) as ConversationContextRow | null;
+		return row ?? undefined;
+	}
+
+	/**
+	 * Check if an origin has had any trigger or steer turns whose prompts were actually sent
+	 * (send_attempted_at is stamped immediately before the prompt is handed to the broker).
+	 * A bound trigger without send_attempted_at provably never reached turn.prompt and was
+	 * requeued; local preflight rejections do not stamp it. Only when a prompt was actually
+	 * sent should root insertion be suppressed on subsequent turns.
+	 * Optionally exclude a specific message (useful when checking on the first turn).
+	 */
+	hasThreadTurns(originKey: string, excludeMessageId?: string): boolean {
+		const params: [string, ...string[]] = [originKey];
+		const whereClause = excludeMessageId ? "AND message_id != ?" : "";
+		if (excludeMessageId) params.push(excludeMessageId);
+
+		return (
+			this.#db
+				.prepare(
+					`SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? ${whereClause} AND turn_role IN ('trigger', 'steer') AND send_attempted_at IS NOT NULL LIMIT 1`,
+				)
+				.get(...params) !== null
+		);
+	}
+
 	#assertNotQuarantined(messageId: string): void {
 		if (this.#db.prepare("SELECT 1 FROM broker_quarantine WHERE kind = 'inbound' AND subject_id = ?").get(messageId))
 			throw new BrokerAuthorityError("quarantined");
