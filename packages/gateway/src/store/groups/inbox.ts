@@ -1371,6 +1371,19 @@ export class InboxGroup {
 			.all() as Array<{ origin_key: string; origin_ref_json: string; text: string; at: string }>;
 	}
 
+	/**
+	 * Get a specific message from conversation context.
+	 * Returns undefined if the message is not found in the conversation context.
+	 */
+	contextRowByMessage(originKey: string, messageId: string): ConversationContextRow | undefined {
+		const row = this.#db
+			.prepare(
+				"SELECT message_id, author_id, author_name, body, received_at FROM conversation_context WHERE origin_key = ? AND message_id = ?",
+			)
+			.get(originKey, messageId) as ConversationContextRow | null;
+		return row ?? undefined;
+	}
+
 	#assertNotQuarantined(messageId: string): void {
 		if (this.#db.prepare("SELECT 1 FROM broker_quarantine WHERE kind = 'inbound' AND subject_id = ?").get(messageId))
 			throw new BrokerAuthorityError("quarantined");
