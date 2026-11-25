@@ -3454,19 +3454,43 @@ async function createInboundTurnLifecycle(
 			: [...prepared.selectedMessageIds, editedOriginalId(row.message_id) ?? row.message_id];
 		contextOmissionRevision = prepared.omissionRevision;
 
-		// Include thread root on first turn in a thread
+		// Include thread root on first turn in a thread or topic
 		let threadRootLine: string | undefined;
 		let threadRootMessageId: string | undefined;
-		if (origin.kind === "thread" && origin.parentId && !options.database.inbox.hasThreadTurns(key, row.message_id)) {
+		if (
+			(origin.kind === "thread" || origin.kind === "topic") &&
+			origin.parentId &&
+			!options.database.inbox.hasThreadTurns(key, row.message_id)
+		) {
 			const parentKey = originKey({
 				platform: origin.platform,
 				kind: "channel",
 				conversationId: origin.parentId,
 			});
-			const rootRow = options.database.inbox.contextRowByMessage(parentKey, origin.conversationId);
+
+			// For Telegram topics, we need to find the root message from the topic's context.
+			// Unlike Slack threads where the root is identifiable by the timestamp in the conversationId,
+			// Telegram topics are created with a message_thread_id but no inherent root message ID.
+			// For now, treat topics the same as threads by using conversationId as the message ID to lookup.
+			const rootMessageIdToLookup = origin.conversationId;
+
+			// Try to find the root message, handling both platform message IDs and gateway-authored posts
+			let rootRow = options.database.inbox.contextRowByMessage(parentKey, rootMessageIdToLookup);
+			if (!rootRow && rootMessageIdToLookup.includes(":")) {
+				// For Slack threads, extract the actual message ID (second part after colon)
+				// which might be a platform message ID or a post/<deliveryId> message ID
+				const deliveryIdMatch = rootMessageIdToLookup.match(/^[^:]+:(.+)$/);
+				if (deliveryIdMatch) {
+					const [, messageIdPart] = deliveryIdMatch;
+					// Try looking it up as-is (might already be post/<deliveryId>)
+					rootRow = options.database.inbox.contextRowByMessage(parentKey, messageIdPart);
+				}
+			}
+
 			if (rootRow) {
 				threadRootMessageId = rootRow.message_id;
-				threadRootLine = `- [${rootRow.received_at}] ${rootRow.author_name ?? "unknown"} (author:${rootRow.author_id ?? "?"}, msg:${rootRow.message_id}): ${clipContextBody(redactHistoricalAttachments(rootRow.body), 4000)}`;
+				const escapedBody = escapeUntrustedContentDelimiters(redactHistoricalAttachments(rootRow.body));
+				threadRootLine = `- [${rootRow.received_at}] ${rootRow.author_name ?? "unknown"} (author:${rootRow.author_id ?? "?"}, msg:${rootRow.message_id}): ${clipContextBody(escapedBody, 4000)}`;
 			}
 		}
 
@@ -5088,6 +5112,16 @@ function diagnostic(error: unknown): string {
  * Safely clips a string to a maximum number of code points, never leaving a lone UTF-16 surrogate.
  * Uses Array.from to iterate over code points (not code units), ensuring the result is always well-formed.
  */
+/**
+ * Escapes XML-like delimiters in untrusted content to prevent injection attacks.
+ * Replaces `<untrusted-content>` and `</untrusted-content>` with escaped versions.
+ */
+function escapeUntrustedContentDelimiters(text: string): string {
+	return text
+		.replaceAll("<untrusted-content>", "&lt;untrusted-content&gt;")
+		.replaceAll("</untrusted-content>", "&lt;/untrusted-content&gt;");
+}
+
 function clipByCodePoints(text: string, limit: number): string {
 	if (text.length <= limit) return text;
 	return Array.from(text).slice(0, limit).join("");
