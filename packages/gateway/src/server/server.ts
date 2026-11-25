@@ -3460,7 +3460,7 @@ async function createInboundTurnLifecycle(
 		if (
 			(origin.kind === "thread" || origin.kind === "topic") &&
 			origin.parentId &&
-			!options.database.inbox.hasThreadTurns(key, row.message_id)
+			!options.database.inbox.hasSentThreadTurns(key, row.message_id)
 		) {
 			// The root's inbound message id is derived from the thread origin: a Slack thread's
 			// conversationId is `<C>:<ts>`, a Discord thread id equals its starter message id, and a

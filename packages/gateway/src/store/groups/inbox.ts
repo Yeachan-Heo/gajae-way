@@ -1408,6 +1408,33 @@ export class InboxGroup {
 		);
 	}
 
+	/**
+	 * Check if an origin has had any trigger or steer turns whose prompts were actually sent
+	 * (send_attempted_at is stamped immediately before the prompt is handed to the broker).
+	 * A bound trigger without send_attempted_at provably never reached turn.prompt and was
+	 * requeued; local preflight rejections do not stamp it. Only when a prompt was actually
+	 * sent should root insertion be suppressed on subsequent turns.
+	 * Optionally exclude a specific message (useful when checking on the first turn).
+	 */
+	hasSentThreadTurns(originKey: string, excludeMessageId?: string): boolean {
+		if (excludeMessageId) {
+			return (
+				this.#db
+					.prepare(
+						"SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND message_id != ? AND turn_role IN ('trigger', 'steer') AND send_attempted_at IS NOT NULL LIMIT 1",
+					)
+					.get(originKey, excludeMessageId) !== null
+			);
+		}
+		return (
+			this.#db
+				.prepare(
+					"SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND turn_role IN ('trigger', 'steer') AND send_attempted_at IS NOT NULL LIMIT 1",
+				)
+				.get(originKey) !== null
+		);
+	}
+
 	#assertNotQuarantined(messageId: string): void {
 		if (this.#db.prepare("SELECT 1 FROM broker_quarantine WHERE kind = 'inbound' AND subject_id = ?").get(messageId))
 			throw new BrokerAuthorityError("quarantined");
