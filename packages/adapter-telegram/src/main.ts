@@ -348,11 +348,11 @@ async function sendTelegramHtml(
 ): Promise<number> {
 	try {
 		const result = await bot.sendMessage(chatId, html, messageThreadId, TELEGRAM_PARSE_MODE);
-		return (result as unknown as { result: { message_id: number } }).result.message_id;
+		return (result as unknown as { message_id: number }).message_id;
 	} catch (error) {
 		if (!isEntityParseError(error)) throw error;
 		const result = await bot.sendMessage(chatId, telegramHtmlToPlainText(html), messageThreadId);
-		return (result as unknown as { result: { message_id: number } }).result.message_id;
+		return (result as unknown as { message_id: number }).message_id;
 	}
 }
 

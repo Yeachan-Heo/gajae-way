@@ -935,14 +935,14 @@ async function sendFirstDiscordPart(
 	part: { content: string; files?: readonly unknown[] },
 	reference: string | undefined,
 ): Promise<string> {
-	const plain = { content: part.content };
+	const plain = part.files ? { content: part.content, files: part.files } : { content: part.content };
 	if (!reference) {
 		const msg = await channel.send(plain);
-		return String((msg as unknown as { id: string }).id);
+		return String((msg as { id: string }).id);
 	}
 	try {
 		const msg = await channel.send({ ...part, reply: { messageReference: reference, failIfNotExists: false } });
-		return String((msg as unknown as { id: string }).id);
+		return String((msg as { id: string }).id);
 	} catch (error) {
 		const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
 		if (code !== "50035") throw error;
@@ -950,7 +950,7 @@ async function sendFirstDiscordPart(
 			`discord reply_reference_rejected reference=${JSON.stringify(reference.slice(0, 80))}; resending without it`,
 		);
 		const msg = await channel.send(plain);
-		return String((msg as unknown as { id: string }).id);
+		return String((msg as { id: string }).id);
 	}
 }
 

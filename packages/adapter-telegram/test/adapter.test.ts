@@ -91,12 +91,17 @@ test("persists a forum topic route across restart and sends replies to its topic
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		await settleTelegramDelivery(
 			mockGateway(requests),
-			{ sendMessage: async (chatId, text, thread) => void sent.push({ chatId, text, thread }) },
+			{
+				sendMessage: async (chatId, text, thread) => {
+					sent.push({ chatId, text, thread });
+					return { message_id: 1 };
+				},
+			},
 			restarted,
 			delivery(origin, "reply"),
 		);
 		expect(sent).toEqual([{ chatId: "-100123", text: "reply", thread: 99 }]);
-		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1", platformMessageId: "-100123:1" } }]);
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
@@ -568,7 +573,7 @@ test("sends Markdown replies as Telegram HTML, escaping the duplicate prefix and
 				parse_mode: "HTML",
 			},
 		]);
-		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1", platformMessageId: "22:1" } }]);
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
@@ -597,7 +602,7 @@ test("resends a chunk as plain text when Telegram cannot parse its entities", as
 			{ chat_id: "22", text: "<b>hi</b> &amp; &lt;tag&gt;", parse_mode: "HTML" },
 			{ chat_id: "22", text: "hi & <tag>" },
 		]);
-		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1", platformMessageId: "22:2" } }]);
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
@@ -627,7 +632,7 @@ test("multi-chunk entity fallback preserves order and forum topic without resend
 			{ chat_id: "-100123", message_thread_id: 99, text: telegramHtmlToPlainText(chunks[1] ?? "") },
 			{ chat_id: "-100123", message_thread_id: 99, text: chunks[2], parse_mode: "HTML" },
 		]);
-		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1", platformMessageId: "-100123:1" } }]);
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
@@ -782,7 +787,7 @@ test("prefixes recovered delivery and settles via injected fake fetch", async ()
 		expect(calls.map((call) => String(call.body.text).length)).toEqual([4_096, 27]);
 		expect(calls[0]?.body.text).toBe(`[recovered - may be a duplicate] ${"x".repeat(4_090)}`.slice(0, 4_096));
 		expect(calls.every((call) => call.body.parse_mode === "HTML")).toBe(true);
-		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1", platformMessageId: "22:1" } }]);
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
@@ -982,7 +987,7 @@ test("a 429 with a short retry_after waits it out and resends only the refused c
 	);
 	expect(sleeps).toEqual([3_000]);
 	expect(sentTexts(calls)).toEqual([chunks[0], chunks[1], chunks[1], chunks[2]]);
-	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1", platformMessageId: "22:1" } }]);
 });
 
 test("a retry_after beyond the settlement wait budget fails at once without waiting", async () => {
@@ -1045,7 +1050,7 @@ test("a transport failure after accepted chunks resumes at the uncertain chunk u
 				ambiguous: true,
 			},
 		},
-		{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } },
+		{ verb: "delivery.confirm", params: { deliveryId: "delivery-1", platformMessageId: "22:3" } },
 	]);
 });
 
@@ -1111,7 +1116,7 @@ test("a delivery replayed after this adapter already posted it is confirmed agai
 	);
 	expect(sentTexts(calls)).toEqual(chunks);
 	expect(requests).toEqual([
-		{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } },
+		{ verb: "delivery.confirm", params: { deliveryId: "delivery-1", platformMessageId: "22:1" } },
 		{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } },
 	]);
 });
