@@ -3462,25 +3462,21 @@ async function createInboundTurnLifecycle(
 			origin.parentId &&
 			!options.database.inbox.hasThreadTurns(key, row.message_id)
 		) {
-			// Determine where the root is stored based on adapter behavior:
-			// - Slack threads: root is stored in parent-channel origin (channel receives the root message, thread receives replies)
-			// - Telegram topics: root is stored in topic origin (adapter includes message_thread_id in inbound message)
-			// - Discord threads: root is stored in thread origin (adapter includes thread context in inbound message)
-			const rootOriginKey =
-				origin.platform === "slack"
-					? originKey({
-							platform: origin.platform,
-							kind: "channel",
-							conversationId: origin.parentId,
-						})
-					: key; // Telegram topics and Discord threads store root under their own origin
-
-			// Extract the message ID to query for the root
+			// The root's inbound message id is derived from the thread origin: a Slack thread's
+			// conversationId is `<C>:<ts>`, a Discord thread id equals its starter message id, and a
+			// Telegram topic `<chat>.<thread>` is rooted at `telegramInboundMessageId` `<chat>:<thread>`.
+			// Where it was stored depends on how the root arrived: a Discord forum starter or a
+			// Telegram forum-topic message lands on the thread/topic origin itself, while a Slack
+			// root, a Discord message a thread was started from, or a Telegram reply-chain root
+			// lands on the parent channel. Look in the thread origin first, then the parent.
 			const rootMessageId =
 				origin.kind === "topic" && origin.platform === "telegram"
 					? origin.conversationId.replace(".", ":")
 					: origin.conversationId;
-			const rootRow = options.database.inbox.contextRowByMessage(rootOriginKey, rootMessageId);
+			const parentKey = originKey({ platform: origin.platform, kind: "channel", conversationId: origin.parentId });
+			const rootRow =
+				options.database.inbox.contextRowByMessage(key, rootMessageId) ??
+				options.database.inbox.contextRowByMessage(parentKey, rootMessageId);
 
 			if (rootRow) {
 				threadRootMessageId = rootRow.message_id;

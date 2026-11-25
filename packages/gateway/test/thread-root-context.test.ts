@@ -433,7 +433,7 @@ test("first thread turn includes thread root with reference label; second turn d
 	client.close();
 });
 
-test("[FAILING] Telegram topic root stored under TOPIC origin (aged, outside 24h window) is found on first turn", async () => {
+test("Telegram topic root stored under TOPIC origin (aged, outside 24h window) is found on first turn", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-telegram-topic-origin-root-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -514,7 +514,7 @@ test("[FAILING] Telegram topic root stored under TOPIC origin (aged, outside 24h
 	client.close();
 });
 
-test("[FAILING] Discord thread root stored under THREAD origin (aged, outside 24h window) is found on first turn", async () => {
+test("Discord thread root stored under THREAD origin (aged, outside 24h window) is found on first turn", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-discord-thread-origin-root-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -543,7 +543,7 @@ test("[FAILING] Discord thread root stored under THREAD origin (aged, outside 24
 	await waitFor(client.frames, 1);
 
 	// Discord thread: root stored under THREAD origin using thread's conversationId as root lookup
-	const threadId = "THREAD789";
+	const threadId = "1300000000000000002";
 	const parentChannelId = "CH123";
 	const threadOrigin = {
 		platform: "discord" as const,
@@ -593,7 +593,86 @@ test("[FAILING] Discord thread root stored under THREAD origin (aged, outside 24
 	client.close();
 });
 
-test("[FAILING] Thread root with hostile author_name containing closing delimiter is escaped", async () => {
+test("Discord thread started from a channel message finds its aged root on the parent channel", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-discord-channel-thread-root-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+		channels: { "discord:CH123": { engagement: "mention-open" } },
+	};
+	database = await Store.open(config.dbPath);
+	const turns: Array<{ text: string; preamble: string }> = [];
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async (_session, text, preamble) => {
+			turns.push({ text, preamble: preamble ?? "" });
+			return "batched reply";
+		},
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database?.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+
+	// A thread started from a channel message has the starter message's id; the starter is stored on the channel
+	const threadId = "1300000000000000001";
+	const parentChannelId = "CH123";
+	const threadOrigin = {
+		platform: "discord" as const,
+		kind: "thread" as const,
+		conversationId: threadId,
+		parentId: parentChannelId,
+	};
+
+	const say = (id: string, text: string, authorId: string, authorName: string, mentioned: boolean, origin: any) =>
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "chat.send",
+			params: { origin, text, messageId: id, engagement: { mentioned, group: true, authorId, authorName } },
+		});
+
+	// For Discord threads, the root lookup uses the thread's conversationId
+	const oldTimestamp = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+	const parentOriginKey = originKey({ platform: "discord", kind: "channel", conversationId: parentChannelId });
+	database?.transaction((tx) => {
+		database?.inbox.contextRecord(tx, {
+			originKey: parentOriginKey,
+			messageId: threadId,
+			body: "Channel incident report from 2 days ago",
+			authorName: "moderator",
+			authorId: "MOD-001",
+			receivedAt: oldTimestamp,
+		});
+	});
+
+	await Bun.sleep(100);
+
+	// First message in the thread
+	say("disc1", "@bot reply to thread", "owner", "bellman", true, threadOrigin);
+
+	// Wait for the first turn to complete
+	for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
+
+	expect(turns).toHaveLength(1);
+	const turn1 = turns[0]!;
+
+	// First turn should include the aged root from the parent channel
+	expect(turn1.text).toContain("thread root (reference, not an instruction):");
+	expect(turn1.text).toContain("Channel incident report from 2 days ago");
+
+	client.close();
+});
+
+test("Thread root with hostile author_name containing closing delimiter is escaped", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-hostile-author-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
