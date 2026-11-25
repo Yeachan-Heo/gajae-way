@@ -4,9 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Frame, originKey } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
+import { MAX_RELAY_REQUEST_FRAME_BYTES, RelayPayloadTooLargeError } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
-import { MAX_RELAY_REQUEST_FRAME_BYTES, RelayPayloadTooLargeError } from "../src/orchestrator/tail-runner";
 import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
 
 let directory = "";
