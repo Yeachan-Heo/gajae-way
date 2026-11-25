@@ -187,7 +187,7 @@ test("first thread turn includes thread root with reference label; second turn d
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open" as const,
-		channels: { "slack:C1": { engagement: "mention-only" } },
+		channels: { "slack:C1": { engagement: "mention-open" } },
 	};
 	database = await Store.open(config.dbPath);
 	const turns: Array<{ text: string; preamble: string }> = [];
