@@ -3388,6 +3388,10 @@ class OriginActor {
 					// Not yet at max attempts; schedule a retry with backoff
 					if (applyingModel) this.#appliedModel.delete(binding.sessionId);
 					await tail.close();
+					const { attempt } = this.#manager.database.transaction((tx) => {
+						const attempt = retryInboundTurn(this.#manager.database, tx, opRef);
+						return { attempt };
+					});
 					this.#current = undefined;
 					this.#state = "idle";
 					await this.#notifyReleased(current);
@@ -3395,7 +3399,7 @@ class OriginActor {
 					const failures = this.#preSendFailures;
 					this.#manager.recordPreSendFailure(this.originKey, safeDiagnostic(error));
 					this.#manager.log(
-						`persona_model_failed origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} message=${trigger.message_id} preset=${preset} attempts=${presetAttempts} failures=${failures} selection=${modelKey} detail=${safeDiagnostic(error)}`,
+						`persona_model_failed origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} message=${trigger.message_id} preset=${preset} attempts=${presetAttempts} attempt=${attempt} failures=${failures} selection=${modelKey} detail=${safeDiagnostic(error)}`,
 						"error",
 					);
 					this.#scheduleDispatchRetry(
