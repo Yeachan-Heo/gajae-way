@@ -1385,30 +1385,6 @@ export class InboxGroup {
 	}
 
 	/**
-	 * Check if an origin has had any trigger or steer turns (persona is already talking).
-	 * Optionally exclude a specific message (useful when checking on the first turn before
-	 * the trigger's turn_role is finalized).
-	 */
-	hasThreadTurns(originKey: string, excludeMessageId?: string): boolean {
-		if (excludeMessageId) {
-			return (
-				this.#db
-					.prepare(
-						"SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND message_id != ? AND turn_role IN ('trigger', 'steer') LIMIT 1",
-					)
-					.get(originKey, excludeMessageId) !== null
-			);
-		}
-		return (
-			this.#db
-				.prepare(
-					"SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND turn_role IN ('trigger', 'steer') LIMIT 1",
-				)
-				.get(originKey) !== null
-		);
-	}
-
-	/**
 	 * Check if an origin has had any trigger or steer turns whose prompts were actually sent
 	 * (send_attempted_at is stamped immediately before the prompt is handed to the broker).
 	 * A bound trigger without send_attempted_at provably never reached turn.prompt and was
@@ -1416,22 +1392,17 @@ export class InboxGroup {
 	 * sent should root insertion be suppressed on subsequent turns.
 	 * Optionally exclude a specific message (useful when checking on the first turn).
 	 */
-	hasSentThreadTurns(originKey: string, excludeMessageId?: string): boolean {
-		if (excludeMessageId) {
-			return (
-				this.#db
-					.prepare(
-						"SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND message_id != ? AND turn_role IN ('trigger', 'steer') AND send_attempted_at IS NOT NULL LIMIT 1",
-					)
-					.get(originKey, excludeMessageId) !== null
-			);
-		}
+	hasThreadTurns(originKey: string, excludeMessageId?: string): boolean {
+		const params: [string, ...string[]] = [originKey];
+		const whereClause = excludeMessageId ? "AND message_id != ?" : "";
+		if (excludeMessageId) params.push(excludeMessageId);
+
 		return (
 			this.#db
 				.prepare(
-					"SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND turn_role IN ('trigger', 'steer') AND send_attempted_at IS NOT NULL LIMIT 1",
+					`SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? ${whereClause} AND turn_role IN ('trigger', 'steer') AND send_attempted_at IS NOT NULL LIMIT 1`,
 				)
-				.get(originKey) !== null
+				.get(...params) !== null
 		);
 	}
 

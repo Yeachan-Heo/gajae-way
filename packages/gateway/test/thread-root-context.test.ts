@@ -26,7 +26,7 @@ async function open(): Promise<Store> {
 	return database;
 }
 
-test("hasThreadTurns returns false when no trigger/steer turns exist on origin", async () => {
+test("hasThreadTurns returns false when no trigger/steer turns with send_attempted_at exist on origin", async () => {
 	database = await open();
 	const threadOriginKey = originKey({
 		platform: "slack",
@@ -38,6 +38,58 @@ test("hasThreadTurns returns false when no trigger/steer turns exist on origin",
 	// No messages recorded yet
 	const result = database?.inbox.hasThreadTurns(threadOriginKey);
 	expect(result).toBe(false);
+});
+
+test("hasThreadTurns: bound trigger without markSendAttempted returns false; after markSendAttempted returns true; excluded message id ignored", async () => {
+	database = await open();
+	const threadOriginKey = originKey({
+		platform: "slack",
+		kind: "thread",
+		conversationId: "C1:1700000000.000100",
+		parentId: "C1",
+	});
+	const messageId = "m-1";
+	const opRef = "op-1";
+
+	// First enqueue the message, then bind it to a turn without calling markSendAttempted
+	database?.transaction((tx) => {
+		database?.inbox.enqueue(tx, {
+			messageId,
+			originKey: threadOriginKey,
+			originRefJson: JSON.stringify({
+				platform: "slack",
+				kind: "thread",
+				conversationId: "C1:1700000000.000100",
+			}),
+			body: "Test message",
+		});
+	});
+
+	database?.transaction((tx) => {
+		database?.bindings.bindAtEpoch(tx, threadOriginKey, "session-1", 0);
+		database?.inbox.bindTurn(tx, {
+			messageId,
+			originKey: threadOriginKey,
+			epoch: 0,
+			opRef,
+			sessionId: "session-1",
+		});
+	});
+
+	// Without markSendAttempted, hasThreadTurns should return false
+	let result = database?.inbox.hasThreadTurns(threadOriginKey);
+	expect(result).toBe(false);
+
+	// After markSendAttempted, hasThreadTurns should return true
+	database?.transaction((tx) => {
+		database?.inbox.markSendAttempted(tx, opRef);
+	});
+	result = database?.inbox.hasThreadTurns(threadOriginKey);
+	expect(result).toBe(true);
+
+	// excludeMessageId properly excludes the sent message
+	result = database?.inbox.hasThreadTurns(threadOriginKey, messageId);
+	expect(result).toBe(false); // No other sent turns exist
 });
 
 test("contextRowByMessage retrieves a specific message from conversation context", async () => {
