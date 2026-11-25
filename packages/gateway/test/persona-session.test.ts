@@ -7157,8 +7157,6 @@ test("/model on a refusal-paused origin whose session is gone answers unavailabl
 	expect(port.sendAttempts).toHaveLength(1);
 });
 
-
-
 test("preset transient model.set failures still retry instead of terminating immediately", async () => {
 	const preset = { preset: "my-preset" };
 	class PresetTransientFailurePort extends ScriptedSessionPort {
@@ -7171,7 +7169,9 @@ test("preset transient model.set failures still retry instead of terminating imm
 			});
 		}
 
-		override async setModel(input: Parameters<ScriptedSessionPort["setModel"]>[0]) {
+		override async setModel(
+			input: Parameters<ScriptedSessionPort["setModel"]>[0],
+		): Promise<{ readonly changed: boolean }> {
 			this.modelAttempts++;
 			if (this.modelAttempts === 1) {
 				// First attempt: transient session_unavailable error
@@ -7182,19 +7182,14 @@ test("preset transient model.set failures still retry instead of terminating imm
 			}
 			if (this.modelAttempts === 2) {
 				// Second attempt: timeout (also transient)
-				throw new GjcCliError(
-					"gjc sdk model.set reported failure: timeout",
-					0,
-					"",
-					{
-						code: "deadline_exceeded",
-						message: "The operation timed out.",
-					},
-			);
+				throw new GjcCliError("gjc sdk model.set reported failure: timeout", 0, "", {
+					code: "deadline_exceeded",
+					message: "The operation timed out.",
+				});
+			}
+			// Third attempt: success
+			return await super.setModel(input);
 		}
-		// Third attempt: success
-		return await super.setModel(input);
-	}
 	}
 
 	const port = new PresetTransientFailurePort();
@@ -7203,7 +7198,7 @@ test("preset transient model.set failures still retry instead of terminating imm
 	await harness(
 		port,
 		{
-			effectiveModel: preset as any,
+			effectiveModel: preset as unknown as string,
 			failureError: (error) => notices.push(formatFailureNotice(error)),
 		},
 		undefined,
@@ -7226,10 +7221,7 @@ test("preset transient model.set failures still retry instead of terminating imm
 
 	// Retry after second transient failure
 	timers[1]!.work();
-	await eventually(
-		() => port.sends.length === 1,
-		"message did not send after transient retries succeeded",
-	);
+	await eventually(() => port.sends.length === 1, "message did not send after transient retries succeeded");
 
 	expect(port.modelAttempts).toBe(3);
 	expect(port.sends.map((send) => send.text)).toEqual(["use my preset with transient errors"]);
@@ -7240,3 +7232,65 @@ test("preset transient model.set failures still retry instead of terminating imm
 		"the message did not finish after transient retries",
 	);
 });
+
+for (const errorCode of ["invalid_preset", "internal"] as const) {
+	test(`preset model failure with ${errorCode} code ends after MAX_PRESET_FAILURE_ATTEMPTS with one notice`, async () => {
+		const preset = { preset: `preset-${errorCode}` };
+		class PresetFailurePort extends ScriptedSessionPort {
+			modelAttempts = 0;
+
+			constructor() {
+				super({
+					onBind: (input) => `model-session-${input.epoch}`,
+					onSend: (input, scripted) => scripted.complete(input.opRef, "send succeeded"),
+				});
+			}
+
+			override async setModel(
+				input: Parameters<ScriptedSessionPort["setModel"]>[0],
+			): Promise<{ readonly changed: boolean }> {
+				this.modelAttempts++;
+				// Simulate a non-transient preset failure
+				throw new GjcCliError(`gjc sdk model.set reported failure: ${errorCode}`, 0, "", {
+					code: errorCode,
+					message: `The preset could not be applied: ${errorCode}.`,
+				});
+			}
+		}
+
+		const port = new PresetFailurePort();
+		const notices: string[] = [];
+		const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
+		await harness(
+			port,
+			{
+				effectiveModel: preset as any,
+				failureError: (error) => notices.push(formatFailureNotice(error)),
+			},
+			undefined,
+			{
+				setTimeout: (work, delayMs) => {
+					const timer = { work, delayMs };
+					timers.push(timer);
+					return timer;
+				},
+				clearTimeout: () => {},
+			},
+		);
+
+		enqueue(`preset-${errorCode}`, `use preset with ${errorCode}`);
+		await manager!.notifyInbound(KEY);
+
+		// Trigger retries by running timers
+		for (let i = 0; i < 2 && timers.length > 0; i++) {
+			const timer = timers.pop()!;
+			timer.work();
+			await manager!.notifyInbound(KEY);
+		}
+
+		// Verify exactly MAX_PRESET_FAILURE_ATTEMPTS (3) model attempts
+		expect(port.modelAttempts).toBe(3);
+		// Verify no additional timers are scheduled (turn is settled, no more retries)
+		expect(timers).toHaveLength(0);
+	});
+}
