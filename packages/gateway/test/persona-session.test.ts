@@ -7203,7 +7203,7 @@ test("preset transient model.set failures still retry instead of terminating imm
 	await harness(
 		port,
 		{
-			effectiveModel: preset,
+			effectiveModel: preset as any,
 			failureError: (error) => notices.push(formatFailureNotice(error)),
 		},
 		undefined,
