@@ -3462,28 +3462,33 @@ async function createInboundTurnLifecycle(
 			origin.parentId &&
 			!options.database.inbox.hasThreadTurns(key, row.message_id)
 		) {
-			const parentKey = originKey({
-				platform: origin.platform,
-				kind: "channel",
-				conversationId: origin.parentId,
-			});
+			// Determine where the root is stored based on adapter behavior:
+			// - Slack threads: root is stored in parent-channel origin (channel receives the root message, thread receives replies)
+			// - Telegram topics: root is stored in topic origin (adapter includes message_thread_id in inbound message)
+			// - Discord threads: root is stored in thread origin (adapter includes thread context in inbound message)
+			const rootOriginKey =
+				origin.platform === "slack"
+					? originKey({
+							platform: origin.platform,
+							kind: "channel",
+							conversationId: origin.parentId,
+						})
+					: key; // Telegram topics and Discord threads store root under their own origin
 
-			// The root is stored on the parent origin under its inbound message id. A Slack thread's
-			// conversationId already is that id (`<C>:<ts>`). A Telegram topic's is
-			// `<chat>.<message_thread_id>`, and the topic root is the message whose id is the thread id,
-			// stored as `telegramInboundMessageId` = `<chat>:<message id>`. Roots the gateway itself
-			// posted are stored as `post/<deliveryId>` and cannot be matched yet: delivery.confirm
-			// carries no platform message id.
+			// Extract the message ID to query for the root
 			const rootMessageId =
 				origin.kind === "topic" && origin.platform === "telegram"
 					? origin.conversationId.replace(".", ":")
 					: origin.conversationId;
-			const rootRow = options.database.inbox.contextRowByMessage(parentKey, rootMessageId);
+			const rootRow = options.database.inbox.contextRowByMessage(rootOriginKey, rootMessageId);
 
 			if (rootRow) {
 				threadRootMessageId = rootRow.message_id;
 				const escapedBody = escapeUntrustedContentDelimiters(redactHistoricalAttachments(rootRow.body));
-				threadRootLine = `- [${rootRow.received_at}] ${rootRow.author_name ?? "unknown"} (author:${rootRow.author_id ?? "?"}, msg:${rootRow.message_id}): ${clipContextBody(escapedBody, 4000)}`;
+				const escapedAuthorName = escapeUntrustedContentDelimiters(rootRow.author_name ?? "unknown");
+				const escapedAuthorId = escapeUntrustedContentDelimiters(rootRow.author_id ?? "?");
+				const escapedMessageId = escapeUntrustedContentDelimiters(rootRow.message_id);
+				threadRootLine = `- [${rootRow.received_at}] ${escapedAuthorName} (author:${escapedAuthorId}, msg:${escapedMessageId}): ${clipContextBody(escapedBody, 4000)}`;
 			}
 		}
 
