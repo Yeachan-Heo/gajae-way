@@ -1384,6 +1384,19 @@ export class InboxGroup {
 		return row ?? undefined;
 	}
 
+	/**
+	 * Check if an origin has had any trigger or steer turns (persona is already talking).
+	 */
+	hasThreadTurns(originKey: string): boolean {
+		return (
+			this.#db
+				.prepare(
+					"SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND turn_role IN ('trigger', 'steer') LIMIT 1",
+				)
+				.get(originKey) !== null
+		);
+	}
+
 	#assertNotQuarantined(messageId: string): void {
 		if (this.#db.prepare("SELECT 1 FROM broker_quarantine WHERE kind = 'inbound' AND subject_id = ?").get(messageId))
 			throw new BrokerAuthorityError("quarantined");

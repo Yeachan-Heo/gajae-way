@@ -3456,7 +3456,8 @@ async function createInboundTurnLifecycle(
 
 		// Include thread root on first turn in a thread
 		let threadRootLine: string | undefined;
-		if (origin.kind === "thread" && origin.parentId && !threadFollowUpEngaged(origin, key, options.database.inbox)) {
+		let threadRootMessageId: string | undefined;
+		if (origin.kind === "thread" && origin.parentId && !options.database.inbox.hasThreadTurns(key)) {
 			const parentKey = originKey({
 				platform: origin.platform,
 				kind: "channel",
@@ -3464,6 +3465,7 @@ async function createInboundTurnLifecycle(
 			});
 			const rootRow = options.database.inbox.contextRowByMessage(parentKey, origin.conversationId);
 			if (rootRow) {
+				threadRootMessageId = rootRow.message_id;
 				threadRootLine = `- [${rootRow.received_at}] ${rootRow.author_name ?? "unknown"} (author:${rootRow.author_id ?? "?"}, msg:${rootRow.message_id}): ${clipContextBody(redactHistoricalAttachments(rootRow.body), 4000)}`;
 			}
 		}
@@ -3472,6 +3474,10 @@ async function createInboundTurnLifecycle(
 			(entry) =>
 				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${clipContextBody(redactHistoricalAttachments(entry.body), 4000)}`,
 		);
+		// Skip the root if it's already in the thread context
+		if (threadRootLine && threadRootMessageId && prepared.selectedMessageIds.includes(threadRootMessageId)) {
+			threadRootLine = undefined;
+		}
 		const omitted = prepared.expiredCount + prepared.truncatedCount;
 		const omittedRange =
 			prepared.omittedOldestAt && prepared.omittedNewestAt
