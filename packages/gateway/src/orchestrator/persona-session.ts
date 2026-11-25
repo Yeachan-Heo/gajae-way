@@ -127,8 +127,12 @@ const STEER_REPLAY_ATTEMPTS = 2;
 const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
 const LOCAL_PREFLIGHT_REJECTION_PREFIX = "persona-local-preflight-rejection:";
 const LOCAL_PREFLIGHT_MODEL_PREFIX = "persona-local-preflight-model:";
+const LOCAL_PREFLIGHT_PRESET_FAILURE_PREFIX = "persona-local-preflight-preset-failure:";
 const PROMPT_TOO_LARGE_CODE = "prompt_too_large";
 const MODEL_NOT_FOUND_REJECTION_CODE = "model_not_found";
+const PRESET_FAILURE_REJECTION_CODE = "invalid_preset";
+/** Maximum attempts for a preset failure before terminating. Bounds identical non-transient failures. */
+const MAX_PRESET_FAILURE_ATTEMPTS = 3;
 
 class SendTurnNoLongerBoundError extends Error {}
 
@@ -157,6 +161,24 @@ function localPreflightModelKey(opRef: string): string {
 function localPreflightRejection(store: Store, opRef: string): string | undefined {
 	const code = store.core.metaGet(localPreflightRejectionKey(opRef));
 	return code === PROMPT_TOO_LARGE_CODE || code === MODEL_NOT_FOUND_REJECTION_CODE ? code : undefined;
+}
+
+function localPreflightPresetFailureKey(originKey: string, triggerMessageId: string, preset: string): string {
+	return `${LOCAL_PREFLIGHT_PRESET_FAILURE_PREFIX}${originKey}:${triggerMessageId}:${preset}`;
+}
+
+function localPreflightPresetFailureAttempts(store: Store, originKey: string, triggerMessageId: string, preset: string): number {
+	const key = localPreflightPresetFailureKey(originKey, triggerMessageId, preset);
+	const value = store.core.metaGet(key);
+	return typeof value === "string" ? parseInt(value, 10) || 0 : 0;
+}
+
+function incrementPresetFailureAttempts(database: Store, originKey: string, triggerMessageId: string, preset: string): number {
+	const key = localPreflightPresetFailureKey(originKey, triggerMessageId, preset);
+	const attempts = localPreflightPresetFailureAttempts(database, originKey, triggerMessageId, preset);
+	const next = attempts + 1;
+	database.core.metaSet(key, String(next));
+	return next;
 }
 
 function freshTurnMetaKey(originKey: string, epoch: number, triggerMessageId: string): string {
@@ -2186,20 +2208,29 @@ class OriginActor {
 	}
 
 	async #settleLocalPreflightRejection(bound: BoundTurn, code: string): Promise<void> {
-		if (code !== PROMPT_TOO_LARGE_CODE && code !== MODEL_NOT_FOUND_REJECTION_CODE) return;
+		if (code !== PROMPT_TOO_LARGE_CODE && code !== MODEL_NOT_FOUND_REJECTION_CODE && code !== PRESET_FAILURE_REJECTION_CODE) return;
 		const opRef = bound.turn.opRef;
 		const key = localPreflightRejectionKey(opRef);
 		if (localPreflightRejection(this.#manager.database, opRef) !== code) return;
 		const selectionKey = localPreflightModelKey(opRef);
 		const modelSelection =
-			code === MODEL_NOT_FOUND_REJECTION_CODE
+			code === MODEL_NOT_FOUND_REJECTION_CODE || code === PRESET_FAILURE_REJECTION_CODE
 				? (this.#manager.database.core.metaGet(selectionKey) ?? describeModel(bound.lifecycle.effectiveModel))
 				: undefined;
-		const errorCode = code === MODEL_NOT_FOUND_REJECTION_CODE ? "invalid_input" : code;
+		const errorCode =
+			code === MODEL_NOT_FOUND_REJECTION_CODE
+				? "invalid_input"
+				: code === PRESET_FAILURE_REJECTION_CODE
+				? "invalid_preset"
+				: code;
 		const message =
 			code === PROMPT_TOO_LARGE_CODE
 				? `the prompt exceeded the ${MAX_RELAY_REQUEST_FRAME_BYTES}-byte request limit before it was sent; reduce the text or number of images and send again`
-				: `the selected model "${modelSelection}" was not found; choose a valid model with /model and send again`;
+				: code === MODEL_NOT_FOUND_REJECTION_CODE
+				? `the selected model "${modelSelection}" was not found; choose a valid model with /model and send again`
+				: code === PRESET_FAILURE_REJECTION_CODE
+				? `the model preset "${modelSelection}" could not be applied; choose a valid preset and send again`
+				: "an unexpected error occurred; please try again";
 		const error = new GjcRuntimeError(`${errorCode}: ${message}`, { code: errorCode, message });
 		this.#manager.log(
 			`persona_send_preflight_rejected origin=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} opRef=${opRef} reason=${code}${modelSelection ? ` selection=${modelSelection}` : ""}`,
@@ -3328,6 +3359,50 @@ class OriginActor {
 				);
 				await this.#settleLocalPreflightRejection(current, MODEL_NOT_FOUND_REJECTION_CODE);
 				return;
+			}
+			// Preset (model.profile.set) failures: terminate on non-transient errors after bounding attempts.
+			if (
+				applyingModel &&
+				typeof lifecycle.effectiveModel === "object" &&
+				lifecycle.effectiveModel !== null &&
+				"preset" in lifecycle.effectiveModel &&
+				isNonTransientPresetFailure(error)
+			) {
+				const preset = (lifecycle.effectiveModel as { preset?: string }).preset || "unknown";
+				const presetAttempts = incrementPresetFailureAttempts(this.#manager.database, this.originKey, trigger.message_id, preset);
+				// After MAX_PRESET_FAILURE_ATTEMPTS of identical non-transient failures, terminate.
+				if (presetAttempts >= MAX_PRESET_FAILURE_ATTEMPTS) {
+					this.#manager.database.transaction(() => {
+						this.#manager.database.core.metaSet(localPreflightModelKey(opRef), preset);
+						this.#manager.database.core.metaSet(localPreflightRejectionKey(opRef), PRESET_FAILURE_REJECTION_CODE);
+					});
+					this.#preSendFailures = 0;
+					this.#manager.recordPreSendFailure(this.originKey, safeDiagnostic(error));
+					this.#manager.log(
+						`persona_model_failed origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} message=${trigger.message_id} terminal=true selection=${modelKey} preset=${preset} attempts=${presetAttempts} detail=${safeDiagnostic(error)}`,
+						"error",
+					);
+					await this.#settleLocalPreflightRejection(current, PRESET_FAILURE_REJECTION_CODE);
+					return;
+				} else {
+					// Not yet at max attempts; schedule a retry with backoff
+					if (applyingModel) this.#appliedModel.delete(binding.sessionId);
+					await tail.close();
+					this.#current = undefined;
+					this.#state = "idle";
+					await this.#notifyReleased(current);
+					this.#preSendFailures += 1;
+					const failures = this.#preSendFailures;
+					this.#manager.recordPreSendFailure(this.originKey, safeDiagnostic(error));
+					this.#manager.log(
+						`persona_model_failed origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} message=${trigger.message_id} preset=${preset} attempts=${presetAttempts} failures=${failures} selection=${modelKey} detail=${safeDiagnostic(error)}`,
+						"error",
+					);
+					this.#scheduleDispatchRetry(
+						Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(failures - 1, 10)),
+					);
+					return;
+				}
 			}
 			// The control may have changed the live model before failing; re-verify on the next attempt.
 			if (applyingModel) this.#appliedModel.delete(binding.sessionId);
@@ -6469,6 +6544,21 @@ function isStructuredModelNotFoundFailure(error: unknown): boolean {
 	const message =
 		typeof details === "object" && details !== null ? (details as { message?: unknown }).message : undefined;
 	return typeof message === "string" && /^Model .+ was not found\.$/.test(message);
+}
+
+/**
+ * Whether a preset model selection failure is non-transient and should terminate the turn.
+ * Recognizes typed codes like `invalid_preset`, `invalid_input`, and `internal` (from gjc 0.20.0).
+ * Keeps transient failures like `session_unavailable` and timeouts on the retry path.
+ */
+function isNonTransientPresetFailure(error: unknown): boolean {
+	const code = sdkStatusErrorCode(error);
+	if (!code) return false;
+	// Non-transient preset-related codes
+	if (code === "invalid_preset" || code === "invalid_input" || code === "internal") return true;
+	// Transient codes that should retry
+	if (code === "session_unavailable" || /timeout|deadline/.test(code)) return false;
+	return false;
 }
 
 /** Keeps raw platform identifiers in SQLite and derives a safe, fixed-length SDK client reference. */
