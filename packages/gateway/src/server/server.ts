@@ -3468,11 +3468,16 @@ async function createInboundTurnLifecycle(
 				conversationId: origin.parentId,
 			});
 
-			// For Telegram topics, we need to find the root message from the topic's context.
-			// Unlike Slack threads where the root is identifiable by the timestamp in the conversationId,
-			// Telegram topics are created with a message_thread_id but no inherent root message ID.
-			// For now, treat topics the same as threads by using conversationId as the message ID to lookup.
-			const rootMessageIdToLookup = origin.conversationId;
+			// Derive the root message ID from the origin's conversationId, handling platform differences:
+			// - Slack threads: conversationId is C:timestamp, root lookup should be timestamp
+			// - Telegram topics: conversationId is chatId.topicId, root lookup should be chatId:topicId
+			// - Gateway posts: conversationId is C:post/deliveryId, extracted part is post/deliveryId
+			let rootMessageIdToLookup = origin.conversationId;
+			if (origin.kind === "topic" && origin.platform === "telegram") {
+				// Transform Telegram topic ID from dot-separated to colon-separated format
+				// to match how inbound messages are stored (chatId:messageId)
+				rootMessageIdToLookup = origin.conversationId.replace(".", ":");
+			}
 
 			// Try to find the root message, handling both platform message IDs and gateway-authored posts
 			let rootRow = options.database.inbox.contextRowByMessage(parentKey, rootMessageIdToLookup);
@@ -5114,12 +5119,15 @@ function diagnostic(error: unknown): string {
  */
 /**
  * Escapes XML-like delimiters in untrusted content to prevent injection attacks.
- * Replaces `<untrusted-content>` and `</untrusted-content>` with escaped versions.
+ * Handles case-insensitive and whitespace-tolerant neutralization of:
+ * - <untrusted-content ...> and </untrusted-content ...>
+ * Replaces < and > with &lt; and &gt; to prevent envelope injection.
  */
 function escapeUntrustedContentDelimiters(text: string): string {
+	// Match case-insensitively and allow optional whitespace/attributes
 	return text
-		.replaceAll("<untrusted-content>", "&lt;untrusted-content&gt;")
-		.replaceAll("</untrusted-content>", "&lt;/untrusted-content&gt;");
+		.replace(/<\s*untrusted-content(?:\s|>)/gi, "&lt;untrusted-content&gt;")
+		.replace(/<\s*\/\s*untrusted-content\s*>/gi, "&lt;/untrusted-content&gt;");
 }
 
 function clipByCodePoints(text: string, limit: number): string {

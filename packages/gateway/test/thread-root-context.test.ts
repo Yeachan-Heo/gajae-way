@@ -207,7 +207,7 @@ test("Telegram topic root older than 24h history is included on first turn", asy
 	// Telegram topic - root is older than 24h history window but within 7-day context retention
 	const chatId = "-100123";
 	const topicId = "42";
-	const rootMessageId = `${chatId}.${topicId}`; // For Telegram topics, use the topic ID as root message ID
+	const rootMessageId = `${chatId}:${topicId}`; // For Telegram topics, derive root ID from message_thread_id in inbound messageId format
 	const parentOrigin = { platform: "telegram" as const, kind: "channel" as const, conversationId: chatId };
 	const topicOrigin = {
 		platform: "telegram" as const,
