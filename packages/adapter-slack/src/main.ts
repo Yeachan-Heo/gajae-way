@@ -447,12 +447,13 @@ export async function settleSlackDelivery(
 				// A fold changes what the live message says.
 				if (outcome.kind === "folded")
 					posted?.remember(message.origin, outcome.message.channel, outcome.message.ts, outcome.message.text, threadTs);
+				const platformId =
+					outcome.kind === "posted" || outcome.kind === "folded"
+						? slackMessageId(outcome.message.channel, outcome.message.ts)
+						: undefined;
 				await gateway.request("delivery.confirm", {
 					deliveryId,
-					platformMessageId: slackMessageId(
-						outcome.kind === "folded" ? outcome.message.channel : channel,
-						outcome.kind === "folded" ? outcome.message.ts : outcome.ts,
-					),
+					...(platformId ? { platformMessageId: platformId } : {}),
 				});
 				return;
 			}
