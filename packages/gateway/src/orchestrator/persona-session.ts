@@ -160,7 +160,7 @@ function localPreflightModelKey(opRef: string): string {
 
 function localPreflightRejection(store: Store, opRef: string): string | undefined {
 	const code = store.core.metaGet(localPreflightRejectionKey(opRef));
-	return code === PROMPT_TOO_LARGE_CODE || code === MODEL_NOT_FOUND_REJECTION_CODE ? code : undefined;
+	return code === PROMPT_TOO_LARGE_CODE || code === MODEL_NOT_FOUND_REJECTION_CODE || code === PRESET_FAILURE_REJECTION_CODE ? code : undefined;
 }
 
 function localPreflightPresetFailureKey(originKey: string, triggerMessageId: string, preset: string): string {
@@ -3336,6 +3336,17 @@ class OriginActor {
 					relay: tail,
 				});
 				applyingModel = false;
+				// Clear preset failure tracking when model set succeeds
+				if (
+					typeof lifecycle.effectiveModel === "object" &&
+					lifecycle.effectiveModel !== null &&
+					"preset" in lifecycle.effectiveModel
+				) {
+					const preset = lifecycle.effectiveModel.preset;
+					this.#manager.database.core.metaDelete(
+						localPreflightPresetFailureKey(this.originKey, trigger.message_id, preset),
+					);
+				}
 			} else {
 				modelReceipt = undefined;
 			}
@@ -3395,6 +3406,10 @@ class OriginActor {
 					this.#manager.database.transaction(() => {
 						this.#manager.database.core.metaSet(localPreflightModelKey(opRef), preset);
 						this.#manager.database.core.metaSet(localPreflightRejectionKey(opRef), PRESET_FAILURE_REJECTION_CODE);
+						// Clear preset failure tracking when turning terminal
+						this.#manager.database.core.metaDelete(
+							localPreflightPresetFailureKey(this.originKey, trigger.message_id, preset),
+						);
 					});
 					this.#preSendFailures = 0;
 					this.#manager.recordPreSendFailure(this.originKey, safeDiagnostic(error));

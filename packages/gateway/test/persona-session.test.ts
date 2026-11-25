@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PromptImage } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
+import type { GjcModelSelection } from "../src/config";
 import {
 	AGENT_RUN_GRACE_MS,
 	AGENT_RUN_MAX_MS,
@@ -129,7 +130,7 @@ async function harness(
 		failure?: (message: string, forceFailureNotice?: boolean) => void;
 		failureError?: (error: Error) => void;
 		modelRefusal?: (input: PersonaFailureInput) => void;
-		effectiveModel?: string;
+		effectiveModel?: GjcModelSelection;
 		imagesFor?: (triggerMessageId: string) => readonly PromptImage[] | undefined;
 		onFrame?: (frame: TailFrame) => boolean | void;
 		contextMessageIds?: readonly string[];
@@ -7198,7 +7199,7 @@ test("preset transient model.set failures still retry instead of terminating imm
 	await harness(
 		port,
 		{
-			effectiveModel: preset as unknown as string,
+			effectiveModel: preset,
 			failureError: (error) => notices.push(formatFailureNotice(error)),
 		},
 		undefined,
@@ -7261,11 +7262,15 @@ for (const errorCode of ["invalid_preset", "internal"] as const) {
 		const port = new PresetFailurePort();
 		const notices: string[] = [];
 		const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
+		let failureCalled = false;
 		await harness(
 			port,
 			{
-				effectiveModel: preset as any,
-				failureError: (error) => notices.push(formatFailureNotice(error)),
+				effectiveModel: preset,
+				failureError: (error) => {
+					failureCalled = true;
+					notices.push(formatFailureNotice(error));
+				},
 			},
 			undefined,
 			{
@@ -7280,6 +7285,7 @@ for (const errorCode of ["invalid_preset", "internal"] as const) {
 
 		enqueue(`preset-${errorCode}`, `use preset with ${errorCode}`);
 		await manager!.notifyInbound(KEY);
+		const opRef = latestOpRef;
 
 		// Trigger retries by running timers
 		for (let i = 0; i < 2 && timers.length > 0; i++) {
@@ -7292,5 +7298,11 @@ for (const errorCode of ["invalid_preset", "internal"] as const) {
 		expect(port.modelAttempts).toBe(3);
 		// Verify no additional timers are scheduled (turn is settled, no more retries)
 		expect(timers).toHaveLength(0);
+		// Verify failure callback was called
+		expect(failureCalled).toBe(true);
+		// Verify exactly 1 notice
+		expect(notices).toHaveLength(1);
+		// Verify notice contains the preset name
+		expect(notices[0]).toContain(`preset-${errorCode}`);
 	});
 }
