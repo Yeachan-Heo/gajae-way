@@ -44,7 +44,7 @@ An axis is not a name in a list. It is a **descriptor** that tells every other p
 | `root` | canonical root relative to the memory root; roots may not overlap |
 | `nesting` | `flat` (entries directly under the root) or `nested` (subdirectories at any depth) |
 | `partitions` | named subdirectories that partition a nested axis |
-| `index` | `recent` (map the last 20 entries in path order, which is newest first only for dated names) or `tree` (map the whole hierarchy, grouped). Either way the map states how many entries it left out |
+| `index` | `recent` (map the last 20 entries in path order, which is newest first only for dated names) or `tree` (map the whole hierarchy, grouped). Either way the map states how many entries it left out and, when the axis has an index file, points at it once |
 | `layout` | `dated` (`[YYYY-MM/]YYYY-MM-DD.md` only) or `free` (any `.md` name) |
 | `retrievalPriority` | higher wins when two documents score equally during recall |
 | `orphanPolicy` | `partitioned` (a file must sit in a declared partition) or `any-depth` |
@@ -101,6 +101,8 @@ The registry **fails closed**. Startup refuses to run, rather than quietly dropp
 **`reflections` is dated and append-only.** Entries are `reflections/YYYY-MM-DD.md`, optionally sharded into `reflections/YYYY-MM/`, with several entries per day allowed inside a file. Per-subject files (`reflections/tone.md`) are rejected with `axis_layout_violation`; a subject view may exist only as a generated projection, never as a second authority. One layout, not both: a writer holding a subject file edits it in place, and the correction history that makes a reflection useful is exactly what gets overwritten. A reflection promotes onward — an operating invariant to `ops/rules`, a cross-incident learning to `ops/distillations`, a project-scoped or person/channel correction to that axis.
 
 Adding an axis to an existing corpus is additive only. Startup creates the missing directories and regenerates the generated map; it never reads, moves, rewrites or deletes a file a human wrote, so a seven-axis corpus and an `ops/` tree written by hand before the axis existed both survive byte-identically.
+
+`MEMORY.md` records the index policy that produced it in a short HTML comment: a digest of every registered axis id and its `index` mode. `initializeMemory` runs at startup, during every audit and on every search call. It compares that marker with the resolved registry and regenerates the map when the marker is missing or different. This is what repairs a corpus after an axis moves between `recent` and `tree` indexing, because the old map can carry every axis heading while still holding only the capped recent pointers. A current map is read and compared, never rewritten, so a second initialization is a no-op. The first bootstrap of a session awaits the same initializer before it reads the map, so the turn that arrives right after an upgrade already sees the restored pointers. The marker is an HTML comment, so link, heading and retrieval parsers ignore it.
 
 Each completed chat turn and each authored monitor event is captured in the current UTC daily file. A capture records timestamp, origin, speaker (`author @ #channel | server`), user/event text, and reply text; each text field is bounded to 500 characters. This gives the canonicalization routine raw daily material to sort into the canonical axes.
 

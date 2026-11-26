@@ -36,7 +36,7 @@ export interface AxisDescriptor {
 	readonly nesting: AxisNesting;
 	/** Named subdirectories that partition a nested axis (`ops` -> rules/distillations/handoffs). */
 	readonly partitions: readonly string[];
-	/** `recent` maps the newest entries; `tree` maps the whole hierarchy grouped by partition. */
+	/** `recent` maps the last entries in reverse path order (newest first only for dated names); `tree` maps the whole hierarchy grouped by partition. */
 	readonly index: AxisIndex;
 	/** `dated` restricts entries to `[YYYY-MM/]YYYY-MM-DD.md`; `free` accepts any `.md` name. */
 	readonly layout: AxisLayout;

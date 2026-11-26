@@ -1,9 +1,11 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
+import { initializeMemory } from "../src/memory/doctrine";
+import { BUILT_IN_AXES } from "../src/memory/registry";
 import type { SessionPort } from "../src/orchestrator/session-port";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
@@ -396,6 +398,85 @@ test("epoch bootstrap commits on first terminal success and is not repeated afte
 	send(client, "bootstrap-after-restart", "after restart");
 	await waitUntil(() => preambles.length === 3);
 	expect(preambles[2]).not.toContain("## Session bootstrap");
+	client.close();
+});
+
+test("index policy upgrade restores the omitted project before the first turn's bootstrap reads the map", async () => {
+	const gatewayConfig = await config();
+	const database = await Store.open(gatewayConfig.dbPath);
+	const root = join(gatewayConfig.home, "memory");
+	const preambles: string[] = [];
+	const dailyAtBootstrap: string[][] = [];
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, _text, preamble) => {
+			preambles.push(preamble ?? "");
+			// The map the bootstrap read was refreshed by initialization, not by a
+			// capture that ran earlier in the turn.
+			dailyAtBootstrap.push(await readdir(join(root, "daily")));
+			return "ok";
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	// Let startup's own initialization settle, then leave the corpus as a
+	// pre-upgrade gateway did: `projects` was indexed `recent`, so its map lists 20
+	// pointers and the alphabetically first project is missing. Written after that
+	// settle, so only the turn path can repair the map before the bootstrap reads it.
+	await initializeMemory(gatewayConfig.home);
+	for (const axis of BUILT_IN_AXES) {
+		await mkdir(join(root, axis.root), { recursive: true });
+		for (const partition of axis.partitions) await mkdir(join(root, axis.root, partition), { recursive: true });
+	}
+	const project = (index: number) => `projects/p-${String(index).padStart(2, "0")}.md`;
+	await writeFile(
+		join(root, "projects/aie-zeitgeist.md"),
+		"---\norigin-key: discord/channel/context-turn\nbootstrap-safe: public\n---\n# Aie zeitgeist\n",
+	);
+	// Same origin but not public: restored into the map, still withheld from a group
+	// bootstrap by the existing visibility filter.
+	await writeFile(
+		join(root, "projects/private-notes.md"),
+		"---\norigin-key: discord/channel/context-turn\n---\n# Private notes\n",
+	);
+	for (let index = 0; index < 20; index++) await writeFile(join(root, project(index)), `# project ${index}\n`);
+	const headings = BUILT_IN_AXES.map((axis) => `## ${axis.id}`).join("\n\n");
+	const listed = Array.from({ length: 20 }, (_, index) => `- [${project(index)}](${project(index)})`).join("\n");
+	await writeFile(join(root, "MEMORY.md"), `# Memory map\n\n${headings}\n\n${listed}\n`);
+
+	send(client, "policy-upgrade-turn", "first request after the upgrade");
+	await waitUntil(() => preambles.length === 1);
+
+	expect(preambles[0]).toContain("## Session bootstrap");
+	expect(preambles[0]).toContain("projects/aie-zeitgeist.md");
+	expect(preambles[0]).not.toContain("projects/private-notes.md");
+	expect(dailyAtBootstrap[0]?.filter((name) => name.endsWith(".md"))).toEqual([]);
+	client.close();
+});
+
+test("a failed memory refresh before bootstrap still runs the turn", async () => {
+	const gatewayConfig = await config();
+	const database = await Store.open(gatewayConfig.dbPath);
+	const preambles: string[] = [];
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, _text, preamble) => {
+			preambles.push(preamble ?? "");
+			return "ok";
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	const root = join(gatewayConfig.home, "memory");
+	// Let startup's initialization settle, then make regeneration impossible: the
+	// atomic rename cannot replace a directory, so the pre-bootstrap refresh rejects.
+	await initializeMemory(gatewayConfig.home);
+	await rm(join(root, "MEMORY.md"), { force: true });
+	await mkdir(join(root, "MEMORY.md"), { recursive: true });
+
+	send(client, "refresh-failure", "first request after a broken map");
+	// The bootstrap already degrades an unreadable map to diagnostics, so a failed
+	// refresh must be logged and skipped rather than dropping the turn.
+	await waitUntil(() => preambles.length === 1);
+	expect(preambles[0]).toContain("## Session bootstrap");
 	client.close();
 });
 
