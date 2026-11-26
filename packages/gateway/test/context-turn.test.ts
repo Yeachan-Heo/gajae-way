@@ -1,12 +1,13 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import { initializeMemory } from "../src/memory/doctrine";
 import { BUILT_IN_AXES } from "../src/memory/registry";
 import type { SessionPort } from "../src/orchestrator/session-port";
+import { buildSessionBootstrap } from "../src/persona/bootstrap";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromScript } from "./session-port.fake";
@@ -401,6 +402,61 @@ test("epoch bootstrap commits on first terminal success and is not repeated afte
 	client.close();
 });
 
+const PROJECT = (index: number) => `projects/p-${String(index).padStart(2, "0")}.md`;
+
+/**
+ * Leave the corpus the way a pre-upgrade gateway wrote it, after initialization
+ * has already run: every axis heading is present but the map carries no
+ * index-policy marker and `projects` holds only the 20 most recent pointers, so
+ * the alphabetically first public project is missing from it.
+ */
+async function staleUpgradeMap(gatewayConfig: GatewayConfig): Promise<string> {
+	const root = join(gatewayConfig.home, "memory");
+	await initializeMemory(gatewayConfig.home);
+	for (const axis of BUILT_IN_AXES) {
+		await mkdir(join(root, axis.root), { recursive: true });
+		for (const partition of axis.partitions) await mkdir(join(root, axis.root, partition), { recursive: true });
+	}
+	await writeFile(
+		join(root, "projects/aie-zeitgeist.md"),
+		"---\norigin-key: discord/channel/context-turn\nbootstrap-safe: public\n---\n# Aie zeitgeist\n",
+	);
+	// Same origin but not public: restored into the map, still withheld from a group
+	// bootstrap by the existing visibility filter.
+	await writeFile(
+		join(root, "projects/private-notes.md"),
+		"---\norigin-key: discord/channel/context-turn\n---\n# Private notes\n",
+	);
+	for (let index = 0; index < 20; index++) await writeFile(join(root, PROJECT(index)), `# project ${index}\n`);
+	const headings = BUILT_IN_AXES.map((axis) => `## ${axis.id}`).join("\n\n");
+	const listed = Array.from({ length: 20 }, (_, index) => `- [${PROJECT(index)}](${PROJECT(index)})`).join("\n");
+	return `# Memory map\n\n${headings}\n\n${listed}\n`;
+}
+
+/**
+ * Replace the canonical map through a second home whose memory root is a symlink
+ * to the same corpus, which is how a competing writer reaches it after the turn's
+ * own refresh has already run.
+ */
+async function replaceMapFromCompetingHome(gatewayConfig: GatewayConfig, map: string): Promise<void> {
+	const secondHome = join(gatewayConfig.home, "second-home");
+	await mkdir(secondHome, { recursive: true });
+	await symlink(join(gatewayConfig.home, "memory"), join(secondHome, "memory"));
+	await writeFile(join(secondHome, "memory", "MEMORY.md"), map);
+}
+
+/** Bootstrap the first home directly, with no server-side refresh in front of it. */
+function directBuild(gatewayConfig: GatewayConfig) {
+	return buildSessionBootstrap({
+		home: gatewayConfig.home,
+		origin: ORIGIN,
+		epoch: 0,
+		config: gatewayConfig,
+		engagement: { mentioned: true, authorId: "owner", authorName: "bellman" },
+		now: new Date("2026-08-28T12:00:00.000Z"),
+	});
+}
+
 test("index policy upgrade restores the omitted project before the first turn's bootstrap reads the map", async () => {
 	const gatewayConfig = await config();
 	const database = await Store.open(gatewayConfig.dbPath);
@@ -419,29 +475,10 @@ test("index policy upgrade restores the omitted project before the first turn's 
 	});
 	const { client } = await start(gatewayConfig, database, sessionPort);
 	// Let startup's own initialization settle, then leave the corpus as a
-	// pre-upgrade gateway did: `projects` was indexed `recent`, so its map lists 20
-	// pointers and the alphabetically first project is missing. Written after that
-	// settle, so only the turn path can repair the map before the bootstrap reads it.
-	await initializeMemory(gatewayConfig.home);
-	for (const axis of BUILT_IN_AXES) {
-		await mkdir(join(root, axis.root), { recursive: true });
-		for (const partition of axis.partitions) await mkdir(join(root, axis.root, partition), { recursive: true });
-	}
-	const project = (index: number) => `projects/p-${String(index).padStart(2, "0")}.md`;
-	await writeFile(
-		join(root, "projects/aie-zeitgeist.md"),
-		"---\norigin-key: discord/channel/context-turn\nbootstrap-safe: public\n---\n# Aie zeitgeist\n",
-	);
-	// Same origin but not public: restored into the map, still withheld from a group
-	// bootstrap by the existing visibility filter.
-	await writeFile(
-		join(root, "projects/private-notes.md"),
-		"---\norigin-key: discord/channel/context-turn\n---\n# Private notes\n",
-	);
-	for (let index = 0; index < 20; index++) await writeFile(join(root, project(index)), `# project ${index}\n`);
-	const headings = BUILT_IN_AXES.map((axis) => `## ${axis.id}`).join("\n\n");
-	const listed = Array.from({ length: 20 }, (_, index) => `- [${project(index)}](${project(index)})`).join("\n");
-	await writeFile(join(root, "MEMORY.md"), `# Memory map\n\n${headings}\n\n${listed}\n`);
+	// pre-upgrade gateway did. Written after that settle, so only the turn path can
+	// repair the map before the bootstrap reads it.
+	const stale = await staleUpgradeMap(gatewayConfig);
+	await writeFile(join(root, "MEMORY.md"), stale);
 
 	send(client, "policy-upgrade-turn", "first request after the upgrade");
 	await waitUntil(() => preambles.length === 1);
@@ -451,6 +488,36 @@ test("index policy upgrade restores the omitted project before the first turn's 
 	expect(preambles[0]).not.toContain("projects/private-notes.md");
 	expect(dailyAtBootstrap[0]?.filter((name) => name.endsWith(".md"))).toEqual([]);
 	client.close();
+});
+
+test("bootstrap repairs a map a competing writer replaced after the refresh has run", async () => {
+	const gatewayConfig = await config();
+	const stale = await staleUpgradeMap(gatewayConfig);
+	await replaceMapFromCompetingHome(gatewayConfig, stale);
+
+	const bootstrap = await directBuild(gatewayConfig);
+
+	expect(bootstrap.diagnostics).not.toContain("MEMORY.md: stale_index_policy");
+	expect(bootstrap.text).toContain("projects/aie-zeitgeist.md");
+	expect(bootstrap.text).not.toContain("projects/private-notes.md");
+});
+
+test("bootstrap omits a stale map when its one repair attempt fails", async () => {
+	const gatewayConfig = await config();
+	const stale = await staleUpgradeMap(gatewayConfig);
+	await replaceMapFromCompetingHome(gatewayConfig, stale);
+	// Deterministic repair failure, no permission tricks: a built-in axis root
+	// cannot be created while a regular file occupies that path.
+	const root = join(gatewayConfig.home, "memory");
+	await rm(join(root, "events"), { recursive: true, force: true });
+	await writeFile(join(root, "events"), "not a directory");
+
+	const bootstrap = await directBuild(gatewayConfig);
+
+	expect(bootstrap.diagnostics).toContain("MEMORY.md: stale_index_policy");
+	expect(bootstrap.text).not.toContain("### Memory navigation map");
+	expect(bootstrap.text).not.toContain("### Associated project/task/handoff pointers");
+	expect(bootstrap.text).not.toContain("projects/aie-zeitgeist.md");
 });
 
 test("a failed memory refresh before bootstrap still runs the turn", async () => {
