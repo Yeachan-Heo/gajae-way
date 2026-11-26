@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initializeMemory, memoryRoot, regenerateMap } from "../src/memory/doctrine";
@@ -74,4 +74,62 @@ test("validator reports map_content_drift", async () => {
 test("validator accepts clean generated tree", async () => {
 	const memory = await root();
 	expect(await validateMemory(memory)).toEqual([]);
+});
+
+// A tree-indexed custom axis whose only index sits behind 173 characters of
+// nesting. The old plain-text notice (`6 entries omitted; see <path>`) measured
+// 213 characters once the audit replaced links with their text, so a map this
+// code generated failed its own audit; the link form measures the 188-character
+// path once and the notice text alone stays short.
+async function longIndexCorpus(leaf: string): Promise<{ readonly memory: string; readonly index: string }> {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-validator-long-index-"));
+	const memory = memoryRoot(home);
+	const directory = [leaf.repeat(57), leaf.repeat(57), leaf.repeat(57)].join("/");
+	const index = `notes/${directory}/index.md`;
+	await mkdir(join(memory, "notes", directory), { recursive: true, mode: 0o700 });
+	await writeFile(
+		join(memory, "axes.json"),
+		`${JSON.stringify({ version: 1, axes: [{ id: "notes", root: "notes", index: "tree" }] }, null, "\t")}\n`,
+	);
+	// 205 entries plus the index exceed the 200-entry tree cap, so the map states
+	// an omission in both sort orders.
+	await Promise.all(
+		Array.from({ length: 205 }, (_, position) =>
+			writeFile(join(memory, `notes/entry-${String(position).padStart(3, "0")}.md`), `# entry ${position}\n`),
+		),
+	);
+	await writeFile(join(memory, index), "# Note index\n");
+	await initializeMemory(home);
+	await regenerateMap(memory);
+	return { memory, index };
+}
+
+const STRIPPED_AS_AUDIT = /\[([^\]]*)\]\([^)]*\)/g;
+
+async function longNotice(memory: string): Promise<{ readonly section: string; readonly notice: string }> {
+	const map = await readFile(join(memory, "MEMORY.md"), "utf8");
+	const section = map.slice(map.indexOf("## notes"));
+	const notice = section.split("\n").find((line) => line.includes("omitted"));
+	expect(notice).toBeDefined();
+	return { section, notice: notice! };
+}
+
+test("a long index omission notice stays short when the index sorts after the rendered prefix", async () => {
+	const { memory, index } = await longIndexCorpus("z");
+	const { section, notice } = await longNotice(memory);
+	expect(notice.replaceAll(STRIPPED_AS_AUDIT, "$1").length).toBeLessThanOrEqual(200);
+	expect(notice).toMatch(/^_\d+ entries omitted; see \[the index\]\(notes\/z+\/z+\/z+\/index\.md\)_$/);
+	// The notice link is the only pointer; the index bullet is not appended again.
+	expect(section.split(`](${index})`)).toHaveLength(2);
+	expect((await validateMemory(memory)).filter((found) => found.code === "long_form_map")).toEqual([]);
+});
+
+test("a long index omission notice links once when the index sorts inside the rendered prefix", async () => {
+	const { memory, index } = await longIndexCorpus("a");
+	const { section, notice } = await longNotice(memory);
+	expect(notice).toMatch(/^_\d+ entries omitted; see the index above_$/);
+	// The rendered bullet above is the only pointer, and the notice carries none.
+	expect(notice).not.toContain("](");
+	expect(section.split(`](${index})`)).toHaveLength(2);
+	expect((await validateMemory(memory)).filter((found) => found.code === "long_form_map")).toEqual([]);
 });

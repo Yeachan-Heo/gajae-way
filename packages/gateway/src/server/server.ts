@@ -3556,6 +3556,18 @@ async function createInboundTurnLifecycle(
 		turnText += `\n\n[Current message: ${promptImages.length} native image(s) attached, resized/JPEG-compressed for model input; fine detail may be lost. Images mentioned only in earlier messages are not attached.]`;
 	}
 
+	// The bootstrap reads MEMORY.md as-is, and startup fires memory initialization
+	// without awaiting it. An index-policy upgrade (an axis moving from `recent` to
+	// `tree`) is repaired by that initialization, so a first turn that raced it would
+	// see the old capped pointers. Awaiting the (per-root serialized) initializer
+	// here makes the refresh finish before the map is read; an up-to-date map is a
+	// read-and-compare, so the common path rewrites nothing.
+	// A failed refresh must not fail the turn; the bootstrap already degrades to
+	// diagnostics when the map is unreadable.
+	if (bootstrapPending)
+		await initializeMemory(runtime.config.home).catch((error: unknown) =>
+			console.error(`memory refresh before bootstrap failed: ${diagnostic(error)}`),
+		);
 	const bootstrap = bootstrapPending
 		? await buildSessionBootstrap({
 				home: runtime.config.home,
