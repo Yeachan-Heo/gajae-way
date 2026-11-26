@@ -428,9 +428,6 @@ async function initializeCorpus(root: string): Promise<string> {
 /** Per-root serialization for `initializeMemory`. */
 const initializations = new Map<string, Promise<unknown>>();
 
-/** Homes that have completed initialization in this process, so subsequent calls are skipped. */
-const completedInitializations = new Set<string>();
-
 /**
  * Bring the corpus for `home` up to the current axis set. Concurrent callers are
  * serialized per root and each observes the same coherent result. A failure is
@@ -438,24 +435,12 @@ const completedInitializations = new Set<string>();
  */
 export function initializeMemory(home: string): Promise<string> {
 	const root = memoryRoot(home);
-	// Once a home is initialized in this process, skip subsequent refreshes.
-	// The first bootstrap after startup or a policy change will still trigger
-	// the initialization, so stale maps are rebuilt before the first read.
-	if (completedInitializations.has(root)) return Promise.resolve(root);
-
 	const previous = initializations.get(root) ?? Promise.resolve();
-	const next = previous.then(() => initializeCorpus(root)).catch(() => initializeCorpus(root));
-	const settled = next
-		.then((result) => {
-			completedInitializations.add(root);
-			return result;
-		})
-		.catch((error) => {
-			// A failure is not contagious: the next call runs regardless.
-			// But we still mark it as attempted, so we don't retry indefinitely.
-			completedInitializations.add(root);
-			throw error;
-		});
+	const next = previous.then(
+		() => initializeCorpus(root),
+		() => initializeCorpus(root),
+	);
+	const settled = next.catch(() => {});
 	initializations.set(root, settled);
 	void settled.then(() => {
 		if (initializations.get(root) === settled) initializations.delete(root);
