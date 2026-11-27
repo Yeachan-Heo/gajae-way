@@ -2076,8 +2076,10 @@ export class MonitorPropagator {
 	 * on this session, when that turn is still running or finished successfully.
 	 * A resolved failure is forgotten so the retry sends a fresh prompt. An unknown
 	 * or unreadable prior turn is held without resending, and so is an unaccounted
-	 * terminal transition (missing/unknown receipt): that identity may still produce
-	 * a late completed receipt (#827).
+	 * terminal transition (missing/unknown receipt) without exact no-send evidence:
+	 * that identity may still produce a late completed receipt (#827). An exact
+	 * authority-scoped busy refusal or operation-correlated durable no-send failure
+	 * proves the prompt was never admitted and releases the pointer for one send.
 	 */
 	async #reusableAuthoringTurn(eventIds: readonly string[], sessionId: string): Promise<string | undefined> {
 		const raw = this.#database.core.metaGet(authoringTurnKey(eventIds[0] ?? ""));
@@ -2130,8 +2132,23 @@ export class MonitorPropagator {
 			if (state === "failed") {
 				// A raw `failed` report whose receipt is missing/unknown is not proof the
 				// turn failed. Hold the saved operation instead of resending a prompt that
-				// may duplicate work the unaccounted turn already did (#827).
-				if (isUnaccountedTerminal(report.status)) throw new AuthoringResultUnavailableError("output_pending");
+				// may duplicate work the unaccounted turn already did (#827) — unless an
+				// exact authority-scoped busy refusal, or a durable no-send failure on
+				// every member event of this exact session/op, proves it was never admitted.
+				if (isUnaccountedTerminal(report.status)) {
+					const authority = this.#database.bindings.brokerAuthority();
+					const neverAdmitted =
+						authority !== null &&
+						(this.#promptBusyRefused(prior) ||
+							prior.eventIds.every((eventId) =>
+								isDurableNoSendFailureForOperation(
+									this.#database.monitors.failure(eventId),
+									prior.sessionId,
+									prior.opRef,
+								),
+							));
+					if (!neverAdmitted) throw new AuthoringResultUnavailableError("output_pending");
+				}
 				forget();
 				return undefined;
 			}

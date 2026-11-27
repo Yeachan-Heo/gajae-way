@@ -2550,13 +2550,23 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 		priorReceiptState?: "missing" | "unknown";
 		priorErrorCode?: string;
 		durableBusyRefusal?: boolean;
+		foreignBusyRefusal?: boolean;
+		noSendFailure?: {
+			code: "session_busy" | "session_submission_wedged" | "session_host_unavailable";
+			opRef?: string;
+			sessionId?: string;
+			eventIndex?: number;
+		};
+		batchSize?: number;
+		withoutAuthority?: boolean;
 	}) {
 		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-742-prior-pointer-"));
 		database = await Store.open(join(home, "gateway.db"));
 		const db = database;
 		const priorSessionId = options.priorSessionId ?? "s1";
 		const currentSessionId = options.currentSessionId ?? priorSessionId;
-		const eventId = crypto.randomUUID();
+		const eventIds = Array.from({ length: options.batchSize ?? 1 }, () => crypto.randomUUID());
+		const eventId = eventIds[0] as string;
 		const priorOpRef = crypto.randomUUID();
 		let prompts = 0;
 		let pointerAtPrompt: string | undefined;
@@ -2565,7 +2575,7 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 			pointerAtPrompt = db.core.metaGet(`monitor_authoring_turn:${eventId}`);
 			return JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "fresh" })));
 		}, currentSessionId);
-		attachTestBrokerOwnership(db, sessionPort, join(home, "agent"));
+		if (!options.withoutAuthority) attachTestBrokerOwnership(db, sessionPort, join(home, "agent"));
 
 		const monitor = new MonitorRegistry(db).add({
 			name: "test-monitor",
@@ -2573,26 +2583,31 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 			eventTypes: ["test.event"],
 		});
 		db.transaction((tx) => {
-			db.monitors.eventCreate(tx, {
-				eventId,
-				monitorId: monitor.monitorId,
-				eventType: "test.event",
-				payloadJson: JSON.stringify({}),
-				firedAt: new Date().toISOString(),
-			});
-			db.monitors.eventUpdate(tx, eventId, "admitted");
-			db.core.metaSet(
-				`monitor_authoring_turn:${eventId}`,
-				JSON.stringify({ sessionId: priorSessionId, opRef: priorOpRef, eventIds: [eventId] }),
-			);
+			const pointer = JSON.stringify({ sessionId: priorSessionId, opRef: priorOpRef, eventIds });
+			for (const id of eventIds) {
+				db.monitors.eventCreate(tx, {
+					eventId: id,
+					monitorId: monitor.monitorId,
+					eventType: "test.event",
+					payloadJson: JSON.stringify({}),
+					firedAt: new Date().toISOString(),
+				});
+				db.monitors.eventUpdate(tx, id, "admitted");
+				db.core.metaSet(`monitor_authoring_turn:${id}`, pointer);
+			}
 		});
 
 		const authority = db.bindings.brokerAuthority();
-		if (!authority) throw new Error("test broker authority was not initialized");
+		if (!authority && !options.withoutAuthority) throw new Error("test broker authority was not initialized");
 		if (options.durableBusyRefusal) {
+			if (!authority) throw new Error("test durable busy refusal requires a broker authority");
 			const scope = JSON.stringify([priorSessionId, priorOpRef]);
+			const owner = options.foreignBusyRefusal
+				? { canonicalAgentDir: join(home, "foreign-agent"), identity: `gjc:${join(home, "foreign-agent")}` }
+				: authority;
+			if (options.foreignBusyRefusal) db.transaction((tx) => db.bindings.setAuthority(tx, owner));
 			db.transaction((tx) => {
-				db.bindings.beginBrokerOperation(tx, authority, {
+				db.bindings.beginBrokerOperation(tx, owner, {
 					operation: "turn.prompt",
 					scope,
 					operationRef: priorOpRef,
@@ -2600,15 +2615,33 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 				});
 				db.bindings.completeBrokerOperation(
 					tx,
-					authority,
+					owner,
 					"turn.prompt",
 					scope,
 					priorOpRef,
 					JSON.stringify({ ok: false, error: { code: "busy" } }),
 				);
 			});
-			expect(db.bindings.brokerOperation(authority, "turn.prompt", scope)?.resultJson).toBe(
+			if (options.foreignBusyRefusal) db.transaction((tx) => db.bindings.setAuthority(tx, authority));
+			expect(db.bindings.brokerOperation(owner, "turn.prompt", scope)?.resultJson).toBe(
 				JSON.stringify({ ok: false, error: { code: "busy" } }),
+			);
+			if (options.foreignBusyRefusal)
+				expect(db.bindings.brokerOperation(authority, "turn.prompt", scope)).toBeUndefined();
+		}
+		if (options.noSendFailure) {
+			const failure = options.noSendFailure;
+			db.transaction((tx) =>
+				db.monitors.failureRecord(
+					tx,
+					eventIds[failure.eventIndex ?? 0] as string,
+					failure.code,
+					"durable no-send refusal",
+					{
+						sessionId: failure.sessionId ?? priorSessionId,
+						opRef: failure.opRef ?? priorOpRef,
+					},
+				),
 			);
 		}
 
@@ -2643,6 +2676,7 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 		return {
 			db,
 			eventId,
+			eventIds,
 			priorOpRef,
 			priorSessionId,
 			statusCalls,
@@ -2834,6 +2868,128 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 			expect(result.db.monitors.failure(result.eventId)?.detail).toContain('"code":"output_pending"');
 		});
 	}
+
+	// #827: an unaccounted terminal report is not proof of failure. Exact evidence
+	// that the prompt was never admitted releases the pointer for one fresh send;
+	// anything less keeps it.
+	const unaccountedReceipts = [
+		{ label: "a missing receipt", receiptState: "missing" as const, errorCode: undefined },
+		{
+			label: "a prompt deadline kill without a receipt",
+			receiptState: "missing" as const,
+			errorCode: "prompt_deadline_exceeded",
+		},
+		{ label: "an unknown receipt", receiptState: "unknown" as const, errorCode: undefined },
+	] as const;
+	for (const receipt of unaccountedReceipts) {
+		for (const evidence of [
+			{ label: "an exact authority-scoped busy refusal", durableBusyRefusal: true as const },
+			{
+				label: "an exact session-busy durable no-send failure",
+				noSendFailure: { code: "session_busy" as const },
+			},
+			{
+				label: "an exact wedged-submission durable no-send failure",
+				noSendFailure: { code: "session_submission_wedged" as const },
+			},
+			{
+				label: "an exact host-unavailable durable no-send failure",
+				noSendFailure: { code: "session_host_unavailable" as const },
+			},
+		] as const) {
+			test(`same-session failed prior status with ${receipt.label} and ${evidence.label} sends exactly one fresh prompt`, async () => {
+				const result = await dispatchWithPriorPointer({
+					priorStatus: "failed",
+					priorReceiptState: receipt.receiptState,
+					...(receipt.errorCode ? { priorErrorCode: receipt.errorCode } : {}),
+					...evidence,
+				});
+				expectOldPointerStatus(result);
+				expect(result.prompts()).toBe(1);
+				expect(result.sessionPort.sendAttempts).toHaveLength(1);
+				const replacement = JSON.parse(result.pointerAtPrompt() ?? "null");
+				expect(replacement).toMatchObject({ sessionId: result.priorSessionId, eventIds: [result.eventId] });
+				expect(replacement.opRef).not.toBe(result.priorOpRef);
+				expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBeUndefined();
+			});
+		}
+	}
+
+	for (const mismatch of [
+		{ label: "a stale operation", noSendFailure: { code: "session_busy" as const, opRef: "stale-op" } },
+		{ label: "another session", noSendFailure: { code: "session_busy" as const, sessionId: "other-session" } },
+	] as const) {
+		test(`same-session failed prior status with a missing receipt and ${mismatch.label} no-send failure holds the pointer`, async () => {
+			const result = await dispatchWithPriorPointer({
+				priorStatus: "failed",
+				priorReceiptState: "missing",
+				noSendFailure: mismatch.noSendFailure,
+			});
+			expect(result.prompts()).toBe(0);
+			expect(result.sessionPort.sendAttempts).toHaveLength(0);
+			expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBe(
+				JSON.stringify({ sessionId: result.priorSessionId, opRef: result.priorOpRef, eventIds: [result.eventId] }),
+			);
+			expect(result.db.monitors.eventGet(result.eventId)?.stage).toBe("failed");
+			expect(result.db.monitors.failure(result.eventId)?.code).toBe("authoring_result_unreadable");
+			expect(result.db.monitors.failure(result.eventId)?.detail).toContain('"code":"output_pending"');
+		});
+	}
+
+	test("same-session failed prior status with a missing receipt and a foreign-authority busy refusal holds the pointer", async () => {
+		const result = await dispatchWithPriorPointer({
+			priorStatus: "failed",
+			priorReceiptState: "missing",
+			durableBusyRefusal: true,
+			foreignBusyRefusal: true,
+		});
+		expect(result.prompts()).toBe(0);
+		expect(result.sessionPort.sendAttempts).toHaveLength(0);
+		expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBe(
+			JSON.stringify({ sessionId: result.priorSessionId, opRef: result.priorOpRef, eventIds: [result.eventId] }),
+		);
+		expect(result.db.monitors.eventGet(result.eventId)?.stage).toBe("failed");
+		expect(result.db.monitors.failure(result.eventId)?.code).toBe("authoring_result_unreadable");
+		expect(result.db.monitors.failure(result.eventId)?.detail).toContain('"code":"output_pending"');
+	});
+
+	test("same-session failed prior status with a missing receipt and exact no-send evidence but no authority holds the pointer", async () => {
+		const result = await dispatchWithPriorPointer({
+			priorStatus: "failed",
+			priorReceiptState: "missing",
+			noSendFailure: { code: "session_busy" },
+			withoutAuthority: true,
+		});
+		expect(result.prompts()).toBe(0);
+		expect(result.sessionPort.sendAttempts).toHaveLength(0);
+		expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBe(
+			JSON.stringify({ sessionId: result.priorSessionId, opRef: result.priorOpRef, eventIds: [result.eventId] }),
+		);
+		expect(result.db.monitors.eventGet(result.eventId)?.stage).toBe("failed");
+		expect(result.db.monitors.failure(result.eventId)?.code).toBe("authoring_result_unreadable");
+		expect(result.db.monitors.failure(result.eventId)?.detail).toContain('"code":"output_pending"');
+	});
+
+	test("same-session failed prior status with durable no-send evidence on only one batch member holds every pointer", async () => {
+		const result = await dispatchWithPriorPointer({
+			priorStatus: "failed",
+			priorReceiptState: "missing",
+			batchSize: 2,
+			noSendFailure: { code: "session_busy", eventIndex: 0 },
+		});
+		expect(result.prompts()).toBe(0);
+		expect(result.sessionPort.sendAttempts).toHaveLength(0);
+		const pointer = JSON.stringify({
+			sessionId: result.priorSessionId,
+			opRef: result.priorOpRef,
+			eventIds: result.eventIds,
+		});
+		for (const eventId of result.eventIds) {
+			expect(result.db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBe(pointer);
+			expect(result.db.monitors.eventGet(eventId)?.stage).toBe("failed");
+			expect(result.db.monitors.failure(eventId)?.code).toBe("authoring_result_unreadable");
+		}
+	});
 
 	test("moved binding with accepted prior status holds the pointer without prompting", async () => {
 		const result = await dispatchWithPriorPointer({
