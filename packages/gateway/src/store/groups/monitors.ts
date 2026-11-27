@@ -824,19 +824,24 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 
 	/**
 	 * The next terminal event after `afterEventId` whose latest failure is `code`
-	 * and whose saved authoring-turn pointer is still kept. Ordered and limited by
+	 * and whose saved authoring-turn pointer is still kept. A coalesced batch stores
+	 * the same pointer on every member; only its smallest eligible event represents
+	 * that operation, even when the cursor has passed it. Ordered and limited by
 	 * `event_id` so the caller can advance a durable cursor one operation at a time;
 	 * `fired_at` ordering is not cursor-comparable when timestamps tie.
 	 */
 	eventsGivenUp(code: string, afterEventId: string): MonitorEventDbRow[] {
 		return this.#db
 			.prepare(
-				`SELECT * FROM monitor_events WHERE stage = 'failed_no_retry' AND ${REPLAYABLE_MONITOR} AND event_id > ?
+				`SELECT * FROM monitor_events WHERE event_id IN (
+				SELECT MIN(monitor_events.event_id) FROM monitor_events
+				JOIN meta m ON m.key = 'monitor_authoring_turn:' || monitor_events.event_id
+				WHERE stage = 'failed_no_retry' AND ${REPLAYABLE_MONITOR}
 				AND (SELECT f.code FROM monitor_failures f WHERE f.event_id = monitor_events.event_id ORDER BY f.rowid DESC LIMIT 1) = ?
-				AND EXISTS (SELECT 1 FROM meta m WHERE m.key = 'monitor_authoring_turn:' || monitor_events.event_id)
+				GROUP BY m.value) AND event_id > ?
 				ORDER BY event_id LIMIT 1`,
 			)
-			.all(afterEventId, code) as MonitorEventDbRow[];
+			.all(code, afterEventId) as MonitorEventDbRow[];
 	}
 
 	eventsOpen(): MonitorEventDbRow[] {
