@@ -238,10 +238,11 @@ export function checkSlackGuestPolicy(
 	const authorId = engagement?.authorId;
 	if (authorId === undefined || authorId === ownerPeerId(config)) return "allow";
 	const policy = config.slack?.guestPolicy;
-	if (policy?.allowUsers?.includes(authorId)) return "allow";
 	if (policy?.denyUsers?.includes(authorId)) return "drop";
+	if (policy?.allowUsers?.includes(authorId)) return "allow";
 	const trust = engagement?.trust;
-	const guest = trust === "guest" || (trust === "unverified" && policy?.failClosed !== false);
+	const isTrustMissing = trust === undefined && policy?.failClosed !== false;
+	const guest = trust === "guest" || (trust === "unverified" && policy?.failClosed !== false) || isTrustMissing;
 	if (!guest) return "allow";
 	return origin.kind === "dm" ? (policy?.dm ?? "drop") : (policy?.channel ?? "allow");
 }

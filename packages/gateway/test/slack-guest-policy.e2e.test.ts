@@ -86,7 +86,7 @@ const CHANNEL_ORIGIN = slackMessageOrigin({ channel: "C1", user: "U_GUEST", ts: 
 const DM_ORIGIN = slackMessageOrigin({ channel: "D1", channel_type: "im", user: "U_GUEST", ts: "1726543210.000100" });
 
 test("a guest in DM with dm=drop receives no response and no model call", async () => {
-	const { config, database, turns } = await gateway(() => "should not be called", {
+	const { config, turns } = await gateway(() => "should not be called", {
 		dmPolicy: "open",
 		slack: {
 			guestPolicy: {
@@ -112,7 +112,7 @@ test("a guest in DM with dm=drop receives no response and no model call", async 
 });
 
 test("a guest in channel with channel=drop receives no response and no model call", async () => {
-	const { config, database, turns } = await gateway(() => "should not be called", {
+	const { config, turns } = await gateway(() => "should not be called", {
 		channels: { "slack:C1": { engagement: "open" } },
 		slack: {
 			guestPolicy: {
@@ -138,7 +138,7 @@ test("a guest in channel with channel=drop receives no response and no model cal
 });
 
 test("a regular member in channel is unaffected by guest policy", async () => {
-	const { config, database, turns } = await gateway(() => "member response", {
+	const { config, turns } = await gateway(() => "member response", {
 		channels: { "slack:C1": { engagement: "open" } },
 		slack: {
 			guestPolicy: {
@@ -166,7 +166,7 @@ test("a regular member in channel is unaffected by guest policy", async () => {
 });
 
 test("a guest on allowUsers list bypasses guest policy restrictions", async () => {
-	const { config, database, turns } = await gateway(() => "allowed guest response", {
+	const { config, turns } = await gateway(() => "allowed guest response", {
 		channels: { "slack:C1": { engagement: "open" } },
 		slack: {
 			guestPolicy: {
@@ -195,7 +195,7 @@ test("a guest on allowUsers list bypasses guest policy restrictions", async () =
 });
 
 test("a guest on denyUsers list is always dropped", async () => {
-	const { config, database, turns } = await gateway(() => "should not be called", {
+	const { config, turns } = await gateway(() => "should not be called", {
 		channels: { "slack:C1": { engagement: "open" } },
 		slack: {
 			guestPolicy: {
@@ -267,4 +267,91 @@ test("a trust claim on a non-Slack origin is ignored", () => {
 	const guest = { mentioned: true, group: false, authorId: "123", trust: "guest" } as const;
 	expect(checkSlackGuestPolicy(guest, { platform: "discord", kind: "dm" }, config)).toBe("allow");
 	expect(checkSlackGuestPolicy(guest, { platform: "slack", kind: "dm" }, config)).toBe("drop");
+});
+
+test("missing trust field (omitted by older adapter) is treated as unverified and dropped by default", () => {
+	const config = {
+		slack: { guestPolicy: { dm: "drop", channel: "allow" } },
+	} as unknown as GatewayConfig;
+	// No trust field: should be treated as unverified and dropped in DM
+	const noTrust = { mentioned: true, group: false, authorId: "U_NO_TRUST" } as const;
+	expect(checkSlackGuestPolicy(noTrust, { platform: "slack", kind: "dm" }, config)).toBe("drop");
+	// Same author with explicit trust=member should be allowed
+	const withMember = { mentioned: true, group: false, authorId: "U_NO_TRUST", trust: "member" as const } as const;
+	expect(checkSlackGuestPolicy(withMember, { platform: "slack", kind: "dm" }, config)).toBe("allow");
+});
+
+test("missing trust field is allowed when failClosed is false", () => {
+	const config = {
+		slack: { guestPolicy: { dm: "drop", channel: "allow", failClosed: false } },
+	} as unknown as GatewayConfig;
+	const noTrust = { mentioned: true, group: false, authorId: "U_NO_TRUST" } as const;
+	// Missing trust with failClosed=false should allow in DM
+	expect(checkSlackGuestPolicy(noTrust, { platform: "slack", kind: "dm" }, config)).toBe("allow");
+});
+
+test("denyUsers takes precedence over allowUsers (deny list must override allow list)", () => {
+	const config = {
+		slack: { guestPolicy: { dm: "allow", channel: "allow", allowUsers: ["U_BOTH"], denyUsers: ["U_BOTH"] } },
+	} as unknown as GatewayConfig;
+	// User listed in both allow and deny should be dropped (deny takes precedence)
+	const overlap = { mentioned: true, group: true, authorId: "U_BOTH", trust: "guest" } as const;
+	expect(checkSlackGuestPolicy(overlap, { platform: "slack", kind: "channel" }, config)).toBe("drop");
+});
+
+test("trust propagates on the live inbound path and policy applies correctly", async () => {
+	const { config, turns } = await gateway(() => "member response", {
+		channels: { "slack:C1": { engagement: "open" } },
+		slack: {
+			guestPolicy: {
+				dm: "drop",
+				channel: "allow",
+			},
+		},
+	});
+	const slack = fakeSlackApi();
+	const adapter = liveGateway(config.socketPath, slack.api);
+	await adapter.connect();
+	const memberOrigin = slackMessageOrigin({ channel: "C1", user: "U_MEMBER", ts: "1726543210.000500" });
+	// Live inbound without explicit trust (older adapter) should compute it and allow members
+	const result = await adapter.requestInbound(
+		slackMessageId("C1", "1726543210.000500"),
+		memberOrigin,
+		"hello member",
+		{ mentioned: true, group: true, authorId: "U_MEMBER" }, // No trust field
+		"2026-09-17T00:00:10.000Z",
+	);
+	expect(result?.engaged).toBe(true);
+	await Bun.sleep(100);
+	expect(turns).toHaveLength(1);
+});
+
+test("trust propagates on the recovery path and guest policy drops correctly", async () => {
+	const { config, turns } = await gateway(() => "should not be called", {
+		channels: { "slack:C1": { engagement: "open" } },
+		slack: {
+			guestPolicy: {
+				dm: "drop",
+				channel: "drop",
+			},
+		},
+	});
+	const slack = fakeSlackApi();
+	const adapter = liveGateway(config.socketPath, slack.api);
+	await adapter.connect();
+	const guestOrigin = slackMessageOrigin({ channel: "C1", user: "U_GUEST_REC", ts: "1726543210.000600" });
+	// Recovery path: guest with trust:guest should be dropped by policy
+	const result = await adapter.requestRecovered(
+		slackMessageId("C1", "1726543210.000600"),
+		guestOrigin,
+		"recovered message",
+		{ mentioned: true, group: true, authorId: "U_GUEST_REC", trust: "guest" },
+		"2026-09-17T00:00:10.000Z",
+	);
+	expect(result.verdict).toBe("acked");
+	expect(result.result?.engaged).toBe(false);
+	await Bun.sleep(100);
+	expect(turns).toHaveLength(0);
+	// Note: edit and slash-command paths also use withAuthorTrust and are covered
+	// by the same code path that propagates trust on live/recovered messages.
 });

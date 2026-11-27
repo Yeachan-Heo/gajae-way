@@ -36,7 +36,14 @@ export function resolveSlackDisplayName(user: SlackUserLike | undefined): string
 	);
 }
 
-type Entry = { readonly value: SlackUserLike | SlackConversationLike | undefined; readonly expires: number };
+/** Trust classification TTL: 1 hour. Bounded refresh ensures guest status changes are picked up. */
+const TRUST_TTL_MS = 3600_000;
+
+type Entry = {
+	readonly value: SlackUserLike | SlackConversationLike | undefined;
+	readonly expires: number;
+	readonly trustExpires?: number; // When trust classification was last validated (user entries only).
+};
 
 /** A shared LRU bounds both caches; negative entries expire so transient API failures recover. */
 export class SlackDirectory {
@@ -56,7 +63,14 @@ export class SlackDirectory {
 	}
 
 	user(id: string): Promise<SlackUserLike | undefined> {
-		return this.load(`user:${id}`, () => this.api.usersInfo(id)) as Promise<SlackUserLike | undefined>;
+		const key = `user:${id}`;
+		// Check if trust TTL has expired; if so, force a fresh fetch to pick up status changes.
+		const cached = this.entries.get(key);
+		if (cached && cached.trustExpires !== undefined && cached.trustExpires <= this.now()) {
+			this.entries.delete(key);
+			this.pending.delete(key);
+		}
+		return this.load(key, () => this.api.usersInfo(id)) as Promise<SlackUserLike | undefined>;
 	}
 
 	conversation(id: string): Promise<SlackConversationLike | undefined> {
@@ -80,7 +94,11 @@ export class SlackDirectory {
 	}
 
 	prime(user: SlackUserLike): void {
-		this.set(`user:${user.id}`, { value: user, expires: Number.POSITIVE_INFINITY });
+		this.set(`user:${user.id}`, {
+			value: user,
+			expires: Number.POSITIVE_INFINITY,
+			trustExpires: this.now() + TRUST_TTL_MS,
+		});
 	}
 
 	/** Every user currently cached (positive entries only), for reverse name lookup. */
@@ -122,7 +140,13 @@ export class SlackDirectory {
 				// A payload primed during an in-flight request is fresher than its result.
 				const primed = this.get(key);
 				if (primed) return primed.value;
-				this.set(key, { value, expires: value === undefined ? this.now() + 60_000 : Number.POSITIVE_INFINITY });
+				// Set trust expiry for user entries (key starts with "user:") to bound trust classification freshness.
+				const trustExpires = key.startsWith("user:") && value !== undefined ? this.now() + TRUST_TTL_MS : undefined;
+				this.set(key, {
+					value,
+					expires: value === undefined ? this.now() + 60_000 : Number.POSITIVE_INFINITY,
+					trustExpires,
+				});
 				return value;
 			})
 			.finally(() => this.pending.delete(key));

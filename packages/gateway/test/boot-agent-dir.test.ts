@@ -96,4 +96,46 @@ describe("config parsing", () => {
 		const config = parseConfigFile({ schemaVersion: 1 });
 		expect(config.gjc).toBeUndefined();
 	});
+
+	test("slack.guestPolicy.denyUsers entries must be non-empty strings", () => {
+		// Valid non-empty string array should be accepted
+		const validConfig = parseConfigFile({
+			schemaVersion: 1,
+			slack: { guestPolicy: { denyUsers: ["U_DENIED1", "U_DENIED2"] } },
+		});
+		expect(validConfig.slack?.guestPolicy?.denyUsers).toEqual(["U_DENIED1", "U_DENIED2"]);
+
+		// Empty string should be rejected
+		expect(() =>
+			parseConfigFile({
+				schemaVersion: 1,
+				slack: { guestPolicy: { denyUsers: ["U_DENIED", ""] } },
+			}),
+		).toThrow("slack.guestPolicy.denyUsers must be a non-empty string array");
+
+		// Non-string entry should be rejected
+		expect(() =>
+			parseConfigFile({
+				schemaVersion: 1,
+				slack: { guestPolicy: { denyUsers: ["U_DENIED", 123 as unknown as string] } },
+			}),
+		).toThrow("slack.guestPolicy.denyUsers must be a non-empty string array");
+	});
+
+	test("slack.guestPolicy.allowUsers entries must be non-empty strings", () => {
+		// Valid non-empty string array should be accepted
+		const validConfig = parseConfigFile({
+			schemaVersion: 1,
+			slack: { guestPolicy: { allowUsers: ["U_ALLOWED1", "U_ALLOWED2"] } },
+		});
+		expect(validConfig.slack?.guestPolicy?.allowUsers).toEqual(["U_ALLOWED1", "U_ALLOWED2"]);
+
+		// Empty string should be rejected
+		expect(() =>
+			parseConfigFile({
+				schemaVersion: 1,
+				slack: { guestPolicy: { allowUsers: [""] } },
+			}),
+		).toThrow("slack.guestPolicy.allowUsers must be a non-empty string array");
+	});
 });

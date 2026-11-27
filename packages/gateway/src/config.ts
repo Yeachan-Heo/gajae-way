@@ -786,10 +786,12 @@ function parseSlackConfig(value: unknown): SlackGatewayPolicy {
 			throw new ConfigError("config_invalid", "slack.guestPolicy.dm must be 'drop' or 'allow'");
 		if (policy.channel !== undefined && !["drop", "allow"].includes(policy.channel as string))
 			throw new ConfigError("config_invalid", "slack.guestPolicy.channel must be 'drop' or 'allow'");
-		if (policy.denyUsers !== undefined && !Array.isArray(policy.denyUsers))
-			throw new ConfigError("config_invalid", "slack.guestPolicy.denyUsers must be an array of strings");
-		if (policy.allowUsers !== undefined && !Array.isArray(policy.allowUsers))
-			throw new ConfigError("config_invalid", "slack.guestPolicy.allowUsers must be an array of strings");
+		if (policy.denyUsers !== undefined) {
+			parseStringArray(policy.denyUsers, "slack.guestPolicy.denyUsers");
+		}
+		if (policy.allowUsers !== undefined) {
+			parseStringArray(policy.allowUsers, "slack.guestPolicy.allowUsers");
+		}
 		if (policy.failClosed !== undefined && typeof policy.failClosed !== "boolean")
 			throw new ConfigError("config_invalid", "slack.guestPolicy.failClosed must be a boolean");
 	}
