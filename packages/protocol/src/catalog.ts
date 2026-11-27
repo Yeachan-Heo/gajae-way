@@ -203,6 +203,11 @@ export interface EngagementContext {
 	 * real mention; the gateway still applies the configured mode and audience.
 	 */
 	readonly replyTo?: ReplyContext;
+	/**
+	 * Trust classification set by the adapter; "guest" indicates Slack
+	 * is_restricted/is_ultra_restricted/is_stranger users subject to guest policy.
+	 */
+	readonly trust?: "guest";
 }
 
 export interface PromptImage {

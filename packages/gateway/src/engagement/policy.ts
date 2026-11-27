@@ -220,6 +220,40 @@ export interface EngagementDecision {
 	readonly botAudienceAdmission: boolean;
 }
 
+/** Decision result of Slack guest policy check: drop, restricted, or allow. */
+export type GuestPolicyDecision = "drop" | "restricted" | "allow";
+
+/**
+ * Evaluate Slack guest policy if the message is from a guest (trust === "guest").
+ * Returns the policy decision; "allow" means treat as a normal user.
+ */
+export function checkSlackGuestPolicy(
+	engagement: EngagementContext | undefined,
+	origin: Pick<OriginRef, "kind">,
+	config: GatewayConfig,
+): GuestPolicyDecision {
+	if (engagement?.trust !== "guest") return "allow";
+	const authorId = engagement?.authorId;
+	if (!authorId) return "allow";
+	const policy = config.slack?.guest_policy;
+	if (!policy) return "allow";
+
+	// Allow overrides are checked first
+	if (policy.allow_users?.includes(authorId)) return "allow";
+
+	// Deny overrides
+	if (policy.deny_users?.includes(authorId)) return "drop";
+
+	// Apply policy based on origin kind
+	if (origin.kind === "dm") {
+		const dmPolicy = policy.dm ?? "drop";
+		return dmPolicy as GuestPolicyDecision;
+	} else {
+		const channelPolicy = policy.channel ?? "restricted";
+		return channelPolicy as GuestPolicyDecision;
+	}
+}
+
 export function decideEngagement(
 	origin: Pick<OriginRef, "platform" | "kind" | "conversationId" | "parentId">,
 	engagement: EngagementContext | undefined,
@@ -241,6 +275,14 @@ export function decideEngagement(
 	// included, because it is a statement about the message, not the author.
 	if (engagement?.contextOnly === true) return { engaged: false, botAudienceAdmission: false };
 	if (origin.platform === "loopback") return { engaged: true, botAudienceAdmission: false };
+	// Check Slack guest policy: drops block the turn entirely
+	const guestDecision = checkSlackGuestPolicy(engagement, origin, config);
+	if (guestDecision === "drop") {
+		const authorId = engagement?.authorId ?? "unknown";
+		const place = `slack ${origin.kind}${origin.kind === "channel" ? ` #${origin.conversationId}` : ""}`;
+		console.info(`gateway guest-policy drop authorId=${authorId} origin=${place} reason=guest_${origin.kind}_policy`);
+		return { engaged: false, botAudienceAdmission: false };
+	}
 	if (origin.kind === "dm") return { engaged: dmEngaged(engagement, config), botAudienceAdmission: false };
 	if (mutedThread && !threadMuteAddressed(engagement, origin, config))
 		return { engaged: false, botAudienceAdmission: false };

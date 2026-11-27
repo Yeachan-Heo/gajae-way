@@ -4,6 +4,11 @@ export interface SlackUserLike {
 	readonly real_name?: string | null;
 	readonly is_bot?: boolean;
 	readonly profile?: { readonly display_name?: string | null; readonly real_name?: string | null } | null;
+	/** Multi-channel guest (is_restricted) or single-channel guest (is_ultra_restricted). */
+	readonly is_restricted?: boolean;
+	readonly is_ultra_restricted?: boolean;
+	/** Slack Connect external user. */
+	readonly is_stranger?: boolean;
 }
 
 export interface SlackConversationLike {
@@ -11,6 +16,11 @@ export interface SlackConversationLike {
 	readonly name?: string | null;
 	readonly is_im?: boolean;
 	readonly is_mpim?: boolean;
+}
+
+/** Classify a user as guest if they have guest restriction flags. */
+export function isSlackGuest(user: SlackUserLike | undefined): boolean {
+	return Boolean(user?.is_restricted || user?.is_ultra_restricted || user?.is_stranger);
 }
 
 /** Blank profile fields mean unset, not a name that should hide a useful fallback. */

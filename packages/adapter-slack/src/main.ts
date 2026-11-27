@@ -25,7 +25,7 @@ import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 import { deliveryFailureIsAmbiguous, OutboundLimiter, SlackApiError, SlackWebApi } from "./api";
 import { describeInboundBody, isSlackNativeImage, prepareSlackImages, type SlackFileCarrier } from "./attachments";
-import { SlackDirectory } from "./author";
+import { isSlackGuest, SlackDirectory } from "./author";
 import { adapterHome, type LoadedSlackAdapterConfig, loadSlackAdapterConfig } from "./config";
 import { SlackFileShares } from "./file-shares";
 import { describePanelResponse, type SlackBlockAction } from "./interactions";
@@ -1256,7 +1256,7 @@ export async function startSlackAdapter(
 				// id, so live traffic records the bounded set recovery will revisit.
 				await rememberDm(message);
 				if (envelope.subtype === "message_changed") {
-					const editToSend = describeMessageEdit(
+					let editToSend = describeMessageEdit(
 						envelope,
 						identity,
 						directory,
@@ -1264,6 +1264,13 @@ export async function startSlackAdapter(
 						messageOrigins.get(messageId),
 					);
 					if (editToSend) {
+						// Classify guest status from the edited message's author
+						if (envelope.message?.user) {
+							const user = await directory.user(envelope.message.user);
+							if (isSlackGuest(user)) {
+								editToSend = { ...editToSend, engagement: { ...editToSend.engagement, trust: "guest" } };
+							}
+						}
 						rememberOrigin(messageId, editToSend.origin);
 						gateway.sendEdit(
 							editToSend.messageId,
@@ -1277,9 +1284,16 @@ export async function startSlackAdapter(
 				}
 				const text = extractBotCommand(message, identity.botUserId) ?? renderInboundText(message, directory);
 				if (text === "") return;
-				const engagement = withRootExcerpt(
+				let engagement = withRootExcerpt(
 					engagementForMessage(message, admitted.origin, identity, directory, config.channels),
 				);
+				// Classify guest status from Slack user info (is_restricted, is_ultra_restricted, is_stranger)
+				if (message.user) {
+					const user = await directory.user(message.user);
+					if (isSlackGuest(user)) {
+						engagement = { ...engagement, trust: "guest" };
+					}
+				}
 				const origin = routedOrigin;
 				let prepared: Awaited<ReturnType<typeof prepareSlackImages>> | undefined;
 				let sent: RecoveredSend;
