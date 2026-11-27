@@ -1,12 +1,13 @@
 import { expect, spyOn, test } from "bun:test";
 import { Buffer } from "node:buffer";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import { Client } from "discord.js";
 import { DiscordImagePreparationError } from "../src/attachments";
+import { ImageOutbox, type PendingImage } from "../src/image-outbox";
 import { engagementForMessage, type ImageOutcome, ReconnectingGateway, startDiscordAdapter } from "../src/main";
 import {
 	RECOVERY_MAX_ATTEMPTS,
@@ -603,6 +604,132 @@ test("a duplicate gateway engagement without a turn does not arm live presence",
 		expect(ports.typing).toEqual([]);
 		expect(ports.armed).toEqual([]);
 	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+}, 15_000);
+
+test("a historical image retry keeps recovered provenance and delivers silently once after history repair", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-live-image-history-provenance-"));
+	const held = holdRetryTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "new-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmImageMessage(id);
+	await saveRecoveryCursors(cursorPath, {
+		// The watermark stays behind the image, so an independent retry must not send it
+		// ahead of the sorted history pass that still owns the gap.
+		recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 5 * 60_000) },
+		quarantined: {},
+		knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+		attempts: {},
+		deadLetters: [],
+		deadLetterDigest: {},
+		sequence: 1,
+		gatewayDbIdentity: "test-db",
+	});
+	const ports = presencePorts();
+	const requests: Array<{ verb: string; params: any }> = [];
+	const sent: string[] = [];
+	let historyReadable = true;
+	const channel = {
+		messages: {
+			fetch: async (query: unknown) => {
+				const single = singleFetchId(query);
+				if (single !== undefined) return message;
+				if (!historyReadable) throw Object.assign(new Error("history temporarily unavailable"), { code: "EAI_AGAIN" });
+				const after = historyAfter(query);
+				return after === undefined || BigInt(after) < BigInt(id) ? [message] : [];
+			},
+		},
+	};
+	const outbox = new ImageOutbox(outboxPath);
+	const realPut = outbox.put.bind(outbox);
+	// The history-discovered intent cannot be persisted before the timer runs, so its
+	// only surviving provenance is the retry closure's captured livePresence.
+	let putFailures = 1;
+	outbox.put = async (entry: PendingImage) => {
+		if (putFailures > 0) {
+			putFailures--;
+			throw Object.assign(new Error("EIO: i/o error, write"), { code: "EIO" });
+		}
+		return realPut(entry);
+	};
+	let preparations = 0;
+	const gateway = new ReconnectingGateway(
+		"unused-socket",
+		{ channels: { fetch: async () => channel } } as never,
+		{ token: "unused", tokenFile: "unused", configPath: "unused", channels: {} } as never,
+		ports.typingPort as never,
+		ports.statusPort as never,
+		cursorPath,
+		() => bot,
+		{
+			request: async (verb: string, params: unknown) => {
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
+				if (verb !== "chat.send") return { engaged: false, turnId: null };
+				requests.push({ verb, params });
+				sent.push((params as { messageId: string }).messageId);
+				return { engaged: true, turnId: "fresh" };
+			},
+		} as never,
+		async () => {},
+		undefined,
+		undefined,
+		async () => {
+			preparations++;
+			return { images: [image], notice: "" };
+		},
+		outbox,
+	);
+	const passes = trackRecoveryPasses(gateway);
+	const scheduled = trackScheduledRetries(gateway);
+	try {
+		// The history pass finds the image, but its first intent write fails before any
+		// row exists; the owner can only arm its backoff retry.
+		expect(await bounded(gateway.recoverMissedMessages())).toBeUndefined();
+		await gateway.cursorsFlushed;
+		expect(putFailures).toBe(0);
+		expect(preparations).toBe(0);
+		expect(sent).toEqual([]);
+		expect(ports.typing).toEqual([]);
+		expect(ports.armed).toEqual([]);
+		// The failed image delivery armed its retry before the incomplete pass armed its
+		// own recovery retry; only the image timer is fired here.
+		const retries = held.retries();
+		expect(retries).toHaveLength(2);
+		const imageRetry = retries[0];
+		expect(imageRetry.delay).toBe(RECOVERY_RETRY_BASE_MS);
+
+		// The timer's preliminary recovery cannot read history, so it cannot re-admit the
+		// image. The repaired journal lets the no-row fallback persist the intent, which
+		// must stay above the horizon and out of the live-presence set.
+		historyReadable = false;
+		imageRetry.fire();
+		await eventually(() => passes.passes.length >= 2);
+		await bounded(passes.passes[1]);
+		await eventually(() => scheduled.outcomes.has(id));
+		expect(await bounded(scheduled.outcomes.get(id) as Promise<ImageOutcome>)).toBe("unavailable");
+		const admitted = JSON.parse(await readFile(outboxPath, "utf8")) as Array<Record<string, unknown>>;
+		expect(admitted).toEqual([expect.objectContaining({ messageId: id, channelId, request: expect.any(Object) })]);
+		expect(admitted[0]?.live).toBeUndefined();
+		expect(sent).toEqual([]);
+		expect(ports.typing).toEqual([]);
+		expect(ports.armed).toEqual([]);
+
+		// History repairs: the durable intent is retried inside the ordered pass and the
+		// engaged fresh turn is delivered exactly once without decorating the replay.
+		historyReadable = true;
+		expect(await bounded(gateway.recoverMissedMessages())).toBeUndefined();
+		await gateway.cursorsFlushed;
+		expect(sent).toEqual([id]);
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toHaveLength(1);
+		expect(ports.typing).toEqual([]);
+		expect(ports.armed).toEqual([]);
+	} finally {
+		scheduled.restore();
+		passes.restore();
+		held.cleanup();
 		await rm(home, { recursive: true, force: true });
 	}
 }, 15_000);

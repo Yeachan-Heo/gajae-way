@@ -2093,6 +2093,10 @@ export class ReconnectingGateway {
 			this.#imageTurnOpen.add(message.id);
 			void turn.then(() => this.#imageTurnOpen.delete(message.id));
 		}
+		// The timer is independent of the batch pass, so it drops `ordered`; it must not
+		// rewrite provenance. A history-discovered intent stays recovered (and silent),
+		// while only a live owner's retry runs as a live retry.
+		const liveRetry = !recovered && !ordered && livePresence;
 		return this.ownImage(
 			message.id,
 			discordMessageOrigin(message).conversationId,
@@ -2102,11 +2106,11 @@ export class ReconnectingGateway {
 					const pending = await this.#imageOutbox.get(message.id);
 					// A scheduled retry inherits the owner's live/recovery context; a recovered
 					// intent must not gain presence just because the retry runs in-process.
-					if (pending) return this.retryPendingImage(pending, undefined, false, true, livePresence);
+					if (pending) return this.retryPendingImage(pending, undefined, false, liveRetry, livePresence);
 				} catch {
 					// Retry the original intent when the outbox itself is unavailable.
 				}
-				return this.processImage(message, engagement, unnamed, turn, false, false, true, livePresence);
+				return this.processImage(message, engagement, unnamed, turn, recovered, false, liveRetry, livePresence);
 			},
 		);
 	}
@@ -2161,11 +2165,13 @@ export class ReconnectingGateway {
 					createdAt: Date.now(),
 					sourceIdentity: imageSourceIdentity(message),
 					sourceText: typeof message.content === "string" ? message.content : "",
-					...(recovered ? {} : { live: true }),
+					...(livePresence ? { live: true } : {}),
 					...(sourceOrigin.kind === "dm" ? { dm: true } : {}),
 				};
 				await this.#imageOutbox.put(entry);
-				if (!recovered) this.rememberLiveImage(entry.messageId);
+				// Presence eligibility is captured live-ingress provenance, not whichever
+				// `recovered` value a retry path chose to re-enter with.
+				if (livePresence) this.rememberLiveImage(entry.messageId);
 				this.#imageAdmissionFailures.delete(message.id);
 				this.#imageUnsent.delete(message.id);
 			}
