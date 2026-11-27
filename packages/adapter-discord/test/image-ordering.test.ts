@@ -1,12 +1,15 @@
 import { expect, spyOn, test } from "bun:test";
+import { Buffer } from "node:buffer";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { ImagePreparationBudgetError } from "@gajae-gateway/images";
+import { GajaewayClient } from "@gajae-gateway/sdk";
+import { Client } from "discord.js";
 import { DiscordImagePreparationError, imageSourceIdentity } from "../src/attachments";
 import { ImageOutbox, type PendingImage } from "../src/image-outbox";
-import { decideInbound, type ImageOutcome, ReconnectingGateway } from "../src/main";
+import { decideInbound, type ImageOutcome, ReconnectingGateway, startDiscordAdapter } from "../src/main";
 import {
 	loadRecoveryCursors,
 	RECOVERY_RETRY_BASE_MS,
@@ -17,6 +20,13 @@ import {
 
 const bot = { id: "bot" };
 const image = { data: "AQID", mimeType: "image/jpeg" as const };
+// The same valid PNG fixture the other adapter image tests download.
+const png = Uint8Array.from(
+	Buffer.from(
+		"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGP4z8DAAMIM/4EAAB/uBfsL2WiLAAAAAElFTkSuQmCC",
+		"base64",
+	),
+);
 const emptyCursors = () => ({
 	recoveredThrough: {},
 	quarantined: {},
@@ -212,6 +222,140 @@ function trackScheduledRetries(adapter: ReconnectingGateway) {
 			seam.scheduleImageRetry = real;
 		},
 	};
+}
+
+/** A live DM text message as discord.js would hand it to `messageCreate`. */
+function liveDmText(id: string, channelId: string, content: string) {
+	return {
+		id,
+		content,
+		author: { id: "human", username: "human", bot: false },
+		channel: { id: channelId, isDMBased: () => true },
+		attachments: [],
+	};
+}
+
+/** A native image message the adapter itself admitted as live thread ingress. */
+function liveThreadImage(id: string, threadId: string, parentId: string) {
+	return {
+		id,
+		content: "what is in this one?",
+		author: { id: "human", username: "human", bot: false },
+		channel: {
+			id: threadId,
+			parentId,
+			type: 11,
+			isDMBased: () => false,
+			isThread: () => true,
+		},
+		attachments: [
+			{
+				name: "photo.png",
+				contentType: "image/png",
+				url: "https://cdn.discordapp.com/attachments/1/2/thread-photo.png",
+			},
+		],
+	};
+}
+
+/** A durable image admitted in a parent channel whose acknowledged turn targets the thread. */
+function threadImageRequest(id: string, threadId: string, parentId: string) {
+	return {
+		messageId: id,
+		text: "from the parent channel\n[image · photo.png]",
+		images: [image],
+		origin: {
+			platform: "discord",
+			kind: "thread",
+			conversationId: threadId,
+			parentId,
+			threadVisibility: "public",
+		},
+		engagement: { mentioned: false, group: true, authorId: "human" },
+	};
+}
+
+/**
+ * Start a real adapter process over a seeded home: cursors and the durable image outbox are on
+ * disk, so this is the adapter as it comes back after a restart. The gateway transport is a
+ * fake, but every Discord event below travels the production `messageCreate` handler and every
+ * conversation ordering decision is made by the adapter itself.
+ */
+async function startRestartedAdapter(options: {
+	imageId: string;
+	cursor: Record<string, unknown>;
+	outbox: unknown;
+	/** Discord messages a replay revalidation may re-read; defaults to the live test source. */
+	sources?: Readonly<Record<string, unknown>>;
+	channels?: Record<string, { engagement: "open" }>;
+	chatSend: (messageId: string, params: unknown) => Promise<unknown>;
+}) {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-live-barrier-"));
+	const oldHome = process.env.GAJAEWAY_HOME;
+	process.env.GAJAEWAY_HOME = home;
+	const directory = join(home, "adapters", "discord");
+	await mkdir(directory, { recursive: true });
+	await saveRecoveryCursors(join(directory, "recovery-cursor.json"), options.cursor as never);
+	await writeFile(join(directory, "image-outbox.json"), JSON.stringify(options.outbox));
+	const chatSends: Array<{ messageId: string; params: any }> = [];
+	const cleanupTimers = trackTimers();
+	let discord: Client | undefined;
+	const transport = {
+		onChatMessage: () => () => {},
+		onChatProgress: () => () => {},
+		request: async (verb: string, params: unknown) => {
+			if (verb === "gateway.status") return { database: { identity: "test-db" } };
+			if (verb !== "chat.send") return { engaged: false, turnId: null };
+			const messageId = (params as { messageId: string }).messageId;
+			const result = await options.chatSend(messageId, params);
+			chatSends.push({ messageId, params });
+			return result;
+		},
+	};
+	const connect = spyOn(GajaewayClient, "connectSocketWithBackoff").mockResolvedValue(transport as never);
+	const reconnect = spyOn(GajaewayClient, "connectSocket").mockResolvedValue(transport as never);
+	const login = spyOn(Client.prototype, "login").mockImplementation(async function (this: Client) {
+		discord = this;
+		Object.defineProperty(this, "user", { value: { id: "bot" }, configurable: true });
+		this.channels.fetch = (async (id: string) => ({
+			messages: {
+				fetch: async (query: unknown) => {
+					const single = singleFetchId(query);
+					if (single === undefined) return [];
+					return (
+						options.sources?.[single] ?? (single === options.imageId ? dmMessage(options.imageId, id, true) : undefined)
+					);
+				},
+			},
+		})) as never;
+		return "offline-test-token";
+	});
+	let restored = false;
+	const restore = async () => {
+		if (restored) return;
+		restored = true;
+		cleanupTimers();
+		login.mockRestore();
+		reconnect.mockRestore();
+		connect.mockRestore();
+		if (oldHome === undefined) delete process.env.GAJAEWAY_HOME;
+		else process.env.GAJAEWAY_HOME = oldHome;
+		await rm(home, { recursive: true, force: true });
+	};
+	try {
+		await startDiscordAdapter({
+			tokenFile: join(home, "unused-token"),
+			token: "offline-test-token",
+			configPath: join(home, "adapter-discord.json"),
+			gatewaySocket: join(home, "unused.sock"),
+			statusReactions: "off",
+			channels: options.channels,
+		});
+	} catch (error) {
+		await restore();
+		throw error;
+	}
+	return { chatSends, discord: () => discord, restore };
 }
 
 test("recovery delivers an older durable image below the watermark before newer history text", async () => {
@@ -3574,3 +3718,346 @@ test("a history-armed image retry does not bypass a horizon that a restore moved
 		await rm(home, { recursive: true, force: true });
 	}
 }, 15_000);
+
+test("a restored unresolved image gates newer live text while unrelated conversations keep flowing", async () => {
+	const channelId = "dm-restored-barrier";
+	const otherChannelId = "dm-unrelated-barrier";
+	const now = Date.now();
+	const imageId = snowflakeFromTimestamp(now - 120_000);
+	const watermark = snowflakeFromTimestamp(now - 90_000);
+	const liveId = snowflakeFromTimestamp(now - 20_000);
+	const otherId = snowflakeFromTimestamp(now - 10_000);
+	const request = imageRequest(imageId, channelId);
+	let attempts = 0;
+	let releaseFirstAttempt!: () => void;
+	const firstAttemptGate = new Promise<void>((resolve) => {
+		releaseFirstAttempt = resolve;
+	});
+	const adapter = await startRestartedAdapter({
+		imageId,
+		cursor: {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: watermark },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		},
+		outbox: [{ messageId: imageId, channelId, request, createdAt: now - 120_000 }],
+		chatSend: async (messageId) => {
+			if (messageId !== imageId) return { engaged: true, turnId: `turn-${messageId}` };
+			attempts++;
+			if (attempts === 1) {
+				// Hold the restart replay in flight so the live messages below arrive while
+				// the older image is still unresolved, then fail it once.
+				await firstAttemptGate;
+				throw new Error("discord image delivery temporarily unavailable");
+			}
+			return { engaged: true, turnId: `turn-${messageId}` };
+		},
+	});
+	try {
+		await eventually(() => attempts === 1);
+		adapter.discord()!.emit("messageCreate", liveDmText(liveId, channelId, "what about this next?") as never);
+		adapter.discord()!.emit("messageCreate", liveDmText(otherId, otherChannelId, "unrelated room") as never);
+		// Another conversation never waits for this one's unresolved predecessor.
+		await eventually(() => adapter.chatSends.some((entry) => entry.messageId === otherId));
+		expect(adapter.chatSends.some((entry) => entry.messageId === liveId)).toBe(false);
+		// Still held while the image retry is outstanding: no newer live text may overtake it.
+		await delay(250);
+		expect(adapter.chatSends.some((entry) => entry.messageId === liveId)).toBe(false);
+		releaseFirstAttempt();
+		await eventually(
+			() =>
+				adapter.chatSends.some((entry) => entry.messageId === imageId) &&
+				adapter.chatSends.some((entry) => entry.messageId === liveId),
+			12_000,
+		);
+		const order = adapter.chatSends.map((entry) => entry.messageId);
+		expect(order.indexOf(imageId)).toBeLessThan(order.indexOf(liveId));
+		// A retry, not the original first attempt, delivered the restored intent.
+		expect(attempts).toBeGreaterThan(1);
+		// The acknowledged send still carries the persisted request untouched.
+		expect(adapter.chatSends.find((entry) => entry.messageId === imageId)?.params).toEqual(request);
+	} finally {
+		await adapter.restore();
+	}
+}, 20_000);
+
+test("an unreadable image outbox holds live dispatch instead of failing open", async () => {
+	const channelId = "dm-outbox-unreadable";
+	const now = Date.now();
+	const imageId = snowflakeFromTimestamp(now - 120_000);
+	const watermark = snowflakeFromTimestamp(now - 90_000);
+	const liveId = snowflakeFromTimestamp(now - 20_000);
+	const request = imageRequest(imageId, channelId);
+	let readable = false;
+	const realLoad = ImageOutbox.prototype.load;
+	const loadSpy = spyOn(ImageOutbox.prototype, "load").mockImplementation(function (this: ImageOutbox) {
+		if (!readable) return Promise.reject(new Error("image outbox unreadable in test"));
+		return realLoad.call(this);
+	});
+	let adapter: Awaited<ReturnType<typeof startRestartedAdapter>> | undefined;
+	try {
+		adapter = await startRestartedAdapter({
+			imageId,
+			cursor: {
+				...emptyCursors(),
+				recoveredThrough: { [channelId]: watermark },
+				knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+				sequence: 1,
+			},
+			outbox: [{ messageId: imageId, channelId, request, createdAt: now - 120_000 }],
+			chatSend: async (messageId) => ({ engaged: true, turnId: `turn-${messageId}` }),
+		});
+		adapter.discord()!.emit("messageCreate", liveDmText(liveId, channelId, "did you see this?") as never);
+		// The journal is the ordering authority: with it unreadable nothing is dispatched.
+		await delay(300);
+		expect(adapter.chatSends).toHaveLength(0);
+		readable = true;
+		await eventually(
+			() =>
+				adapter!.chatSends.some((entry) => entry.messageId === imageId) &&
+				adapter!.chatSends.some((entry) => entry.messageId === liveId),
+		);
+		const order = adapter.chatSends.map((entry) => entry.messageId);
+		expect(order.indexOf(imageId)).toBeLessThan(order.indexOf(liveId));
+		expect(adapter.chatSends.find((entry) => entry.messageId === imageId)?.params).toEqual(request);
+	} finally {
+		if (adapter) await adapter.restore();
+		loadSpy.mockRestore();
+	}
+}, 20_000);
+
+test("durable image ordering ignores newer, parked, terminal and unrelated rows", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-barrier-predicate-"));
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "dm-barrier";
+	const otherChannelId = "dm-barrier-other";
+	const now = Date.now();
+	const current = snowflakeFromTimestamp(now - 30_000);
+	const newer = snowflakeFromTimestamp(now - 10_000);
+	const deferredId = snowflakeFromTimestamp(now - 70_000);
+	const terminalId = snowflakeFromTimestamp(now - 60_000);
+	const otherId = snowflakeFromTimestamp(now - 50_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(
+			join(home, "image-outbox.json"),
+			JSON.stringify([
+				{ messageId: deferredId, channelId, deferred: true },
+				{ messageId: terminalId, channelId, terminal: true, audited: true },
+				{ messageId: newer, channelId },
+				{ messageId: otherId, channelId: otherChannelId },
+			]),
+		);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		// Parked, terminal, newer, and other-conversation rows all release the barrier.
+		await bounded(adapter.awaitImagePredecessors(current, channelId, channelId));
+		expect(requests).toEqual([]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("a restored image destination in this thread holds newer live text posted there", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-barrier-thread-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const parentId = "channel-parent";
+	const otherParentId = "channel-parent-other";
+	const threadId = "thread-reply";
+	const unrelatedChannelId = "dm-unrelated";
+	const now = Date.now();
+	const olderId = snowflakeFromTimestamp(now - 80_000);
+	const newestId = snowflakeFromTimestamp(now - 40_000);
+	const liveTextId = snowflakeFromTimestamp(now - 10_000);
+	const origin = (parent: string) => ({
+		platform: "discord",
+		kind: "thread",
+		conversationId: threadId,
+		parentId: parent,
+		threadVisibility: "public",
+	});
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(
+			join(home, "image-outbox.json"),
+			JSON.stringify([
+				// Destination recorded on the resolved intent itself.
+				{ messageId: olderId, channelId: parentId, origin: origin(parentId) },
+				// Older persisted rows may carry the destination only inside the request.
+				{
+					messageId: newestId,
+					channelId: otherParentId,
+					request: { messageId: newestId, text: "describe", origin: origin(otherParentId) },
+				},
+			]),
+		);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		const barrier = adapter.awaitImagePredecessors(liveTextId, threadId, threadId);
+		let resolved = false;
+		void barrier.then(() => {
+			resolved = true;
+		});
+		await delay(150);
+		expect(resolved).toBe(false);
+		// An unrelated conversation is never held by these rows.
+		await bounded(adapter.awaitImagePredecessors(liveTextId, unrelatedChannelId, unrelatedChannelId));
+		// A row never blocks on itself.
+		await bounded(adapter.awaitImagePredecessors(olderId, parentId, threadId));
+		await adapter.invalidateImageSource(olderId, "image source message was deleted");
+		await adapter.invalidateImageSource(newestId, "image source message was deleted");
+		await bounded(barrier);
+		expect(resolved).toBe(true);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("a restored parent-channel image targeting this thread gates a newer live image posted there", async () => {
+	const parentId = "channel-live-image-parent";
+	const threadId = "thread-live-image";
+	const now = Date.now();
+	const restoredId = snowflakeFromTimestamp(now - 120_000);
+	const watermark = snowflakeFromTimestamp(now - 90_000);
+	const liveImageId = snowflakeFromTimestamp(now - 20_000);
+	const liveImage = liveThreadImage(liveImageId, threadId, parentId);
+	const request = threadImageRequest(restoredId, threadId, parentId);
+	let restoredAttempts = 0;
+	let releaseRestored!: () => void;
+	const restoredGate = new Promise<void>((resolve) => {
+		releaseRestored = resolve;
+	});
+	const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+		(async () => new Response(png, { headers: { "content-type": "image/png" } })) as unknown as typeof fetch,
+	);
+	const adapter = await startRestartedAdapter({
+		imageId: restoredId,
+		channels: { [parentId]: { engagement: "open" } },
+		sources: { [liveImageId]: liveImage },
+		cursor: {
+			...emptyCursors(),
+			recoveredThrough: { [parentId]: watermark },
+			sequence: 1,
+		},
+		outbox: [{ messageId: restoredId, channelId: parentId, request, createdAt: now - 120_000 }],
+		chatSend: async (messageId) => {
+			if (messageId === restoredId) {
+				restoredAttempts++;
+				// Hold the restored image in flight while the live thread image arrives.
+				await restoredGate;
+			}
+			return { engaged: true, turnId: `turn-${messageId}` };
+		},
+	});
+	try {
+		await eventually(() => restoredAttempts === 1);
+		adapter.discord()!.emit("messageCreate", liveImage as never);
+		await delay(250);
+		// The live image's turn in this thread stays closed behind the restored predecessor.
+		expect(adapter.chatSends.some((entry) => entry.messageId === liveImageId)).toBe(false);
+		releaseRestored();
+		await eventually(
+			() =>
+				adapter.chatSends.some((entry) => entry.messageId === restoredId) &&
+				adapter.chatSends.some((entry) => entry.messageId === liveImageId),
+			12_000,
+		);
+		const order = adapter.chatSends.map((entry) => entry.messageId);
+		expect(order.indexOf(restoredId)).toBeLessThan(order.indexOf(liveImageId));
+		const live = adapter.chatSends.find((entry) => entry.messageId === liveImageId)?.params;
+		expect(live).toMatchObject({
+			messageId: liveImageId,
+			origin: { platform: "discord", kind: "thread", conversationId: threadId, parentId },
+			images: [{ mimeType: "image/jpeg", data: expect.any(String) }],
+		});
+	} finally {
+		await adapter.restore();
+		fetchSpy.mockRestore();
+	}
+}, 20_000);
+
+test("a retry stays behind a cross-source durable image targeting this thread, then releases", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-retry-destination-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const parentId = "channel-retry-parent";
+	const threadId = "thread-retry-target";
+	const now = Date.now();
+	const predecessorId = snowflakeFromTimestamp(now - 90_000);
+	const currentId = snowflakeFromTimestamp(now - 60_000);
+	const watermark = snowflakeFromTimestamp(now - 30_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	const sent: string[] = [];
+	let predecessorAttempts = 0;
+	let releasePredecessor!: () => void;
+	const predecessorGate = new Promise<void>((resolve) => {
+		releasePredecessor = resolve;
+	});
+	const channel = {
+		messages: {
+			fetch: async (query: unknown) => {
+				const single = singleFetchId(query);
+				if (single !== undefined) return dmMessage(single, single === predecessorId ? parentId : threadId, true);
+				return [];
+			},
+		},
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [parentId]: watermark, [threadId]: watermark },
+			sequence: 1,
+		});
+		await writeFile(
+			join(home, "image-outbox.json"),
+			JSON.stringify([
+				// The thread intent is replayed first, but it must stay behind this
+				// parent-channel intent that targets the same thread.
+				{ messageId: currentId, channelId: threadId, request: threadImageRequest(currentId, threadId, parentId) },
+				{
+					messageId: predecessorId,
+					channelId: parentId,
+					request: threadImageRequest(predecessorId, threadId, parentId),
+				},
+			]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => channel,
+			requests,
+			{},
+			async (verb, params) => {
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
+				if (verb !== "chat.send") return { engaged: false, turnId: null };
+				const messageId = (params as { messageId: string }).messageId;
+				if (messageId === predecessorId) {
+					predecessorAttempts++;
+					await predecessorGate;
+				}
+				sent.push(messageId);
+				return { engaged: true, turnId: `turn-${messageId}` };
+			},
+		);
+		const pass = adapter.recoverMissedMessages();
+		// The thread intent's retry already ran: the cross-source predecessor in another
+		// channel but the same thread destination holds it instead of dispatching.
+		await eventually(() => predecessorAttempts === 1);
+		expect(sent).toEqual([]);
+		releasePredecessor();
+		await bounded(pass);
+		// Resolved evidence releases the retry on the next pass.
+		await bounded(adapter.recoverMissedMessages());
+		await eventually(() => sent.includes(currentId));
+		expect(sent).toEqual([predecessorId, currentId]);
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			predecessorId,
+			currentId,
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});

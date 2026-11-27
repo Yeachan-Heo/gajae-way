@@ -1497,6 +1497,11 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			});
 			const image = gateway.processImage(message, engagement, unnamedThreads, turn);
 			ingress.run(origin.conversationId, async () => {
+				// A restored image replays outside this live chain. Open this image's turn —
+				// and only then release every later message in the conversation — after older
+				// durable predecessors in the destination conversation settle, so a live image
+				// cannot overtake one that survived a restart.
+				await gateway.awaitImagePredecessors(message.id as string, messageChannelId, origin.conversationId, origin);
 				start();
 				await gateway.waitForImage(message, image);
 			});
@@ -1522,6 +1527,10 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			// spoken message is answered in voice and text both, without the
 			// persona having to ask for it.
 			const spoken = firstVoiceMessage(message) !== undefined;
+			// Durable images replay outside this live chain, so a restored image that is
+			// still retrying after a restart has no ingress slot of its own. Hold this text
+			// behind it instead of letting a newer message reach the gateway first.
+			await gateway.awaitImagePredecessors(message.id as string, messageChannelId, origin.conversationId, origin);
 			gateway.sendInbound(message.id as string, origin, body, engagement, receivedAt, spoken, messageChannelId);
 		});
 	});
@@ -2121,13 +2130,7 @@ export class ReconnectingGateway {
 	 * dead-lettered retry budget, so a permanently unsendable intent cannot wedge the chain.
 	 */
 	async waitForImage(message: DiscordInboundMessage, initial: Promise<ImageOutcome>): Promise<void> {
-		let release!: () => void;
-		const settled = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		const listeners = this.#imageSettled.get(message.id) ?? new Set<() => void>();
-		listeners.add(release);
-		this.#imageSettled.set(message.id, listeners);
+		const wait = this.imageSettlement(message.id);
 		try {
 			if ((await initial) === "unavailable" && !this.#imageDone.has(message.id)) {
 				const current = await this.#imageOutbox.get(message.id).catch(() => undefined);
@@ -2135,12 +2138,112 @@ export class ReconnectingGateway {
 				// so it must not hold the conversation chain. The outbox row is the authority:
 				// it survives a restart, unlike a process-local marker.
 				const parked = current?.deferred === true;
-				if (!parked && !current?.completed && !(current?.terminal && current.audited)) await settled;
+				if (!parked && !current?.completed && !(current?.terminal && current.audited)) await wait.promise;
 			}
 		} finally {
-			listeners.delete(release);
-			if (listeners.size === 0) this.#imageSettled.delete(message.id);
+			wait.cancel();
 		}
+	}
+
+	/**
+	 * Hold a live message behind older durable image intents in the same conversation.
+	 *
+	 * Durable images are replayed by their own consumer, outside the live `OrderedIngress`
+	 * chain, so after a restart an older image can still be retrying while a newer text
+	 * arrives and reach the gateway first. Wait for every older unresolved image to settle:
+	 * acknowledged, parked on its own budget quota, terminally rejected, or past the existing
+	 * 24h intent deadline — the same releases a live image's ingress slot observes. A
+	 * restored image whose reply destination (`request.origin`) is the conversation this
+	 * message belongs to counts even when the image itself landed in a parent channel.
+	 * Only older message ids are considered, so a newer image never holds this message, and
+	 * the match is scoped to one source channel/conversation, so unrelated conversations
+	 * keep flowing.
+	 *
+	 * This resolves only when the journal proves no older unresolved image remains. An
+	 * unreadable journal is NOT proof: the live message is held (never dispatched) and the
+	 * read is retried with backoff while recovery is nudged, so a restored image cannot be
+	 * overtaken just because the outbox is temporarily unreadable.
+	 */
+	async awaitImagePredecessors(
+		messageId: string,
+		channelId: string,
+		conversationId: string = channelId,
+		origin?: OriginRef,
+	): Promise<void> {
+		let readAttempt = 0;
+		let registered = false;
+		for (;;) {
+			const blockers = await this.unresolvedImagePredecessors(messageId, channelId, conversationId);
+			if (blockers === undefined) {
+				if (!registered && origin) {
+					registered = true;
+					// If the process dies while the journal is unreadable, recovery must still
+					// be able to find this live message. A first-seen DM exists only once the
+					// adapter registers it; a configured channel is discovered from config.
+					await this.rememberInboundDm(origin);
+					await this.cursorsFlushed;
+				}
+				this.scheduleRecoveryRetry();
+				const backoff = Math.min(RECOVERY_RETRY_MAX_MS, RECOVERY_ATTEMPT_BACKOFF_MS * 2 ** Math.min(readAttempt++, 6));
+				console.error(
+					`Discord ordering could not read the image outbox for channel=${channelId}; holding live message=${messageId} for ${backoff}ms before retrying the read.`,
+				);
+				await this.sleep(backoff);
+				continue;
+			}
+			if (blockers.length === 0) return;
+			// Register before advancing anything: a settlement can land during the retry
+			// below, and only a listener installed first observes it.
+			const waits = blockers.map((blocker) => this.imageSettlement(blocker.messageId));
+			for (const blocker of blockers) {
+				if (this.#imageOwners.has(blocker.messageId) || this.#imageRetries.has(blocker.messageId)) continue;
+				// A restored row above the recovery horizon can have no owner and no armed
+				// retry. Advancing it here gives the barrier the same retry and 24h clock a
+				// live image would already have, instead of waiting on nothing.
+				void this.retryPendingImage(blocker).catch((error: unknown) => {
+					console.error(
+						`Discord image predecessor retry failed message=${blocker.messageId}: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				});
+			}
+			// Re-read after registering: a predecessor that settled between the snapshot and
+			// this registration is resolved evidence, not a reason to wait.
+			const remaining = await this.unresolvedImagePredecessors(messageId, channelId, conversationId);
+			if (remaining === undefined) {
+				for (const wait of waits) wait.cancel();
+				const backoff = Math.min(RECOVERY_RETRY_MAX_MS, RECOVERY_ATTEMPT_BACKOFF_MS * 2 ** Math.min(readAttempt++, 6));
+				console.error(
+					`Discord ordering could not re-read the image outbox for channel=${channelId}; holding live message=${messageId} for ${backoff}ms before retrying the read.`,
+				);
+				await this.sleep(backoff);
+				continue;
+			}
+			const stillBlocking = new Set(remaining.map((entry) => entry.messageId));
+			const outstanding = waits.filter((wait) => stillBlocking.has(wait.messageId));
+			for (const wait of waits) if (!stillBlocking.has(wait.messageId)) wait.cancel();
+			if (outstanding.length === 0) continue;
+			await Promise.all(outstanding.map((wait) => wait.promise));
+		}
+	}
+
+	/** Register a one-shot settlement listener for one image intent. */
+	private imageSettlement(messageId: string): {
+		readonly messageId: string;
+		readonly promise: Promise<void>;
+		cancel(): void;
+	} {
+		let release!: () => void;
+		const promise = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const listeners = this.#imageSettled.get(messageId) ?? new Set<() => void>();
+		listeners.add(release);
+		this.#imageSettled.set(messageId, listeners);
+		const cancel = () => {
+			listeners.delete(release);
+			if (listeners.size === 0 && this.#imageSettled.get(messageId) === listeners) this.#imageSettled.delete(messageId);
+		};
+		return { messageId, promise, cancel };
 	}
 
 	private async processOwnedImage(
@@ -2428,24 +2531,67 @@ export class ReconnectingGateway {
 	 * True when an older, still deliverable intent in the same conversation has not settled.
 	 * The batch pass holds its rows with a per-channel cursor, but a live dispatch, a
 	 * scheduled retry, and a direct journal replay are independent owners with no such
-	 * cursor, so each asks this before preparing or sending. Parked (budget-backoff) rows are
-	 * not deliverable work and keep the documented exception; completed and terminal rows are
+	 * cursor, so each asks this before preparing or sending. "Conversation" is the intent's
+	 * own resolved destination when it has one: a live image can land in a parent channel
+	 * while its turn targets a thread, and a cross-source predecessor targeting that same
+	 * thread must still hold every retry and deferral. Parked (budget-backoff) rows are not
+	 * deliverable work and keep the documented exception; completed and terminal rows are
 	 * resolved evidence and never block. An unreadable journal cannot prove ordering, so it
 	 * holds the intent retryable instead of sending out of order.
 	 */
 	private async hasUnresolvedImagePredecessor(entry: PendingImage): Promise<boolean> {
+		const predecessors = await this.unresolvedImagePredecessors(
+			entry.messageId,
+			entry.channelId,
+			this.imageDestinationConversation(entry) ?? entry.channelId,
+		);
+		// An unreadable journal cannot prove ordering, so it holds the intent retryable.
+		return predecessors === undefined || predecessors.length > 0;
+	}
+
+	/**
+	 * Older durable intents in one conversation that still owe delivery, or undefined when
+	 * the journal cannot be read. Completed and terminal rows are resolved evidence, and a
+	 * parked row is not deliverable work: both keep the documented release exceptions.
+	 *
+	 * `conversationId` widens the match to a restored image whose reply destination is that
+	 * conversation: a live image can live in a parent channel while its gateway turn targets
+	 * a thread, and text posted in that thread must still be held behind it. Every current
+	 * caller passes the intent's own resolved destination (falling back to its source
+	 * channel), so deferrals and retries cannot bypass a cross-source predecessor.
+	 */
+	private async unresolvedImagePredecessors(
+		messageId: string,
+		channelId: string,
+		conversationId?: string,
+	): Promise<PendingImage[] | undefined> {
 		let pending: readonly PendingImage[];
 		try {
 			pending = await this.#imageOutbox.load();
 		} catch {
-			return true;
+			return undefined;
 		}
-		for (const candidate of pending) {
-			if (candidate.messageId === entry.messageId || candidate.channelId !== entry.channelId) continue;
-			if (candidate.completed || candidate.terminal || candidate.deferred === true) continue;
-			if (snowflakeIsAfter(entry.messageId, candidate.messageId)) return true;
-		}
-		return false;
+		return pending.filter(
+			(candidate) =>
+				candidate.messageId !== messageId &&
+				!candidate.completed &&
+				!candidate.terminal &&
+				candidate.deferred !== true &&
+				(candidate.channelId === channelId ||
+					(conversationId !== undefined && this.imageDestinationConversation(candidate) === conversationId)) &&
+				snowflakeIsAfter(messageId, candidate.messageId),
+		);
+	}
+
+	/** The conversation a durable image intent's acknowledged turn belongs to. */
+	private imageDestinationConversation(entry: PendingImage): string | undefined {
+		const origin = entry.origin;
+		if (origin && typeof origin.conversationId === "string" && origin.conversationId !== "")
+			return origin.conversationId;
+		const requestOrigin = entry.request?.origin as { conversationId?: unknown } | undefined;
+		return typeof requestOrigin?.conversationId === "string" && requestOrigin.conversationId !== ""
+			? requestOrigin.conversationId
+			: undefined;
 	}
 
 	/** Record a transient failure and enforce the 24h intent deadline on every retry. */
