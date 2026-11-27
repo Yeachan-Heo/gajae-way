@@ -61,6 +61,8 @@ export async function runBrokerHost(config: GatewayConfig): Promise<number> {
 			GJC_CODING_AGENT_DIR: agentDir,
 			[GJC_ATTACH_ONLY_ENV]: "0",
 			...brokerEnv,
+			// Sessions run `gajaeway` from their shells; without this they resolve the default home.
+			GAJAEWAY_HOME: resolve(config.home),
 		};
 		const version = await versionOf(exe, env, config.home);
 		// The release beside the running binary owns the pin (see pinnedGjcCandidatePaths), so

@@ -108,8 +108,10 @@ if (command === "config" && args[0] === "check") {
 	}
 } else if (command === "daemon") {
 	let booted: BootedGateway | undefined;
+	const stdio = args.includes("--stdio");
 	const disposeLogging = installStructuredLogging({
 		path: join(gatewayHome(), "gateway.log"),
+		stdio,
 		// A heartbeat that ticks while every request fails must say so (#246).
 		heartbeatDetails: () => booted?.broker.outage() ?? "",
 	});
@@ -141,7 +143,7 @@ if (command === "config" && args[0] === "check") {
 	};
 	try {
 		const server = await bootGateway({
-			stdio: args.includes("--stdio"),
+			stdio,
 			broker: { onLiveOutageExceeded },
 		});
 		booted = server;

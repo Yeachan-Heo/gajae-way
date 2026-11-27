@@ -9,6 +9,17 @@ import {
 	type WorkJournalEventType,
 } from "./journal";
 
+/**
+ * A delivery that is not the escalation notice of a still-open hold. The persona
+ * layer links such a notice with an `escalation-notice-delivery:<deliveryId>`
+ * meta key and deletes it when the hold completes; until then the confirmed row
+ * is the proof that the user was told, so retention keeps it. Only a confirmed
+ * row is proof: an expired linked notice is swept like any other, so that it
+ * becomes missing and recovery can reissue it once.
+ */
+const UNLINKED_ESCALATION_NOTICE =
+	"NOT EXISTS (SELECT 1 FROM meta m WHERE m.key = 'escalation-notice-delivery:' || deliveries.delivery_id)";
+
 export type DeliveryState = "pending" | "inflight" | "confirmed" | "failed_ambiguous" | "expired";
 export type LedgerOutcome = "unknown" | "transitioned" | "already_terminal";
 const MAX_DEFINITIVE_FAILURES = 5;
@@ -274,7 +285,9 @@ export class OutboxGroup {
 
 	prune(tx: WriteTx, deliveredOlderThanMs: number, now = Date.now()): number {
 		const ids = this.#db
-			.prepare("SELECT delivery_id FROM deliveries WHERE state = 'confirmed' AND updated_at < ?")
+			.prepare(
+				`SELECT delivery_id FROM deliveries WHERE state = 'confirmed' AND updated_at < ? AND ${UNLINKED_ESCALATION_NOTICE}`,
+			)
 			.all(new Date(now - deliveredOlderThanMs).toISOString()) as Array<{ delivery_id: string }>;
 		return this.#delete(tx, ids);
 	}
@@ -363,16 +376,17 @@ export class OutboxGroup {
 			.all(Math.floor(nowMs / 1000)) as Array<{ origin_key: string; n: number; oldest_ms: number }>;
 	}
 
+	/** Confirmed non-reaction replies for one canonical origin, excluding deliveries already represented in context. */
 	confirmedConversation(
-		conversationId: string,
+		originKey: string,
 		floorAt: string,
 		limit: number,
 	): Array<{ created_at: string; payload_json: string }> {
 		return this.#db
 			.prepare(
-				"SELECT created_at, payload_json FROM deliveries WHERE state = 'confirmed' AND json_extract(payload_json, '$.origin.conversationId') = ? AND json_extract(payload_json, '$.reaction') IS NULL AND created_at >= ? AND NOT EXISTS (SELECT 1 FROM conversation_context WHERE conversation_context.message_id = 'post/' || deliveries.delivery_id) ORDER BY created_at DESC LIMIT ?",
+				"SELECT created_at, payload_json FROM deliveries WHERE origin_key = ? AND state = 'confirmed' AND json_extract(payload_json, '$.reaction') IS NULL AND created_at >= ? AND NOT EXISTS (SELECT 1 FROM conversation_context WHERE conversation_context.message_id = 'post/' || deliveries.delivery_id) ORDER BY created_at DESC LIMIT ?",
 			)
-			.all(conversationId, floorAt, limit) as Array<{ created_at: string; payload_json: string }>;
+			.all(originKey, floorAt, limit) as Array<{ created_at: string; payload_json: string }>;
 	}
 
 	unsettledTerminalDeliveryIds(): string[] {
@@ -398,7 +412,7 @@ export class OutboxGroup {
 	sweep(tx: WriteTx, cutoffs: { deliveryCutoff: string; historyCutoff: string; batch: number }): number {
 		const ids = this.#db
 			.prepare(
-				"SELECT delivery_id FROM deliveries WHERE (state = 'confirmed' AND updated_at < ?) OR (state = 'expired' AND updated_at < ?) ORDER BY rowid LIMIT ?",
+				`SELECT delivery_id FROM deliveries WHERE ((state = 'confirmed' AND updated_at < ? AND ${UNLINKED_ESCALATION_NOTICE}) OR (state = 'expired' AND updated_at < ?)) ORDER BY rowid LIMIT ?`,
 			)
 			.all(cutoffs.deliveryCutoff, cutoffs.historyCutoff, cutoffs.batch) as Array<{ delivery_id: string }>;
 		return this.#delete(tx, ids);

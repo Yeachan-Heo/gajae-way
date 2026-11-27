@@ -4,7 +4,6 @@ import { acquireLease, exitOnLeaseHeld, type Lease, LeaseHeldError } from "@gaja
 
 import {
 	type ChatMessagePayload,
-	type ChatSendResult,
 	type EngagementContext,
 	type FileRef,
 	type OriginRef,
@@ -69,6 +68,12 @@ export interface TelegramMessage extends TelegramMessageOriginShape, TelegramAtt
 	/** Media messages carry their text here instead of in `text`. */
 	readonly caption?: string;
 	readonly reply_to_message?: TelegramReplyMessageShape;
+	/** Service message: forum topic was created. */
+	readonly forum_topic_created?: {
+		readonly name: string;
+		readonly icon_color?: number;
+		readonly icon_custom_emoji_id?: string;
+	};
 }
 
 /** One entry of Telegram's `ReactionType` union; bots only ever set/read `type: "emoji"`. */
@@ -793,7 +798,6 @@ export class TelegramAdapter {
 		readonly botUserId: string,
 		readonly config: Pick<LoadedTelegramAdapterConfig, "chats">,
 		readonly attachments: TelegramAttachmentSaver,
-		readonly replyBot: Pick<TelegramBotApi, "sendMessage">,
 	) {}
 
 	async handleUpdate(gateway: Pick<GatewayClientLike, "request">, update: TelegramUpdate): Promise<boolean> {
@@ -816,6 +820,25 @@ export class TelegramAdapter {
 		// A photo or file has no `text`; forwarding text alone dropped it without a trace.
 		const content = message.text ?? message.caption ?? "";
 		const attachment = telegramAttachment(message);
+		// A forum topic's creation service message is the topic root: its message id is the
+		// topic's message_thread_id. Record it as context only, so the gateway can show it as
+		// the thread root on the topic's first turn without answering the service message.
+		if (message.forum_topic_created && content === "" && !attachment) {
+			const origin = telegramMessageOrigin(message);
+			await this.state.rememberOrigin(origin, origin.kind === "topic" ? message.message_thread_id : undefined);
+			try {
+				await gateway.request("chat.send", {
+					origin,
+					text: `Forum topic created: ${message.forum_topic_created.name}`,
+					engagement: { ...engagementForMessage(message, origin, this.botUsername, this.botUserId), contextOnly: true },
+					messageId: telegramInboundMessageId(message.chat.id, message.message_id),
+				});
+			} catch (error) {
+				if (!(error instanceof ProtocolError) || error.code !== "invalid_params") throw error;
+				return this.state.rejectUpdate(update.update_id, "chat.send");
+			}
+			return this.state.acceptUpdate(update.update_id);
+		}
 		if (content === "" && !attachment) return this.state.acceptUpdate(update.update_id);
 		const origin = telegramMessageOrigin(message);
 		await this.state.rememberOrigin(origin, origin.kind === "topic" ? message.message_thread_id : undefined);
@@ -826,7 +849,6 @@ export class TelegramAdapter {
 				: baseEngagement;
 		let stored: Awaited<ReturnType<TelegramAttachmentSaver["save"]>> | undefined;
 		let images: PromptImage[] | undefined;
-		let imageNotice = "";
 		if (attachment?.kind === "image") {
 			try {
 				stored = await this.attachments.save(attachment, String(message.chat.id), message.message_id);
@@ -835,7 +857,6 @@ export class TelegramAdapter {
 				const prepared = await prepareTelegramImage(stored);
 				if (prepared.images.length === 0) throw new Error("image preparation produced no images");
 				images = prepared.images;
-				imageNotice = prepared.notice;
 			} catch (error) {
 				if (error instanceof TelegramAttachmentRetryableError) throw error;
 				// Telegram has no local allowlist that proves a failure notice is authorized.
@@ -850,9 +871,8 @@ export class TelegramAdapter {
 			if (!("path" in stored) && stored.retryable) throw new TelegramAttachmentRetryableError();
 		}
 		const body = describeInboundBody(content, attachment, stored, images !== undefined);
-		let accepted: ChatSendResult;
 		try {
-			accepted = await gateway.request<ChatSendResult>("chat.send", {
+			await gateway.request("chat.send", {
 				origin,
 				text: body,
 				engagement,
@@ -862,16 +882,6 @@ export class TelegramAdapter {
 		} catch (error) {
 			if (!(error instanceof ProtocolError) || error.code !== "invalid_params") throw error;
 			return this.state.rejectUpdate(update.update_id, "chat.send");
-		}
-		if (accepted.engaged && accepted.turnId !== null && imageNotice) {
-			try {
-				for (const chunk of renderTelegramDelivery(`Image processing: ${imageNotice}`))
-					await sendTelegramHtml(this.replyBot, String(message.chat.id), chunk, message.message_thread_id);
-			} catch {
-				console.error(
-					`Telegram image processing notice failed message=${telegramInboundMessageId(message.chat.id, message.message_id)}.`,
-				);
-			}
 		}
 		return this.state.acceptUpdate(update.update_id);
 	}
@@ -1008,7 +1018,6 @@ export async function startTelegramAdapter(config: LoadedTelegramAdapterConfig):
 		String(identity.id),
 		config,
 		new TelegramAttachmentStore(attachmentDirectory, bot),
-		bot,
 	);
 	const gateway = new ReconnectingGateway(config.gatewaySocket ?? defaultGatewaySocket(), bot, state);
 	await gateway.connectInitial();
@@ -1023,7 +1032,7 @@ export async function startTelegramAdapter(config: LoadedTelegramAdapterConfig):
 	}
 }
 
-class ReconnectingGateway implements GatewayClientLike {
+export class ReconnectingGateway implements GatewayClientLike {
 	#client: GajaewayClient | undefined;
 	#reconnecting = false;
 	#attempt = 0;

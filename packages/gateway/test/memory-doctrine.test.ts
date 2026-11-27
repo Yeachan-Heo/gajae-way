@@ -162,8 +162,9 @@ test("a trimmed map retains every registered axis heading", async () => {
 test("a trimmed axis points to its existing index and states the omitted count", async () => {
 	const { map } = await largeMap();
 	const section = map.slice(map.indexOf("## ops"), map.indexOf("## reflections"));
-	expect(section).toMatch(/_\d+ entries omitted; see ops\/rules\/index\.md_/);
-	expect(section.trimEnd()).toEndWith("- [ops/rules/index.md](ops/rules/index.md)");
+	expect(section).toMatch(/_\d+ entries omitted; see \[the index\]\(ops\/rules\/index\.md\)_/);
+	// The notice link is the only pointer: the index sorts after the rendered entries.
+	expect(section.split("](ops/rules/index.md)")).toHaveLength(2);
 });
 
 test("a trimmed axis without an index states the omitted count without inventing a path", async () => {
@@ -173,7 +174,34 @@ test("a trimmed axis without an index states the omitted count without inventing
 	expect(section).not.toContain("ops/rules/index.md");
 });
 
-test("a small map keeps the historical rendering byte-for-byte", async () => {
+test("every project is mapped when the axis outgrows the recent window, including the alphabetically first", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-map-projects-"));
+	const root = await initializeMemory(home);
+	await writeFile(join(root, "projects/aie-zeitgeist.md"), "# first\n");
+	for (let index = 0; index < 20; index++)
+		await writeFile(join(root, `projects/p-${String(index).padStart(2, "0")}.md`), "# p\n");
+	await regenerateMap(root);
+	const map = await readFile(join(root, "MEMORY.md"), "utf8");
+	const section = map.slice(map.indexOf("## projects"), map.indexOf("## channels"));
+	expect(section).toContain("- [projects/aie-zeitgeist.md](projects/aie-zeitgeist.md)");
+	expect(section.match(/^- \[projects\//gm)).toHaveLength(21);
+	expect(section).not.toContain("omitted");
+});
+
+test("a recent axis over its cap states how many entries the map left out", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-map-recent-cap-"));
+	const root = await initializeMemory(home);
+	for (let day = 1; day <= 22; day++)
+		await writeFile(join(root, `events/2026-10-${String(day).padStart(2, "0")}.md`), "# e\n");
+	await regenerateMap(root);
+	const map = await readFile(join(root, "MEMORY.md"), "utf8");
+	const section = map.slice(map.indexOf("## events"), map.indexOf("## tasks"));
+	expect(section).toContain("- [events/2026-10-22.md](events/2026-10-22.md)");
+	expect(section).not.toContain("events/2026-10-02.md");
+	expect(section).toContain("_2 entries omitted; no index entry found_");
+});
+
+test("a small map is rendered byte-for-byte, including the index policy marker", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-map-small-"));
 	const root = join(home, "memory");
 	await mkdir(join(root, "probe"), { recursive: true });
@@ -193,13 +221,16 @@ test("a small map keeps the historical rendering byte-for-byte", async () => {
 	};
 	await regenerateMap(root, singleAxisRegistry(axis));
 	expect(await readFile(join(root, "MEMORY.md"), "utf8")).toBe(
-		"# Memory map\n\nGenerated pointers; canonical facts live in axis files.\n\n## probe\n\n_Probe_\n\n- [probe/entry.md](probe/entry.md)\n\n",
+		"# Memory map\n\n<!-- memory-index-policy: 78451ddeef02d503 -->\n\nGenerated pointers; canonical facts live in axis files.\n\n## probe\n\n_Probe_\n\n- [probe/entry.md](probe/entry.md)\n\n",
 	);
 });
 
 test("map trimming never emits a partial markdown link line", async () => {
 	const { map } = await largeMap();
-	for (const line of map.split("\n")) if (line.includes("](")) expect(line).toMatch(/^- \[[^\]]+\]\([^)]+\)$/);
+	// Two complete linked forms exist: a bullet and the omission notice's index link.
+	for (const line of map.split("\n"))
+		if (line.includes("]("))
+			expect(line).toMatch(/^(?:- \[[^\]]+\]\([^)]+\)|_\d+ entries omitted; see \[the index\]\([^)]+\)_)$/);
 });
 
 test("a failed git operation reports argv, exit status and stdout, never a bare `failed:` (#192)", async () => {

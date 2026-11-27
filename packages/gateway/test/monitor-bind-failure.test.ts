@@ -7,6 +7,7 @@ import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import type { SessionPort } from "../src/orchestrator/session-port";
+import { SessionContractError } from "../src/orchestrator/session-port";
 import { Store } from "../src/store";
 
 test("bind failure includes operation details in error report", async () => {
@@ -233,6 +234,125 @@ test("setModel failure includes operation details in error report", async () => 
 		expect(detailObj.operation).toBe("setModel");
 		expect(detailObj.operation_args).toBeDefined();
 		expect(detailObj.operation_args?.model).toBe("preset:invalid-preset");
+
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("SessionContractError from setModel includes fixed message in failure detail", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-contract-error-setmodel-"));
+	try {
+		const database = await Store.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "contract-error-test",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.contract_error"],
+			burstPolicy: "serialize",
+			model: { preset: "test-model" },
+		});
+
+		const failingPort: Partial<SessionPort> = {
+			bind: async (input) => ({
+				sessionId: input.originKey,
+				epoch: 0,
+				startupModelApplied: false,
+				originKey: input.originKey,
+				repo: input.repo,
+			}),
+			setModel: async () => {
+				throw new SessionContractError("model.set succeeded without a changed receipt");
+			},
+			runExclusive: async (_, fn) => fn(),
+		};
+
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: failingPort as SessionPort,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			repo: join(home, "workspace"),
+			model: undefined,
+			serviceTier: undefined,
+		});
+
+		const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.contract_error", {});
+
+		// Let dispatch attempt and fail
+		for (let i = 0; i < 100; i++) {
+			const row = database.monitors.eventRows().find((r) => r.event_id === eventId);
+			if (row?.stage === "failed") break;
+			await Bun.sleep(10);
+		}
+
+		// Verify failure was recorded
+		const failure = database.monitors.failure(eventId);
+		expect(failure).toBeDefined();
+
+		// Verify the detail includes the SessionContractError with its message
+		const detail = failure?.detail || "";
+		expect(detail).toContain("SessionContractError");
+		expect(detail).toContain("model.set succeeded without a changed receipt");
+
+		database.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("plain Error from send-step does NOT include message in failure detail", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-plain-error-"));
+	try {
+		const database = await Store.open(join(home, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "plain-error-test",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.plain_error"],
+			burstPolicy: "serialize",
+		});
+
+		const failingPort: Partial<SessionPort> = {
+			bind: async () => {
+				throw new Error("secret /home/user/key");
+			},
+			runExclusive: async (_, fn) => fn(),
+		};
+
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			sessionPort: failingPort as SessionPort,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(database),
+			emit: () => {},
+			repo: join(home, "workspace"),
+			model: undefined,
+			serviceTier: undefined,
+		});
+
+		const eventId = await pipeline.submitAwaitable(monitor.monitorId, "test.plain_error", {});
+
+		// Let dispatch attempt and fail
+		for (let i = 0; i < 100; i++) {
+			const row = database.monitors.eventRows().find((r) => r.event_id === eventId);
+			if (row?.stage === "failed") break;
+			await Bun.sleep(10);
+		}
+
+		// Verify failure was recorded
+		const failure = database.monitors.failure(eventId);
+		expect(failure).toBeDefined();
+
+		// Verify the detail does NOT include the plain Error message
+		// (plain Error is in allowedClasses but NOT in messageSourceClasses)
+		const detail = failure?.detail || "";
+		expect(detail).not.toContain("secret");
+		expect(detail).not.toContain("/home/user/key");
 
 		database.close();
 	} finally {

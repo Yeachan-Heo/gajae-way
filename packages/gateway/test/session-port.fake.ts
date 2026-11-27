@@ -144,7 +144,7 @@ export class ScriptedSessionPort implements SessionPort {
 	readonly inspections: Array<{ sessionId: string; repo: string }> = [];
 	readonly models: Array<{ sessionId: string; repo: string; selection: GjcModelSelection }> = [];
 	readonly serviceTiers: Array<{ sessionId: string; repo: string; tier: GjcServiceTier }> = [];
-	readonly closes: Array<{ sessionId: string; repo: string }> = [];
+	readonly closes: Array<{ sessionId: string; repo: string; ifIdle?: boolean }> = [];
 	/** Per-session close attempts: errors preserve the live host; undefined succeeds. */
 	readonly closeOutcomes = new Map<string, Array<Error | undefined>>();
 	readonly statusReads: Array<{ sessionId: string; repo: string; opRef: string; relayUsed: boolean }> = [];
@@ -215,7 +215,7 @@ export class ScriptedSessionPort implements SessionPort {
 		return this.#sessionStates.get(input.sessionId);
 	}
 
-	async close(input: { sessionId: string; repo: string }): Promise<void> {
+	async close(input: { sessionId: string; repo: string; ifIdle?: boolean }): Promise<void> {
 		this.closes.push(input);
 		const outcome = this.closeOutcomes.get(input.sessionId)?.shift();
 		if (outcome) throw outcome;
@@ -285,12 +285,25 @@ export class ScriptedSessionPort implements SessionPort {
 		this.#activity.set(sessionId, { state, at });
 	}
 
+	readonly #hostIncarnations = new Map<string, string>();
+
+	/** The host process identity `session inspect` reports; a revived host gets a new one. */
+	setHostIncarnation(sessionId: string, hostIncarnation: string): void {
+		this.#hostIncarnations.set(sessionId, hostIncarnation);
+	}
+
 	/** Broker liveness from the scripted state table; an unseeded id is disowned, like an id the broker never indexed. */
 	async liveness(input: { sessionId: string; repo: string }): Promise<SessionLiveness> {
 		const state = this.#sessionStates.get(input.sessionId);
 		if (!state) return { live: undefined, disowned: true };
 		const activity = this.#activity.get(input.sessionId);
-		return { live: state.live, disowned: false, ...(activity ? { activity } : {}) };
+		const hostIncarnation = this.#hostIncarnations.get(input.sessionId);
+		return {
+			live: state.live,
+			disowned: false,
+			...(activity ? { activity } : {}),
+			...(hostIncarnation ? { hostIncarnation } : {}),
+		};
 	}
 
 	async hostExited(input: { sessionId: string; repo: string }): Promise<boolean> {

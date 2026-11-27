@@ -222,6 +222,38 @@ test("Slack partial chunk success makes a later definitive failure uncertain", a
 	]);
 });
 
+test("Slack reports every post, plain or panel, with its origin to the posted-message hook", async () => {
+	const client = new Gateway();
+	const api = new Api();
+	const remembered: unknown[][] = [];
+	const posted = { remember: (...args: unknown[]) => void remembered.push(args) };
+	let next = 0;
+	api.postMessage = async (channel) => ({ channel, ts: `${++next}.000` });
+	const settle = (message: ChatMessagePayload) =>
+		settleSlackDelivery(client, api, message, console, undefined, undefined, undefined, posted);
+	await settle(delivery({ text: "x".repeat(9000) }));
+	// Each chunk is recorded; the first, a possible thread root, carries the whole text.
+	expect(remembered[0]).toEqual([origin, "C1", "1.000", "x".repeat(9000), undefined]);
+	expect(remembered).toHaveLength(next);
+	expect(remembered.slice(1).every(([recorded, , , text]) => recorded === origin && text !== "x".repeat(9000))).toBe(
+		true,
+	);
+	const threaded = { platform: "slack" as const, kind: "thread" as const, conversationId: "C1:1.000", parentId: "C1" };
+	await settle(delivery({ origin: threaded, text: "in thread" }));
+	expect(remembered.at(-1)).toEqual([threaded, "C1", `${next}.000`, "in thread", "1.000"]);
+	await settle(
+		delivery({
+			askUserPanel: {
+				panelId: "q_1",
+				question: "Choose",
+				expiresAt: "2099-01-01T00:00:00Z",
+				options: [{ id: "a", label: "A" }],
+			},
+		}),
+	);
+	expect(remembered.at(-1)).toEqual([origin, "C1", `${next}.000`, expect.stringContaining("Choose"), undefined]);
+});
+
 test("Slack complete settlements serialize one origin while unrelated origins continue after failure", async () => {
 	const client = new Gateway();
 	const api = new Api();
@@ -649,9 +681,8 @@ for (const shape of [
 			await f.event({ ...inbound(shape) });
 			const dm = shape.channel === "D1";
 			const thread = "thread_ts" in shape;
-			// A thread rooted at the bot's own message routes to the channel session (see decideInbound),
-			// while replyTo still names the thread so the answer lands where the human wrote.
-			const threadSession = thread && shape.parent_user_id !== "UBOT";
+			// Every reply keeps its thread session, including one under the bot's own message.
+			const threadSession = thread;
 			expect(f.client.requests).toEqual([
 				{
 					verb: "chat.send",
@@ -728,7 +759,7 @@ const appMention = (extra: Record<string, unknown> = {}) => ({
 const chatSends = (gateway: Gateway) =>
 	gateway.requests.filter((r) => r.verb === "chat.send").map((r) => r.params as Record<string, unknown>);
 
-test("Slack forwards prepared native images and delivers resize notices only after an engaged chat.send", async () => {
+test("Slack forwards prepared native images without posting an extra message", async () => {
 	const f = await fixture(undefined, {
 		imageFetch: async () => new Response(ONE_PIXEL_PNG, { status: 200, headers: { "content-type": "image/png" } }),
 	});
@@ -763,15 +794,8 @@ test("Slack forwards prepared native images and delivers resize notices only aft
 		expect(sends).toHaveLength(2);
 		expect(sends[0]?.images).toHaveLength(1);
 		expect(sends[1]?.images).toHaveLength(1);
-		expect(sends[0]?.text).not.toContain("Image preparation notice");
 		expect(sends[0]?.text).not.toContain("files.slack.com");
-		expect(f.api.posts).toEqual([
-			[
-				"C1",
-				"Image adjustment: Images resized/compressed for model input; fine detail may be lost.",
-				"1699999999.000001",
-			],
-		]);
+		expect(f.api.posts).toEqual([]);
 		await f.event({
 			...inbound({
 				ts: "1700000001.123456",
@@ -781,13 +805,13 @@ test("Slack forwards prepared native images and delivers resize notices only aft
 			}),
 		});
 		expect(chatSends(f.client)).toHaveLength(2);
-		expect(f.api.posts).toHaveLength(1);
+		expect(f.api.posts).toEqual([]);
 		f.client.turnId = null;
 		await f.event({
 			...inbound({ ts: "1700000002.123456", thread_ts: "1699999999.000001", parent_user_id: "UBOT", files: [file] }),
 		});
 		expect(chatSends(f.client)).toHaveLength(3);
-		expect(f.api.posts).toHaveLength(1);
+		expect(f.api.posts).toEqual([]);
 	} finally {
 		f.socket.stop();
 	}
@@ -989,16 +1013,21 @@ test("Slack mention, open-channel and parent-bot promotion; bot authors remain m
 	});
 });
 
-test("Slack thread reply under the bot's own message continues the channel session; a human-rooted thread stays isolated", () => {
-	// Reply threaded under the bot's answer: origin collapses to the channel (same session), while
-	// replyTo still names the thread so the answer lands where the human wrote.
+test("Slack thread replies keep their own thread session whoever posted the root", () => {
+	// Reply threaded under the bot's answer: its own thread session, never the channel's, and
+	// replyTo marks the root as ours.
 	const underBot = decideInbound(
 		inbound({ ts: "1700000002.000000", thread_ts: "1700000001.000000", parent_user_id: "UBOT", text: "and then?" }),
 		identity,
 		names,
 		undefined,
 	);
-	expect(underBot?.origin).toEqual({ platform: "slack", kind: "channel", conversationId: "C1" });
+	expect(underBot?.origin).toEqual({
+		platform: "slack",
+		kind: "thread",
+		conversationId: "C1:1700000001.000000",
+		parentId: "C1",
+	});
 	expect(underBot?.engagement.replyTo).toEqual({ messageId: "C1:1700000001.000000", authorId: "UBOT", fromSelf: true });
 	expect(underBot?.engagement.mentioned).toBe(true);
 	expect(underBot?.engagement.explicitMention).toBe(false);
@@ -1411,6 +1440,109 @@ test("Slack inbound reactions carry action metadata and ignore the bot", async (
 	}
 });
 
+test("Slack reactions follow the session their target message was routed to", async () => {
+	const f = await fixture();
+	try {
+		const root = "1700000001.000000";
+		const thread = { platform: "slack", kind: "thread", conversationId: `C1:${root}`, parentId: "C1" };
+		await f.event({ ...inbound({ ts: "1700000002.000001", text: "reply", thread_ts: root, parent_user_id: "UBOT" }) });
+		const react = (ts: string) =>
+			f.event({
+				type: "reaction_added",
+				user: "U1",
+				reaction: "+1",
+				item: { type: "message", channel: "C1", ts },
+				event_ts: "1700000009.000000",
+			});
+		await react("1700000002.000001");
+		// A message the adapter never routed keeps the channel fallback.
+		await react("1700000003.000001");
+		const reactions = f.client.requests.filter((request) => request.verb === "engagement.reaction");
+		expect(reactions.map((request) => (request.params as { origin: unknown }).origin)).toEqual([thread, origin]);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("Slack reactions to the bot's own file share follow the delivery that uploaded it, matched by file id", async () => {
+	const { mkdir, mkdtemp, writeFile, realpath, rm } = await import("node:fs/promises");
+	const home = await mkdtemp(join(tmpdir(), "slack-file-share-"));
+	const f = await fixture();
+	try {
+		// Same name and destination; only the bytes tell the two uploads apart.
+		const fileWith = async (dir: string, body: string) => {
+			await mkdir(join(home, dir));
+			const path = join(home, dir, "reply.txt");
+			await writeFile(path, body);
+			return { path: await realpath(path), name: "reply.txt", size: body.length };
+		};
+		const threadFile = await fileWith("t", "thread");
+		const channelFile = await fileWith("c", "channel");
+		const root = "1700000001.000000";
+		const thread = { platform: "slack", kind: "thread", conversationId: `C1:${root}`, parentId: "C1" } as const;
+		// Both uploads reserve an id and then hang: Slack's share events arrive before either HTTP response.
+		const pending: (() => void)[] = [];
+		const reservedOrder: string[] = [];
+		f.api.uploadFile = (
+			_channel: string,
+			upload: { readonly bytes: Uint8Array },
+			_threadTs?: string,
+			_comment?: string,
+			onReserved?: (fileId: string) => void,
+		) => {
+			const fileId = new TextDecoder().decode(upload.bytes) === "thread" ? "F1" : "F2";
+			reservedOrder.push(fileId);
+			onReserved?.(fileId);
+			const { promise, resolve } = Promise.withResolvers<void>();
+			pending.push(resolve);
+			return promise;
+		};
+		const push = (message: ChatMessagePayload) => {
+			for (const handler of f.client.handlers) handler(message);
+		};
+		// A thread-session upload, and a channel-session turn uploading the same name into that same thread.
+		push(delivery({ deliveryId: "thread-file", origin: thread, file: threadFile }));
+		push(delivery({ deliveryId: "channel-file", replyToMessageId: `C1:${root}`, file: channelFile }));
+		for (let i = 0; i < 200 && pending.length < 2; i++) await Bun.sleep(5);
+		expect(pending).toHaveLength(2);
+		const share = (ts: string, id: string) =>
+			f.event({
+				...inbound({ ts, text: "", thread_ts: root, user: "UBOT" }),
+				subtype: "file_share",
+				files: [{ id, name: "reply.txt" }],
+			});
+		// The events land in the reverse of upload order, and before either upload answers.
+		const [first = "", second = ""] = reservedOrder;
+		await share("1700000004.000001", second);
+		await share("1700000004.000002", first);
+		// An own share with no recorded upload stays unknown.
+		await share("1700000004.000003", "F9");
+		for (const resolve of pending) resolve();
+		const react = (ts: string) =>
+			f.event({
+				type: "reaction_added",
+				user: "U1",
+				reaction: "+1",
+				item: { type: "message", channel: "C1", ts },
+				event_ts: "1700000009.000000",
+			});
+		await react("1700000004.000001");
+		await react("1700000004.000002");
+		await react("1700000004.000003");
+		expect(chatSends(f.client)).toHaveLength(0);
+		const reactions = f.client.requests.filter((request) => request.verb === "engagement.reaction");
+		const originOf = (fileId: string) => (fileId === "F1" ? thread : origin);
+		expect(reactions.map((request) => (request.params as { origin: unknown }).origin)).toEqual([
+			originOf(second),
+			originOf(first),
+			origin,
+		]);
+	} finally {
+		f.socket.stop();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
 test("Slack reaction request rejection does not reconnect the healthy client", async () => {
 	const log = spyOn(console, "error").mockImplementation(() => {});
 	try {
@@ -1740,7 +1872,10 @@ test("Slack shares image admission between live conversations and recovery witho
 		expect(await f.recoverMissedMessages()).toBe(true);
 		expect(downloads).toBe(3);
 		expect((await loadRecoveryCursors(f.recoveryCursorPath)).recoveredThrough.C1).toBe("1700000040.000001");
-		expect(chatSends(f.client).filter((send) => send.text === "recovered\n[image · photo.png]")).toHaveLength(1);
+		const recovered = chatSends(f.client).filter((send) => send.text === "recovered\n[image · photo.png]");
+		expect(recovered).toHaveLength(1);
+		expect(recovered[0]?.images).toHaveLength(1);
+		expect(f.api.posts).toEqual([]);
 	} finally {
 		release();
 		f.socket.stop();
@@ -1782,6 +1917,196 @@ test("Slack retains a failed image job's slot until its sibling download settles
 		expect(downloads).toBe(2);
 		expect(chatSends(f.client)).toEqual([]);
 		expect(f.logs).toContain("Slack image input preparation failed; chat.send was not dispatched.");
+	} finally {
+		release();
+		await f.ingress.drain();
+		f.socket.stop();
+	}
+});
+
+test("Slack recovery advances past a live-delivered image without downloading it again", async () => {
+	let downloads = 0;
+	const f = await fixture(
+		{ C1: { engagement: "open" } },
+		{
+			autoRecover: false,
+			imageFetch: async () => {
+				downloads++;
+				return downloads === 1 ? new Response(ONE_PIXEL_PNG) : new Response("expired", { status: 404 });
+			},
+		},
+	);
+	const message = inbound({
+		ts: "1700000040.000001",
+		files: [{ name: "photo.png", mimetype: "image/png", url_private: "https://files.slack.com/photo.png" }],
+	});
+	try {
+		await f.event({ ...message });
+		f.api.history.C1 = [{ ...message }];
+		expect(await f.recoverMissedMessages()).toBe(true);
+		expect(downloads).toBe(1);
+		expect(chatSends(f.client)).toHaveLength(1);
+		const cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.recoveredThrough.C1).toBe(message.ts);
+		expect(cursors.deadLetters).toHaveLength(0);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("Slack recovery skips acknowledged images when a budget-limited pass is retried", async () => {
+	let clock = 0;
+	const monotonic = spyOn(performance, "now").mockImplementation(() => clock);
+	let downloads = 0;
+	const f = await fixture(
+		{ C1: { engagement: "open" } },
+		{
+			autoRecover: false,
+			imageFetch: async () => {
+				downloads++;
+				return new Response(ONE_PIXEL_PNG);
+			},
+		},
+	);
+	try {
+		f.client.engaged = false;
+		f.api.history.C1 = Array.from({ length: 9 }, (_, index) => ({
+			...inbound({ ts: `17000000${String(40 + index)}.000001` }),
+			files: [{ name: "photo.png", mimetype: "image/png", url_private: "https://files.slack.com/photo.png" }],
+		})).reverse();
+		expect(await f.recoverMissedMessages()).toBe(false);
+		expect(downloads).toBe(8);
+		expect((await loadRecoveryCursors(f.recoveryCursorPath)).recoveredThrough.C1).toBeUndefined();
+		expect(await f.recoverMissedMessages()).toBe(false);
+		expect(downloads).toBe(8);
+		clock = 60_001;
+		expect(await f.recoverMissedMessages()).toBe(true);
+		expect(downloads).toBe(9);
+		expect(chatSends(f.client)).toHaveLength(9);
+		expect((await loadRecoveryCursors(f.recoveryCursorPath)).recoveredThrough.C1).toBe("1700000048.000001");
+	} finally {
+		f.socket.stop();
+		monotonic.mockRestore();
+	}
+});
+
+test.each([true, false])("Slack recovery joins live image preparation, success=%s", async (succeeds) => {
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let started!: () => void;
+	const downloading = new Promise<void>((resolve) => {
+		started = resolve;
+	});
+	let downloads = 0;
+	const f = await fixture(
+		{ C1: { engagement: "open" } },
+		{
+			autoRecover: false,
+			imageFetch: async () => {
+				downloads++;
+				started();
+				await held;
+				return succeeds || downloads > 1 ? new Response(ONE_PIXEL_PNG) : new Response("unavailable", { status: 503 });
+			},
+		},
+	);
+	const message = inbound({
+		ts: "1700000040.000001",
+		files: [{ name: "photo.png", mimetype: "image/png", url_private: "https://files.slack.com/photo.png" }],
+	});
+	try {
+		await f.handleEvent({ ...message });
+		await downloading;
+		let joined!: () => void;
+		const joining = new Promise<void>((resolve) => {
+			joined = resolve;
+		});
+		const requestPrepared = f.gateway.requestPrepared.bind(f.gateway);
+		spyOn(f.gateway, "requestPrepared").mockImplementation((...args) => {
+			const result = requestPrepared(...args);
+			joined();
+			return result;
+		});
+		f.api.history.C1 = [{ ...message }];
+		const recovery = f.recoverMissedMessages();
+		await joining;
+		expect(downloads).toBe(1);
+		expect(chatSends(f.client)).toHaveLength(0);
+		expect((await loadRecoveryCursors(f.recoveryCursorPath)).recoveredThrough.C1).toBeUndefined();
+		release();
+		expect(await recovery).toBe(succeeds);
+		await f.ingress.drain();
+		if (!succeeds) {
+			expect((await loadRecoveryCursors(f.recoveryCursorPath)).recoveredThrough.C1).toBeUndefined();
+			expect(await f.recoverMissedMessages()).toBe(true);
+		}
+		expect(downloads).toBe(succeeds ? 1 : 2);
+		expect(chatSends(f.client)).toHaveLength(1);
+		expect((await loadRecoveryCursors(f.recoveryCursorPath)).recoveredThrough.C1).toBe(message.ts);
+	} finally {
+		release();
+		await f.ingress.drain();
+		f.socket.stop();
+	}
+});
+
+test.each([404, 503])("Slack live image survives recovery's failed snapshot, status=%s", async (status) => {
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let started!: () => void;
+	const downloading = new Promise<void>((resolve) => {
+		started = resolve;
+	});
+	const urls: string[] = [];
+	const f = await fixture(
+		{ C1: { engagement: "open" } },
+		{
+			autoRecover: false,
+			imageFetch: async (input) => {
+				urls.push(String(input));
+				if (String(input).endsWith("/old.png")) {
+					started();
+					await held;
+					return new Response("unavailable", { status });
+				}
+				return new Response(ONE_PIXEL_PNG);
+			},
+		},
+	);
+	const image = { name: "photo.png", mimetype: "image/png" };
+	const message = inbound({
+		ts: "1700000040.000001",
+		files: [{ ...image, url_private: "https://files.slack.com/old.png" }],
+	});
+	try {
+		f.api.history.C1 = [{ ...message }];
+		const recovery = f.recoverMissedMessages();
+		await downloading;
+		let joined!: () => void;
+		const joining = new Promise<void>((resolve) => {
+			joined = resolve;
+		});
+		const requestPrepared = f.gateway.requestPrepared.bind(f.gateway);
+		spyOn(f.gateway, "requestPrepared").mockImplementation((...args) => {
+			const result = requestPrepared(...args);
+			joined();
+			return result;
+		});
+		await f.handleEvent({ ...message, files: [{ ...image, url_private: "https://files.slack.com/new.png" }] });
+		await joining;
+		release();
+		expect(await recovery).toBe(false);
+		await f.ingress.drain();
+		expect(urls).toEqual(["https://files.slack.com/old.png", "https://files.slack.com/new.png"]);
+		expect(chatSends(f.client)).toHaveLength(1);
+		expect(await f.recoverMissedMessages()).toBe(true);
+		const cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.recoveredThrough.C1).toBe(message.ts);
+		expect(cursors.deadLetters).toHaveLength(0);
 	} finally {
 		release();
 		await f.ingress.drain();
@@ -1859,7 +2184,7 @@ test("Slack recovery retains image messages and the watermark after a transient 
 			text: expect.stringContaining("inspect this"),
 			images: [{ mimeType: "image/jpeg" }],
 		});
-		expect(f.api.posts).toHaveLength(1);
+		expect(f.api.posts).toEqual([]);
 	} finally {
 		f.socket.stop();
 		f.recovery.stop();
@@ -1928,12 +2253,72 @@ test("Slack recovery joins a still-pending live send instead of calling it a dup
 	}
 });
 
-test("Slack bot-root threads remain recoverable after a restart and the root leaves channel history", async () => {
+test("Slack never looks up a cold root for a reply the gateway refused", async () => {
+	const f = await fixture();
+	try {
+		let lookups = 0;
+		f.api.conversationsReplies = async (_channel: string, _ts: string, options?: { oldest?: string }) => {
+			if (options?.oldest === undefined) lookups++;
+			return { messages: [], has_more: false };
+		};
+		f.client.engaged = false;
+		await f.event({
+			...inbound({ ts: "1700000002.000001", text: "hi", thread_ts: "1700000001.000000", parent_user_id: "UBOT" }),
+		});
+		await Bun.sleep(0);
+		expect(chatSends(f.client)).toHaveLength(1);
+		expect(lookups).toBe(0);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("Slack bot-root replies never wait for the root text; later replies quote it once fetched", async () => {
+	const f = await fixture();
+	try {
+		const root = "1700000001.000000";
+		let lookups = 0;
+		const { promise: rootFetched, resolve: releaseRoot } = Promise.withResolvers<void>();
+		f.api.conversationsReplies = async (_channel: string, ts: string, options?: { oldest?: string }) => {
+			// Thread recovery reads the root too (from `oldest`); count only the header lookup.
+			if (options?.oldest === undefined) lookups++;
+			await rootFetched;
+			return {
+				messages: ts === root ? [{ type: "message", user: "UBOT", ts: root, text: "IOPS-1 work\nthread" }] : [],
+				has_more: false,
+			};
+		};
+		const reply = (ts: string, text: string) => inbound({ ts, text, thread_ts: root, parent_user_id: "UBOT" });
+		// The lookup is still pending: both replies are delivered at once, without a quote.
+		await f.event({ ...reply("1700000002.000001", "first") });
+		await f.event({ ...reply("1700000003.000001", "second") });
+		expect(chatSends(f.client).map((send) => (send.engagement as { replyTo?: unknown }).replyTo)).toEqual([
+			{ messageId: `C1:${root}`, authorId: "UBOT", fromSelf: true },
+			{ messageId: `C1:${root}`, authorId: "UBOT", fromSelf: true },
+		]);
+		expect(lookups).toBe(1);
+		releaseRoot();
+		await Bun.sleep(0);
+		await f.event({ ...reply("1700000004.000001", "third") });
+		expect((chatSends(f.client).at(-1)?.engagement as { replyTo?: unknown } | undefined)?.replyTo).toEqual({
+			messageId: `C1:${root}`,
+			authorId: "UBOT",
+			fromSelf: true,
+			excerpt: "IOPS-1 work thread",
+		});
+		expect(lookups).toBe(1);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("Slack bot-root threads keep their thread session and stay recoverable after a restart", async () => {
 	for (const initial of ["live", "recovered"]) {
 		const channels = { C1: { engagement: "mention-open" as const } };
 		const f = await fixture(channels, { autoRecover: false });
 		let resumed: Awaited<ReturnType<typeof fixture>> | undefined;
 		const root = "1700000001.000000";
+		const threadOrigin = { platform: "slack", kind: "thread", conversationId: `C1:${root}`, parentId: "C1" };
 		const rootMessage = { type: "message", user: "UBOT", ts: root, text: "bot parent", reply_count: 1 };
 		const firstReply = inbound({
 			ts: "1700000030.000001",
@@ -1949,7 +2334,10 @@ test("Slack bot-root threads remain recoverable after a restart and the root lea
 			if (initial === "live") await f.event({ ...firstReply });
 			f.api.history.C1 = [{ ...inbound({ ts: "1700000050.000001", text: "later channel context" }) }, rootMessage];
 			expect(await f.recoverMissedMessages()).toBe(true);
-			expect(chatSends(f.client).find((send) => send.text === "@UBOT first reply")).toMatchObject({ origin });
+			expect(chatSends(f.client).find((send) => send.text === "@UBOT first reply")).toMatchObject({
+				origin: threadOrigin,
+				engagement: { replyTo: { fromSelf: true } },
+			});
 			const saved = await loadRecoveryCursors(f.recoveryCursorPath);
 			expect(saved.recoveredThrough.C1).toBe("1700000050.000001");
 			expect(saved.participatedThreads[`C1:${root}`]).toBeDefined();
@@ -1966,7 +2354,7 @@ test("Slack bot-root threads remain recoverable after a restart and the root lea
 			});
 			expect(await resumed.recoverMissedMessages()).toBe(true);
 			expect(chatSends(resumed.client)).toHaveLength(1);
-			expect(chatSends(resumed.client)[0]).toMatchObject({ origin, text: "@UBOT late reply" });
+			expect(chatSends(resumed.client)[0]).toMatchObject({ origin: threadOrigin, text: "@UBOT late reply" });
 			const recovered = await loadRecoveryCursors(resumed.recoveryCursorPath);
 			expect(recovered.participatedThreads[`C1:${root}`]?.through).toBe("1700000060.000001");
 		} finally {

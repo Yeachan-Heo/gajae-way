@@ -8,9 +8,14 @@ import { GjcCommandQueueTimeoutError } from "../src/orchestrator/broker";
 import { isDefinitiveSteerRejection } from "../src/orchestrator/persona-session";
 import {
 	BrokerSessionPort,
+	isPermanentBindFailure,
+	isPermanentRefusal,
 	MAX_POISONED_CREATE_ROTATIONS,
 	ModelNotSelectedError,
+	ModelPartiallyAppliedError,
+	modelRefusalCode,
 	SessionBusyStalledError,
+	SessionContractError,
 	SessionRequestTimeoutError,
 } from "../src/orchestrator/session-port";
 import {
@@ -608,6 +613,48 @@ test("model thinking suffix is applied on create and explicit model changes", as
 	expect(calls.findIndex((args) => args.includes("inspect"))).toBeLessThan(
 		calls.findIndex((args) => args.includes("thinking.set")),
 	);
+});
+
+test("control setters without a boolean changed receipt throw SessionContractError with fixed text", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-contract-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	const malformed = new Set<string>();
+	const run: CliRunner = async (args) => {
+		if (args.includes("session.create"))
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "contract-1" } }), stderr: "" };
+		for (const op of ["model.profile.set", "model.set", "thinking.set", "service_tier.set"])
+			if (args.includes(op)) {
+				const changed = malformed.has(op) ? "yes" : false;
+				return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { changed } }), stderr: "" };
+			}
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: run,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	const binding = await port.bind({ originKey: "discord/dm/contract", epoch: 0, repo });
+	const target = { sessionId: binding.sessionId, repo };
+	const cases: Array<[string, () => Promise<unknown>]> = [
+		["model.profile.set", () => port.setModel({ ...target, selection: { preset: "gpt-heavy" } })],
+		["model.set", () => port.setModel({ ...target, selection: "openai-codex/gpt-5.5" })],
+		["thinking.set", () => port.setModel({ ...target, selection: "openai-codex/gpt-5.5:high" })],
+		["service_tier.set", () => port.setServiceTier({ ...target, tier: "default" })],
+	];
+	for (const [op, call] of cases) {
+		malformed.clear();
+		malformed.add(op);
+		const error = await call().then(
+			() => undefined,
+			(caught: unknown) => caught,
+		);
+		expect(error).toBeInstanceOf(SessionContractError);
+		expect((error as Error).message).toBe(`${op} succeeded without a changed receipt`);
+	}
 });
 
 test("broker SessionPort reuses the durable epoch binding and does not recreate a session", async () => {
@@ -2140,8 +2187,11 @@ test("request keeps observing an accepted op on the CLI when its relay tears mid
 // tool activity the whole way, and were killed as SessionRequestTimeoutError
 // at the 1800 s mark with the work still landing. The wait is an inactivity
 // lease: frames attributed to the turn refresh it; silence still ends it.
-for (const progressing of [true, false]) {
-	test(`request wait is an activity lease: a turn that keeps emitting ${progressing ? "survives past" : "is not spared when silent for"} waitTimeoutMs`, async () => {
+// Uncorrelated session broadcasts (lifecycle/idle hints that reach every relay)
+// are not the turn's activity and must not extend it.
+for (const traffic of ["correlated", "silent", "uncorrelated"] as const) {
+	const progressing = traffic === "correlated";
+	test(`request wait is an activity lease: a turn with ${traffic} traffic ${progressing ? "survives past" : "is not spared past"} waitTimeoutMs`, async () => {
 		home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 		database = await Store.open(join(home, "gateway.db"));
 		const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
@@ -2178,8 +2228,12 @@ for (const progressing of [true, false]) {
 			now: () => clock,
 			sleep: async (ms) => {
 				clock += ms;
-				if (progressing)
+				if (traffic === "correlated")
 					relay.streams[0]!.host({ type: "event", kind: "tool_execution_update", ...ids, payload: { event: {} } });
+				else if (traffic === "uncorrelated") {
+					relay.streams[0]!.host({ type: "agent_end" });
+					relay.streams[0]!.host({ type: "activity", state: "idle" });
+				}
 				// Let the pushed frame reach the handle before the next deadline check.
 				await Bun.sleep(1);
 			},
@@ -2417,8 +2471,7 @@ test("runCompaction gives gjc's own request the compaction budget and reports a 
 	// One five-minute deadline end to end: the process bound (CLI slot wait included)
 	// is the whole budget, and gjc's request ends a little earlier so its reply is read.
 	expect(calls[0]!.timeoutMs).toBe(300_000);
-	expect(requestBudgetMs).toBeGreaterThan(40_000);
-	expect(requestBudgetMs).toBeLessThan(calls[0]!.timeoutMs!);
+	expect(requestBudgetMs).toBe(285_000);
 
 	// gjc's request timeout settles only the client; the host may still be compacting.
 	respond = async () => ({ exitCode: 1, stdout: commandError("timeout", "unknown"), stderr: "" });
@@ -2486,7 +2539,7 @@ test("runCompaction on the relay reports whether the host's ordered dispatcher a
 	reply = async () => ({ ok: false, error: { code: "internal", message: "Control operation failed." } });
 	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "internal", answered: true });
 	// Refused before ordered dispatch: the run never started and proves nothing about earlier ones.
-	for (const code of ["session_quiescing", "not_activated", "operation_not_session_owned"]) {
+	for (const code of ["session_quiescing", "not_activated", "operation_not_session_owned", "operation_prohibited"]) {
 		reply = async () => ({ ok: false, error: { code, message: "refused" } });
 		expect(await port.runCompaction(target)).toEqual({ status: "failed", code });
 	}
@@ -2507,4 +2560,192 @@ test("runCompaction on the relay reports whether the host's ordered dispatcher a
 		throw new RelayClosedError("sdk-1", "relay not open", false);
 	};
 	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "relay_unwritten" });
+});
+
+test("a permanent model refusal from the real CLI envelope is classified as a refusal; a refused thinking level after model.set is not", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-model-refusal-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database!, join(home, "agent"));
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "model", epoch: 0 });
+	// gjc 0.21's public command-error envelope for an unknown preset (2026-11-20 incident).
+	const usageRefusal = JSON.stringify({
+		schema: "gjc.command-error",
+		version: 1,
+		ok: false,
+		command: ["sdk", "session", "raw", "control"],
+		error: {
+			code: "usage",
+			category: "usage",
+			message: "The command arguments are invalid.",
+			retryability: "no",
+			outcomeCertainty: "not-applied",
+			references: [{ kind: "sessionId", value: "sdk-1" }],
+		},
+		complete: true,
+	});
+	const run: CliRunner = async (args) => {
+		if (args.includes("model.profile.set") || args.includes("thinking.set"))
+			return { exitCode: 1, stdout: usageRefusal, stderr: "" };
+		if (args.includes("model.set"))
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { changed: true } }), stderr: "" };
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		database: database!,
+		authority,
+		cli: run,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	const target = { sessionId: "sdk-1", repo };
+
+	const refused = await port.setModel({ ...target, selection: { preset: "@gajae_way_bot" } }).then(
+		() => undefined,
+		(error: unknown) => error,
+	);
+	expect(isPermanentRefusal(refused)).toBe(true);
+	expect(modelRefusalCode(refused as GjcCliError)).toBe("usage");
+
+	// model.set landed before thinking.set was refused: the live model changed, so this is not "not applied".
+	const partial = await port.setModel({ ...target, selection: "provider/model:max" }).then(
+		() => undefined,
+		(error: unknown) => error,
+	);
+	expect(partial).toBeInstanceOf(ModelPartiallyAppliedError);
+	expect((partial as ModelPartiallyAppliedError).code).toBe("usage");
+	expect(isPermanentRefusal(partial)).toBe(false);
+});
+
+test("a permanently refused session.create keeps that verdict through sanitization and retires its intent so a corrected bind creates", async () => {
+	let createCalls = 0;
+	const createKeys: string[] = [];
+	const run: CliRunner = async (args) => {
+		if (args.includes("session.create")) {
+			createCalls++;
+			createKeys.push(args[args.indexOf("--idempotency-key") + 1] ?? "");
+			const input = JSON.parse(args[args.indexOf("--json-input") + 1] ?? "{}") as { modelPreset?: string };
+			if (input.modelPreset === "missing-preset")
+				return {
+					exitCode: 1,
+					stdout: JSON.stringify({
+						schema: "gjc.command-error",
+						version: 1,
+						ok: false,
+						command: ["sdk", "session", "raw", "global"],
+						error: {
+							code: "usage",
+							category: "usage",
+							message: "The command arguments are invalid. See /Users/someone/.gjc/agent/models.yml",
+							retryability: "no",
+							outcomeCertainty: "not-applied",
+							references: [],
+						},
+						complete: true,
+					}),
+					stderr: "",
+				};
+			return createSuccess("corrected-preset-session");
+		}
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						session: { sessionId: args.at(-1), live: true, deleted: false, locator: { cwd: "/tmp/workspace" } },
+					},
+				}),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const { port, repo, database } = await brokerPortFixture(run);
+	const originKey = "telegram/topic/refused-preset";
+
+	const refused = await port.bind({ originKey, epoch: 0, repo, model: { preset: "missing-preset" } }).then(
+		() => undefined,
+		(error: unknown) => error,
+	);
+	expect(isPermanentBindFailure(refused)).toBe(true);
+	expect(modelRefusalCode(refused as GjcCliError)).toBe("usage");
+	expect(database.bindings.getSessionRecord(originKey)?.sessionId).toBeFalsy();
+
+	// The refused create left no pending intent, so a corrected default starts a fresh create.
+	await expect(port.bind({ originKey, epoch: 0, repo, model: { preset: "good-preset" } })).resolves.toMatchObject({
+		sessionId: "corrected-preset-session",
+		epoch: 0,
+	});
+	expect(createCalls).toBe(2);
+	expect(new Set(createKeys).size).toBe(2);
+});
+
+test("a permanent refusal while replaying an ambiguous create keeps its original key and request", async () => {
+	const createKeys: string[] = [];
+	const createPresets: Array<string | undefined> = [];
+	let answer: "ambiguous" | "refused" | "created" = "ambiguous";
+	const run: CliRunner = async (args) => {
+		if (args.includes("session.create")) {
+			createKeys.push(args[args.indexOf("--idempotency-key") + 1] ?? "");
+			createPresets.push(
+				(JSON.parse(args[args.indexOf("--json-input") + 1] ?? "{}") as { modelPreset?: string }).modelPreset,
+			);
+			if (answer === "created") return createSuccess("replayed-session");
+			const refused = answer === "refused";
+			return {
+				exitCode: 1,
+				stdout: JSON.stringify({
+					schema: "gjc.command-error",
+					version: 1,
+					ok: false,
+					command: ["sdk", "session", "raw", "global"],
+					error: {
+						code: refused ? "usage" : "operation_failed",
+						category: refused ? "usage" : "operation",
+						message: "failure",
+						retryability: refused ? "no" : "unknown",
+						outcomeCertainty: refused ? "not-applied" : "unknown",
+						references: [],
+					},
+					complete: true,
+				}),
+				stderr: "",
+			};
+		}
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						session: { sessionId: args.at(-1), live: true, deleted: false, locator: { cwd: "/tmp/workspace" } },
+					},
+				}),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const { port, repo } = await brokerPortFixture(run);
+	const originKey = "telegram/topic/ambiguous-create";
+
+	// The first create may have landed: its key stays pending.
+	await expect(port.bind({ originKey, epoch: 0, repo, model: { preset: "a" } })).rejects.toBeInstanceOf(GjcCliError);
+	const original = createKeys[0]!;
+
+	// Replaying it (same input) and replacing it (new input) are both refused; neither settles the original attempt.
+	answer = "refused";
+	const sameInput = await port.bind({ originKey, epoch: 0, repo, model: { preset: "a" } }).then(
+		() => undefined,
+		(error: unknown) => error,
+	);
+	expect(isPermanentBindFailure(sameInput)).toBe(true);
+	await expect(port.bind({ originKey, epoch: 0, repo, model: { preset: "b" } })).rejects.toBeInstanceOf(GjcCliError);
+	expect(createKeys).toEqual([original, original, original]);
+	expect(createPresets).toEqual(["a", "a", "a"]);
+
+	// When the broker finally answers the original key, that session is the binding: no replacement was minted.
+	answer = "created";
+	await expect(port.bind({ originKey, epoch: 0, repo, model: { preset: "a" } })).resolves.toMatchObject({
+		sessionId: "replayed-session",
+	});
+	expect(new Set(createKeys)).toEqual(new Set([original]));
 });

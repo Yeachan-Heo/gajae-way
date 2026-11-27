@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initializeMemory, memoryRoot, regenerateMap } from "../src/memory/doctrine";
@@ -70,6 +70,31 @@ test("a strong hit pulls its crosslinked neighbour in as a discounted secondary 
 	const tight = await searchMemory(root, "cutover 결정", 1);
 	expect(tight).toHaveLength(1);
 	expect(tight[0]?.path).toBe("decisions/cutover.md");
+});
+
+test("an already-listed index pointer is mapped once so search cannot return it twice", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-index-pointer-"));
+	try {
+		const root = await initializeMemory(home);
+		// 201 projects: `projects/index.md` sorts inside the 200-entry rendered prefix
+		// and the last z- file is the one entry left out.
+		await writeFile(join(root, "projects/index.md"), "# Project index\n\nzqxunique project navigation entry.\n");
+		for (let index = 0; index < 200; index++)
+			await writeFile(join(root, `projects/z-${String(index).padStart(3, "0")}.md`), `# project ${index}\n`);
+		await regenerateMap(root);
+
+		const map = await readFile(join(root, "MEMORY.md"), "utf8");
+		const section = map.slice(map.indexOf("## projects"), map.indexOf("## channels"));
+		// The omission notice still points at the index, but the index pointer itself
+		// is not repeated: it was already rendered above the notice.
+		expect(section).toMatch(/_1 entry omitted; see the index above_/);
+		expect(section.split("](projects/index.md)")).toHaveLength(2);
+
+		const hits = await searchMemory(root, "zqxunique", 2);
+		expect(hits.map((hit) => hit.path)).toEqual(["projects/index.md"]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
 });
 
 test("tags boost ranking and pull tag-group neighbours in as secondary hits", async () => {

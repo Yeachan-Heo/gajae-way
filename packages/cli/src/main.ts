@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 import type {
 	MonitorEventOperatorResult,
@@ -24,7 +24,14 @@ import type {
 	WorkStatusResult,
 	WorkSteerResult,
 } from "@gajae-gateway/protocol";
-import { LOOPBACK_ORIGIN, OPS_CYCLE_MAX_LIMIT, originKey, WORK_JOBS_MAX_LIMIT } from "@gajae-gateway/protocol";
+import {
+	isWorkRefusalCause,
+	LOOPBACK_ORIGIN,
+	OPS_CYCLE_MAX_LIMIT,
+	originKey,
+	ProtocolError,
+	WORK_JOBS_MAX_LIMIT,
+} from "@gajae-gateway/protocol";
 
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
@@ -60,13 +67,41 @@ import {
 	serviceUsage,
 } from "./services";
 import { type RunSetupOptions, runSetup } from "./setup";
-import { parseUpdateArgs, renderUpdate, runUpdate, type UpdateDeps } from "./update";
+import { parseUpdateArgs, readPinnedGjcVersion, renderUpdate, runUpdate, type UpdateDeps } from "./update";
 
 async function connectGatewaySocket(
 	path: string,
 	options: { readonly requestTimeoutMs?: number } = {},
 ): Promise<GajaewayClient> {
 	return GajaewayClient.connectSocketWithBackoff(path, { ...options, deadlineMs: 30_000 });
+}
+
+function successorRefusalMessage(error: unknown): string | undefined {
+	if (!(error instanceof ProtocolError) || error.code !== "invalid_params") return undefined;
+	const detail = error.detail;
+	if (typeof detail !== "object" || detail === null || Array.isArray(detail) || !("reasonCode" in detail))
+		return undefined;
+	const reason = detail.reasonCode;
+	if (error.message === "isolated successor refused") {
+		switch (reason) {
+			case "successor_name_already_bound":
+			case "successor_source_changed":
+			case "successor_already_authorized":
+			case "successor_repository_mismatch":
+			case "successor_request_mismatch":
+			case "successor_report_owner_mismatch":
+			case "successor_requires_missing_execution_end":
+				return `${error.message}: ${reason}`;
+		}
+	}
+	if (
+		error.message === "successor already designated; inspect the original linked lane" &&
+		reason === "successor_already_authorized"
+	)
+		return `${error.message}: successor_already_authorized`;
+	if (error.message === "successor checkout does not match the reviewed commit" && reason === "successor_base_mismatch")
+		return `${error.message}: successor_base_mismatch`;
+	return undefined;
 }
 
 export function socketPath(home = process.env.GAJAEWAY_HOME): string {
@@ -96,7 +131,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--limit N] [--offset N] [--json]|ops integrity|ops restart-stack [--status|--recover --confirm-service-manager-settled]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
+	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] [--successor-of NAME --source-op REF --source-session ID --acknowledge-unresolved (start only; requires --repo and --base FULL_SHA; no --cwd/--resume)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--limit N] [--offset N] [--json]|ops integrity|ops restart-stack [--status|--recover --confirm-service-manager-settled]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -639,6 +674,13 @@ async function chat(socket: string): Promise<void> {
 	}
 }
 
+export interface PollMemoryOpClock {
+	/** Epoch ms used for the CLI wait deadline. Defaults to Date.now. */
+	readonly now?: () => number;
+	/** Wait between status polls. Defaults to setTimeout. */
+	readonly sleep?: (ms: number) => Promise<void>;
+}
+
 /**
  * Poll for memory operation completion. Memory operations (audit, autolink) are
  * long-running and return an opRef immediately; this function polls for the result.
@@ -649,11 +691,14 @@ export async function pollMemoryOp(
 	opRef: string,
 	maxWaitMs = 300_000, // 5 min default CLI timeout
 	pollIntervalMs = 1_000,
+	clock: PollMemoryOpClock = {},
 ): Promise<{ status: "completed" | "failed" | "still_running"; elapsedMs: number; result?: unknown; error?: string }> {
-	const startTime = Date.now();
+	const now = clock.now ?? Date.now;
+	const sleep = clock.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+	const startTime = now();
 	let operationElapsedMs = 0;
 
-	while (Date.now() - startTime < maxWaitMs) {
+	while (now() - startTime < maxWaitMs) {
 		const status = await client.request<{
 			status: "pending" | "completed" | "failed";
 			elapsedMs: number;
@@ -671,11 +716,11 @@ export async function pollMemoryOp(
 		}
 
 		// Wait before polling again
-		await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+		await sleep(pollIntervalMs);
 	}
 
 	// CLI wait expired, but operation may still be running on the server
-	const waitedMs = Date.now() - startTime;
+	const waitedMs = now() - startTime;
 	console.error(
 		`memory operation still running (${Math.round(operationElapsedMs / 1000)}s operation elapsed; CLI wait ended after ${Math.round(waitedMs / 1000)}s).\nCheck status: gajaeway memory status ${opRef}`,
 	);
@@ -798,6 +843,20 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					const home = gatewayHome();
 					const flag = parsed.rest[1];
 					if (flag === "--run" && parsed.rest.length === 3 && parsed.rest[2]) {
+						// Resolve the gjc version to pin after broker restart: the explicit
+						// env override wins, otherwise read the release manifest's pin.
+						let gjcVersionToPinAfterBrokerRestart = process.env.GAJAEWAY_GJC_VERSION_TO_PIN;
+						if (gjcVersionToPinAfterBrokerRestart === undefined) {
+							const binDir = process.env.GAJAEWAY_BIN_DIR;
+							if (binDir !== undefined) {
+								try {
+									gjcVersionToPinAfterBrokerRestart = await readPinnedGjcVersion(join(binDir, "package.json"));
+								} catch {
+									// Without a readable release manifest, restart without a pin flip.
+								}
+							}
+						}
+
 						const receipt = await runRestartStack({
 							...options.restartStack?.run,
 							home,
@@ -806,6 +865,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 							...(process.env.GAJAEWAY_LAUNCH_AGENTS_DIR === undefined
 								? {}
 								: { launchAgentsDir: process.env.GAJAEWAY_LAUNCH_AGENTS_DIR }),
+							...(gjcVersionToPinAfterBrokerRestart === undefined ? {} : { gjcVersionToPinAfterBrokerRestart }),
 						});
 						for (const line of renderRestartReceipt(receipt)) console.log(line);
 						if (receipt.state !== "ok") process.exitCode = 1;
@@ -1008,7 +1068,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			case "work": {
 				const [command, ...args] = parsed.rest;
 				const usage =
-					'usage: gajaeway work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] "<task text>"|status <name>|steer <name> <text>|retire <name>|jobs|directive add "<text>"|directive list|directive remove <id>';
+					'usage: gajaeway work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--successor-of NAME --source-op REF --source-session ID --acknowledge-unresolved (start only; requires --repo and --base FULL_SHA; no --cwd/--resume)] "<task text>"|status <name>|steer <name> <text>|retire <name>|jobs|directive add "<text>"|directive list|directive remove <id>';
 				if (command === "directive") {
 					const [action, ...rest] = args;
 					const text = rest.join(" ").trim();
@@ -1052,7 +1112,22 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					const client = await connectGatewaySocket(parsed.socket);
 					try {
 						if (command === "status") {
-							console.log(JSON.stringify(await client.request<WorkStatusResult>("work.status", { name })));
+							try {
+								console.log(JSON.stringify(await client.request<WorkStatusResult>("work.status", { name })));
+							} catch (error) {
+								if (
+									error instanceof ProtocolError &&
+									typeof error.detail === "object" &&
+									error.detail !== null &&
+									"reasonCode" in error.detail &&
+									error.detail.reasonCode === "unknown_work_lane"
+								) {
+									throw new Error(
+										"unknown work lane; a previous start or run may still be admitted after a timeout or disconnect. Do not blindly retry, even with the same name; continue observing and reconcile the original request.",
+									);
+								}
+								throw error;
+							}
 						} else {
 							const result = await client.request<WorkSteerResult>("work.steer", { name, text });
 							console.log(result.steered ? `steered: ${result.clientRef}` : `not steered: ${result.reason}`);
@@ -1153,6 +1228,10 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				let repo: string | undefined;
 				let base: string | undefined;
 				let model: string | { preset: string } | undefined;
+				let sourceName: string | undefined;
+				let sourceOpRef: string | undefined;
+				let sourceSessionId: string | undefined;
+				let acknowledgeUnresolved = false;
 				const textParts: string[] = [];
 				for (let i = 1; i < args.length; i++) {
 					const arg = args[i];
@@ -1172,6 +1251,22 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 							if (model !== undefined) throw new Error(`${usage}\n--model and --preset are mutually exclusive`);
 							model = arg === "--preset" ? { preset: value } : value;
 						}
+					} else if (arg === "--successor-of" || arg === "--source-op" || arg === "--source-session") {
+						const value = args[++i];
+						if (!value?.trim() || value.startsWith("--")) throw new Error(usage);
+						if (arg === "--successor-of") {
+							if (sourceName !== undefined) throw new Error(usage);
+							sourceName = value;
+						} else if (arg === "--source-op") {
+							if (sourceOpRef !== undefined) throw new Error(usage);
+							sourceOpRef = value;
+						} else {
+							if (sourceSessionId !== undefined) throw new Error(usage);
+							sourceSessionId = value;
+						}
+					} else if (arg === "--acknowledge-unresolved") {
+						if (acknowledgeUnresolved) throw new Error(usage);
+						acknowledgeUnresolved = true;
 					} else if (arg === "--resume") resume = true;
 					else if (arg?.startsWith("--")) throw new Error(usage);
 					else textParts.push(arg as string);
@@ -1179,8 +1274,37 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				const text = textParts.join(" ").trim();
 				if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) || !text) throw new Error(usage);
 				if (base !== undefined && repo === undefined) throw new Error(usage);
+				let successorOf: WorkStartParams["successorOf"];
+				if (
+					sourceName !== undefined ||
+					sourceOpRef !== undefined ||
+					sourceSessionId !== undefined ||
+					acknowledgeUnresolved
+				) {
+					if (
+						command !== "start" ||
+						!sourceName ||
+						!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(sourceName) ||
+						sourceName === name ||
+						!sourceOpRef ||
+						!sourceSessionId ||
+						!acknowledgeUnresolved ||
+						repo === undefined ||
+						base === undefined ||
+						!/^[a-f0-9]{40}$/.test(base) ||
+						cwd !== undefined ||
+						resume
+					)
+						throw new Error(usage);
+					successorOf = {
+						name: sourceName,
+						opRef: sourceOpRef,
+						sessionId: sourceSessionId,
+						acknowledgeUnresolved: true,
+					};
+				}
 				// This is a caller response-wait budget, never an attempt deadline.
-				// Timeout/disconnect leaves the attempt observable via work.status.
+				// Timeout/disconnect does not cancel admission or an accepted attempt.
 				const client = await connectGatewaySocket(parsed.socket, {
 					requestTimeoutMs: command === "run" ? 3_600_000 : 120_000,
 				});
@@ -1193,14 +1317,22 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						...(repo ? { repo } : {}),
 						...(base ? { base } : {}),
 						...(resume ? { resume: true } : {}),
+						...(successorOf === undefined ? {} : { successorOf }),
 						...(model === undefined ? {} : { model }),
 						...(callerSessionId ? { callerSessionId } : {}),
 					};
 					if (command === "start") {
-						const result = await client.request<WorkStartResult>("work.start", params);
+						let result: WorkStartResult;
+						try {
+							result = await client.request<WorkStartResult>("work.start", params);
+						} catch (error) {
+							const message = successorOf === undefined ? undefined : successorRefusalMessage(error);
+							if (message !== undefined) throw new Error(message);
+							throw error;
+						}
 						if (result.started) {
 							console.log(
-								`started: ${result.sessionKey} session=${result.sessionId} job=${result.jobId} op=${result.opRef}`,
+								`${result.alreadyStarted ? "already started" : "started"}: ${result.sessionKey} session=${result.sessionId} job=${result.jobId} op=${result.opRef}`,
 							);
 						} else {
 							console.log(`HELD: ${result.reason}\njob: ${result.jobId} state: ${result.state}`);
@@ -1261,7 +1393,26 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				throw new Error(CLI_USAGE);
 		}
 	} catch (error) {
-		console.error(error instanceof Error ? error.message : String(error));
+		// The SDK and CLI may load different physical copies of the protocol package.
+		const protocolError =
+			error instanceof Error && error.name === "ProtocolError" && "code" in error && error.code === "verb_failed";
+		const detail = protocolError && "detail" in error ? error.detail : undefined;
+		if (
+			parsed.command === "work" &&
+			(parsed.rest[0] === "run" || parsed.rest[0] === "start") &&
+			protocolError &&
+			typeof detail === "object" &&
+			detail !== null &&
+			!Array.isArray(detail) &&
+			"reasonCode" in detail &&
+			detail.reasonCode === "send_rejected"
+		) {
+			// Never print structured detail or a remote refusal message. Only these
+			// exact diagnostic tokens are safe; none implies automatic replay.
+			const cause = "cause" in detail ? detail.cause : undefined;
+			const safeCause = isWorkRefusalCause(cause);
+			console.error(`work send rejected${safeCause ? ` cause=${cause}` : ""}`);
+		} else console.error(error instanceof Error ? error.message : String(error));
 		process.exitCode = 1;
 	}
 }

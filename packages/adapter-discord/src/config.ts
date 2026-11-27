@@ -86,6 +86,13 @@ export interface DiscordAdapterConfig {
 	readonly tokenFile: string;
 	readonly gatewaySocket?: string;
 	readonly intents?: readonly number[];
+	/**
+	 * How often the connected adapter re-resolves its application's owners
+	 * (milliseconds, #862 finding 3). Omitting it uses the 10-minute default
+	 * (`APP_OWNER_REFRESH_INTERVAL_MS`); the field exists mainly so tests can
+	 * shrink the interval instead of waiting ten minutes.
+	 */
+	readonly appOwnerRefreshIntervalMs?: number;
 	readonly channels?: Readonly<Record<string, DiscordChannelPolicy>>;
 	/** Absolute or config-relative directories permitted for outbound MEDIA files. Omitted disables file uploads. */
 	readonly mediaDirectories?: readonly string[];

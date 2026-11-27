@@ -1,4 +1,6 @@
 export {
+	type AdapterOwnersParams,
+	type AdapterOwnersResult,
 	type AgentDiskView,
 	type BurstPolicyKind,
 	type ChatMessagePayload,
@@ -32,6 +34,7 @@ export {
 	isShutupToken,
 	isSilenceToken,
 	isSilentOutput,
+	isWorkRefusalCause,
 	type LaneCapacityDetail,
 	type MemoryAuditResult,
 	type MemoryAutolinkResult,
@@ -87,6 +90,7 @@ export {
 	type VerbName,
 	WORK_JOBS_DEFAULT_LIMIT,
 	WORK_JOBS_MAX_LIMIT,
+	WORK_REFUSAL_CODES,
 	type WorkDirective,
 	type WorkDirectiveParams,
 	type WorkDirectiveResult,

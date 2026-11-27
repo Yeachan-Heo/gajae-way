@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
-import { NAVIGATION_SOURCE_MAX_BYTES } from "../src/memory/registry";
+import { indexPolicyMarker } from "../src/memory/doctrine";
+import { loadRegistry, NAVIGATION_SOURCE_MAX_BYTES } from "../src/memory/registry";
 import { buildSessionBootstrap, SESSION_BOOTSTRAP_MAX_BYTES } from "../src/persona/bootstrap";
 
 const ORIGIN = { platform: "discord", kind: "channel", conversationId: "c1" } as const;
@@ -29,6 +30,20 @@ async function setup(): Promise<GatewayConfig> {
 		mentionAllowlist: ["owner-2", "owner-1"],
 		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "owner", peerId: "owner" } },
 	};
+}
+
+/** The marker a current gateway stamps into every generated navigation map. */
+async function policyMarker(): Promise<string> {
+	return indexPolicyMarker(await loadRegistry(join(home, "memory")));
+}
+
+/**
+ * Write a navigation map that a current gateway would accept. A fixture without
+ * the index-policy marker is stale by definition: bootstrap would repair it once
+ * and replace the hand-written links these tests assert on.
+ */
+async function writeMap(body: string): Promise<void> {
+	await writeFile(join(home, "memory", "MEMORY.md"), `${await policyMarker()}\n${body}`);
 }
 
 async function build(config: GatewayConfig, epoch = 0) {
@@ -93,10 +108,7 @@ describe("session bootstrap builder", () => {
 			join(home, "memory", "channels", "other.md"),
 			"origin-key: discord/channel/other\nbootstrap-safe: public\nother room",
 		);
-		await writeFile(
-			join(home, "memory", "MEMORY.md"),
-			"# Navigation\n- [Owner](people/owner.md)\n- [Other room](channels/other.md)",
-		);
+		await writeMap("# Navigation\n- [Owner](people/owner.md)\n- [Other room](channels/other.md)");
 		const result = await build(config);
 		expect(result.text).not.toContain("people/owner.md");
 		expect(result.text).not.toContain("channels/other.md");
@@ -188,10 +200,7 @@ describe("session bootstrap builder", () => {
 		const outside = join(home, "outside.md");
 		await writeFile(outside, "ESCAPED SECRET");
 		await symlink(outside, join(home, "memory", "channels", "escape.md"));
-		await writeFile(
-			join(home, "memory", "MEMORY.md"),
-			"# Map\n- [bad](%2e%2e/outside.md)\n- [escape](channels/escape.md)",
-		);
+		await writeMap("# Map\n- [bad](%2e%2e/outside.md)\n- [escape](channels/escape.md)");
 		const result = await build(config);
 		expect(result.text).not.toContain("ESCAPED SECRET");
 		expect(result.text).not.toContain("%2e%2e/outside.md");
@@ -207,7 +216,7 @@ describe("session bootstrap builder", () => {
 			"origin-key: discord/channel/c1\nbootstrap-safe: public\ncurrent",
 		);
 		await writeFile(join(home, "outside.md"), "outside");
-		await writeFile(join(home, "memory", "MEMORY.md"), "# Map\n- [safe](channels/c1.md) and [private](../outside.md)");
+		await writeMap("# Map\n- [safe](channels/c1.md) and [private](../outside.md)");
 		const result = await build(config);
 		expect(result.text).toContain("[safe](channels/c1.md)");
 		expect(result.text).not.toContain("../outside.md");
@@ -237,10 +246,7 @@ describe("session bootstrap builder", () => {
 		);
 		await mkdir(join(home, "memory", "ops", "rules"), { recursive: true });
 		await writeFile(join(home, "memory", "ops", "rules", "safe.md"), "safe rule");
-		await writeFile(
-			join(home, "memory", "MEMORY.md"),
-			"# password=hunter2\n- [api_key=map-token](channels/c1.md) secret=adjacent-map",
-		);
+		await writeMap("# password=hunter2\n- [api_key=map-token](channels/c1.md) secret=adjacent-map");
 		await writeFile(
 			join(home, "memory", "ops", "rules", "index.md"),
 			"# Authorization: Bearer rules-token\n- [token=rules-token](safe.md) password=adjacent-rules",
@@ -256,7 +262,7 @@ describe("session bootstrap builder", () => {
 	test("navigation headings cannot emit traversal or private pointer strings", async () => {
 		const config = await setup();
 		await mkdir(join(home, "memory", "ops", "rules"), { recursive: true });
-		await writeFile(join(home, "memory", "MEMORY.md"), "# [private map](../outside.md)");
+		await writeMap("# [private map](../outside.md)");
 		await writeFile(join(home, "memory", "ops", "rules", "index.md"), "# [private rules](../../outside.md)");
 		const result = await build(config);
 		expect(result.text).toContain("# Memory navigation");
@@ -280,10 +286,7 @@ describe("session bootstrap builder", () => {
 		);
 		await mkdir(join(home, "memory", "ops", "rules"), { recursive: true });
 		await writeFile(join(home, "memory", "ops", "rules", "safe.md"), "safe rule");
-		await writeFile(
-			join(home, "memory", "MEMORY.md"),
-			"# Map\n- [a\u2060pi_key=MAP-CREDENTIAL](channels/c1.md)\n- [xoxb-abc\u2060defgh](channels/c1.md)",
-		);
+		await writeMap("# Map\n- [a\u2060pi_key=MAP-CREDENTIAL](channels/c1.md)\n- [xoxb-abc\u2060defgh](channels/c1.md)");
 		await writeFile(
 			join(home, "memory", "ops", "rules", "index.md"),
 			"# Rules\n- [sec\u200cret=RULES-CREDENTIAL](safe.md)\n- [pk_te\u200bst_abcdefgh](safe.md)",
@@ -319,15 +322,17 @@ describe("session bootstrap builder", () => {
 		await rm(join(home, "memory"), { recursive: true, force: true });
 		const canonical = join(home, "canonical-memory");
 		await mkdir(canonical, { recursive: true });
-		await writeFile(join(canonical, "MEMORY.md"), "# Navigation\n- [Rules](ops/rules/index.md)");
+		// The link goes in first so the marker is written through the canonical
+		// directory, which is where the configured root resolves.
 		await symlink(canonical, join(home, "memory"));
+		await writeMap("# Navigation\n- [Rules](ops/rules/index.md)");
 		const result = await build(config);
 		expect(result.includedSections).toContain("Memory navigation map");
 	});
 
 	test("uses whole sections at the deterministic 8 KiB boundary with multibyte UTF-8 diagnostics", async () => {
 		const config = await setup();
-		await writeFile(join(home, "memory", "MEMORY.md"), `# Navigation\n- [${"한글".repeat(3000)}](channels/c1.md)`);
+		await writeMap(`# Navigation\n- [${"한글".repeat(3000)}](channels/c1.md)`);
 		await writeFile(
 			join(home, "memory", "channels", "c1.md"),
 			`origin: discord/channel/c1\nbootstrap-safe: public\n${"🦞".repeat(1800)}`,
@@ -344,13 +349,20 @@ describe("session bootstrap builder", () => {
 
 	test("accepts a navigation source exactly at the shared byte ceiling", async () => {
 		const config = await setup();
-		const prefix = "# Navigation\n";
+		// The marker and its newline are bytes in the file, so the fill has to leave
+		// room for them to land exactly on the ceiling instead of over it.
+		const prefix = `${await policyMarker()}\n# Navigation\n`;
 		await writeFile(
 			join(home, "memory", "MEMORY.md"),
 			`${prefix}${"x".repeat(NAVIGATION_SOURCE_MAX_BYTES - Buffer.byteLength(prefix, "utf8"))}`,
 		);
 		const result = await build(config);
+		expect(Buffer.byteLength(await readFile(join(home, "memory", "MEMORY.md"), "utf8"), "utf8")).toBe(
+			NAVIGATION_SOURCE_MAX_BYTES,
+		);
 		expect(result.diagnostics).not.toContain("MEMORY.md: source_too_large");
+		expect(result.diagnostics).not.toContain("MEMORY.md: stale_index_policy");
+		expect(result.includedSections).toContain("Memory navigation map");
 	});
 
 	test("re-reads source edits for a later epoch", async () => {

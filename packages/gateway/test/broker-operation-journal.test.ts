@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliResult, type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
-import { BrokerSessionPort } from "../src/orchestrator/session-port";
+import { BrokerSessionPort, isSessionBusy } from "../src/orchestrator/session-port";
 import { TailRunner, type TailStreamSpawner } from "../src/orchestrator/tail-runner";
 import { Store } from "../src/store";
 import { BROKER_PROMPT_BUSY_REFUSAL, type BrokerAuthority } from "../src/store/groups/bindings";
@@ -44,9 +44,12 @@ class FakeBroker {
 	readonly createKeys: string[] = [];
 	readonly createInputs: string[] = [];
 	readonly closeKeys: string[] = [];
+	readonly closeInputs: string[] = [];
 	readonly closedSessionIds: string[] = [];
 	readonly dead = new Set<string>();
 	dieAfterApply = false;
+	/** Idle-fenced closes refuse `busy` (not applied) while set, like gjc's atomic idle check. */
+	busy = false;
 	#sessions = 0;
 
 	readonly cli: CliRunner = async (args) => {
@@ -60,10 +63,21 @@ class FakeBroker {
 		}
 		if (args.includes("session.close")) {
 			this.closeKeys.push(key);
+			const input = args[args.indexOf("--json-input") + 1] ?? "{}";
+			this.closeInputs.push(input);
+			if (this.busy && (JSON.parse(input) as { ifIdle?: unknown }).ifIdle === true)
+				return {
+					exitCode: 1,
+					stdout: JSON.stringify({
+						ok: false,
+						error: { code: "busy", outcomeCertainty: "not-applied", retryability: "yes" },
+					}),
+					stderr: "",
+				};
 			// The broker's own idempotency: one key closes once.
 			if (!this.closes.has(key)) {
 				this.closes.set(key, this.closes.size + 1);
-				const request = JSON.parse(args[args.indexOf("--json-input") + 1] ?? "{}") as { sessionId?: unknown };
+				const request = JSON.parse(input) as { sessionId?: unknown };
 				if (typeof request.sessionId === "string") this.closedSessionIds.push(request.sessionId);
 			}
 			return this.#reply({ closed: true, closeNumber: this.closes.get(key) });
@@ -711,14 +725,18 @@ test("bind clears a stale pending close when inspection confirms a resumed host 
 	const sessionId = "sdk-live-after-resume";
 	const originKey = "lane/live-after-resume";
 	await createOwnedSessionFixture(database!, authority, { sessionId, repo, originKey, epoch: 0 });
-	database!.transaction((tx) =>
-		database!.bindings.beginBrokerOperation(tx, authority, {
-			operation: "session.close",
-			scope: sessionId,
-			operationRef: "gw-close-stale",
-			requestJson: JSON.stringify({ sessionId }),
-		}),
-	);
+	for (const [operation, operationRef] of [
+		["session.close", "gw-close-stale"],
+		["session.close_if_idle", "gw-close-idle-stale"],
+	] as const)
+		database!.transaction((tx) =>
+			database!.bindings.beginBrokerOperation(tx, authority, {
+				operation,
+				scope: sessionId,
+				operationRef,
+				requestJson: JSON.stringify({ sessionId }),
+			}),
+		);
 	const closeKeys: string[] = [];
 	const cli: CliRunner = async (args) => {
 		if (args.includes("inspect"))
@@ -742,6 +760,10 @@ test("bind clears a stale pending close when inspection confirms a resumed host 
 	await port.close({ sessionId, repo });
 	expect(closeKeys).toHaveLength(1);
 	expect(closeKeys[0]).not.toBe("gw-close-stale");
+	expect(database!.bindings.brokerOperation(authority, "session.close_if_idle", sessionId)).toBeUndefined();
+	await port.close({ sessionId, repo, ifIdle: true });
+	expect(closeKeys).toHaveLength(2);
+	expect(closeKeys[1]).not.toBe("gw-close-idle-stale");
 });
 
 test("a finished create is never served to a later bind after the lane's session died", async () => {
@@ -1657,6 +1679,144 @@ test("session.close interrupted after the broker applied it replays its key once
 	});
 });
 
+test("idle-fenced and forced closes are journaled as distinct operations with distinct requests", async () => {
+	const { path, authority, repo } = await setup();
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/c", epoch: 0 });
+	const broker = new FakeBroker();
+	const gateway = await openGateway(path, authority, broker);
+
+	await gateway.port.close({ sessionId: "sdk-1", repo, ifIdle: true });
+	await gateway.port.close({ sessionId: "sdk-1", repo });
+
+	expect(broker.closeInputs).toEqual([
+		JSON.stringify({ sessionId: "sdk-1", ifIdle: true }),
+		JSON.stringify({ sessionId: "sdk-1" }),
+	]);
+	expect(broker.closeKeys[0]).toStartWith("gw-close-idle-");
+	expect(broker.closeKeys[1]).toStartWith("gw-close-");
+	expect(broker.closeKeys[1]).not.toStartWith("gw-close-idle-");
+	// A completed idle close does not stand in for a forced close, nor the reverse.
+	expect(broker.closes.size).toBe(2);
+	expect(gateway.database.bindings.brokerOperation(authority, "session.close_if_idle", "sdk-1")).toMatchObject({
+		state: "complete",
+		operationRef: broker.closeKeys[0],
+		requestJson: JSON.stringify({ sessionId: "sdk-1", ifIdle: true }),
+	});
+	expect(gateway.database.bindings.brokerOperation(authority, "session.close", "sdk-1")).toMatchObject({
+		state: "complete",
+		operationRef: broker.closeKeys[1],
+		requestJson: JSON.stringify({ sessionId: "sdk-1" }),
+	});
+	expect(journalRows(path).filter((row) => row.scope === "sdk-1")).toEqual([
+		{ operation: "session.close", scope: "sdk-1", state: "complete" },
+		{ operation: "session.close_if_idle", scope: "sdk-1", state: "complete" },
+	]);
+});
+
+test("an idle-fenced close refused busy releases its intent and never falls back to a forced close", async () => {
+	const { path, authority, repo } = await setup();
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/c", epoch: 0 });
+	const broker = new FakeBroker();
+	const gateway = await openGateway(path, authority, broker);
+	broker.busy = true;
+
+	const refusal = await gateway.port.close({ sessionId: "sdk-1", repo, ifIdle: true }).catch((error: unknown) => error);
+	expect(isSessionBusy(refusal)).toBe(true);
+	expect(broker.closeInputs).toEqual([JSON.stringify({ sessionId: "sdk-1", ifIdle: true })]);
+	expect(broker.closedSessionIds).toEqual([]);
+	expect(gateway.database.bindings.brokerOperation(authority, "session.close_if_idle", "sdk-1")).toBeUndefined();
+	expect(gateway.database.bindings.brokerOperation(authority, "session.close", "sdk-1")).toBeUndefined();
+
+	broker.busy = false;
+	await gateway.port.close({ sessionId: "sdk-1", repo, ifIdle: true });
+	expect(broker.closeKeys).toHaveLength(2);
+	expect(broker.closeKeys[1]).not.toBe(broker.closeKeys[0]);
+	expect(broker.closeInputs[1]).toBe(JSON.stringify({ sessionId: "sdk-1", ifIdle: true }));
+	expect(broker.closedSessionIds).toEqual(["sdk-1"]);
+});
+
+test("an interrupted idle-fenced close replays as idle-fenced under its original key", async () => {
+	const { path, authority, repo } = await setup();
+	await createOwnedSessionFixture(database!, authority, { sessionId: "sdk-1", repo, originKey: "lane/c", epoch: 0 });
+	const broker = new FakeBroker();
+	let gateway = await openGateway(path, authority, broker);
+	broker.dieAfterApply = true;
+	await expect(gateway.port.close({ sessionId: "sdk-1", repo, ifIdle: true })).rejects.toThrow("broker_unavailable");
+	expect(gateway.database.bindings.brokerOperation(authority, "session.close_if_idle", "sdk-1")).toMatchObject({
+		state: "pending",
+	});
+
+	gateway = await openGateway(path, authority, broker);
+	await gateway.port.close({ sessionId: "sdk-1", repo, ifIdle: true });
+	expect(broker.closeKeys).toEqual([broker.closeKeys[0]!, broker.closeKeys[0]!]);
+	expect(broker.closeInputs).toEqual([
+		JSON.stringify({ sessionId: "sdk-1", ifIdle: true }),
+		JSON.stringify({ sessionId: "sdk-1", ifIdle: true }),
+	]);
+	expect(broker.closes.size).toBe(1);
+	expect(gateway.database.bindings.brokerOperation(authority, "session.close", "sdk-1")).toBeUndefined();
+});
+
+test("schema 43 migrates existing journal rows and admits the idle-fenced close kind", async () => {
+	const { path, authority } = await setup();
+	database!.transaction((tx) =>
+		database!.bindings.beginBrokerOperation(tx, authority, {
+			operation: "session.close",
+			scope: "sdk-legacy",
+			operationRef: "gw-close-legacy",
+			requestJson: JSON.stringify({ sessionId: "sdk-legacy" }),
+		}),
+	);
+	database!.close();
+	database = undefined;
+	const legacy = new Database(path);
+	legacy.exec(`
+		CREATE TABLE broker_operations_v42 (
+			authority_key TEXT NOT NULL,
+			operation TEXT NOT NULL CHECK(operation IN ('session.create','turn.prompt','session.close')),
+			scope TEXT NOT NULL,
+			operation_ref TEXT NOT NULL,
+			request_json TEXT NOT NULL,
+			state TEXT NOT NULL CHECK(state IN ('pending','complete')),
+			result_json TEXT,
+			created_at TEXT NOT NULL,
+			completed_at TEXT,
+			PRIMARY KEY(authority_key, operation, scope),
+			CHECK((state = 'complete' AND result_json IS NOT NULL AND completed_at IS NOT NULL) OR (state = 'pending' AND result_json IS NULL AND completed_at IS NULL))
+		);
+		INSERT INTO broker_operations_v42 SELECT * FROM broker_operations;
+		DROP TABLE broker_operations;
+		ALTER TABLE broker_operations_v42 RENAME TO broker_operations;
+		CREATE INDEX broker_operations_completed ON broker_operations(state, completed_at);
+		DELETE FROM schema_migrations WHERE version = 43;
+	`);
+	expect(() =>
+		legacy
+			.query(
+				"INSERT INTO broker_operations(authority_key, operation, scope, operation_ref, request_json, state, created_at) VALUES ('k', 'session.close_if_idle', 's', 'r', '{}', 'pending', 'now')",
+			)
+			.run(),
+	).toThrow("CHECK constraint failed");
+	legacy.close();
+
+	database = await Store.open(path);
+	expect(database.bindings.brokerOperation(authority, "session.close", "sdk-legacy")).toMatchObject({
+		state: "pending",
+		operationRef: "gw-close-legacy",
+	});
+	const store = database;
+	expect(
+		store.transaction((tx) =>
+			store.bindings.beginBrokerOperation(tx, authority, {
+				operation: "session.close_if_idle",
+				scope: "sdk-legacy",
+				operationRef: "gw-close-idle-new",
+				requestJson: JSON.stringify({ sessionId: "sdk-legacy", ifIdle: true }),
+			}),
+		),
+	).toMatchObject({ operation: "session.close_if_idle", state: "pending", resumed: false });
+});
+
 // Store group: the bindings.ts broker-operation methods, driven directly.
 
 const at = (offsetMs: number) => new Date(Date.now() + offsetMs).toISOString();
@@ -2099,7 +2259,10 @@ test("releaseBrokerOperation drops only the row of the exact ref, pending or com
 test("pruneBrokerOperations retains create intents and pending prompts at any age", async () => {
 	const { path, authority } = await setup();
 	const store = database!;
-	const begin = (operation: "session.create" | "turn.prompt" | "session.close", scope: string) =>
+	const begin = (
+		operation: "session.create" | "turn.prompt" | "session.close" | "session.close_if_idle",
+		scope: string,
+	) =>
 		store.transaction((tx) =>
 			store.bindings.beginBrokerOperation(tx, authority, {
 				operation,
@@ -2114,10 +2277,13 @@ test("pruneBrokerOperations retains create intents and pending prompts at any ag
 	begin("session.create", "create-done");
 	begin("turn.prompt", "prompt-done");
 	begin("session.close", "close-done");
+	begin("session.close_if_idle", "idle-close-pending");
+	begin("session.close_if_idle", "idle-close-done");
 	for (const [operation, scope] of [
 		["session.create", "create-done"],
 		["turn.prompt", "prompt-done"],
 		["session.close", "close-done"],
+		["session.close_if_idle", "idle-close-done"],
 	] as const)
 		store.transaction((tx) =>
 			store.bindings.completeBrokerOperation(tx, authority, operation, scope, `ref-${scope}`, "{}"),
@@ -2127,19 +2293,21 @@ test("pruneBrokerOperations retains create intents and pending prompts at any ag
 
 	// Cutoffs before every row: nothing is old enough.
 	expect(prune(at(-60_000), at(-60_000))).toBe(0);
-	expect(journalRows(path)).toHaveLength(6);
+	expect(journalRows(path)).toHaveLength(8);
 
-	// Only the completed cutoff has passed: the create and every pending intent stay.
-	expect(prune(at(60_000), at(-60_000))).toBe(2);
+	// Only the completed cutoff has passed: the completed create stays as unreconciled
+	// evidence, and every pending intent (forced or idle-fenced) stays.
+	expect(prune(at(60_000), at(-60_000))).toBe(3);
 	expect(journalRows(path)).toEqual([
 		{ operation: "session.close", scope: "close-pending", state: "pending" },
+		{ operation: "session.close_if_idle", scope: "idle-close-pending", state: "pending" },
 		{ operation: "session.create", scope: "create-done", state: "complete" },
 		{ operation: "session.create", scope: "create-pending", state: "pending" },
 		{ operation: "turn.prompt", scope: "prompt-pending", state: "pending" },
 	]);
 
-	// Only pending close intents expire; a prompt's missing reconciliation record never authorizes a resend.
-	expect(prune(at(60_000), at(60_000))).toBe(1);
+	// Only pending close intents (forced and idle-fenced) expire; a prompt's missing reconciliation record never authorizes a resend.
+	expect(prune(at(60_000), at(60_000))).toBe(2);
 	expect(journalRows(path)).toEqual([
 		{ operation: "session.create", scope: "create-done", state: "complete" },
 		{ operation: "session.create", scope: "create-pending", state: "pending" },

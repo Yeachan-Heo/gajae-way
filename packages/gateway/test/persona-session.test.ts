@@ -5,9 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PromptImage } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
+import type { GjcModelSelection } from "../src/config";
 import {
 	AGENT_RUN_GRACE_MS,
 	AGENT_RUN_MAX_MS,
+	COMPACTION_HOLD_ESCALATED,
+	COMPACTION_UNRESOLVED_ATTEMPTS,
+	deterministicBindHoldDeliveryId,
 	freshTurnAttempt,
 	PERSONA_COMPACTION_TOKENS,
 	PERSONA_PREAMBLE_REFRESH_SENDS,
@@ -17,11 +21,13 @@ import {
 	resetFailedTurn,
 	retryInboundTurn,
 	STALLED_TURN_TERMINAL_TIMEOUT_MS,
+	UNRESOLVED_HOLD_ESCALATED,
 } from "../src/orchestrator/persona-session";
 import { formatFailureNotice } from "../src/orchestrator/rebind";
 import {
 	BrokerSessionPort,
 	ModelNotSelectedError,
+	type SessionBindInput,
 	type SessionCompactionInput,
 	type SessionCompactionResult,
 	type SessionCompactionStatus,
@@ -124,6 +130,7 @@ async function harness(
 		failure?: (message: string, forceFailureNotice?: boolean) => void;
 		failureError?: (error: Error) => void;
 		modelRefusal?: (input: PersonaFailureInput) => void;
+		effectiveModel?: GjcModelSelection;
 		imagesFor?: (triggerMessageId: string) => readonly PromptImage[] | undefined;
 		onFrame?: (frame: TailFrame) => boolean | void;
 		contextMessageIds?: readonly string[];
@@ -158,6 +165,7 @@ async function harness(
 			const images = hooks.imagesFor?.(trigger.message_id);
 			return {
 				text: trigger.body,
+				...(hooks.effectiveModel ? { effectiveModel: hooks.effectiveModel } : {}),
 				...(images ? { images } : {}),
 				...(hooks.contextMessageIds ? { contextMessageIds: new Set(hooks.contextMessageIds) } : {}),
 				...(hooks.onFrame ? { onFrame: (input) => hooks.onFrame?.(input.frame) } : {}),
@@ -538,6 +546,96 @@ test("oversized text plus images is a local terminal failure and does not hold a
 	);
 	port.complete(port.sends[0]!.opRef, "next reply");
 	await manager!.tick(KEY);
+});
+
+test("model-not-found settles the turn and a transient model.set failure still retries", async () => {
+	const selection = "google-antigravity/gemini-4-hydrogen-xhigh";
+	class ModelSetFailurePort extends ScriptedSessionPort {
+		modelAttempts = 0;
+
+		constructor() {
+			super({
+				onBind: (input) => `model-session-${input.epoch}`,
+				onSend: (input, scripted) => scripted.complete(input.opRef, "model recovered"),
+			});
+		}
+
+		override async setModel(input: Parameters<ScriptedSessionPort["setModel"]>[0]) {
+			this.modelAttempts++;
+			if (this.modelAttempts === 1) {
+				const message = `Model "${selection}" was not found.`;
+				throw new GjcCliError(
+					`gjc sdk model.set reported failure: ${JSON.stringify({ code: "invalid_input", message })}`,
+					0,
+					"",
+					{ code: "invalid_input", message },
+				);
+			}
+			if (this.modelAttempts === 2)
+				throw new GjcCliError("gjc sdk model.set reported failure: timeout", 0, "", {
+					code: "timeout",
+					message: "SDK session Router startup timed out.",
+				});
+			return await super.setModel(input);
+		}
+	}
+
+	const port = new ModelSetFailurePort();
+	const notices: string[] = [];
+	const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
+	await harness(
+		port,
+		{
+			effectiveModel: selection,
+			failureError: (error) => notices.push(formatFailureNotice(error)),
+		},
+		undefined,
+		{
+			setTimeout: (work, delayMs) => {
+				const timer = { work, delayMs };
+				timers.push(timer);
+				return timer;
+			},
+			clearTimeout: () => {},
+		},
+	);
+
+	enqueue("model-not-found", "fail before send");
+	await manager!.notifyInbound(KEY);
+	const failedOpRef = latestOpRef;
+	await eventually(
+		() => database!.inbox.turnRow(failedOpRef)?.turn_state === "done",
+		"the model-not-found turn did not settle",
+	);
+	expect(database!.inbox.turnRow(failedOpRef)).toMatchObject({
+		state: "done",
+		turn_state: "done",
+		terminal_delivery_id: JSON.stringify({ none: "turn_failed" }),
+	});
+	expect(port.modelAttempts).toBe(1);
+	expect(timers).toEqual([]);
+	expect(notices).toHaveLength(1);
+	expect(notices[0]).toContain(selection);
+	expect(notices[0]).toContain("/model");
+
+	enqueue("model-after-not-found", "send after the failure");
+	await manager!.notifyInbound(KEY);
+	await eventually(
+		() => port.modelAttempts === 2 && timers.length === 1,
+		"transient model.set failure was not retried",
+	);
+	expect(port.sends).toEqual([]);
+	expect(timers.map((timer) => timer.delayMs)).toEqual([2_000]);
+
+	timers[0]!.work();
+	await eventually(() => port.sends.length === 1, "model.set retry did not dispatch the later message");
+	expect(port.modelAttempts).toBe(3);
+	expect(port.sends.map((send) => send.text)).toEqual(["send after the failure"]);
+	expect(notices).toHaveLength(1);
+	await eventually(
+		() => database!.inbox.turnRow(port.sends[0]!.opRef)?.turn_state === "done",
+		"the later message did not finish after the transient retry",
+	);
 });
 
 test("actual relay envelope rejection is durable before actor error handling and survives restart", async () => {
@@ -3891,6 +3989,52 @@ test("tail activity that resumes after the stall deadline cancels the cutoff", a
 	expect(port.closes).toHaveLength(0);
 });
 
+for (const owned of [false, true]) {
+	test(`${owned ? "an owned correlated" : "a stray uncorrelated"} agent_end during a stall ${owned ? "cancels" : "keeps"} the cutoff (#733)`, async () => {
+		const port = new ScriptedSessionPort();
+		const clock = { now: Date.now() };
+		await harness(port, {}, undefined, { now: () => clock.now });
+		enqueue(`stall-end-${owned}`, "keep working");
+		await manager!.notifyInbound(KEY);
+		await eventually(() => port.sends.length === 1, "persona turn did not start");
+		const send = port.sends[0]!;
+		port.setActivity(send.sessionId, "tool", clock.now);
+		const readsBeforeStall = port.statusReads.length;
+		port.emitStall(send.sessionId);
+		await eventually(() => port.statusReads.length > readsBeforeStall, "stall did not check operation status");
+
+		// The operation is still in flight when the end arrives, so status cannot settle it.
+		const readsBeforeEnd = port.statusReads.length;
+		if (owned) port.emitTurnEnd(send.sessionId, send.opRef, "agent_end");
+		else
+			for (const tail of port.tailsOf(send.sessionId))
+				tail.emit({
+					kind: "agent_end",
+					rawKind: "agent_end",
+					payload: { outcome: { reason: "end_turn" } },
+					steerEcho: false,
+					idle: true,
+				});
+		// Either end still wakes a status reconcile.
+		await eventually(() => port.statusReads.length > readsBeforeEnd, "agent_end did not reconcile status");
+		await manager!.reconcile(KEY);
+		expect(database!.inbox.turnRow(send.opRef)?.turn_state).toBe("accepted");
+
+		clock.now += STALLED_TURN_TERMINAL_TIMEOUT_MS;
+		let terminations = 0;
+		let authorized: boolean | undefined;
+		port.terminateHost = async (input) => {
+			terminations++;
+			authorized = await input.shouldTerminate?.();
+			return { outcome: "terminated", pid: 123 };
+		};
+		if (owned) await manager!.tick(KEY);
+		else await manager!.tick(KEY).catch(() => {});
+		expect(terminations).toBe(owned ? 0 : 1);
+		if (!owned) expect(authorized).toBe(true);
+	});
+}
+
 test("resumed activity clears an unknown-status recovery hold before a later stall", async () => {
 	class UnknownStatusPort extends ScriptedSessionPort {
 		unknown = false;
@@ -4592,7 +4736,7 @@ test("successful /model resumes the refused trigger on its existing session", as
 	enqueue("refused-before-model", "replay after model selection");
 	await manager!.notifyInbound(KEY);
 	const refusedOpRef = latestOpRef;
-	await manager!.rebindModel(KEY, "provider/model");
+	await manager!.runModelCommand(KEY, async (apply) => await apply("provider/model", () => {}));
 	await eventually(() => terminal.length === 1, "successful model selection did not resume the pending trigger");
 	expect(port.models).toContainEqual({
 		sessionId: "session-e0",
@@ -4639,7 +4783,7 @@ test("an accepted turn resumed after an authenticated refusal reports its submis
 	expect(port.sends).toHaveLength(0);
 	expect(notices).toHaveLength(1);
 
-	await manager!.rebindModel(KEY, "provider/model");
+	await manager!.runModelCommand(KEY, async (apply) => await apply("provider/model", () => {}));
 	await eventually(
 		() => failures.length === 1 && manager!.state(KEY) === "idle",
 		"resumed submission failure did not settle through the ordinary failure path",
@@ -4681,7 +4825,9 @@ test("failed /model keeps the pending refusal paused", async () => {
 	enqueue("failed-model-selection", "must stay pending");
 	await manager!.notifyInbound(KEY);
 	const refusedOpRef = latestOpRef;
-	await expect(manager!.rebindModel(KEY, "provider/model")).rejects.toThrow("selection unavailable");
+	await expect(manager!.runModelCommand(KEY, async (apply) => await apply("provider/model", () => {}))).rejects.toThrow(
+		"selection unavailable",
+	);
 	port.modelFailure = undefined;
 	port.repaired = true;
 	enqueue("after-failed-model", "also waits");
@@ -5546,8 +5692,9 @@ class ContextUsagePort extends ScriptedSessionPort {
 	/** How many sends had been made when each compaction ran. */
 	readonly compactedAfterSends: number[] = [];
 
-	constructor() {
+	constructor(options: { onBind?: (input: SessionBindInput) => string } = {}) {
 		super({
+			...options,
 			onSend: (input, port) => {
 				if (this.failing.has(input.text)) port.fail(input.opRef, "post-start failure");
 				else if (this.autoComplete) port.complete(input.opRef, "ok");
@@ -5555,7 +5702,7 @@ class ContextUsagePort extends ScriptedSessionPort {
 		});
 	}
 
-	async contextUsage(): Promise<SessionContextUsage | undefined> {
+	async contextUsage(_input?: { sessionId: string }): Promise<SessionContextUsage | undefined> {
 		const scripted = this.nextUsageReads.shift();
 		if (scripted === "throw") throw new Error("context read failed");
 		if (scripted === "undefined") return undefined;
@@ -5582,7 +5729,7 @@ async function preambleHarness(
 	port: ScriptedSessionPort,
 	lifecycle: { persona: () => string; bootstrap?: () => string | undefined },
 	log?: (line: string) => void,
-	timers?: Pick<ConstructorParameters<typeof PersonaSessionManager>[0], "setTimeout" | "clearTimeout">,
+	timers?: Pick<ConstructorParameters<typeof PersonaSessionManager>[0], "setTimeout" | "clearTimeout" | "onBindHold">,
 ): Promise<void> {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-preamble-"));
 	database = await Store.open(join(home, "gateway.db"));
@@ -5877,41 +6024,339 @@ for (const read of ["throw", "undefined", "above"] as const) {
 	});
 }
 
-test("behind an unresolved compaction, refused or unanswered runs keep holding and a host answer releases the send with the persona", async () => {
+test("behind an unresolved compaction, refused runs keep holding and an answered failure over a context still above the line sends without claiming compaction", async () => {
 	const port = new ContextUsagePort();
 	const logs: string[] = [];
 	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
 	port.percent = 5;
 	expect(await sendTurn(port, "first")).toBe(PERSONA);
-	// None of these prove the first run ended: another unanswered run, a frame
-	// never written, and a refusal before the host's ordered dispatch. The
-	// dispatcher's own failure (e.g. already compacted) does, and the earlier run
-	// may have compacted, so the persona goes back in.
+	// Neither a frame never written nor a refusal before the host's ordered
+	// dispatch proves the first run ended, and neither is left pending, so each
+	// retry sends one barrier. The dispatcher's own failure (e.g. already
+	// compacted) clears the chain; the context is read again and is still above
+	// the line, so the turn is not reported compacted.
 	await heldByUnresolvedCompaction(
 		port,
 		logs,
 		"held",
 		{ status: "failed", code: "timeout", outcomeUnknown: true },
-		{ status: "failed", outcomeUnknown: true },
 		{ status: "failed", code: "relay_unwritten" },
 		{ status: "failed", code: "session_quiescing" },
 		{ status: "failed", code: "internal", answered: true },
 	);
 	await eventually(() => port.sends.length === 2 && manager!.state(KEY) === "idle", "held turn was not sent");
-	expect(port.sends[1]).toMatchObject({ text: "held", systemPreamble: PERSONA });
-	expect(port.compactedAfterSends).toEqual([1, 1, 1, 1, 1]);
-	expect(logs.filter((line) => line.startsWith("send_pre_send_requeue stage=prepare_context"))).toHaveLength(4);
+	expect(port.sends[1]).toMatchObject({ text: "held" });
+	expect(port.sends[1]!.systemPreamble).toBeUndefined();
+	expect(port.compactedAfterSends).toEqual([1, 1, 1, 1]);
+	expect(logs.filter((line) => line.startsWith("send_pre_send_requeue stage=prepare_context"))).toHaveLength(3);
 	expect(
 		logs
 			.filter((line) => line.startsWith("persona_compaction "))
 			.map((line) => line.match(/status=\w+( code=\w+)?/)?.[0]),
 	).toEqual([
 		"status=failed code=timeout",
-		"status=failed",
 		"status=failed code=relay_unwritten",
 		"status=failed code=session_quiescing",
 		"status=failed code=internal",
 	]);
+	expect(
+		logs.some(
+			(line) =>
+				line.startsWith("persona_compaction_resolved ") &&
+				line.includes("evidence=barrier_answered") &&
+				line.includes("context=above_line"),
+		),
+	).toBe(true);
+	expect(logs.some((line) => line.startsWith("persona_preamble ") && line.includes("reason=compacted"))).toBe(false);
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeUndefined();
+});
+
+test("an answered barrier over a context now below the line sends with the persona", async () => {
+	class ShrinkingBarrierPort extends ContextUsagePort {
+		override async runCompaction(input: SessionCompactionInput): Promise<SessionCompactionResult> {
+			const first = this.compactedAfterSends.length === 0;
+			const result = await super.runCompaction(input);
+			// The barrier's own run compacted the session.
+			if (!first) this.percent = 3;
+			return result;
+		}
+	}
+	const port = new ShrinkingBarrierPort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	await heldByUnresolvedCompaction(
+		port,
+		logs,
+		"held",
+		{ status: "failed", code: "timeout", outcomeUnknown: true },
+		{ status: "failed", code: "internal", answered: true },
+	);
+	await eventually(() => port.sends.length === 2 && manager!.state(KEY) === "idle", "held turn was not sent");
+	expect(port.sends[1]).toMatchObject({ text: "held", systemPreamble: PERSONA });
+	expect(port.compactedAfterSends).toEqual([1, 1]);
+	expect(
+		logs.some(
+			(line) =>
+				line.startsWith("persona_compaction_resolved ") &&
+				line.includes("evidence=barrier_answered") &&
+				line.includes("tokens=30000") &&
+				!line.includes("context=above_line"),
+		),
+	).toBe(true);
+	expect(logs.some((line) => line.startsWith("persona_preamble ") && line.includes("reason=compacted"))).toBe(true);
+});
+
+test("an unanswered barrier is never stacked, and after the bound of unresolved retries the turn moves to a fresh session with one notice", async () => {
+	class StuckSessionPort extends ContextUsagePort {
+		override async contextUsage(input?: { sessionId: string }): Promise<SessionContextUsage | undefined> {
+			// Only the stuck session stays above the line; a fresh one is small.
+			if (input && input.sessionId !== "session-e0") return { percent: 1, tokens: 10_000 };
+			return await super.contextUsage(input);
+		}
+	}
+	const port = new StuckSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	const holds: { reason: string; notice: string; message: string }[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), {
+		...FAST_RETRY,
+		onBindHold: ({ reason, notice, trigger }) => {
+			holds.push({ reason, notice, message: trigger.message_id });
+		},
+	});
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	// The first run and its barrier both go unanswered by a host whose relay stays up.
+	await heldByUnresolvedCompaction(
+		port,
+		logs,
+		"held",
+		{ status: "failed", code: "timeout", outcomeUnknown: true },
+		{ status: "failed", outcomeUnknown: true },
+	);
+	await eventually(
+		() => port.sends.length === 2 && manager!.state(KEY) === "idle",
+		"the turn did not move to a fresh session",
+	);
+	// Two runs only: once the barrier went unanswered, retries just read the context.
+	expect(port.compactedAfterSends).toEqual([1, 1]);
+	expect(logs.filter((line) => line.startsWith("persona_compaction_held "))).toHaveLength(
+		COMPACTION_UNRESOLVED_ATTEMPTS - 2,
+	);
+	expect(logs.filter((line) => line.startsWith("send_pre_send_requeue stage=prepare_context"))).toHaveLength(
+		COMPACTION_UNRESOLVED_ATTEMPTS - 1,
+	);
+	expect(
+		logs.filter(
+			(line) =>
+				line.startsWith("persona_compaction_escalated ") &&
+				line.includes("session=session-e0") &&
+				line.includes("nextEpoch=1") &&
+				line.includes(`attempts=${COMPACTION_UNRESOLVED_ATTEMPTS}`),
+		),
+	).toHaveLength(1);
+	// Never sent into the stuck session; the fresh session gets it with the persona.
+	expect(port.sendAttempts.filter((attempt) => attempt.text === "held").map((attempt) => attempt.sessionId)).toEqual([
+		"session-e1",
+	]);
+	expect(port.sends[1]).toMatchObject({ text: "held", sessionId: "session-e1", systemPreamble: PERSONA });
+	expect(database!.bindings.getSessionRecord(KEY)).toMatchObject({ sessionId: "session-e1", epoch: 1 });
+	expect(
+		logs.some(
+			(line) =>
+				line.startsWith("retired_session_host ") &&
+				line.includes("session=session-e0") &&
+				line.includes("reason=compaction_unresolved"),
+		),
+	).toBe(true);
+	expect(holds).toEqual([
+		{ reason: COMPACTION_HOLD_ESCALATED, notice: expect.stringContaining("fresh session"), message: "m-held" },
+	]);
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeUndefined();
+});
+
+test("a barrier left unanswered before a gateway restart is not sent again by the recovered actor", async () => {
+	const port = new ContextUsagePort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	await heldByUnresolvedCompaction(
+		port,
+		logs,
+		"held",
+		{ status: "failed", code: "timeout", outcomeUnknown: true },
+		{ status: "failed", outcomeUnknown: true },
+	);
+	await eventually(() => port.compactedAfterSends.length === 2, "no barrier was run");
+	await eventually(
+		() => JSON.parse(database!.core.metaGet(`compaction-unresolved:${KEY}`) ?? "{}").barrier === true,
+		"the unanswered barrier was not recorded as pending",
+	);
+
+	await manager!.stop();
+	database!.close();
+	database = await Store.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		log: (line) => logs.push(line),
+		...FAST_RETRY,
+		onTurnStart: ({ trigger }) => ({ text: trigger.body, systemPreamble: PERSONA }),
+	});
+	const heldBefore = logs.filter((line) => line.startsWith("persona_compaction_held ")).length;
+	await manager.recover();
+	await eventually(
+		() => logs.filter((line) => line.startsWith("persona_compaction_held ")).length > heldBefore,
+		"the recovered actor did not hold on the pending barrier",
+	);
+	expect(port.compactedAfterSends).toEqual([1, 1]);
+	expect(port.sends).toHaveLength(1);
+
+	// The pending barrier lands: the context reads below the line and the turn goes with the persona.
+	port.percent = 3;
+	await eventually(() => port.sends.length === 2 && manager!.state(KEY) === "idle", "held turn was not sent");
+	expect(port.sends[1]).toMatchObject({ text: "held", systemPreamble: PERSONA });
+	expect(port.compactedAfterSends).toEqual([1, 1]);
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeUndefined();
+});
+
+test("a barrier left pending when its host died starts over on the resumed host instead of counting toward escalation", async () => {
+	class DyingBarrierPort extends ContextUsagePort {
+		killed = false;
+		override async liveness(input: Parameters<ScriptedSessionPort["liveness"]>[0]) {
+			const result = await super.liveness(input);
+			// The requeue after the unanswered barrier still sees the host live; it dies
+			// right after, so the next dispatch resumes the same session on a new host.
+			if (!this.killed && this.compactedAfterSends.length === 2) {
+				this.killed = true;
+				await this.close(input);
+			}
+			return result;
+		}
+	}
+	const port = new DyingBarrierPort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	const sessionId = database!.bindings.getSessionRecord(KEY)!.sessionId;
+	await heldByUnresolvedCompaction(
+		port,
+		logs,
+		"held",
+		{ status: "failed", code: "timeout", outcomeUnknown: true },
+		{ status: "failed", outcomeUnknown: true },
+	);
+	await eventually(() => port.sends.length === 2 && manager!.state(KEY) === "idle", "held turn was not sent");
+	// One barrier on the resumed host proves its chain clear; the turn stays in the same session.
+	expect(port.resumes.map((resume) => resume.sessionId)).toEqual([sessionId]);
+	expect(port.compactedAfterSends).toEqual([1, 1, 1]);
+	expect(port.sends[1]).toMatchObject({ text: "held", sessionId, systemPreamble: PERSONA });
+	expect(
+		logs.some((line) => line.startsWith("persona_compaction_reset ") && line.includes("reason=host_resumed")),
+	).toBe(true);
+	expect(logs.some((line) => line.startsWith("persona_compaction_escalated "))).toBe(false);
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeUndefined();
+});
+
+test("a barrier that compacted sends with the persona even if the context still reads above the line", async () => {
+	const port = new ContextUsagePort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	await heldByUnresolvedCompaction(
+		port,
+		logs,
+		"held",
+		{ status: "failed", code: "timeout", outcomeUnknown: true },
+		{ status: "succeeded", answered: true },
+	);
+	await eventually(() => port.sends.length === 2 && manager!.state(KEY) === "idle", "held turn was not sent");
+	expect(port.sends[1]).toMatchObject({ text: "held", systemPreamble: PERSONA });
+	expect(logs.some((line) => line.startsWith("persona_preamble ") && line.includes("reason=compacted"))).toBe(true);
+});
+
+test("a compaction escalation notice whose hook failed is posted by recovery after a restart", async () => {
+	class StuckSessionPort extends ContextUsagePort {
+		override async contextUsage(input?: { sessionId: string }): Promise<SessionContextUsage | undefined> {
+			if (input && input.sessionId !== "session-e0") return { percent: 1, tokens: 10_000 };
+			return await super.contextUsage(input);
+		}
+	}
+	const port = new StuckSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	const holds: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), {
+		...FAST_RETRY,
+		onBindHold: () => {
+			throw new Error("delivery hook down");
+		},
+	});
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	await heldByUnresolvedCompaction(
+		port,
+		logs,
+		"held",
+		{ status: "failed", code: "timeout", outcomeUnknown: true },
+		{ status: "failed", outcomeUnknown: true },
+	);
+	await eventually(() => port.sends.length === 2 && manager!.state(KEY) === "idle", "held turn was not sent");
+	expect(logs.some((line) => line.startsWith("persona_bind_hold_notice_failed "))).toBe(true);
+	const intents = () =>
+		database!.core.metaKeysInRange("compaction-escalation-notice:", "compaction-escalation-notice:\uffff");
+	expect(intents()).toHaveLength(1);
+
+	await manager!.stop();
+	database!.close();
+	database = await Store.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		log: (line) => logs.push(line),
+		onBindHold: ({ reason, trigger }) => {
+			holds.push(`${reason}:${trigger.message_id}`);
+		},
+		onTurnStart: ({ trigger }) => ({ text: trigger.body, systemPreamble: PERSONA }),
+	});
+	await manager.recover();
+	await eventually(() => holds.length === 1, "the notice was not replayed");
+	expect(holds).toEqual([`${COMPACTION_HOLD_ESCALATED}:m-held`]);
+	expect(intents()).toEqual([]);
+	expect(port.sends).toHaveLength(2);
+});
+
+test("a compaction escalation notice has its own delivery id, apart from other hold notices for the trigger", () => {
+	const ids = new Set(
+		["host_capacity", UNRESOLVED_HOLD_ESCALATED, COMPACTION_HOLD_ESCALATED].map((reason) =>
+			deterministicBindHoldDeliveryId(KEY, "m-1", reason),
+		),
+	);
+	expect(ids.size).toBe(3);
+});
+
+test("a hold stored as a bare session id still holds that session until a barrier answers", async () => {
+	const port = new ContextUsagePort();
+	const logs: string[] = [];
+	await preambleHarness(port, { persona: () => PERSONA }, (line) => logs.push(line), FAST_RETRY);
+	port.percent = 5;
+	expect(await sendTurn(port, "first")).toBe(PERSONA);
+	database!.core.metaSet(`compaction-unresolved:${KEY}`, database!.bindings.getSessionRecord(KEY)!.sessionId);
+	port.percent = COMPACTION_PERCENT + 5;
+	// The barrier is answered (and compacts): the turn goes with the persona.
+	expect(await sendTurn(port, "held")).toBe(PERSONA);
+	expect(port.compactedAfterSends).toEqual([1]);
+	expect(logs.some((line) => line.startsWith("persona_compaction ") && line.includes("after=unresolved"))).toBe(true);
+	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeUndefined();
 });
 
 test("an unresolved compaction keeps holding the send after a gateway restart until the host answers", async () => {
@@ -5980,10 +6425,11 @@ test("the unresolved-compaction hold is stored before the first run, so a gatewa
 	await eventually(() => port.compactedAfterSends.length === 1, "compaction did not start");
 	// While the host is compacting, the durable hold already names the session;
 	// a restarted gateway reads it (see the restart test) instead of sending.
-	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBe(
-		database!.bindings.getSessionRecord(KEY)?.sessionId,
-	);
-	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeDefined();
+	expect(JSON.parse(database!.core.metaGet(`compaction-unresolved:${KEY}`) ?? "null")).toEqual({
+		sessionId: database!.bindings.getSessionRecord(KEY)?.sessionId,
+		attempts: 0,
+		barrier: false,
+	});
 	releaseCompaction();
 	await eventually(() => port.sends.length === 1 && manager!.state(KEY) === "idle", "compacted send did not follow");
 	expect(database!.core.metaGet(`compaction-unresolved:${KEY}`)).toBeUndefined();
@@ -6476,3 +6922,394 @@ test("a notice during a gateway turn steers its gateway framing without lane-rep
 	expect(f.port.steers[0]!.text).toContain("[Gateway notice]");
 	expect(f.port.steers[0]!.text).not.toContain("Internal lane report");
 });
+
+test("model selection cache distinguishes a preset object from its colliding string rendering on the next turn", async () => {
+	const port = new ScriptedSessionPort();
+	const hooks: { effectiveModel?: string } = {};
+	await harness(port, hooks);
+	await manager!.runModelCommand(KEY, async (apply) => await apply({ preset: "foo" }, () => {}));
+	const sessionId = port.models[0]!.sessionId;
+	hooks.effectiveModel = "preset:foo";
+	enqueue("colliding-string-turn", "send with the string model");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "the inherited session did not send its turn");
+	expect(port.models.filter((model) => model.sessionId === sessionId).map((model) => model.selection)).toEqual([
+		{ preset: "foo" },
+		"preset:foo",
+	]);
+});
+
+const PERMANENT_MODEL_REFUSAL = {
+	code: "usage",
+	category: "usage",
+	message: "The command arguments are invalid.",
+	retryability: "no",
+	outcomeCertainty: "not-applied",
+	references: [],
+};
+
+/** A port whose live model control answers the selections in `answers` with the given failure. */
+class ModelAnswerPort extends ScriptedSessionPort {
+	readonly answers = new Map<string, Error>();
+
+	override async setModel(input: Parameters<ScriptedSessionPort["setModel"]>[0]) {
+		const failure = typeof input.selection === "string" ? this.answers.get(input.selection) : undefined;
+		if (failure) throw failure;
+		return await super.setModel(input);
+	}
+}
+
+/** Binds the origin on `provider/a` through one completed turn, so the live model is cached. */
+async function modelCachedOnFirstTurn(): Promise<{ port: ModelAnswerPort; hooks: { effectiveModel?: string } }> {
+	const port = new ModelAnswerPort();
+	const hooks: { effectiveModel?: string } = { effectiveModel: "provider/a" };
+	await harness(port, hooks);
+	enqueue("model-cache-first", "first");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "the first turn did not send");
+	port.complete(port.sends[0]!.opRef, "first reply");
+	await eventually(() => manager!.state(KEY) === "idle", "the first turn did not settle");
+	return { port, hooks };
+}
+
+async function nextTurnModels(port: ModelAnswerPort, messageId: string): Promise<unknown[]> {
+	const before = port.sends.length;
+	enqueue(messageId, "next");
+	await manager!.notifyInbound(KEY);
+	await eventually(() => port.sends.length === before + 1, "the next turn did not send");
+	return port.models.map((model) => model.selection);
+}
+
+test("a permanent /model refusal is returned, records nothing, and leaves the cached live model in place", async () => {
+	const { port } = await modelCachedOnFirstTurn();
+	port.answers.set(
+		"provider/bad",
+		new GjcCliError("gjc sdk model.set reported failure", 0, "", PERMANENT_MODEL_REFUSAL),
+	);
+	let commits = 0;
+	const result = await manager!.runModelCommand(KEY, async (apply) => await apply("provider/bad", () => commits++));
+	expect(result).toEqual({ kind: "refused", code: "usage" });
+	expect(commits).toBe(0);
+	// gjc applied nothing, so the cached `provider/a` is still the live model and is not re-sent.
+	expect(await nextTurnModels(port, "after-refusal")).toEqual(["provider/a"]);
+});
+
+test("a retryable not-applied answer is a failure, not a refusal the owner is told about", async () => {
+	const { port } = await modelCachedOnFirstTurn();
+	port.answers.set(
+		"provider/busy",
+		new GjcCliError("gjc sdk model.set reported failure", 0, "", {
+			...PERMANENT_MODEL_REFUSAL,
+			code: "busy",
+			retryability: "yes",
+		}),
+	);
+	let commits = 0;
+	await expect(
+		manager!.runModelCommand(KEY, async (apply) => await apply("provider/busy", () => commits++)),
+	).rejects.toThrow("model.set reported failure");
+	expect(commits).toBe(0);
+});
+
+test("an uncertain /model failure drops the applied-model cache so the next turn re-applies the stored model", async () => {
+	const { port } = await modelCachedOnFirstTurn();
+	port.answers.set(
+		"provider/b",
+		new GjcCliError("gjc sdk model.set reply lost", 0, "", {
+			code: "operation_failed",
+			outcomeCertainty: "unknown",
+		}),
+	);
+	let commits = 0;
+	await expect(
+		manager!.runModelCommand(KEY, async (apply) => await apply("provider/b", () => commits++)),
+	).rejects.toThrow("model.set reply lost");
+	expect(commits).toBe(0);
+	expect(await nextTurnModels(port, "after-uncertain")).toEqual(["provider/a", "provider/a"]);
+});
+
+test("a /model whose record fails after gjc applied it re-applies the stored model on the next turn", async () => {
+	const { port } = await modelCachedOnFirstTurn();
+	await expect(
+		manager!.runModelCommand(
+			KEY,
+			async (apply) =>
+				await apply("provider/c", () => {
+					throw new Error("database is locked");
+				}),
+		),
+	).rejects.toThrow("database is locked");
+	expect(await nextTurnModels(port, "after-commit-failure")).toEqual(["provider/a", "provider/c", "provider/a"]);
+});
+
+test("a failing resumed turn is not reported as a failure of the /model that resumed it", async () => {
+	// The resumed turn is refused again and its tail cleanup throws: that is the
+	// turn's failure, logged by the actor, never the answer to `/model`.
+	class RefusingAgainPort extends ModelNotSelectedPort {
+		override async setModel(input: Parameters<ScriptedSessionPort["setModel"]>[0]) {
+			const receipt = await super.setModel(input);
+			this.repaired = false;
+			return receipt;
+		}
+	}
+	const port = new RefusingAgainPort();
+	const attach = port.attachTail.bind(port);
+	let tails = 0;
+	port.attachTail = async (input) => {
+		const tail = await attach(input);
+		const close = tail.close.bind(tail);
+		const ordinal = ++tails;
+		tail.close = async () => {
+			if (ordinal === 2) throw new Error("resumed tail close failed");
+			await close();
+		};
+		return tail;
+	};
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line));
+	enqueue("refused-then-resume-fails", "resume me");
+	await manager!.notifyInbound(KEY);
+	expect(port.sendAttempts).toHaveLength(1);
+	let commits = 0;
+	const result = await manager!.runModelCommand(KEY, async (apply) => await apply("provider/model", () => commits++));
+	expect(result).toEqual({ kind: "applied" });
+	expect(commits).toBe(1);
+	await eventually(
+		() =>
+			logs.some((line) => line.includes("persona model resume failed") && line.includes("resumed tail close failed")),
+		"the resumed turn failure was not logged by the actor",
+	);
+	expect(port.sendAttempts).toHaveLength(2);
+});
+
+test("an uncertain turn-preflight model failure drops the cache so a default reverted before the retry is re-applied", async () => {
+	const { port, hooks } = await modelCachedOnFirstTurn();
+	port.answers.set(
+		"provider/b",
+		new GjcCliError("gjc sdk model.set reply lost", 0, "", { code: "operation_failed", outcomeCertainty: "unknown" }),
+	);
+	hooks.effectiveModel = "provider/b";
+	enqueue("preflight-uncertain", "second");
+	await manager!.notifyInbound(KEY);
+	expect(port.sends).toHaveLength(1);
+	// The default goes back to A before the retry; B may be live, so A must be sent again.
+	hooks.effectiveModel = "provider/a";
+	// The pre-send failure schedules its own retry after the 2 s backoff.
+	await Bun.sleep(2_100);
+	await eventually(() => port.sends.length === 2, "the retried turn did not send");
+	expect(port.models.map((model) => model.selection)).toEqual(["provider/a", "provider/a"]);
+});
+
+test("/model on a bound session the broker no longer hosts is answered without rebinding or recording", async () => {
+	class DisownedIdlePort extends ScriptedSessionPort {
+		readonly goneSessions = new Set<string>();
+
+		override async setModel(input: Parameters<ScriptedSessionPort["setModel"]>[0]) {
+			if (this.goneSessions.has(input.sessionId))
+				throw new GjcCliError("gjc sdk model.set reported failure", 0, "", { code: "endpoint_stale" });
+			return await super.setModel(input);
+		}
+	}
+	const port = new DisownedIdlePort({ onBind: (input) => `session-e${input.epoch}` });
+	await harness(port, {});
+	expect(await manager!.runModelCommand(KEY, async (apply) => await apply("provider/a", () => {}))).toEqual({
+		kind: "applied",
+	});
+	port.goneSessions.add("session-e0");
+	const binds = port.binds.length;
+
+	let commits = 0;
+	expect(await manager!.runModelCommand(KEY, async (apply) => await apply("provider/b", () => commits++))).toEqual({
+		kind: "unavailable",
+		code: "session_unavailable",
+	});
+	expect(commits).toBe(0);
+	// Rebinding is left to the turn path and its fences: no epoch rotation and no new session here.
+	expect(database!.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
+	expect(port.binds).toHaveLength(binds);
+});
+
+test("/model on a refusal-paused origin whose session is gone answers unavailable and leaves the pause and pending trigger for /new", async () => {
+	class GoneAfterRefusalPort extends ModelNotSelectedPort {
+		gone = false;
+
+		override async setModel(input: Parameters<ScriptedSessionPort["setModel"]>[0]) {
+			if (this.gone) throw new GjcCliError("gjc sdk model.set reported failure", 0, "", { code: "endpoint_stale" });
+			return await super.setModel(input);
+		}
+	}
+	const port = new GoneAfterRefusalPort();
+	await harness(port, {});
+	enqueue("paused-then-gone", "waits for a model");
+	await manager!.notifyInbound(KEY);
+	expect(port.sendAttempts).toHaveLength(1);
+	port.gone = true;
+	let commits = 0;
+	expect(await manager!.runModelCommand(KEY, async (apply) => await apply("provider/model", () => commits++))).toEqual({
+		kind: "unavailable",
+		code: "session_unavailable",
+	});
+	expect(commits).toBe(0);
+	expect(database!.bindings.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "session-e0" });
+	// Still paused: the trigger stays pending and no new prompt is attempted until /new or a successful /model.
+	enqueue("after-gone-model", "also waits");
+	await manager!.notifyInbound(KEY);
+	expect(database!.inbox.pendingOldest(KEY)?.message_id).toBe("paused-then-gone");
+	expect(port.sendAttempts).toHaveLength(1);
+});
+
+test("preset transient model.set failures still retry instead of terminating immediately", async () => {
+	const preset = { preset: "my-preset" };
+	class PresetTransientFailurePort extends ScriptedSessionPort {
+		modelAttempts = 0;
+
+		constructor() {
+			super({
+				onBind: (input) => `model-session-${input.epoch}`,
+				onSend: (input, scripted) => scripted.complete(input.opRef, "model recovered"),
+			});
+		}
+
+		override async setModel(
+			input: Parameters<ScriptedSessionPort["setModel"]>[0],
+		): Promise<{ readonly changed: boolean }> {
+			this.modelAttempts++;
+			if (this.modelAttempts === 1) {
+				// First attempt: transient session_unavailable error
+				throw new GjcCliError("gjc sdk model.set reported failure: session unavailable", 0, "", {
+					code: "session_unavailable",
+					message: "The session is not available.",
+				});
+			}
+			if (this.modelAttempts === 2) {
+				// Second attempt: timeout (also transient)
+				throw new GjcCliError("gjc sdk model.set reported failure: timeout", 0, "", {
+					code: "deadline_exceeded",
+					message: "The operation timed out.",
+				});
+			}
+			// Third attempt: success
+			return await super.setModel(input);
+		}
+	}
+
+	const port = new PresetTransientFailurePort();
+	const notices: string[] = [];
+	const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
+	await harness(
+		port,
+		{
+			effectiveModel: preset,
+			failureError: (error) => notices.push(formatFailureNotice(error)),
+		},
+		undefined,
+		{
+			setTimeout: (work, delayMs) => {
+				const timer = { work, delayMs };
+				timers.push(timer);
+				return timer;
+			},
+			clearTimeout: () => {},
+		},
+	);
+
+	enqueue("preset-transient", "use my preset with transient errors");
+	await manager!.notifyInbound(KEY);
+
+	// Retry after first transient failure
+	timers[0]!.work();
+	await eventually(() => port.modelAttempts >= 2, "model.set did not retry after transient error");
+
+	// Retry after second transient failure
+	timers[1]!.work();
+	await eventually(() => port.sends.length === 1, "message did not send after transient retries succeeded");
+
+	expect(port.modelAttempts).toBe(3);
+	expect(port.sends.map((send) => send.text)).toEqual(["use my preset with transient errors"]);
+	// No failure notices since all transient failures retried successfully
+	expect(notices).toHaveLength(0);
+	await eventually(
+		() => database!.inbox.turnRow(port.sends[0]!.opRef)?.turn_state === "done",
+		"the message did not finish after transient retries",
+	);
+});
+
+for (const errorCode of ["invalid_preset", "internal"] as const) {
+	test(`preset model failure with ${errorCode} code ends after MAX_PRESET_FAILURE_ATTEMPTS with one notice`, async () => {
+		const preset = { preset: `preset-${errorCode}` };
+		class PresetFailurePort extends ScriptedSessionPort {
+			modelAttempts = 0;
+
+			constructor() {
+				super({
+					onBind: (input) => `model-session-${input.epoch}`,
+					onSend: (input, scripted) => scripted.complete(input.opRef, "send succeeded"),
+				});
+			}
+
+			override async setModel(
+				input: Parameters<ScriptedSessionPort["setModel"]>[0],
+			): Promise<{ readonly changed: boolean }> {
+				this.modelAttempts++;
+				// Simulate a non-transient preset failure
+				throw new GjcCliError(`gjc sdk model.set reported failure: ${errorCode}`, 0, "", {
+					code: errorCode,
+					message: `The preset could not be applied: ${errorCode}.`,
+				});
+			}
+		}
+
+		const port = new PresetFailurePort();
+		const notices: string[] = [];
+		const logs: string[] = [];
+		const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
+		let failureCalled = false;
+		await harness(
+			port,
+			{
+				effectiveModel: preset,
+				failureError: (error) => {
+					failureCalled = true;
+					notices.push(formatFailureNotice(error));
+				},
+			},
+			(line) => logs.push(line),
+			{
+				setTimeout: (work, delayMs) => {
+					const timer = { work, delayMs };
+					timers.push(timer);
+					return timer;
+				},
+				clearTimeout: () => {},
+			},
+		);
+
+		enqueue(`preset-${errorCode}`, `use preset with ${errorCode}`);
+		await manager!.notifyInbound(KEY);
+		const opRef = latestOpRef;
+
+		// Trigger retries by running timers
+		for (let i = 0; i < 2 && timers.length > 0; i++) {
+			const timer = timers.pop()!;
+			timer.work();
+			await manager!.notifyInbound(KEY);
+		}
+
+		// Verify exactly MAX_PRESET_FAILURE_ATTEMPTS (3) model attempts
+		expect(port.modelAttempts).toBe(3);
+		// Verify no additional timers are scheduled (turn is settled, no more retries)
+		expect(timers).toHaveLength(0);
+		// Verify failure callback was called
+		expect(failureCalled).toBe(true);
+		// Verify exactly 1 notice
+		expect(notices).toHaveLength(1);
+		// Verify notice does NOT contain the preset name (security: prevent preset discovery by non-owners)
+		expect(notices[0]).not.toContain(`preset-${errorCode}`);
+		// Verify generic message is in conversation notice
+		expect(notices[0]).toContain("the configured model preset could not be applied");
+		// The operator log keeps the exact preset name
+		const preflightLog = logs.find((log) => log.includes("persona_send_preflight_rejected"));
+		expect(preflightLog).toBeDefined();
+		expect(preflightLog).toContain(`preset-${errorCode}`);
+	});
+}

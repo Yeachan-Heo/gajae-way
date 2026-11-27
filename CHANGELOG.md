@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.5.2] - 2026-11-23
+
+### Deps
+- **gateway**: Pin GJC 0.22.0 and raise `VERIFIED_GJC_THROUGH` to 0.22; the live contract test (`gjc-contract.e2e.test.ts`) passes on 0.22.0
+
+### Fixes
+- **gateway**: `gajaeway work status <name>` returns the ledger state when the lane's GJC host is gone instead of throwing `status_unavailable` (#836, #837)
+- **gateway**: Store a `/model` choice only after GJC accepts it, and answer permanent failures (#861)
+- **gateway**: Default the `/model` owner to the Discord application owner (#871)
+- **gateway**: Log routine retention sweep results at info level (#838)
+- **adapter-slack**: Give a thread rooted at the bot's own message its own session (#854); keep the legacy mute fallback, attribute file-share reactions to their origin, and bound the root lookup (#858)
+- **docs**: Correct the lane cap default, the build binary list and broker signals (#855)
+
+## [0.5.1] - 2026-11-18
+
+### Deps
+- **gateway**: Pin GJC 0.21.0 and raise `VERIFIED_GJC_THROUGH` to 0.21 (#835, #839)
+
+### Fixes
+- **gateway**: Park an escalated retired hold whose session host stays not live, with its process gone, for `sessions.retiredHoldAbandonMs` (default 24 hours) while its operation state stays unknown: it stays tracked and its late answer is still delivered, but it is probed hourly instead of every minute, so accumulated dead holds no longer saturate the CLI pool and stall live turns on `broker_unavailable`. A parked hold is never closed on that evidence, never resent, and gets no second notice. (#785)
+- **gateway**: Rebind sessions to the new default model on config reload (#798, #799)
+- **gateway**: Settle deterministic `model.set` failures (#829, #830)
+- **gateway**: Detect undelivered sends and fail the attempt on `transport_unavailable` with unknown status (#790, #792)
+- **gateway**: Probe the stall cutoff's reply proof before stopping the host (#805)
+- **gateway**: Restart drain passes escalated holds whose host has exited, requires a status report for the held operation, bounds host probes by the drain deadline, and treats zombie hosts as exited; a failed inspect invocation is never host-exit evidence (#811)
+- **gateway**: Give pre-send compaction GJC's full request budget (#808)
+- **gateway**: Emit an operator alert for a broker startup wedge (#800, #801)
+- **gateway**: Keep a repeated pending WATCH silent instead of reporting failure (#825)
+- **gateway**: Surface missing terminal receipts instead of holding forever; pending lane output reports `final_response_pending` (JJO-2053, #784)
+- **gateway**: Allow opting the preboot memory monitor seed out (JJO-1999, #776)
+- **gateway**: Name send-path invariant errors so their cause is recorded (#657, #664)
+- **gateway, cli**: Atomically retire coalesced batch pointers, persist terminal recovery, and enforce target-release GJC pins (#822, #823)
+- **work**: Preserve unresolved execution and authorize isolated successors (#701); preserve authenticated prompt refusal diagnostics (#679)
+- **cli**: Explain uncertain work admission after a disconnect (#709)
+- **adapter-discord**: Keep replies in their thread and report the exact delivery failure; classify archived-thread refusals and transient reopen failures (#813)
+- **adapter-discord**: Gate `/model` and its autocomplete to the owner and defer the slash reply (#796, #807)
+- **adapter-slack**: Dedupe inbound ids before paying for image preparation (#819)
+- **adapters**: Stop posting the internal image resize/compress notice into chat (#831, #832)
+- **release**: Make the npm release resumable by checking the registry before publish, and apply dist-tags to already-published packages on resume (#791, #818)
+
 ## [0.5.0] - 2026-11-11
 
 ### Deps
