@@ -204,10 +204,11 @@ export interface EngagementContext {
 	 */
 	readonly replyTo?: ReplyContext;
 	/**
-	 * Trust classification set by the adapter; "guest" indicates Slack
-	 * is_restricted/is_ultra_restricted/is_stranger users subject to guest policy.
+	 * Trust classification set by the adapter; additive and optional. Only honored for
+	 * Slack-origin engagements. "guest" indicates Slack is_restricted/is_ultra_restricted/
+	 * is_stranger users subject to guest policy.
 	 */
-	readonly trust?: "guest";
+	readonly trust?: "member" | "guest";
 }
 
 export interface PromptImage {

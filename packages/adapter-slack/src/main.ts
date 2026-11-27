@@ -1264,10 +1264,11 @@ export async function startSlackAdapter(
 						messageOrigins.get(messageId),
 					);
 					if (editToSend) {
-						// Classify guest status from the edited message's author
+						// Classify guest status from the edited message's author (fail-closed)
 						if (envelope.message?.user) {
 							const user = await directory.user(envelope.message.user);
-							if (isSlackGuest(user)) {
+							// Treat as guest if: is_restricted/is_ultra_restricted/is_stranger OR users.info failed (undefined)
+							if (isSlackGuest(user) || user === undefined) {
 								editToSend = { ...editToSend, engagement: { ...editToSend.engagement, trust: "guest" } };
 							}
 						}
@@ -1287,10 +1288,11 @@ export async function startSlackAdapter(
 				let engagement = withRootExcerpt(
 					engagementForMessage(message, admitted.origin, identity, directory, config.channels),
 				);
-				// Classify guest status from Slack user info (is_restricted, is_ultra_restricted, is_stranger)
+				// Classify guest status from Slack user info (fail-closed: treat as guest if is_restricted/is_ultra_restricted/is_stranger OR users.info failed)
 				if (message.user) {
 					const user = await directory.user(message.user);
-					if (isSlackGuest(user)) {
+					// Treat as guest if: is_restricted/is_ultra_restricted/is_stranger OR users.info failed (undefined)
+					if (isSlackGuest(user) || user === undefined) {
 						engagement = { ...engagement, trust: "guest" };
 					}
 				}

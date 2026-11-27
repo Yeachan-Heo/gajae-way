@@ -90,9 +90,9 @@ test("a guest in DM with dm=drop receives no response and no model call", async 
 		{
 			dmPolicy: "open",
 			slack: {
-				guest_policy: {
+				guestPolicy: {
 					dm: "drop",
-					channel: "restricted",
+					channel: "allow",
 				},
 			},
 		},
@@ -119,7 +119,7 @@ test("a guest in channel with channel=drop receives no response and no model cal
 		{
 			channels: { "slack:C1": { engagement: "open" } },
 			slack: {
-				guest_policy: {
+				guestPolicy: {
 					dm: "drop",
 					channel: "drop",
 				},
@@ -142,54 +142,15 @@ test("a guest in channel with channel=drop receives no response and no model cal
 	expect(slack.posts).toHaveLength(0);
 });
 
-test("a guest in channel with channel=restricted runs with no bootstrap and restricted prompt", async () => {
-	let turnContent = "";
-	const { config, database, turns } = await gateway(
-		(text) => {
-			turnContent = text;
-			// Check that bootstrap is NOT in the prompt (would contain "[Current conversation metadata]" or similar)
-			expect(text).not.toContain("[Current conversation metadata]");
-			expect(text).not.toContain("[Unread messages");
-			return "restricted response";
-		},
-		{
-			channels: { "slack:C1": { engagement: "open" } },
-			slack: {
-				guest_policy: {
-					dm: "drop",
-					channel: "restricted",
-				},
-			},
-		},
-	);
-	const slack = fakeSlackApi();
-	const adapter = liveGateway(config.socketPath, slack.api);
-	await adapter.connect();
-	const result = await adapter.requestInbound(
-		slackMessageId("C1", "1726543210.000100"),
-		CHANNEL_ORIGIN,
-		"hello guest",
-		{ mentioned: true, group: true, authorId: "U_GUEST", trust: "guest" },
-		"2026-09-17T00:00:10.000Z",
-	);
-	expect(result?.engaged).toBe(true);
-	await Bun.sleep(100);
-	expect(turns).toHaveLength(1);
-	// Verify the turn text does not contain bootstrap (which is for restricted guests)
-	expect(turnContent).not.toContain("[Current conversation metadata]");
-	expect(slack.posts).toHaveLength(1);
-	expect(slack.posts[0]?.text).toContain("restricted response");
-});
-
 test("a regular member in channel is unaffected by guest policy", async () => {
 	const { config, database, turns } = await gateway(
 		() => "member response",
 		{
 			channels: { "slack:C1": { engagement: "open" } },
 			slack: {
-				guest_policy: {
+				guestPolicy: {
 					dm: "drop",
-					channel: "restricted",
+					channel: "allow",
 				},
 			},
 		},
@@ -212,16 +173,16 @@ test("a regular member in channel is unaffected by guest policy", async () => {
 	expect(slack.posts[0]?.text).toContain("member response");
 });
 
-test("a guest on allow_users list bypasses guest policy restrictions", async () => {
+test("a guest on allowUsers list bypasses guest policy restrictions", async () => {
 	const { config, database, turns } = await gateway(
 		() => "allowed guest response",
 		{
 			channels: { "slack:C1": { engagement: "open" } },
 			slack: {
-				guest_policy: {
+				guestPolicy: {
 					dm: "drop",
-					channel: "restricted",
-					allow_users: ["U_ALLOWLISTED"],
+					channel: "allow",
+					allowUsers: ["U_ALLOWLISTED"],
 				},
 			},
 		},
@@ -244,16 +205,16 @@ test("a guest on allow_users list bypasses guest policy restrictions", async () 
 	expect(slack.posts[0]?.text).toContain("allowed guest response");
 });
 
-test("a guest on deny_users list is always dropped", async () => {
+test("a guest on denyUsers list is always dropped", async () => {
 	const { config, database, turns } = await gateway(
 		() => "should not be called",
 		{
 			channels: { "slack:C1": { engagement: "open" } },
 			slack: {
-				guest_policy: {
+				guestPolicy: {
 					dm: "allow",
 					channel: "allow",
-					deny_users: ["U_DENIED"],
+					denyUsers: ["U_DENIED"],
 				},
 			},
 		},

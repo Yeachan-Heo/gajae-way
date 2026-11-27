@@ -220,12 +220,13 @@ export interface EngagementDecision {
 	readonly botAudienceAdmission: boolean;
 }
 
-/** Decision result of Slack guest policy check: drop, restricted, or allow. */
-export type GuestPolicyDecision = "drop" | "restricted" | "allow";
+/** Decision result of Slack guest policy check: drop or allow. */
+export type GuestPolicyDecision = "drop" | "allow";
 
 /**
  * Evaluate Slack guest policy if the message is from a guest (trust === "guest").
  * Returns the policy decision; "allow" means treat as a normal user.
+ * Defaults: DM=drop, channel=allow (unless configured otherwise).
  */
 export function checkSlackGuestPolicy(
 	engagement: EngagementContext | undefined,
@@ -235,21 +236,20 @@ export function checkSlackGuestPolicy(
 	if (engagement?.trust !== "guest") return "allow";
 	const authorId = engagement?.authorId;
 	if (!authorId) return "allow";
-	const policy = config.slack?.guest_policy;
-	if (!policy) return "allow";
+	const policy = config.slack?.guestPolicy;
 
 	// Allow overrides are checked first
-	if (policy.allow_users?.includes(authorId)) return "allow";
+	if (policy?.allowUsers?.includes(authorId)) return "allow";
 
 	// Deny overrides
-	if (policy.deny_users?.includes(authorId)) return "drop";
+	if (policy?.denyUsers?.includes(authorId)) return "drop";
 
-	// Apply policy based on origin kind
+	// Apply policy based on origin kind (defaults: dm=drop, channel=allow)
 	if (origin.kind === "dm") {
-		const dmPolicy = policy.dm ?? "drop";
+		const dmPolicy = policy?.dm ?? "drop";
 		return dmPolicy as GuestPolicyDecision;
 	} else {
-		const channelPolicy = policy.channel ?? "restricted";
+		const channelPolicy = policy?.channel ?? "allow";
 		return channelPolicy as GuestPolicyDecision;
 	}
 }

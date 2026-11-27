@@ -3371,26 +3371,7 @@ async function editChat(
 	await runtime.personaSessions.notifyInbound(key);
 }
 
-/** Determine if a turn should be restricted due to Slack guest policy. */
-function isRestrictedGuestTurn(
-	engagement: { trust?: string } | undefined,
-	origin: Pick<OriginRef, "kind">,
-	config: GatewayConfig,
-): boolean {
-	if (engagement?.trust !== "guest") return false;
-	const policy = config.slack?.guest_policy;
-	if (!policy) return false;
-	const authorId = (engagement as { authorId?: string } | undefined)?.authorId;
-	if (!authorId) return false;
-	// Allow overrides
-	if (policy.allow_users?.includes(authorId)) return false;
-	// Deny overrides block but don't restrict
-	if (policy.deny_users?.includes(authorId)) return false;
-	// Check policy
-	if (origin.kind === "dm") return false; // DMs are either dropped or allowed, never restricted
-	const channelPolicy = policy.channel ?? "restricted";
-	return channelPolicy === "restricted";
-}
+
 
 async function createInboundTurnLifecycle(
 	input: PersonaTurnStartInput,
@@ -3603,33 +3584,15 @@ async function createInboundTurnLifecycle(
 	// Stable per origin: the persona actor sends it only when the session's
 	// context may not hold it. The bootstrap and a changed-AGENTS.md section are
 	// one-shot and ride their own send.
-	const isRestricted = isRestrictedGuestTurn(engagement, origin, runtime.config);
-	if (isRestricted) {
-		const authorId = (engagement as { authorId?: string } | undefined)?.authorId ?? "unknown";
-		const place = `slack channel #${origin.conversationId}`;
-		console.info(
-			`gateway guest-policy restricted authorId=${authorId} origin=${place} reason=guest_channel_restricted_policy`,
-		);
-	}
-	const sessionBootstrap = !isRestricted ? [bootstrap?.text, agentsMdSection].filter(Boolean).join("\n\n") : undefined;
-	const restrictedGuestPrompt =
-		"You are a helpful assistant. Keep your responses brief and friendly.\n\n" +
-		"Do not:\n" +
-		"- Reference specific people, projects, customers, or internal details\n" +
-		"- Mention company names, proprietary technology, or confidential information\n" +
-		"- Provide access to tools or integrations\n" +
-		"- Share information from memory or files\n\n" +
-		"For work-related questions, respond: 담당자에게 문의 부탁드립니다 (Please contact the relevant person).\n";
-	const baseSystemPreamble = isRestricted ? restrictedGuestPrompt : await runtime.persona.systemPreamble();
-	const systemPreamble = !isRestricted
-		? [
-				baseSystemPreamble,
-				currentConversationNotice(origin),
-				ATTACHMENT_SCOPE_NOTICE,
-				ACTION_GUARD_SYSTEM_NOTICE,
-				SECRET_GUARD_SYSTEM_NOTICE,
-			].join("\n\n")
-		: baseSystemPreamble;
+	const sessionBootstrap = [bootstrap?.text, agentsMdSection].filter(Boolean).join("\n\n");
+	const baseSystemPreamble = await runtime.persona.systemPreamble();
+	const systemPreamble = [
+		baseSystemPreamble,
+		currentConversationNotice(origin),
+		ATTACHMENT_SCOPE_NOTICE,
+		ACTION_GUARD_SYSTEM_NOTICE,
+		SECRET_GUARD_SYSTEM_NOTICE,
+	].join("\n\n");
 	const modelOverride = options.database.bindings.modelGet(key)?.selection;
 	const effectiveModel = modelOverride ?? runtime.config.model;
 
