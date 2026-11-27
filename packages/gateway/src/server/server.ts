@@ -3521,7 +3521,7 @@ async function createInboundTurnLifecycle(
 			.filter(
 				(entry) =>
 					(entry.id === undefined || (!inWindowIds.has(entry.id) && entry.id !== row.message_id)) &&
-					entry.id !== threadRootMessageId,
+					(threadRootMessageId === undefined || entry.id !== threadRootMessageId),
 			)
 			.map(
 				(entry) => `- [${entry.at}] ${entry.author}: ${clipContextBody(redactHistoricalAttachments(entry.body), 500)}`,
