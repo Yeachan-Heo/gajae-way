@@ -28,6 +28,7 @@ import type { PromptImage } from "@gajae-gateway/protocol";
 const MAX_RENDERED_ATTACHMENTS = 10;
 
 export type AttachmentLike = {
+	readonly id?: string | null;
 	readonly name?: string | null;
 	readonly contentType?: string | null;
 	readonly size?: number | null;
@@ -67,6 +68,7 @@ export class DiscordImagePreparationError extends Error {
 	constructor(
 		readonly disposition: "retryable" | "terminal",
 		message = disposition === "terminal" ? "Discord image input rejected." : "Discord image download failed.",
+		readonly refreshSource = false,
 	) {
 		super(message);
 		this.name = "DiscordImagePreparationError";
@@ -84,6 +86,17 @@ export function selectImageAttachments(message: AttachmentCarrier): AttachmentLi
 }
 
 /** PNG/JPEG attachments accepted as native prompt inputs, never fetching other formats. */
+/** Stable identity for the image bytes a message currently points at. */
+export function imageSourceIdentity(message: AttachmentCarrier): string {
+	return selectNativeImageAttachments(message)
+		.map((attachment) => {
+			const stable =
+				attachment.id ?? `${attachment.name ?? ""}\u0000${attachment.size ?? ""}\u0000${attachment.contentType ?? ""}`;
+			return stable;
+		})
+		.join("\u0001");
+}
+
 export function selectNativeImageAttachments(message: AttachmentCarrier): AttachmentLike[] {
 	return collectAttachments(message).filter(isNativeImageAttachment);
 }
@@ -134,6 +147,8 @@ async function downloadDiscordImage(url: string, ports: DiscordImagePreparationP
 	} catch (error) {
 		throw new DiscordImagePreparationError(
 			error instanceof PromptImageDownloadError && !error.retryable ? "terminal" : "retryable",
+			undefined,
+			true,
 		);
 	}
 }

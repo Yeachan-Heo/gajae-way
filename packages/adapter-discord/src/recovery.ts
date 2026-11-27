@@ -98,6 +98,8 @@ export interface RecoveryCursorState {
 	readonly deadLetterDigest: Readonly<Record<string, RecoveryDeadLetterDigest>>;
 	/** Monotonic allocator for the `seq` fields above. */
 	readonly sequence: number;
+	/** Inode of the gateway database seen at the last cursor write; detects operator restore. */
+	readonly gatewayDbIdentity?: string;
 }
 
 export type RecoveryGateResult = "acked" | "duplicate" | "unavailable";
@@ -120,6 +122,7 @@ export function recoveryCursorPath(home: string = adapterHome()): string {
 export class RecoveryGate {
 	readonly #pending = new Map<string, Promise<RecoveryGateResult>>();
 	readonly #acked = new Set<string>();
+	#generation = 0;
 
 	constructor(readonly limit = 10_000) {
 		if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("recovery gate limit must be a positive integer");
@@ -135,11 +138,13 @@ export class RecoveryGate {
 		const pending = this.#pending.get(messageId);
 		if (pending) return pending;
 		if (this.#acked.has(messageId)) return Promise.resolve("duplicate");
+		const generation = this.#generation;
 		const attemptPromise = Promise.resolve()
 			.then(attempt)
 			.then(
 				(verdict) => {
 					this.#pending.delete(messageId);
+					if (verdict === "acked" && generation !== this.#generation) return "unavailable";
 					if (verdict === "acked") {
 						this.#acked.add(messageId);
 						this.forgetBeyond(this.limit);
@@ -158,6 +163,12 @@ export class RecoveryGate {
 	/** True when the gateway already acknowledged this id in this process. */
 	acked(messageId: string): boolean {
 		return this.#acked.has(messageId);
+	}
+
+	/** Forget process-local acknowledgements after the gateway database is replaced. */
+	resetAcknowledged(): void {
+		this.#acked.clear();
+		this.#generation++;
 	}
 
 	/** Bounded memory: forget acked ids beyond the limit (least-recently added first). */
@@ -199,6 +210,7 @@ export async function loadRecoveryCursors(path: string): Promise<RecoveryCursorS
 		// Never hand back a sequence below anything already stored, or fresh entries would
 		// collide with old ones and the retention order would be wrong after a restart.
 		sequence: Math.max(stored, ...seqs, 0),
+		...(typeof record.gatewayDbIdentity === "string" ? { gatewayDbIdentity: record.gatewayDbIdentity } : {}),
 	};
 }
 
@@ -697,6 +709,21 @@ export function isPermanentDiscordUnreadable(error: unknown): boolean {
 		candidate?.status === 403 ||
 		candidate?.status === 404 ||
 		candidate?.httpStatus === 403 ||
+		candidate?.httpStatus === 404
+	);
+}
+
+/**
+ * A Discord response that proves the target no longer exists, as opposed to a
+ * permission problem the operator can repair. Replay verification terminalizes
+ * only these; access failures keep the intent retryable.
+ */
+export function isDefinitiveDiscordNotFound(error: unknown): boolean {
+	const candidate = error as { readonly code?: unknown; readonly status?: unknown; readonly httpStatus?: unknown };
+	return (
+		candidate?.code === 10_003 ||
+		candidate?.code === 10_008 ||
+		candidate?.status === 404 ||
 		candidate?.httpStatus === 404
 	);
 }

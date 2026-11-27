@@ -1,0 +1,4256 @@
+import { expect, spyOn, test } from "bun:test";
+import { Buffer } from "node:buffer";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { ImagePreparationBudgetError } from "@gajae-gateway/images";
+import { GajaewayClient } from "@gajae-gateway/sdk";
+import { Client } from "discord.js";
+import { DiscordImagePreparationError, imageSourceIdentity } from "../src/attachments";
+import { ImageOutbox, type PendingImage } from "../src/image-outbox";
+import { decideInbound, type ImageOutcome, ReconnectingGateway, startDiscordAdapter } from "../src/main";
+import {
+	loadRecoveryCursors,
+	RECOVERY_RETRY_BASE_MS,
+	RECOVERY_RETRY_MAX_MS,
+	saveRecoveryCursors,
+	snowflakeFromTimestamp,
+} from "../src/recovery";
+
+const bot = { id: "bot" };
+const image = { data: "AQID", mimeType: "image/jpeg" as const };
+// The same valid PNG fixture the other adapter image tests download.
+const png = Uint8Array.from(
+	Buffer.from(
+		"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGP4z8DAAMIM/4EAAB/uBfsL2WiLAAAAAElFTkSuQmCC",
+		"base64",
+	),
+);
+const emptyCursors = () => ({
+	recoveredThrough: {},
+	quarantined: {},
+	knownDms: {},
+	attempts: {},
+	deadLetters: [],
+	deadLetterDigest: {},
+	sequence: 0,
+	gatewayDbIdentity: "test-db",
+});
+
+function imageRequest(id: string, channelId: string) {
+	return {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+}
+
+function dmMessage(id: string, channelId: string, withImage = false) {
+	return {
+		id,
+		content: withImage ? "describe this" : "later text",
+		author: { id: "human", username: "human", bot: false },
+		channel: { id: channelId, isDMBased: () => true },
+		attachments: withImage
+			? [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo.png" }]
+			: [],
+	};
+}
+
+/**
+ * discord.js fetches one message by bare id or by `{ message, force }`. Test doubles accept
+ * both so a forced verification fetch and a history page can share one fake.
+ */
+const singleFetchId = (query: unknown): string | undefined =>
+	typeof query === "string" ? query : (query as { message?: string } | undefined)?.message;
+const historyAfter = (query: unknown): string | undefined =>
+	typeof query === "string" ? undefined : (query as { after?: string } | undefined)?.after;
+
+function deferred() {
+	let release!: () => void;
+	const promise = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	return { promise, release };
+}
+
+async function bounded<T>(promise: Promise<T>, ms = 8_000): Promise<T> {
+	return Promise.race([
+		promise,
+		delay(ms).then(() => {
+			throw new Error("Timed out waiting for ingress progress");
+		}),
+	]);
+}
+
+async function eventually(predicate: () => boolean, ms = 8_000) {
+	const deadline = Date.now() + ms;
+	while (!predicate() && Date.now() < deadline) await delay(25);
+	expect(predicate()).toBe(true);
+}
+
+function trackTimers() {
+	const realSetTimeout = globalThis.setTimeout;
+	const timers: ReturnType<typeof setTimeout>[] = [];
+	const spy = spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+		const timer = realSetTimeout(...args);
+		timer.unref?.();
+		timers.push(timer);
+		return timer;
+	}) as typeof setTimeout);
+	return () => {
+		for (const timer of timers) clearTimeout(timer);
+		spy.mockRestore();
+	};
+}
+
+function gateway(
+	cursorPath: string,
+	fetchChannel: (id: string) => Promise<unknown>,
+	requests: Array<{ verb: string; params: any }>,
+	channels: Record<string, { engagement: string }> = {},
+	requestImpl?: (verb: string, params: unknown) => Promise<unknown>,
+	prepareImpl?: () => Promise<{ images: Array<{ data: string; mimeType: "image/jpeg" }>; notice: string }>,
+	withClient = true,
+	socketPath = "unused-socket",
+) {
+	return new ReconnectingGateway(
+		socketPath,
+		{ channels: { fetch: fetchChannel } } as never,
+		{ token: "unused", tokenFile: "unused", configPath: "unused", channels } as never,
+		undefined,
+		undefined,
+		cursorPath,
+		() => bot,
+		withClient
+			? ({
+					request: async (verb: string, params: unknown) => {
+						if (verb !== "gateway.status") requests.push({ verb, params });
+						if (!requestImpl && verb === "gateway.status") return { database: { identity: "test-db" } };
+						return requestImpl ? requestImpl(verb, params) : { engaged: false, turnId: null };
+					},
+				} as never)
+			: undefined,
+		async () => {},
+		undefined,
+		undefined,
+		prepareImpl ?? (async () => ({ images: [image], notice: "" })),
+	);
+}
+
+/** Every delay `scheduleImageRetry`/`scheduleRecoveryRetry` can arm. */
+const RETRY_BACKOFF_MS = new Set(
+	Array.from({ length: 7 }, (_, index) => Math.min(RECOVERY_RETRY_MAX_MS, RECOVERY_RETRY_BASE_MS * 2 ** index)),
+);
+
+/**
+ * Hold the timers the adapter arms with the recovery backoff so the test fires the armed
+ * retry path itself. Every backoff-schedule timer is cleared and cancelled again at
+ * teardown, so neither a wall-clock delay nor a leaked pass can decide the assertion.
+ * Product sleeps on these paths are injected no-ops, so nothing awaited is held.
+ */
+function holdRetryTimers() {
+	const realSetTimeout = globalThis.setTimeout;
+	const handles: ReturnType<typeof setTimeout>[] = [];
+	const armed: Array<{ delay: number; fire: () => void }> = [];
+	const spy = spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+		const timer = realSetTimeout(...args);
+		timer.unref?.();
+		const delay = typeof args[1] === "number" ? args[1] : 0;
+		// Only the recovery backoff schedule is held; other product timers keep their
+		// schedule, and the runner's own test timeout stays intact.
+		if (!RETRY_BACKOFF_MS.has(delay)) return timer;
+		handles.push(timer);
+		clearTimeout(timer);
+		armed.push({
+			delay,
+			fire: () => (args[0] as unknown as (...rest: unknown[]) => void)(...args.slice(2)),
+		});
+		return timer;
+	}) as typeof setTimeout);
+	return {
+		/** One entry per retry timer armed at the backoff floor (the first re-arm). */
+		retries: () => armed.filter((entry) => entry.delay === RECOVERY_RETRY_BASE_MS),
+		cleanup() {
+			for (const handle of handles) clearTimeout(handle);
+			spy.mockRestore();
+		},
+	};
+}
+
+/** Capture every recovery pass this adapter starts so a fired retry can be joined. */
+function trackRecoveryPasses(adapter: ReconnectingGateway) {
+	const passes: Array<Promise<void>> = [];
+	const seam = adapter as unknown as { recoverMissedMessages(): Promise<void> };
+	const real = seam.recoverMissedMessages.bind(adapter);
+	seam.recoverMissedMessages = () => {
+		const pass = real();
+		passes.push(pass);
+		return pass;
+	};
+	return {
+		passes,
+		restore() {
+			seam.recoverMissedMessages = real;
+		},
+	};
+}
+
+/**
+ * Capture the closure each scheduled retry will run, so its outcome can be awaited. The
+ * fired timer invokes that closure synchronously before it yields, which makes the captured
+ * promise the authoritative completion of the armed path.
+ */
+function trackScheduledRetries(adapter: ReconnectingGateway) {
+	const outcomes = new Map<string, Promise<ImageOutcome>>();
+	const seam = adapter as unknown as {
+		scheduleImageRetry(id: string, channelId: string, retry: () => Promise<ImageOutcome>): void;
+	};
+	const real = seam.scheduleImageRetry.bind(adapter);
+	seam.scheduleImageRetry = (id, channelId, retry) =>
+		real(id, channelId, () => {
+			const outcome = retry();
+			outcomes.set(id, outcome);
+			return outcome;
+		});
+	return {
+		outcomes,
+		restore() {
+			seam.scheduleImageRetry = real;
+		},
+	};
+}
+
+/** A live DM text message as discord.js would hand it to `messageCreate`. */
+function liveDmText(id: string, channelId: string, content: string) {
+	return {
+		id,
+		content,
+		author: { id: "human", username: "human", bot: false },
+		channel: { id: channelId, isDMBased: () => true },
+		attachments: [],
+	};
+}
+
+/** A native image message the adapter itself admitted as live thread ingress. */
+function liveThreadImage(id: string, threadId: string, parentId: string) {
+	return {
+		id,
+		content: "what is in this one?",
+		author: { id: "human", username: "human", bot: false },
+		channel: {
+			id: threadId,
+			parentId,
+			type: 11,
+			isDMBased: () => false,
+			isThread: () => true,
+		},
+		attachments: [
+			{
+				name: "photo.png",
+				contentType: "image/png",
+				url: "https://cdn.discordapp.com/attachments/1/2/thread-photo.png",
+			},
+		],
+	};
+}
+
+/** A durable image admitted in a parent channel whose acknowledged turn targets the thread. */
+function threadImageRequest(id: string, threadId: string, parentId: string) {
+	return {
+		messageId: id,
+		text: "from the parent channel\n[image · photo.png]",
+		images: [image],
+		origin: {
+			platform: "discord",
+			kind: "thread",
+			conversationId: threadId,
+			parentId,
+			threadVisibility: "public",
+		},
+		engagement: { mentioned: false, group: true, authorId: "human" },
+	};
+}
+
+/**
+ * Start a real adapter process over a seeded home: cursors and the durable image outbox are on
+ * disk, so this is the adapter as it comes back after a restart. The gateway transport is a
+ * fake, but every Discord event below travels the production `messageCreate` handler and every
+ * conversation ordering decision is made by the adapter itself.
+ */
+async function startRestartedAdapter(options: {
+	imageId: string;
+	cursor: Record<string, unknown>;
+	outbox: unknown;
+	/** Discord messages a replay revalidation may re-read; defaults to the live test source. */
+	sources?: Readonly<Record<string, unknown>>;
+	channels?: Record<string, { engagement: "open" }>;
+	chatSend: (messageId: string, params: unknown) => Promise<unknown>;
+}) {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-live-barrier-"));
+	const oldHome = process.env.GAJAEWAY_HOME;
+	process.env.GAJAEWAY_HOME = home;
+	const directory = join(home, "adapters", "discord");
+	await mkdir(directory, { recursive: true });
+	await saveRecoveryCursors(join(directory, "recovery-cursor.json"), options.cursor as never);
+	await writeFile(join(directory, "image-outbox.json"), JSON.stringify(options.outbox));
+	const chatSends: Array<{ messageId: string; params: any }> = [];
+	const cleanupTimers = trackTimers();
+	let discord: Client | undefined;
+	const transport = {
+		onChatMessage: () => () => {},
+		onChatProgress: () => () => {},
+		request: async (verb: string, params: unknown) => {
+			if (verb === "gateway.status") return { database: { identity: "test-db" } };
+			if (verb !== "chat.send") return { engaged: false, turnId: null };
+			const messageId = (params as { messageId: string }).messageId;
+			const result = await options.chatSend(messageId, params);
+			chatSends.push({ messageId, params });
+			return result;
+		},
+	};
+	const connect = spyOn(GajaewayClient, "connectSocketWithBackoff").mockResolvedValue(transport as never);
+	const reconnect = spyOn(GajaewayClient, "connectSocket").mockResolvedValue(transport as never);
+	const login = spyOn(Client.prototype, "login").mockImplementation(async function (this: Client) {
+		discord = this;
+		Object.defineProperty(this, "user", { value: { id: "bot" }, configurable: true });
+		this.channels.fetch = (async (id: string) => ({
+			messages: {
+				fetch: async (query: unknown) => {
+					const single = singleFetchId(query);
+					if (single === undefined) return [];
+					return (
+						options.sources?.[single] ?? (single === options.imageId ? dmMessage(options.imageId, id, true) : undefined)
+					);
+				},
+			},
+		})) as never;
+		return "offline-test-token";
+	});
+	let restored = false;
+	const restore = async () => {
+		if (restored) return;
+		restored = true;
+		cleanupTimers();
+		login.mockRestore();
+		reconnect.mockRestore();
+		connect.mockRestore();
+		if (oldHome === undefined) delete process.env.GAJAEWAY_HOME;
+		else process.env.GAJAEWAY_HOME = oldHome;
+		await rm(home, { recursive: true, force: true });
+	};
+	try {
+		await startDiscordAdapter({
+			tokenFile: join(home, "unused-token"),
+			token: "offline-test-token",
+			configPath: join(home, "adapter-discord.json"),
+			gatewaySocket: join(home, "unused.sock"),
+			statusReactions: "off",
+			channels: options.channels,
+		});
+	} catch (error) {
+		await restore();
+		throw error;
+	}
+	return { chatSends, discord: () => discord, restore };
+}
+
+test("recovery delivers an older durable image below the watermark before newer history text", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-history-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "dm-history";
+	const olderId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const watermark = snowflakeFromTimestamp(Date.now() - 90_000);
+	const newerId = snowflakeFromTimestamp(Date.now() - 60_000);
+	const later = dmMessage(newerId, channelId);
+	const request = {
+		messageId: olderId,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: watermark },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: olderId, channelId, request }]));
+		const channel = {
+			messages: {
+				fetch: async (query: unknown) => {
+					const single = singleFetchId(query);
+					if (single !== undefined) return single === olderId ? dmMessage(olderId, channelId, true) : undefined;
+					const after = historyAfter(query);
+					return !after || BigInt(after) < BigInt(newerId) ? [later] : [];
+				},
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			olderId,
+			newerId,
+		]);
+		expect(requests.find((entry) => entry.verb === "chat.send")?.params).toEqual(request);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toHaveLength(2);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("without a cursor, durable replay waits behind the bootstrap history window", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-bootstrap-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "bootstrap-dm";
+	const olderId = snowflakeFromTimestamp(Date.now() - 180_000);
+	const imageId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const request = {
+		messageId: imageId,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: imageId, channelId, request }]));
+		const channel = {
+			messages: {
+				fetch: async (query: unknown) => {
+					if (singleFetchId(query) !== undefined) return dmMessage(imageId, channelId, true);
+					const after = historyAfter(query);
+					return !after || BigInt(after) < BigInt(imageId)
+						? [dmMessage(olderId, channelId), dmMessage(imageId, channelId, true)]
+						: [];
+				},
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			olderId,
+			imageId,
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("a failing unrelated channel cannot starve a repaired live image intent below its watermark", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-isolation-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "healthy-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 120_000);
+	const message = dmMessage(id, channelId, true);
+	const requests: Array<{ verb: string; params: any }> = [];
+	let failedHistoryFetches = 0;
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 60_000) },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(outboxPath, "not JSON");
+		const adapter = gateway(
+			cursorPath,
+			async (id) =>
+				id === "broken-channel"
+					? {
+							messages: {
+								fetch: async () => {
+									failedHistoryFetches++;
+									throw new Error("temporary history failure");
+								},
+							},
+						}
+					: { messages: { fetch: async (query: unknown) => (singleFetchId(query) !== undefined ? message : []) } },
+			requests,
+			{ "broken-channel": { engagement: "open" } },
+		);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("unavailable");
+		expect(requests).toEqual([]);
+		await bounded(adapter.recoverMissedMessages());
+		expect(failedHistoryFetches).toBeGreaterThan(0);
+		await writeFile(outboxPath, "[]\n");
+		await eventually(() => requests.some((entry) => entry.verb === "chat.send"));
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([id]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a cursor-store write failure does not block image delivery or duplicate it after repair", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-turn-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "new-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		const channel = {
+			messages: { fetch: async (query: unknown) => (singleFetchId(query) !== undefined ? message : [message]) },
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		// Replacing the cursor file with a directory makes the DM registration's
+		// atomic rename fail after the outbox intent has already been persisted.
+		await rm(cursorPath);
+		await mkdir(cursorPath);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("acked");
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([id]);
+		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
+			{ messageId: id, channelId, completed: true, completedAt: expect.any(Number), declined: true, dm: true },
+		]);
+		await rm(cursorPath, { recursive: true });
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toHaveLength(1);
+		// The registration is re-persisted once the store is repaired, and the
+		// completed tombstone keeps the repaired pass from replaying the send.
+		expect((await loadRecoveryCursors(cursorPath)).knownDms[channelId]).toBeDefined();
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 15_000);
+
+test("a deleted image message is dead-lettered instead of retrying forever", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-deleted-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "gone-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 120_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: id, channelId }]));
+		const channel = {
+			messages: {
+				fetch: async (query: unknown) => {
+					if (singleFetchId(query) === undefined) return [];
+					throw Object.assign(new Error("Unknown Message"), { code: 10_008, status: 404 });
+				},
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
+		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
+			{ messageId: id, channelId, terminal: true, audited: true },
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a requestless intent survives a repairable permission failure instead of dead-lettering", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-blocked-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "broken-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 120_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: id, channelId }]));
+		const denied = Object.assign(new Error("Missing Access"), { code: 50_001, status: 403 });
+		const channel = {
+			messages: {
+				fetch: async () => {
+					throw denied;
+				},
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		// A crash between intent admission and request persistence must not turn an
+		// operator-fixable permission outage into a permanent rejection.
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(adapter.deadLetters).toEqual([]);
+		const persisted = JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))[0];
+		expect(persisted.terminal).toBeUndefined();
+		expect(persisted.failureAt).toBeNumber();
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a terminal chat.send rejection is dead-lettered after the bounded attempt budget", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-terminal-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "new-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	const requests: Array<{ verb: string; params: any }> = [];
+	const channel = {
+		messages: { fetch: async (query: unknown) => (singleFetchId(query) !== undefined ? message : []) },
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		const adapter = gateway(
+			cursorPath,
+			async () => channel,
+			requests,
+			{},
+			async () => {
+				throw Object.assign(new Error("frame exceeds limit"), { code: "payload_too_large" });
+			},
+		);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		let sends = 0;
+		const client = {
+			request: async (verb: string) => {
+				// The first status poll of the database identity is additive, not a send.
+				if (verb !== "chat.send") return {};
+				sends++;
+				throw Object.assign(new Error("frame exceeds limit"), { code: "payload_too_large" });
+			},
+		};
+		adapter.adoptClient(client as never);
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("unavailable");
+		adapter.adoptClient(client as never);
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("unavailable");
+		const waiting = adapter.waitForImage(message as never, Promise.resolve("unavailable"));
+		adapter.adoptClient(client as never);
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("skip");
+		await bounded(waiting, 2_000);
+		expect(sends).toBe(3);
+		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
+		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
+			{ messageId: id, channelId, terminal: true, audited: true, dm: true },
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("recovery does not wait behind a live image whose ingress turn is still held", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-wait-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "new-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	const requests: Array<{ verb: string; params: any }> = [];
+	const turn = deferred();
+	const channel = {
+		messages: { fetch: async (query: unknown) => (singleFetchId(query) !== undefined ? message : [message]) },
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		const live = adapter.processImage(message as never, engagement!, undefined, turn.promise);
+		await delay(100);
+		await bounded(adapter.recoverMissedMessages(), 3_000);
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		turn.release();
+		expect(await bounded(live)).toBe("acked");
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toHaveLength(1);
+	} finally {
+		turn.release();
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("consecutive preparation failures re-arm the image retry timer", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-rearm-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "new-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	const requests: Array<{ verb: string; params: any }> = [];
+	let preparations = 0;
+	const channel = {
+		messages: { fetch: async (query?: unknown) => (singleFetchId(query) !== undefined ? message : []) },
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		const adapter = gateway(
+			cursorPath,
+			async () => channel,
+			requests,
+			{},
+			undefined,
+			async () => {
+				preparations++;
+				if (preparations <= 6) throw new DiscordImagePreparationError("retryable");
+				return { images: [image], notice: "" };
+			},
+		);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("unavailable");
+		// Two timer-driven attempts must follow the first in-invocation budget.
+		await eventually(() => requests.some((entry) => entry.verb === "chat.send"), 8_000);
+		expect(preparations).toBe(7);
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toHaveLength(1);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an intent unacknowledged for 24 hours is dead-lettered instead of wedging ingress", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-expired-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "stuck-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 120_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	const channel = {
+		messages: {
+			fetch: async (query?: unknown) => (singleFetchId(query) !== undefined ? dmMessage(id, channelId, true) : []),
+		},
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		const request = {
+			messageId: id,
+			text: "look\n[image · photo.png]",
+			origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+			engagement: { mentioned: false, group: false, authorId: "human" },
+			images: [image],
+		};
+		await writeFile(
+			join(home, "image-outbox.json"),
+			JSON.stringify([{ messageId: id, channelId, request, dm: true, failureAt: Date.now() - 25 * 60 * 60 * 1000 }]),
+		);
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
+		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
+			{ messageId: id, channelId, terminal: true, audited: true, dm: true },
+		]);
+		await bounded(adapter.waitForImage({ id } as never, Promise.resolve("unavailable")), 2_000);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an image refused by the admission bound releases the conversation chain", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-capacity-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	await saveRecoveryCursors(cursorPath, emptyCursors());
+	const channelId = "capacity-dm";
+	const base = 1571558400000000000n;
+	await writeFile(
+		outboxPath,
+		JSON.stringify(
+			Array.from({ length: 1_000 }, (_, index) => ({
+				messageId: String(base + BigInt(index)),
+				channelId,
+				dm: true,
+			})),
+		),
+	);
+	try {
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		const id = String(base + 10_000n);
+		const message = dmMessage(id, channelId, true);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		const first = adapter.processImage(message as never, engagement!);
+		const waiter = adapter.waitForImage(message as never, first);
+		expect(await bounded(first)).toBe("unavailable");
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("unavailable");
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("skip");
+		await bounded(waiter, 2_000);
+		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
+		expect(adapter.deadLetters[0]!.summary).toContain("admission");
+		expect(
+			JSON.parse(await readFile(outboxPath, "utf8")).some((entry: { messageId: string }) => entry.messageId === id),
+		).toBe(false);
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect((await loadRecoveryCursors(cursorPath)).knownDms[channelId]).toBeDefined();
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 30_000);
+
+test("a transient source-fetch failure starts the failure clock and expires", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-source-fail-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "source-fail-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 120_000);
+	await saveRecoveryCursors(cursorPath, {
+		...emptyCursors(),
+		knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+		sequence: 1,
+	});
+	await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, dm: true }]));
+	try {
+		const failing = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async () => {
+						throw new Error("temporary source failure");
+					},
+				},
+			}),
+			[],
+		);
+		await bounded(failing.recoverMissedMessages());
+		const afterFailure = JSON.parse(await readFile(outboxPath, "utf8"));
+		expect(afterFailure[0].failureAt).toEqual(expect.any(Number));
+		expect(afterFailure[0].terminal).toBeUndefined();
+		await writeFile(outboxPath, JSON.stringify([{ ...afterFailure[0], failureAt: Date.now() - 25 * 60 * 60 * 1000 }]));
+		const expired = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async () => {
+						throw new Error("temporary source failure");
+					},
+				},
+			}),
+			[],
+		);
+		await bounded(expired.recoverMissedMessages());
+		expect(expired.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([
+			{ messageId: id, channelId, terminal: true, audited: true, dm: true },
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an in-window pending image stays behind older missed history", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-inwindow-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "dm-inwindow";
+	const watermark = snowflakeFromTimestamp(Date.now() - 180_000);
+	const textId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const imageId = snowflakeFromTimestamp(Date.now() - 60_000);
+	const text = dmMessage(textId, channelId);
+	const imageMessage = dmMessage(imageId, channelId, true);
+	const request = {
+		messageId: imageId,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: watermark },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: imageId, channelId, request }]));
+		const channel = {
+			messages: {
+				fetch: async (query: unknown) => {
+					if (singleFetchId(query) !== undefined) return imageMessage;
+					const after = historyAfter(query);
+					return !after || BigInt(after) < BigInt(imageId) ? [imageMessage, text] : [];
+				},
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			textId,
+			imageId,
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a truncated backfill does not let an above-horizon image overtake history", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-truncated-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "truncated-dm";
+	const watermark = snowflakeFromTimestamp(Date.now() - 180_000);
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const request = {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: watermark },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, request }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async () => {
+						throw new Error("temporary history truncation");
+					},
+				},
+			}),
+			requests,
+		);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		const persisted = JSON.parse(await readFile(outboxPath, "utf8"));
+		expect(persisted).toEqual([{ messageId: id, channelId, request, failureAt: expect.any(Number) }]);
+		await writeFile(
+			outboxPath,
+			JSON.stringify([{ messageId: id, channelId, request, failureAt: Date.now() - 25 * 60 * 60 * 1000 }]),
+		);
+		const expired = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async () => {
+						throw new Error("temporary history truncation");
+					},
+				},
+			}),
+			requests,
+		);
+		await bounded(expired.recoverMissedMessages());
+		expect(expired.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([
+			{ messageId: id, channelId, terminal: true, audited: true },
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a first-time channel uses the bootstrap floor before independent image replay", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-bootstrap-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "dm-bootstrap";
+	const textId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const imageId = snowflakeFromTimestamp(Date.now() - 60_000);
+	const text = dmMessage(textId, channelId);
+	const imageMessage = dmMessage(imageId, channelId, true);
+	const request = {
+		messageId: imageId,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: imageId, channelId, request }]));
+		const channel = {
+			messages: {
+				fetch: async (query: unknown) => {
+					if (singleFetchId(query) !== undefined) return imageMessage;
+					const after = historyAfter(query);
+					return !after || BigInt(after) < BigInt(imageId) ? [imageMessage, text] : [];
+				},
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			textId,
+			imageId,
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a recovered image is admitted without creating a thread first", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-nothread-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "guild-channel";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	let created = 0;
+	const message = {
+		id,
+		content: "<@bot> look",
+		author: { id: "human", username: "human", bot: false },
+		channel: { id: channelId, isDMBased: () => false },
+		guild: { id: "guild" },
+		mentions: { has: () => true },
+		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo.png" }],
+		startThread: async () => {
+			created++;
+			return { id: "created-thread" };
+		},
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		const channel = {
+			messages: { fetch: async (query?: unknown) => (singleFetchId(query) !== undefined ? message : [message]) },
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests, { [channelId]: { engagement: "open" } });
+		await bounded(adapter.recoverMissedMessages());
+		expect(created).toBe(0);
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([id]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a duplicate live image event is coalesced while its first send is settling", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-duplicate-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "duplicate-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	const requests: Array<{ verb: string; params: any }> = [];
+	let sends = 0;
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			requests,
+			{},
+			async (verb) => {
+				if (verb !== "chat.send") return { engaged: false, turnId: null };
+				sends++;
+				if (sends === 1) throw new Error("temporary send failure");
+				return { engaged: false, turnId: null };
+			},
+		);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		const first = adapter.processImage(message as never, engagement!);
+		const waiter = adapter.waitForImage(message as never, first);
+		expect(await bounded(first)).toBe("unavailable");
+		adapter.adoptClient({
+			request: async (verb: string, params: unknown) => {
+				requests.push({ verb, params });
+				// The first status poll of the database identity is additive, not a send.
+				if (verb === "chat.send") sends++;
+				return { engaged: false, turnId: null };
+			},
+		} as never);
+		expect(adapter.imageInFlight(id)).toBe(true);
+		expect(["unavailable", "acked"]).toContain(await adapter.processImage(message as never, engagement!));
+		await bounded(waiter);
+		expect(sends).toBe(2);
+		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
+			{ messageId: id, channelId, completed: true, completedAt: expect.any(Number), declined: true, dm: true },
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a request older than gateway dedupe retention is not replayed", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-dedupe-age-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "old-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 31 * 24 * 60 * 60 * 1000);
+	const request = {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([{ messageId: id, channelId, request, createdAt: Date.now() - 31 * 24 * 60 * 60 * 1000 }]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async (query: unknown) => (singleFetchId(query) === id ? dmMessage(id, channelId, true) : []),
+				},
+			}),
+			requests,
+		);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
+		expect(adapter.deadLetters[0]!.summary).toContain("dedupe retention");
+		// The bootstrap watermark passed this id, so the terminal evidence compacted safely.
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an old source is rejected even when its outbox row was stamped recently", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-source-age-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "source-age-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 31 * 24 * 60 * 60 * 1000);
+	const request = {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, request, createdAt: Date.now() }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async (query: unknown) => (singleFetchId(query) === id ? dmMessage(id, channelId, true) : []),
+				},
+			}),
+			requests,
+		);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(adapter.deadLetters[0]?.summary).toContain("dedupe retention");
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an unknown database identity holds recovery once a generation was adopted", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-identity-unknown-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "identity-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	const requests: Array<{ verb: string; params: any }> = [];
+	let fetches = 0;
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			gatewayDbIdentity: "known-db",
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		const adapter = gateway(
+			cursorPath,
+			async () => {
+				fetches++;
+				return { messages: { fetch: async () => [message] } };
+			},
+			requests,
+			{},
+			async (verb) => (verb === "gateway.status" ? { database: {} } : { engaged: false, turnId: null }),
+		);
+		await bounded(adapter.recoverMissedMessages());
+		expect(fetches).toBe(0);
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a deleted source invalidates a pending exact-request replay", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-source-delete-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "delete-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const request = {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, request, dm: true }]));
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), []);
+		await adapter.invalidateImageSource(id, "image source message was deleted");
+		const persisted = JSON.parse(await readFile(outboxPath, "utf8"));
+		expect(persisted[0]).toMatchObject({ messageId: id, terminal: true });
+		expect(adapter.deadLetters[0]?.summary).toContain("deleted");
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a persisted request revalidates its source before the first replay", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-source-revalidate-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "revalidate-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const request = {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 30_000) },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: id, channelId, dm: true, request, sourceIdentity: "attachment-old", sourceText: "describe this" },
+			]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async (query: unknown) => {
+						if (singleFetchId(query) !== id) return [];
+						throw Object.assign(new Error("Unknown Message"), { code: 10_008, status: 404 });
+					},
+				},
+			}),
+			requests,
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(adapter.deadLetters[0]?.summary).toContain("message unavailable");
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))[0]).toMatchObject({ messageId: id, terminal: true });
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a replay verification fetch bypasses the discord.js message cache", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-replay-cache-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "cache-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const stale = dmMessage(id, channelId, true);
+	const request = {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 30_000) },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{
+					messageId: id,
+					channelId,
+					dm: true,
+					request,
+					sourceIdentity: imageSourceIdentity(stale),
+					sourceText: "describe this",
+				},
+			]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async (query: unknown) => {
+						const single = singleFetchId(query);
+						if (single === undefined) return [];
+						// Model discord.js: a bare id, or an object without `force`, is served from the
+						// message cache. Only `force: true` reaches the API and observes the delete
+						// that landed while the link was down; the cache would replay a missing message.
+						if (typeof query === "object" && query !== null && (query as { force?: boolean }).force === true) {
+							if (single === id) throw Object.assign(new Error("Unknown Message"), { code: 10_008, status: 404 });
+							return undefined;
+						}
+						return single === id ? stale : undefined;
+					},
+				},
+			}),
+			requests,
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(adapter.deadLetters[0]?.summary).toContain("message unavailable");
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))[0]).toMatchObject({ messageId: id, terminal: true });
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an expired signed url is refreshed with a forced fetch, not a cached message", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-refresh-forced-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "refresh-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const expired = dmMessage(id, channelId, true);
+	// Re-signing changes the url, not the attachment identity the intent was recorded for.
+	const fresh = dmMessage(id, channelId, true);
+	(fresh.attachments[0] as { url?: string }).url = "https://cdn.discordapp.com/photo.png?signature=fresh";
+	const requests: Array<{ verb: string; params: any }> = [];
+	let served = "expired";
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		const adapter = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async (query: unknown) => {
+						const single = singleFetchId(query);
+						if (single === undefined) return [];
+						// Model discord.js: only a forced read reaches the API for the re-signed url.
+						if (typeof query === "object" && query !== null && (query as { force?: boolean }).force === true) {
+							if (single !== id) return undefined;
+							served = "fresh";
+							return fresh;
+						}
+						return single === id ? expired : undefined;
+					},
+				},
+			}),
+			requests,
+			{},
+			undefined,
+			async () => {
+				// A cache hit would return the same expired url and this refresh could never
+				// succeed, wedging the intent until it dead-lettered.
+				if (served === "expired") throw new DiscordImagePreparationError("retryable", "expired signed url", true);
+				return { images: [image], notice: "" };
+			},
+		);
+		const engagement = decideInbound(expired as never, bot, {});
+		expect(engagement).toBeDefined();
+		expect(await bounded(adapter.processImage(expired as never, engagement!))).toBe("acked");
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toHaveLength(1);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a transient source read during replay defers instead of dead-lettering", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-source-transient-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "transient-source-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const request = {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 30_000) },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, dm: true, request }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async (query: unknown) => {
+						if (singleFetchId(query) !== id) return [];
+						throw new Error("socket hang up");
+					},
+				},
+			}),
+			requests,
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(adapter.deadLetters).toEqual([]);
+		const persisted = JSON.parse(await readFile(outboxPath, "utf8"))[0];
+		expect(persisted.terminal).toBeUndefined();
+		expect(persisted.failureAt).toBeNumber();
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a permission-only source read during replay defers instead of dead-lettering", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-source-permission-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "permission-source-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const request = {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 30_000) },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, dm: true, request }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async (query: unknown) => {
+						if (singleFetchId(query) !== id) return [];
+						throw Object.assign(new Error("Missing Access"), { code: 50_001, status: 403 });
+					},
+				},
+			}),
+			requests,
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(adapter.deadLetters).toEqual([]);
+		const persisted = JSON.parse(await readFile(outboxPath, "utf8"))[0];
+		expect(persisted.terminal).toBeUndefined();
+		expect(persisted.failureAt).toBeNumber();
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a persisted request whose source attachment was replaced is not replayed", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-source-replaced-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "replaced-source-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const request = {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 30_000) },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([{ messageId: id, channelId, dm: true, request, sourceIdentity: "attachment-old" }]),
+		);
+		const edited = dmMessage(id, channelId, true);
+		(edited.attachments[0] as { id?: string }).id = "attachment-new";
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async (query: unknown) => (singleFetchId(query) === id ? edited : []) } }),
+			requests,
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(adapter.deadLetters[0]?.summary).toContain("source changed");
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))[0]).toMatchObject({ messageId: id, terminal: true });
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a delete during image preparation cannot resurrect the request", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-prep-race-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "prep-race-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	const requests: Array<{ verb: string; params: any }> = [];
+	const preparation = deferred();
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => message } }),
+			requests,
+			{},
+			undefined,
+			async () => {
+				await preparation.promise;
+				return { images: [image], notice: "" };
+			},
+		);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		const first = adapter.processImage(message as never, engagement!);
+		let admitted = false;
+		for (let attempt = 0; attempt < 200 && !admitted; attempt++) {
+			try {
+				admitted = JSON.parse(await readFile(outboxPath, "utf8")).some(
+					(row: { messageId: string }) => row.messageId === id,
+				);
+			} catch {}
+			if (!admitted) await delay(10);
+		}
+		expect(admitted).toBe(true);
+		await bounded(adapter.invalidateImageSource(id, "image source message was deleted"));
+		preparation.release();
+		expect(await bounded(first)).toBe("skip");
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))[0]).toMatchObject({ messageId: id, terminal: true });
+	} finally {
+		preparation.release();
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("completed image evidence compacts only below the recovery watermark", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-completed-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "completed-dm";
+	const watermark = snowflakeFromTimestamp(Date.now() - 60_000);
+	const below = snowflakeFromTimestamp(Date.now() - 120_000);
+	const above = snowflakeFromTimestamp(Date.now() + 60_000);
+	const row = (messageId: string, completedAt: number) => ({ messageId, channelId, completed: true, completedAt });
+	const withinRestoreWindow = row(below, Date.now() - 8 * 24 * 60 * 60 * 1000);
+	const beyondRestoreWindow = row(
+		snowflakeFromTimestamp(Date.now() - 31 * 24 * 60 * 60 * 1000),
+		Date.now() - 31 * 24 * 60 * 60 * 1000,
+	);
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: watermark },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(outboxPath, JSON.stringify([withinRestoreWindow, beyondRestoreWindow, row(above, Date.now())]));
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), []);
+		await bounded(adapter.recoverMissedMessages());
+		expect(
+			JSON.parse(await readFile(outboxPath, "utf8")).map((entry: { messageId: string }) => entry.messageId),
+		).toEqual([withinRestoreWindow.messageId, above]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a persistent pre-intent outbox failure releases ingress after bounded attempts", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-unwritable-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "unwritable-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await mkdir(outboxPath);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		const first = adapter.processImage(message as never, engagement!);
+		const waiter = adapter.waitForImage(message as never, first);
+		expect(await bounded(first)).toBe("unavailable");
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("unavailable");
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("skip");
+		expect(requests).toEqual([]);
+		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
+		expect(adapter.deadLetters[0]!.summary).toContain("3 admission attempts");
+		await bounded(waiter, 2_000);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("recovered admission failures never take the live terminal release", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-recovered-admission-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "recovered-dm";
+	const base = 1571558400000000000n;
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(
+			outboxPath,
+			JSON.stringify(
+				Array.from({ length: 1_000 }, (_, index) => ({
+					messageId: String(base + BigInt(index)),
+					channelId,
+				})),
+			),
+		);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		const id = String(base + 10_000n);
+		const message = dmMessage(id, channelId, true);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		expect(await bounded(adapter.processImage(message as never, engagement!, undefined, undefined, true))).toBe(
+			"unavailable",
+		);
+		expect(adapter.deadLetters).toEqual([]);
+		expect(requests).toEqual([]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("recovered pre-intent outbox failures hold progress without dead-lettering", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-recovered-io-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "recovered-io-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await mkdir(outboxPath);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), []);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		for (let attempt = 0; attempt < 5; attempt++)
+			expect(await bounded(adapter.processImage(message as never, engagement!, undefined, undefined, true))).toBe(
+				"unavailable",
+			);
+		expect(adapter.deadLetters).toEqual([]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a history join inherits a capacity hold from the live owner", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-join-capacity-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "join-capacity-dm";
+	const base = 1571558400000000000n;
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(
+			outboxPath,
+			JSON.stringify(
+				Array.from({ length: 1_000 }, (_, index) => ({
+					messageId: String(base + BigInt(index)),
+					channelId,
+				})),
+			),
+		);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		const id = String(base + 10_000n);
+		const message = dmMessage(id, channelId, true);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		const live = adapter.processImage(message as never, engagement!);
+		const waiter = adapter.waitForImage(message as never, live);
+		const history = adapter.processImage(message as never, engagement!, undefined, undefined, true);
+		expect(await bounded(live)).toBe("unavailable");
+		expect(await bounded(history)).toBe("unavailable");
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("unavailable");
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("skip");
+		await bounded(waiter, 2_000);
+		expect(requests).toEqual([]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a replaced gateway database invalidates completion tombstones", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-restore-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "restore-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 60_000) },
+			gatewayDbIdentity: "0:0",
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([{ messageId: id, channelId, completed: true, completedAt: Date.now() }]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			[],
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "new-db" } } : { engaged: false, turnId: null },
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([]);
+		const cursors = await loadRecoveryCursors(cursorPath);
+		expect(cursors.gatewayDbIdentity).toBe("new-db");
+		const watermark = cursors.recoveredThrough[channelId] ?? cursors.quarantined[channelId]?.watermark;
+		expect(watermark).toBeDefined();
+		expect(BigInt(watermark!)).toBeLessThan(BigInt(snowflakeFromTimestamp(Date.now() - 29 * 24 * 60 * 60 * 1000)));
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("live completion compacts eligible evidence without a recovery pass", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-live-compact-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "live-compact-dm";
+	const old = snowflakeFromTimestamp(Date.now() - 31 * 24 * 60 * 60 * 1000);
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 30 * 24 * 60 * 60 * 1000) },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: old, channelId, completed: true, completedAt: Date.now() - 31 * 24 * 60 * 60 * 1000 },
+			]),
+		);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), []);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("acked");
+		await delay(20);
+		const rows = JSON.parse(await readFile(outboxPath, "utf8")) as Array<{ messageId: string }>;
+		expect(rows.map((row) => row.messageId)).not.toContain(old);
+		expect(rows.map((row) => row.messageId)).toContain(id);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a declined image is marked reclaimable evidence instead of completion quota", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-declined-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	// A bot-visible channel that is never configured for recovery: its row has no
+	// watermark to compact against, so a quota-charged tombstone would accumulate
+	// until it blocked images in every other channel.
+	const channelId = "bot-visible-guild-channel";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = {
+		id,
+		content: "look at this",
+		author: { id: "human", username: "human", bot: false },
+		channel: { id: channelId, name: "general" },
+		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo.png" }],
+	};
+	try {
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), [], {});
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("acked");
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([
+			{
+				messageId: id,
+				channelId,
+				completed: true,
+				completedAt: expect.any(Number),
+				declined: true,
+			},
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a persisted image request replays even when the recovery cursor is unreadable", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-cursor-read-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "new-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 25 * 60 * 60 * 1000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await mkdir(cursorPath);
+		const request = {
+			messageId: id,
+			text: "look\n[image · photo.png]",
+			origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+			engagement: { mentioned: false, group: false, authorId: "human" },
+			images: [image],
+		};
+		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: id, channelId, request, dm: true }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async (query: unknown) => (singleFetchId(query) === id ? dmMessage(id, channelId, true) : []),
+				},
+			}),
+			requests,
+		);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([id]);
+		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
+			{ messageId: id, channelId, completed: true, completedAt: expect.any(Number), declined: true, dm: true },
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a fresh durable image waits for history when the recovery cursor is unreadable", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-cursor-read-fresh-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "fresh-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await mkdir(cursorPath);
+		const request = {
+			messageId: id,
+			text: "look\n[image · photo.png]",
+			origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+			engagement: { mentioned: false, group: false, authorId: "human" },
+			images: [image],
+		};
+		await writeFile(join(home, "image-outbox.json"), JSON.stringify([{ messageId: id, channelId, request, dm: true }]));
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))[0].messageId).toBe(id);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an admitted source identity is retained across a restart before request persistence", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-source-retain-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "retained-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(
+			join(home, "image-outbox.json"),
+			JSON.stringify([
+				{ messageId: id, channelId, dm: true, sourceIdentity: "attachment-old", sourceText: "describe this" },
+			]),
+		);
+		const edited = dmMessage(id, channelId, true);
+		edited.content = "describe this differently";
+		const replacement: any = {
+			name: "photo.png",
+			contentType: "image/png",
+			url: "https://cdn.discordapp.com/photo.png",
+			id: "attachment-new",
+		};
+		edited.attachments = [replacement];
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		const engagement = decideInbound(edited as never, bot, {});
+		expect(engagement).toBeDefined();
+		expect(await bounded(adapter.processImage(edited as never, engagement!))).toBe("skip");
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))[0].terminal).toBe(true);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a budget-refused live image releases ingress while retrying", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-budget-release-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "budget-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, dm: true }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => message } }),
+			[],
+			{},
+			undefined,
+			async () => {
+				throw new ImagePreparationBudgetError();
+			},
+		);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		const first = adapter.processImage(message as never, engagement!);
+		const waiter = adapter.waitForImage(message as never, first);
+		await bounded(waiter, 1_500);
+		expect(await bounded(first)).toBe("unavailable");
+		// The parked state is durable, so a restart cannot charge the work pool for bytes
+		// that were never prepared.
+		const parked = JSON.parse(await readFile(outboxPath, "utf8"));
+		expect(parked[0]).toMatchObject({ deferred: true, failureAt: expect.any(Number) });
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an unabsorbable budget backlog dead-letters instead of holding a parked slot", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-budget-overflow-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "budget-overflow-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	// The parked pool is already at its global bound, spread across channels so no
+	// single channel explains the refusal.
+	const parked = Array.from({ length: 250 }, (_, index) => ({
+		messageId: snowflakeFromTimestamp(Date.now() - 3_600_000 + index),
+		channelId: `parked-${index % 5}`,
+		deferred: true,
+	}));
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(outboxPath, JSON.stringify([...parked, { messageId: id, channelId, dm: true }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => message } }),
+			[],
+			{},
+			undefined,
+			async () => {
+				throw new ImagePreparationBudgetError();
+			},
+		);
+		const engagement = decideInbound(message as never, bot, {});
+		if (!engagement) throw new Error("expected the DM to engage");
+		// A refusal must release ingress: a parked slot the intent can never use is worse
+		// than an audited dead letter.
+		expect(await bounded(adapter.processImage(message as never, engagement))).toBe("skip");
+		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
+		const persisted: Array<{ messageId: string; terminal?: boolean }> = JSON.parse(await readFile(outboxPath, "utf8"));
+		expect(persisted.find((entry) => entry.messageId === id)).toMatchObject({ terminal: true });
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a full work pool parks budget backpressure durably and releases ingress", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-full-pool-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "full-pool-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	const base = 1571558400000000000n;
+	const work = Array.from({ length: 1_000 }, (_, index) => ({
+		messageId: String(base + BigInt(index)),
+		channelId: "work-channel",
+	}));
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(outboxPath, JSON.stringify([...work, { messageId: id, channelId, dm: true }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => message } }),
+			[],
+			{},
+			undefined,
+			async () => {
+				throw new ImagePreparationBudgetError();
+			},
+		);
+		const engagement = decideInbound(message as never, bot, {});
+		if (!engagement) throw new Error("expected the DM to engage");
+		const first = adapter.processImage(message as never, engagement);
+		const waiter = adapter.waitForImage(message as never, first);
+		// A parked row has no bytes and no authorization to wait for, so the ordered ingress
+		// chain must not be held behind it even while the work pool is full.
+		await bounded(waiter, 1_500);
+		expect(await bounded(first)).toBe("unavailable");
+		expect(adapter.deadLetters).toEqual([]);
+		const persisted: Array<Record<string, unknown>> = JSON.parse(await readFile(outboxPath, "utf8"));
+		expect(persisted.find((entry) => entry.messageId === id)).toMatchObject({
+			deferred: true,
+			failureAt: expect.any(Number),
+		});
+		expect(persisted.find((entry) => entry.messageId === id)?.terminal).toBeUndefined();
+		// The parked row is charged to its own quota, so the authorized work pool keeps its
+		// exact membership; no admitted intent was evicted to make room for backpressure.
+		expect(persisted.filter((entry) => !entry.completed && !entry.terminal && entry.deferred !== true)).toHaveLength(
+			1_000,
+		);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a transient parked-write failure retries the intent instead of dead-lettering it", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-park-eio-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "park-eio-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	const originalPut = ImageOutbox.prototype.put;
+	let failures = 1;
+	const putSpy = spyOn(ImageOutbox.prototype, "put").mockImplementation(async function (
+		this: ImageOutbox,
+		entry: PendingImage,
+	) {
+		// Exactly one transient journal write failure, where local backpressure parks the
+		// intent. A full parked pool is a capacity verdict; an I/O error is not.
+		if (entry.messageId === id && entry.deferred === true && failures > 0) {
+			failures--;
+			throw Object.assign(new Error("EIO: i/o error, write"), { code: "EIO" });
+		}
+		return originalPut.call(this, entry);
+	});
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, dm: true }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					// The forced source fetch takes `{ message, force }`; the background recovery
+					// history scan takes `{ after, limit }` and expects a collection-like page.
+					fetch: async (query: unknown) => (singleFetchId(query) !== undefined ? message : new Map<string, unknown>()),
+				},
+			}),
+			[],
+			{},
+			undefined,
+			async () => {
+				throw new ImagePreparationBudgetError();
+			},
+		);
+		const engagement = decideInbound(message as never, bot, {});
+		if (!engagement) throw new Error("expected the DM to engage");
+		const first = adapter.processImage(message as never, engagement);
+		const waiter = adapter.waitForImage(message as never, first);
+		expect(await bounded(first)).toBe("unavailable");
+		// A journal failure is not an unabsorbable backlog: the intent must stay recoverable,
+		// with no dead letter and no terminal row.
+		expect(adapter.deadLetters).toEqual([]);
+		const failed: Array<Record<string, unknown>> = JSON.parse(await readFile(outboxPath, "utf8"));
+		expect(failed.find((entry) => entry.messageId === id)?.terminal).toBeUndefined();
+		// The scheduled retry re-parks the same durable id once the journal recovers.
+		// Parking is two durable writes: the deferred marker, then the failure evidence
+		// that starts the intent deadline. Wait for both so this observes the completed
+		// hand-off instead of the window between them.
+		const deadline = Date.now() + 8_000;
+		let parked: Record<string, unknown> | undefined;
+		while (Date.now() < deadline) {
+			const rows: Array<Record<string, unknown>> = JSON.parse(await readFile(outboxPath, "utf8"));
+			parked = rows.find((entry) => entry.messageId === id);
+			if (parked?.deferred === true && typeof parked.failureAt === "number") break;
+			await delay(25);
+		}
+		expect(parked).toMatchObject({ messageId: id, deferred: true, failureAt: expect.any(Number) });
+		expect(parked?.terminal).toBeUndefined();
+		expect(adapter.deadLetters).toEqual([]);
+		// Parking is the durable hand-off: the conversation chain must not stay behind the
+		// journal failure that delayed the park by one retry.
+		await bounded(waiter, 8_000);
+	} finally {
+		putSpy.mockRestore();
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a restored parked row resumes once the image budget frees up", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-park-restart-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "restored-park-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 120_000);
+	const message = dmMessage(id, channelId, true);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		// A restart that happens while the shared image budget is exhausted leaves the intent
+		// parked: no bytes were prepared, so the row must be retried, never lost or terminal.
+		await writeFile(
+			outboxPath,
+			JSON.stringify([{ messageId: id, channelId, dm: true, deferred: true, failureAt: Date.now() }]),
+		);
+		const channel = {
+			messages: {
+				fetch: async (query: unknown) => {
+					if (singleFetchId(query) !== undefined) return message;
+					const after = historyAfter(query);
+					return !after || BigInt(after) < BigInt(id) ? [message] : [];
+				},
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		// The budget is available again, so the parked row is promoted into the work pool and
+		// delivered with its exact id.
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([id]);
+		const persisted = JSON.parse(await readFile(outboxPath, "utf8")) as Array<Record<string, unknown>>;
+		expect(persisted.find((entry) => entry.messageId === id)).toMatchObject({ completed: true });
+		expect(persisted.find((entry) => entry.messageId === id)?.deferred).toBeUndefined();
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("terminal image rows are compacted only after the watermark passes them", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-compact-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "channel-1";
+	const insideChannel = "channel-2";
+	const recentChannel = "channel-3";
+	const below = snowflakeFromTimestamp(Date.now() - 31 * 24 * 60 * 60 * 1000);
+	const above = snowflakeFromTimestamp(Date.now() + 60_000);
+	const inside = snowflakeFromTimestamp(Date.now() - 20 * 24 * 60 * 60 * 1000);
+	const recent = snowflakeFromTimestamp(Date.now() - 8 * 24 * 60 * 60 * 1000);
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: {
+				[channelId]: snowflakeFromTimestamp(Date.now() - 30 * 24 * 60 * 60 * 1000),
+				[insideChannel]: snowflakeFromTimestamp(Date.now() - 19 * 24 * 60 * 60 * 1000),
+				[recentChannel]: snowflakeFromTimestamp(Date.now() - 7 * 24 * 60 * 60 * 1000),
+			},
+		});
+		await writeFile(
+			join(home, "image-outbox.json"),
+			JSON.stringify([
+				{ messageId: below, channelId, terminal: true, audited: true },
+				{ messageId: above, channelId, terminal: true, audited: true },
+				{ messageId: inside, channelId: insideChannel, terminal: true, audited: true },
+				{ messageId: recent, channelId: recentChannel, terminal: true, audited: true },
+			]),
+		);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), []);
+		await bounded(adapter.recoverMissedMessages());
+		// `inside` (20 days) and `recent` (8 days) both sit past their channel's watermark but
+		// still inside the 30-day replay horizon. A restore rewinds history by that horizon,
+		// so their evidence must survive or the rejected image would be rediscovered as a
+		// fresh send; only the 31-day row is past the retention window.
+		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
+			{ messageId: above, channelId, terminal: true, audited: true },
+			{ messageId: inside, channelId: insideChannel, terminal: true, audited: true },
+			{ messageId: recent, channelId: recentChannel, terminal: true, audited: true },
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a gateway-unavailable image intent records its failure clock and expires", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-noclient-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "new-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		const request = {
+			messageId: id,
+			text: "look\n[image · photo.png]",
+			origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+			engagement: { mentioned: false, group: false, authorId: "human" },
+			images: [image],
+		};
+		const outboxPath = join(home, "image-outbox.json");
+		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, request, dm: true }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			requests,
+			{},
+			undefined,
+			undefined,
+			false,
+		);
+		const message = dmMessage(id, channelId, true);
+		const engagement = decideInbound(message as never, bot, {});
+		expect(engagement).toBeDefined();
+		expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("unavailable");
+		const afterFailure = JSON.parse(await readFile(outboxPath, "utf8"));
+		expect(afterFailure[0].failureAt).toEqual(expect.any(Number));
+		await writeFile(outboxPath, JSON.stringify([{ ...afterFailure[0], failureAt: Date.now() - 25 * 60 * 60 * 1000 }]));
+		const restarted = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			requests,
+			{},
+			undefined,
+			undefined,
+			false,
+		);
+		expect(await bounded(restarted.processImage(message as never, engagement!))).toBe("skip");
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		expect(restarted.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([
+			{ messageId: id, channelId, terminal: true, audited: true, dm: true },
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a retried image adopts its persisted thread destination", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-origin-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "origin-guild";
+	const threadOrigin = {
+		platform: "discord",
+		kind: "thread",
+		conversationId: "thread-1",
+		parentId: channelId,
+	};
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const inbound = {
+		id,
+		content: "describe this",
+		author: { id: "human", username: "human", bot: false },
+		channel: { id: channelId, name: "general" },
+		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo.png" }],
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(
+			outboxPath,
+			JSON.stringify([{ messageId: id, channelId, origin: threadOrigin, createdAt: Date.now(), live: true }]),
+		);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [inbound] } }), requests, {
+			[channelId]: { engagement: "open" },
+		});
+		await bounded(adapter.recoverMissedMessages());
+		const send = requests.find((entry) => entry.verb === "chat.send");
+		expect(send?.params.origin).toMatchObject({ kind: "thread", conversationId: "thread-1" });
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("completed DM tombstones are rebound into recovery targets before invalidation", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-restore-dm-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { other: snowflakeFromTimestamp(Date.now() - 60_000) },
+			gatewayDbIdentity: "0:0",
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{
+					messageId: snowflakeFromTimestamp(Date.now() - 60_000),
+					channelId: "lost-dm",
+					dm: true,
+					completed: true,
+					completedAt: Date.now(),
+				},
+			]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			[],
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "new-db" } } : { engaged: false, turnId: null },
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		expect((await loadRecoveryCursors(cursorPath)).knownDms["lost-dm"]).toBeDefined();
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("a restore rediscovers an in-window completed DM evicted from knownDms", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-restore-evicted-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "evicted-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 8 * 24 * 60 * 60 * 1000);
+	const message = dmMessage(id, channelId, true);
+	const requests: Array<{ verb: string; params: any }> = [];
+	const fetched: string[] = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { other: snowflakeFromTimestamp(Date.now() - 60_000) },
+			knownDms: Object.fromEntries(
+				Array.from({ length: 100 }, (_, index) => [
+					`known-${index}`,
+					{ lastSeenAt: new Date().toISOString(), seq: index + 1 },
+				]),
+			),
+			sequence: 100,
+			gatewayDbIdentity: "0:0",
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{
+					messageId: id,
+					channelId,
+					dm: true,
+					completed: true,
+					completedAt: Date.now() - 8 * 24 * 60 * 60 * 1000,
+				},
+			]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async (requested: string) => {
+				fetched.push(requested);
+				return { messages: { fetch: async () => (requested === channelId ? [message] : []) } };
+			},
+			requests,
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "new-db" } } : { engaged: false, turnId: null },
+			async () => ({ images: [image], notice: "" }),
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		expect(fetched).toContain(channelId);
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([id]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("completed rows outside every recovery target are reclaimed", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-reclaim-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const orphanId = snowflakeFromTimestamp(Date.now() - 60_000);
+	const durableId = snowflakeFromTimestamp(Date.now() - 120_000);
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { other: snowflakeFromTimestamp(Date.now() - 60_000) },
+			gatewayDbIdentity: "0:0",
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{
+					messageId: orphanId,
+					channelId: "unconfigured-orphan",
+					completed: true,
+					completedAt: Date.now(),
+				},
+				{
+					// Durable scope: this channel has a watermark, so a later pass can read
+					// it even though neither config nor knownDms names it.
+					messageId: durableId,
+					channelId: "other",
+					completed: true,
+					completedAt: Date.now() - 60_000,
+				},
+			]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			[],
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "0:0" } } : { engaged: false, turnId: null },
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([
+			{
+				messageId: durableId,
+				channelId: "other",
+				completed: true,
+				completedAt: expect.any(Number),
+			},
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a restore never displaces recent live known DMs with completed tombstones", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-restore-cap-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const recent = new Date(Date.now() - 60_000).toISOString();
+	const knownDms = Object.fromEntries(
+		Array.from({ length: 100 }, (_, index) => [`dm-${index}`, { lastSeenAt: recent, seq: index + 1 }]),
+	);
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { other: snowflakeFromTimestamp(Date.now() - 60_000) },
+			knownDms,
+			sequence: 100,
+			gatewayDbIdentity: "0:0",
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{
+					messageId: snowflakeFromTimestamp(Date.now() - 24 * 60 * 60 * 1000),
+					channelId: "dm-a",
+					dm: true,
+					completed: true,
+					completedAt: Date.now() - 24 * 60 * 60 * 1000,
+				},
+				{
+					messageId: snowflakeFromTimestamp(Date.now() - 48 * 60 * 60 * 1000),
+					channelId: "dm-b",
+					dm: true,
+					completed: true,
+					completedAt: Date.now() - 48 * 60 * 60 * 1000,
+				},
+			]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			[],
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "new-db" } } : { engaged: false, turnId: null },
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		const cursors = await loadRecoveryCursors(cursorPath);
+		expect(Object.keys(cursors.knownDms)).toHaveLength(100);
+		expect(cursors.knownDms["dm-0"]).toBeDefined();
+		expect(cursors.knownDms["dm-a"]).toBeUndefined();
+		expect(cursors.knownDms["dm-b"]).toBeUndefined();
+		expect(cursors.sequence).toBeGreaterThanOrEqual(100);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("incomplete thread discovery never reclaims completed evidence", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-incomplete-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const parent = {
+		messages: { fetch: async () => [] },
+		threads: {
+			fetchActive: async () => {
+				throw new Error("temporary thread discovery failure");
+			},
+			fetchArchived: async () => ({ threads: [], hasMore: false }),
+		},
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { "channel-1": snowflakeFromTimestamp(Date.now() - 60_000) },
+			gatewayDbIdentity: "0:0",
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{
+					messageId: snowflakeFromTimestamp(Date.now() - 60_000),
+					channelId: "orphan-thread",
+					completed: true,
+					completedAt: Date.now(),
+				},
+			]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => parent,
+			[],
+			{ "channel-1": { engagement: "open" } },
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "0:0" } } : { engaged: false, turnId: null },
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toHaveLength(1);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a restore keeps the newest completed DM tombstones when one slot is free", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-restore-recency-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const recent = new Date(Date.now() - 60_000).toISOString();
+	const knownDms = Object.fromEntries(
+		Array.from({ length: 99 }, (_, index) => [`dm-${index}`, { lastSeenAt: recent, seq: index + 1 }]),
+	);
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { other: snowflakeFromTimestamp(Date.now() - 60_000) },
+			knownDms,
+			sequence: 99,
+			gatewayDbIdentity: "0:0",
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{
+					messageId: snowflakeFromTimestamp(Date.now() - 24 * 60 * 60 * 1000),
+					channelId: "dm-a",
+					dm: true,
+					completed: true,
+					completedAt: Date.now() - 24 * 60 * 60 * 1000,
+				},
+				{
+					messageId: snowflakeFromTimestamp(Date.now() - 48 * 60 * 60 * 1000),
+					channelId: "dm-b",
+					dm: true,
+					completed: true,
+					completedAt: Date.now() - 48 * 60 * 60 * 1000,
+				},
+			]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			[],
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "new-db" } } : { engaged: false, turnId: null },
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		const cursors = await loadRecoveryCursors(cursorPath);
+		expect(Object.keys(cursors.knownDms)).toHaveLength(100);
+		expect(cursors.knownDms["dm-0"]).toBeDefined();
+		// The newer completion holds the only free slot; the older one is behind it.
+		expect(cursors.knownDms["dm-a"]).toBeDefined();
+		expect(cursors.knownDms["dm-b"]).toBeUndefined();
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("persistent partial thread discovery stops driving retries but never reclaims", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-partial-bounded-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const parent = {
+		messages: { fetch: async () => [] },
+		threads: {
+			fetchActive: async () => {
+				throw new Error("temporary thread discovery failure");
+			},
+			fetchArchived: async () => ({ threads: [], hasMore: false }),
+		},
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { "channel-1": snowflakeFromTimestamp(Date.now() - 60_000) },
+			gatewayDbIdentity: "0:0",
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{
+					messageId: snowflakeFromTimestamp(Date.now() - 60_000),
+					channelId: "orphan-thread",
+					completed: true,
+					completedAt: Date.now(),
+				},
+			]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => parent,
+			[],
+			{ "channel-1": { engagement: "open" } },
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "0:0" } } : { engaged: false, turnId: null },
+		);
+		const warnings: string[] = [];
+		const originalWarn = console.warn;
+		console.warn = (...args: unknown[]) => {
+			warnings.push(args.map(String).join(" "));
+		};
+		try {
+			// A retry timer from an earlier pass may add a pass of its own; four awaited
+			// passes guarantee the bounded attempt count is reached either way.
+			for (let pass = 0; pass < 4; pass++) {
+				await bounded(adapter.recoverMissedMessages());
+				await adapter.cursorsFlushed;
+			}
+		} finally {
+			console.warn = originalWarn;
+		}
+		expect(warnings.some((line) => line.includes("quarantined partial thread discovery"))).toBe(true);
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toHaveLength(1);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a failed cursor checkpoint preserves completed DM evidence until restore can retry", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-restore-durable-dm-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const cursorTemp = `${cursorPath}.${process.pid}.tmp`;
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const row = { messageId: id, channelId: "lost-dm", dm: true, completed: true, completedAt: Date.now() };
+	try {
+		await saveRecoveryCursors(cursorPath, { ...emptyCursors(), gatewayDbIdentity: "old-db" });
+		await writeFile(outboxPath, JSON.stringify([row]));
+		await mkdir(cursorTemp);
+		const requests: Array<{ verb: string; params: any }> = [];
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			requests,
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "new-db" } } : { engaged: false, turnId: null },
+		);
+		await bounded(adapter.recoverMissedMessages());
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([row]);
+		expect((await loadRecoveryCursors(cursorPath)).knownDms["lost-dm"]).toBeUndefined();
+		expect(adapter.recoveryRetryPending).toBe(true);
+
+		await rm(cursorTemp, { recursive: true });
+		const restarted = gateway(
+			cursorPath,
+			async () => ({
+				messages: {
+					fetch: async (query: unknown) => {
+						if (singleFetchId(query) !== undefined) return dmMessage(id, "lost-dm", true);
+						const after = historyAfter(query);
+						return !after || BigInt(after) < BigInt(id) ? [dmMessage(id, "lost-dm", true)] : [];
+					},
+				},
+			}),
+			requests,
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "new-db" } } : { engaged: false, turnId: null },
+		);
+		await bounded(restarted.recoverMissedMessages());
+		expect((await loadRecoveryCursors(cursorPath)).knownDms["lost-dm"]).toBeDefined();
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([id]);
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toMatchObject([
+			{ messageId: id, dm: true, completed: true },
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("restore preserves and visits DM targets beyond the known-DM cap", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-restore-dm-overflow-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const now = Date.now();
+	const rows = Array.from({ length: 101 }, (_, index) => ({
+		messageId: snowflakeFromTimestamp(now - 60_000 + index),
+		channelId: `dm-${index}`,
+		dm: true,
+		completed: true,
+		completedAt: now,
+	}));
+	const fetched = new Set<string>();
+	try {
+		await saveRecoveryCursors(cursorPath, { ...emptyCursors(), gatewayDbIdentity: "old-db" });
+		await writeFile(outboxPath, JSON.stringify(rows));
+		const adapter = gateway(
+			cursorPath,
+			async (id) => {
+				fetched.add(id);
+				throw new Error("temporarily unavailable");
+			},
+			[],
+			{},
+			async (verb) => (verb === "gateway.status" ? { database: { identity: "new-db" } } : {}),
+		);
+		await bounded(adapter.recoverMissedMessages(), 30_000);
+		const cursors = await loadRecoveryCursors(cursorPath);
+		expect(Object.keys(cursors.knownDms)).toHaveLength(100);
+		expect(fetched.size).toBe(101);
+		const pending = JSON.parse(await readFile(outboxPath, "utf8")) as Array<{ channelId: string; completed?: boolean }>;
+		expect(new Set(pending.map((entry) => entry.channelId))).toEqual(new Set(rows.map((entry) => entry.channelId)));
+		expect(pending.every((entry) => !entry.completed)).toBe(true);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 35_000);
+
+test("audited terminal rows in unconfigured channels get a recovery watermark and are reclaimed", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-terminal-orphan-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "unconfigured-channel";
+	// Use a message older than 30 days (IMAGE_REPLAY_RETENTION_MS) to verify compaction
+	const id = snowflakeFromTimestamp(Date.now() - 31 * 24 * 60 * 60 * 1000);
+	const message = { ...dmMessage(id, channelId, true), channel: { id: channelId } };
+	let channelFetches = 0;
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 32 * 24 * 60 * 60 * 1000) },
+		});
+		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, terminal: true, audited: true }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => {
+				channelFetches++;
+				return {
+					messages: {
+						fetch: async ({ after }: { after?: string }) => (!after || BigInt(after) < BigInt(id) ? [message] : []),
+					},
+				};
+			},
+			requests,
+		);
+		await bounded(adapter.recoverMissedMessages());
+		expect(channelFetches).toBe(1);
+		expect(requests.filter((entry) => entry.verb !== "gateway.status")).toEqual([]);
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toEqual([]);
+		const cursors = await loadRecoveryCursors(cursorPath);
+		expect(cursors.recoveredThrough[channelId] ?? cursors.quarantined[channelId]?.watermark).toBe(id);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("an edited caption or replaced attachment is not mixed with refreshed image bytes", async () => {
+	for (const edit of ["caption", "attachment"] as const) {
+		const home = await mkdtemp(join(tmpdir(), "discord-image-refresh-snapshot-"));
+		const cleanupTimers = trackTimers();
+		const cursorPath = join(home, "recovery-cursor.json");
+		const channelId = "snapshot-dm";
+		const id = snowflakeFromTimestamp(Date.now() - 60_000);
+		const message = dmMessage(id, channelId, true);
+		const fresh =
+			edit === "caption"
+				? { ...message, content: "edited caption" }
+				: {
+						...message,
+						attachments: [
+							{ name: "replacement.png", contentType: "image/png", url: "https://cdn.discordapp.com/new.png" },
+						],
+					};
+		let preparations = 0;
+		const requests: Array<{ verb: string; params: any }> = [];
+		try {
+			await saveRecoveryCursors(cursorPath, emptyCursors());
+			const adapter = gateway(
+				cursorPath,
+				async () => ({ messages: { fetch: async () => fresh } }),
+				requests,
+				{},
+				undefined,
+				async () => {
+					preparations++;
+					if (preparations === 1) throw new DiscordImagePreparationError("retryable", undefined, true);
+					return { images: [image], notice: "" };
+				},
+			);
+			const engagement = decideInbound(message as never, bot, {});
+			expect(engagement).toBeDefined();
+			expect(await bounded(adapter.processImage(message as never, engagement!))).toBe("skip");
+			expect(preparations).toBe(1);
+			expect(requests).toEqual([]);
+			expect(adapter.deadLetters.map((entry) => entry.summary)).toContain(
+				"image source changed after the message was edited",
+			);
+		} finally {
+			cleanupTimers();
+			await rm(home, { recursive: true, force: true });
+		}
+	}
+});
+
+test("completed DM tombstones do not refresh recovery recency", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-recency-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(
+			outboxPath,
+			JSON.stringify([{ messageId: id, channelId: "old-dm", completed: true, completedAt: Date.now(), dm: true }]),
+		);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), []);
+		await bounded(adapter.recoverMissedMessages());
+		expect((await loadRecoveryCursors(cursorPath)).knownDms["old-dm"]).toBeUndefined();
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("legacy populated cursors rewind on the first gateway identity", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-legacy-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "legacy-dm";
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 60_000) },
+		});
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => [] } }),
+			[],
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "first-db" } } : { engaged: false, turnId: null },
+		);
+		await bounded(adapter.recoverMissedMessages());
+		const cursors = await loadRecoveryCursors(cursorPath);
+		const watermark = cursors.recoveredThrough[channelId] ?? cursors.quarantined[channelId]?.watermark;
+		expect(watermark).toBeDefined();
+		expect(BigInt(watermark!)).toBeLessThan(BigInt(snowflakeFromTimestamp(Date.now() - 29 * 24 * 60 * 60 * 1000)));
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a restored DM replay never evicts a live known DM", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-restore-replay-cap-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const recent = new Date(Date.now() - 60_000).toISOString();
+	const completedAt = Date.now() - 60 * 60 * 1000;
+	const row = {
+		messageId: snowflakeFromTimestamp(completedAt),
+		channelId: "dm-a",
+		dm: true,
+		completed: true,
+		completedAt,
+	};
+	const message = dmMessage(row.messageId, "dm-a", true);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			knownDms: Object.fromEntries(
+				Array.from({ length: 100 }, (_, index) => [`dm-${index}`, { lastSeenAt: recent, seq: index + 1 }]),
+			),
+			sequence: 100,
+			gatewayDbIdentity: "0:0",
+		});
+		await writeFile(outboxPath, JSON.stringify([row]));
+		const adapter = gateway(
+			cursorPath,
+			async (id) =>
+				id === "dm-a"
+					? {
+							messages: {
+								fetch: async (query: unknown) => (singleFetchId(query) !== undefined ? message : [message]),
+							},
+						}
+					: { messages: { fetch: async () => [] } },
+			requests,
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "new-db" } } : { engaged: true, turnId: "turn-1" },
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		const cursors = await loadRecoveryCursors(cursorPath);
+		expect(Object.keys(cursors.knownDms)).toHaveLength(100);
+		expect(cursors.knownDms["dm-0"]).toBeDefined();
+		// The restored target replays from the outbox row, never from a promoted slot.
+		expect(cursors.knownDms["dm-a"]).toBeUndefined();
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			row.messageId,
+		]);
+		expect(JSON.parse(await readFile(outboxPath, "utf8"))).toMatchObject([
+			{ messageId: row.messageId, completed: true, dm: true },
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a request-bearing restored DM retry never evicts a live DM", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-restore-replay-retry-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const recent = new Date(Date.now() - 60_000).toISOString();
+	const completedAt = Date.now() - 60 * 60 * 1000;
+	const id = snowflakeFromTimestamp(completedAt);
+	const request = {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: "dm-a", peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			// The watermark is past the intent, so the request retry runs instead of
+			// deferring behind a history pass.
+			recoveredThrough: { "dm-a": snowflakeFromTimestamp(Date.now()) },
+			knownDms: Object.fromEntries(
+				Array.from({ length: 100 }, (_, index) => [`dm-${index}`, { lastSeenAt: recent, seq: index + 1 }]),
+			),
+			sequence: 100,
+			gatewayDbIdentity: "0:0",
+		});
+		// The state left after a restored replay prepared its message and the first send
+		// failed: the persisted request still carries the restore marker.
+		await writeFile(
+			outboxPath,
+			JSON.stringify([{ messageId: id, channelId: "dm-a", dm: true, restored: true, request, failureAt: Date.now() }]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => ({
+				messages: { fetch: async (query: unknown) => (singleFetchId(query) === id ? dmMessage(id, "dm-a", true) : []) },
+			}),
+			requests,
+			{},
+			async (verb) =>
+				verb === "gateway.status" ? { database: { identity: "0:0" } } : { engaged: true, turnId: "turn-1" },
+		);
+		await bounded(adapter.recoverMissedMessages());
+		await adapter.cursorsFlushed;
+		const cursors = await loadRecoveryCursors(cursorPath);
+		expect(Object.keys(cursors.knownDms)).toHaveLength(100);
+		expect(cursors.knownDms["dm-0"]).toBeDefined();
+		expect(cursors.knownDms["dm-a"]).toBeUndefined();
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([id]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 20_000);
+
+test("reversed durable request rows below the watermark replay in snowflake order", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-reversed-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "dm-reversed";
+	const olderId = snowflakeFromTimestamp(Date.now() - 180_000);
+	const newerId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const watermark = snowflakeFromTimestamp(Date.now() - 60_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: watermark },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		// Journal insertion order is the reverse of Discord order: the newer intent was
+		// admitted first. Durable replay must not send it ahead of its predecessor.
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: newerId, channelId, request: imageRequest(newerId, channelId) },
+				{ messageId: olderId, channelId, request: imageRequest(olderId, channelId) },
+			]),
+		);
+		const channel = {
+			messages: {
+				fetch: async (query: unknown) => {
+					const single = singleFetchId(query);
+					return single === undefined ? [] : dmMessage(single, channelId, true);
+				},
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			olderId,
+			newerId,
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an older repairable source failure holds a newer durable send in the same conversation", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-hold-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "dm-held";
+	const olderId = snowflakeFromTimestamp(Date.now() - 180_000);
+	const newerId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 60_000) },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: newerId, channelId, request: imageRequest(newerId, channelId) },
+				{ messageId: olderId, channelId },
+			]),
+		);
+		const denied = Object.assign(new Error("Missing Access"), { code: 50_001, status: 403 });
+		const channel = {
+			messages: {
+				fetch: async (query: unknown) => {
+					const single = singleFetchId(query);
+					if (single === undefined) return [];
+					if (single === olderId) throw denied;
+					return dmMessage(single, channelId, true);
+				},
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		const rows = JSON.parse(await readFile(outboxPath, "utf8")) as PendingImage[];
+		expect(rows.find((entry) => entry.messageId === olderId)?.failureAt).toBeNumber();
+		expect(rows.find((entry) => entry.messageId === newerId)?.completed).toBeUndefined();
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an older requestless intent is replayed before a newer durable request", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-requestless-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "dm-requestless";
+	const olderId = snowflakeFromTimestamp(Date.now() - 180_000);
+	const newerId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 60_000) },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: newerId, channelId, request: imageRequest(newerId, channelId) },
+				{ messageId: olderId, channelId },
+			]),
+		);
+		const channel = {
+			messages: {
+				fetch: async (query: unknown) => {
+					const single = singleFetchId(query);
+					return single === undefined ? [] : dmMessage(single, channelId, true);
+				},
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			olderId,
+			newerId,
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an unavailable conversation does not hold durable sends in an unrelated conversation", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-unrelated-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const blockedId = "dm-blocked";
+	const healthyId = "dm-healthy";
+	const blockedMessageId = snowflakeFromTimestamp(Date.now() - 180_000);
+	const healthyMessageId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		const watermark = snowflakeFromTimestamp(Date.now() - 60_000);
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [blockedId]: watermark, [healthyId]: watermark },
+			knownDms: {
+				[blockedId]: { lastSeenAt: new Date().toISOString(), seq: 1 },
+				[healthyId]: { lastSeenAt: new Date().toISOString(), seq: 2 },
+			},
+			sequence: 2,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: healthyMessageId, channelId: healthyId, request: imageRequest(healthyMessageId, healthyId) },
+				{ messageId: blockedMessageId, channelId: blockedId },
+			]),
+		);
+		const denied = Object.assign(new Error("Missing Access"), { code: 50_001, status: 403 });
+		const channelFor = (channelId: string) => ({
+			messages: {
+				fetch: async (query: unknown) => {
+					const single = singleFetchId(query);
+					if (single === undefined) return [];
+					if (channelId === blockedId) throw denied;
+					return dmMessage(single, channelId, true);
+				},
+			},
+		});
+		const adapter = gateway(cursorPath, async (id) => channelFor(id), requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			healthyMessageId,
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a budget-parked predecessor keeps the documented ordering exception", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-parked-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "dm-parked";
+	const olderId = snowflakeFromTimestamp(Date.now() - 180_000);
+	const newerId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 60_000) },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: newerId, channelId, request: imageRequest(newerId, channelId) },
+				{ messageId: olderId, channelId, deferred: true },
+			]),
+		);
+		const denied = Object.assign(new Error("Missing Access"), { code: 50_001, status: 403 });
+		const channel = {
+			messages: {
+				fetch: async (query: unknown) => {
+					const single = singleFetchId(query);
+					if (single === undefined) return [];
+					if (single === olderId) throw denied;
+					return dmMessage(single, channelId, true);
+				},
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			newerId,
+		]);
+		const rows = JSON.parse(await readFile(outboxPath, "utf8")) as PendingImage[];
+		expect(rows.find((entry) => entry.messageId === olderId)?.deferred).toBe(true);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an armed image retry cannot overtake an older unavailable intent in the same conversation", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-retry-hold-"));
+	const held = holdRetryTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "dm-retry-hold";
+	const olderId = snowflakeFromTimestamp(Date.now() - 180_000);
+	const newerId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const watermark = snowflakeFromTimestamp(Date.now() - 60_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	const sent: string[] = [];
+	let sourceRepaired = false;
+	let newerAttempts = 0;
+	const denied = Object.assign(new Error("Missing Access"), { code: 50_001, status: 403 });
+	const channel = {
+		messages: {
+			fetch: async (query: unknown) => {
+				const single = singleFetchId(query);
+				if (single === undefined) return [];
+				if (single === olderId && !sourceRepaired) throw denied;
+				return dmMessage(single, channelId, true);
+			},
+		},
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: watermark },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: newerId, channelId, request: imageRequest(newerId, channelId), live: true },
+				{ messageId: olderId, channelId },
+			]),
+		);
+		// Constructed after the durable fixtures so its first cursor load sees them.
+		const adapter = gateway(
+			cursorPath,
+			async () => channel,
+			requests,
+			{},
+			async (verb, params) => {
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
+				if (verb !== "chat.send") return { engaged: false, turnId: null };
+				const messageId = (params as { messageId: string }).messageId;
+				// A per-payload rejection keeps the gateway link up: one failed attempt is
+				// enough to arm the intent's own retry closure without a reconnect. The gate
+				// is limited to the pre-repair phase so the ordered drain after the older
+				// intent is repaired is not poisoned by the arming failure.
+				if (messageId === newerId && !sourceRepaired && newerAttempts++ === 0)
+					throw Object.assign(new Error("payload too large"), { code: "payload_too_large" });
+				sent.push(messageId);
+				return { engaged: false, turnId: null };
+			},
+		);
+		const passes = trackRecoveryPasses(adapter);
+		const scheduled = trackScheduledRetries(adapter);
+		try {
+			const live = dmMessage(newerId, channelId, true);
+			const engagement = decideInbound(live as never, bot, {});
+			expect(engagement).toBeDefined();
+			// The prior live attempt fails, arming this intent's timer while the older
+			// requestless intent in the same conversation is still unavailable.
+			expect(await bounded(adapter.processImage(live as never, engagement!))).toBe("unavailable");
+			const retries = held.retries();
+			expect(retries).toHaveLength(1);
+			expect(retries[0].delay).toBe(RECOVERY_RETRY_BASE_MS);
+
+			retries[0].fire();
+			await bounded(passes.passes[0]);
+			// The recovery pass itself held the newer intent behind the unavailable older one.
+			expect(sent).toEqual([]);
+			const overtaking = scheduled.outcomes.get(newerId);
+			if (overtaking) await bounded(overtaking);
+			// The timer's individual closure ran afterwards and must not send past it either.
+			expect(sent).toEqual([]);
+			const rows = JSON.parse(await readFile(outboxPath, "utf8")) as PendingImage[];
+			expect(rows.find((entry) => entry.messageId === olderId)?.failureAt).toBeNumber();
+			expect(rows.find((entry) => entry.messageId === newerId)?.completed).toBeUndefined();
+
+			sourceRepaired = true;
+			await bounded(adapter.recoverMissedMessages());
+			await eventually(() => sent.includes(olderId) && sent.includes(newerId));
+			expect(sent).toEqual([olderId, newerId]);
+		} finally {
+			scheduled.restore();
+			passes.restore();
+		}
+	} finally {
+		held.cleanup();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 15_000);
+
+test("an armed image retry still sends when its unavailable predecessor is in another conversation", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-retry-unrelated-"));
+	const held = holdRetryTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const blockedId = "dm-retry-blocked";
+	const healthyId = "dm-retry-healthy";
+	const olderId = snowflakeFromTimestamp(Date.now() - 180_000);
+	const newerId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const watermark = snowflakeFromTimestamp(Date.now() - 60_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	const sent: string[] = [];
+	let newerAttempts = 0;
+	const denied = Object.assign(new Error("Missing Access"), { code: 50_001, status: 403 });
+	const channelFor = (channelId: string) => ({
+		messages: {
+			fetch: async (query: unknown) => {
+				const single = singleFetchId(query);
+				if (single === undefined) return [];
+				if (channelId === blockedId && single === olderId) throw denied;
+				return dmMessage(single, channelId, true);
+			},
+		},
+	});
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [blockedId]: watermark, [healthyId]: watermark },
+			knownDms: {
+				[blockedId]: { lastSeenAt: new Date().toISOString(), seq: 1 },
+				[healthyId]: { lastSeenAt: new Date().toISOString(), seq: 2 },
+			},
+			sequence: 2,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: olderId, channelId: blockedId, request: imageRequest(olderId, blockedId) },
+				{ messageId: newerId, channelId: healthyId, request: imageRequest(newerId, healthyId), live: true },
+			]),
+		);
+		// Constructed after the durable fixtures so its first cursor load sees them.
+		const adapter = gateway(
+			cursorPath,
+			async (id) => channelFor(id),
+			requests,
+			{},
+			async (verb, params) => {
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
+				if (verb !== "chat.send") return { engaged: false, turnId: null };
+				const messageId = (params as { messageId: string }).messageId;
+				if (messageId === newerId && newerAttempts++ === 0)
+					throw Object.assign(new Error("payload too large"), { code: "payload_too_large" });
+				sent.push(messageId);
+				return { engaged: false, turnId: null };
+			},
+		);
+		const passes = trackRecoveryPasses(adapter);
+		const scheduled = trackScheduledRetries(adapter);
+		try {
+			const live = dmMessage(newerId, healthyId, true);
+			const engagement = decideInbound(live as never, bot, {});
+			expect(engagement).toBeDefined();
+			expect(await bounded(adapter.processImage(live as never, engagement!))).toBe("unavailable");
+			const retries = held.retries();
+			expect(retries).toHaveLength(1);
+			retries[0].fire();
+			await bounded(passes.passes[0]);
+			const overtaking = scheduled.outcomes.get(newerId);
+			if (overtaking) await bounded(overtaking);
+			// A blocked conversation must not hold a healthy one through the timer path either.
+			expect(sent).toEqual([newerId]);
+			const rows = JSON.parse(await readFile(outboxPath, "utf8")) as PendingImage[];
+			expect(rows.find((entry) => entry.messageId === olderId)?.failureAt).toBeNumber();
+			expect(rows.find((entry) => entry.messageId === olderId)?.completed).toBeUndefined();
+			expect(rows.find((entry) => entry.messageId === newerId)?.completed).toBe(true);
+		} finally {
+			scheduled.restore();
+			passes.restore();
+		}
+	} finally {
+		held.cleanup();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 15_000);
+
+test("an armed image retry still sends past a budget-parked predecessor", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-retry-parked-"));
+	const held = holdRetryTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "dm-retry-parked";
+	const olderId = snowflakeFromTimestamp(Date.now() - 180_000);
+	const newerId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const watermark = snowflakeFromTimestamp(Date.now() - 60_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	const sent: string[] = [];
+	let newerAttempts = 0;
+	const denied = Object.assign(new Error("Missing Access"), { code: 50_001, status: 403 });
+	const channel = {
+		messages: {
+			fetch: async (query: unknown) => {
+				const single = singleFetchId(query);
+				if (single === undefined) return [];
+				if (single === olderId) throw denied;
+				return dmMessage(single, channelId, true);
+			},
+		},
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: watermark },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: newerId, channelId, request: imageRequest(newerId, channelId), live: true },
+				{ messageId: olderId, channelId, deferred: true },
+			]),
+		);
+		// Constructed after the durable fixtures so its first cursor load sees them.
+		const adapter = gateway(
+			cursorPath,
+			async () => channel,
+			requests,
+			{},
+			async (verb, params) => {
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
+				if (verb !== "chat.send") return { engaged: false, turnId: null };
+				const messageId = (params as { messageId: string }).messageId;
+				if (messageId === newerId && newerAttempts++ === 0)
+					throw Object.assign(new Error("payload too large"), { code: "payload_too_large" });
+				sent.push(messageId);
+				return { engaged: false, turnId: null };
+			},
+		);
+		const passes = trackRecoveryPasses(adapter);
+		const scheduled = trackScheduledRetries(adapter);
+		try {
+			const live = dmMessage(newerId, channelId, true);
+			const engagement = decideInbound(live as never, bot, {});
+			expect(engagement).toBeDefined();
+			expect(await bounded(adapter.processImage(live as never, engagement!))).toBe("unavailable");
+			const retries = held.retries();
+			expect(retries).toHaveLength(1);
+			retries[0].fire();
+			await bounded(passes.passes[0]);
+			const overtaking = scheduled.outcomes.get(newerId);
+			if (overtaking) await bounded(overtaking);
+			// Parked backpressure is not deliverable work and must not hold the newer send.
+			expect(sent).toEqual([newerId]);
+			const rows = JSON.parse(await readFile(outboxPath, "utf8")) as PendingImage[];
+			expect(rows.find((entry) => entry.messageId === olderId)?.deferred).toBe(true);
+			expect(rows.find((entry) => entry.messageId === olderId)?.completed).toBeUndefined();
+			expect(rows.find((entry) => entry.messageId === newerId)?.completed).toBe(true);
+		} finally {
+			scheduled.restore();
+			passes.restore();
+		}
+	} finally {
+		held.cleanup();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 15_000);
+
+test("a history-armed image retry does not bypass a horizon that a restore moved behind it", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-retry-horizon-"));
+	const held = holdRetryTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "dm-retry-horizon";
+	const olderId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const newerId = snowflakeFromTimestamp(Date.now() - 60_000);
+	const watermark = snowflakeFromTimestamp(Date.now() - 90_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	const sent: string[] = [];
+	let identity = "old-db";
+	let olderTextBroken = true;
+	let newerAttempts = 0;
+	const channel = {
+		messages: {
+			fetch: async (query: unknown) => {
+				const single = singleFetchId(query);
+				if (single !== undefined) return dmMessage(single, channelId, single === newerId);
+				const after = historyAfter(query);
+				if (after === undefined) return [];
+				// The first pass starts above the older message; the restore rewind extends the
+				// replay window behind it, so the next pass must deliver it first.
+				if (BigInt(after) < BigInt(olderId))
+					return [dmMessage(olderId, channelId), dmMessage(newerId, channelId, true)];
+				if (BigInt(after) < BigInt(newerId)) return [dmMessage(newerId, channelId, true)];
+				return [];
+			},
+		},
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			gatewayDbIdentity: "old-db",
+			recoveredThrough: { [channelId]: watermark },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([{ messageId: newerId, channelId, request: imageRequest(newerId, channelId) }]),
+		);
+		// Constructed after the durable fixtures so its first cursor load sees them.
+		const adapter = gateway(
+			cursorPath,
+			async () => channel,
+			requests,
+			{},
+			async (verb, params) => {
+				if (verb === "gateway.status") return { database: { identity } };
+				if (verb !== "chat.send") return { engaged: false, turnId: null };
+				const messageId = (params as { messageId: string }).messageId;
+				if (messageId === olderId) {
+					if (olderTextBroken) throw Object.assign(new Error("temporarily unavailable"), { status: 503 });
+					sent.push(messageId);
+					return { engaged: false, turnId: null };
+				}
+				if (messageId === newerId && newerAttempts++ === 0)
+					throw Object.assign(new Error("payload too large"), { code: "payload_too_large" });
+				sent.push(messageId);
+				return { engaged: false, turnId: null };
+			},
+		);
+		const passes = trackRecoveryPasses(adapter);
+		const scheduled = trackScheduledRetries(adapter);
+		try {
+			// The history pass reaches the newer intent and its delivery fails, so the armed
+			// retry keeps the ordered context of a pass that never completed the watermark.
+			await bounded(adapter.recoverMissedMessages());
+			expect(sent).toEqual([]);
+			const retries = held.retries();
+			expect(retries).toHaveLength(2);
+			// The delivery's image retry is armed before the pass arms its own backoff.
+			const imageRetry = retries[0];
+			expect(imageRetry.delay).toBe(RECOVERY_RETRY_BASE_MS);
+
+			// A gateway database restore rewinds the watermark behind the newer intent and
+			// re-exposes an older message that has to be replayed first.
+			identity = "restored-db";
+			imageRetry.fire();
+			await bounded(passes.passes[1]);
+			// The post-restore history pass held the newer intent above the rewound horizon.
+			expect(sent).toEqual([]);
+			const overtaking = scheduled.outcomes.get(newerId);
+			if (overtaking) await bounded(overtaking);
+			// The armed retry may not reuse the stale ordered context to overtake it.
+			expect(sent).toEqual([]);
+			const rows = JSON.parse(await readFile(outboxPath, "utf8")) as PendingImage[];
+			expect(rows.find((entry) => entry.messageId === newerId)?.completed).toBeUndefined();
+
+			olderTextBroken = false;
+			await bounded(adapter.recoverMissedMessages());
+			await eventually(() => sent.includes(olderId) && sent.includes(newerId));
+			expect(sent).toEqual([olderId, newerId]);
+		} finally {
+			scheduled.restore();
+			passes.restore();
+		}
+	} finally {
+		held.cleanup();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 15_000);
+
+test("a restored unresolved image gates newer live text while unrelated conversations keep flowing", async () => {
+	const channelId = "dm-restored-barrier";
+	const otherChannelId = "dm-unrelated-barrier";
+	const now = Date.now();
+	const imageId = snowflakeFromTimestamp(now - 120_000);
+	const watermark = snowflakeFromTimestamp(now - 90_000);
+	const liveId = snowflakeFromTimestamp(now - 20_000);
+	const otherId = snowflakeFromTimestamp(now - 10_000);
+	const request = imageRequest(imageId, channelId);
+	let attempts = 0;
+	let releaseFirstAttempt!: () => void;
+	const firstAttemptGate = new Promise<void>((resolve) => {
+		releaseFirstAttempt = resolve;
+	});
+	const adapter = await startRestartedAdapter({
+		imageId,
+		cursor: {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: watermark },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		},
+		outbox: [{ messageId: imageId, channelId, request, createdAt: now - 120_000 }],
+		chatSend: async (messageId) => {
+			if (messageId !== imageId) return { engaged: true, turnId: `turn-${messageId}` };
+			attempts++;
+			if (attempts === 1) {
+				// Hold the restart replay in flight so the live messages below arrive while
+				// the older image is still unresolved, then fail it once.
+				await firstAttemptGate;
+				throw new Error("discord image delivery temporarily unavailable");
+			}
+			return { engaged: true, turnId: `turn-${messageId}` };
+		},
+	});
+	try {
+		await eventually(() => attempts === 1);
+		adapter.discord()!.emit("messageCreate", liveDmText(liveId, channelId, "what about this next?") as never);
+		adapter.discord()!.emit("messageCreate", liveDmText(otherId, otherChannelId, "unrelated room") as never);
+		// Another conversation never waits for this one's unresolved predecessor.
+		await eventually(() => adapter.chatSends.some((entry) => entry.messageId === otherId));
+		expect(adapter.chatSends.some((entry) => entry.messageId === liveId)).toBe(false);
+		// Still held while the image retry is outstanding: no newer live text may overtake it.
+		await delay(250);
+		expect(adapter.chatSends.some((entry) => entry.messageId === liveId)).toBe(false);
+		releaseFirstAttempt();
+		await eventually(
+			() =>
+				adapter.chatSends.some((entry) => entry.messageId === imageId) &&
+				adapter.chatSends.some((entry) => entry.messageId === liveId),
+			12_000,
+		);
+		const order = adapter.chatSends.map((entry) => entry.messageId);
+		expect(order.indexOf(imageId)).toBeLessThan(order.indexOf(liveId));
+		// A retry, not the original first attempt, delivered the restored intent.
+		expect(attempts).toBeGreaterThan(1);
+		// The acknowledged send still carries the persisted request untouched.
+		expect(adapter.chatSends.find((entry) => entry.messageId === imageId)?.params).toEqual(request);
+	} finally {
+		await adapter.restore();
+	}
+}, 20_000);
+
+test("an unreadable image outbox holds live dispatch instead of failing open", async () => {
+	const channelId = "dm-outbox-unreadable";
+	const now = Date.now();
+	const imageId = snowflakeFromTimestamp(now - 120_000);
+	const watermark = snowflakeFromTimestamp(now - 90_000);
+	const liveId = snowflakeFromTimestamp(now - 20_000);
+	const request = imageRequest(imageId, channelId);
+	let readable = false;
+	const realLoad = ImageOutbox.prototype.load;
+	const loadSpy = spyOn(ImageOutbox.prototype, "load").mockImplementation(function (this: ImageOutbox) {
+		if (!readable) return Promise.reject(new Error("image outbox unreadable in test"));
+		return realLoad.call(this);
+	});
+	let adapter: Awaited<ReturnType<typeof startRestartedAdapter>> | undefined;
+	try {
+		adapter = await startRestartedAdapter({
+			imageId,
+			cursor: {
+				...emptyCursors(),
+				recoveredThrough: { [channelId]: watermark },
+				knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+				sequence: 1,
+			},
+			outbox: [{ messageId: imageId, channelId, request, createdAt: now - 120_000 }],
+			chatSend: async (messageId) => ({ engaged: true, turnId: `turn-${messageId}` }),
+		});
+		adapter.discord()!.emit("messageCreate", liveDmText(liveId, channelId, "did you see this?") as never);
+		// The journal is the ordering authority: with it unreadable nothing is dispatched.
+		await delay(300);
+		expect(adapter.chatSends).toHaveLength(0);
+		readable = true;
+		await eventually(
+			() =>
+				adapter!.chatSends.some((entry) => entry.messageId === imageId) &&
+				adapter!.chatSends.some((entry) => entry.messageId === liveId),
+		);
+		const order = adapter.chatSends.map((entry) => entry.messageId);
+		expect(order.indexOf(imageId)).toBeLessThan(order.indexOf(liveId));
+		expect(adapter.chatSends.find((entry) => entry.messageId === imageId)?.params).toEqual(request);
+	} finally {
+		if (adapter) await adapter.restore();
+		loadSpy.mockRestore();
+	}
+}, 20_000);
+
+test("durable image ordering ignores newer, parked, terminal and unrelated rows", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-barrier-predicate-"));
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "dm-barrier";
+	const otherChannelId = "dm-barrier-other";
+	const now = Date.now();
+	const current = snowflakeFromTimestamp(now - 30_000);
+	const newer = snowflakeFromTimestamp(now - 10_000);
+	const deferredId = snowflakeFromTimestamp(now - 70_000);
+	const terminalId = snowflakeFromTimestamp(now - 60_000);
+	const otherId = snowflakeFromTimestamp(now - 50_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(
+			join(home, "image-outbox.json"),
+			JSON.stringify([
+				{ messageId: deferredId, channelId, deferred: true },
+				{ messageId: terminalId, channelId, terminal: true, audited: true },
+				{ messageId: newer, channelId },
+				{ messageId: otherId, channelId: otherChannelId },
+			]),
+		);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		// Parked, terminal, newer, and other-conversation rows all release the barrier.
+		await bounded(adapter.awaitImagePredecessors(current, channelId, channelId));
+		expect(requests).toEqual([]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("a restored image destination in this thread holds newer live text posted there", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-barrier-thread-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const parentId = "channel-parent";
+	const otherParentId = "channel-parent-other";
+	const threadId = "thread-reply";
+	const unrelatedChannelId = "dm-unrelated";
+	const now = Date.now();
+	const olderId = snowflakeFromTimestamp(now - 80_000);
+	const newestId = snowflakeFromTimestamp(now - 40_000);
+	const liveTextId = snowflakeFromTimestamp(now - 10_000);
+	const origin = (parent: string) => ({
+		platform: "discord",
+		kind: "thread",
+		conversationId: threadId,
+		parentId: parent,
+		threadVisibility: "public",
+	});
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(
+			join(home, "image-outbox.json"),
+			JSON.stringify([
+				// Destination recorded on the resolved intent itself.
+				{ messageId: olderId, channelId: parentId, origin: origin(parentId) },
+				// Older persisted rows may carry the destination only inside the request.
+				{
+					messageId: newestId,
+					channelId: otherParentId,
+					request: { messageId: newestId, text: "describe", origin: origin(otherParentId) },
+				},
+			]),
+		);
+		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), requests);
+		const barrier = adapter.awaitImagePredecessors(liveTextId, threadId, threadId);
+		let resolved = false;
+		void barrier.then(() => {
+			resolved = true;
+		});
+		await delay(150);
+		expect(resolved).toBe(false);
+		// An unrelated conversation is never held by these rows.
+		await bounded(adapter.awaitImagePredecessors(liveTextId, unrelatedChannelId, unrelatedChannelId));
+		// A row never blocks on itself.
+		await bounded(adapter.awaitImagePredecessors(olderId, parentId, threadId));
+		await adapter.invalidateImageSource(olderId, "image source message was deleted");
+		await adapter.invalidateImageSource(newestId, "image source message was deleted");
+		await bounded(barrier);
+		expect(resolved).toBe(true);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("a restored parent-channel image targeting this thread gates a newer live image posted there", async () => {
+	const parentId = "channel-live-image-parent";
+	const threadId = "thread-live-image";
+	const now = Date.now();
+	const restoredId = snowflakeFromTimestamp(now - 120_000);
+	const watermark = snowflakeFromTimestamp(now - 90_000);
+	const liveImageId = snowflakeFromTimestamp(now - 20_000);
+	const liveImage = liveThreadImage(liveImageId, threadId, parentId);
+	const request = threadImageRequest(restoredId, threadId, parentId);
+	let restoredAttempts = 0;
+	let releaseRestored!: () => void;
+	const restoredGate = new Promise<void>((resolve) => {
+		releaseRestored = resolve;
+	});
+	const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+		(async () => new Response(png, { headers: { "content-type": "image/png" } })) as unknown as typeof fetch,
+	);
+	const adapter = await startRestartedAdapter({
+		imageId: restoredId,
+		channels: { [parentId]: { engagement: "open" } },
+		sources: { [liveImageId]: liveImage },
+		cursor: {
+			...emptyCursors(),
+			recoveredThrough: { [parentId]: watermark },
+			sequence: 1,
+		},
+		outbox: [{ messageId: restoredId, channelId: parentId, request, createdAt: now - 120_000 }],
+		chatSend: async (messageId) => {
+			if (messageId === restoredId) {
+				restoredAttempts++;
+				// Hold the restored image in flight while the live thread image arrives.
+				await restoredGate;
+			}
+			return { engaged: true, turnId: `turn-${messageId}` };
+		},
+	});
+	try {
+		await eventually(() => restoredAttempts === 1);
+		adapter.discord()!.emit("messageCreate", liveImage as never);
+		await delay(250);
+		// The live image's turn in this thread stays closed behind the restored predecessor.
+		expect(adapter.chatSends.some((entry) => entry.messageId === liveImageId)).toBe(false);
+		releaseRestored();
+		await eventually(
+			() =>
+				adapter.chatSends.some((entry) => entry.messageId === restoredId) &&
+				adapter.chatSends.some((entry) => entry.messageId === liveImageId),
+			12_000,
+		);
+		const order = adapter.chatSends.map((entry) => entry.messageId);
+		expect(order.indexOf(restoredId)).toBeLessThan(order.indexOf(liveImageId));
+		const live = adapter.chatSends.find((entry) => entry.messageId === liveImageId)?.params;
+		expect(live).toMatchObject({
+			messageId: liveImageId,
+			origin: { platform: "discord", kind: "thread", conversationId: threadId, parentId },
+			images: [{ mimeType: "image/jpeg", data: expect.any(String) }],
+		});
+	} finally {
+		await adapter.restore();
+		fetchSpy.mockRestore();
+	}
+}, 20_000);
+
+test("a retry stays behind a cross-source durable image targeting this thread, then releases", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-retry-destination-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const parentId = "channel-retry-parent";
+	const threadId = "thread-retry-target";
+	const now = Date.now();
+	const predecessorId = snowflakeFromTimestamp(now - 90_000);
+	const currentId = snowflakeFromTimestamp(now - 60_000);
+	const watermark = snowflakeFromTimestamp(now - 30_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	const sent: string[] = [];
+	let predecessorAttempts = 0;
+	let releasePredecessor!: () => void;
+	const predecessorGate = new Promise<void>((resolve) => {
+		releasePredecessor = resolve;
+	});
+	const channel = {
+		messages: {
+			fetch: async (query: unknown) => {
+				const single = singleFetchId(query);
+				if (single !== undefined) return dmMessage(single, single === predecessorId ? parentId : threadId, true);
+				return [];
+			},
+		},
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [parentId]: watermark, [threadId]: watermark },
+			sequence: 1,
+		});
+		await writeFile(
+			join(home, "image-outbox.json"),
+			JSON.stringify([
+				// The thread intent is replayed first, but it must stay behind this
+				// parent-channel intent that targets the same thread.
+				{ messageId: currentId, channelId: threadId, request: threadImageRequest(currentId, threadId, parentId) },
+				{
+					messageId: predecessorId,
+					channelId: parentId,
+					request: threadImageRequest(predecessorId, threadId, parentId),
+				},
+			]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async () => channel,
+			requests,
+			{},
+			async (verb, params) => {
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
+				if (verb !== "chat.send") return { engaged: false, turnId: null };
+				const messageId = (params as { messageId: string }).messageId;
+				if (messageId === predecessorId) {
+					predecessorAttempts++;
+					await predecessorGate;
+				}
+				sent.push(messageId);
+				return { engaged: true, turnId: `turn-${messageId}` };
+			},
+		);
+		const pass = adapter.recoverMissedMessages();
+		// The thread intent's retry already ran: the cross-source predecessor in another
+		// channel but the same thread destination holds it instead of dispatching.
+		await eventually(() => predecessorAttempts === 1);
+		expect(sent).toEqual([]);
+		releasePredecessor();
+		await bounded(pass);
+		// Resolved evidence releases the retry on the next pass.
+		await bounded(adapter.recoverMissedMessages());
+		await eventually(() => sent.includes(currentId));
+		expect(sent).toEqual([predecessorId, currentId]);
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			predecessorId,
+			currentId,
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("recovered thread text cannot overtake an older parent-channel image targeting that thread", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-recovered-thread-text-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const parentId = "channel-recovered-parent";
+	const threadId = "thread-recovered-text";
+	const unrelatedId = "dm-recovered-unrelated";
+	const now = Date.now();
+	const imageId = snowflakeFromTimestamp(now - 150_000);
+	const parentWatermark = snowflakeFromTimestamp(now - 100_000);
+	const threadWatermark = snowflakeFromTimestamp(now - 100_000);
+	const unrelatedWatermark = snowflakeFromTimestamp(now - 100_000);
+	const textId = snowflakeFromTimestamp(now - 60_000);
+	const unrelatedTextId = snowflakeFromTimestamp(now - 30_000);
+	const request = threadImageRequest(imageId, threadId, parentId);
+	const imageSource = {
+		id: imageId,
+		content: "from the parent channel",
+		author: { id: "human", username: "human", bot: false },
+		channel: { id: parentId, isDMBased: () => false },
+		attachments: [
+			{
+				name: "photo.png",
+				contentType: "image/png",
+				url: "https://cdn.discordapp.com/attachments/1/2/parent-photo.png",
+			},
+		],
+	};
+	// The newer recovered text lives in the thread the older image targets from its parent.
+	const threadText = {
+		id: textId,
+		content: "what about the picture?",
+		author: { id: "human", username: "human", bot: false },
+		channel: { id: threadId, parentId, type: 11, isDMBased: () => false, isThread: () => true },
+		attachments: [],
+	};
+	const unrelatedText = dmMessage(unrelatedTextId, unrelatedId);
+	let sourceReadable = false;
+	let sourceReads = 0;
+	const requests: Array<{ verb: string; params: any }> = [];
+	const sent: string[] = [];
+	const channelById: Record<string, unknown> = {
+		[parentId]: {
+			messages: {
+				fetch: async (query: unknown) => {
+					const single = singleFetchId(query);
+					if (single !== undefined) {
+						sourceReads++;
+						// Unresolved, not rejected: the source read keeps failing so the intent
+						// stays in the journal with its destination intact.
+						if (!sourceReadable) throw new Error("Discord API temporarily unavailable");
+						return imageSource;
+					}
+					return [];
+				},
+			},
+		},
+		[threadId]: {
+			messages: {
+				fetch: async (query: unknown) => {
+					const after = historyAfter(query);
+					return !after || BigInt(after) < BigInt(textId) ? [threadText] : [];
+				},
+			},
+		},
+		[unrelatedId]: {
+			messages: {
+				fetch: async (query: unknown) => {
+					const after = historyAfter(query);
+					return !after || BigInt(after) < BigInt(unrelatedTextId) ? [unrelatedText] : [];
+				},
+			},
+		},
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [parentId]: parentWatermark, [threadId]: threadWatermark, [unrelatedId]: unrelatedWatermark },
+			knownDms: {
+				[threadId]: { lastSeenAt: new Date().toISOString(), seq: 1 },
+				[unrelatedId]: { lastSeenAt: new Date().toISOString(), seq: 2 },
+			},
+			sequence: 2,
+		});
+		await writeFile(
+			join(home, "image-outbox.json"),
+			JSON.stringify([{ messageId: imageId, channelId: parentId, request }]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async (id) => channelById[id],
+			requests,
+			{},
+			async (verb, params) => {
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
+				if (verb !== "chat.send") return { engaged: false, turnId: null };
+				const messageId = (params as { messageId: string }).messageId;
+				sent.push(messageId);
+				return { engaged: true, turnId: `turn-${messageId}` };
+			},
+		);
+		await bounded(adapter.recoverMissedMessages());
+		// The image is genuinely unresolved: its forced source read ran and failed.
+		expect(sourceReads).toBeGreaterThan(0);
+		// The unrelated conversation recovered. The thread's older text did not dispatch,
+		// even though only another source channel's image holds it back.
+		expect(sent).toEqual([unrelatedTextId]);
+		const held = await loadRecoveryCursors(cursorPath);
+		// The blocked conversation's watermark stays behind its first blocked message.
+		expect(held.recoveredThrough[threadId]).toBe(threadWatermark);
+		expect(held.recoveredThrough[unrelatedId]).toBe(unrelatedTextId);
+		// Repairing the image source lets the same pass deliver the image first, then text.
+		sourceReadable = true;
+		await bounded(adapter.recoverMissedMessages());
+		expect(sent).toEqual([unrelatedTextId, imageId, textId]);
+		const acknowledged = requests.find((entry) => entry.verb === "chat.send" && entry.params.messageId === imageId);
+		expect(acknowledged?.params).toEqual(request);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("recovered text is fail-closed while the image journal is unreadable", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-recovered-text-unreadable-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "thread-unreadable-authority";
+	const now = Date.now();
+	const watermark = snowflakeFromTimestamp(now - 90_000);
+	const textId = snowflakeFromTimestamp(now - 60_000);
+	const text = {
+		id: textId,
+		content: "is this still queued?",
+		author: { id: "human", username: "human", bot: false },
+		channel: {
+			id: channelId,
+			parentId: "channel-unreadable-parent",
+			type: 11,
+			isDMBased: () => false,
+			isThread: () => true,
+		},
+		attachments: [],
+	};
+	const channel = {
+		messages: {
+			fetch: async (query: unknown) => {
+				const after = historyAfter(query);
+				return !after || BigInt(after) < BigInt(textId) ? [text] : [];
+			},
+		},
+	};
+	const sent: string[] = [];
+	const realLoad = ImageOutbox.prototype.load;
+	let readable = false;
+	const loadSpy = spyOn(ImageOutbox.prototype, "load").mockImplementation(function (this: ImageOutbox) {
+		if (!readable) return Promise.reject(new Error("image journal unreadable in test"));
+		return realLoad.call(this);
+	});
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: watermark },
+		});
+		const adapter = gateway(
+			cursorPath,
+			async () => channel,
+			[],
+			{ [channelId]: { engagement: "open" } },
+			async (verb, params) => {
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
+				if (verb !== "chat.send") return { engaged: false, turnId: null };
+				const messageId = (params as { messageId: string }).messageId;
+				sent.push(messageId);
+				return { engaged: true, turnId: `turn-${messageId}` };
+			},
+		);
+		await bounded(adapter.recoverMissedMessages());
+		// An unreadable journal cannot prove no older image targets this conversation, so
+		// recovered text fails closed and the cursor never moves past it.
+		expect(sent).toEqual([]);
+		expect((await loadRecoveryCursors(cursorPath)).recoveredThrough[channelId]).toBe(watermark);
+		readable = true;
+		await bounded(adapter.recoverMissedMessages());
+		expect(sent).toEqual([textId]);
+		expect((await loadRecoveryCursors(cursorPath)).recoveredThrough[channelId]).toBe(textId);
+	} finally {
+		loadSpy.mockRestore();
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});

@@ -70,6 +70,14 @@ export interface GatewayStatusResult {
 	readonly schemaVersion: number;
 	/** Functional health when reported; older gateways may omit this additive field. */
 	readonly readiness?: GatewayReadinessResult;
+	/**
+	 * Identity of the gateway database file this process opened (`dev:ino`). A change
+	 * between status polls means an operator replaced the file (the supported restore
+	 * path swaps it), so durable client cursors written against the previous database
+	 * may now skip messages. Absent on older gateways and when the file cannot be
+	 * stat'ed.
+	 */
+	readonly database?: { readonly identity: string };
 	/** Session census (grows in later phases). */
 	readonly sessions: { readonly active: number };
 	/** Delivery ledger health (P1+). */
