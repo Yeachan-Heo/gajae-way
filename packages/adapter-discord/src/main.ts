@@ -1812,7 +1812,6 @@ export class ReconnectingGateway {
 	readonly #imageDone = new Set<string>();
 	readonly #imageUnsent = new Set<string>();
 	readonly #imageAdmissionFailures = new Map<string, number>();
-	readonly #imageBudgetDeferred = new Set<string>();
 	readonly #imageTurnOpen = new Set<string>();
 	readonly #blockedRecoveryChannels = new Set<string>();
 	readonly unnamedThreads = new UnnamedThreads();
@@ -1925,12 +1924,11 @@ export class ReconnectingGateway {
 		try {
 			if ((await initial) === "unavailable" && !this.#imageDone.has(message.id)) {
 				const current = await this.#imageOutbox.get(message.id).catch(() => undefined);
-				if (
-					!current?.completed &&
-					!(current?.terminal && current.audited) &&
-					!this.#imageBudgetDeferred.has(message.id)
-				)
-					await settled;
+				// A durably parked intent holds no bytes and has no authorization to wait for,
+				// so it must not hold the conversation chain. The outbox row is the authority:
+				// it survives a restart, unlike a process-local marker.
+				const parked = current?.deferred === true;
+				if (!parked && !current?.completed && !(current?.terminal && current.audited)) await settled;
 			}
 		} finally {
 			listeners.delete(release);
@@ -2004,7 +2002,6 @@ export class ReconnectingGateway {
 			this.#imageAdmissionFailures.delete(message.id);
 			this.#imageUnsent.delete(message.id);
 		}
-		this.#imageBudgetDeferred.delete(message.id);
 		const admittedIdentity = entry.sourceIdentity ?? imageSourceIdentity(message);
 		const admittedText = entry.sourceText ?? (typeof message.content === "string" ? message.content : "");
 		if (
@@ -2070,7 +2067,6 @@ export class ReconnectingGateway {
 					}
 				}
 				if (error instanceof ImagePreparationBudgetError) {
-					this.#imageBudgetDeferred.add(entry.messageId);
 					// Park the intent on its own durable quota: local backpressure must never
 					// consume the pool that authorized images compete for.
 					try {
@@ -2079,7 +2075,6 @@ export class ReconnectingGateway {
 					} catch {
 						// The parked pool is full, so this backpressure cannot be absorbed. Refuse
 						// the intent rather than hold a slot it can never use.
-						this.#imageBudgetDeferred.delete(entry.messageId);
 						return this.terminateImage(entry, "image budget backlog exceeded");
 					}
 					return this.deferImageFailure(entry);
@@ -2375,7 +2370,6 @@ export class ReconnectingGateway {
 
 	private cleanupImageState(id: string): void {
 		this.#imageAdmissionFailures.delete(id);
-		this.#imageBudgetDeferred.delete(id);
 		const timer = this.#imageRetries.get(id);
 		if (timer) clearTimeout(timer);
 		this.#imageRetries.delete(id);

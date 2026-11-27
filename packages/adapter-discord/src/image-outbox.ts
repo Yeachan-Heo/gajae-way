@@ -305,15 +305,12 @@ export class ImageOutbox {
 			// must not grow until the next recovery load.
 			const pruned = pruneEntries(entries);
 			if (!entry.completed && !entry.terminal) {
-				const unresolved = pruned.filter(
-					(pending) => !pending.completed && !pending.terminal && pending.deferred !== true,
-				);
-				const deferred = pruned.filter(
-					(pending) => !pending.completed && !pending.terminal && pending.deferred === true,
-				);
 				// Parked rows keep their own bound. Re-marking an already parked row is a
 				// retry, not a new occupant, so only a row entering the pool is counted.
 				if (entry.deferred === true && existing?.deferred !== true) {
+					const deferred = pruned.filter(
+						(pending) => !pending.completed && !pending.terminal && pending.deferred === true,
+					);
 					if (
 						deferred.filter((pending) => pending.channelId === entry.channelId).length >=
 							MAX_DEFERRED_IMAGES_PER_CHANNEL ||
@@ -321,18 +318,28 @@ export class ImageOutbox {
 					)
 						throw new ImageOutboxCapacityError();
 				}
-				const terminal = pruned.filter((pending) => pending.terminal);
-				// Declined tombstones are reclaimable evidence, never delivery quota:
-				// one declined image must not be able to block a later authorized one.
-				const completed = pruned.filter((pending) => pending.completed && pending.declined !== true);
-				if (
-					(index === -1 && unresolved.length >= MAX_UNRESOLVED_IMAGES) ||
-					terminal.filter((pending) => pending.channelId === entry.channelId).length >=
-						MAX_TERMINAL_IMAGES_PER_CHANNEL ||
-					terminal.length >= MAX_TERMINAL_IMAGES ||
-					completed.length >= MAX_COMPLETED_IMAGES
-				)
-					throw new ImageOutboxCapacityError();
+				// Every bound below refuses a *new* intent. An admitted intent must always be
+				// able to record its own progress; otherwise terminal or completion evidence
+				// would wedge live images that are already past admission.
+				if (index === -1 && entry.deferred !== true) {
+					// Parked rows are not deliverable work: the gateway was never asked about
+					// them, so they must not consume the pool authorized images compete for.
+					const unresolved = pruned.filter(
+						(pending) => !pending.completed && !pending.terminal && pending.deferred !== true,
+					);
+					const terminal = pruned.filter((pending) => pending.terminal);
+					// Declined tombstones are reclaimable evidence, never delivery quota:
+					// one declined image must not be able to block a later authorized one.
+					const completed = pruned.filter((pending) => pending.completed && pending.declined !== true);
+					if (
+						unresolved.length >= MAX_UNRESOLVED_IMAGES ||
+						terminal.filter((pending) => pending.channelId === entry.channelId).length >=
+							MAX_TERMINAL_IMAGES_PER_CHANNEL ||
+						terminal.length >= MAX_TERMINAL_IMAGES ||
+						completed.length >= MAX_COMPLETED_IMAGES
+					)
+						throw new ImageOutboxCapacityError();
+				}
 			}
 			await writeEntries(this.#path, pruned);
 			this.#entries = pruned;

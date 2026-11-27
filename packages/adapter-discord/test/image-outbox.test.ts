@@ -141,6 +141,69 @@ describe("ImageOutbox", () => {
 		await outbox.put({ messageId: parked[0] as string, channelId: "channel-0", deferred: true });
 	});
 
+	test("parked backpressure never consumes the unresolved pool authorized images compete for", async () => {
+		const base = 1571558400000000000n;
+		const work = Array.from({ length: 750 }, (_, index) => ({
+			messageId: String(base + BigInt(index)),
+			channelId: `work-${index % 3}`,
+		}));
+		const parked = Array.from({ length: 250 }, (_, index) => ({
+			messageId: String(base + 10_000n + BigInt(index)),
+			channelId: `parked-${index % 5}`,
+			deferred: true,
+		}));
+		await writeFile(path, JSON.stringify([...work, ...parked]));
+		const outbox = new ImageOutbox(path);
+		const admitted: PendingImage = { messageId: String(base + 20_000n), channelId: "work-admitted" };
+		// 750 deliverable rows plus 250 parked ones fill the journal only when parked
+		// backpressure is charged to the pool it never ran in.
+		await expect(outbox.put(admitted)).resolves.toBeUndefined();
+		expect(await outbox.get(admitted.messageId)).toEqual(admitted);
+		// The parked pool stays bounded on its own, independent of the work pool.
+		await expect(
+			outbox.put({ messageId: String(base + 20_001n), channelId: "parked-new", deferred: true }),
+		).rejects.toBeInstanceOf(ImageOutboxCapacityError);
+	});
+
+	test("a full work pool still records parked backpressure on its own quota", async () => {
+		const base = 1571558400000000000n;
+		const work = Array.from({ length: 1_000 }, (_, index) => ({
+			messageId: String(base + BigInt(index)),
+			channelId: "channel",
+		}));
+		await writeFile(path, JSON.stringify(work));
+		const outbox = new ImageOutbox(path);
+		await expect(outbox.put({ messageId: String(base + 20_000n), channelId: "channel" })).rejects.toBeInstanceOf(
+			ImageOutboxCapacityError,
+		);
+		// Parking is not admission: a full work pool must not turn every budget deferral
+		// into a dead letter.
+		await expect(
+			outbox.put({ messageId: String(base + 20_001n), channelId: "channel", deferred: true }),
+		).resolves.toBeUndefined();
+	});
+
+	test("terminal evidence at the cap never blocks an admitted intent from progressing", async () => {
+		const base = 1571558400000000000n;
+		const terminal = Array.from({ length: 500 }, (_, index) => ({
+			messageId: String(base + BigInt(index)),
+			channelId: "channel",
+			terminal: true,
+			audited: true,
+		}));
+		const pending: PendingImage = { messageId: String(base + 20_000n), channelId: "channel" };
+		await writeFile(path, JSON.stringify([...terminal, pending]));
+		const outbox = new ImageOutbox(path);
+		await expect(outbox.put({ messageId: String(base + 30_000n), channelId: "channel" })).rejects.toBeInstanceOf(
+			ImageOutboxCapacityError,
+		);
+		// The evidence cap binds admission only; an already admitted intent must still be
+		// able to persist its failure clock and its prepared request.
+		await expect(outbox.put({ ...pending, failureAt: Date.now() })).resolves.toBeUndefined();
+		await expect(outbox.put({ ...pending, request: { text: "prepared" } })).resolves.toBeUndefined();
+		expect(await outbox.get(pending.messageId)).toMatchObject({ request: { text: "prepared" } });
+	});
+
 	test("drops one corrupt record but keeps readable intents", async () => {
 		const valid: PendingImage = { messageId: "123456789012345683", channelId: "channel" };
 		await writeFile(path, JSON.stringify([valid, { messageId: "not-a-snowflake", channelId: "channel" }]));

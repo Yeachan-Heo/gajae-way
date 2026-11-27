@@ -1780,6 +1780,52 @@ test("a budget-refused live image releases ingress while retrying", async () => 
 		const waiter = adapter.waitForImage(message as never, first);
 		await bounded(waiter, 1_500);
 		expect(await bounded(first)).toBe("unavailable");
+		// The parked state is durable, so a restart cannot charge the work pool for bytes
+		// that were never prepared.
+		const parked = JSON.parse(await readFile(outboxPath, "utf8"));
+		expect(parked[0]).toMatchObject({ deferred: true, failureAt: expect.any(Number) });
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an unabsorbable budget backlog dead-letters instead of holding a parked slot", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-budget-overflow-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "budget-overflow-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	// The parked pool is already at its global bound, spread across channels so no
+	// single channel explains the refusal.
+	const parked = Array.from({ length: 250 }, (_, index) => ({
+		messageId: snowflakeFromTimestamp(Date.now() - 3_600_000 + index),
+		channelId: `parked-${index % 5}`,
+		deferred: true,
+	}));
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(outboxPath, JSON.stringify([...parked, { messageId: id, channelId, dm: true }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => message } }),
+			[],
+			{},
+			undefined,
+			async () => {
+				throw new ImagePreparationBudgetError();
+			},
+		);
+		const engagement = decideInbound(message as never, bot, {});
+		if (!engagement) throw new Error("expected the DM to engage");
+		// A refusal must release ingress: a parked slot the intent can never use is worse
+		// than an audited dead letter.
+		expect(await bounded(adapter.processImage(message as never, engagement))).toBe("skip");
+		expect(adapter.deadLetters.map((entry) => entry.messageId)).toEqual([id]);
+		const persisted: Array<{ messageId: string; terminal?: boolean }> = JSON.parse(await readFile(outboxPath, "utf8"));
+		expect(persisted.find((entry) => entry.messageId === id)).toMatchObject({ terminal: true });
 	} finally {
 		cleanupTimers();
 		await rm(home, { recursive: true, force: true });
