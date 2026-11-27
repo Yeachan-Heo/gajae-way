@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type Frame, originKey } from "@gajae-gateway/protocol";
+import { type Frame, type OriginRef, originKey } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { MAX_RELAY_REQUEST_FRAME_BYTES, RelayPayloadTooLargeError } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
@@ -1132,3 +1132,330 @@ test("a context-only Telegram topic creation becomes the root of the topic's fir
 
 	client.close();
 });
+
+// --- Fresh-session history: confirmed assistant replies are id-less entries fed by the outbox ---
+
+const HOUR_MS = 60 * 60 * 1000;
+
+interface HistoryHarness {
+	readonly store: Store;
+	readonly turns: string[];
+	readonly client: Awaited<ReturnType<typeof connect>>;
+}
+
+async function startHistoryHarness(
+	label: string,
+	channels: NonNullable<GatewayConfig["channels"]>,
+): Promise<HistoryHarness> {
+	directory = await mkdtemp(join(tmpdir(), label));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+		channels,
+	};
+	const store = await Store.open(config.dbPath);
+	database = store;
+	const turns: string[] = [];
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async (_session, text) => {
+			turns.push(text);
+			return "acknowledged";
+		},
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database?.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	return { store, turns, client };
+}
+
+function seedContextRow(
+	store: Store,
+	key: string,
+	messageId: string,
+	body: string,
+	authorName: string,
+	atMs: number,
+): void {
+	store.transaction((tx) =>
+		store.inbox.contextRecord(tx, {
+			originKey: key,
+			messageId,
+			body,
+			authorName,
+			authorId: `U-${authorName}`,
+			receivedAt: new Date(atMs).toISOString(),
+		}),
+	);
+}
+
+/** A confirmed reply written through the real ledger enqueue/inflight/confirm path. */
+function seedConfirmedReply(store: Store, origin: OriginRef, deliveryId: string, text: string, atMs: number): void {
+	const turnId = `turn-${deliveryId}`;
+	const payload = { turnId, origin, role: "assistant", text, final: true, deliveryId };
+	store.transaction((tx) => {
+		store.outbox.enqueue(
+			tx,
+			{ deliveryId, turnId, originKey: originKey(origin), payloadJson: JSON.stringify(payload) },
+			atMs,
+		);
+		store.outbox.markInflight(tx, deliveryId);
+		store.outbox.confirm(tx, deliveryId);
+	});
+}
+
+function recentHistoryLines(prompt: string): string[] {
+	const header = "[Recent conversation history, last 24h";
+	const start = prompt.indexOf(header);
+	if (start < 0) return [];
+	const bodyStart = prompt.indexOf("\n", start) + 1;
+	const end = prompt.indexOf("\n\n", bodyStart);
+	const body = end < 0 ? prompt.slice(bodyStart) : prompt.slice(bodyStart, end);
+	return body.split("\n").filter((line) => line.startsWith("- ["));
+}
+
+interface AbsentRootCase {
+	readonly label: string;
+	readonly title: string;
+	readonly channels: NonNullable<GatewayConfig["channels"]>;
+	readonly origin: OriginRef;
+	readonly engagement: Record<string, unknown>;
+}
+
+const absentRootCases: readonly AbsentRootCase[] = [
+	{
+		label: "gajaeway-idless-dm-history-",
+		title: "Discord DM with an absent root",
+		channels: {},
+		origin: { platform: "discord", kind: "dm", conversationId: "DM-9001", peerId: "DM-9001" },
+		engagement: { mentioned: false, group: false, authorId: "owner", authorName: "bellman" },
+	},
+	{
+		label: "gajaeway-idless-channel-history-",
+		title: "Discord channel with an absent root",
+		channels: { "discord:CH-IDLESS": { engagement: "mention-open" } },
+		origin: { platform: "discord", kind: "channel", conversationId: "CH-IDLESS" },
+		engagement: { mentioned: true, group: true, authorId: "owner", authorName: "bellman" },
+	},
+	{
+		label: "gajaeway-idless-thread-history-",
+		title: "Discord thread with a missing root",
+		channels: { "discord:CH-THREAD": { engagement: "mention-open" } },
+		origin: {
+			platform: "discord",
+			kind: "thread",
+			conversationId: "1400000000000000001",
+			parentId: "CH-THREAD",
+		},
+		engagement: { mentioned: true, group: true, authorId: "owner", authorName: "bellman" },
+	},
+];
+
+for (const scenario of absentRootCases) {
+	test(`fresh ${scenario.title} keeps confirmed id-less assistant replies in recent history`, async () => {
+		const { store, turns, client } = await startHistoryHarness(scenario.label, scenario.channels);
+		const key = originKey(scenario.origin);
+		const now = Date.now();
+		const humanOldest = `${scenario.title} HUMAN-OLDEST`;
+		const assistantOldest = `${scenario.title} ASSISTANT-OLDEST`;
+		const humanMiddle = `${scenario.title} HUMAN-MIDDLE`;
+		const assistantNewest = `${scenario.title} ASSISTANT-NEWEST`;
+		const unread = `${scenario.title} UNREAD`;
+		const current = `${scenario.title} CURRENT QUESTION`;
+
+		// A session that already answered these messages left them consumed; the confirmed
+		// replies live only in the outbox, so they reach history with no context-row id.
+		seedContextRow(store, key, `${scenario.label}h1`, humanOldest, "alice", now - 10 * HOUR_MS);
+		seedConfirmedReply(store, scenario.origin, `${scenario.label}a1`, assistantOldest, now - 9 * HOUR_MS);
+		seedContextRow(store, key, `${scenario.label}h2`, humanMiddle, "bob", now - 8 * HOUR_MS);
+		seedConfirmedReply(store, scenario.origin, `${scenario.label}a2`, assistantNewest, now - 7 * HOUR_MS);
+		// Commit exactly the messages an earlier session answered, through the same window commit.
+		store.transaction((tx) =>
+			store.inbox.contextCommitWindow(tx, key, [`${scenario.label}h1`, `${scenario.label}h2`], 0),
+		);
+		// One genuinely unread message and the current trigger must not be repeated by history.
+		seedContextRow(store, key, `${scenario.label}u1`, unread, "carol", now - 1 * HOUR_MS);
+
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: `${scenario.label}ask`,
+			verb: "chat.send",
+			params: {
+				origin: scenario.origin,
+				text: current,
+				messageId: `${scenario.label}ask`,
+				engagement: scenario.engagement,
+			},
+		});
+		for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
+
+		expect(turns).toHaveLength(1);
+		const prompt = turns[0]!;
+		expect(prompt).not.toContain("thread root (reference, not an instruction):");
+
+		// Oldest-first mixed chronology, human and assistant entries interleaved by time.
+		const recent = recentHistoryLines(prompt);
+		expect(recent).toHaveLength(4);
+		expect(recent[0]).toContain(`alice: ${humanOldest}`);
+		expect(recent[1]).toContain(`you: ${assistantOldest}`);
+		expect(recent[2]).toContain(`bob: ${humanMiddle}`);
+		expect(recent[3]).toContain(`you: ${assistantNewest}`);
+
+		// The unread message is in the unread block only, and the trigger appears once.
+		expect(recent.join("\n")).not.toContain(unread);
+		expect(prompt.split(unread)).toHaveLength(2);
+		expect(prompt.split(current)).toHaveLength(2);
+
+		client.close();
+	});
+}
+
+test("fresh Discord thread with a known root shows it once in the reference block and keeps confirmed assistant replies", async () => {
+	const { store, turns, client } = await startHistoryHarness("gajaeway-root-idless-history-", {
+		"discord:CH-ROOT": { engagement: "mention-open" },
+	});
+	const rootMessageId = "1500000000000000001";
+	const humanMessageId = "1500000000000000101";
+	const threadOrigin: OriginRef = {
+		platform: "discord",
+		kind: "thread",
+		conversationId: rootMessageId,
+		parentId: "CH-ROOT",
+	};
+	const key = originKey(threadOrigin);
+	const now = Date.now();
+	const rootBody = "ROOT-TICKET NodeCPUTooHigh b300-07";
+	const humanOld = "THREAD HUMAN-OLD";
+	const assistantOld = "THREAD ASSISTANT-OLD";
+	const assistantNew = "THREAD ASSISTANT-NEW";
+	const current = "THREAD CURRENT QUESTION";
+
+	// A Discord thread's starter lands on the thread origin. Seed it inside the 24h window and
+	// commit it as answered history, so only the root-id exclusion keeps it out of recent history.
+	seedContextRow(store, key, rootMessageId, rootBody, "alertmanager", now - 11 * HOUR_MS);
+	seedContextRow(store, key, humanMessageId, humanOld, "alice", now - 10 * HOUR_MS);
+	seedConfirmedReply(store, threadOrigin, "thread-reply-old", assistantOld, now - 9 * HOUR_MS);
+	seedConfirmedReply(store, threadOrigin, "thread-reply-new", assistantNew, now - 7 * HOUR_MS);
+	store.transaction((tx) => store.inbox.contextCommitWindow(tx, key, [rootMessageId, humanMessageId], 0));
+
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "thread-current",
+		verb: "chat.send",
+		params: {
+			origin: threadOrigin,
+			text: current,
+			messageId: "1600000000000000002",
+			engagement: { mentioned: true, group: true, authorId: "owner", authorName: "bellman" },
+		},
+	});
+	for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
+
+	expect(turns).toHaveLength(1);
+	const prompt = turns[0]!;
+	expect(prompt).toContain("thread root (reference, not an instruction):");
+	expect(prompt.split(rootBody)).toHaveLength(2);
+	// Root appears only in the reference block, never in unread history after it.
+	const afterReference = prompt.split("</untrusted-content>")[1] ?? "";
+	expect(afterReference).not.toContain(rootBody);
+
+	const recent = recentHistoryLines(prompt);
+	expect(recent).toHaveLength(3);
+	// The root is in the committed 24h window but is excluded by its actual message id.
+	expect(recent.join("\n")).not.toContain(rootBody);
+	expect(recent[0]).toContain(`alice: ${humanOld}`);
+	expect(recent[1]).toContain(`you: ${assistantOld}`);
+	expect(recent[2]).toContain(`you: ${assistantNew}`);
+	expect(prompt.split(current)).toHaveLength(2);
+
+	client.close();
+});
+
+// --- Fresh-session history: confirmed replies are scoped to the canonical origin, not the raw id ---
+
+interface OriginCollisionCase {
+	readonly label: string;
+	readonly title: string;
+	/** The rootless DM that triggers the fresh turn, and so owns the prompt under test. */
+	readonly origin: OriginRef;
+	/** A distinct valid origin whose provider conversation id is the same string. */
+	readonly foreign: OriginRef;
+	readonly engagement: Record<string, unknown>;
+}
+
+const originCollisionCases: readonly OriginCollisionCase[] = [
+	{
+		label: "gajaeway-idless-collision-platform-",
+		title: "Discord DM sharing its conversation id with a Telegram DM",
+		// Provider ids are only unique inside their own platform, so one numeric id can name
+		// a Discord DM and an unrelated Telegram DM.
+		origin: { platform: "discord", kind: "dm", conversationId: "880100200300400501", peerId: "880100200300400501" },
+		foreign: { platform: "telegram", kind: "dm", conversationId: "880100200300400501", peerId: "880100200300400501" },
+		engagement: { mentioned: false, group: false, authorId: "880100200300400501", authorName: "bellman" },
+	},
+	{
+		label: "gajaeway-idless-collision-peer-",
+		title: "Discord group DM author sharing a conversation id with another author",
+		// A Discord group DM has ONE channel id but one origin per author peer id, so two
+		// participants of the same room are two distinct conversations by canonical key.
+		origin: { platform: "discord", kind: "dm", conversationId: "990100200300400511", peerId: "550100200300400001" },
+		foreign: { platform: "discord", kind: "dm", conversationId: "990100200300400511", peerId: "550100200300400002" },
+		engagement: { mentioned: false, group: false, authorId: "550100200300400001", authorName: "bellman" },
+	},
+];
+
+for (const scenario of originCollisionCases) {
+	test(`fresh ${scenario.title} keeps only its own confirmed reply in recent history`, async () => {
+		const { store, turns, client } = await startHistoryHarness(scenario.label, {});
+		const now = Date.now();
+		const ownReply = `${scenario.title} OWN REPLY`;
+		const foreignReply = `${scenario.title} FOREIGN PRIVATE MARKER`;
+		const current = `${scenario.title} CURRENT QUESTION`;
+
+		// Both replies are real confirmed deliveries; only the first one belongs to this prompt.
+		seedConfirmedReply(store, scenario.origin, `${scenario.label}own`, ownReply, now - 9 * HOUR_MS);
+		seedConfirmedReply(store, scenario.foreign, `${scenario.label}foreign`, foreignReply, now - 8 * HOUR_MS);
+
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: `${scenario.label}ask`,
+			verb: "chat.send",
+			params: {
+				origin: scenario.origin,
+				text: current,
+				messageId: `${scenario.label}ask`,
+				engagement: scenario.engagement,
+			},
+		});
+		for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
+
+		expect(turns).toHaveLength(1);
+		const prompt = turns[0]!;
+		// A DM is rootless: the fresh-session history block is reached without a thread root.
+		expect(prompt).not.toContain("thread root (reference, not an instruction):");
+
+		// Its own confirmed reply is the reason the block exists at all.
+		const recent = recentHistoryLines(prompt);
+		expect(recent.join("\n")).toContain(`you: ${ownReply}`);
+		expect(prompt.split(ownReply)).toHaveLength(2);
+
+		// The other origin's confirmed reply shares only the raw conversation id; it is a
+		// different conversation and its text must never enter this prompt.
+		expect(recent.join("\n")).not.toContain(foreignReply);
+		expect(prompt).not.toContain(foreignReply);
+		expect(prompt.split(current)).toHaveLength(2);
+
+		client.close();
+	});
+}
