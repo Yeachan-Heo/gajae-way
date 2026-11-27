@@ -229,7 +229,7 @@ test("a [POST:] part goes to the configured target once, recorded there as the p
 	expect(recent[0]?.id).toBe(`post/${postId}`);
 	expect(recent[0]?.author).toStartWith("you (posted here from");
 	// ...and not also as a confirmed delivery: the context row is the single carrier.
-	expect(database!.outbox.confirmedConversation("report-room", since, 20)).toHaveLength(0);
+	expect(database!.outbox.confirmedConversation(REPORT, since, 20)).toHaveLength(0);
 	// The source room's history keeps the local part only.
 	expect(rows(HERE).map((row) => JSON.parse(row.payload_json).text)).toEqual(["여기 답"]);
 });
