@@ -5150,21 +5150,24 @@ function ownerPeerIdOf(config: GatewayConfig): string | undefined {
 }
 
 /**
- * Whether `authorId` in an engagement or request params is the owner. The
- * configured owner (`ownerTarget.origin.peerId`) always authorises, and an
- * explicit `ownerTarget` supersedes the adapter-reported application owners
- * entirely (#862). Without an `ownerTarget`, an id the Discord adapter resolved
- * from its own application at login (`hello.adapter.ownerIds`) authorises a
- * `discord`-platform author: the ids arrive over the adapter's authenticated
- * connection, and the connection that reported them is the only one they are
- * trusted on. No owner anywhere authorises nobody (fail closed). Owner-only
- * verbs (`/restart`, `/model`, `session.modelChoices`) require this.
+ * Whether `authorId` in an engagement or request params is the owner. Owner
+ * identity is separate from the notification destination:
+ * - If ownerTarget.origin has a peerId (DM), that peerId is the owner (#862).
+ * - If ownerTarget.origin has no peerId (channel), fall back to adapter-reported
+ *   owners for that platform (#901).
+ * - If ownerTarget is absent, use adapter-reported owners (#862).
+ * No owner anywhere authorises nobody (fail closed). Owner-only verbs
+ * (`/restart`, `/model`, `session.modelChoices`) require this.
  */
 function ownerAuthored(config: GatewayConfig, carrier: unknown, connection?: Connection): boolean {
 	const record = (carrier ?? {}) as { authorId?: unknown; originPlatform?: unknown };
 	const authorId = record.authorId;
 	if (typeof authorId !== "string") return false;
-	if (config.ownerTarget !== undefined) return authorId === ownerPeerIdOf(config);
+	// Check DM ownerTarget first (has explicit peerId)
+	const ownerPeerId = ownerPeerIdOf(config);
+	if (ownerPeerId !== undefined) return authorId === ownerPeerId;
+	// ownerTarget exists but has no peerId (e.g., channel destination):
+	// fall back to adapter-reported owners for identity (#901)
 	if (connection === undefined) return false;
 	// Adapter-reported owners are authority for the DECLARED platform only
 	// (#862): the originless verb (session.modelChoices) must name the platform

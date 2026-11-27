@@ -284,6 +284,80 @@ describe("adapter-reported application owners (#862)", () => {
 		);
 	});
 });
+
+describe("channel ownerTarget with identity fallback (#901)", () => {
+	test("channel ownerTarget: owner authorized, non-owner refused", async () => {
+		const home = await mkdtemp(join(tmpdir(), "gajaeway-channel-owner-target-"));
+		const channelOrigin = { platform: "discord" as const, kind: "channel" as const, conversationId: "reports" };
+		const config: GatewayConfig = {
+			schemaVersion: 1,
+			home,
+			gjc: { agentDir: join(home, "agent") },
+			configPath: join(home, "config.json"),
+			socketPath: join(home, "gateway.sock"),
+			dbPath: join(home, "gateway.db"),
+			logVerbosity: "info",
+			model: { preset: "base" },
+			// ownerTarget points to a channel (no peerId), but we also have adapter owners
+			ownerTarget: { origin: channelOrigin },
+			channels: mentionOpen,
+		};
+		const database = await Store.open(config.dbPath);
+		const port = attachTestBrokerOwnership(database, new ScriptedSessionPort(), join(home, "agent"));
+		let server: GatewayServer | undefined;
+		let client: Awaited<ReturnType<typeof connect>> | undefined;
+		try {
+			server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
+			client = await connect(config.socketPath);
+			client.send({
+				v: "0.1",
+				type: "hello",
+				payload: { supportedVersions: ["0.1"], adapter: { platform: "discord", ownerIds: [APP_OWNER] } },
+			});
+			await Bun.sleep(5);
+			const key = "discord/channel/public";
+
+			// The configured owner should be authorized even though ownerTarget is a channel
+			expect(
+				await requestOverSocket(client, "owner-set", "chat.send", {
+					origin: CHANNEL,
+					text: "/model set frontier-heavy",
+					engagement: as(APP_OWNER),
+				}),
+			).toMatchObject({ type: "response", result: { engaged: true } });
+			expect(database.bindings.modelGet(key)?.selection).toEqual({ preset: "frontier-heavy" });
+
+			// A non-owner should still be refused
+			expect(
+				await requestOverSocket(client, "member-set", "chat.send", {
+					origin: CHANNEL,
+					text: "/model set other-model",
+					engagement: as(MEMBER),
+				}),
+			).toMatchObject({ type: "response", result: { turnId: null, engaged: false } });
+			expect(database.bindings.modelGet(key)?.selection).toEqual({ preset: "frontier-heavy" });
+
+			// Channel membership alone should not grant access
+			expect(
+				await requestOverSocket(client, "channel-member-set", "chat.send", {
+					origin: CHANNEL,
+					text: "/model set channel-member-model",
+					engagement: as(TEAM_MEMBER),
+				}),
+			).toMatchObject({ type: "response", result: { turnId: null, engaged: false } });
+			expect(database.bindings.modelGet(key)?.selection).toEqual({ preset: "frontier-heavy" });
+		} finally {
+			client?.close();
+			try {
+				await server?.stop();
+			} finally {
+				if (!server) database.close();
+				await rm(home, { recursive: true, force: true });
+			}
+		}
+	});
+});
+
 describe("gateway.adapterOwners live refresh (#862, finding 3)", () => {
 	test("a pushed replacement revokes a removed member on the live connection", async () => {
 		await withGateway(
