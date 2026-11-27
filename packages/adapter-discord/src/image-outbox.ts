@@ -311,34 +311,45 @@ export class ImageOutbox {
 					const deferred = pruned.filter(
 						(pending) => !pending.completed && !pending.terminal && pending.deferred === true,
 					);
+					// The row being admitted already counts here, so the rule is "at most the
+					// bound": the last free slot admits and only the next one is refused.
 					if (
-						deferred.filter((pending) => pending.channelId === entry.channelId).length >=
+						deferred.filter((pending) => pending.channelId === entry.channelId).length >
 							MAX_DEFERRED_IMAGES_PER_CHANNEL ||
-						deferred.length >= MAX_DEFERRED_IMAGES
+						deferred.length > MAX_DEFERRED_IMAGES
 					)
 						throw new ImageOutboxCapacityError();
 				}
-				// Every bound below refuses a *new* intent. An admitted intent must always be
-				// able to record its own progress; otherwise terminal or completion evidence
-				// would wedge live images that are already past admission.
-				if (index === -1 && entry.deferred !== true) {
+				// The work-pool bound below refuses a write that would take a *new* slot: a
+				// first intent or a promotion out of the parked pool. An admitted intent must
+				// always be able to record its own progress; otherwise failure or completion
+				// evidence would wedge live images that are already past admission.
+				const promoting = existing?.deferred === true && entry.deferred !== true;
+				if (index === -1 || promoting) {
 					// Parked rows are not deliverable work: the gateway was never asked about
 					// them, so they must not consume the pool authorized images compete for.
 					const unresolved = pruned.filter(
 						(pending) => !pending.completed && !pending.terminal && pending.deferred !== true,
 					);
-					const terminal = pruned.filter((pending) => pending.terminal);
-					// Declined tombstones are reclaimable evidence, never delivery quota:
-					// one declined image must not be able to block a later authorized one.
-					const completed = pruned.filter((pending) => pending.completed && pending.declined !== true);
-					if (
-						unresolved.length >= MAX_UNRESOLVED_IMAGES ||
-						terminal.filter((pending) => pending.channelId === entry.channelId).length >=
-							MAX_TERMINAL_IMAGES_PER_CHANNEL ||
-						terminal.length >= MAX_TERMINAL_IMAGES ||
-						completed.length >= MAX_COMPLETED_IMAGES
-					)
-						throw new ImageOutboxCapacityError();
+					// `unresolved` already counts the row being written, so an exact bound admits
+					// the last slot and only an overfull pool refuses.
+					if (unresolved.length > MAX_UNRESOLVED_IMAGES) throw new ImageOutboxCapacityError();
+					// Evidence caps gate new intents only. A parked row is already an admitted
+					// intent, so its promotion must not be blocked by evidence that cannot be
+					// evicted; otherwise a bounded parked backlog would decay into terminal rows.
+					if (index === -1) {
+						const terminal = pruned.filter((pending) => pending.terminal);
+						// Declined tombstones are reclaimable evidence, never delivery quota:
+						// one declined image must not be able to block a later authorized one.
+						const completed = pruned.filter((pending) => pending.completed && pending.declined !== true);
+						if (
+							terminal.filter((pending) => pending.channelId === entry.channelId).length >=
+								MAX_TERMINAL_IMAGES_PER_CHANNEL ||
+							terminal.length >= MAX_TERMINAL_IMAGES ||
+							completed.length >= MAX_COMPLETED_IMAGES
+						)
+							throw new ImageOutboxCapacityError();
+					}
 				}
 			}
 			await writeEntries(this.#path, pruned);

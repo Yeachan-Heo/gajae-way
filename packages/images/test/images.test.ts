@@ -169,11 +169,12 @@ describe("adapter-wide image preparation budget", () => {
 });
 
 describe("prompt image preparation", () => {
-	test("returns canonical budgeted JPEGs and an explicit notice", async () => {
+	test("returns canonical budgeted JPEGs", async () => {
 		const source = await makePng();
 		const result = await preparePromptImages([source, await makeJpeg()]);
 		expect(result.images).toHaveLength(2);
-		expect(result.notice).toContain("fine detail may be lost");
+		expect(Object.keys(result)).toEqual(["images"]);
+		expect(await preparePromptImages([])).toEqual({ images: [] });
 		for (const image of result.images) {
 			const bytes = Buffer.from(image.data, "base64");
 			expect(image.mimeType).toBe("image/jpeg");

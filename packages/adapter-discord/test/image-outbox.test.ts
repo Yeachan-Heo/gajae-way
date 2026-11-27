@@ -286,21 +286,29 @@ describe("ImageOutbox", () => {
 
 	test("completed evidence bounds admission when no watermark is available", async () => {
 		const base = 1571558400000000000n;
+		const pending: PendingImage = { messageId: String(base + 20_000n), channelId: "channel" };
 		await writeFile(
 			path,
-			JSON.stringify(
-				Array.from({ length: 10_000 }, (_, index) => ({
+			JSON.stringify([
+				...Array.from({ length: 10_000 }, (_, index) => ({
 					messageId: String(base + BigInt(index)),
 					channelId: "channel",
 					completed: true,
 					completedAt: Date.now(),
 				})),
-			),
+				pending,
+			]),
 		);
 		const outbox = new ImageOutbox(path);
-		await expect(outbox.put({ messageId: String(base + 20_000n), channelId: "channel" })).rejects.toThrow(
+		await expect(outbox.put({ messageId: String(base + 30_000n), channelId: "channel" })).rejects.toThrow(
 			"admission bound",
 		);
+		expect((await outbox.load()).filter((entry) => entry.completed)).toHaveLength(10_000);
+		// The completion cap is an admission gate, never a reason to evict evidence or to
+		// freeze an intent that is already past admission.
+		await expect(outbox.put({ ...pending, failureAt: Date.now() })).resolves.toBeUndefined();
+		await expect(outbox.put({ ...pending, request: { text: "prepared" } })).resolves.toBeUndefined();
+		expect(await outbox.get(pending.messageId)).toMatchObject({ request: { text: "prepared" } });
 		expect((await outbox.load()).filter((entry) => entry.completed)).toHaveLength(10_000);
 	});
 
@@ -374,6 +382,170 @@ describe("ImageOutbox", () => {
 		);
 		await expect(bounded.put({ messageId: String(base + 3_001n), channelId: "other" })).resolves.toBeUndefined();
 		expect((await bounded.load()).filter((entry) => entry.terminal)).toHaveLength(500);
+	});
+
+	test("a restored overfull journal preserves every unresolved id on load and on update", async () => {
+		const base = 1571558400000000000n;
+		const ids = (count: number) => Array.from({ length: count }, (_, index) => String(base + BigInt(index)));
+		const rows = (count: number) => ids(count).map((messageId) => ({ messageId, channelId: "channel" }));
+		const persistedIds = async () =>
+			(JSON.parse(await readFile(path, "utf8")) as Array<{ messageId: string }>).map((entry) => entry.messageId);
+
+		for (const count of [1_000, 1_001]) {
+			await writeFile(path, JSON.stringify(rows(count)));
+			const outbox = new ImageOutbox(path);
+			// Loading must not evict a row the admission bound protects: dropping the oldest
+			// intent here would silently lose an image the gateway already accepted.
+			expect((await outbox.load()).map((entry) => entry.messageId)).toEqual(ids(count));
+			// An admitted intent keeps its exact journal slot while it records progress.
+			await expect(
+				outbox.put({ messageId: ids(count)[0] as string, channelId: "channel", failureAt: Date.now() }),
+			).resolves.toBeUndefined();
+			expect(await persistedIds()).toEqual(ids(count));
+			// A refusal writes nothing: no eviction, no reordering, no dropped evidence.
+			await expect(outbox.put({ messageId: String(base + 50_000n), channelId: "channel" })).rejects.toBeInstanceOf(
+				ImageOutboxCapacityError,
+			);
+			expect(await persistedIds()).toEqual(ids(count));
+		}
+	});
+
+	test("a restored journal preserves every terminal id at the per-channel and global evidence caps", async () => {
+		const base = 1571558400000000000n;
+		const terminal = (channelId: string, start: bigint, count: number) =>
+			Array.from({ length: count }, (_, index) => ({
+				messageId: String(start + BigInt(index)),
+				channelId,
+				terminal: true,
+				audited: true,
+			}));
+
+		// Per channel: 500 rows is the exact cap and must survive load and later updates.
+		const perChannel = terminal("channel-a", base, 500);
+		const workRow: PendingImage = { messageId: String(base + 20_000n), channelId: "channel-a" };
+		await writeFile(path, JSON.stringify([...perChannel, workRow]));
+		const perChannelOutbox = new ImageOutbox(path);
+		expect((await perChannelOutbox.load()).filter((entry) => entry.terminal)).toHaveLength(500);
+		await expect(perChannelOutbox.put({ ...workRow, failureAt: Date.now() })).resolves.toBeUndefined();
+		expect((await perChannelOutbox.load()).filter((entry) => entry.terminal)).toHaveLength(500);
+		expect(await perChannelOutbox.get(perChannel[0]!.messageId)).toMatchObject({ terminal: true, audited: true });
+		await expect(
+			perChannelOutbox.put({ messageId: String(base + 30_000n), channelId: "channel-a" }),
+		).rejects.toBeInstanceOf(ImageOutboxCapacityError);
+		expect((await perChannelOutbox.load()).filter((entry) => entry.terminal)).toHaveLength(500);
+
+		// Global: 10_000 terminal rows spread below the per-channel cap must survive too.
+		const channels = Array.from({ length: 20 }, (_, index) => `global-${index}`);
+		const globalTerminal = channels.flatMap((channelId, index) =>
+			terminal(channelId, base + 100_000n + BigInt(index * 500), 500),
+		);
+		const globalWork: PendingImage = { messageId: String(base + 40_000n), channelId: "global-work" };
+		await writeFile(path, JSON.stringify([...globalTerminal, globalWork]));
+		const globalOutbox = new ImageOutbox(path);
+		expect((await globalOutbox.load()).filter((entry) => entry.terminal)).toHaveLength(10_000);
+		expect(await globalOutbox.get(globalTerminal[globalTerminal.length - 1]!.messageId)).toMatchObject({
+			terminal: true,
+		});
+		await expect(globalOutbox.put({ ...globalWork, failureAt: Date.now() })).resolves.toBeUndefined();
+		await expect(
+			globalOutbox.put({ messageId: String(base + 50_000n), channelId: "global-work" }),
+		).rejects.toBeInstanceOf(ImageOutboxCapacityError);
+		expect((await globalOutbox.load()).filter((entry) => entry.terminal)).toHaveLength(10_000);
+	});
+
+	test("the last free work slot admits and the next intent is refused", async () => {
+		const base = 1571558400000000000n;
+		await writeFile(
+			path,
+			JSON.stringify(
+				Array.from({ length: 999 }, (_, index) => ({
+					messageId: String(base + BigInt(index)),
+					channelId: "channel",
+				})),
+			),
+		);
+		const outbox = new ImageOutbox(path);
+		const last: PendingImage = { messageId: String(base + 10_000n), channelId: "channel" };
+		// The bound is a count of intents, so the 1000th still fits.
+		await expect(outbox.put(last)).resolves.toBeUndefined();
+		expect((await outbox.load()).filter((entry) => !entry.completed && !entry.terminal)).toHaveLength(1_000);
+		await expect(
+			outbox.put({ messageId: String(base + 10_001n), channelId: "channel" }),
+		).rejects.toBeInstanceOf(ImageOutboxCapacityError);
+		expect((await outbox.load()).filter((entry) => !entry.completed && !entry.terminal)).toHaveLength(1_000);
+	});
+
+	test("the last free parked slot admits and the next parked intent is refused", async () => {
+		const base = 1571558400000000000n;
+		const parked = (channelId: string, start: bigint, count: number): PendingImage[] =>
+			Array.from({ length: count }, (_, index) => ({
+				messageId: String(start + BigInt(index)),
+				channelId,
+				deferred: true,
+			}));
+
+		// Per channel: the 50th parked row is the last one a channel may hold.
+		await writeFile(path, JSON.stringify(parked("parked-a", base, 49)));
+		const perChannel = new ImageOutbox(path);
+		await expect(
+			perChannel.put({ messageId: String(base + 10_000n), channelId: "parked-a", deferred: true }),
+		).resolves.toBeUndefined();
+		await expect(
+			perChannel.put({ messageId: String(base + 10_001n), channelId: "parked-a", deferred: true }),
+		).rejects.toBeInstanceOf(ImageOutboxCapacityError);
+		expect((await perChannel.load()).filter((entry) => entry.deferred === true)).toHaveLength(50);
+
+		// Global: 250 parked rows are the whole parked pool, however they are spread.
+		const spread = Array.from({ length: 5 }, (_, channel) =>
+			parked(`parked-${channel}`, base + 100_000n + BigInt(channel * 50), 50),
+		).flat();
+		await writeFile(path, JSON.stringify(spread));
+		const global = new ImageOutbox(path);
+		await expect(
+			global.put({ messageId: String(base + 20_000n), channelId: "parked-new", deferred: true }),
+		).rejects.toBeInstanceOf(ImageOutboxCapacityError);
+		// Re-marking an already parked row is a retry, not a new occupant.
+		await expect(global.put({ ...(spread[0] as PendingImage) })).resolves.toBeUndefined();
+		expect((await global.load()).filter((entry) => entry.deferred === true)).toHaveLength(250);
+	});
+
+	test("promoting a parked row is charged to the work pool without losing its durable intent", async () => {
+		const base = 1571558400000000000n;
+		const work = Array.from({ length: 999 }, (_, index) => ({
+			messageId: String(base + BigInt(index)),
+			channelId: "channel",
+		}));
+		const parked: PendingImage[] = ["parked-a", "parked-b"].map((channelId, index) => ({
+			messageId: String(base + 10_000n + BigInt(index)),
+			channelId,
+			deferred: true,
+		}));
+		const evidence = Array.from({ length: 500 }, (_, index) => ({
+			messageId: String(base + 20_000n + BigInt(index)),
+			channelId: "channel",
+			terminal: true,
+			audited: true,
+		}));
+		await writeFile(path, JSON.stringify([...work, ...parked, ...evidence]));
+		const outbox = new ImageOutbox(path);
+		// Terminal evidence at its cap must not block a promotion: the parked row is already an
+		// admitted intent, and the evidence it would wait for can never be evicted here.
+		const promoted: PendingImage = { messageId: parked[0]!.messageId, channelId: parked[0]!.channelId };
+		await expect(outbox.put(promoted)).resolves.toBeUndefined();
+		expect(await outbox.get(promoted.messageId)).toEqual(promoted);
+		// The work pool is exactly full now, so the next promotion keeps its parked row instead
+		// of losing the intent or turning it terminal.
+		await expect(outbox.put({ messageId: parked[1]!.messageId, channelId: parked[1]!.channelId })).rejects.toBeInstanceOf(
+			ImageOutboxCapacityError,
+		);
+		expect(await outbox.get(parked[1]!.messageId)).toMatchObject({ deferred: true });
+		// Making room lets the same promotion through with the same durable id.
+		await outbox.remove(String(base));
+		await expect(outbox.put({ messageId: parked[1]!.messageId, channelId: parked[1]!.channelId })).resolves.toBeUndefined();
+		expect(await outbox.get(parked[1]!.messageId)).toEqual({
+			messageId: parked[1]!.messageId,
+			channelId: parked[1]!.channelId,
+		});
 	});
 });
 

@@ -69,6 +69,7 @@ export function writeFixtureJson(
 
 /** Only fixture files supply broker authority; rehydration never invokes send or bind. */
 class PersistentPort extends ScriptedSessionPort {
+	private waitingBind?: { id: string; originKey: string };
 	constructor(
 		readonly home: string,
 		readonly hit: (point: Barrier) => void,
@@ -100,7 +101,28 @@ class PersistentPort extends ScriptedSessionPort {
 		}
 		return control;
 	}
+	override async runExclusive<T>(key: string, work: () => Promise<T>): Promise<T> {
+		if (this.waitingBind?.originKey === key)
+			writeFixtureJson(join(this.home, "bind-gate-contender.json"), { ...this.waitingBind, pid: process.pid });
+		return super.runExclusive(key, work);
+	}
 	override async bind(input: SessionBindInput) {
+		const gate = json<{ id?: string }>(join(this.home, "bind-gate-arm.json"), {});
+		if (gate.id) {
+			const waiting = { id: gate.id, originKey: input.originKey };
+			this.waitingBind = waiting;
+			writeFixtureJson(join(this.home, "bind-gate-arrival.json"), { ...waiting, pid: process.pid });
+			try {
+				await eventually(
+					() => json<{ id?: string }>(join(this.home, "bind-gate-release.json"), {}).id,
+					(id) => id === waiting.id,
+					"bind gate release",
+					60_000,
+				);
+			} finally {
+				this.waitingBind = undefined;
+			}
+		}
 		this.record("bind", input);
 		const binding = await super.bind(input);
 		if (
@@ -470,8 +492,34 @@ export class WorkFixture {
 		}
 	}
 	async cleanup() {
+		this.releaseBindGate();
 		await this.kill();
 		await rm(this.home, { recursive: true, force: true });
+	}
+	armBindGate() {
+		const id = crypto.randomUUID();
+		writeFixtureJson(join(this.home, "bind-gate-arm.json"), { id });
+		return id;
+	}
+	async bindGateArrival(id: string) {
+		return eventually(
+			() => json<{ id?: string; originKey?: string; pid?: number }>(join(this.home, "bind-gate-arrival.json"), {}),
+			(value) => value.id === id && value.pid === this.child?.pid,
+			"bind gate arrival",
+		);
+	}
+	async bindGateContender(id: string) {
+		return eventually(
+			() => json<{ id?: string; originKey?: string; pid?: number }>(join(this.home, "bind-gate-contender.json"), {}),
+			(value) => value.id === id && value.pid === this.child?.pid,
+			"bind gate contender",
+		);
+	}
+	releaseBindGate() {
+		const gate = json<{ id?: string }>(join(this.home, "bind-gate-arm.json"), {});
+		if (!gate.id) return;
+		writeFixtureJson(join(this.home, "bind-gate-release.json"), { id: gate.id });
+		rmSync(join(this.home, "bind-gate-arm.json"), { force: true });
 	}
 	async armBarrier(point: Barrier): Promise<void> {
 		writeFixtureJson(join(this.home, "barrier-arm.json"), { point });

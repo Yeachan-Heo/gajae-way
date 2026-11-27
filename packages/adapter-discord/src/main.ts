@@ -976,16 +976,6 @@ async function sendFirstDiscordPart(
 	}
 }
 
-async function sendDiscordInboundNotice(message: DiscordInboundMessage, content: string): Promise<void> {
-	const channel = message.channel as typeof message.channel & { send?: DiscordTextChannelLike["send"] };
-	if (typeof channel.send !== "function") return;
-	try {
-		await sendFirstDiscordPart({ send: channel.send.bind(channel) }, { content }, message.id);
-	} catch {
-		console.error(`Discord inbound image notice failed message=${message.id}.`);
-	}
-}
-
 export async function settleDiscordDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	discord: DiscordClientLike,
@@ -2032,7 +2022,7 @@ export class ReconnectingGateway {
 		if (isImageIntentExpired(entry)) return this.terminateImage(entry, "image intent unresolved for 24 hours");
 		await turn;
 		if (entry.request) return this.sendPendingImage(entry);
-		let prepared: { readonly images: PromptImage[]; readonly notice: string } | undefined;
+		let prepared: { readonly images: PromptImage[] } | undefined;
 		let imageSource = message;
 		let refreshed = false;
 		const sourceIdentity = admittedIdentity;
@@ -2072,11 +2062,16 @@ export class ReconnectingGateway {
 					try {
 						entry = { ...entry, deferred: true };
 						await this.#imageOutbox.put(entry);
-					} catch {
-						// The parked pool is full, so this backpressure cannot be absorbed. Refuse
-						// the intent rather than hold a slot it can never use.
+					} catch (error) {
+						// Only a genuinely full parked pool means this backpressure cannot be
+						// absorbed; refuse the intent rather than hold a slot it can never use.
+						if (!(error instanceof ImageOutboxCapacityError)) throw error;
 						return this.terminateImage(entry, "image budget backlog exceeded");
 					}
+					// A parked row is a durable retry target, not pending delivery, so the ordered
+					// ingress must not stay behind it. Release the waiters here as well: a first
+					// park that failed on the journal only becomes visible a retry later.
+					this.releaseImageWaiters(entry.messageId);
 					return this.deferImageFailure(entry);
 				}
 				if (error instanceof DiscordImagePreparationError && error.disposition === "terminal") {
@@ -2166,12 +2161,7 @@ export class ReconnectingGateway {
 			// recovered/offline intents always wait for the sorted history pass.
 			if (!retry || this.#blockedRecoveryChannels.has(entry.channelId)) return this.deferImageFailure(entry);
 		}
-		let notify = false;
-		const result = await this.sendPendingImage(entry, (response) => {
-			notify = response?.engaged === true && response.turnId != null;
-		});
-		if (result === "acked" && notify && prepared.notice)
-			await sendDiscordInboundNotice(message, `Image processing: ${prepared.notice}`);
+		const result = await this.sendPendingImage(entry);
 		return result;
 	}
 
@@ -2375,6 +2365,11 @@ export class ReconnectingGateway {
 		this.#imageRetries.delete(id);
 		this.#imageRetryAttempts.delete(id);
 		this.#imageTurnOpen.delete(id);
+		this.releaseImageWaiters(id);
+	}
+
+	/** Release the ordered-ingress waiters of one image intent. */
+	private releaseImageWaiters(id: string): void {
 		for (const release of this.#imageSettled.get(id) ?? []) release();
 		this.#imageSettled.delete(id);
 	}
@@ -2579,6 +2574,8 @@ export class ReconnectingGateway {
 				}
 				// Recovery usually holds the message that produced the intent, so use it
 				// instead of spending another API call on a fetch that may not be allowed.
+				// Keep permission failures retryable until the intent deadline, treating only
+				// definitive not-found as terminal, to maintain parity with request-bearing replay.
 				let inbound = source?.id === current.messageId ? source : undefined;
 				if (!inbound) {
 					// A crash between intent admission and request persistence leaves a

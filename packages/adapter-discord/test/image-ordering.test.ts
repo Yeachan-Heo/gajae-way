@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { ImagePreparationBudgetError } from "@gajae-gateway/images";
 import { DiscordImagePreparationError, imageSourceIdentity } from "../src/attachments";
+import { ImageOutbox, type PendingImage } from "../src/image-outbox";
 import { decideInbound, ReconnectingGateway } from "../src/main";
 import { loadRecoveryCursors, saveRecoveryCursors, snowflakeFromTimestamp } from "../src/recovery";
 
@@ -1832,21 +1833,189 @@ test("an unabsorbable budget backlog dead-letters instead of holding a parked sl
 	}
 }, 12_000);
 
+test("a full work pool parks budget backpressure durably and releases ingress", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-full-pool-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "full-pool-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	const base = 1571558400000000000n;
+	const work = Array.from({ length: 1_000 }, (_, index) => ({
+		messageId: String(base + BigInt(index)),
+		channelId: "work-channel",
+	}));
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(outboxPath, JSON.stringify([...work, { messageId: id, channelId, dm: true }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => message } }),
+			[],
+			{},
+			undefined,
+			async () => {
+				throw new ImagePreparationBudgetError();
+			},
+		);
+		const engagement = decideInbound(message as never, bot, {});
+		if (!engagement) throw new Error("expected the DM to engage");
+		const first = adapter.processImage(message as never, engagement);
+		const waiter = adapter.waitForImage(message as never, first);
+		// A parked row has no bytes and no authorization to wait for, so the ordered ingress
+		// chain must not be held behind it even while the work pool is full.
+		await bounded(waiter, 1_500);
+		expect(await bounded(first)).toBe("unavailable");
+		expect(adapter.deadLetters).toEqual([]);
+		const persisted: Array<Record<string, unknown>> = JSON.parse(await readFile(outboxPath, "utf8"));
+		expect(persisted.find((entry) => entry.messageId === id)).toMatchObject({
+			deferred: true,
+			failureAt: expect.any(Number),
+		});
+		expect(persisted.find((entry) => entry.messageId === id)?.terminal).toBeUndefined();
+		// The parked row is charged to its own quota, so the authorized work pool keeps its
+		// exact membership; no admitted intent was evicted to make room for backpressure.
+		expect(persisted.filter((entry) => !entry.completed && !entry.terminal && entry.deferred !== true)).toHaveLength(
+			1_000,
+		);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a transient parked-write failure retries the intent instead of dead-lettering it", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-park-eio-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "park-eio-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const message = dmMessage(id, channelId, true);
+	const originalPut = ImageOutbox.prototype.put;
+	let failures = 1;
+	const putSpy = spyOn(ImageOutbox.prototype, "put").mockImplementation(async function (
+		this: ImageOutbox,
+		entry: PendingImage,
+	) {
+		// Exactly one transient journal write failure, where local backpressure parks the
+		// intent. A full parked pool is a capacity verdict; an I/O error is not.
+		if (entry.messageId === id && entry.deferred === true && failures > 0) {
+			failures--;
+			throw Object.assign(new Error("EIO: i/o error, write"), { code: "EIO" });
+		}
+		return originalPut.call(this, entry);
+	});
+	try {
+		await saveRecoveryCursors(cursorPath, emptyCursors());
+		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, dm: true }]));
+		const adapter = gateway(
+			cursorPath,
+			async () => ({ messages: { fetch: async () => message } }),
+			[],
+			{},
+			undefined,
+			async () => {
+				throw new ImagePreparationBudgetError();
+			},
+		);
+		const engagement = decideInbound(message as never, bot, {});
+		if (!engagement) throw new Error("expected the DM to engage");
+		const first = adapter.processImage(message as never, engagement);
+		const waiter = adapter.waitForImage(message as never, first);
+		expect(await bounded(first)).toBe("unavailable");
+		// A journal failure is not an unabsorbable backlog: the intent must stay recoverable,
+		// with no dead letter and no terminal row.
+		expect(adapter.deadLetters).toEqual([]);
+		const failed: Array<Record<string, unknown>> = JSON.parse(await readFile(outboxPath, "utf8"));
+		expect(failed.find((entry) => entry.messageId === id)?.terminal).toBeUndefined();
+		// The scheduled retry re-parks the same durable id once the journal recovers.
+		const deadline = Date.now() + 8_000;
+		let parked: Record<string, unknown> | undefined;
+		while (Date.now() < deadline) {
+			const rows: Array<Record<string, unknown>> = JSON.parse(await readFile(outboxPath, "utf8"));
+			parked = rows.find((entry) => entry.messageId === id);
+			if (parked?.deferred === true) break;
+			await delay(25);
+		}
+		expect(parked).toMatchObject({ deferred: true, failureAt: expect.any(Number) });
+		expect(parked?.terminal).toBeUndefined();
+		expect(adapter.deadLetters).toEqual([]);
+		// Parking is the durable hand-off: the conversation chain must not stay behind the
+		// journal failure that delayed the park by one retry.
+		await bounded(waiter, 8_000);
+	} finally {
+		putSpy.mockRestore();
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a restored parked row resumes once the image budget frees up", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-park-restart-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "restored-park-dm";
+	const id = snowflakeFromTimestamp(Date.now() - 120_000);
+	const message = dmMessage(id, channelId, true);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		// A restart that happens while the shared image budget is exhausted leaves the intent
+		// parked: no bytes were prepared, so the row must be retried, never lost or terminal.
+		await writeFile(
+			outboxPath,
+			JSON.stringify([{ messageId: id, channelId, dm: true, deferred: true, failureAt: Date.now() }]),
+		);
+		const channel = {
+			messages: {
+				fetch: async (query: unknown) => {
+					if (singleFetchId(query) !== undefined) return message;
+					const after = historyAfter(query);
+					return !after || BigInt(after) < BigInt(id) ? [message] : [];
+				},
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		// The budget is available again, so the parked row is promoted into the work pool and
+		// delivered with its exact id.
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			id,
+		]);
+		const persisted = JSON.parse(await readFile(outboxPath, "utf8")) as Array<Record<string, unknown>>;
+		expect(persisted.find((entry) => entry.messageId === id)).toMatchObject({ completed: true });
+		expect(persisted.find((entry) => entry.messageId === id)?.deferred).toBeUndefined();
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
 test("terminal image rows are compacted only after the watermark passes them", async () => {
 	const home = await mkdtemp(join(tmpdir(), "discord-image-order-compact-"));
 	const cleanupTimers = trackTimers();
 	const cursorPath = join(home, "recovery-cursor.json");
 	const channelId = "channel-1";
 	const insideChannel = "channel-2";
+	const recentChannel = "channel-3";
 	const below = snowflakeFromTimestamp(Date.now() - 31 * 24 * 60 * 60 * 1000);
 	const above = snowflakeFromTimestamp(Date.now() + 60_000);
 	const inside = snowflakeFromTimestamp(Date.now() - 20 * 24 * 60 * 60 * 1000);
+	const recent = snowflakeFromTimestamp(Date.now() - 8 * 24 * 60 * 60 * 1000);
 	try {
 		await saveRecoveryCursors(cursorPath, {
 			...emptyCursors(),
 			recoveredThrough: {
 				[channelId]: snowflakeFromTimestamp(Date.now() - 30 * 24 * 60 * 60 * 1000),
 				[insideChannel]: snowflakeFromTimestamp(Date.now() - 19 * 24 * 60 * 60 * 1000),
+				[recentChannel]: snowflakeFromTimestamp(Date.now() - 7 * 24 * 60 * 60 * 1000),
 			},
 		});
 		await writeFile(
@@ -1855,16 +2024,19 @@ test("terminal image rows are compacted only after the watermark passes them", a
 				{ messageId: below, channelId, terminal: true, audited: true },
 				{ messageId: above, channelId, terminal: true, audited: true },
 				{ messageId: inside, channelId: insideChannel, terminal: true, audited: true },
+				{ messageId: recent, channelId: recentChannel, terminal: true, audited: true },
 			]),
 		);
 		const adapter = gateway(cursorPath, async () => ({ messages: { fetch: async () => [] } }), []);
 		await bounded(adapter.recoverMissedMessages());
-		// `inside` sits past its channel's watermark but still inside the 30-day replay
-		// horizon: a restore rewinds history by that horizon, so its evidence must
-		// survive or the rejected image would be rediscovered as a fresh send.
+		// `inside` (20 days) and `recent` (8 days) both sit past their channel's watermark but
+		// still inside the 30-day replay horizon. A restore rewinds history by that horizon,
+		// so their evidence must survive or the rejected image would be rediscovered as a
+		// fresh send; only the 31-day row is past the retention window.
 		expect(JSON.parse(await readFile(join(home, "image-outbox.json"), "utf8"))).toEqual([
 			{ messageId: above, channelId, terminal: true, audited: true },
 			{ messageId: inside, channelId: insideChannel, terminal: true, audited: true },
+			{ messageId: recent, channelId: recentChannel, terminal: true, audited: true },
 		]);
 	} finally {
 		cleanupTimers();
@@ -2446,6 +2618,7 @@ test("audited terminal rows in unconfigured channels get a recovery watermark an
 	const cursorPath = join(home, "recovery-cursor.json");
 	const outboxPath = join(home, "image-outbox.json");
 	const channelId = "unconfigured-channel";
+	// Use a message older than 30 days (IMAGE_REPLAY_RETENTION_MS) to verify compaction
 	const id = snowflakeFromTimestamp(Date.now() - 31 * 24 * 60 * 60 * 1000);
 	const message = { ...dmMessage(id, channelId, true), channel: { id: channelId } };
 	let channelFetches = 0;

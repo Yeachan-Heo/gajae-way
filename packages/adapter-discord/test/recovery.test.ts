@@ -1276,16 +1276,12 @@ test("recovered image resize notice is sent only for a fresh engaged acknowledge
 		text: "look\n[image · photo.png]",
 	});
 	expect((send?.params as { text: string }).text).not.toContain("Image processing:");
-	expect(visibleNotices).toEqual([
-		{
-			content: "Image processing: Images resized/compressed.",
-			reply: { messageReference: inbound.id, failIfNotExists: false },
-		},
-	]);
+	// Image notice was removed in PR #832; no notice is expected
+	expect(visibleNotices).toEqual([]);
 	expect(await gateway.requestRecovered(inbound.id, channelOrigin, "look", { mentioned: true } as never)).toEqual({
 		verdict: "duplicate",
 	});
-	expect(visibleNotices).toHaveLength(1);
+	expect(visibleNotices).toHaveLength(0);
 });
 
 test("unsupported images and ordinary attachments reach chat.send as captioned text", async () => {
