@@ -397,6 +397,11 @@ export type WorkerOutputResult =
 export interface SessionRequestInput extends SessionSendInput {
 	/** Best-effort post-turn context sampling. Off unless explicitly requested. */
 	readonly sampleContext?: boolean;
+	/** Fetch the op-owned `turn.result` over the request's own relay while it
+	 * is up (monitors bind the answer to the operation, #809). The read is
+	 * carried on `SessionRequestResult.workerOutput`; a consumer that misses it
+	 * re-reads through `fetchWorkerOutput` after the request returns. */
+	readonly fetchWorkerOutput?: boolean;
 	/** Stable caller identity carried into tail observability. */
 	readonly originKey?: string;
 	/**
@@ -458,6 +463,11 @@ export interface SessionRequestResult {
 	readonly receipt: SendReceipt;
 	readonly status: StatusReport;
 	readonly assistant: LastAssistantResult;
+	/** The op-owned `turn.result` read over the request's own relay, populated
+	 * when `SessionRequestInput.fetchWorkerOutput` is set. A proven read is the
+	 * invocation-owned answer; absent/unavailable must be re-read (or retried)
+	 * via `fetchWorkerOutput` — it is never a verdict about the answer. */
+	workerOutput?: WorkerOutputResult;
 	readonly contextUsage?: SessionContextUsage;
 }
 
@@ -2258,6 +2268,9 @@ export class BrokerSessionPort implements SessionPort {
 			} catch (error) {
 				throw markSessionRequestStep(error, "attach");
 			}
+			// Pre-send floor for the op-owned read: stamped at or before the host's
+			// startedAt (acceptedAt is stamped after the turn may have started).
+			const preSendAt = this.#now();
 			let receipt: SendReceipt;
 			let status: StatusReport | undefined;
 			try {
@@ -2307,6 +2320,27 @@ export class BrokerSessionPort implements SessionPort {
 					throw markSessionRequestStep(error, "last_assistant");
 				},
 			);
+			let workerOutput: WorkerOutputResult | undefined;
+			// The op-owned read rides THIS relay while it is up; after the close
+			// below only the CLI recovery transport remains (#809).
+			if (input.fetchWorkerOutput) {
+				try {
+					workerOutput = await this.fetchWorkerOutput({
+						sessionId: input.sessionId,
+						repo: input.repo,
+						opRef: input.opRef,
+						// Pre-send floor only: status.startedAt is a same-turn stamp that
+						// can legitimately differ from turn.result's own startedAt by
+						// scheduling skew; the floor's job is to exclude PRIOR turns.
+						notBeforeMs: preSendAt,
+						terminalIdentity: status.status,
+						relay,
+					});
+				} catch (error) {
+					if (error instanceof BrokerAuthorityError) throw markSessionRequestStep(error, "authority");
+					workerOutput = { status: "absent", code: "transport_error" };
+				}
+			}
 			let contextUsage: SessionContextUsage | undefined;
 			// An empty answer cannot arm a size roll, so it never pays for a context read.
 			if (input.sampleContext && assistant.text.trim()) {
@@ -2320,6 +2354,7 @@ export class BrokerSessionPort implements SessionPort {
 				receipt,
 				status,
 				assistant,
+				...(workerOutput === undefined ? {} : { workerOutput }),
 				...(contextUsage === undefined ? {} : { contextUsage }),
 			};
 		} catch (error) {
