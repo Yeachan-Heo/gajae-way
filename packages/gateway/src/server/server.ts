@@ -2725,7 +2725,7 @@ async function sendChat(
 	// configured owner. Loopback is the local operator socket itself.
 	if (userText === "/model" || userText.startsWith("/model ")) {
 		if (
-			!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp) ||
+			!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp, connection) ||
 			(origin.platform !== "loopback" && !ownerAuthoredOn(origin, runtime.config, params.engagement, connection))
 		) {
 			connection.write({
@@ -2784,7 +2784,7 @@ async function sendChat(
 		// KeepAlive / systemd Restart=always) brings it back; sessions are durable
 		// and resume through recovery, so the persona keeps its transcript.
 		if (
-			!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp) ||
+			!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp, connection) ||
 			!ownerAuthoredOn(origin, runtime.config, params.engagement, connection)
 		) {
 			connection.write({
@@ -2898,7 +2898,7 @@ async function sendChat(
 	if (params.text === "/new" || params.text === "/reset") {
 		// Session resets are privileged control paths: an unauthorized DM must not
 		// erase the caller's session merely because commands bypass normal dispatch.
-		if (!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp)) {
+		if (!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp, connection)) {
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
@@ -2957,6 +2957,7 @@ async function sendChat(
 		runtime.config,
 		threadFollowUpForEngagement,
 		mutedThread,
+		connection,
 	);
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
@@ -3320,6 +3321,7 @@ async function editChat(
 		runtime.config,
 		threadFollowUpForEngagement,
 		mutedThread,
+		connection,
 	);
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
@@ -5203,6 +5205,14 @@ function commandAuthorised(
 	config: GatewayConfig,
 	engagement: unknown,
 	threadFollowUp: boolean,
+	connection: Connection,
 ): boolean {
-	return decideEngagement(origin, engagement as Parameters<typeof decideEngagement>[1], config, threadFollowUp).engaged;
+	return decideEngagement(
+		origin,
+		engagement as Parameters<typeof decideEngagement>[1],
+		config,
+		threadFollowUp,
+		false,
+		connection,
+	).engaged;
 }
