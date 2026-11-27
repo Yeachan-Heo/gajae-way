@@ -3259,7 +3259,7 @@ export class ReconnectingGateway {
 				pendingImages = await this.#imageOutbox.load();
 			} catch {
 				console.error(
-					"Discord image outbox unavailable; image recovery is paused while unrelated text recovery continues.",
+					"Discord image outbox unavailable; image recovery is paused. History probing continues, but dispatch waits for readable ordering evidence so recovered text cannot overtake a restored image.",
 				);
 			}
 			// Load the cursor state before replay so an above-horizon intent can wait
@@ -3572,6 +3572,29 @@ export class ReconnectingGateway {
 				const text = describeInboundBody(message);
 				if (text === "") return "skip";
 				const origin = discordMessageOrigin(message);
+				// History recovery is partitioned by source channel, but an older image may target
+				// this conversation from a DIFFERENT source: an image admitted in the parent
+				// channel prepares to answer in this thread. Source cursors cannot order that
+				// pair, so consult the same source-or-destination predicate live text uses before
+				// dispatching recovered text. Parked and terminal rows are excluded by that
+				// predicate, so both documented release exceptions still apply. A blocker — or an
+				// unreadable journal, which cannot prove ordering — keeps this conversation's cursor
+				// behind the message. This pass never awaits settlement: unrelated conversations
+				// keep recovering and the image's own replay/retry path resolves the predecessor.
+				const predecessors = await this.unresolvedImagePredecessors(message.id, channelId, origin.conversationId);
+				if (predecessors === undefined) {
+					console.error(
+						`Discord recovery could not read the image outbox for channel=${channelId}; holding message=${message.id} instead of dispatching without ordering evidence.`,
+					);
+					return "unavailable";
+				}
+				const oldest = predecessors[0];
+				if (oldest !== undefined) {
+					console.error(
+						`Discord recovery holding message=${message.id} in channel=${channelId} behind unresolved image=${oldest.messageId}; cursor stays behind it.`,
+					);
+					return "unavailable";
+				}
 				let failure: RecoveryFailureClass = "write-path-unknown";
 				let summary = "unclassified chat.send failure";
 				for (let attempt = 1; attempt <= RECOVERY_MAX_ATTEMPTS; attempt++) {

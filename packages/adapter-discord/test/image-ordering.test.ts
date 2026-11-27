@@ -4061,3 +4061,196 @@ test("a retry stays behind a cross-source durable image targeting this thread, t
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+test("recovered thread text cannot overtake an older parent-channel image targeting that thread", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-recovered-thread-text-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const parentId = "channel-recovered-parent";
+	const threadId = "thread-recovered-text";
+	const unrelatedId = "dm-recovered-unrelated";
+	const now = Date.now();
+	const imageId = snowflakeFromTimestamp(now - 150_000);
+	const parentWatermark = snowflakeFromTimestamp(now - 100_000);
+	const threadWatermark = snowflakeFromTimestamp(now - 100_000);
+	const unrelatedWatermark = snowflakeFromTimestamp(now - 100_000);
+	const textId = snowflakeFromTimestamp(now - 60_000);
+	const unrelatedTextId = snowflakeFromTimestamp(now - 30_000);
+	const request = threadImageRequest(imageId, threadId, parentId);
+	const imageSource = {
+		id: imageId,
+		content: "from the parent channel",
+		author: { id: "human", username: "human", bot: false },
+		channel: { id: parentId, isDMBased: () => false },
+		attachments: [
+			{
+				name: "photo.png",
+				contentType: "image/png",
+				url: "https://cdn.discordapp.com/attachments/1/2/parent-photo.png",
+			},
+		],
+	};
+	// The newer recovered text lives in the thread the older image targets from its parent.
+	const threadText = {
+		id: textId,
+		content: "what about the picture?",
+		author: { id: "human", username: "human", bot: false },
+		channel: { id: threadId, parentId, type: 11, isDMBased: () => false, isThread: () => true },
+		attachments: [],
+	};
+	const unrelatedText = dmMessage(unrelatedTextId, unrelatedId);
+	let sourceReadable = false;
+	let sourceReads = 0;
+	const requests: Array<{ verb: string; params: any }> = [];
+	const sent: string[] = [];
+	const channelById: Record<string, unknown> = {
+		[parentId]: {
+			messages: {
+				fetch: async (query: unknown) => {
+					const single = singleFetchId(query);
+					if (single !== undefined) {
+						sourceReads++;
+						// Unresolved, not rejected: the source read keeps failing so the intent
+						// stays in the journal with its destination intact.
+						if (!sourceReadable) throw new Error("Discord API temporarily unavailable");
+						return imageSource;
+					}
+					return [];
+				},
+			},
+		},
+		[threadId]: {
+			messages: {
+				fetch: async (query: unknown) => {
+					const after = historyAfter(query);
+					return !after || BigInt(after) < BigInt(textId) ? [threadText] : [];
+				},
+			},
+		},
+		[unrelatedId]: {
+			messages: {
+				fetch: async (query: unknown) => {
+					const after = historyAfter(query);
+					return !after || BigInt(after) < BigInt(unrelatedTextId) ? [unrelatedText] : [];
+				},
+			},
+		},
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [parentId]: parentWatermark, [threadId]: threadWatermark, [unrelatedId]: unrelatedWatermark },
+			knownDms: {
+				[threadId]: { lastSeenAt: new Date().toISOString(), seq: 1 },
+				[unrelatedId]: { lastSeenAt: new Date().toISOString(), seq: 2 },
+			},
+			sequence: 2,
+		});
+		await writeFile(
+			join(home, "image-outbox.json"),
+			JSON.stringify([{ messageId: imageId, channelId: parentId, request }]),
+		);
+		const adapter = gateway(
+			cursorPath,
+			async (id) => channelById[id],
+			requests,
+			{},
+			async (verb, params) => {
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
+				if (verb !== "chat.send") return { engaged: false, turnId: null };
+				const messageId = (params as { messageId: string }).messageId;
+				sent.push(messageId);
+				return { engaged: true, turnId: `turn-${messageId}` };
+			},
+		);
+		await bounded(adapter.recoverMissedMessages());
+		// The image is genuinely unresolved: its forced source read ran and failed.
+		expect(sourceReads).toBeGreaterThan(0);
+		// The unrelated conversation recovered. The thread's older text did not dispatch,
+		// even though only another source channel's image holds it back.
+		expect(sent).toEqual([unrelatedTextId]);
+		const held = await loadRecoveryCursors(cursorPath);
+		// The blocked conversation's watermark stays behind its first blocked message.
+		expect(held.recoveredThrough[threadId]).toBe(threadWatermark);
+		expect(held.recoveredThrough[unrelatedId]).toBe(unrelatedTextId);
+		// Repairing the image source lets the same pass deliver the image first, then text.
+		sourceReadable = true;
+		await bounded(adapter.recoverMissedMessages());
+		expect(sent).toEqual([unrelatedTextId, imageId, textId]);
+		const acknowledged = requests.find((entry) => entry.verb === "chat.send" && entry.params.messageId === imageId);
+		expect(acknowledged?.params).toEqual(request);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("recovered text is fail-closed while the image journal is unreadable", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-recovered-text-unreadable-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const channelId = "thread-unreadable-authority";
+	const now = Date.now();
+	const watermark = snowflakeFromTimestamp(now - 90_000);
+	const textId = snowflakeFromTimestamp(now - 60_000);
+	const text = {
+		id: textId,
+		content: "is this still queued?",
+		author: { id: "human", username: "human", bot: false },
+		channel: {
+			id: channelId,
+			parentId: "channel-unreadable-parent",
+			type: 11,
+			isDMBased: () => false,
+			isThread: () => true,
+		},
+		attachments: [],
+	};
+	const channel = {
+		messages: {
+			fetch: async (query: unknown) => {
+				const after = historyAfter(query);
+				return !after || BigInt(after) < BigInt(textId) ? [text] : [];
+			},
+		},
+	};
+	const sent: string[] = [];
+	const realLoad = ImageOutbox.prototype.load;
+	let readable = false;
+	const loadSpy = spyOn(ImageOutbox.prototype, "load").mockImplementation(function (this: ImageOutbox) {
+		if (!readable) return Promise.reject(new Error("image journal unreadable in test"));
+		return realLoad.call(this);
+	});
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: watermark },
+		});
+		const adapter = gateway(
+			cursorPath,
+			async () => channel,
+			[],
+			{ [channelId]: { engagement: "open" } },
+			async (verb, params) => {
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
+				if (verb !== "chat.send") return { engaged: false, turnId: null };
+				const messageId = (params as { messageId: string }).messageId;
+				sent.push(messageId);
+				return { engaged: true, turnId: `turn-${messageId}` };
+			},
+		);
+		await bounded(adapter.recoverMissedMessages());
+		// An unreadable journal cannot prove no older image targets this conversation, so
+		// recovered text fails closed and the cursor never moves past it.
+		expect(sent).toEqual([]);
+		expect((await loadRecoveryCursors(cursorPath)).recoveredThrough[channelId]).toBe(watermark);
+		readable = true;
+		await bounded(adapter.recoverMissedMessages());
+		expect(sent).toEqual([textId]);
+		expect((await loadRecoveryCursors(cursorPath)).recoveredThrough[channelId]).toBe(textId);
+	} finally {
+		loadSpy.mockRestore();
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+});
