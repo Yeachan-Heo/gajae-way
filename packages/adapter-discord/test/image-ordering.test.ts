@@ -1912,7 +1912,13 @@ test("a transient parked-write failure retries the intent instead of dead-letter
 		await writeFile(outboxPath, JSON.stringify([{ messageId: id, channelId, dm: true }]));
 		const adapter = gateway(
 			cursorPath,
-			async () => ({ messages: { fetch: async () => message } }),
+			async () => ({
+				messages: {
+					// The forced source fetch takes `{ message, force }`; the background recovery
+					// history scan takes `{ after, limit }` and expects a collection-like page.
+					fetch: async (query: unknown) => (singleFetchId(query) !== undefined ? message : new Map<string, unknown>()),
+				},
+			}),
 			[],
 			{},
 			undefined,
@@ -1931,15 +1937,18 @@ test("a transient parked-write failure retries the intent instead of dead-letter
 		const failed: Array<Record<string, unknown>> = JSON.parse(await readFile(outboxPath, "utf8"));
 		expect(failed.find((entry) => entry.messageId === id)?.terminal).toBeUndefined();
 		// The scheduled retry re-parks the same durable id once the journal recovers.
+		// Parking is two durable writes: the deferred marker, then the failure evidence
+		// that starts the intent deadline. Wait for both so this observes the completed
+		// hand-off instead of the window between them.
 		const deadline = Date.now() + 8_000;
 		let parked: Record<string, unknown> | undefined;
 		while (Date.now() < deadline) {
 			const rows: Array<Record<string, unknown>> = JSON.parse(await readFile(outboxPath, "utf8"));
 			parked = rows.find((entry) => entry.messageId === id);
-			if (parked?.deferred === true) break;
+			if (parked?.deferred === true && typeof parked.failureAt === "number") break;
 			await delay(25);
 		}
-		expect(parked).toMatchObject({ deferred: true, failureAt: expect.any(Number) });
+		expect(parked).toMatchObject({ messageId: id, deferred: true, failureAt: expect.any(Number) });
 		expect(parked?.terminal).toBeUndefined();
 		expect(adapter.deadLetters).toEqual([]);
 		// Parking is the durable hand-off: the conversation chain must not stay behind the
