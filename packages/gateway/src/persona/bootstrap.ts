@@ -4,8 +4,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { type OriginRef, originKey, validateOriginRef } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../config";
 import { resolveChannelPolicy } from "../engagement/policy";
-import { captureRoot } from "../memory/doctrine";
-import { NAVIGATION_SOURCE_MAX_BYTES } from "../memory/registry";
+import { captureRoot, initializeMemory, mapMatchesIndexPolicy } from "../memory/doctrine";
+import { loadRegistry, NAVIGATION_SOURCE_MAX_BYTES } from "../memory/registry";
 import { redactSecrets } from "../orchestrator/rebind";
 
 export const SESSION_BOOTSTRAP_MAX_BYTES = 8 * 1024;
@@ -485,10 +485,44 @@ export async function buildSessionBootstrap(input: {
 
 	let mapText = "";
 	try {
-		const mapPath = await confinedFile(resolved.memory, "MEMORY.md", resolved.allowed);
-		const mapInfo = await stat(mapPath);
-		if (mapInfo.size > NAVIGATION_SOURCE_MAX_BYTES) throw new Error("source_too_large");
-		mapText = await readFile(mapPath, "utf8");
+		// One read path for both the first read and the post-repair re-read, so the
+		// byte ceiling applies to the exact bytes the session ends up consuming.
+		const readMap = async () => {
+			const mapPath = await confinedFile(resolved.memory, "MEMORY.md", resolved.allowed);
+			const info = await stat(mapPath);
+			if (info.size > NAVIGATION_SOURCE_MAX_BYTES) throw new Error("source_too_large");
+			return { info, text: await readFile(mapPath, "utf8") };
+		};
+		let map = await readMap();
+		const registry = await loadRegistry(resolved.memory);
+		if (!mapMatchesIndexPolicy(map.text, registry)) {
+			// The turn awaits an initializer before bootstrap, but a competing writer can
+			// still replace the map in between. Validate the bytes actually read and
+			// repair once instead of serving pointers from the previous index policy.
+			const repaired = await initializeMemory(input.home).then(
+				() => true,
+				(error: unknown) => {
+					diagnostics.push(`MEMORY.md refresh: ${diagnosticCode(error)}`);
+					return false;
+				},
+			);
+			if (repaired) {
+				try {
+					map = await readMap();
+				} catch (error) {
+					diagnostics.push(`MEMORY.md refresh: ${diagnosticCode(error)}`);
+				}
+			}
+			if (!mapMatchesIndexPolicy(map.text, registry)) {
+				// Serving a stale map is worse than omitting it: its capped pointers are the
+				// navigation the upgrade was supposed to replace. Clearing the text also
+				// keeps the associated-pointer pass below from parsing these same bytes.
+				diagnostics.push("MEMORY.md: stale_index_policy");
+				map.text = "";
+			}
+		}
+		mapText = map.text;
+		const mapInfo = map.info;
 		const safeLinks = new Set<string>();
 		for (const path of links(mapText))
 			try {
@@ -535,8 +569,17 @@ export async function buildSessionBootstrap(input: {
 			}
 		}
 		const body = [...headings, ...pointers].join("\n");
-		if (!body) throw new Error("no_safe_content");
-		candidates.push({ name: "Memory navigation map", path: "MEMORY.md", freshness: mapInfo.mtime.toISOString(), body });
+		// A map cleared by the index-policy check is already reported; it is omitted,
+		// not degraded into a second `no_safe_content` diagnostic.
+		if (mapText) {
+			if (!body) throw new Error("no_safe_content");
+			candidates.push({
+				name: "Memory navigation map",
+				path: "MEMORY.md",
+				freshness: mapInfo.mtime.toISOString(),
+				body,
+			});
+		}
 	} catch (error) {
 		diagnostics.push(`MEMORY.md: ${diagnosticCode(error)}`);
 	}

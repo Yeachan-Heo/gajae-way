@@ -54,6 +54,7 @@ import {
 	type WorkAttemptSettlement,
 	type WorkAttemptSettleResult,
 	type WorkAttemptTerminalEvidence,
+	type WorkAuthorizationOwner,
 	type WorkParent,
 	type WorkReportRoot,
 	workAssert,
@@ -135,6 +136,36 @@ const pendingOutput = () => ({
 });
 function hasAcceptanceEvidence(runtime: WorkAttemptRuntime): boolean {
 	return runtime.sendPhase === "accepted" || runtime.output.proof !== null || runtime.output.knownSilence !== null;
+}
+/** Authorization follows the stable owner, independently of the report destination. */
+function authorizationOwner(parent: WorkParent | null): WorkAuthorizationOwner | null {
+	if (!parent) return null;
+	if (parent.kind === "persona") return { kind: "persona", originKey: parent.originKey };
+	return { kind: "lane", name: parent.name, rootOriginKey: parent.root?.originKey ?? null };
+}
+function runtimeAuthorizationOwner(runtime: WorkAttemptRuntime): WorkAuthorizationOwner | null {
+	return runtime.authorizationOwner === undefined ? authorizationOwner(runtime.parent) : runtime.authorizationOwner;
+}
+function sameAuthorizationOwner(
+	left: WorkAuthorizationOwner | null | undefined,
+	right: WorkAuthorizationOwner | null,
+): boolean {
+	if (!left || !right) return false;
+	if (left.kind === "persona") return right.kind === "persona" && left.originKey === right.originKey;
+	return (
+		right.kind === "lane" &&
+		left.name === right.name &&
+		left.rootOriginKey !== null &&
+		left.rootOriginKey === right.rootOriginKey
+	);
+}
+function successorRequestFingerprint(input: WorkInput): string {
+	return createHash("sha256")
+		.update(JSON.stringify([input.text, input.model ?? null]))
+		.digest("hex");
+}
+function hasDefinitiveTerminal(runtime: WorkAttemptRuntime): boolean {
+	return runtime.terminal !== null && !unresolvedTerminalReceipt(runtime.terminal);
 }
 interface Observer {
 	readonly runtime: WorkAttemptRuntime;
@@ -236,9 +267,11 @@ interface WorkInput {
 	resume: boolean;
 	model?: GjcModelSelection;
 	callerSessionId?: string;
+	successorOf?: { name: string; opRef: string; sessionId: string; acknowledgeUnresolved: true };
 }
 interface StartContext {
 	readonly parent: WorkParent | null;
+	readonly authorizationOwner?: WorkAuthorizationOwner | null;
 	readonly runCall?: RunCall;
 	readonly opRef?: string;
 	readonly wakeReportId?: string;
@@ -373,6 +406,22 @@ export class WorkLaneManager {
 			const binding = this.#db.bindings.getSessionRecord(runtime.sessionKey);
 			const bindingMatches = binding?.sessionId === runtime.sessionId && binding.epoch === runtime.epoch;
 			this.#db.work.workAttemptPrepare(tx, runtime, record, runtime.mode === "historical" || bindingMatches);
+			if (runtime.successorOf) {
+				const source = this.#job(runtime.successorOf.name, true)!;
+				this.#putJob(
+					runtime.successorOf.name,
+					{
+						...source,
+						state: "awaiting_operator",
+						updatedAt: runtime.startedAt,
+						escalations: [
+							...source.escalations,
+							`${runtime.startedAt} isolated successor ${runtime.sessionKey}; predecessor execution end remains unproven`,
+						].slice(-32),
+					},
+					tx,
+				);
+			}
 			this.#refreshWorkSession(tx, runtime, runtime.startedAt);
 		});
 	}
@@ -675,11 +724,21 @@ export class WorkLaneManager {
 		const opRef = this.#job(name)?.attempts.at(-1)?.opRef;
 		return opRef ? this.#db.work.workAttemptGet(opRef) : undefined;
 	}
+	#successorProvenance(name: string): WorkAttemptRuntime["successorOf"] {
+		return this.#db.work.workAttemptLinkedByLane(laneJobIdentity(name).laneKey, "successorOf")?.successorOf;
+	}
 	#rootForLane(name: string): WorkReportRoot | null {
 		const parent = this.#latestRuntime(name)?.parent;
 		if (parent?.kind === "persona") return { originKey: parent.originKey, origin: parent.origin };
 		if (parent?.kind === "lane") return parent.root;
 		return null;
+	}
+	#callerAuthorizationOwner(caller: WorkParent | null): WorkAuthorizationOwner | null {
+		if (caller?.kind !== "lane") return authorizationOwner(caller);
+		const runtime = this.#latestRuntime(caller.name);
+		const owner = runtime ? runtimeAuthorizationOwner(runtime) : null;
+		const rootOriginKey = owner?.kind === "persona" ? owner.originKey : (owner?.rootOriginKey ?? null);
+		return { kind: "lane", name: caller.name, rootOriginKey };
 	}
 	#assertNoNestedCycle(childName: string, parentName: string): void {
 		const visited = new Set<string>();
@@ -746,15 +805,10 @@ export class WorkLaneManager {
 			}
 			if (mode === "start") this.#assertNoNestedCycle(input.name, callerLane);
 			const parent: WorkParent = { kind: "lane", name: callerLane, root: this.#rootForLane(callerLane) };
-			const resolved = mode === "start" ? parent : null;
 			console.error(
 				`work_parent_resolved verb=${mode} name=${input.name} source=session kind=${mode === "start" ? "lane" : "none"}`,
 			);
-			return resolved;
-		}
-		if (mode === "run") {
-			console.error(`work_parent_resolved verb=run name=${input.name} source=none kind=none`);
-			return null;
+			return parent;
 		}
 		if (callerPersona) {
 			const parent: WorkParent = {
@@ -763,7 +817,9 @@ export class WorkLaneManager {
 				origin: callerPersona,
 				...(triggerMessageId ? { triggerMessageId } : {}),
 			};
-			console.error(`work_parent_resolved verb=start name=${input.name} source=session kind=persona`);
+			console.error(
+				`work_parent_resolved verb=${mode} name=${input.name} source=session kind=${mode === "start" ? "persona" : "none"}`,
+			);
 			return parent;
 		}
 		// A monitor turn reports to the conversation its monitor delivers to; an
@@ -796,14 +852,16 @@ export class WorkLaneManager {
 						origin: structuredClone(owner),
 						...(ownerTriggerMessageId ? { triggerMessageId: ownerTriggerMessageId } : {}),
 					};
-					console.error(`work_parent_resolved verb=start name=${input.name} source=owner kind=persona${fallback}`);
+					console.error(
+						`work_parent_resolved verb=${mode} name=${input.name} source=owner kind=${mode === "start" ? "persona" : "none"}${fallback}`,
+					);
 					return parent;
 				}
 			} catch {
 				/* Invalid owner origins cannot become report targets. */
 			}
 		}
-		console.error(`work_parent_resolved verb=start name=${input.name} source=none kind=none${fallback}`);
+		console.error(`work_parent_resolved verb=${mode} name=${input.name} source=none kind=none${fallback}`);
 		return null;
 	}
 	#monitorTargetParent(monitorOrigin: OriginRef): { readonly parent: WorkParent } | { readonly reason: string } {
@@ -825,9 +883,19 @@ export class WorkLaneManager {
 		name: string,
 		parent: WorkParent | null,
 		epoch: number,
+		includeReportNotice: boolean,
+		successorOf?: WorkAttemptRuntime["successorOf"],
 	): { readonly text: string; readonly hash: string } | undefined {
 		const allowNested = this.#options.allowNested?.() === true;
-		const text = laneSystemNotice({ name, parent, allowNested });
+		const text = [
+			...(includeReportNotice ? [laneSystemNotice({ name, parent, allowNested })] : []),
+			...(successorOf
+				? [
+						`Explicit isolated successor of ${successorOf.name}, session ${successorOf.sessionId}, operation ${successorOf.opRef}. Reviewed starting commit: ${successorOf.baseSha}.`,
+						"The predecessor's execution end is UNPROVEN and it may still be writing. This is separately authorized new work, not replay or writer transfer. Do not touch its checkout, branch, session, or external side effects. Use only the new checkout and branch; review shared external effects with the coordinator before publishing them.",
+					]
+				: []),
+		].join("\n");
 		const hash = createHash("sha256").update(text).digest("hex");
 		const stored = this.#db.core.metaGet(`lane-notice:${workSessionKey(name)}`);
 		if (stored) {
@@ -873,11 +941,13 @@ export class WorkLaneManager {
 	}
 	async #start(input: WorkInput, mode: "start" | "run", runCall?: RunCall): Promise<WorkStartResult> {
 		this.#live();
-		const parent = this.#resolveCaller(input, mode);
-		if (this.#job(input.name)) return await this.#startAdmitted(input, mode, { parent, runCall });
+		if (input.successorOf && mode !== "start") invalid("successorOf");
+		const caller = this.#resolveCaller(input, mode);
+		const parent = mode === "start" ? caller : null;
+		const context: StartContext = { parent, authorizationOwner: this.#callerAuthorizationOwner(caller), runCall };
+		if (this.#job(input.name)) return await this.#startAdmitted(input, mode, context);
 		const admitting = this.#admissions.get(input.name);
-		// A same-name retry (for example after a caller timeout) must not queue a
-		// second clone, bind or send behind the admission still in progress.
+		// Do not queue another admission behind an in-flight start of this name.
 		if (admitting && admitting.failedAt === undefined)
 			return {
 				started: false,
@@ -889,7 +959,7 @@ export class WorkLaneManager {
 		const admission = { startedAt: this.#at() };
 		this.#admissions.set(input.name, admission);
 		try {
-			const result = await this.#startAdmitted(input, mode, { parent, runCall });
+			const result = await this.#startAdmitted(input, mode, context);
 			if (this.#admissions.get(input.name) === admission) this.#admissions.delete(input.name);
 			return result;
 		} catch (error) {
@@ -905,12 +975,137 @@ export class WorkLaneManager {
 		this.#live();
 		return this.#port.runExclusive(workSessionKey(input.name), () => this.#startLocked(input, mode, context));
 	}
+	/** New authorized work, never execution settlement, prompt replay, or writer transfer. */
+	async #successorSource(
+		input: WorkInput,
+		owner: WorkAuthorizationOwner | null | undefined,
+		prepared = false,
+	): Promise<WorkAttemptRuntime | undefined> {
+		const expected = input.successorOf;
+		if (!expected) return undefined;
+		function refuse(reason: string): never {
+			throw new ProtocolError("invalid_params", "isolated successor refused", { reasonCode: reason });
+		}
+		const target = this.#job(input.name);
+		if (target && (!prepared || target.attempts.length > 0)) refuse("successor_name_already_bound");
+		const source = this.#job(expected.name, true)!;
+		const attempt = source.attempts.at(-1);
+		const runtime = this.#db.work.workAttemptGet(expected.opRef);
+		if (
+			!runtime ||
+			attempt?.opRef !== expected.opRef ||
+			attempt.sessionId !== expected.sessionId ||
+			runtime.sessionId !== expected.sessionId ||
+			runtime.sessionKey !== workSessionKey(expected.name) ||
+			attempt.endedAt !== undefined ||
+			runtime.settledAt !== null ||
+			hasDefinitiveTerminal(runtime) ||
+			runtime.turnEndObservedAt !== undefined ||
+			!this.#binding(runtime) ||
+			runtime.sendPhase !== "accepted"
+		)
+			refuse("successor_source_changed");
+		if (runtime.successor) refuse("successor_already_authorized");
+		if (source.lane.repository === undefined || source.lane.repository !== input.repo)
+			refuse("successor_repository_mismatch");
+		if (!sameAuthorizationOwner(runtimeAuthorizationOwner(runtime), owner ?? null))
+			refuse("successor_report_owner_mismatch");
+		const status = await this.#query(runtime);
+		if (
+			status.status !== "failed" ||
+			status.receiptState !== "missing" ||
+			status.clientRef !== runtime.opRef ||
+			!status.commandId ||
+			!status.turnId ||
+			status.startedAt === undefined ||
+			status.startedAt < Date.parse(runtime.startedAt) ||
+			status.terminalAt === undefined ||
+			status.terminalAt < status.startedAt
+		)
+			refuse("successor_requires_missing_execution_end");
+		const current = this.#db.work.workAttemptGet(runtime.opRef);
+		if (
+			!current ||
+			!this.#binding(current) ||
+			current.settledAt !== null ||
+			hasDefinitiveTerminal(current) ||
+			current.turnEndObservedAt !== undefined ||
+			current.successor
+		)
+			refuse("successor_source_changed");
+		return current;
+	}
 	async #startLocked(input: WorkInput, mode: "start" | "run", context: StartContext): Promise<WorkStartResult> {
 		this.#live();
+		if (input.successorOf) {
+			const expected = input.successorOf;
+			this.#job(expected.name, true);
+			const source = this.#db.work.workAttemptGet(expected.opRef);
+			if (
+				source?.sessionKey === workSessionKey(expected.name) &&
+				source.sessionId === expected.sessionId &&
+				sameAuthorizationOwner(runtimeAuthorizationOwner(source), context.authorizationOwner ?? null) &&
+				source.successor
+			) {
+				const link = source.successor;
+				const existing = this.#db.work.workAttemptGet(link.opRef);
+				const job = this.#job(link.name, true)!;
+				if (
+					link.name !== input.name ||
+					existing?.sessionId !== link.sessionId ||
+					existing.successorOf?.opRef !== source.opRef ||
+					existing.successorOf.baseSha !== input.base ||
+					job.lane.repository !== input.repo
+				)
+					throw new ProtocolError("invalid_params", "successor already designated; inspect the original linked lane", {
+						reasonCode: "successor_already_authorized",
+						successor: link,
+					});
+				if (existing.successorRequestFingerprint !== successorRequestFingerprint(input))
+					throw new ProtocolError("invalid_params", "isolated successor refused", {
+						reasonCode: "successor_request_mismatch",
+					});
+				if (!hasAcceptanceEvidence(existing)) {
+					if (existing.terminal?.reasonCode === "send_rejected" || existing.terminal?.reasonCode === "send_undelivered")
+						throw workError(
+							`work ${existing.terminal.reasonCode === "send_rejected" ? "send rejected" : "send undelivered"}`,
+							existing.terminal.reasonCode,
+							existing,
+						);
+					throw workError(
+						"designated successor acceptance remains unproven; observe it, do not replay",
+						"send_acceptance_uncertain",
+						existing,
+					);
+				}
+				return {
+					started: true,
+					alreadyStarted: true,
+					jobId: existing.jobId,
+					opRef: existing.opRef,
+					sessionKey: existing.sessionKey,
+					sessionId: existing.sessionId,
+				};
+			}
+		}
+		const recoverySource = await this.#successorSource(input, context.authorizationOwner);
+		if (recoverySource) context = { ...context, parent: recoverySource.parent };
 		if (input.cwd !== undefined) assertOutsideServiceDirectory(this.#options.serviceDirectory, input.cwd, input.name);
 		const sessionKey = workSessionKey(input.name);
 		let job = this.#job(input.name);
 		const { jobId } = laneJobIdentity(input.name);
+		const linked = job && this.#db.work.workAttemptLinkedByLane(laneJobIdentity(input.name).laneKey, "successorOf");
+		if (linked) {
+			const owner = runtimeAuthorizationOwner(linked);
+			if (!sameAuthorizationOwner(owner, context.authorizationOwner ?? null))
+				throw new ProtocolError("invalid_params", "isolated successor refused", {
+					reasonCode: "successor_report_owner_mismatch",
+				});
+			let parent = context.parent;
+			if (mode === "run") parent = null;
+			else if (!context.checksRetry && context.wakeReportId === undefined) parent = linked.parent;
+			context = { ...context, parent, authorizationOwner: owner };
+		}
 		// A supplied repository identifies a repo-backed lane; otherwise an explicit
 		// cwd must match the durable worktree path. Omitting both resumes by lane name.
 		if (job && input.repo !== undefined && job.lane.repository !== input.repo)
@@ -945,13 +1140,20 @@ export class WorkLaneManager {
 		if (candidateRepositoryPath !== undefined)
 			assertOutsideServiceDirectory(this.#options.serviceDirectory, candidateRepositoryPath, input.name);
 		const open = job?.attempts.find((attempt) => attempt.endedAt === undefined);
-		if (open)
-			throw new ProtocolError("invalid_params", "attempt already open; use work.steer or wait", {
-				reasonCode: "attempt_open",
-				jobId,
-				opRef: open.opRef,
-				sessionId: open.sessionId,
-			});
+		if (open) {
+			const successor = this.#db.work.workAttemptGet(open.opRef)?.successor;
+			throw new ProtocolError(
+				"invalid_params",
+				"attempt still open; observe it, or explicitly authorize an isolated successor with work.start successorOf after reviewing external effects; resuming cannot prove execution ended",
+				{
+					reasonCode: "attempt_open",
+					jobId,
+					opRef: open.opRef,
+					sessionId: open.sessionId,
+					...(successor ? { successor } : {}),
+				},
+			);
+		}
 		if (job?.state === "awaiting_checks" && !context.checksRetry)
 			return {
 				started: false,
@@ -992,6 +1194,12 @@ export class WorkLaneManager {
 					input.base,
 					this.#gitTimeouts(),
 				);
+				if (input.successorOf && createdWorktree.baseSha !== input.base) {
+					await discardCreatedWorktree(input.name, createdWorktree, this.#gitTimeouts());
+					throw new ProtocolError("invalid_params", "successor checkout does not match the reviewed commit", {
+						reasonCode: "successor_base_mismatch",
+					});
+				}
 				worktreePath = createdWorktree.worktreePath;
 				repositoryPath = createdWorktree.repositoryPath;
 			}
@@ -1071,20 +1279,38 @@ export class WorkLaneManager {
 		}
 		this.#live();
 		const opRef = context.opRef ?? newOpRef(`work-${input.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
-		const notice = mode === "start" ? this.#laneNotice(input.name, context.parent, binding.epoch) : undefined;
-		const runtime = makeRuntime(
-			this.#db,
-			input.name,
-			binding.sessionId,
-			binding.epoch,
-			worktreePath,
-			this.#at(),
-			opRef,
-			mode,
-			mode === "start" ? context.parent : null,
-			context.wakeReportId ?? null,
-			notice?.hash ?? null,
-		);
+		const predecessor = await this.#successorSource(input, context.authorizationOwner, true);
+		const successorOf = predecessor
+			? {
+					name: input.successorOf!.name,
+					opRef: predecessor.opRef,
+					sessionId: predecessor.sessionId,
+					baseSha: input.base!,
+					authorizedAt: this.#at(),
+				}
+			: undefined;
+		const provenance = successorOf ?? linked?.successorOf;
+		const notice =
+			mode === "start" || provenance
+				? this.#laneNotice(input.name, context.parent, binding.epoch, mode === "start", provenance)
+				: undefined;
+		const runtime: WorkAttemptRuntime = {
+			...makeRuntime(
+				this.#db,
+				input.name,
+				binding.sessionId,
+				binding.epoch,
+				worktreePath,
+				this.#at(),
+				opRef,
+				mode,
+				mode === "start" ? context.parent : null,
+				context.wakeReportId ?? null,
+				notice?.hash ?? null,
+			),
+			authorizationOwner: context.authorizationOwner ?? null,
+			...(successorOf ? { successorOf, successorRequestFingerprint: successorRequestFingerprint(input) } : {}),
+		};
 		job = appendAttempt(initialJob, { opRef, sessionId: binding.sessionId, startedAt: runtime.startedAt });
 		this.#prepareAttempt(runtime, job);
 
@@ -1241,6 +1467,10 @@ export class WorkLaneManager {
 		const key = workSessionKey(name);
 		const binding = this.#db.bindings.getSessionRecord(key);
 		const attempt = job.attempts.at(-1);
+		const runtime = attempt && this.#db.work.workAttemptGet(attempt.opRef);
+		const provenance = this.#successorProvenance(name);
+		const successor = this.#db.work.workAttemptLinkedByLane(laneJobIdentity(name).laneKey, "successor")?.successor;
+		let opUnavailable = false;
 		let op: PromptStatusBody | null = null;
 		if (attempt && binding?.sessionId === attempt.sessionId) {
 			try {
@@ -1256,8 +1486,12 @@ export class WorkLaneManager {
 					tail,
 				);
 			} catch (error) {
+				if (error instanceof BrokerAuthorityError) throw error;
 				// A settled attempt whose host is gone has no live op to report.
-				if (attempt.endedAt === undefined || !isSessionUnavailable(error))
+				if (successor || provenance || (job.state === "awaiting_operator" && attempt.endedAt === undefined))
+					opUnavailable = true;
+				else if (attempt.endedAt === undefined && isSessionUnavailable(error)) opUnavailable = true;
+				else if (!isSessionUnavailable(error))
 					throw workError("work status unavailable", "status_unavailable", { ...attempt, jobId: job.jobId });
 			}
 			const current = this.#db.bindings.getSessionRecord(key);
@@ -1277,6 +1511,14 @@ export class WorkLaneManager {
 					}
 				: null,
 			op,
+			...(opUnavailable ? { opUnavailable: true as const } : {}),
+			...(provenance ? { successorOf: provenance } : {}),
+			...(successor ? { successor } : {}),
+			...(!attempt?.endedAt &&
+			!runtime?.turnEndObservedAt &&
+			(runtime?.successor || op?.receiptState === "missing" || job.state === "awaiting_operator")
+				? { recoveryHold: "execution_end_unproven" as const }
+				: {}),
 			// Add repository binding info if present (issue #480)
 			...(job.lane.repository
 				? {
@@ -1792,6 +2034,21 @@ export class WorkLaneManager {
 		}
 		return true;
 	}
+	#holdOpenExecution(observer: Observer): void {
+		if (!this.#writeCurrent(observer)) return;
+		const name = observer.runtime.sessionKey.slice("work/task/".length);
+		const source = this.#job(name, true)!;
+		if (source.state !== "running") return;
+		this.#putJob(name, {
+			...source,
+			state: "awaiting_operator",
+			updatedAt: this.#at(),
+			escalations: [
+				...source.escalations,
+				`${this.#at()} execution end unproven; no replay or same-checkout takeover`,
+			].slice(-32),
+		});
+	}
 	async #tick(observer: Observer): Promise<void> {
 		if (!this.#writeCurrent(observer)) return;
 		let runtime = this.#db.work.workAttemptGet(observer.runtime.opRef)!;
@@ -1855,6 +2112,9 @@ export class WorkLaneManager {
 				runtime.turnEndObservedAt === undefined &&
 				observer.turnEndObservedAt === undefined
 			) {
+				// Hold admission without pretending that the native execution ended.
+				// Observation continues, including late receipts and correlated lifecycle end.
+				this.#holdOpenExecution(observer);
 				const activityVersion = observer.activityVersion;
 				const proofTail = observer.tail;
 				const proofConnectionEpoch = proofTail?.connectionEpoch;
@@ -2366,10 +2626,11 @@ export class WorkLaneManager {
 		const log = failureLogTail ? `\nFailed log tail:\n${utf8Prefix(sanitizeDiagnostic(failureLogTail), 3_200)}` : "";
 		const text = `PR #${cycle.prNumber} checks failed on ${cycle.headSha.slice(0, 12)}: ${names}. Fix the failures, commit and push again (re-steer ${retries}/${AWAITING_CHECKS_RETRY_LIMIT}).${log}`;
 		const last = job.attempts.at(-1);
-		const parent = last ? (this.#attemptByOpRef(last.opRef)?.parent ?? null) : null;
+		const previous = last ? this.#attemptByOpRef(last.opRef) : undefined;
 		try {
 			await this.#startLocked({ name, text, cwd: job.lane.worktreePath, resume: false }, "start", {
-				parent,
+				parent: previous?.parent ?? null,
+				authorizationOwner: previous ? runtimeAuthorizationOwner(previous) : null,
 				checksRetry: true,
 			});
 			console.error(`awaiting_checks_resteered jobId=${job.jobId} pr=${cycle.prNumber} retry=${retries}`);
@@ -2470,15 +2731,18 @@ export class WorkLaneManager {
 			if (this.#stopped) return;
 			let job: LaneJobRecord | undefined;
 			let unavailable = this.#db.bindings.isQuarantined("work", laneJobIdentity(parentName).jobId);
-			if (!unavailable) {
-				try {
-					job = this.#job(parentName, true);
-				} catch {
-					unavailable = true;
-				}
-			}
 			for (let row of this.#db.work.laneReportsByParent(parentName)) {
 				if (this.#stopped) return;
+				// The observer holds a lane outside this session lock, so an awaited steer above may
+				// have parked the parent. Re-read the durable job before admitting the next report.
+				if (!unavailable) {
+					try {
+						job = this.#job(parentName, true);
+					} catch {
+						unavailable = true;
+						job = undefined;
+					}
+				}
 				if (["consumed", "fallback", "undeliverable"].includes(row.state)) continue;
 				if (unavailable || !job) {
 					await this.#resolveUnavailableLaneReport(row);
@@ -2538,7 +2802,13 @@ export class WorkLaneManager {
 				const open = job.attempts.find((attempt) => attempt.endedAt === undefined);
 				if (open) {
 					const runtime = this.#attemptByOpRef(open.opRef);
-					if (runtime && !runtime.terminal && this.#binding(runtime))
+					if (
+						runtime &&
+						job.state !== "awaiting_operator" &&
+						!runtime.terminal &&
+						!runtime.turnEndObservedAt &&
+						this.#binding(runtime)
+					)
 						await this.#claimAndSteerLaneReport(row, job, runtime);
 					continue;
 				}
@@ -2651,7 +2921,29 @@ export class WorkLaneManager {
 			this.#logLaneReportTransition(row, "claimed", "held", "parent_quarantined_ambiguous");
 	}
 
+	/** A steer may only land on a parent whose durable lane and attempt are still live. */
+	#steerAdmissible(parentName: string, runtime: WorkAttemptRuntime): boolean {
+		let job: LaneJobRecord | undefined;
+		try {
+			job = this.#job(parentName, true);
+		} catch {
+			return false;
+		}
+		if (!job) return false;
+		if (
+			job.state === "awaiting_operator" ||
+			job.state === "awaiting_checks" ||
+			job.state === "stalled" ||
+			job.state === "done" ||
+			job.state === "aborted"
+		)
+			return false;
+		const fresh = this.#attemptByOpRef(runtime.opRef);
+		return Boolean(fresh && !fresh.terminal && fresh.turnEndObservedAt === undefined && this.#binding(fresh));
+	}
+
 	async #claimAndSteerLaneReport(row: LaneReportRow, job: LaneJobRecord, runtime: WorkAttemptRuntime): Promise<void> {
+		if (!this.#steerAdmissible(row.parent_name, runtime)) return;
 		const claimSeq = row.claim_seq + 1;
 		const clientRef = laneSteerClientRef(row.report_id, claimSeq);
 		const claimed = this.#reportMutation((tx) =>
@@ -2669,6 +2961,8 @@ export class WorkLaneManager {
 				this.#logLaneReportTransition(row, row.state, "held", "steer_acceptance_uncertain");
 			return;
 		}
+		// Retain an uncertain steer instead of delivering it into a held or reconciling parent.
+		if (!this.#steerAdmissible(row.parent_name, runtime)) return;
 		await this.#sendLaneSteer(row, job, runtime);
 	}
 
@@ -2714,7 +3008,7 @@ export class WorkLaneManager {
 		}
 		if (!opRef || claimed.claim_kind !== "wake" || claimed.claim_ref !== opRef) return;
 		const last = job.attempts.at(-1);
-		const inheritedParent = last ? (this.#attemptByOpRef(last.opRef)?.parent ?? null) : null;
+		const previous = last ? this.#attemptByOpRef(last.opRef) : undefined;
 		try {
 			const outcome = await this.#startLocked(
 				{
@@ -2724,7 +3018,12 @@ export class WorkLaneManager {
 					resume: false,
 				},
 				"start",
-				{ parent: inheritedParent, opRef, wakeReportId: row.report_id },
+				{
+					parent: previous?.parent ?? null,
+					authorizationOwner: previous ? runtimeAuthorizationOwner(previous) : null,
+					opRef,
+					wakeReportId: row.report_id,
+				},
 			);
 			if (outcome.started) return;
 		} catch {
@@ -2889,6 +3188,21 @@ export class WorkLaneManager {
 				}
 				if (!this.#current(observer)) continue;
 				if (live.live === true && !live.disowned && this.#binding(runtime)) {
+					this.#attach(observer);
+					this.#schedule(observer, 0);
+					continue;
+				}
+				if (
+					this.#binding(runtime) &&
+					(this.#successorProvenance(runtime.sessionKey.slice("work/task/".length)) ||
+						runtime.successor ||
+						(live.live === undefined && !live.disowned && hasAcceptanceEvidence(runtime)))
+				) {
+					// A reconstruction gap is not an execution end. Accepted work and
+					// prepared linked successors remain non-replayable even if BOTH
+					// status and inspect are unavailable. The normal observer supplies
+					// correlated lifecycle/idle proof or continuously fenced host death.
+					this.#holdOpenExecution(observer);
 					this.#attach(observer);
 					this.#schedule(observer, 0);
 					continue;
@@ -3138,7 +3452,7 @@ function laneWakeOpRef(parentName: string, reportId: string, claimSeq: number): 
 	return `gw-work-${slug}-lr-${laneReportClaimHash(reportId, claimSeq).slice(0, 24)}`;
 }
 function parseInput(params: unknown): WorkInput {
-	const inputFields = ["name", "text", "cwd", "repo", "base", "resume", "model", "callerSessionId"];
+	const inputFields = ["name", "text", "cwd", "repo", "base", "resume", "model", "callerSessionId", "successorOf"];
 	const input = params as Record<string, unknown>;
 	if (input && typeof input === "object" && !Array.isArray(input))
 		for (const field of Object.keys(input)) if (!inputFields.includes(field)) invalid(field);
@@ -3176,6 +3490,32 @@ function parseInput(params: unknown): WorkInput {
 		base = input.base;
 	}
 	if (input.resume !== undefined && typeof input.resume !== "boolean") invalid("resume");
+	let successorOf: WorkInput["successorOf"];
+	if (input.successorOf !== undefined) {
+		const source = input.successorOf as Record<string, unknown> | null;
+		if (
+			!source ||
+			typeof source !== "object" ||
+			Array.isArray(source) ||
+			Object.keys(source).length !== 4 ||
+			!Object.keys(source).every((key) => ["name", "opRef", "sessionId", "acknowledgeUnresolved"].includes(key)) ||
+			typeof source.name !== "string" ||
+			!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(source.name) ||
+			source.name === name ||
+			typeof source.opRef !== "string" ||
+			!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(source.opRef) ||
+			typeof source.sessionId !== "string" ||
+			!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(source.sessionId) ||
+			source.acknowledgeUnresolved !== true ||
+			!repo ||
+			!base ||
+			!/^[0-9a-f]{40}$/.test(base) ||
+			input.cwd !== undefined ||
+			input.resume !== undefined
+		)
+			invalid("successorOf");
+		successorOf = source as unknown as NonNullable<WorkInput["successorOf"]>;
+	}
 	let model: GjcModelSelection | undefined;
 	if (input.model !== undefined) {
 		if (typeof input.model === "string" && input.model) model = input.model;
@@ -3205,6 +3545,7 @@ function parseInput(params: unknown): WorkInput {
 		resume: input.resume === true,
 		model,
 		...(callerSessionId === undefined ? {} : { callerSessionId }),
+		...(successorOf ? { successorOf } : {}),
 	};
 }
 function workError(

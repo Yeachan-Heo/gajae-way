@@ -3,15 +3,62 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ConfigError, loadConfig, parseConfigFile, reloadConfig } from "../src/config";
+import { type GatewayServer, startUnixServer } from "../src/server/server";
+import { Store } from "../src/store";
+import { respondingSessionPort } from "./session-port.fake";
 
 const homes: string[] = [];
+let server: GatewayServer | undefined;
+let client: ReloadClient | undefined;
 afterEach(async () => {
+	client?.close();
+	client = undefined;
+	await server?.stop();
+	server = undefined;
 	await Promise.all(homes.splice(0).map((home) => rm(home, { recursive: true, force: true })));
 });
+
+interface ReloadFrame {
+	readonly type?: string;
+	readonly id?: string;
+	readonly result?: { readonly ok?: boolean; readonly changed?: readonly string[] };
+}
+
+interface ReloadClient {
+	send(value: unknown): void;
+	readonly frames: ReloadFrame[];
+	close(): void;
+}
+
 async function home(): Promise<string> {
 	const path = await mkdtemp(join(tmpdir(), "gajaeway-config-"));
 	homes.push(path);
 	return path;
+}
+
+async function connectReloadClient(socketPath: string): Promise<ReloadClient> {
+	const frames: ReloadFrame[] = [];
+	let buffered = "";
+	const socket = await Bun.connect({
+		unix: socketPath,
+		socket: {
+			data(_socket, data) {
+				buffered += Buffer.from(data).toString();
+				const lines = buffered.split("\n");
+				buffered = lines.pop() ?? "";
+				for (const line of lines) if (line) frames.push(JSON.parse(line) as ReloadFrame);
+			},
+		},
+	});
+	return { send: (value) => socket.write(`${JSON.stringify(value)}\n`), frames, close: () => socket.end() };
+}
+
+async function waitUntil(predicate: () => boolean, message: string): Promise<void> {
+	for (let attempt = 0; attempt < 600; attempt++) {
+		if (predicate()) return;
+		await Bun.sleep(5);
+	}
+	expect(predicate(), message).toBe(true);
 }
 
 test("file config is canonical while per-process CLI overrides win", async () => {
@@ -358,4 +405,113 @@ test("sqlite journalMode accepts only durable modes and requires restart when ch
 	const result = await reloadConfig(current);
 	expect(result).toMatchObject({ ok: true, changed: [], restartRequired: ["sqlite"] });
 	if (result.ok) expect(result.config.sqlite).toEqual({ journalMode: "WAL" });
+});
+
+test("concurrent reloads serialize stale reads and keep the latest default model", async () => {
+	const path = await home();
+	const configPath = join(path, "config.json");
+	const initialConfig = {
+		schemaVersion: 1,
+		mentionAllowlist: ["owner"],
+		model: "provider/boot",
+		stallTimeoutMs: 60_000,
+	};
+	await Bun.write(configPath, JSON.stringify(initialConfig));
+	const config = await loadConfig({ home: path });
+	const database = await Store.open(config.dbPath);
+	const port = respondingSessionPort(async () => "reply");
+	server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
+	client = await connectReloadClient(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitUntil(() => client!.frames.length >= 1, "server did not complete the handshake");
+
+	const version1 = {
+		schemaVersion: 1,
+		mentionAllowlist: ["owner"],
+		model: "provider/model-v1",
+		stallTimeoutMs: 90_000,
+	};
+	const version2 = {
+		schemaVersion: 1,
+		mentionAllowlist: ["owner"],
+		model: "provider/model-v2",
+		stallTimeoutMs: 90_000,
+	};
+	await Bun.write(configPath, JSON.stringify(version1));
+
+	const originalFile = Bun.file;
+	let readCount = 0;
+	let firstReadStarted = false;
+	let signalSecondRead!: () => void;
+	let releaseFirstRead!: () => void;
+	const secondRead = new Promise<void>((resolve) => {
+		signalSecondRead = resolve;
+	});
+	const holdFirstRead = new Promise<void>((resolve) => {
+		releaseFirstRead = resolve;
+	});
+	Bun.file = ((...args: Parameters<typeof Bun.file>) => {
+		const file = originalFile(...args);
+		if (String(args[0]) !== configPath) return file;
+		return new Proxy(file, {
+			get(target, property, receiver) {
+				if (property !== "text") return Reflect.get(target, property, receiver);
+				return async () => {
+					const contents = await target.text();
+					readCount++;
+					if (readCount === 1) {
+						firstReadStarted = true;
+						await holdFirstRead;
+					} else if (readCount === 2) signalSecondRead();
+					return contents;
+				};
+			},
+		});
+	}) as typeof Bun.file;
+
+	try {
+		client.send({ v: "0.1", type: "request", id: "reload-a", verb: "gateway.reloadConfig" });
+		await waitUntil(() => firstReadStarted, "reload A did not read config v1");
+		await Bun.write(configPath, JSON.stringify(version2));
+		client.send({ v: "0.1", type: "request", id: "reload-b", verb: "gateway.reloadConfig" });
+
+		// An unlocked reload reaches the file while A is held, publishes v2, and
+		// replies before A is released. A reload protected by the mutex waits.
+		const bReadBeforeAReleased = await Promise.race([secondRead.then(() => true), Bun.sleep(100).then(() => false)]);
+		if (bReadBeforeAReleased)
+			await waitUntil(() => client!.frames.some((frame) => frame.id === "reload-b"), "reload B did not finish");
+	} finally {
+		releaseFirstRead();
+		Bun.file = originalFile;
+	}
+
+	await waitUntil(
+		() =>
+			client!.frames.some((frame) => frame.id === "reload-a") &&
+			client!.frames.some((frame) => frame.id === "reload-b"),
+		"both reloads did not finish",
+	);
+	const resultA = client.frames.find((frame) => frame.id === "reload-a")?.result;
+	const resultB = client.frames.find((frame) => frame.id === "reload-b")?.result;
+	expect(resultA).toMatchObject({ ok: true, changed: ["stallTimeoutMs", "model"] });
+	expect(resultB).toMatchObject({ ok: true, changed: ["model"] });
+
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "use-default-model",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "discord", kind: "channel", conversationId: "reload-race" },
+			text: "use the configured default",
+			messageId: "reload-race-message",
+			engagement: { mentioned: true, group: true, authorId: "owner" },
+		},
+	});
+	await waitUntil(() => port.sends.length === 1, "the persona did not send its first turn");
+	await waitUntil(
+		() => port.models.some((model) => model.selection === "provider/model-v2"),
+		"the inherited session did not receive the latest configured default model",
+	);
+	expect(port.models.at(-1)?.selection).toBe("provider/model-v2");
 });

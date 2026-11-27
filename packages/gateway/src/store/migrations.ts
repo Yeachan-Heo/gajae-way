@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 42;
+export const LATEST_SCHEMA_VERSION = 43;
 
 export interface MigrationHost {
 	readonly database: {
@@ -233,8 +233,7 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 		host.withTransaction(() => {
 			// Issue #20: per-conversation model override. This lives beside session
 			// state rather than in config.json, because config is the owner's file
-			// (a slash command must not race their editor) and `model` is not a
-			// reloadable field, so a config write would not be read until restart.
+			// (a slash command must not race their editor).
 			host.database.execute(
 				"CREATE TABLE IF NOT EXISTS conversation_model (origin_key TEXT PRIMARY KEY, selection_json TEXT NOT NULL, set_by TEXT, updated_at TEXT NOT NULL)",
 			);
@@ -933,6 +932,35 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(42, new Date().toISOString());
+		});
+	}
+	if (current < 43) {
+		// Follow-up to #738: the idle-fenced close (`session.close` with `ifIdle: true`)
+		// is journaled as its own operation kind, distinct from the forced close.
+		host.withTransaction(() => {
+			host.database.execute(`
+				CREATE TABLE broker_operations_v43 (
+					authority_key TEXT NOT NULL,
+					operation TEXT NOT NULL CHECK(operation IN ('session.create','turn.prompt','session.close','session.close_if_idle')),
+					scope TEXT NOT NULL,
+					operation_ref TEXT NOT NULL,
+					request_json TEXT NOT NULL,
+					state TEXT NOT NULL CHECK(state IN ('pending','complete')),
+					result_json TEXT,
+					created_at TEXT NOT NULL,
+					completed_at TEXT,
+					PRIMARY KEY(authority_key, operation, scope),
+					CHECK((state = 'complete' AND result_json IS NOT NULL AND completed_at IS NOT NULL) OR (state = 'pending' AND result_json IS NULL AND completed_at IS NULL))
+				);
+				INSERT INTO broker_operations_v43 (authority_key, operation, scope, operation_ref, request_json, state, result_json, created_at, completed_at)
+					SELECT authority_key, operation, scope, operation_ref, request_json, state, result_json, created_at, completed_at FROM broker_operations;
+				DROP TABLE broker_operations;
+				ALTER TABLE broker_operations_v43 RENAME TO broker_operations;
+				CREATE INDEX IF NOT EXISTS broker_operations_completed ON broker_operations(state, completed_at);
+			`);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(43, new Date().toISOString());
 		});
 	}
 }

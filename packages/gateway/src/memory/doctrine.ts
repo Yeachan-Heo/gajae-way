@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Dirent } from "node:fs";
 import {
 	appendFile,
@@ -401,13 +402,26 @@ async function initializeCorpus(root: string): Promise<string> {
 	// every later startup concludes there is nothing to do, so `memory.audit`
 	// reports unmapped_axis_dir indefinitely on a corpus nobody mistreated.
 	// The map is generated navigation, so regenerating it is repair, not data loss.
+	//
+	// The policy marker is the second half of that state question. An index mode
+	// can change without changing any heading: this repository moved tasks, people,
+	// projects, channels and decisions from `recent` to `tree`, so a pre-upgrade map
+	// carried every heading while its pointers were still the old capped window. A
+	// heading check alone would keep serving that map forever, and the persona
+	// bootstrap reads it as-is. The marker is a cheap substring test, which matters
+	// because audit and search call this on their request paths.
 	let map: string | undefined;
 	try {
 		map = await readFile(join(root, "MEMORY.md"), "utf8");
 	} catch {
 		map = undefined;
 	}
-	if (map === undefined || registry.axes.some((axis) => !mapListsAxis(map, axis))) await regenerateMap(root, registry);
+	if (
+		map === undefined ||
+		registry.axes.some((axis) => !mapListsAxis(map, axis)) ||
+		!mapMatchesIndexPolicy(map, registry)
+	)
+		await regenerateMap(root, registry);
 	return root;
 }
 
@@ -523,20 +537,48 @@ export function mapListsAxis(map: string, axis: AxisDescriptor): boolean {
 }
 
 /**
+ * The comment a generated map carries to record the index policy that produced
+ * it. A digest of every resolved axis id and its `index` mode, not the list
+ * itself: an operator with many custom axes cannot push the generated map past
+ * the audit's long-line limit, and the marker stays a single short line.
+ *
+ * A map generated under the current registry carries this marker; one written by
+ * an older gateway (or by a registry that indexed an axis differently) does not,
+ * which is what lets initialization tell a current map from a stale one.
+ */
+export function indexPolicyMarker(registry: AxisRegistry): string {
+	const policy = registry.axes.map((axis) => `${axis.id}=${axis.index}`).join("\n");
+	return `<!-- memory-index-policy: ${createHash("sha256").update(policy).digest("hex").slice(0, 16)} -->`;
+}
+
+/**
+ * Whether a map body was generated under the current index policy. Headings
+ * alone are not enough: a pre-upgrade map can carry every axis heading while its
+ * `tree` axes still hold the old capped `recent` pointers, which is the state a
+ * moved index mode leaves behind.
+ */
+export function mapMatchesIndexPolicy(map: string, registry: AxisRegistry): boolean {
+	return map.includes(indexPolicyMarker(registry));
+}
+
+/**
  * MEMORY.md contains navigation only; its pointers are regenerated from the
  * canonical tree. Each axis is indexed the way its descriptor asks: a `recent`
- * axis lists its newest entries, a `tree` axis lists its whole hierarchy grouped
- * by partition, so a routable axis stays navigable instead of scrolling off the
- * newest-20 window. Under the shared source ceiling, allowances shrink fairly
- * and a trimmed axis points at an existing index when one is available. No axis
- * is special-cased by id.
+ * axis lists its last entries in reverse path order (newest first when names are
+ * date-prefixed), a `tree` axis lists its whole hierarchy grouped by partition,
+ * so a routable axis stays navigable instead of scrolling off the newest-20
+ * window. Under the shared source ceiling, allowances shrink fairly and a
+ * trimmed axis points at an existing index when one is available. No axis is
+ * special-cased by id.
  */
 export function regenerateMap(root: string, registry?: AxisRegistry): Promise<void> {
 	return regenerateMapFiles(root, registry);
 }
 
 async function regenerateMapFiles(root: string, registry?: AxisRegistry): Promise<void> {
-	const axes = (registry ?? (await loadRegistry(root))).axes;
+	const resolved = registry ?? (await loadRegistry(root));
+	const axes = resolved.axes;
+	const marker = indexPolicyMarker(resolved);
 	const files = await Promise.all(axes.map((axis) => axisEntries(root, axis)));
 	const indexed = axes.map((axis, index) => {
 		const entries =
@@ -552,8 +594,8 @@ async function regenerateMapFiles(root: string, registry?: AxisRegistry): Promis
 
 	const render = (allowances: readonly number[], compact: boolean): string => {
 		const lines = compact
-			? ["# Memory map"]
-			: ["# Memory map", "", "Generated pointers; canonical facts live in axis files.", ""];
+			? ["# Memory map", marker]
+			: ["# Memory map", "", marker, "", "Generated pointers; canonical facts live in axis files.", ""];
 		for (const [index, descriptor] of indexed.entries()) {
 			const { axis, allFiles, entries, indexPath } = descriptor;
 			if (compact) lines.push(`## ${axis.id}`);
@@ -563,11 +605,14 @@ async function regenerateMapFiles(root: string, registry?: AxisRegistry): Promis
 			// be visible here rather than only in the descriptor.
 			if (!compact && axis.promotesTo.length) lines.push(`_promotes to: ${axis.promotesTo.join(", ")}_`, "");
 			const allowance = allowances[index] ?? 0;
+			// The byte budget can shorten the prefix below the axis cap, so the
+			// already-rendered set is exactly this slice, never the whole capped list.
+			const rendered = entries.slice(0, allowance);
 			if (axis.index === "recent") {
-				for (const path of entries.slice(0, allowance)) lines.push(`- [${path}](${path})`);
+				for (const path of rendered) lines.push(`- [${path}](${path})`);
 			} else {
 				let group = "";
-				for (const path of entries.slice(0, allowance)) {
+				for (const path of rendered) {
 					const branch = path
 						.slice(axis.root.length + 1)
 						.split("/")
@@ -580,13 +625,22 @@ async function regenerateMapFiles(root: string, registry?: AxisRegistry): Promis
 					lines.push(`- [${path}](${path})`);
 				}
 			}
+			// Count against every file on disk, not the capped entry list, so an index
+			// cap that drops entries is stated in the map instead of happening silently.
 			const omitted = allFiles.length - allowance;
-			if (allowance < entries.length) {
+			if (omitted > 0) {
 				const noun = omitted === 1 ? "entry" : "entries";
-				if (indexPath) {
-					lines.push(`_${omitted} ${noun} omitted; see ${indexPath}_`);
-					lines.push(`- [${indexPath}](${indexPath})`);
-				} else lines.push(`_${omitted} ${noun} omitted; no index entry found_`);
+				// One pointer to the index, never two, and never a bare path: the audit
+				// measures a line after replacing links with their text, so a deeply nested
+				// custom index spelled out in plain text would make a map this code just
+				// generated fail `memory.audit` as long-form prose.
+				// A tree index can sort inside the rendered prefix (projects/index.md among
+				// 201 project files). Then its bullet above is the pointer and the notice
+				// only says where to look; listing it again would make recall read the same
+				// mapped path twice and return the same hit twice.
+				if (!indexPath) lines.push(`_${omitted} ${noun} omitted; no index entry found_`);
+				else if (rendered.includes(indexPath)) lines.push(`_${omitted} ${noun} omitted; see the index above_`);
+				else lines.push(`_${omitted} ${noun} omitted; see [the index](${indexPath})_`);
 			}
 			if (!compact) lines.push("");
 		}

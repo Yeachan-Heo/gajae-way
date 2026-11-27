@@ -41,6 +41,17 @@ export interface HelloPayload {
 	 * against the previous gateway generation (issue #251).
 	 */
 	readonly clientInfo?: { readonly name?: string; readonly version?: string; readonly startedAt?: string };
+	/**
+	 * Platform user ids the ADAPTER resolved as owners of its own application,
+	 * reported only by an authenticated adapter connection and accepted only for
+	 * `platform`'s origins (issue #862). The Discord adapter resolves the
+	 * application owner (`client.application.fetch()`: the `owner` user, or
+	 * every accepted team member when the owner is a Team); it is owner
+	 * evidence, never a credential, and an explicit `ownerTarget` on the gateway
+	 * still supersedes it. Absent, empty, or unknown-platform keeps every gate
+	 * closed.
+	 */
+	readonly adapter?: { readonly platform: string; readonly ownerIds?: readonly string[] };
 }
 
 export interface NegotiatedPayload {

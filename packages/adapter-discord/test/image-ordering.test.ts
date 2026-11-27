@@ -1986,9 +1986,7 @@ test("a restored parked row resumes once the image budget frees up", async () =>
 		await bounded(adapter.recoverMissedMessages());
 		// The budget is available again, so the parked row is promoted into the work pool and
 		// delivered with its exact id.
-		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
-			id,
-		]);
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([id]);
 		const persisted = JSON.parse(await readFile(outboxPath, "utf8")) as Array<Record<string, unknown>>;
 		expect(persisted.find((entry) => entry.messageId === id)).toMatchObject({ completed: true });
 		expect(persisted.find((entry) => entry.messageId === id)?.deferred).toBeUndefined();

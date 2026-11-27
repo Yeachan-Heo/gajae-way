@@ -125,6 +125,60 @@ async function startBotTurn(claimTerminal: boolean) {
 	return { guard, port, opRef: firstSend.opRef };
 }
 
+/**
+ * A scripted port whose first prompt is parked until the test releases it.
+ * `chat.send` replies before the turn is dispatched, and a first engaged turn
+ * awaits the memory refresh before bootstrap (#893), so on a slow runner its
+ * prompt lands after the test has read every response. Parking the first send
+ * makes that ordering deterministic on every platform.
+ */
+function dispatchGatedPort(): { port: ScriptedSessionPort; releaseDispatch(): void } {
+	if (!database) throw new Error("dispatch-gated port needs an open database");
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let parked = false;
+	const port = attachTestBrokerOwnership(
+		database,
+		new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` }),
+		join(directory, "agent"),
+	);
+	const send = port.send.bind(port);
+	port.send = async (input) => {
+		if (!parked) {
+			parked = true;
+			await gate;
+		}
+		return send(input);
+	};
+	return { port, releaseDispatch: () => release() };
+}
+
+/**
+ * Terminates every dispatched turn, including one that lands after the asserts,
+ * and waits until no turn for this origin is in flight. Failing a snapshot of
+ * `port.sends` instead leaves the late prompt unanswered, so afterEach waits on
+ * it past the hook timeout.
+ */
+async function finishDispatchedTurns(port: ScriptedSessionPort): Promise<void> {
+	if (!database) throw new Error("settling dispatched turns needs an open database");
+	const store = database;
+	const terminated = new Set<string>();
+	await eventually(() => {
+		for (const send of port.sends) {
+			if (terminated.has(send.opRef)) continue;
+			terminated.add(send.opRef);
+			port.fail(send.opRef, "fixture turn finished");
+		}
+		return (
+			port.sends.length > 0 &&
+			store.inbox.nonterminalTurns(ORIGIN).length === 0 &&
+			port.sends.every((send) => store.inbox.turnRow(send.opRef)?.turn_state === "done")
+		);
+	}, "dispatched turns did not settle");
+}
+
 test("an unanswered bot turn refunds its admission and the next bot follow-up is admitted", async () => {
 	const { guard, port, opRef } = await startBotTurn(false);
 	port.fail(opRef, "prompt deadline exceeded");
@@ -202,11 +256,7 @@ test("the gateway counts addressed declines, ignores unaddressed bot chatter, an
 		channels: { "discord:bot-budget": { engagement: "open", audience: "all", botAudienceMaxConsecutiveTurns: 1 } },
 	};
 	database = await Store.open(config.dbPath);
-	const port = attachTestBrokerOwnership(
-		database,
-		new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` }),
-		join(directory, "agent"),
-	);
+	const { port, releaseDispatch } = dispatchGatedPort();
 	server = await startUnixServer({ config, database, sessionPort: port });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -255,14 +305,8 @@ test("the gateway counts addressed declines, ignores unaddressed bot chatter, an
 		botAudienceDeclines: 1,
 		botAudienceRateLimited: 0,
 	});
-	const firstSend = port.sends[0];
-	if (firstSend) {
-		port.fail(firstSend.opRef);
-		await eventually(
-			() => database?.inbox.turnRow(firstSend.opRef)?.turn_state === "done",
-			"status fixture did not settle",
-		);
-	}
+	releaseDispatch();
+	await finishDispatchedTurns(port);
 	client.close();
 });
 
@@ -281,11 +325,7 @@ test("an open bot audience runs consecutive bot turns by default and stops only 
 		channels: { "discord:bot-budget": { engagement: "open", audience: "all", botAudienceMaxTurnsPerWindow: 2 } },
 	};
 	database = await Store.open(config.dbPath);
-	const port = attachTestBrokerOwnership(
-		database,
-		new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` }),
-		join(directory, "agent"),
-	);
+	const { port, releaseDispatch } = dispatchGatedPort();
 	server = await startUnixServer({ config, database, sessionPort: port });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -315,12 +355,7 @@ test("an open bot audience runs consecutive bot turns by default and stops only 
 		botAudienceDeclines: 1,
 		botAudienceRateLimited: 1,
 	});
-	for (const send of port.sends) {
-		port.fail(send.opRef);
-		await eventually(
-			() => database?.inbox.turnRow(send.opRef)?.turn_state === "done",
-			"rate-limit fixture did not settle",
-		);
-	}
+	releaseDispatch();
+	await finishDispatchedTurns(port);
 	client.close();
 });

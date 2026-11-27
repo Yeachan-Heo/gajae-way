@@ -43,6 +43,10 @@ export interface GajaewayClientOptions {
 	clientName?: string;
 	/** Cancels an in-progress socket connection or negotiation. */
 	signal?: AbortSignal;
+	/** Adapter-resolved application owner ids reported on the hello (#862). */
+	adapterOwnerIds?: readonly string[];
+	/** Platform those owner ids belong to; defaults to the discord adapter's. */
+	adapterOwnerPlatform?: string;
 }
 
 export interface ConnectSocketWithBackoffOptions extends GajaewayClientOptions {
@@ -252,6 +256,9 @@ export class GajaewayClient {
 	#requestTimeoutMs: number;
 	#clientName: string;
 	readonly #requiredCapabilities: readonly string[];
+	/** Adapter-resolved application owner ids (#862); reported on the hello when set. */
+	#adapterOwnerIds?: readonly string[];
+	#adapterOwnerPlatform: string | undefined;
 	#id = 0;
 
 	private constructor(transport?: Transport, options?: GajaewayClientOptions) {
@@ -259,6 +266,19 @@ export class GajaewayClient {
 		this.#requestTimeoutMs = options?.requestTimeoutMs ?? 30_000;
 		this.#clientName = options?.clientName ?? "@gajae-gateway/sdk";
 		this.#requiredCapabilities = [...(options?.requiredCapabilities ?? [])];
+		this.#adapterOwnerIds = options?.adapterOwnerIds;
+		this.#adapterOwnerPlatform = options?.adapterOwnerPlatform ?? "discord";
+	}
+
+	/**
+	 * Reports platform user ids this adapter resolved as its own application's
+	 * owners (#862) on the NEXT hello this client sends. A hello is sent once
+	 * per connection, so pass `adapterOwnerIds` through the connect options for
+	 * an existing connection's replacement.
+	 */
+	setAppOwnerIds(ids: readonly string[] | undefined, platform = "discord"): void {
+		this.#adapterOwnerIds = ids;
+		this.#adapterOwnerPlatform = platform;
 	}
 
 	on(event: string, handler: EventHandler): () => void {
@@ -386,6 +406,9 @@ export class GajaewayClient {
 						supportedVersions: [PROFILE_VERSION],
 						requiredCapabilities: this.#requiredCapabilities,
 						clientInfo: { name: this.#clientName, startedAt: processStartedAt() },
+						...(this.#adapterOwnerIds
+							? { adapter: { platform: this.#adapterOwnerPlatform, ownerIds: this.#adapterOwnerIds } }
+							: {}),
 					},
 				})
 				.catch((error) => this.#fail(error instanceof Error ? error : new Error(String(error))));

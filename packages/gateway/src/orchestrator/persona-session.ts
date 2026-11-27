@@ -38,9 +38,13 @@ import type { WriteTx } from "../store/tx";
 import { type BrokerLivenessProbe, type BrokerLivenessVerdict, describeBindHold } from "./broker-liveness";
 import type { FailedTurnEvidence } from "./failed-turn-evidence";
 import { isSessionGoneCode } from "./gjc-contract";
-import { GjcRuntimeError, sanitizeDiagnostic } from "./rebind";
+import { GjcRuntimeError, sanitizeDiagnostic, sanitizeDiagnosticDetail } from "./rebind";
 import {
+	isPermanentBindFailure,
+	isPermanentRefusal,
 	ModelNotSelectedError,
+	ModelPartiallyAppliedError,
+	modelRefusalCode,
 	type SessionBinding,
 	SessionBusyStalledError,
 	type SessionContextUsage,
@@ -57,6 +61,19 @@ import {
 } from "./tail-runner";
 
 export const DEFAULT_STALL_TIMEOUT_MS = 120_000;
+
+/**
+ * What gjc answered a `/model` selection. Only `applied` is recorded. `refused`
+ * left the live model untouched; `partial` changed the model but refused its
+ * thinking level; `unbound` could not open the session and `unavailable`
+ * found the bound session gone, so in both the selection was never applied.
+ * Each carries gjc's stable error code.
+ */
+export type ModelApplyResult =
+	| { readonly kind: "applied" }
+	| { readonly kind: "refused" | "partial" | "unbound" | "unavailable"; readonly code: string };
+/** Applies a selection to the origin's live session and runs `commit` once gjc accepted it. */
+export type ModelApply = (selection: GjcModelSelection, commit: () => void) => Promise<ModelApplyResult>;
 /** Graceful shutdown gives accepted persona turns time to finish before their relays close. */
 const PERSONA_SHUTDOWN_DRAIN_MS = 15_000;
 /** Maximum silence after a tail stall before a still-nonterminal operation is cut off. */
@@ -110,14 +127,24 @@ const STEER_REPLAY_ATTEMPTS = 2;
 const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
 const LOCAL_PREFLIGHT_REJECTION_PREFIX = "persona-local-preflight-rejection:";
 const LOCAL_PREFLIGHT_MODEL_PREFIX = "persona-local-preflight-model:";
+const LOCAL_PREFLIGHT_PRESET_FAILURE_PREFIX = "persona-local-preflight-preset-failure:";
 const PROMPT_TOO_LARGE_CODE = "prompt_too_large";
 const MODEL_NOT_FOUND_REJECTION_CODE = "model_not_found";
+const PRESET_FAILURE_REJECTION_CODE = "invalid_preset";
+/** Maximum attempts for a preset failure before terminating. Bounds identical non-transient failures. */
+const MAX_PRESET_FAILURE_ATTEMPTS = 3;
 
 class SendTurnNoLongerBoundError extends Error {}
 
 /** The pre-send compaction may still be running on the host; the send must wait for evidence it is over. */
 class CompactionUnresolvedError extends Error {
-	constructor(code: string | undefined) {
+	constructor(
+		code: string | undefined,
+		/** Unresolved retries so far, this one included. */
+		readonly attempts: number,
+		/** The bound is reached: the origin leaves the session instead of retrying on it. */
+		readonly escalate: boolean,
+	) {
 		super(`compaction may still be running${code ? ` (${code})` : ""}`);
 		this.name = "CompactionUnresolvedError";
 	}
@@ -133,7 +160,39 @@ function localPreflightModelKey(opRef: string): string {
 
 function localPreflightRejection(store: Store, opRef: string): string | undefined {
 	const code = store.core.metaGet(localPreflightRejectionKey(opRef));
-	return code === PROMPT_TOO_LARGE_CODE || code === MODEL_NOT_FOUND_REJECTION_CODE ? code : undefined;
+	return code === PROMPT_TOO_LARGE_CODE ||
+		code === MODEL_NOT_FOUND_REJECTION_CODE ||
+		code === PRESET_FAILURE_REJECTION_CODE
+		? code
+		: undefined;
+}
+
+function localPreflightPresetFailureKey(originKey: string, triggerMessageId: string, preset: string): string {
+	return `${LOCAL_PREFLIGHT_PRESET_FAILURE_PREFIX}${originKey}:${triggerMessageId}:${preset}`;
+}
+
+function localPreflightPresetFailureAttempts(
+	store: Store,
+	originKey: string,
+	triggerMessageId: string,
+	preset: string,
+): number {
+	const key = localPreflightPresetFailureKey(originKey, triggerMessageId, preset);
+	const value = store.core.metaGet(key);
+	return typeof value === "string" ? parseInt(value, 10) || 0 : 0;
+}
+
+function incrementPresetFailureAttempts(
+	database: Store,
+	originKey: string,
+	triggerMessageId: string,
+	preset: string,
+): number {
+	const key = localPreflightPresetFailureKey(originKey, triggerMessageId, preset);
+	const attempts = localPreflightPresetFailureAttempts(database, originKey, triggerMessageId, preset);
+	const next = attempts + 1;
+	database.core.metaSet(key, String(next));
+	return next;
 }
 
 function freshTurnMetaKey(originKey: string, epoch: number, triggerMessageId: string): string {
@@ -245,7 +304,7 @@ function escalationNoticeDeliveryKey(deliveryId: string): string {
 
 /** Deterministic delivery id of a bind-hold or escalation notice, so a replayed notice posts once. */
 export function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string, reason: string): string {
-	const kind = reason === UNRESOLVED_HOLD_ESCALATED ? UNRESOLVED_HOLD_ESCALATED : "bind_hold";
+	const kind = reason === UNRESOLVED_HOLD_ESCALATED || reason === COMPACTION_HOLD_ESCALATED ? reason : "bind_hold";
 	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|${kind}`).digest("hex").slice(0, 32)}`;
 }
 
@@ -328,6 +387,64 @@ function parseDeadHostMark(value: string | undefined): DeadHostMark | undefined 
 /** Session of an origin whose last pre-send compaction may still be running. */
 function unresolvedCompactionKey(originKey: string): string {
 	return `compaction-unresolved:${originKey}`;
+}
+
+/**
+ * Pre-send attempts (the first run included) that may end with a compaction
+ * still unresolved on one session before the origin moves to a fresh one. With the 5 min run budget
+ * and the retry backoff this is about 11 minutes of a host that keeps its
+ * relay up but answers neither run.
+ */
+export const COMPACTION_UNRESOLVED_ATTEMPTS = 6;
+
+/** The durable `compaction-unresolved:<origin>` record. */
+interface UnresolvedCompaction {
+	readonly sessionId: string;
+	/** Pre-send attempts on this session that ended with a run still unresolved, the first run included. */
+	readonly attempts: number;
+	/** A barrier run was written behind the unresolved one and has no answer yet. */
+	readonly barrier: boolean;
+}
+
+/** A value that is not a record (a bare session id) holds that session with nothing counted yet. */
+function parseUnresolvedCompaction(value: string | undefined): UnresolvedCompaction | undefined {
+	if (value === undefined) return undefined;
+	try {
+		const record = JSON.parse(value) as Partial<UnresolvedCompaction>;
+		if (
+			typeof record === "object" &&
+			record !== null &&
+			typeof record.sessionId === "string" &&
+			Number.isSafeInteger(record.attempts) &&
+			typeof record.barrier === "boolean"
+		)
+			return { sessionId: record.sessionId, attempts: Math.max(0, record.attempts!), barrier: record.barrier };
+	} catch {}
+	return { sessionId: value, attempts: 0, barrier: false };
+}
+
+/** Bind-hold reason for a turn whose pre-send compaction stayed unresolved past the bound. */
+export const COMPACTION_HOLD_ESCALATED = "compaction_unresolved_escalated";
+const COMPACTION_HOLD_NOTICE =
+	"[turn held] I could not confirm that compacting this conversation's session finished, so I did not send your message into it. It continues in a fresh session.";
+
+const COMPACTION_NOTICE_PREFIX = "compaction-escalation-notice:";
+
+/**
+ * Durable intent to post a compaction escalation notice (the value is the
+ * trigger's message id), written with the epoch rotation and deleted once the
+ * notice hook accepted it, so a crash or a failed hook still tells the origin
+ * why it moved to a fresh session.
+ */
+function compactionNoticeKey(originKey: string, opRef: string): string {
+	return `${COMPACTION_NOTICE_PREFIX}${originKey}#${opRef}`;
+}
+
+/** Origins holding an unposted compaction escalation notice; op-refs never contain `#`. */
+function compactionNoticeOrigins(store: Store): string[] {
+	return store.core
+		.metaKeysInRange(COMPACTION_NOTICE_PREFIX, `${COMPACTION_NOTICE_PREFIX}\uffff`)
+		.map((key) => key.slice(COMPACTION_NOTICE_PREFIX.length, key.lastIndexOf("#")));
 }
 
 /** Track relay unavailable events for a turn to detect unresponsive relays even on live hosts (#766). */
@@ -917,7 +1034,7 @@ export class PersonaSessionManager {
 	readonly #instanceId: string;
 	readonly #repo: string;
 	readonly #brokerAgentDir: string | undefined;
-	readonly #sessionModel: GjcModelSelection | undefined;
+	#sessionModel: GjcModelSelection | undefined;
 	#stallTimeoutMs: number;
 	readonly #brokerGeneration: () => number;
 	readonly #brokerAvailable: (() => boolean) | undefined;
@@ -1208,14 +1325,31 @@ export class PersonaSessionManager {
 		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).reset(originRefJson, floorAt));
 	}
 
+	/** Publish the default for future binds and resume inherited model-refusal holds. */
+	setSessionModel(selection: GjcModelSelection): void {
+		this.#sessionModel = selection;
+		for (const actor of this.#actors.values())
+			void actor
+				.enqueue(async () => await actor.defaultModelChanged())
+				.catch((error: unknown) =>
+					this.#log(`persona model reload failed origin=${actor.originKey}: ${safeDiagnostic(error)}`, "error"),
+				);
+	}
+
 	/**
-	 * `/model` is serialized by this same mailbox. Idle binds and controls the
-	 * existing epoch immediately; running waits behind its accepted send and never
-	 * aborts, retires, or changes that in-flight operation.
+	 * Runs one `/model` command inside this origin's mailbox, so reading the
+	 * stored override, applying the selection, and recording it happen in one
+	 * serialized step that no other `/model` or turn dispatch can interleave.
+	 * Idle binds and controls the existing epoch immediately; running waits
+	 * behind its accepted send and never aborts, retires, or changes that
+	 * in-flight operation. Resolves undefined when the manager is stopped.
 	 */
-	rebindModel(originKey: string, selection: GjcModelSelection): Promise<void> {
-		if (this.#stopped) return Promise.resolve();
-		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).rebindModel(selection));
+	runModelCommand<T>(originKey: string, command: (apply: ModelApply) => Promise<T>): Promise<T | undefined> {
+		if (this.#stopped) return Promise.resolve(undefined);
+		const actor = this.#actor(originKey);
+		return actor.enqueue(
+			async () => await command(async (selection, commit) => await actor.applyModel(selection, commit)),
+		);
 	}
 
 	/**
@@ -1228,6 +1362,7 @@ export class PersonaSessionManager {
 		if (this.#stopped) return Promise.resolve();
 		const origins = new Set<string>([
 			...escalationNoticeOrigins(this.#database),
+			...compactionNoticeOrigins(this.#database),
 			...this.#database.inbox.nonterminalOrigins(),
 			...this.#database.inbox.pendingOrigins(),
 			...this.#database.inbox.heldSteerOrigins(),
@@ -1944,23 +2079,103 @@ class OriginActor {
 		await this.#dispatchNext();
 	}
 
-	/** Mailbox-serialized live rebind. The caller supplies a verified concrete selection. */
-	async rebindModel(selection: GjcModelSelection): Promise<void> {
-		const binding = await this.#ensureSession(this.#epoch());
+	/**
+	 * Mailbox-serialized live rebind. `commit` records the selection and runs
+	 * only after gjc accepted it, so a selection gjc refuses is never stored. A
+	 * condition replaying the command cannot fix (refused selection, partially
+	 * applied selection, session that cannot be opened, bound session the
+	 * broker no longer hosts) is returned, not thrown, so the platform message
+	 * is answered instead of replayed. Any failure that may have changed the
+	 * live model drops the applied cache so the next turn re-applies the stored
+	 * or default selection.
+	 */
+	async applyModel(selection: GjcModelSelection, commit: () => void): Promise<ModelApplyResult> {
+		const selectionLabel = sanitizeDiagnosticDetail(describeModel(selection), 120);
+		let binding: SessionBinding;
+		try {
+			binding = await this.#ensureSession(this.#epoch());
+		} catch (error) {
+			if (!isPermanentBindFailure(error)) throw error;
+			const code = modelRefusalCode(error);
+			this.#manager.log(
+				`persona_model_unbound origin=${this.originKey} selection=${selectionLabel} code=${code} source=/model`,
+				"error",
+			);
+			return { kind: "unbound", code };
+		}
 		this.#touchHost(binding.sessionId);
-		const receipt = await this.#manager.port.setModel({
-			sessionId: binding.sessionId,
-			repo: this.#manager.repo,
-			selection,
-		});
-		this.#appliedModel.set(binding.sessionId, describeModel(selection));
+		let receipt: { readonly changed: boolean };
+		try {
+			receipt = await this.#manager.port.setModel({
+				sessionId: binding.sessionId,
+				repo: this.#manager.repo,
+				selection,
+			});
+		} catch (error) {
+			const outcome = this.#modelControlFailure(error, binding, selectionLabel);
+			if (outcome) return outcome;
+			throw error;
+		}
+		try {
+			commit();
+		} catch (error) {
+			this.#appliedModel.delete(binding.sessionId);
+			throw error;
+		}
+		this.#appliedModel.set(binding.sessionId, selectIdentity(selection));
 		this.#manager.log(
 			`persona_model origin=${this.originKey} epoch=${binding.epoch} session=${binding.sessionId} effective=${describeModel(selection)} changed=${receipt.changed} source=/model`,
 		);
+		// The change is recorded; resuming a refused turn is that turn's own
+		// work, queued behind this command so its failure is never reported as a
+		// failure of `/model`.
 		if (this.#modelRefusalPaused) {
 			this.#modelRefusalPaused = false;
-			await this.#dispatchNext();
+			void this.enqueue(async () => await this.#dispatchNext()).catch((error: unknown) =>
+				this.#manager.log(`persona model resume failed origin=${this.originKey}: ${safeDiagnostic(error)}`, "error"),
+			);
 		}
+		return { kind: "applied" };
+	}
+
+	/** A permanent answer to a `/model` control, or undefined when the failure must be retried. */
+	#modelControlFailure(error: unknown, binding: SessionBinding, selectionLabel: string): ModelApplyResult | undefined {
+		if (error instanceof ModelPartiallyAppliedError) {
+			this.#appliedModel.delete(binding.sessionId);
+			this.#manager.log(
+				`persona_model_partial origin=${this.originKey} epoch=${binding.epoch} session=${binding.sessionId} selection=${selectionLabel} code=${error.code} source=/model`,
+				"error",
+			);
+			return { kind: "partial", code: error.code };
+		}
+		if (isPermanentRefusal(error)) {
+			const code = modelRefusalCode(error);
+			this.#manager.log(
+				`persona_model_refused origin=${this.originKey} epoch=${binding.epoch} session=${binding.sessionId} selection=${selectionLabel} code=${code} source=/model`,
+				"error",
+			);
+			return { kind: "refused", code };
+		}
+		// Anything else may have changed the live model: re-verify before the next turn.
+		this.#appliedModel.delete(binding.sessionId);
+		// The bound session is gone. Rebinding belongs to the turn path, which
+		// fences it against in-flight work, pending creates and host admission;
+		// `/model` only answers, so the platform does not replay it forever.
+		if (sdkStatusErrorCode(error) === "session_unavailable") {
+			this.#manager.log(
+				`persona_model_unbound origin=${this.originKey} epoch=${binding.epoch} session=${binding.sessionId} selection=${selectionLabel} code=session_unavailable source=/model`,
+				"error",
+			);
+			return { kind: "unavailable", code: "session_unavailable" };
+		}
+		return undefined;
+	}
+
+	/** Retry an inherited, proven refusal using the newly published default. */
+	async defaultModelChanged(): Promise<void> {
+		if (!this.#modelRefusalPaused || this.#manager.database.bindings.modelGet(this.originKey)) return;
+		this.#modelRefusalPaused = false;
+		await this.#dispatchNext();
 	}
 
 	async reconcile(): Promise<void> {
@@ -1971,6 +2186,7 @@ class OriginActor {
 	async recover(): Promise<void> {
 		this.#recoveryScanned = true;
 		await this.#emitEscalationNotices();
+		await this.#emitCompactionNotices();
 		const turns = this.#manager.database.inbox.nonterminalTurns(this.originKey);
 		const open = new Set(turns.map((turn) => turn.opRef));
 		for (const key of this.#loggedRecoveryHolds) {
@@ -2006,21 +2222,42 @@ class OriginActor {
 	}
 
 	async #settleLocalPreflightRejection(bound: BoundTurn, code: string): Promise<void> {
-		if (code !== PROMPT_TOO_LARGE_CODE && code !== MODEL_NOT_FOUND_REJECTION_CODE) return;
+		if (
+			code !== PROMPT_TOO_LARGE_CODE &&
+			code !== MODEL_NOT_FOUND_REJECTION_CODE &&
+			code !== PRESET_FAILURE_REJECTION_CODE
+		)
+			return;
 		const opRef = bound.turn.opRef;
 		const key = localPreflightRejectionKey(opRef);
 		if (localPreflightRejection(this.#manager.database, opRef) !== code) return;
 		const selectionKey = localPreflightModelKey(opRef);
 		const modelSelection =
-			code === MODEL_NOT_FOUND_REJECTION_CODE
+			code === MODEL_NOT_FOUND_REJECTION_CODE || code === PRESET_FAILURE_REJECTION_CODE
 				? (this.#manager.database.core.metaGet(selectionKey) ?? describeModel(bound.lifecycle.effectiveModel))
 				: undefined;
-		const errorCode = code === MODEL_NOT_FOUND_REJECTION_CODE ? "invalid_input" : code;
-		const message =
+		const errorCode =
+			code === MODEL_NOT_FOUND_REJECTION_CODE
+				? "invalid_input"
+				: code === PRESET_FAILURE_REJECTION_CODE
+					? "invalid_preset"
+					: code;
+		// Generic message for the shared conversation notice.
+		// Preset names are excluded to prevent non-owner participants from learning about
+		// preset identifiers (#895); the exact preset name is kept only in operator-facing diagnostics.
+		// Model names are included for MODEL_NOT_FOUND since users explicitly chose them.
+		const conversationMessage =
 			code === PROMPT_TOO_LARGE_CODE
 				? `the prompt exceeded the ${MAX_RELAY_REQUEST_FRAME_BYTES}-byte request limit before it was sent; reduce the text or number of images and send again`
-				: `the selected model "${modelSelection}" was not found; choose a valid model with /model and send again`;
-		const error = new GjcRuntimeError(`${errorCode}: ${message}`, { code: errorCode, message });
+				: code === MODEL_NOT_FOUND_REJECTION_CODE
+					? `the selected model "${modelSelection}" was not found; choose a valid model with /model and send again`
+					: code === PRESET_FAILURE_REJECTION_CODE
+						? `the configured model preset could not be applied; choose a valid preset and send again`
+						: "an unexpected error occurred; please try again";
+		const error = new GjcRuntimeError(`${errorCode}: ${conversationMessage}`, {
+			code: errorCode,
+			message: conversationMessage,
+		});
 		this.#manager.log(
 			`persona_send_preflight_rejected origin=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} opRef=${opRef} reason=${code}${modelSelection ? ` selection=${modelSelection}` : ""}`,
 			"warn",
@@ -2323,6 +2560,31 @@ class OriginActor {
 				trigger,
 				reason: UNRESOLVED_HOLD_ESCALATED,
 				notice: UNRESOLVED_HOLD_NOTICE,
+				verdict: undefined,
+			});
+			if (delivered) database.core.metaDelete(key);
+		}
+	}
+
+	/** Posts every compaction escalation notice whose intent is durable; replayed by recovery. */
+	async #emitCompactionNotices(): Promise<void> {
+		const database = this.#manager.database;
+		const prefix = compactionNoticeKey(this.originKey, "");
+		for (const key of database.core.metaKeysInRange(prefix, `${prefix}\uffff`)) {
+			const opRef = key.slice(prefix.length);
+			const triggerId = database.core.metaGet(key);
+			const trigger = triggerId === undefined ? undefined : database.inbox.messageRow(triggerId, this.originKey);
+			if (!trigger) {
+				// Without its trigger the notice has no message to answer.
+				database.core.metaDelete(key);
+				this.#manager.log(`compaction_notice_unresolvable origin=${this.originKey} opRef=${opRef}`, "warn");
+				continue;
+			}
+			const delivered = await this.#manager.emitBindHold({
+				originKey: this.originKey,
+				trigger,
+				reason: COMPACTION_HOLD_ESCALATED,
+				notice: COMPACTION_HOLD_NOTICE,
 				verdict: undefined,
 			});
 			if (delivered) database.core.metaDelete(key);
@@ -2736,11 +2998,36 @@ class OriginActor {
 		opRef: string,
 		error: unknown,
 	): Promise<void> {
-		const sessionGone = await this.#sessionProvablyGone(sessionId, error);
-		const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => ({
-			attempt: retryInboundTurn(this.#manager.database, tx, opRef),
-			nextEpoch: sessionGone ? this.#manager.database.bindings.rotateEpoch(tx, this.originKey) : undefined,
-		}));
+		// A compaction left unresolved past the bound moves the origin to a fresh
+		// session, like an escalated unresolved hold: the turn was never sent, so it
+		// goes there, and the old host and its stuck controls are ended.
+		const escalated = error instanceof CompactionUnresolvedError && error.escalate ? error : undefined;
+		const escalate = escalated !== undefined;
+		const sessionGone = escalate || (await this.#sessionProvablyGone(sessionId, error));
+		// Read before the requeue, which unlinks the trigger from its op-ref.
+		const triggerId = escalate ? this.#manager.database.inbox.turnRow(opRef)?.message_id : undefined;
+		const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
+			if (escalate) {
+				this.#manager.database.core.metaDelete(unresolvedCompactionKey(this.originKey));
+				if (triggerId !== undefined)
+					this.#manager.database.core.metaSet(compactionNoticeKey(this.originKey, opRef), triggerId);
+			}
+			return {
+				attempt: retryInboundTurn(this.#manager.database, tx, opRef),
+				nextEpoch: sessionGone ? this.#manager.database.bindings.rotateEpoch(tx, this.originKey) : undefined,
+			};
+		});
+		if (escalated) {
+			this.#manager.log(
+				`persona_compaction_escalated origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} session=${sessionId} attempts=${escalated.attempts} action=fresh_session`,
+				"warn",
+			);
+			// The notice goes first: ending the host can take seconds.
+			await this.#emitCompactionNotices();
+			await this.#terminateRetiredSession(sessionId, "compaction_unresolved");
+			await this.#dispatchNext();
+			return;
+		}
 		if (sessionGone) {
 			this.#bindFailures += 1;
 			const attempts = this.#bindFailures;
@@ -3047,7 +3334,7 @@ class OriginActor {
 		// prompt can have landed, so holding the BOUND row as an ambiguous send
 		// would brick the origin. Release it to plain pending and retry with
 		// backoff instead.
-		const modelKey = describeModel(lifecycle.effectiveModel);
+		const modelKey = selectIdentity(lifecycle.effectiveModel);
 		let modelReceipt: { readonly changed: boolean } | undefined;
 		let applyingModel = false;
 		try {
@@ -3060,6 +3347,17 @@ class OriginActor {
 					relay: tail,
 				});
 				applyingModel = false;
+				// Clear preset failure tracking when model set succeeds
+				if (
+					typeof lifecycle.effectiveModel === "object" &&
+					lifecycle.effectiveModel !== null &&
+					"preset" in lifecycle.effectiveModel
+				) {
+					const preset = lifecycle.effectiveModel.preset;
+					this.#manager.database.core.metaDelete(
+						localPreflightPresetFailureKey(this.originKey, trigger.message_id, preset),
+					);
+				}
 			} else {
 				modelReceipt = undefined;
 			}
@@ -3099,6 +3397,43 @@ class OriginActor {
 				await this.#settleLocalPreflightRejection(current, MODEL_NOT_FOUND_REJECTION_CODE);
 				return;
 			}
+			// Preset (model.profile.set) failures: terminate on non-transient errors after bounding attempts.
+			if (
+				applyingModel &&
+				typeof lifecycle.effectiveModel === "object" &&
+				lifecycle.effectiveModel !== null &&
+				"preset" in lifecycle.effectiveModel &&
+				isNonTransientPresetFailure(error)
+			) {
+				const preset = (lifecycle.effectiveModel as { preset?: string }).preset || "unknown";
+				const presetAttempts = incrementPresetFailureAttempts(
+					this.#manager.database,
+					this.originKey,
+					trigger.message_id,
+					preset,
+				);
+				// After MAX_PRESET_FAILURE_ATTEMPTS of identical non-transient failures, terminate.
+				if (presetAttempts >= MAX_PRESET_FAILURE_ATTEMPTS) {
+					this.#manager.database.transaction(() => {
+						this.#manager.database.core.metaSet(localPreflightModelKey(opRef), preset);
+						this.#manager.database.core.metaSet(localPreflightRejectionKey(opRef), PRESET_FAILURE_REJECTION_CODE);
+						// Clear preset failure tracking when turning terminal
+						this.#manager.database.core.metaDelete(
+							localPreflightPresetFailureKey(this.originKey, trigger.message_id, preset),
+						);
+					});
+					this.#preSendFailures = 0;
+					this.#manager.recordPreSendFailure(this.originKey, safeDiagnostic(error));
+					this.#manager.log(
+						`persona_model_failed origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} message=${trigger.message_id} terminal=true selection=${modelKey} preset=${preset} attempts=${presetAttempts} detail=${safeDiagnostic(error)}`,
+						"error",
+					);
+					await this.#settleLocalPreflightRejection(current, PRESET_FAILURE_REJECTION_CODE);
+					return;
+				}
+			}
+			// The control may have changed the live model before failing; re-verify on the next attempt.
+			if (applyingModel) this.#appliedModel.delete(binding.sessionId);
 			await tail.close();
 			const sessionGone = sdkStatusErrorCode(error) === "session_unavailable";
 			const { attempt, nextEpoch } = this.#manager.database.transaction((tx) => {
@@ -3712,6 +4047,7 @@ class OriginActor {
 					this.#manager.log(
 						`session_resumed origin=${this.originKey} epoch=${epoch} session=${existing.sessionId} reason=idle_dead_binding`,
 					);
+					this.#resetUnresolvedCompaction(existing.sessionId);
 					return binding;
 				} catch (error) {
 					this.#manager.log(
@@ -3726,15 +4062,35 @@ class OriginActor {
 		return undefined;
 	}
 
+	/**
+	 * The dead host took its runs with it: nothing is queued on the resumed one,
+	 * so the count and a pending barrier start over. The hold itself stays, and
+	 * the next retry proves the chain clear with one barrier on the new host.
+	 */
+	#resetUnresolvedCompaction(sessionId: string): void {
+		const key = unresolvedCompactionKey(this.originKey);
+		const held = parseUnresolvedCompaction(this.#manager.database.core.metaGet(key));
+		if (held?.sessionId !== sessionId || (held.attempts === 0 && !held.barrier)) return;
+		this.#manager.database.core.metaSet(
+			key,
+			JSON.stringify({ sessionId, attempts: 0, barrier: false } satisfies UnresolvedCompaction),
+		);
+		this.#manager.log(
+			`persona_compaction_reset origin=${this.originKey} session=${sessionId} attempts=${held.attempts} reason=host_resumed`,
+		);
+	}
+
 	async #bindSession(epoch: number): Promise<SessionBinding> {
+		// A config reload can replace the default while bind is in flight; cache only what bind was sent.
+		const startupModel = this.#manager.sessionModel;
 		const binding = await this.#manager.port.bind({
 			originKey: this.originKey,
 			epoch,
 			repo: this.#manager.repo,
-			...(this.#manager.sessionModel ? { model: this.#manager.sessionModel } : {}),
+			...(startupModel ? { model: startupModel } : {}),
 		});
-		if (binding.startupModelApplied && this.#manager.sessionModel)
-			this.#appliedModel.set(binding.sessionId, describeModel(this.#manager.sessionModel));
+		if (binding.startupModelApplied && startupModel)
+			this.#appliedModel.set(binding.sessionId, selectIdentity(startupModel));
 		return binding;
 	}
 
@@ -4027,8 +4383,7 @@ class OriginActor {
 					!frame.idle ||
 					frame.assistantText !== undefined ||
 					frame.payload.toolCallStarted === true ||
-					frame.rawKind === "agent_end" ||
-					frame.rawKind === "agent_failed"
+					ownedTerminalFrame(frame)
 				)
 					activity.version += 1;
 				await this.enqueue(async () => {
@@ -4420,11 +4775,9 @@ class OriginActor {
 		} else {
 			// Tail activity after a stall resumes the ordinary live path. If it goes
 			// quiet again, the tail will raise another stall and restart status checks.
-			if (
-				!bound.stallHostTerminated &&
-				!bound.stallHostTerminating &&
-				(!frame.idle || frame.rawKind === "agent_end" || frame.rawKind === "agent_failed")
-			)
+			// An uncorrelated end is a session broadcast, not the turn's activity: it
+			// only wakes a status reconcile and leaves the stall path armed.
+			if (!bound.stallHostTerminated && !bound.stallHostTerminating && (!frame.idle || ownedTerminalFrame(frame)))
 				this.#clearStallReconciliation(bound);
 			if (frame.assistantText && !frame.steerEcho) bound.lastAssistantText = frame.assistantText;
 			if (frame.rawKind === "tool_execution_start" || frame.payload.toolCallStarted === true)
@@ -4464,9 +4817,7 @@ class OriginActor {
 		// never saw the final message. Like an `idle` activity broadcast, such an end
 		// only wakes a status reconcile. Treating it as tail evidence settled the turn
 		// with its last mid-work line as the answer (#228).
-		const ownedTerminal =
-			(frame.rawKind === "agent_end" || frame.rawKind === "agent_failed") &&
-			(frame.commandId !== undefined || frame.turnId !== undefined);
+		const ownedTerminal = ownedTerminalFrame(frame);
 		if (ownedTerminal && !bound.tailEvidenceUnavailable) bound.tailTerminalObserved = true;
 		if (ownedTerminal || frame.idle) await this.#reconcileBound(bound);
 	}
@@ -5052,17 +5403,29 @@ class OriginActor {
 	 * behind it on the session's ordered controls and times out as an ambiguous
 	 * send. The turn goes back to pending, and each retry needs evidence that
 	 * the run is over: a readable context below the line (it landed), or the
-	 * host's answer to a second `compaction.run` sent on the relay, which gjc's
-	 * ordered dispatcher runs only after the first. An unreadable context, a
-	 * refusal before dispatch and a missing reply are not evidence.
+	 * host's answer to a second `compaction.run` (the barrier) sent on the
+	 * relay, which gjc's ordered dispatcher runs only after the first. An
+	 * unreadable context, a refusal before dispatch and a missing reply are not
+	 * evidence.
+	 *
+	 * At most one barrier is outstanding: once one goes unanswered, retries only
+	 * read the context, since another run would queue behind it. After
+	 * COMPACTION_UNRESOLVED_ATTEMPTS unresolved retries the origin moves to a
+	 * fresh session (see #requeuePreSend). An answered barrier proves the chain
+	 * is clear, not that the context shrank, so the context is read again and
+	 * the turn counts as compacted only below the line or when unreadable.
 	 */
 	async #prepareContext(sessionId: string, epoch: number, opRef: string, tail: TailHandle): Promise<PreparedContext> {
+		const database = this.#manager.database;
 		// Durable, so a restarted gateway keeps holding until the run is proven over.
 		const unresolvedKey = unresolvedCompactionKey(this.originKey);
-		const unresolvedOn = this.#manager.database.core.metaGet(unresolvedKey);
+		let held = parseUnresolvedCompaction(database.core.metaGet(unresolvedKey));
 		// A run left unresolved on another session says nothing about this one.
-		if (unresolvedOn !== undefined && unresolvedOn !== sessionId) this.#manager.database.core.metaDelete(unresolvedKey);
-		const unresolved = unresolvedOn === sessionId;
+		if (held !== undefined && held.sessionId !== sessionId) {
+			database.core.metaDelete(unresolvedKey);
+			held = undefined;
+		}
+		const unresolved = held !== undefined;
 		let usage: SessionContextUsage | undefined;
 		try {
 			usage = await this.#manager.port.contextUsage?.({ sessionId, repo: this.#manager.repo, relay: tail });
@@ -5076,16 +5439,31 @@ class OriginActor {
 		const belowLine = usage !== undefined && usage.tokens < PERSONA_COMPACTION_TOKENS;
 		if (unresolved && belowLine) {
 			// The earlier run landed: the context is compacted and the persona goes back in.
-			this.#manager.database.core.metaDelete(unresolvedKey);
+			database.core.metaDelete(unresolvedKey);
 			this.#manager.log(
 				`persona_compaction_resolved origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage!.tokens} evidence=context_below_line`,
 			);
 			return { compacted: true };
 		}
 		if (!unresolved && (usage === undefined || belowLine)) return { ...(usage ? { usage } : {}), compacted: false };
+		if (held && (held.barrier || held.attempts >= COMPACTION_UNRESOLVED_ATTEMPTS)) {
+			// A barrier is already queued behind the unresolved run; another would
+			// stack on the host's ordered controls without proving anything more.
+			const reason = held.barrier ? "barrier_pending" : "bound_reached";
+			const error = this.#compactionStillUnresolved(held, held.barrier, reason);
+			this.#manager.log(
+				`persona_compaction_held origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage?.tokens ?? "unknown"} attempts=${error.attempts} reason=${reason}`,
+				"warn",
+			);
+			throw error;
+		}
 		// Written ahead of the run: a gateway that stops while it is in flight must
-		// come back holding, since the host keeps compacting regardless.
-		if (!unresolved) this.#manager.database.core.metaSet(unresolvedKey, sessionId);
+		// come back holding, since the host keeps compacting regardless. A barrier
+		// is marked pending before it is written, so a restart never stacks another.
+		database.core.metaSet(
+			unresolvedKey,
+			JSON.stringify(held ? { ...held, barrier: true } : { sessionId, attempts: 0, barrier: false }),
+		);
 		const startedAt = this.#manager.now();
 		const { status, code, outcomeUnknown, answered } = await this.#manager.port.runCompaction({
 			sessionId,
@@ -5099,18 +5477,71 @@ class OriginActor {
 		// Behind an unresolved run, only the host dispatcher's answer to this run
 		// proves the earlier one is over (gjc orders them): a refusal before
 		// dispatch or a reply that never came does not. The hold lasts until such
-		// an answer, a readable context below the line, the host's death or /new.
-		// A receipt is the host's answer on either path, and a host without
-		// compaction.run cannot have one running.
+		// an answer, a readable context below the line, the bound, the host's
+		// death or /new. A receipt is the host's answer on either path, and a host
+		// without compaction.run cannot have one running.
 		const settled = answered === true || status === "succeeded" || status === "skipped" || status === "unavailable";
-		if (outcomeUnknown || (unresolved && !settled)) throw new CompactionUnresolvedError(code);
+		if (outcomeUnknown || (unresolved && !settled))
+			// A barrier refused before dispatch never reached the host: only an
+			// unanswered one stays pending.
+			throw this.#compactionStillUnresolved(
+				held ?? { sessionId, attempts: 0, barrier: false },
+				unresolved && outcomeUnknown === true,
+				code,
+			);
 		// Answered, or a first run that never reached the host (refused before
 		// dispatch, frame never written): nothing is left compacting.
-		this.#manager.database.core.metaDelete(unresolvedKey);
-		// The earlier run may have compacted even if this one failed ("already
-		// compacted"): resolve it as compacted so the persona goes back in.
-		if (unresolved || status === "succeeded") return { compacted: true };
+		database.core.metaDelete(unresolvedKey);
+		// A barrier that compacted put the persona out of the context whatever its size.
+		if (unresolved && status !== "succeeded") return await this.#contextAfterBarrier(sessionId, epoch, opRef, tail);
+		if (unresolved) return { compacted: true };
+		if (status === "succeeded") return { compacted: true };
 		return { ...(usage ? { usage } : {}), compacted: false };
+	}
+
+	/**
+	 * Counts one more unresolved retry in the durable record. At the bound the
+	 * record is kept for #requeuePreSend, which drops it with the epoch rotation.
+	 */
+	#compactionStillUnresolved(
+		held: UnresolvedCompaction,
+		barrier: boolean,
+		code: string | undefined,
+	): CompactionUnresolvedError {
+		const attempts = held.attempts + 1;
+		this.#manager.database.core.metaSet(
+			unresolvedCompactionKey(this.originKey),
+			JSON.stringify({ sessionId: held.sessionId, attempts, barrier } satisfies UnresolvedCompaction),
+		);
+		return new CompactionUnresolvedError(code, attempts, attempts >= COMPACTION_UNRESOLVED_ATTEMPTS);
+	}
+
+	/**
+	 * The barrier answered, so nothing is compacting any more, but its run may
+	 * have failed ("already compacted") over a context that is still large. The
+	 * persona goes back in unless a fresh read shows the context still above the
+	 * line; an unreadable context is treated as compacted.
+	 */
+	async #contextAfterBarrier(
+		sessionId: string,
+		epoch: number,
+		opRef: string,
+		tail: TailHandle,
+	): Promise<PreparedContext> {
+		let usage: SessionContextUsage | undefined;
+		try {
+			usage = await this.#manager.port.contextUsage?.({ sessionId, repo: this.#manager.repo, relay: tail });
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			this.#manager.log(
+				`persona_context_unreadable origin=${this.originKey} session=${sessionId} detail=${safeDiagnostic(error)}`,
+			);
+		}
+		const aboveLine = usage !== undefined && usage.tokens >= PERSONA_COMPACTION_TOKENS;
+		this.#manager.log(
+			`persona_compaction_resolved origin=${this.originKey} epoch=${epoch} session=${sessionId} opRef=${opRef} tokens=${usage?.tokens ?? "unknown"} evidence=barrier_answered${aboveLine ? " context=above_line" : ""}`,
+		);
+		return aboveLine ? { usage, compacted: false } : { compacted: true };
 	}
 
 	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {
@@ -6143,6 +6574,15 @@ function isStructuredModelNotFoundFailure(error: unknown): boolean {
 	return typeof message === "string" && /^Model .+ was not found\.$/.test(message);
 }
 
+/**
+ * Whether a preset model selection failure is non-transient and should terminate the turn.
+ * Recognizes typed codes like `invalid_preset`, `invalid_input`, and `internal` (from gjc 0.20.0).
+ */
+function isNonTransientPresetFailure(error: unknown): boolean {
+	const code = sdkStatusErrorCode(error);
+	return code === "invalid_preset" || code === "invalid_input" || code === "internal";
+}
+
 /** Keeps raw platform identifiers in SQLite and derives a safe, fixed-length SDK client reference. */
 export function personaTurnOpRef(
 	instanceId: string,
@@ -6168,6 +6608,13 @@ function describeModel(selection: GjcModelSelection | undefined): string {
 			: `preset:${selection.preset}`;
 }
 
+/** Generates a type-tagged unique identity for a model selection to avoid cache collisions. */
+function selectIdentity(selection: GjcModelSelection | undefined): string {
+	if (selection === undefined) return "undefined";
+	if (typeof selection === "string") return `string:${selection}`;
+	return `object:preset:${selection.preset}`;
+}
+
 function sameRecoveryAuthority(left: BrokerSession | undefined, right: BrokerSession | undefined): boolean {
 	if (!left || !right) return left === right;
 	return (
@@ -6186,6 +6633,18 @@ function steerClientRef(instanceId: string, originKey: string, epoch: number, me
 
 function retiredKey(bound: Pick<BoundTurn, "epoch" | "turn">): string {
 	return `${bound.epoch}:${bound.turn.opRef}`;
+}
+
+/**
+ * A lifecycle end the tail admitted with correlation belongs to the turn: the
+ * tail drops correlated frames that do not match it. An uncorrelated end is an
+ * idle broadcast that reaches every relay on the session (#733).
+ */
+function ownedTerminalFrame(frame: TailFrame): boolean {
+	return (
+		(frame.rawKind === "agent_end" || frame.rawKind === "agent_failed") &&
+		(frame.commandId !== undefined || frame.turnId !== undefined)
+	);
 }
 
 function positiveInteger(value: number | undefined, fallback: number, name: string): number {

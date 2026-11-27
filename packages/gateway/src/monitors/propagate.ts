@@ -324,7 +324,7 @@ export class MonitorPropagator {
 	/** Per-origin serialization lives in SessionPort, shared with all SDK callers. */
 	readonly #repo: string;
 	readonly #memoryDebloat: { readonly root: string; readonly thresholdBytes: number } | undefined;
-	readonly #model: GjcModelSelection | undefined;
+	#model: GjcModelSelection | undefined;
 	readonly #serviceTier: GjcServiceTier | undefined;
 	readonly #appliedModels = new Map<string, string>();
 	readonly #appliedServiceTiers = new Map<string, GjcServiceTier>();
@@ -427,6 +427,11 @@ export class MonitorPropagator {
 			options.protocolFailureRollThreshold ?? MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD;
 		this.#repo = options.repo ?? process.cwd();
 		this.#memoryDebloat = options.memoryDebloat;
+	}
+
+	/** Future monitor turns inherit the latest gateway default unless explicitly overridden. */
+	setDefaultModel(model: GjcModelSelection): void {
+		this.#model = model;
 	}
 
 	/**
@@ -1357,15 +1362,11 @@ export class MonitorPropagator {
 					boundSessionId = sessionId;
 					boundSessionEpoch = binding.epoch;
 					dispatchPhase = "configure";
-					const modelKey = effectiveModel
-						? typeof effectiveModel === "string"
-							? effectiveModel
-							: `preset:${effectiveModel.preset}`
-						: undefined;
+					const modelKey = selectIdentity(effectiveModel);
 					if (effectiveModel && !binding.startupModelApplied && this.#appliedModels.get(sessionId) !== modelKey) {
 						dispatchOperation = "setModel";
 						dispatchOperationArgs = {
-							model: modelKey,
+							model: modelSelector(effectiveModel),
 						};
 						await this.#sessionPort.setModel({ sessionId, repo: this.#repo, selection: effectiveModel });
 						this.#appliedModels.set(sessionId, modelKey!);
@@ -2460,7 +2461,9 @@ export class MonitorPropagator {
 				return;
 			}
 			let held: string | undefined;
-			// Independent observations in turn, queue, jobs order do not reserve an idle host.
+			// Independent observations in turn, queue, jobs order do not reserve an idle host;
+			// they only skip a close that would be refused. gjc's idle-fenced close below is
+			// the authority: it checks idleness and fences prompt admission atomically.
 			for (const probe of ["turnRunning", "queueEmpty", "runningJobs"] as const) {
 				if (probe === "queueEmpty" && !this.#sessionPort.queueEmpty) continue;
 				try {
@@ -2497,9 +2500,22 @@ export class MonitorPropagator {
 			});
 			if (!authorized) return;
 			try {
-				await this.#sessionPort.close({ sessionId, repo: this.#repo });
+				// Never forced: work that started after the last probe makes gjc refuse with
+				// `busy` instead of being aborted.
+				await this.#sessionPort.close({ sessionId, repo: this.#repo, ifIdle: true });
 				outcome = "closed";
 			} catch (error) {
+				if (isSessionBusy(error)) {
+					// Not applied and retryable: the host stays live and the record stays for a
+					// later pass, with the diagnostic closing phase cleared. No forced fallback.
+					const { phase: _phase, closeStartedAt: _closeStartedAt, ...idle } = record;
+					const idleRaw = JSON.stringify(idle);
+					this.#database.transaction(() => {
+						if (this.#database.core.metaGet(key) === raw) this.#database.core.metaSet(key, idleRaw);
+					});
+					outcome = "held:busy";
+					return;
+				}
 				const brokerCode =
 					error instanceof GjcCliError && error.exitCode === 0 ? envelopeErrorCode(error.details) : undefined;
 				const code =
@@ -3186,6 +3202,7 @@ export function failureDetail(error: unknown): string {
 		"AuthoringResultUnavailableError",
 		"BrokerAuthorityError",
 		"ModelNotSelectedError",
+		"SessionContractError",
 	]);
 	const allowedCodes = new Set([
 		"broker_unavailable",
@@ -3276,7 +3293,7 @@ export function failureDetail(error: unknown): string {
 	// A top-level message is recorded only for classes that build it from fixed
 	// text and numbers. Every other message can carry operation ids or remote
 	// text (SessionTerminalError, RelayRefusedError, plain Error).
-	const messageSourceClasses = new Set(["RelayHelloError", "ModelNotSelectedError"]);
+	const messageSourceClasses = new Set(["RelayHelloError", "ModelNotSelectedError", "SessionContractError"]);
 	const message =
 		causes
 			.slice()
@@ -3350,4 +3367,18 @@ export function failureDetail(error: unknown): string {
 		...(causeCode && causeCode !== code ? { causeCode } : {}),
 		...(message ? { message } : {}),
 	});
+}
+
+/** Generates a type-tagged unique identity for a model selection to avoid cache collisions. */
+function selectIdentity(selection: GjcModelSelection | undefined): string {
+	if (selection === undefined) return "undefined";
+	if (typeof selection === "string") return `string:${selection}`;
+	return `object:preset:${selection.preset}`;
+}
+
+/** Converts a model selection to its user-visible selector format. */
+function modelSelector(selection: GjcModelSelection | undefined): string {
+	if (selection === undefined) return "undefined";
+	if (typeof selection === "string") return selection;
+	return `preset:${selection.preset}`;
 }

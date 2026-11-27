@@ -1,4 +1,6 @@
 export {
+	type AdapterOwnersParams,
+	type AdapterOwnersResult,
 	type AgentDiskView,
 	type BurstPolicyKind,
 	type ChatMessagePayload,

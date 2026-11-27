@@ -198,6 +198,8 @@ export interface ValidatedIdentity {
 	readonly summary: string;
 	/** A user id the platform names as the app owner, when it names one. */
 	readonly ownerId?: string;
+	/** Every owner id the platform resolved for the application (#862). */
+	readonly ownerIds?: readonly string[];
 	/** Application ID (Discord only). */
 	readonly appId?: string;
 }
@@ -255,13 +257,34 @@ export async function validateDiscord(
 	if (credentials.appId !== undefined && appId !== credentials.appId)
 		throw new SetupError(`discord: the token belongs to application ${appId}, not ${credentials.appId}`);
 	const owner = app.body.owner as { id?: unknown } | undefined;
-	const hasTeam = app.body.team !== null && app.body.team !== undefined;
+	const team = app.body.team as { members?: unknown; owner_user_id?: unknown } | undefined;
+	// Accepted team members carry the app alongside the owner (discord
+	// membership_state 2); invited-only members do not (#862). Only accepted
+	// members with an admin or developer role count — a read_only member must
+	// never gate owner-only verbs (finding 1) — and the team owner
+	// (`owner_user_id`) is added explicitly because the API may report no
+	// "admin" role for them.
+	const teamMemberIds = Array.isArray(team?.members)
+		? team.members
+				.map((member) => member as { membership_state?: unknown; role?: unknown; user?: { id?: unknown } })
+				.filter(
+					(member) =>
+						member.membership_state === 2 &&
+						(member.role === "admin" || member.role === "developer") &&
+						typeof member.user?.id === "string",
+				)
+				.map((member) => member.user?.id as string)
+		: [];
+	if (typeof team?.owner_user_id === "string") teamMemberIds.push(team.owner_user_id);
+	const hasTeam = team !== null && team !== undefined;
 	const ownerId = !hasTeam && typeof owner?.id === "string" ? owner.id : undefined;
+	const ownerIds = hasTeam ? [...new Set(teamMemberIds)] : ownerId ? [ownerId] : [];
 	return {
 		platform: "discord",
 		summary: `bot named ${String(me.body.username ?? "?")} (${String(me.body.id ?? "?")}) of application ${appId}`,
 		appId,
 		...(ownerId ? { ownerId } : {}),
+		...(ownerIds.length > 0 ? { ownerIds } : {}),
 	};
 }
 
@@ -375,6 +398,13 @@ export interface ApplySetupOptions {
 	readonly home: string;
 	readonly tokens: SetupTokens;
 	readonly owners: readonly string[];
+	/**
+	 * Retained so a call site can hand setup the ids it resolved (#862), but
+	 * deliberately unused for authorization: membership- or lookup-derived ids
+	 * never persist into `mentionAllowlist` — the adapter reports them at
+	 * runtime, where they stay revocable (finding 3).
+	 */
+	readonly appOwnerIds?: readonly string[];
 }
 
 export interface AppliedSetup {
@@ -445,15 +475,31 @@ export async function applySetup(options: ApplySetupOptions): Promise<AppliedSet
 	const previousAllowlist = Array.isArray(base.mentionAllowlist)
 		? base.mentionAllowlist.filter((id): id is string => typeof id === "string")
 		: [];
+	// Discord application owners (#862) are authorized at runtime via
+	// adapter-reported adapterOwnerIds, refreshed by the adapter so a removed
+	// Team member is revoked without waiting for a restart (finding 3). They are
+	// deliberately NOT written into the persistent mentionAllowlist: that list
+	// holds only user-managed grants (`--owner`, kept across reruns), so rerun
+	// setup cannot resurrect a membership-derived id the adapter has revoked.
+	// ownerTarget is never synthesized from team members (finding 4).
 	const owners = [...new Set([...previousAllowlist, ...options.owners])];
+	const existingOwnerTarget =
+		typeof base.ownerTarget === "object" && base.ownerTarget !== null && !Array.isArray(base.ownerTarget)
+			? (base.ownerTarget as Record<string, unknown>)
+			: undefined;
+	const ownerTarget = existingOwnerTarget ?? undefined;
 	const config = {
 		...base,
 		credentials: { ...previousCredentials, ...credentials },
 		...(owners.length > 0 ? { mentionAllowlist: owners } : {}),
+		...(ownerTarget ? { ownerTarget } : {}),
 	};
 	await writePrivateFile(configPath, `${JSON.stringify(config, null, "\t")}\n`);
 	written.push(configPath);
-	return { written, owners };
+	return {
+		written,
+		owners,
+	};
 }
 
 /** Adapters with a config file in `home`, in canonical order: the compose profiles to run. */
@@ -662,12 +708,22 @@ export async function runSetup(args: readonly string[], options: RunSetupOptions
 			printDiscordBotReady(log, discordIdentity.appId, botName);
 		}
 
+		// dev behavior restored (#862, finding D): when the user named no owner,
+		// a USER-owned application's owner is allowed to DM the bot. That id is
+		// not membership-derived — a Team's members are never allowlisted here;
+		// team-owned apps authorize their members at runtime via the adapter's
+		// revocable adapterOwnerIds (finding 3) instead of a persistent list.
 		for (const identity of identities)
 			if (identity.ownerId && owners.length === 0) {
 				owners.push(identity.ownerId);
 				log(`${identity.platform}: allowing DMs from the application owner ${identity.ownerId}`);
 			}
-		const applied = await applySetup({ home: options.home, tokens, owners });
+		const applied = await applySetup({
+			home: options.home,
+			tokens,
+			owners,
+			...(discordIdentity?.ownerIds ? { appOwnerIds: discordIdentity.ownerIds } : {}),
+		});
 		for (const path of applied.written) log(`wrote ${path}`);
 		if (applied.owners.length === 0)
 			log(

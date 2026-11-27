@@ -85,8 +85,12 @@ async function pruneVersions(prefix: string, keep: readonly string[]): Promise<v
 		if (!retained.has(version)) await rm(join(prefix, version), { recursive: true, force: true });
 }
 
-/** Install the gateway-pinned gjc into its versioned private prefix. */
-export async function installPinnedGjc(options: {
+/**
+ * Install the gateway-pinned gjc into its versioned private prefix without
+ * flipping the current symlink. This is used by `gajaeway update` which
+ * defers the pin flip until after the broker restart succeeds.
+ */
+export async function installPinnedGjcWithoutFlip(options: {
 	readonly home: string;
 	readonly version: string;
 	readonly runner?: GjcInstallRunner;
@@ -99,7 +103,6 @@ export async function installPinnedGjc(options: {
 	await chmod(layout.gjcPrefix, 0o700);
 
 	const versionDir = join(layout.gjcPrefix, version);
-	const previousVersion = await currentVersion(layout.gjcPrefix, layout.gjcCurrent);
 	let staging: string | undefined;
 	try {
 		let installed = false;
@@ -133,16 +136,50 @@ export async function installPinnedGjc(options: {
 			await verifyGjc(join(versionDir, "bin", "gjc"), versionDir, version, runner);
 		}
 
-		await pruneVersions(layout.gjcPrefix, [version, ...(previousVersion === undefined ? [] : [previousVersion])]);
-		const temporaryLink = join(layout.gjcPrefix, `.current-${randomUUID()}`);
-		try {
-			await symlink(version, temporaryLink, "dir");
-			await rename(temporaryLink, layout.gjcCurrent);
-		} finally {
-			await rm(temporaryLink, { force: true });
-		}
 		return layout.gjcExecutable();
 	} finally {
 		if (staging !== undefined) await rm(staging, { recursive: true, force: true });
 	}
+}
+
+/**
+ * Flip the gjc/current symlink to point to the specified version.
+ * The version must already be installed via installPinnedGjcWithoutFlip.
+ */
+export async function flipGjcPin(options: { readonly home: string; readonly version: string }): Promise<void> {
+	const { home, version } = options;
+	if (!VERSION_PATTERN.test(version)) throw new Error(`invalid pinned gjc version: ${version}`);
+	const layout = homeLayout(home);
+
+	const versionDir = join(layout.gjcPrefix, version);
+	try {
+		const info = await lstat(versionDir);
+		if (!info.isDirectory()) throw new Error(`gjc version path is not a directory: ${versionDir}`);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT")
+			throw new Error(`gjc version ${version} is not installed at ${versionDir}`);
+		throw error;
+	}
+
+	const previousVersion = await currentVersion(layout.gjcPrefix, layout.gjcCurrent);
+	await pruneVersions(layout.gjcPrefix, [version, ...(previousVersion === undefined ? [] : [previousVersion])]);
+	const temporaryLink = join(layout.gjcPrefix, `.current-${randomUUID()}`);
+	try {
+		await symlink(version, temporaryLink, "dir");
+		await rename(temporaryLink, layout.gjcCurrent);
+	} finally {
+		await rm(temporaryLink, { force: true });
+	}
+}
+
+/** Install the gateway-pinned gjc into its versioned private prefix and flip the pin immediately. */
+export async function installPinnedGjc(options: {
+	readonly home: string;
+	readonly version: string;
+	readonly runner?: GjcInstallRunner;
+}): Promise<string> {
+	const { home, version } = options;
+	await installPinnedGjcWithoutFlip(options);
+	await flipGjcPin({ home, version });
+	return homeLayout(home).gjcExecutable();
 }

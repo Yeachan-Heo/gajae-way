@@ -469,9 +469,9 @@ describe("ImageOutbox", () => {
 		// The bound is a count of intents, so the 1000th still fits.
 		await expect(outbox.put(last)).resolves.toBeUndefined();
 		expect((await outbox.load()).filter((entry) => !entry.completed && !entry.terminal)).toHaveLength(1_000);
-		await expect(
-			outbox.put({ messageId: String(base + 10_001n), channelId: "channel" }),
-		).rejects.toBeInstanceOf(ImageOutboxCapacityError);
+		await expect(outbox.put({ messageId: String(base + 10_001n), channelId: "channel" })).rejects.toBeInstanceOf(
+			ImageOutboxCapacityError,
+		);
 		expect((await outbox.load()).filter((entry) => !entry.completed && !entry.terminal)).toHaveLength(1_000);
 	});
 
@@ -535,13 +535,15 @@ describe("ImageOutbox", () => {
 		expect(await outbox.get(promoted.messageId)).toEqual(promoted);
 		// The work pool is exactly full now, so the next promotion keeps its parked row instead
 		// of losing the intent or turning it terminal.
-		await expect(outbox.put({ messageId: parked[1]!.messageId, channelId: parked[1]!.channelId })).rejects.toBeInstanceOf(
-			ImageOutboxCapacityError,
-		);
+		await expect(
+			outbox.put({ messageId: parked[1]!.messageId, channelId: parked[1]!.channelId }),
+		).rejects.toBeInstanceOf(ImageOutboxCapacityError);
 		expect(await outbox.get(parked[1]!.messageId)).toMatchObject({ deferred: true });
 		// Making room lets the same promotion through with the same durable id.
 		await outbox.remove(String(base));
-		await expect(outbox.put({ messageId: parked[1]!.messageId, channelId: parked[1]!.channelId })).resolves.toBeUndefined();
+		await expect(
+			outbox.put({ messageId: parked[1]!.messageId, channelId: parked[1]!.channelId }),
+		).resolves.toBeUndefined();
 		expect(await outbox.get(parked[1]!.messageId)).toEqual({
 			messageId: parked[1]!.messageId,
 			channelId: parked[1]!.channelId,

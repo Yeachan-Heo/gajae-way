@@ -1562,6 +1562,7 @@ test("working status ignores non-discord progress and survives channel failures"
 test("slash commands /new and /reset map to gateway session resets with the invoker attributed", async () => {
 	const sent: Array<{ messageId: string; text: string; engagement: unknown }> = [];
 	const gateway = {
+		gatewayAvailable: () => true,
 		requestInbound: async (messageId: string, _origin: unknown, text: string, engagement: unknown) => {
 			sent.push({ messageId, text, engagement });
 			return { engaged: true };
@@ -1605,6 +1606,7 @@ test("/model is registered with show/set/clear and set autocompletes its choice"
 test("/model subcommands map to the gateway's /model text verbs, not to a session reset", async () => {
 	const sent: string[] = [];
 	const gateway = {
+		gatewayAvailable: () => true,
 		requestInbound: async (_messageId: string, _origin: unknown, text: string) => {
 			sent.push(text);
 			return { engaged: true };
@@ -1697,7 +1699,7 @@ test("/model autocomplete narrows provider models by typed text and drops choice
 });
 
 test("a declined slash command answers not-authorized instead of claiming a reset", async () => {
-	const gateway = { requestInbound: async () => ({ engaged: false }) };
+	const gateway = { gatewayAvailable: () => true, requestInbound: async () => ({ engaged: false }) };
 	let replied = "";
 	await handleSlashCommand(
 		{
@@ -1721,6 +1723,7 @@ test("/model acknowledges within Discord's deadline: the reply is deferred befor
 	const events: string[] = [];
 	let release: (() => void) | undefined;
 	const gateway = {
+		gatewayAvailable: () => true,
 		requestInbound: async () => {
 			events.push("gateway");
 			await new Promise<void>((resolve) => {
@@ -1786,9 +1789,10 @@ test("a non-owner /model set gets an ephemeral owner-only refusal, and a failed 
 			gateway as never,
 			{ error: () => {} },
 		);
-	await interaction({ requestInbound: async () => ({ engaged: false }) }, "itx-member");
+	await interaction({ gatewayAvailable: () => true, requestInbound: async () => ({ engaged: false }) }, "itx-member");
 	await interaction(
 		{
+			gatewayAvailable: () => true,
 			requestInbound: async () => {
 				throw new Error("gateway link not connected");
 			},
@@ -1803,6 +1807,7 @@ test("/model autocomplete asks for the invoking user's choices and offers nothin
 	const responded: Array<Array<{ name: string; value: string }>> = [];
 	// The gateway answers per author: preset names only for the owner.
 	const gateway = {
+		gatewayAvailable: () => true,
 		modelChoices: async (authorId: string) => {
 			asked.push(authorId);
 			return authorId === "owner-1" ? ["frontier-heavy"] : [];

@@ -76,7 +76,7 @@ async function start(
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open",
-		channels: { c1: { engagement: "mention-open" } },
+		channels: { c1: { engagement: "mention-open" }, "slack:C1": { engagement: "mention-open" } },
 	};
 	database = await Store.open(config.dbPath);
 	const port = sessionPortFromScript({
@@ -446,4 +446,77 @@ test("a crash between steer acceptance and the lifecycle hook cannot leave the m
 	} finally {
 		await manager.stop();
 	}
+});
+
+test("an edit of a Slack bot-root reply recorded on the channel session before #854 applies there", async () => {
+	const turns: string[] = [];
+	const { client } = await start(async (text) => {
+		turns.push(text);
+		return "ok";
+	});
+	const channel = { platform: "slack", kind: "channel", conversationId: "C1" } as const;
+	const thread = { platform: "slack", kind: "thread", conversationId: "C1:1.0", parentId: "C1" } as const;
+	const engagement = {
+		mentioned: true,
+		group: true,
+		authorId: "U1",
+		replyTo: { messageId: "C1:1.0", authorId: "UBOT", fromSelf: true },
+	};
+	const request = (id: string, verb: string, params: Record<string, unknown>) =>
+		client.send({ v: "0.1", type: "request", id, verb, params });
+	// Recorded by an older adapter: the reply under the bot's root landed on the channel session.
+	request("s1", "chat.send", { origin: channel, messageId: "C1:2.0", text: "question", engagement });
+	await eventually(() => turns.length === 1, "original was not sent");
+	await eventually(() => database!.inbox.pendingCount("slack/channel/C1") === 0, "first turn did not complete");
+	// After the cutover the adapter names the thread origin for the same reply.
+	request("e1", "chat.edit", { origin: thread, messageId: "C1:2.0", text: "question, edited", engagement });
+	await eventually(() => turns.length === 2, "edit was not applied");
+	expect(turns[1]).toContain("[MESSAGE POINTER: C1:2.0]");
+	expect(client.response("e1")?.result).toMatchObject({ engaged: true });
+	expect(database!.inbox.knownMessage("slack/channel/C1", messageEditId("C1:2.0", "question, edited"))).toBe(true);
+	// A thread a human rooted is never redirected to the channel.
+	request("e2", "chat.edit", {
+		origin: thread,
+		messageId: "C1:2.0",
+		text: "question, edited again",
+		engagement: { ...engagement, replyTo: { messageId: "C1:1.0", authorId: "U9", fromSelf: false } },
+	});
+	await eventually(() => client.response("e2") !== undefined, "no response to the second edit");
+	expect(client.response("e2")?.result).toEqual({ turnId: null, engaged: false });
+	client.close();
+});
+
+test("a mention edited into a channel message opens its thread to plain follow-ups", async () => {
+	const turns: string[] = [];
+	const { client } = await start(async (text) => {
+		turns.push(text);
+		return "ok";
+	});
+	const channel = { platform: "slack", kind: "channel", conversationId: "C1" } as const;
+	const thread = { platform: "slack", kind: "thread", conversationId: "C1:5.0", parentId: "C1" } as const;
+	const plain = { mentioned: false, group: true, authorId: "U1" };
+	const request = (id: string, verb: string, params: Record<string, unknown>) =>
+		client.send({ v: "0.1", type: "request", id, verb, params });
+	// Written without a mention: a mention-open channel does not answer it.
+	request("s1", "chat.send", { origin: channel, messageId: "C1:5.0", text: "status?", engagement: plain });
+	await eventually(() => client.response("s1") !== undefined, "no response to the original");
+	expect(client.response("s1")?.result).toMatchObject({ engaged: false });
+	// The author edits the mention in. The turn runs on the channel origin under an edit row id.
+	request("e1", "chat.edit", {
+		origin: channel,
+		messageId: "C1:5.0",
+		text: "@bot status?",
+		engagement: { ...plain, mentioned: true },
+	});
+	await eventually(() => turns.length === 1, "the edited mention was not answered");
+	await eventually(() => database!.inbox.pendingCount("slack/channel/C1") === 0, "edit turn did not complete");
+	expect(database!.inbox.messageJoinedTurn("slack/channel/C1", "C1:5.0")).toBe(true);
+	// A different root in the same channel is not opened by that edit.
+	expect(database!.inbox.messageJoinedTurn("slack/channel/C1", "C1:5.1")).toBe(false);
+	// The answer was posted into the thread under that message, so a plain reply there is heard.
+	request("s2", "chat.send", { origin: thread, messageId: "C1:6.0", text: "and then?", engagement: plain });
+	await eventually(() => client.response("s2") !== undefined, "no response to the follow-up");
+	expect(client.response("s2")?.result).toMatchObject({ engaged: true });
+	await eventually(() => turns.length === 2, "the follow-up was not sent");
+	client.close();
 });

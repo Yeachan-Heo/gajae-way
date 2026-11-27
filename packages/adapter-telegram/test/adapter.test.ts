@@ -633,7 +633,11 @@ test("multi-chunk entity fallback preserves order and forum topic without resend
 	}
 });
 
-test.each<{ name: string; responses: Array<"ok" | "reject" | "entity" | "transport">; ambiguous: boolean }>([
+test.each<{
+	name: string;
+	responses: Array<"ok" | "reject" | "entity" | "bad-request" | "transport">;
+	ambiguous: boolean;
+}>([
 	{
 		name: "an accepted chunk followed by a Telegram 429 is ambiguous",
 		responses: ["ok", "reject"],
@@ -654,6 +658,21 @@ test.each<{ name: string; responses: Array<"ok" | "reject" | "entity" | "transpo
 		responses: ["entity", "ok", "reject"],
 		ambiguous: true,
 	},
+	{
+		name: "an accepted chunk followed by a refused plain-text retry is ambiguous",
+		responses: ["ok", "entity", "bad-request"],
+		ambiguous: true,
+	},
+	{
+		name: "an accepted chunk followed by a non-entity 400 is ambiguous and not resent as plain text",
+		responses: ["ok", "bad-request"],
+		ambiguous: true,
+	},
+	{
+		name: "a refused plain-text retry of the first chunk is definitive",
+		responses: ["entity", "bad-request"],
+		ambiguous: false,
+	},
 ])("$name", async ({ responses, ambiguous }) => {
 	const home = await temporaryHome();
 	try {
@@ -670,6 +689,8 @@ test.each<{ name: string; responses: Array<"ok" | "reject" | "entity" | "transpo
 					return Response.json({ ok: false, description: "Too Many Requests" }, { status: 429 });
 				case "entity":
 					return Response.json({ ok: false, description: "Bad Request: can't parse entities" }, { status: 400 });
+				case "bad-request":
+					return Response.json({ ok: false, description: "Bad Request: message thread not found" }, { status: 400 });
 				case "transport":
 					throw new Error("fallback transport failed");
 				case "ok":
@@ -699,7 +720,9 @@ test.each<{ name: string; responses: Array<"ok" | "reject" | "entity" | "transpo
 					deliveryId: "delivery-1",
 					reason: responses.includes("transport")
 						? "Telegram sendMessage request failed: fallback transport failed"
-						: "Too Many Requests",
+						: responses.includes("bad-request")
+							? "Bad Request: message thread not found"
+							: "Too Many Requests",
 					ambiguous,
 				},
 			},
@@ -1134,6 +1157,29 @@ test("progress eviction drops completed deliveries before a partly delivered one
 	expect(progress.get("done-299")?.sent).toBe(1);
 });
 
+test("progress eviction bounds a cache holding only partly delivered deliveries, oldest first", () => {
+	const progress = new TelegramDeliveryProgress();
+	const partial = () => ({ chunks: ["a", "b"], sent: 1, uncertain: false, stalls: 0 });
+	const survivors = (total: number) =>
+		Array.from({ length: total }, (_, index) => `partial-${index}`).filter((id) => progress.get(id) !== undefined);
+	for (let index = 0; index < 300; index++) progress.remember(`partial-${index}`, partial());
+	const kept = survivors(300);
+	// With no completed entry to drop, the unresolved pass must still bound the map
+	// at TELEGRAM_PROGRESS_LIMIT.
+	expect(kept).toHaveLength(256);
+	expect(kept).toEqual(Array.from({ length: kept.length }, (_, index) => `partial-${300 - kept.length + index}`));
+	// Remembering an entry again makes it the newest, so the next eviction takes
+	// the one after it.
+	const [refreshed = "", nextOldest = ""] = kept;
+	progress.remember(refreshed, partial());
+	progress.remember("partial-300", partial());
+	expect(progress.get(refreshed)?.sent).toBe(1);
+	expect(progress.get(nextOldest)).toBeUndefined();
+	for (let index = 301; index < 600; index++) progress.remember(`partial-${index}`, partial());
+	expect(survivors(600)).toHaveLength(kept.length);
+	expect(progress.get("partial-599")?.sent).toBe(1);
+});
+
 test("a redelivery with no remembered progress counts a definitive mid-reply refusal as definitive", async () => {
 	const chunks = renderTelegramDelivery(threeChunks, true);
 	const { calls, requests } = await chunkedSettlement(
@@ -1158,4 +1204,43 @@ test("a reply that cannot be rendered fails definitively without sending", async
 	expect(requests).toHaveLength(1);
 	expect(requests[0]).toMatchObject({ verb: "delivery.fail", params: { deliveryId: "delivery-1", ambiguous: false } });
 	expect((requests[0]?.params as { reason: string }).reason).toStartWith("Telegram rendering failed: ");
+});
+
+test("a forum topic creation is recorded as context-only under the topic root id", async () => {
+	const home = await temporaryHome();
+	try {
+		const adapter = new TelegramAdapter(
+			await TelegramAdapterState.load(home),
+			"agent",
+			"900",
+			{ chats: { "-100123": { engagement: "open" } } },
+			noAttachments,
+		);
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const created: TelegramUpdate = {
+			update_id: 90,
+			message: {
+				message_id: 99,
+				chat: { id: -100123, type: "supergroup" },
+				from: { id: 42 },
+				message_thread_id: 99,
+				is_topic_message: true,
+				forum_topic_created: { name: "NodeCPUTooHigh b300-07" },
+			},
+		};
+		expect(await adapter.handleUpdate(mockGateway(requests), created)).toBe(true);
+		expect(requests).toEqual([
+			{
+				verb: "chat.send",
+				params: {
+					origin: { platform: "telegram", kind: "topic", conversationId: "-100123.99", parentId: "-100123" },
+					text: "Forum topic created: NodeCPUTooHigh b300-07",
+					engagement: { mentioned: false, group: true, authorId: "42", contextOnly: true },
+					messageId: "-100123:99",
+				},
+			},
+		]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
 });

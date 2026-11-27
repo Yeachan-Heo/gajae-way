@@ -53,7 +53,7 @@
     },
     "packages/cli": {
       "name": "@gajae-gateway/cli",
-      "version": "0.5.0",
+      "version": "0.5.2",
       "bin": {
         "gajaeway": "./dist/main.js",
       },
@@ -93,7 +93,7 @@
     },
     "packages/images": {
       "name": "@gajae-gateway/images",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "dependencies": {
         "@gajae-gateway/protocol": "workspace:*",
         "image-size": "2.1.0",
@@ -106,11 +106,11 @@
     },
     "packages/protocol": {
       "name": "@gajae-gateway/protocol",
-      "version": "0.5.0",
+      "version": "0.5.2",
     },
     "packages/sdk": {
       "name": "@gajae-gateway/sdk",
-      "version": "0.5.0",
+      "version": "0.5.2",
       "dependencies": {
         "@gajae-gateway/protocol": "workspace:*",
       },

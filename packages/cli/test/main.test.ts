@@ -1373,6 +1373,284 @@ describe("work operator commands", () => {
 		expect(output.errors.join(" ")).toContain("--repo");
 	});
 
+	const successorBase = "1234567890abcdef1234567890abcdef12345678";
+	const successorOptions = [
+		["--successor-of", "original"],
+		["--source-op", "op-original"],
+		["--source-session", "session-original"],
+		["--acknowledge-unresolved"],
+	];
+
+	test("work start forwards explicit successor authorization with repository, immutable base, model and caller", async () => {
+		const output = await run(
+			[
+				"start",
+				"replacement",
+				"--repo",
+				".",
+				"--base",
+				successorBase,
+				...successorOptions.flat(),
+				"--preset",
+				"reliable",
+				"review",
+				"and recover",
+			],
+			{
+				started: true,
+				jobId: "job-new",
+				opRef: "op-new",
+				sessionKey: "work/task/replacement",
+				sessionId: "session-new",
+			},
+			"caller-session",
+		);
+		expect(output.requests).toEqual([
+			{
+				verb: "work.start",
+				params: {
+					name: "replacement",
+					text: "review and recover",
+					repo: resolve("."),
+					base: successorBase,
+					model: { preset: "reliable" },
+					callerSessionId: "caller-session",
+					successorOf: {
+						name: "original",
+						opRef: "op-original",
+						sessionId: "session-original",
+						acknowledgeUnresolved: true,
+					},
+				},
+			},
+		]);
+		expect(output.errors).toEqual([]);
+		expect(output.lines).toEqual(["started: work/task/replacement session=session-new job=job-new op=op-new"]);
+		expect(output.closed).toBe(true);
+	});
+
+	test("work start identifies an idempotent successor receipt as already started", async () => {
+		const output = await run(
+			["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+			{
+				started: true,
+				alreadyStarted: true,
+				jobId: "job-new",
+				opRef: "op-new",
+				sessionKey: "work/task/replacement",
+				sessionId: "session-new",
+			},
+		);
+		expect(output.lines).toEqual(["already started: work/task/replacement session=session-new job=job-new op=op-new"]);
+		expect(output.requests).toHaveLength(1);
+	});
+
+	for (const reasonCode of [
+		"successor_name_already_bound",
+		"successor_source_changed",
+		"successor_already_authorized",
+		"successor_repository_mismatch",
+		"successor_request_mismatch",
+		"successor_report_owner_mismatch",
+		"successor_requires_missing_execution_end",
+	]) {
+		test(`work successor displays the safe refusal reason ${reasonCode} without private detail`, async () => {
+			const output = await run(
+				["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+				new ProtocolError("invalid_params", "isolated successor refused", {
+					reasonCode,
+					diagnostic: "private diagnostic /secret/checkout",
+					successor: { name: "private-target", sessionId: "private-session" },
+				}),
+			);
+			expect(output.errors.join("\n")).toContain(reasonCode);
+			expect(output.errors.join("\n")).not.toContain("private");
+			expect(output.errors.join("\n")).not.toContain("/secret/checkout");
+			expect(output.lines).toEqual([]);
+			expect(output.exitCode).toBe(1);
+			expect(output.closed).toBe(true);
+		});
+	}
+
+	test("work successor displays the designated successor refusal without leaking the linked target", async () => {
+		const message = "successor already designated; inspect the original linked lane";
+		const output = await run(
+			["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+			new ProtocolError("invalid_params", message, {
+				reasonCode: "successor_already_authorized",
+				successor: { name: "private-target", opRef: "private-op", sessionId: "private-session" },
+			}),
+		);
+		expect(output.errors.join("\n")).toContain(message);
+		expect(output.errors.join("\n")).toContain("successor_already_authorized");
+		expect(output.errors.join("\n")).not.toContain("private");
+		expect(output.exitCode).toBe(1);
+		expect(output.closed).toBe(true);
+	});
+
+	test("work successor displays the reviewed base mismatch without private detail", async () => {
+		const message = "successor checkout does not match the reviewed commit";
+		const output = await run(
+			["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+			new ProtocolError("invalid_params", message, {
+				reasonCode: "successor_base_mismatch",
+				diagnostic: "private diagnostic /secret/checkout",
+			}),
+		);
+		expect(output.errors.join("\n")).toContain(message);
+		expect(output.errors.join("\n")).toContain("successor_base_mismatch");
+		expect(output.errors.join("\n")).not.toContain("private");
+		expect(output.errors.join("\n")).not.toContain("/secret/checkout");
+		expect(output.lines).toEqual([]);
+		expect(output.exitCode).toBe(1);
+		expect(output.closed).toBe(true);
+	});
+
+	for (const [label, detail] of [
+		["unknown reason", { reasonCode: "private-unknown-reason", diagnostic: "private diagnostic" }],
+		["obsolete reason", { reasonCode: "successor_checkout_not_isolated", diagnostic: "private diagnostic" }],
+		["missing reason", { diagnostic: "private diagnostic" }],
+		["non-string reason", { reasonCode: { code: "successor_source_changed", secret: "private" } }],
+		["array detail", [{ reasonCode: "successor_source_changed" }, "private"]],
+		["null detail", null],
+	] as const) {
+		test(`work successor leaves ${label} opaque`, async () => {
+			const output = await run(
+				["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+				new ProtocolError("invalid_params", "isolated successor refused", detail),
+			);
+			expect(output.errors).toEqual(["isolated successor refused"]);
+			expect(output.exitCode).toBe(1);
+			expect(output.closed).toBe(true);
+		});
+	}
+
+	for (const [label, args, error] of [
+		[
+			"ordinary start",
+			["start", "fix", "task"],
+			new ProtocolError("invalid_params", "isolated successor refused", { reasonCode: "successor_source_changed" }),
+		],
+		[
+			"work run",
+			["run", "fix", "task"],
+			new ProtocolError("invalid_params", "isolated successor refused", { reasonCode: "successor_source_changed" }),
+		],
+		[
+			"different error message",
+			["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+			new ProtocolError("invalid_params", "ordinary failure", { reasonCode: "successor_source_changed" }),
+		],
+		[
+			"different error code",
+			["start", "replacement", "--repo", ".", "--base", successorBase, ...successorOptions.flat(), "review"],
+			new ProtocolError("verb_failed", "isolated successor refused", { reasonCode: "successor_source_changed" }),
+		],
+	] as const) {
+		test(`work successor reason rendering preserves unrelated ${label} errors`, async () => {
+			const output = await run([...args], error);
+			expect(output.errors).toEqual([error.message]);
+			expect(output.exitCode).toBe(1);
+			expect(output.closed).toBe(true);
+		});
+	}
+
+	for (let mask = 1; mask < 15; mask++) {
+		test(`work start rejects incomplete successor authorization ${mask} before connecting`, async () => {
+			const flags = successorOptions.filter((_, index) => mask & (1 << index)).flat();
+			const output = await run(["start", "replacement", "--repo", ".", "--base", successorBase, ...flags, "task"], {});
+			expect(output.requests).toEqual([]);
+			expect(output.connections).toBe(0);
+			expect(output.exitCode).toBe(1);
+			expect(output.errors.join(" ")).toContain("--successor-of");
+		});
+	}
+
+	for (const option of successorOptions) {
+		test(`work run rejects ${option[0]} alone before connecting`, async () => {
+			const output = await run(["run", "replacement", "--repo", ".", "--base", successorBase, ...option, "task"], {});
+			expect(output.requests).toEqual([]);
+			expect(output.connections).toBe(0);
+			expect(output.exitCode).toBe(1);
+		});
+	}
+
+	for (const option of successorOptions.slice(0, 3)) {
+		test(`work start rejects missing ${option[0]} value before connecting`, async () => {
+			const output = await run(["start", "replacement", "task", option[0]!], {});
+			expect(output.requests).toEqual([]);
+			expect(output.connections).toBe(0);
+			expect(output.exitCode).toBe(1);
+		});
+	}
+
+	for (const [label, command, name, repositoryFlags, recoveryFlags, extraFlags] of [
+		["run", "run", "replacement", ["--repo", ".", "--base", successorBase], successorOptions.flat(), []],
+		["missing repo", "start", "replacement", ["--base", successorBase], successorOptions.flat(), []],
+		["missing base", "start", "replacement", ["--repo", "."], successorOptions.flat(), []],
+		["branch base", "start", "replacement", ["--repo", ".", "--base", "dev"], successorOptions.flat(), []],
+		["abbreviated base", "start", "replacement", ["--repo", ".", "--base", "1234567"], successorOptions.flat(), []],
+		["non-hex base", "start", "replacement", ["--repo", ".", "--base", "g".repeat(40)], successorOptions.flat(), []],
+		[
+			"uppercase base",
+			"start",
+			"replacement",
+			["--repo", ".", "--base", successorBase.toUpperCase()],
+			successorOptions.flat(),
+			[],
+		],
+		[
+			"cwd",
+			"start",
+			"replacement",
+			["--repo", ".", "--base", successorBase],
+			successorOptions.flat(),
+			["--cwd", "/repo"],
+		],
+		["resume", "start", "replacement", ["--repo", ".", "--base", successorBase], successorOptions.flat(), ["--resume"]],
+		["same name", "start", "original", ["--repo", ".", "--base", successorBase], successorOptions.flat(), []],
+		[
+			"invalid source name",
+			"start",
+			"replacement",
+			["--repo", ".", "--base", successorBase],
+			["--successor-of", "bad/name", ...successorOptions.slice(1).flat()],
+			[],
+		],
+		...successorOptions.map(
+			(option) =>
+				[
+					"duplicate " + option[0],
+					"start",
+					"replacement",
+					["--repo", ".", "--base", successorBase],
+					successorOptions.flat(),
+					option,
+				] as const,
+		),
+		...successorOptions
+			.slice(0, 3)
+			.map(
+				(option, index) =>
+					[
+						"blank " + option[0],
+						"start",
+						"replacement",
+						["--repo", ".", "--base", successorBase],
+						successorOptions.flatMap((entry, entryIndex) => (entryIndex === index ? [entry[0]!, " "] : entry)),
+						[],
+					] as const,
+			),
+	] as const) {
+		test(`work successor rejects ${label} before connecting`, async () => {
+			const output = await run([command, name, ...repositoryFlags, ...recoveryFlags, ...extraFlags, "task"], {});
+			expect(output.requests).toEqual([]);
+			expect(output.connections).toBe(0);
+			expect(output.exitCode).toBe(1);
+			expect(output.errors.join(" ")).toContain("--successor-of");
+		});
+	}
+
 	for (const command of ["run", "start"]) {
 		test(`work ${command} prints held without claiming acceptance`, async () => {
 			const output = await run([command, "fix", "task"], {
@@ -1791,19 +2069,88 @@ describe("memory async operations (#473)", () => {
 		const errors: string[] = [];
 		const originalErr = console.error;
 		console.error = (line: unknown) => errors.push(String(line));
+		let clockMs = 50_000;
+		const sleeps: number[] = [];
 		let polls = 0;
 		const client: Pick<GajaewayClient, "request"> = {
 			request: async <T>() => {
 				polls++;
-				return { status: "pending", elapsedMs: polls * 15 } as T;
+				return { status: "pending", elapsedMs: polls * 1_500 } as T;
 			},
 		};
 		try {
-			const result = await pollMemoryOp(client, "gw-ml-still-running", 20, 10);
-			expect(result.status).toBe("still_running");
-			expect(result.elapsedMs).toBeGreaterThanOrEqual(20);
-			expect(polls).toBeGreaterThan(0);
-			expect(errors.join("\n")).toContain("gajaeway memory status gw-ml-still-running");
+			const result = await pollMemoryOp(client, "gw-ml-still-running", 3_000, 1_000, {
+				now: () => clockMs,
+				sleep: async (ms) => {
+					sleeps.push(ms);
+					clockMs += ms;
+				},
+			});
+			expect(result).toEqual({ status: "still_running", elapsedMs: 4_500 });
+			expect(polls).toBe(3);
+			expect(sleeps).toEqual([1_000, 1_000, 1_000]);
+			const stderr = errors.join("\n");
+			expect(stderr).toContain("5s operation elapsed; CLI wait ended after 3s");
+			expect(stderr).toContain("gajaeway memory status gw-ml-still-running");
+		} finally {
+			console.error = originalErr;
+		}
+	});
+
+	test("memory operation polling stops exactly at its wait deadline", async () => {
+		const errors: string[] = [];
+		const originalErr = console.error;
+		console.error = (line: unknown) => errors.push(String(line));
+		try {
+			// One tick before the deadline still polls, so a result that lands there is returned.
+			let beforeMs = 0;
+			let beforePolls = 0;
+			const completesLate: Pick<GajaewayClient, "request"> = {
+				request: async <T>() => {
+					beforePolls++;
+					return (
+						beforeMs === 19
+							? { status: "completed", elapsedMs: 19, result: { ok: true } }
+							: { status: "pending", elapsedMs: beforeMs }
+					) as T;
+				},
+			};
+			const completed = await pollMemoryOp(completesLate, "gw-ml-before-deadline", 20, 19, {
+				now: () => beforeMs,
+				sleep: async (ms) => {
+					beforeMs += ms;
+				},
+			});
+			expect(completed).toEqual({ status: "completed", elapsedMs: 19, result: { ok: true } });
+			expect(beforePolls).toBe(2);
+			expect(errors).toEqual([]);
+
+			// Reaching the deadline exactly does not poll again, even if the next poll would complete.
+			let atMs = 0;
+			let atPolls = 0;
+			const atSleeps: number[] = [];
+			const completesAtDeadline: Pick<GajaewayClient, "request"> = {
+				request: async <T>() => {
+					atPolls++;
+					return (
+						atMs >= 20
+							? { status: "completed", elapsedMs: atMs, result: { ok: true } }
+							: { status: "pending", elapsedMs: 15 }
+					) as T;
+				},
+			};
+			// The first wait lands exactly on the deadline; the operation reported only 15ms so far.
+			const stillRunning = await pollMemoryOp(completesAtDeadline, "gw-ml-at-deadline", 20, 10, {
+				now: () => atMs,
+				sleep: async (ms) => {
+					atSleeps.push(ms);
+					atMs = 20;
+				},
+			});
+			expect(stillRunning).toEqual({ status: "still_running", elapsedMs: 15 });
+			expect(atPolls).toBe(1);
+			expect(atSleeps).toEqual([10]);
+			expect(errors.join("\n")).toContain("gajaeway memory status gw-ml-at-deadline");
 		} finally {
 			console.error = originalErr;
 		}
