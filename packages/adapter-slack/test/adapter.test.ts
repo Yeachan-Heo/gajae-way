@@ -703,6 +703,7 @@ for (const shape of [
 							authorName: "Alice",
 							authorHandle: "alice",
 							serverLabel: "Workspace",
+							trust: "member",
 							...(!dm ? { channelLabel: "#general" } : {}),
 							...(thread
 								? {
@@ -1094,6 +1095,7 @@ test("Slack edits use nested identity, edited timestamp and rendered body equali
 						authorHandle: "alice",
 						channelLabel: "#general",
 						serverLabel: "Workspace",
+						trust: "member",
 					},
 				},
 			},
@@ -1662,7 +1664,7 @@ for (const command of ["/new", "/reset", "/restart", "/model", "/unknown"])
 								messageId: `slash-${engaged}`,
 								origin: { platform: "slack", kind: "dm", conversationId: "D1", peerId: "U1" },
 								text: command,
-								engagement: { mentioned: true, group: false, authorId: "U1", authorHandle: "alice" },
+								engagement: { mentioned: true, group: false, authorId: "U1", authorHandle: "alice", trust: "member" },
 							},
 						})),
 			);
@@ -2911,7 +2913,7 @@ test("#710: Event Subscriptions stay off after forced reconnect; suspect flag cl
 	}
 });
 
-test("Slack recovery states author trust: guests and failed lookups are marked, members are not", async () => {
+test("Slack recovery states author trust: every author is classified, a failed lookup is unverified", async () => {
 	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false });
 	try {
 		const usersInfo = f.api.usersInfo.bind(f.api);
@@ -2934,7 +2936,7 @@ test("Slack recovery states author trust: guests and failed lookups are marked, 
 					return [params.text, params.engagement.trust];
 				}),
 		);
-		expect(trust).toEqual({ member: undefined, guest: "guest", unknown: "unverified" });
+		expect(trust).toEqual({ member: "member", guest: "guest", unknown: "unverified" });
 	} finally {
 		f.socket.stop();
 		f.recovery.stop();

@@ -299,26 +299,16 @@ test("denyUsers takes precedence over allowUsers (deny list must override allow 
 	expect(checkSlackGuestPolicy(overlap, { platform: "slack", kind: "channel" }, config)).toBe("drop");
 });
 
-test("trust propagates on the live inbound path and policy applies correctly", async () => {
-	const { config, turns } = await gateway(() => "member response", {
-		channels: { "slack:C1": { engagement: "open" } },
-		slack: {
-			guestPolicy: {
-				dm: "drop",
-				channel: "allow",
-			},
-		},
-	});
+test("a member's DM is answered under the default fail-closed policy", async () => {
+	const { config, turns } = await gateway(() => "member response", { dmPolicy: "open" });
 	const slack = fakeSlackApi();
 	const adapter = liveGateway(config.socketPath, slack.api);
 	await adapter.connect();
-	const memberOrigin = slackMessageOrigin({ channel: "C1", user: "U_MEMBER", ts: "1726543210.000500" });
-	// Live inbound without explicit trust (older adapter) should compute it and allow members
 	const result = await adapter.requestInbound(
-		slackMessageId("C1", "1726543210.000500"),
-		memberOrigin,
+		slackMessageId("D1", "1726543210.000500"),
+		DM_ORIGIN,
 		"hello member",
-		{ mentioned: true, group: true, authorId: "U_MEMBER" }, // No trust field
+		{ mentioned: true, group: false, authorId: "U_MEMBER", trust: "member" },
 		"2026-09-17T00:00:10.000Z",
 	);
 	expect(result?.engaged).toBe(true);

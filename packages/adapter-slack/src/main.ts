@@ -1088,15 +1088,15 @@ export async function startSlackAdapter(
 	/**
 	 * Every path that hands a human message to the gateway (live, edit, recovery, slash
 	 * command) states the author's trust, so the gateway's guest policy cannot be skipped
-	 * by a recovered or edited message. Members carry no trust field.
+	 * by a recovered or edited message. Members are stated explicitly: the gateway treats
+	 * a missing trust field as unverified and, by default, fails closed on it.
 	 */
 	const withAuthorTrust = async <T extends EngagementContext>(
 		engagement: T,
 		userId: string | undefined,
 	): Promise<T> => {
 		if (userId === undefined) return engagement;
-		const trust = slackAuthorTrust(await directory.user(userId));
-		return trust === "member" ? engagement : { ...engagement, trust };
+		return { ...engagement, trust: slackAuthorTrust(await directory.user(userId)) };
 	};
 	const status = new WorkingStatus(api, log);
 	const live = config.liveReplies === true ? new LiveReplyTracker(api, log) : undefined;
