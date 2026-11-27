@@ -6,8 +6,14 @@ import { setTimeout as delay } from "node:timers/promises";
 import { ImagePreparationBudgetError } from "@gajae-gateway/images";
 import { DiscordImagePreparationError, imageSourceIdentity } from "../src/attachments";
 import { ImageOutbox, type PendingImage } from "../src/image-outbox";
-import { decideInbound, ReconnectingGateway } from "../src/main";
-import { loadRecoveryCursors, saveRecoveryCursors, snowflakeFromTimestamp } from "../src/recovery";
+import { decideInbound, type ImageOutcome, ReconnectingGateway } from "../src/main";
+import {
+	loadRecoveryCursors,
+	RECOVERY_RETRY_BASE_MS,
+	RECOVERY_RETRY_MAX_MS,
+	saveRecoveryCursors,
+	snowflakeFromTimestamp,
+} from "../src/recovery";
 
 const bot = { id: "bot" };
 const image = { data: "AQID", mimeType: "image/jpeg" as const };
@@ -123,6 +129,89 @@ function gateway(
 		undefined,
 		prepareImpl ?? (async () => ({ images: [image], notice: "" })),
 	);
+}
+
+/** Every delay `scheduleImageRetry`/`scheduleRecoveryRetry` can arm. */
+const RETRY_BACKOFF_MS = new Set(
+	Array.from({ length: 7 }, (_, index) => Math.min(RECOVERY_RETRY_MAX_MS, RECOVERY_RETRY_BASE_MS * 2 ** index)),
+);
+
+/**
+ * Hold the timers the adapter arms with the recovery backoff so the test fires the armed
+ * retry path itself. Every backoff-schedule timer is cleared and cancelled again at
+ * teardown, so neither a wall-clock delay nor a leaked pass can decide the assertion.
+ * Product sleeps on these paths are injected no-ops, so nothing awaited is held.
+ */
+function holdRetryTimers() {
+	const realSetTimeout = globalThis.setTimeout;
+	const handles: ReturnType<typeof setTimeout>[] = [];
+	const armed: Array<{ delay: number; fire: () => void }> = [];
+	const spy = spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+		const timer = realSetTimeout(...args);
+		timer.unref?.();
+		const delay = typeof args[1] === "number" ? args[1] : 0;
+		// Only the recovery backoff schedule is held; other product timers keep their
+		// schedule, and the runner's own test timeout stays intact.
+		if (!RETRY_BACKOFF_MS.has(delay)) return timer;
+		handles.push(timer);
+		clearTimeout(timer);
+		armed.push({
+			delay,
+			fire: () => (args[0] as unknown as (...rest: unknown[]) => void)(...args.slice(2)),
+		});
+		return timer;
+	}) as typeof setTimeout);
+	return {
+		/** One entry per retry timer armed at the backoff floor (the first re-arm). */
+		retries: () => armed.filter((entry) => entry.delay === RECOVERY_RETRY_BASE_MS),
+		cleanup() {
+			for (const handle of handles) clearTimeout(handle);
+			spy.mockRestore();
+		},
+	};
+}
+
+/** Capture every recovery pass this adapter starts so a fired retry can be joined. */
+function trackRecoveryPasses(adapter: ReconnectingGateway) {
+	const passes: Array<Promise<void>> = [];
+	const seam = adapter as unknown as { recoverMissedMessages(): Promise<void> };
+	const real = seam.recoverMissedMessages.bind(adapter);
+	seam.recoverMissedMessages = () => {
+		const pass = real();
+		passes.push(pass);
+		return pass;
+	};
+	return {
+		passes,
+		restore() {
+			seam.recoverMissedMessages = real;
+		},
+	};
+}
+
+/**
+ * Capture the closure each scheduled retry will run, so its outcome can be awaited. The
+ * fired timer invokes that closure synchronously before it yields, which makes the captured
+ * promise the authoritative completion of the armed path.
+ */
+function trackScheduledRetries(adapter: ReconnectingGateway) {
+	const outcomes = new Map<string, Promise<ImageOutcome>>();
+	const seam = adapter as unknown as {
+		scheduleImageRetry(id: string, channelId: string, retry: () => Promise<ImageOutcome>): void;
+	};
+	const real = seam.scheduleImageRetry.bind(adapter);
+	seam.scheduleImageRetry = (id, channelId, retry) =>
+		real(id, channelId, () => {
+			const outcome = retry();
+			outcomes.set(id, outcome);
+			return outcome;
+		});
+	return {
+		outcomes,
+		restore() {
+			seam.scheduleImageRetry = real;
+		},
+	};
 }
 
 test("recovery delivers an older durable image below the watermark before newer history text", async () => {
@@ -3116,3 +3205,372 @@ test("a budget-parked predecessor keeps the documented ordering exception", asyn
 		await rm(home, { recursive: true, force: true });
 	}
 }, 12_000);
+
+test("an armed image retry cannot overtake an older unavailable intent in the same conversation", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-retry-hold-"));
+	const held = holdRetryTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "dm-retry-hold";
+	const olderId = snowflakeFromTimestamp(Date.now() - 180_000);
+	const newerId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const watermark = snowflakeFromTimestamp(Date.now() - 60_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	const sent: string[] = [];
+	let sourceRepaired = false;
+	let newerAttempts = 0;
+	const denied = Object.assign(new Error("Missing Access"), { code: 50_001, status: 403 });
+	const channel = {
+		messages: {
+			fetch: async (query: unknown) => {
+				const single = singleFetchId(query);
+				if (single === undefined) return [];
+				if (single === olderId && !sourceRepaired) throw denied;
+				return dmMessage(single, channelId, true);
+			},
+		},
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: watermark },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: newerId, channelId, request: imageRequest(newerId, channelId), live: true },
+				{ messageId: olderId, channelId },
+			]),
+		);
+		// Constructed after the durable fixtures so its first cursor load sees them.
+		const adapter = gateway(
+			cursorPath,
+			async () => channel,
+			requests,
+			{},
+			async (verb, params) => {
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
+				if (verb !== "chat.send") return { engaged: false, turnId: null };
+				const messageId = (params as { messageId: string }).messageId;
+				// A per-payload rejection keeps the gateway link up: one failed attempt is
+				// enough to arm the intent's own retry closure without a reconnect. The gate
+				// is limited to the pre-repair phase so the ordered drain after the older
+				// intent is repaired is not poisoned by the arming failure.
+				if (messageId === newerId && !sourceRepaired && newerAttempts++ === 0)
+					throw Object.assign(new Error("payload too large"), { code: "payload_too_large" });
+				sent.push(messageId);
+				return { engaged: false, turnId: null };
+			},
+		);
+		const passes = trackRecoveryPasses(adapter);
+		const scheduled = trackScheduledRetries(adapter);
+		try {
+			const live = dmMessage(newerId, channelId, true);
+			const engagement = decideInbound(live as never, bot, {});
+			expect(engagement).toBeDefined();
+			// The prior live attempt fails, arming this intent's timer while the older
+			// requestless intent in the same conversation is still unavailable.
+			expect(await bounded(adapter.processImage(live as never, engagement!))).toBe("unavailable");
+			const retries = held.retries();
+			expect(retries).toHaveLength(1);
+			expect(retries[0].delay).toBe(RECOVERY_RETRY_BASE_MS);
+
+			retries[0].fire();
+			await bounded(passes.passes[0]);
+			// The recovery pass itself held the newer intent behind the unavailable older one.
+			expect(sent).toEqual([]);
+			const overtaking = scheduled.outcomes.get(newerId);
+			if (overtaking) await bounded(overtaking);
+			// The timer's individual closure ran afterwards and must not send past it either.
+			expect(sent).toEqual([]);
+			const rows = JSON.parse(await readFile(outboxPath, "utf8")) as PendingImage[];
+			expect(rows.find((entry) => entry.messageId === olderId)?.failureAt).toBeNumber();
+			expect(rows.find((entry) => entry.messageId === newerId)?.completed).toBeUndefined();
+
+			sourceRepaired = true;
+			await bounded(adapter.recoverMissedMessages());
+			await eventually(() => sent.includes(olderId) && sent.includes(newerId));
+			expect(sent).toEqual([olderId, newerId]);
+		} finally {
+			scheduled.restore();
+			passes.restore();
+		}
+	} finally {
+		held.cleanup();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 15_000);
+
+test("an armed image retry still sends when its unavailable predecessor is in another conversation", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-retry-unrelated-"));
+	const held = holdRetryTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const blockedId = "dm-retry-blocked";
+	const healthyId = "dm-retry-healthy";
+	const olderId = snowflakeFromTimestamp(Date.now() - 180_000);
+	const newerId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const watermark = snowflakeFromTimestamp(Date.now() - 60_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	const sent: string[] = [];
+	let newerAttempts = 0;
+	const denied = Object.assign(new Error("Missing Access"), { code: 50_001, status: 403 });
+	const channelFor = (channelId: string) => ({
+		messages: {
+			fetch: async (query: unknown) => {
+				const single = singleFetchId(query);
+				if (single === undefined) return [];
+				if (channelId === blockedId && single === olderId) throw denied;
+				return dmMessage(single, channelId, true);
+			},
+		},
+	});
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [blockedId]: watermark, [healthyId]: watermark },
+			knownDms: {
+				[blockedId]: { lastSeenAt: new Date().toISOString(), seq: 1 },
+				[healthyId]: { lastSeenAt: new Date().toISOString(), seq: 2 },
+			},
+			sequence: 2,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: olderId, channelId: blockedId, request: imageRequest(olderId, blockedId) },
+				{ messageId: newerId, channelId: healthyId, request: imageRequest(newerId, healthyId), live: true },
+			]),
+		);
+		// Constructed after the durable fixtures so its first cursor load sees them.
+		const adapter = gateway(
+			cursorPath,
+			async (id) => channelFor(id),
+			requests,
+			{},
+			async (verb, params) => {
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
+				if (verb !== "chat.send") return { engaged: false, turnId: null };
+				const messageId = (params as { messageId: string }).messageId;
+				if (messageId === newerId && newerAttempts++ === 0)
+					throw Object.assign(new Error("payload too large"), { code: "payload_too_large" });
+				sent.push(messageId);
+				return { engaged: false, turnId: null };
+			},
+		);
+		const passes = trackRecoveryPasses(adapter);
+		const scheduled = trackScheduledRetries(adapter);
+		try {
+			const live = dmMessage(newerId, healthyId, true);
+			const engagement = decideInbound(live as never, bot, {});
+			expect(engagement).toBeDefined();
+			expect(await bounded(adapter.processImage(live as never, engagement!))).toBe("unavailable");
+			const retries = held.retries();
+			expect(retries).toHaveLength(1);
+			retries[0].fire();
+			await bounded(passes.passes[0]);
+			const overtaking = scheduled.outcomes.get(newerId);
+			if (overtaking) await bounded(overtaking);
+			// A blocked conversation must not hold a healthy one through the timer path either.
+			expect(sent).toEqual([newerId]);
+			const rows = JSON.parse(await readFile(outboxPath, "utf8")) as PendingImage[];
+			expect(rows.find((entry) => entry.messageId === olderId)?.failureAt).toBeNumber();
+			expect(rows.find((entry) => entry.messageId === olderId)?.completed).toBeUndefined();
+			expect(rows.find((entry) => entry.messageId === newerId)?.completed).toBe(true);
+		} finally {
+			scheduled.restore();
+			passes.restore();
+		}
+	} finally {
+		held.cleanup();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 15_000);
+
+test("an armed image retry still sends past a budget-parked predecessor", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-retry-parked-"));
+	const held = holdRetryTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "dm-retry-parked";
+	const olderId = snowflakeFromTimestamp(Date.now() - 180_000);
+	const newerId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const watermark = snowflakeFromTimestamp(Date.now() - 60_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	const sent: string[] = [];
+	let newerAttempts = 0;
+	const denied = Object.assign(new Error("Missing Access"), { code: 50_001, status: 403 });
+	const channel = {
+		messages: {
+			fetch: async (query: unknown) => {
+				const single = singleFetchId(query);
+				if (single === undefined) return [];
+				if (single === olderId) throw denied;
+				return dmMessage(single, channelId, true);
+			},
+		},
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: watermark },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: newerId, channelId, request: imageRequest(newerId, channelId), live: true },
+				{ messageId: olderId, channelId, deferred: true },
+			]),
+		);
+		// Constructed after the durable fixtures so its first cursor load sees them.
+		const adapter = gateway(
+			cursorPath,
+			async () => channel,
+			requests,
+			{},
+			async (verb, params) => {
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
+				if (verb !== "chat.send") return { engaged: false, turnId: null };
+				const messageId = (params as { messageId: string }).messageId;
+				if (messageId === newerId && newerAttempts++ === 0)
+					throw Object.assign(new Error("payload too large"), { code: "payload_too_large" });
+				sent.push(messageId);
+				return { engaged: false, turnId: null };
+			},
+		);
+		const passes = trackRecoveryPasses(adapter);
+		const scheduled = trackScheduledRetries(adapter);
+		try {
+			const live = dmMessage(newerId, channelId, true);
+			const engagement = decideInbound(live as never, bot, {});
+			expect(engagement).toBeDefined();
+			expect(await bounded(adapter.processImage(live as never, engagement!))).toBe("unavailable");
+			const retries = held.retries();
+			expect(retries).toHaveLength(1);
+			retries[0].fire();
+			await bounded(passes.passes[0]);
+			const overtaking = scheduled.outcomes.get(newerId);
+			if (overtaking) await bounded(overtaking);
+			// Parked backpressure is not deliverable work and must not hold the newer send.
+			expect(sent).toEqual([newerId]);
+			const rows = JSON.parse(await readFile(outboxPath, "utf8")) as PendingImage[];
+			expect(rows.find((entry) => entry.messageId === olderId)?.deferred).toBe(true);
+			expect(rows.find((entry) => entry.messageId === olderId)?.completed).toBeUndefined();
+			expect(rows.find((entry) => entry.messageId === newerId)?.completed).toBe(true);
+		} finally {
+			scheduled.restore();
+			passes.restore();
+		}
+	} finally {
+		held.cleanup();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 15_000);
+
+test("a history-armed image retry does not bypass a horizon that a restore moved behind it", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-retry-horizon-"));
+	const held = holdRetryTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "dm-retry-horizon";
+	const olderId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const newerId = snowflakeFromTimestamp(Date.now() - 60_000);
+	const watermark = snowflakeFromTimestamp(Date.now() - 90_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	const sent: string[] = [];
+	let identity = "old-db";
+	let olderTextBroken = true;
+	let newerAttempts = 0;
+	const channel = {
+		messages: {
+			fetch: async (query: unknown) => {
+				const single = singleFetchId(query);
+				if (single !== undefined) return dmMessage(single, channelId, single === newerId);
+				const after = historyAfter(query);
+				if (after === undefined) return [];
+				// The first pass starts above the older message; the restore rewind extends the
+				// replay window behind it, so the next pass must deliver it first.
+				if (BigInt(after) < BigInt(olderId))
+					return [dmMessage(olderId, channelId), dmMessage(newerId, channelId, true)];
+				if (BigInt(after) < BigInt(newerId)) return [dmMessage(newerId, channelId, true)];
+				return [];
+			},
+		},
+	};
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			gatewayDbIdentity: "old-db",
+			recoveredThrough: { [channelId]: watermark },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([{ messageId: newerId, channelId, request: imageRequest(newerId, channelId) }]),
+		);
+		// Constructed after the durable fixtures so its first cursor load sees them.
+		const adapter = gateway(
+			cursorPath,
+			async () => channel,
+			requests,
+			{},
+			async (verb, params) => {
+				if (verb === "gateway.status") return { database: { identity } };
+				if (verb !== "chat.send") return { engaged: false, turnId: null };
+				const messageId = (params as { messageId: string }).messageId;
+				if (messageId === olderId) {
+					if (olderTextBroken) throw Object.assign(new Error("temporarily unavailable"), { status: 503 });
+					sent.push(messageId);
+					return { engaged: false, turnId: null };
+				}
+				if (messageId === newerId && newerAttempts++ === 0)
+					throw Object.assign(new Error("payload too large"), { code: "payload_too_large" });
+				sent.push(messageId);
+				return { engaged: false, turnId: null };
+			},
+		);
+		const passes = trackRecoveryPasses(adapter);
+		const scheduled = trackScheduledRetries(adapter);
+		try {
+			// The history pass reaches the newer intent and its delivery fails, so the armed
+			// retry keeps the ordered context of a pass that never completed the watermark.
+			await bounded(adapter.recoverMissedMessages());
+			expect(sent).toEqual([]);
+			const retries = held.retries();
+			expect(retries).toHaveLength(2);
+			// The delivery's image retry is armed before the pass arms its own backoff.
+			const imageRetry = retries[0];
+			expect(imageRetry.delay).toBe(RECOVERY_RETRY_BASE_MS);
+
+			// A gateway database restore rewinds the watermark behind the newer intent and
+			// re-exposes an older message that has to be replayed first.
+			identity = "restored-db";
+			imageRetry.fire();
+			await bounded(passes.passes[1]);
+			// The post-restore history pass held the newer intent above the rewound horizon.
+			expect(sent).toEqual([]);
+			const overtaking = scheduled.outcomes.get(newerId);
+			if (overtaking) await bounded(overtaking);
+			// The armed retry may not reuse the stale ordered context to overtake it.
+			expect(sent).toEqual([]);
+			const rows = JSON.parse(await readFile(outboxPath, "utf8")) as PendingImage[];
+			expect(rows.find((entry) => entry.messageId === newerId)?.completed).toBeUndefined();
+
+			olderTextBroken = false;
+			await bounded(adapter.recoverMissedMessages());
+			await eventually(() => sent.includes(olderId) && sent.includes(newerId));
+			expect(sent).toEqual([olderId, newerId]);
+		} finally {
+			scheduled.restore();
+			passes.restore();
+		}
+	} finally {
+		held.cleanup();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 15_000);

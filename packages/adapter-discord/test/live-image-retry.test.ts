@@ -6,13 +6,22 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import { Client } from "discord.js";
-import { engagementForMessage, ReconnectingGateway, startDiscordAdapter } from "../src/main";
-import { saveRecoveryCursors, snowflakeFromTimestamp } from "../src/recovery";
+import { DiscordImagePreparationError } from "../src/attachments";
+import { engagementForMessage, type ImageOutcome, ReconnectingGateway, startDiscordAdapter } from "../src/main";
+import {
+	RECOVERY_MAX_ATTEMPTS,
+	RECOVERY_RETRY_BASE_MS,
+	RECOVERY_RETRY_MAX_MS,
+	saveRecoveryCursors,
+	snowflakeFromTimestamp,
+} from "../src/recovery";
 
 // The same valid PNG fixture used by the other adapter image tests.
 /** discord.js accepts a bare id or `{ message, force }`; the fake must accept both. */
 const singleFetchId = (query: unknown): string | undefined =>
 	typeof query === "string" ? query : (query as { message?: string } | undefined)?.message;
+const historyAfter = (query: unknown): string | undefined =>
+	typeof query === "string" ? undefined : (query as { after?: string } | undefined)?.after;
 
 const png = Uint8Array.from(
 	Buffer.from(
@@ -51,6 +60,104 @@ function presencePorts() {
 			clear: () => {},
 		},
 	};
+}
+
+/** Every delay `scheduleImageRetry`/`scheduleRecoveryRetry` can arm. */
+const RETRY_BACKOFF_MS = new Set(
+	Array.from({ length: 7 }, (_, index) => Math.min(RECOVERY_RETRY_MAX_MS, RECOVERY_RETRY_BASE_MS * 2 ** index)),
+);
+
+/**
+ * Hold the timers the adapter arms with the recovery backoff so the test fires the armed
+ * retry path itself. Every backoff-schedule timer is cleared and cancelled again at
+ * teardown, so neither a wall-clock delay nor a leaked pass can decide the assertion.
+ * Sleep on these paths is injected, so nothing awaited is held.
+ */
+function holdRetryTimers() {
+	const realSetTimeout = globalThis.setTimeout;
+	const handles: ReturnType<typeof setTimeout>[] = [];
+	const armed: Array<{ delay: number; fire: () => void }> = [];
+	const spy = spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+		const timer = realSetTimeout(...args);
+		timer.unref?.();
+		const delay = typeof args[1] === "number" ? args[1] : 0;
+		// Only the recovery backoff schedule is held; other product timers keep their
+		// schedule, and the runner's own test timeout stays intact.
+		if (!RETRY_BACKOFF_MS.has(delay)) return timer;
+		handles.push(timer);
+		clearTimeout(timer);
+		armed.push({
+			delay,
+			fire: () => (args[0] as unknown as (...rest: unknown[]) => void)(...args.slice(2)),
+		});
+		return timer;
+	}) as typeof setTimeout);
+	return {
+		/** One entry per retry timer armed at the backoff floor (the first re-arm). */
+		retries: () => armed.filter((entry) => entry.delay === RECOVERY_RETRY_BASE_MS),
+		cleanup() {
+			for (const handle of handles) clearTimeout(handle);
+			spy.mockRestore();
+		},
+	};
+}
+
+/** Capture every recovery pass this adapter starts so a fired retry can be joined. */
+function trackRecoveryPasses(adapter: ReconnectingGateway) {
+	const passes: Array<Promise<void>> = [];
+	const seam = adapter as unknown as { recoverMissedMessages(): Promise<void> };
+	const real = seam.recoverMissedMessages.bind(adapter);
+	seam.recoverMissedMessages = () => {
+		const pass = real();
+		passes.push(pass);
+		return pass;
+	};
+	return {
+		passes,
+		restore() {
+			seam.recoverMissedMessages = real;
+		},
+	};
+}
+
+/**
+ * Capture the closure each scheduled retry will run, so its outcome can be awaited. The
+ * fired timer invokes that closure synchronously before it yields, which makes the captured
+ * promise the authoritative completion of the armed path.
+ */
+function trackScheduledRetries(adapter: ReconnectingGateway) {
+	const outcomes = new Map<string, Promise<ImageOutcome>>();
+	const seam = adapter as unknown as {
+		scheduleImageRetry(id: string, channelId: string, retry: () => Promise<ImageOutcome>): void;
+	};
+	const real = seam.scheduleImageRetry.bind(adapter);
+	seam.scheduleImageRetry = (id, channelId, retry) =>
+		real(id, channelId, () => {
+			const outcome = retry();
+			outcomes.set(id, outcome);
+			return outcome;
+		});
+	return {
+		outcomes,
+		restore() {
+			seam.scheduleImageRetry = real;
+		},
+	};
+}
+
+async function bounded<T>(promise: Promise<T>, ms = 8_000): Promise<T> {
+	return Promise.race([
+		promise,
+		delay(ms).then(() => {
+			throw new Error("Timed out waiting for the retried image");
+		}),
+	]);
+}
+
+async function eventually(predicate: () => boolean, ms = 8_000) {
+	const deadline = Date.now() + ms;
+	while (!predicate() && Date.now() < deadline) await delay(25);
+	expect(predicate()).toBe(true);
 }
 
 test("a transient image download failure retries a live new DM without reconnecting or sending text alone", async () => {
@@ -341,6 +448,158 @@ test("a persisted live image replayed after restart does not restore presence", 
 		await gateway.recoverMissedMessages();
 		await gateway.cursorsFlushed;
 		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([id]);
+		expect(ports.typing).toEqual([]);
+		expect(ports.armed).toEqual([]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+}, 15_000);
+
+test("a same-process live image retry arms presence once when the timer pass takes over", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-live-image-takeover-"));
+	const held = holdRetryTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	await saveRecoveryCursors(cursorPath, {
+		recoveredThrough: {},
+		quarantined: {},
+		knownDms: {},
+		attempts: {},
+		deadLetters: [],
+		deadLetterDigest: {},
+		sequence: 0,
+		gatewayDbIdentity: "test-db",
+	});
+	const ports = presencePorts();
+	const requests: Array<{ verb: string; params: any }> = [];
+	const sent: string[] = [];
+	let preparations = 0;
+	const mentioned = {
+		id: snowflakeFromTimestamp(Date.now() - 90_000),
+		content: "<@bot> describe this",
+		author: { id: "owner", username: "owner", bot: false },
+		channel: { id: "channel-thread", name: "general" },
+		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo.png" }],
+		startThread: async () => ({ id: "thread-live" }),
+	};
+	const channel = {
+		messages: {
+			fetch: async (query: unknown) => {
+				const single = singleFetchId(query);
+				if (single !== undefined) return mentioned;
+				const after = historyAfter(query);
+				// The bootstrap window starts behind this mention; later pages are empty.
+				return after === undefined || BigInt(after) < BigInt(mentioned.id) ? [mentioned] : [];
+			},
+		},
+	};
+	const gateway = new ReconnectingGateway(
+		"unused-socket",
+		{ channels: { fetch: async () => channel } } as never,
+		{
+			token: "unused",
+			tokenFile: "unused",
+			configPath: "unused",
+			channels: { "channel-thread": { engagement: "open" } },
+		} as never,
+		ports.typingPort as never,
+		ports.statusPort as never,
+		cursorPath,
+		() => bot,
+		{
+			request: async (verb: string, params: unknown) => {
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
+				if (verb !== "chat.send") return { engaged: false, turnId: null };
+				requests.push({ verb, params });
+				sent.push((params as { messageId: string }).messageId);
+				return { engaged: true, turnId: "fresh" };
+			},
+		} as never,
+		async () => {},
+		undefined,
+		undefined,
+		async () => {
+			preparations++;
+			if (preparations <= RECOVERY_MAX_ATTEMPTS) throw new DiscordImagePreparationError("retryable");
+			return { images: [image], notice: "" };
+		},
+	);
+	const passes = trackRecoveryPasses(gateway);
+	const scheduled = trackScheduledRetries(gateway);
+	try {
+		// The live attempt burns its whole in-invocation budget before the timer runs.
+		expect(await bounded(gateway.processImage(mentioned as never, engagementForMessage(mentioned as never, bot)))).toBe(
+			"unavailable",
+		);
+		expect(preparations).toBe(RECOVERY_MAX_ATTEMPTS);
+		expect(ports.typing).toEqual([]);
+		expect(ports.armed).toEqual([]);
+		const retries = held.retries();
+		expect(retries).toHaveLength(1);
+
+		retries[0].fire();
+		await bounded(passes.passes[0]);
+		// Recovery acquired the still-live row and prepared it successfully on the next
+		// attempt; the engaged acknowledgement must decorate the live turn exactly once,
+		// on the thread this mention created.
+		expect(sent).toEqual([mentioned.id]);
+		expect(ports.typing).toEqual(["thread-live"]);
+		expect(ports.armed).toEqual([
+			{ conversationId: "thread-live", messageId: mentioned.id, channelId: "channel-thread" },
+		]);
+		// The original owner's closure must not restore presence a second time.
+		const overtaking = scheduled.outcomes.get(mentioned.id);
+		if (overtaking) await bounded(overtaking);
+		expect(ports.typing).toEqual(["thread-live"]);
+		expect(ports.armed).toHaveLength(1);
+	} finally {
+		scheduled.restore();
+		passes.restore();
+		held.cleanup();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 15_000);
+
+test("a duplicate gateway engagement without a turn does not arm live presence", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-live-image-duplicate-turn-"));
+	const cursorPath = join(home, "recovery-cursor.json");
+	await saveRecoveryCursors(cursorPath, {
+		recoveredThrough: {},
+		quarantined: {},
+		knownDms: {},
+		attempts: {},
+		deadLetters: [],
+		deadLetterDigest: {},
+		sequence: 0,
+		gatewayDbIdentity: "test-db",
+	});
+	const ports = presencePorts();
+	const requests: Array<{ verb: string; params: any }> = [];
+	const channel = { messages: { fetch: async () => [] } };
+	const gateway = new ReconnectingGateway(
+		"unused-socket",
+		{ channels: { fetch: async () => channel } } as never,
+		{ token: "unused", tokenFile: "unused", configPath: "unused", channels: {} } as never,
+		ports.typingPort as never,
+		ports.statusPort as never,
+		cursorPath,
+		() => bot,
+		{
+			request: async (verb: string, params: unknown) => {
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
+				requests.push({ verb, params });
+				// The gateway already owns a turn for this delivery: no new turn was opened.
+				return { engaged: true, turnId: null };
+			},
+		} as never,
+		async () => {},
+		undefined,
+		undefined,
+		async () => ({ images: [image], notice: "" }),
+	);
+	try {
+		const live = dmImageMessage(snowflakeFromTimestamp(Date.now() - 90_000));
+		expect(await gateway.processImage(live as never, engagementForMessage(live as never, bot))).toBe("acked");
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toHaveLength(1);
 		expect(ports.typing).toEqual([]);
 		expect(ports.armed).toEqual([]);
 	} finally {

@@ -1935,6 +1935,13 @@ export class ReconnectingGateway {
 	readonly #imageAdmissionFailures = new Map<string, number>();
 	readonly #imageTurnOpen = new Set<string>();
 	/**
+	 * Message ids this process admitted as live image ingress and has not settled yet.
+	 * Presence eligibility is process-local: the persisted `live:true` marker survives a
+	 * restart and proves only where an intent began, so it cannot grant typing/status to a
+	 * replay. A recovery pass that takes over an in-process live intent consults this set.
+	 */
+	readonly #liveImageIds = new Set<string>();
+	/**
 	 * Synchronous delete/edit fence for an owner that is still admitting its first
 	 * intent. The journal cannot hold the fence (the row may not exist yet), so it
 	 * lives in memory until the terminal row is durable; it never creates state for
@@ -2158,6 +2165,7 @@ export class ReconnectingGateway {
 					...(sourceOrigin.kind === "dm" ? { dm: true } : {}),
 				};
 				await this.#imageOutbox.put(entry);
+				if (!recovered) this.rememberLiveImage(entry.messageId);
 				this.#imageAdmissionFailures.delete(message.id);
 				this.#imageUnsent.delete(message.id);
 			}
@@ -2237,6 +2245,10 @@ export class ReconnectingGateway {
 			return "skip";
 		}
 		if (isImageIntentExpired(entry)) return this.terminateImage(entry, "image intent unresolved for 24 hours");
+		// Live ingress and every independent recovery dispatch are separate owners: none of
+		// them carries the batch pass's per-channel cursor, so each asks the journal before
+		// preparing bytes or sending. The batch loops keep their own hold to avoid this work.
+		if (await this.hasUnresolvedImagePredecessor(entry)) return this.deferImageFailure(entry);
 		await turn;
 		if (entry.request) return this.sendPendingImage(entry, livePresence);
 		let prepared: { readonly images: PromptImage[] } | undefined;
@@ -2398,6 +2410,36 @@ export class ReconnectingGateway {
 		const watermark = cursors.recoveredThrough[entry.channelId] ?? cursors.quarantined[entry.channelId]?.watermark;
 		const horizon = watermark ?? snowflakeFromTimestamp(Date.now() - RECOVERY_BOOTSTRAP_LOOKBACK_MS);
 		return snowflakeIsAfter(entry.messageId, horizon);
+	}
+
+	/** Record that this process admitted the intent from live ingress. */
+	private rememberLiveImage(messageId: string): void {
+		this.#liveImageIds.add(messageId);
+		if (this.#liveImageIds.size > 10_000) this.#liveImageIds.delete(this.#liveImageIds.values().next().value as string);
+	}
+
+	/**
+	 * True when an older, still deliverable intent in the same conversation has not settled.
+	 * The batch pass holds its rows with a per-channel cursor, but a live dispatch, a
+	 * scheduled retry, and a direct journal replay are independent owners with no such
+	 * cursor, so each asks this before preparing or sending. Parked (budget-backoff) rows are
+	 * not deliverable work and keep the documented exception; completed and terminal rows are
+	 * resolved evidence and never block. An unreadable journal cannot prove ordering, so it
+	 * holds the intent retryable instead of sending out of order.
+	 */
+	private async hasUnresolvedImagePredecessor(entry: PendingImage): Promise<boolean> {
+		let pending: readonly PendingImage[];
+		try {
+			pending = await this.#imageOutbox.load();
+		} catch {
+			return true;
+		}
+		for (const candidate of pending) {
+			if (candidate.messageId === entry.messageId || candidate.channelId !== entry.channelId) continue;
+			if (candidate.completed || candidate.terminal || candidate.deferred === true) continue;
+			if (snowflakeIsAfter(entry.messageId, candidate.messageId)) return true;
+		}
+		return false;
 	}
 
 	/** Record a transient failure and enforce the 24h intent deadline on every retry. */
@@ -2621,6 +2663,7 @@ export class ReconnectingGateway {
 
 	private cleanupImageState(id: string): void {
 		this.#imageAdmissionFailures.delete(id);
+		this.#liveImageIds.delete(id);
 		const timer = this.#imageRetries.get(id);
 		if (timer) clearTimeout(timer);
 		this.#imageRetries.delete(id);
@@ -2735,10 +2778,13 @@ export class ReconnectingGateway {
 			try {
 				const response = await client.request<{ engaged?: boolean; turnId?: string | null }>("chat.send", request);
 				declined = response?.engaged === false;
-				if (response?.engaged && livePresence) {
-					// Presence belongs to a currently live owner's engaged acknowledgement.
-					// A persisted `live:true`, a recovered/restarted replay, an explicitly
-					// declined send, or a duplicate owner all leave typing/status untouched.
+				// Presence belongs to a message this process admitted as live and whose
+				// acknowledgement opened a fresh turn. The persisted `live:true` marker is not
+				// eligibility (a restart or restore replay must stay silent), and a duplicate
+				// delivery reports engaged:true with turnId:null because the gateway already owns
+				// that turn; decorating it again would double the typing/status cycle.
+				const liveEligible = livePresence || this.#liveImageIds.has(entry.messageId);
+				if (liveEligible && response?.engaged && typeof response.turnId === "string" && response.turnId !== "") {
 					const origin = request.origin as OriginRef;
 					this.status?.arm(
 						origin.conversationId,
@@ -2817,6 +2863,10 @@ export class ReconnectingGateway {
 					if (!current.audited) await this.recordTerminalImage(current, "image intent was previously rejected");
 					return "skip";
 				}
+				// A scheduled retry and any direct journal replay are independent owners: they
+				// have no batch cursor to hold them, so they must ask the journal before
+				// preparing or sending. This is the hold a timer used to bypass.
+				if (await this.hasUnresolvedImagePredecessor(current)) return this.deferImageFailure(current);
 				if (current.request) {
 					if (
 						!ordered &&
@@ -2873,8 +2923,11 @@ export class ReconnectingGateway {
 			},
 			// A scheduled retry runs later than the walk that produced `source`, so that
 			// snapshot must not become evidence a replay verification trusts. Dropping it
-			// makes the retry re-read the source through the forced fetch.
-			() => this.retryPendingImage(entry, undefined, ordered, liveRetry, livePresence),
+			// makes the retry re-read the source through the forced fetch. The armed retry
+			// also outlives the pass's ordering context: retaining `ordered` would let it skip
+			// every later horizon and predecessor hold for the rest of the process, so the
+			// retry re-evaluates ordering against the state where it actually runs.
+			() => this.retryPendingImage(entry, undefined, false, liveRetry, livePresence),
 		);
 	}
 
