@@ -1483,14 +1483,13 @@ function settleMonitorBatch(database: Store, deliveryId: string, stage: MonitorE
 function recentConversation(
 	store: Store,
 	originKey: string,
-	conversationId: string,
 	limit: number,
 	sinceIso: string,
 ): Array<{ id?: string; at: string; author: string; body: string }> {
 	const inbound = store.inbox.recentContext(originKey, limit, sinceIso);
 	const floorAt = [store.inbox.contextFloorAt(originKey) ?? "", sinceIso].sort().at(-1) ?? sinceIso;
 	const replies = store.outbox
-		.confirmedConversation(conversationId, floorAt, limit)
+		.confirmedConversation(originKey, floorAt, limit)
 		.map((row) => {
 			const text = (JSON.parse(row.payload_json) as { text?: unknown }).text;
 			return { at: row.created_at, author: "you", body: typeof text === "string" ? text : "" };
@@ -3511,7 +3510,6 @@ async function createInboundTurnLifecycle(
 			? recentConversation(
 					options.database,
 					key,
-					origin.conversationId,
 					RECENT_HISTORY_MAX,
 					new Date(Date.now() - RECENT_HISTORY_WINDOW_MS).toISOString(),
 				)
@@ -3695,7 +3693,6 @@ async function createInboundTurnLifecycle(
 			recentConversation(
 				options.database,
 				key,
-				origin.conversationId,
 				RECENT_HISTORY_MAX,
 				new Date(Date.now() - RECENT_HISTORY_WINDOW_MS).toISOString(),
 			),

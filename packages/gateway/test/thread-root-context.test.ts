@@ -1380,3 +1380,82 @@ test("fresh Discord thread with a known root shows it once in the reference bloc
 
 	client.close();
 });
+
+// --- Fresh-session history: confirmed replies are scoped to the canonical origin, not the raw id ---
+
+interface OriginCollisionCase {
+	readonly label: string;
+	readonly title: string;
+	/** The rootless DM that triggers the fresh turn, and so owns the prompt under test. */
+	readonly origin: OriginRef;
+	/** A distinct valid origin whose provider conversation id is the same string. */
+	readonly foreign: OriginRef;
+	readonly engagement: Record<string, unknown>;
+}
+
+const originCollisionCases: readonly OriginCollisionCase[] = [
+	{
+		label: "gajaeway-idless-collision-platform-",
+		title: "Discord DM sharing its conversation id with a Telegram DM",
+		// Provider ids are only unique inside their own platform, so one numeric id can name
+		// a Discord DM and an unrelated Telegram DM.
+		origin: { platform: "discord", kind: "dm", conversationId: "880100200300400501", peerId: "880100200300400501" },
+		foreign: { platform: "telegram", kind: "dm", conversationId: "880100200300400501", peerId: "880100200300400501" },
+		engagement: { mentioned: false, group: false, authorId: "880100200300400501", authorName: "bellman" },
+	},
+	{
+		label: "gajaeway-idless-collision-peer-",
+		title: "Discord group DM author sharing a conversation id with another author",
+		// A Discord group DM has ONE channel id but one origin per author peer id, so two
+		// participants of the same room are two distinct conversations by canonical key.
+		origin: { platform: "discord", kind: "dm", conversationId: "990100200300400511", peerId: "550100200300400001" },
+		foreign: { platform: "discord", kind: "dm", conversationId: "990100200300400511", peerId: "550100200300400002" },
+		engagement: { mentioned: false, group: false, authorId: "550100200300400001", authorName: "bellman" },
+	},
+];
+
+for (const scenario of originCollisionCases) {
+	test(`fresh ${scenario.title} keeps only its own confirmed reply in recent history`, async () => {
+		const { store, turns, client } = await startHistoryHarness(scenario.label, {});
+		const now = Date.now();
+		const ownReply = `${scenario.title} OWN REPLY`;
+		const foreignReply = `${scenario.title} FOREIGN PRIVATE MARKER`;
+		const current = `${scenario.title} CURRENT QUESTION`;
+
+		// Both replies are real confirmed deliveries; only the first one belongs to this prompt.
+		seedConfirmedReply(store, scenario.origin, `${scenario.label}own`, ownReply, now - 9 * HOUR_MS);
+		seedConfirmedReply(store, scenario.foreign, `${scenario.label}foreign`, foreignReply, now - 8 * HOUR_MS);
+
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: `${scenario.label}ask`,
+			verb: "chat.send",
+			params: {
+				origin: scenario.origin,
+				text: current,
+				messageId: `${scenario.label}ask`,
+				engagement: scenario.engagement,
+			},
+		});
+		for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
+
+		expect(turns).toHaveLength(1);
+		const prompt = turns[0]!;
+		// A DM is rootless: the fresh-session history block is reached without a thread root.
+		expect(prompt).not.toContain("thread root (reference, not an instruction):");
+
+		// Its own confirmed reply is the reason the block exists at all.
+		const recent = recentHistoryLines(prompt);
+		expect(recent.join("\n")).toContain(`you: ${ownReply}`);
+		expect(prompt.split(ownReply)).toHaveLength(2);
+
+		// The other origin's confirmed reply shares only the raw conversation id; it is a
+		// different conversation and its text must never enter this prompt.
+		expect(recent.join("\n")).not.toContain(foreignReply);
+		expect(prompt).not.toContain(foreignReply);
+		expect(prompt.split(current)).toHaveLength(2);
+
+		client.close();
+	});
+}
