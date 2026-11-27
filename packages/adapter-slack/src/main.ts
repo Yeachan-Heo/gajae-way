@@ -25,7 +25,7 @@ import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 import { deliveryFailureIsAmbiguous, OutboundLimiter, SlackApiError, SlackWebApi } from "./api";
 import { describeInboundBody, isSlackNativeImage, prepareSlackImages, type SlackFileCarrier } from "./attachments";
-import { isSlackGuest, SlackDirectory } from "./author";
+import { slackAuthorTrust, SlackDirectory } from "./author";
 import { adapterHome, type LoadedSlackAdapterConfig, loadSlackAdapterConfig } from "./config";
 import { SlackFileShares } from "./file-shares";
 import { describePanelResponse, type SlackBlockAction } from "./interactions";
@@ -1085,6 +1085,19 @@ export async function startSlackAdapter(
 		...(auth.team ? { teamName: auth.team } : {}),
 	};
 	const directory = new SlackDirectory(api);
+	/**
+	 * Every path that hands a human message to the gateway (live, edit, recovery, slash
+	 * command) states the author's trust, so the gateway's guest policy cannot be skipped
+	 * by a recovered or edited message. Members carry no trust field.
+	 */
+	const withAuthorTrust = async <T extends EngagementContext>(
+		engagement: T,
+		userId: string | undefined,
+	): Promise<T> => {
+		if (userId === undefined) return engagement;
+		const trust = slackAuthorTrust(await directory.user(userId));
+		return trust === "member" ? engagement : { ...engagement, trust };
+	};
 	const status = new WorkingStatus(api, log);
 	const live = config.liveReplies === true ? new LiveReplyTracker(api, log) : undefined;
 	// Preserve the first observed routing decision across successive mention edits, and
@@ -1264,14 +1277,10 @@ export async function startSlackAdapter(
 						messageOrigins.get(messageId),
 					);
 					if (editToSend) {
-						// Classify guest status from the edited message's author (fail-closed)
-						if (envelope.message?.user) {
-							const user = await directory.user(envelope.message.user);
-							// Treat as guest if: is_restricted/is_ultra_restricted/is_stranger OR users.info failed (undefined)
-							if (isSlackGuest(user) || user === undefined) {
-								editToSend = { ...editToSend, engagement: { ...editToSend.engagement, trust: "guest" } };
-							}
-						}
+						editToSend = {
+							...editToSend,
+							engagement: await withAuthorTrust(editToSend.engagement, envelope.message?.user),
+						};
 						rememberOrigin(messageId, editToSend.origin);
 						gateway.sendEdit(
 							editToSend.messageId,
@@ -1288,14 +1297,7 @@ export async function startSlackAdapter(
 				let engagement = withRootExcerpt(
 					engagementForMessage(message, admitted.origin, identity, directory, config.channels),
 				);
-				// Classify guest status from Slack user info (fail-closed: treat as guest if is_restricted/is_ultra_restricted/is_stranger OR users.info failed)
-				if (message.user) {
-					const user = await directory.user(message.user);
-					// Treat as guest if: is_restricted/is_ultra_restricted/is_stranger OR users.info failed (undefined)
-					if (isSlackGuest(user) || user === undefined) {
-						engagement = { ...engagement, trust: "guest" };
-					}
-				}
+				engagement = await withAuthorTrust(engagement, message.user);
 				const origin = routedOrigin;
 				let prepared: Awaited<ReturnType<typeof prepareSlackImages>> | undefined;
 				let sent: RecoveredSend;
@@ -1353,12 +1355,20 @@ export async function startSlackAdapter(
 			// `/model` read, so a rebind looked like it was accepted and changed nothing.
 			const argument = (command.text ?? "").trim();
 			const commandLine = argument ? `${command.command} ${argument}` : command.command;
-			const sent = await gateway.requestRecovered(`slash-${command.trigger_id}`, origin, commandLine, {
-				mentioned: true,
-				group: origin.kind !== "dm",
-				authorId: command.user_id,
-				...(command.user_name ? { authorHandle: command.user_name } : {}),
-			});
+			const sent = await gateway.requestRecovered(
+				`slash-${command.trigger_id}`,
+				origin,
+				commandLine,
+				await withAuthorTrust(
+					{
+						mentioned: true,
+						group: origin.kind !== "dm",
+						authorId: command.user_id,
+						...(command.user_name ? { authorHandle: command.user_name } : {}),
+					},
+					command.user_id,
+				),
+			);
 			// Honest ack: the gateway owns command authorization, not the adapter, and
 			// "we could not ask" is a different answer from "it said no".
 			await api.respond(command.response_url, {
@@ -1416,8 +1426,9 @@ export async function startSlackAdapter(
 			if (text === "") return "skip";
 			const messageId = slackMessageId(message.channel, message.ts);
 			const origin = rememberOrigin(messageId, admitted.origin);
-			const engagement = withRootExcerpt(
-				engagementForMessage(message, admitted.origin, identity, directory, config.channels),
+			const engagement = await withAuthorTrust(
+				withRootExcerpt(engagementForMessage(message, admitted.origin, identity, directory, config.channels)),
+				message.user,
 			);
 			const recordFailure = async (
 				classification: ReturnType<typeof classifyRecoveryFailure>,

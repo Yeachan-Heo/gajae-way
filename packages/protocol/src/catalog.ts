@@ -204,11 +204,11 @@ export interface EngagementContext {
 	 */
 	readonly replyTo?: ReplyContext;
 	/**
-	 * Trust classification set by the adapter; additive and optional. Only honored for
-	 * Slack-origin engagements. "guest" indicates Slack is_restricted/is_ultra_restricted/
-	 * is_stranger users subject to guest policy.
+	 * Author trust set by the Slack adapter and honored only for Slack origins: "guest"
+	 * for Slack guests and Slack Connect strangers, "unverified" when the author lookup
+	 * failed. Subject to the gateway's `slack.guestPolicy`.
 	 */
-	readonly trust?: "member" | "guest";
+	readonly trust?: "member" | "guest" | "unverified";
 }
 
 export interface PromptImage {

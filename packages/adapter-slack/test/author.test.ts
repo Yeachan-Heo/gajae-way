@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { resolveSlackDisplayName, SlackDirectory, type SlackUserLike } from "../src/author";
+import { resolveSlackDisplayName, SlackDirectory, type SlackUserLike, slackAuthorTrust } from "../src/author";
 
 test("Slack display names skip blanks at each precedence level", () => {
 	const user = {
@@ -85,4 +85,12 @@ test("Slack priming during a lookup preserves the fresher payload", async () => 
 	resolve({ id: "U1", name: "stale" });
 	expect((await request)?.name).toBe("fresh");
 	expect(directory.userName("U1")).toBe("fresh");
+});
+
+test("author trust: guests and Slack Connect strangers are guests, a failed lookup is unverified", () => {
+	expect(slackAuthorTrust({ id: "U1" })).toBe("member");
+	expect(slackAuthorTrust({ id: "U1", is_restricted: true })).toBe("guest");
+	expect(slackAuthorTrust({ id: "U1", is_ultra_restricted: true })).toBe("guest");
+	expect(slackAuthorTrust({ id: "U1", is_stranger: true })).toBe("guest");
+	expect(slackAuthorTrust(undefined)).toBe("unverified");
 });

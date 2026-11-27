@@ -18,9 +18,15 @@ export interface SlackConversationLike {
 	readonly is_mpim?: boolean;
 }
 
-/** Classify a user as guest if they have guest restriction flags. */
-export function isSlackGuest(user: SlackUserLike | undefined): boolean {
-	return Boolean(user?.is_restricted || user?.is_ultra_restricted || user?.is_stranger);
+/**
+ * How far the gateway can trust a message author. Single- and multi-channel guests
+ * (`is_restricted`, `is_ultra_restricted`) and Slack Connect strangers are guests; an
+ * author whose users.info lookup failed is unverified, and the gateway's
+ * `slack.guestPolicy.failClosed` decides whether that counts as a guest.
+ */
+export function slackAuthorTrust(user: SlackUserLike | undefined): "member" | "guest" | "unverified" {
+	if (user === undefined) return "unverified";
+	return user.is_restricted || user.is_ultra_restricted || user.is_stranger ? "guest" : "member";
 }
 
 /** Blank profile fields mean unset, not a name that should hide a useful fallback. */

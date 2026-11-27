@@ -6,6 +6,7 @@ import type { SlackWebApi } from "../../adapter-slack/src/api";
 import { slackMessageId, slackMessageOrigin } from "../../adapter-slack/src/origin";
 import { liveGateway, stopLiveGatewaysAfterEach } from "../../adapter-slack/test/live-gateways";
 import type { GatewayConfig } from "../src/config";
+import { checkSlackGuestPolicy } from "../src/engagement/policy";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
@@ -85,18 +86,15 @@ const CHANNEL_ORIGIN = slackMessageOrigin({ channel: "C1", user: "U_GUEST", ts: 
 const DM_ORIGIN = slackMessageOrigin({ channel: "D1", channel_type: "im", user: "U_GUEST", ts: "1726543210.000100" });
 
 test("a guest in DM with dm=drop receives no response and no model call", async () => {
-	const { config, database, turns } = await gateway(
-		() => "should not be called",
-		{
-			dmPolicy: "open",
-			slack: {
-				guestPolicy: {
-					dm: "drop",
-					channel: "allow",
-				},
+	const { config, database, turns } = await gateway(() => "should not be called", {
+		dmPolicy: "open",
+		slack: {
+			guestPolicy: {
+				dm: "drop",
+				channel: "allow",
 			},
 		},
-	);
+	});
 	const slack = fakeSlackApi();
 	const adapter = liveGateway(config.socketPath, slack.api);
 	await adapter.connect();
@@ -114,18 +112,15 @@ test("a guest in DM with dm=drop receives no response and no model call", async 
 });
 
 test("a guest in channel with channel=drop receives no response and no model call", async () => {
-	const { config, database, turns } = await gateway(
-		() => "should not be called",
-		{
-			channels: { "slack:C1": { engagement: "open" } },
-			slack: {
-				guestPolicy: {
-					dm: "drop",
-					channel: "drop",
-				},
+	const { config, database, turns } = await gateway(() => "should not be called", {
+		channels: { "slack:C1": { engagement: "open" } },
+		slack: {
+			guestPolicy: {
+				dm: "drop",
+				channel: "drop",
 			},
 		},
-	);
+	});
 	const slack = fakeSlackApi();
 	const adapter = liveGateway(config.socketPath, slack.api);
 	await adapter.connect();
@@ -143,18 +138,15 @@ test("a guest in channel with channel=drop receives no response and no model cal
 });
 
 test("a regular member in channel is unaffected by guest policy", async () => {
-	const { config, database, turns } = await gateway(
-		() => "member response",
-		{
-			channels: { "slack:C1": { engagement: "open" } },
-			slack: {
-				guestPolicy: {
-					dm: "drop",
-					channel: "allow",
-				},
+	const { config, database, turns } = await gateway(() => "member response", {
+		channels: { "slack:C1": { engagement: "open" } },
+		slack: {
+			guestPolicy: {
+				dm: "drop",
+				channel: "allow",
 			},
 		},
-	);
+	});
 	const slack = fakeSlackApi();
 	const adapter = liveGateway(config.socketPath, slack.api);
 	await adapter.connect();
@@ -174,19 +166,16 @@ test("a regular member in channel is unaffected by guest policy", async () => {
 });
 
 test("a guest on allowUsers list bypasses guest policy restrictions", async () => {
-	const { config, database, turns } = await gateway(
-		() => "allowed guest response",
-		{
-			channels: { "slack:C1": { engagement: "open" } },
-			slack: {
-				guestPolicy: {
-					dm: "drop",
-					channel: "allow",
-					allowUsers: ["U_ALLOWLISTED"],
-				},
+	const { config, database, turns } = await gateway(() => "allowed guest response", {
+		channels: { "slack:C1": { engagement: "open" } },
+		slack: {
+			guestPolicy: {
+				dm: "drop",
+				channel: "allow",
+				allowUsers: ["U_ALLOWLISTED"],
 			},
 		},
-	);
+	});
 	const slack = fakeSlackApi();
 	const adapter = liveGateway(config.socketPath, slack.api);
 	await adapter.connect();
@@ -206,19 +195,16 @@ test("a guest on allowUsers list bypasses guest policy restrictions", async () =
 });
 
 test("a guest on denyUsers list is always dropped", async () => {
-	const { config, database, turns } = await gateway(
-		() => "should not be called",
-		{
-			channels: { "slack:C1": { engagement: "open" } },
-			slack: {
-				guestPolicy: {
-					dm: "allow",
-					channel: "allow",
-					denyUsers: ["U_DENIED"],
-				},
+	const { config, database, turns } = await gateway(() => "should not be called", {
+		channels: { "slack:C1": { engagement: "open" } },
+		slack: {
+			guestPolicy: {
+				dm: "allow",
+				channel: "allow",
+				denyUsers: ["U_DENIED"],
 			},
 		},
-	);
+	});
 	const slack = fakeSlackApi();
 	const adapter = liveGateway(config.socketPath, slack.api);
 	await adapter.connect();
@@ -234,4 +220,51 @@ test("a guest on denyUsers list is always dropped", async () => {
 	await Bun.sleep(100);
 	expect(turns).toHaveLength(0);
 	expect(slack.posts).toHaveLength(0);
+});
+
+test("an unverified author is dropped in a DM by default and admitted when failClosed is false", async () => {
+	for (const failClosed of [undefined, false] as const) {
+		const { config, turns } = await gateway(() => "reply", {
+			dmPolicy: "open",
+			...(failClosed === undefined ? {} : { slack: { guestPolicy: { failClosed } } }),
+		});
+		const slack = fakeSlackApi();
+		const adapter = liveGateway(config.socketPath, slack.api);
+		await adapter.connect();
+		const result = await adapter.requestInbound(
+			slackMessageId("D1", "1726543210.000100"),
+			DM_ORIGIN,
+			"hello",
+			{ mentioned: true, group: false, authorId: "U_GUEST", trust: "unverified" },
+			"2026-09-17T00:00:10.000Z",
+		);
+		expect(result?.engaged).toBe(failClosed === false);
+		await server?.stop();
+		server = undefined;
+		await rm(directory, { recursive: true, force: true });
+		directory = "";
+		if (failClosed === undefined) expect(turns).toHaveLength(0);
+	}
+});
+
+test("the owner is never dropped by the guest policy, even when the lookup failed", () => {
+	const config = {
+		ownerTarget: { origin: { platform: "slack", kind: "dm", conversationId: "D1", peerId: "U_OWNER" } },
+		slack: { guestPolicy: { dm: "drop", channel: "drop" } },
+	} as unknown as GatewayConfig;
+	const owner = { mentioned: true, group: false, authorId: "U_OWNER", trust: "unverified" } as const;
+	expect(checkSlackGuestPolicy(owner, { platform: "slack", kind: "dm" }, config)).toBe("allow");
+	expect(checkSlackGuestPolicy({ ...owner, trust: "guest" }, { platform: "slack", kind: "channel" }, config)).toBe(
+		"allow",
+	);
+	expect(checkSlackGuestPolicy({ ...owner, authorId: "U_OTHER" }, { platform: "slack", kind: "dm" }, config)).toBe(
+		"drop",
+	);
+});
+
+test("a trust claim on a non-Slack origin is ignored", () => {
+	const config = { slack: { guestPolicy: { dm: "drop", channel: "drop" } } } as unknown as GatewayConfig;
+	const guest = { mentioned: true, group: false, authorId: "123", trust: "guest" } as const;
+	expect(checkSlackGuestPolicy(guest, { platform: "discord", kind: "dm" }, config)).toBe("allow");
+	expect(checkSlackGuestPolicy(guest, { platform: "slack", kind: "dm" }, config)).toBe("drop");
 });

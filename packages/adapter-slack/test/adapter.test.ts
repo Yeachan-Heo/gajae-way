@@ -2910,3 +2910,33 @@ test("#710: Event Subscriptions stay off after forced reconnect; suspect flag cl
 		f.recovery.stop();
 	}
 });
+
+test("Slack recovery states author trust: guests and failed lookups are marked, members are not", async () => {
+	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false });
+	try {
+		const usersInfo = f.api.usersInfo.bind(f.api);
+		f.api.usersInfo = async (id: string) => {
+			if (id === "UGUEST") return { ...(await usersInfo(id)), is_restricted: true };
+			if (id === "UFAIL") throw new Error("ratelimited");
+			return await usersInfo(id);
+		};
+		f.api.history.C1 = [
+			{ type: "message", user: "UFAIL", ts: "1700000050.000003", text: "unknown" },
+			{ type: "message", user: "UGUEST", ts: "1700000050.000002", text: "guest" },
+			{ type: "message", user: "U1", ts: "1700000040.000001", text: "member" },
+		];
+		expect(await f.recoverMissedMessages()).toBe(true);
+		const trust = Object.fromEntries(
+			f.client.requests
+				.filter((request) => request.verb === "chat.send")
+				.map((request) => {
+					const params = request.params as { text: string; engagement: { trust?: string } };
+					return [params.text, params.engagement.trust];
+				}),
+		);
+		expect(trust).toEqual({ member: undefined, guest: "guest", unknown: "unverified" });
+	} finally {
+		f.socket.stop();
+		f.recovery.stop();
+	}
+});
