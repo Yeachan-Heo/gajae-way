@@ -22,6 +22,16 @@ const emptyCursors = () => ({
 	gatewayDbIdentity: "test-db",
 });
 
+function imageRequest(id: string, channelId: string) {
+	return {
+		messageId: id,
+		text: "describe this\n[image · photo.png]",
+		images: [image],
+		origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "human" },
+		engagement: { mentioned: false, group: false, authorId: "human" },
+	};
+}
+
 function dmMessage(id: string, channelId: string, withImage = false) {
 	return {
 		id,
@@ -2874,3 +2884,235 @@ test("a request-bearing restored DM retry never evicts a live DM", async () => {
 		await rm(home, { recursive: true, force: true });
 	}
 }, 20_000);
+
+test("reversed durable request rows below the watermark replay in snowflake order", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-reversed-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "dm-reversed";
+	const olderId = snowflakeFromTimestamp(Date.now() - 180_000);
+	const newerId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const watermark = snowflakeFromTimestamp(Date.now() - 60_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: watermark },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		// Journal insertion order is the reverse of Discord order: the newer intent was
+		// admitted first. Durable replay must not send it ahead of its predecessor.
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: newerId, channelId, request: imageRequest(newerId, channelId) },
+				{ messageId: olderId, channelId, request: imageRequest(olderId, channelId) },
+			]),
+		);
+		const channel = {
+			messages: {
+				fetch: async (query: unknown) => {
+					const single = singleFetchId(query);
+					return single === undefined ? [] : dmMessage(single, channelId, true);
+				},
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			olderId,
+			newerId,
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an older repairable source failure holds a newer durable send in the same conversation", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-hold-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "dm-held";
+	const olderId = snowflakeFromTimestamp(Date.now() - 180_000);
+	const newerId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 60_000) },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: newerId, channelId, request: imageRequest(newerId, channelId) },
+				{ messageId: olderId, channelId },
+			]),
+		);
+		const denied = Object.assign(new Error("Missing Access"), { code: 50_001, status: 403 });
+		const channel = {
+			messages: {
+				fetch: async (query: unknown) => {
+					const single = singleFetchId(query);
+					if (single === undefined) return [];
+					if (single === olderId) throw denied;
+					return dmMessage(single, channelId, true);
+				},
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send")).toEqual([]);
+		const rows = JSON.parse(await readFile(outboxPath, "utf8")) as PendingImage[];
+		expect(rows.find((entry) => entry.messageId === olderId)?.failureAt).toBeNumber();
+		expect(rows.find((entry) => entry.messageId === newerId)?.completed).toBeUndefined();
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an older requestless intent is replayed before a newer durable request", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-requestless-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "dm-requestless";
+	const olderId = snowflakeFromTimestamp(Date.now() - 180_000);
+	const newerId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 60_000) },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: newerId, channelId, request: imageRequest(newerId, channelId) },
+				{ messageId: olderId, channelId },
+			]),
+		);
+		const channel = {
+			messages: {
+				fetch: async (query: unknown) => {
+					const single = singleFetchId(query);
+					return single === undefined ? [] : dmMessage(single, channelId, true);
+				},
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			olderId,
+			newerId,
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("an unavailable conversation does not hold durable sends in an unrelated conversation", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-unrelated-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const blockedId = "dm-blocked";
+	const healthyId = "dm-healthy";
+	const blockedMessageId = snowflakeFromTimestamp(Date.now() - 180_000);
+	const healthyMessageId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		const watermark = snowflakeFromTimestamp(Date.now() - 60_000);
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [blockedId]: watermark, [healthyId]: watermark },
+			knownDms: {
+				[blockedId]: { lastSeenAt: new Date().toISOString(), seq: 1 },
+				[healthyId]: { lastSeenAt: new Date().toISOString(), seq: 2 },
+			},
+			sequence: 2,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: healthyMessageId, channelId: healthyId, request: imageRequest(healthyMessageId, healthyId) },
+				{ messageId: blockedMessageId, channelId: blockedId },
+			]),
+		);
+		const denied = Object.assign(new Error("Missing Access"), { code: 50_001, status: 403 });
+		const channelFor = (channelId: string) => ({
+			messages: {
+				fetch: async (query: unknown) => {
+					const single = singleFetchId(query);
+					if (single === undefined) return [];
+					if (channelId === blockedId) throw denied;
+					return dmMessage(single, channelId, true);
+				},
+			},
+		});
+		const adapter = gateway(cursorPath, async (id) => channelFor(id), requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			healthyMessageId,
+		]);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);
+
+test("a budget-parked predecessor keeps the documented ordering exception", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-order-parked-"));
+	const cleanupTimers = trackTimers();
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const channelId = "dm-parked";
+	const olderId = snowflakeFromTimestamp(Date.now() - 180_000);
+	const newerId = snowflakeFromTimestamp(Date.now() - 120_000);
+	const requests: Array<{ verb: string; params: any }> = [];
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			...emptyCursors(),
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 60_000) },
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			sequence: 1,
+		});
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{ messageId: newerId, channelId, request: imageRequest(newerId, channelId) },
+				{ messageId: olderId, channelId, deferred: true },
+			]),
+		);
+		const denied = Object.assign(new Error("Missing Access"), { code: 50_001, status: 403 });
+		const channel = {
+			messages: {
+				fetch: async (query: unknown) => {
+					const single = singleFetchId(query);
+					if (single === undefined) return [];
+					if (single === olderId) throw denied;
+					return dmMessage(single, channelId, true);
+				},
+			},
+		};
+		const adapter = gateway(cursorPath, async () => channel, requests);
+		await bounded(adapter.recoverMissedMessages());
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([
+			newerId,
+		]);
+		const rows = JSON.parse(await readFile(outboxPath, "utf8")) as PendingImage[];
+		expect(rows.find((entry) => entry.messageId === olderId)?.deferred).toBe(true);
+	} finally {
+		cleanupTimers();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 12_000);

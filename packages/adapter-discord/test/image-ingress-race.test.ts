@@ -1,8 +1,9 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { ImageOutbox, type PendingImage } from "../src/image-outbox";
 import { engagementForMessage, ReconnectingGateway } from "../src/main";
 import { saveRecoveryCursors, snowflakeFromTimestamp } from "../src/recovery";
 
@@ -103,6 +104,132 @@ async function fixture(options: { dm?: boolean; watermarkPast?: boolean } = {}) 
 		release,
 		requests,
 		counts: () => ({ preparations, threads, historyFetches }),
+	};
+}
+
+function trackTimers() {
+	const realSetTimeout = globalThis.setTimeout;
+	const timers: ReturnType<typeof setTimeout>[] = [];
+	const spy = spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+		const timer = realSetTimeout(...args);
+		timer.unref?.();
+		timers.push(timer);
+		return timer;
+	}) as typeof setTimeout);
+	return () => {
+		for (const timer of timers) clearTimeout(timer);
+		spy.mockRestore();
+	};
+}
+
+/** Keep scheduled retries from firing during an assertion that inspects intermediate state. */
+function postponeTimers() {
+	const realSetTimeout = globalThis.setTimeout;
+	const timers: ReturnType<typeof setTimeout>[] = [];
+	const spy = spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+		const timer = realSetTimeout(args[0], 60_000, ...args.slice(2));
+		timer.unref?.();
+		timers.push(timer);
+		return timer;
+	}) as typeof setTimeout);
+	return () => {
+		for (const timer of timers) clearTimeout(timer);
+		spy.mockRestore();
+	};
+}
+
+async function invalidationFixture(options: { summary: string; failTerminalWrite?: boolean }) {
+	const home = await mkdtemp(join(tmpdir(), "discord-image-invalidation-"));
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const id = snowflakeFromTimestamp(Date.now() - 60_000);
+	const channelId = "new-dm";
+	await saveRecoveryCursors(cursorPath, {
+		recoveredThrough: {},
+		quarantined: {},
+		knownDms: {},
+		attempts: {},
+		deadLetters: [],
+		deadLetterDigest: {},
+		sequence: 0,
+		gatewayDbIdentity: "test-db",
+	});
+	const message = {
+		id,
+		content: "describe this",
+		author: { id: "human", username: "human", bot: false },
+		channel: { id: channelId, isDMBased: () => true },
+		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo.png" }],
+	};
+	let releaseAdmission!: () => void;
+	const admission = new Promise<void>((resolve) => {
+		releaseAdmission = resolve;
+	});
+	let reachedAdmission!: () => void;
+	const reached = new Promise<void>((resolve) => {
+		reachedAdmission = resolve;
+	});
+	const outbox = new ImageOutbox(outboxPath);
+	const realGet = outbox.get.bind(outbox);
+	let blockInitialRead = true;
+	outbox.get = async (messageId: string) => {
+		const entry = await realGet(messageId);
+		if (blockInitialRead) {
+			blockInitialRead = false;
+			reachedAdmission();
+			await admission;
+		}
+		return entry;
+	};
+	if (options.failTerminalWrite) {
+		const realPut = outbox.put.bind(outbox);
+		let failOnce = true;
+		outbox.put = async (entry: PendingImage) => {
+			if (entry.terminal && failOnce) {
+				failOnce = false;
+				throw new Error("transient terminal journal failure");
+			}
+			return realPut(entry);
+		};
+	}
+	const requests: Array<{ verb: string; params: any }> = [];
+	const channel = {
+		messages: {
+			fetch: async (query: unknown) =>
+				typeof query === "string" || (query as { message?: string }).message !== undefined ? message : [],
+		},
+	};
+	const gateway = new ReconnectingGateway(
+		"unused-socket",
+		{ channels: { fetch: async () => channel } } as never,
+		{ token: "unused", tokenFile: "unused", configPath: "unused", channels: {} } as never,
+		undefined,
+		undefined,
+		cursorPath,
+		() => bot,
+		{
+			request: async (verb: string, params: unknown) => {
+				if (verb !== "gateway.status") requests.push({ verb, params });
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
+				return { engaged: true, turnId: "turn-1" };
+			},
+			onChatMessage: () => () => {},
+		} as never,
+		async () => {},
+		undefined,
+		undefined,
+		async () => ({ images: [image], notice: "" }),
+		outbox,
+	);
+	return {
+		home,
+		outboxPath,
+		id,
+		message,
+		gateway,
+		reached,
+		releaseAdmission,
+		requests,
 	};
 }
 
@@ -215,3 +342,65 @@ test("an unreadable image outbox fails closed until durable storage is repaired"
 		await rm(f.home, { recursive: true, force: true });
 	}
 });
+
+for (const scenario of [
+	{ label: "delete", summary: "image source message was deleted" },
+	{ label: "image edit", summary: "image source message was edited" },
+]) {
+	test(`a ${scenario.label} between the initial journal read and first put never sends the stale image`, async () => {
+		const cleanupTimers = trackTimers();
+		const f = await invalidationFixture({ summary: scenario.summary });
+		try {
+			const live = f.gateway.processImage(f.message as never, engagementForMessage(f.message as never, bot));
+			await f.reached;
+			// The owner has observed "no row" and is still holding its first admission
+			// write. The invalidation must arrive as a synchronous fence, not a lookup
+			// that can miss the intent about to land.
+			await f.gateway.invalidateImageSource(f.id, scenario.summary);
+			f.releaseAdmission();
+			expect(await live).toBe("skip");
+			expect(f.requests).toEqual([]);
+			expect(JSON.parse(await readFile(f.outboxPath, "utf8"))).toEqual([
+				{ messageId: f.id, channelId: "new-dm", terminal: true, audited: true, dm: true },
+			]);
+		} finally {
+			f.releaseAdmission();
+			cleanupTimers();
+			await rm(f.home, { recursive: true, force: true });
+		}
+	}, 12_000);
+}
+
+test("a transient terminal journal failure keeps the invalidation fence until the row is durable", async () => {
+	const f = await invalidationFixture({
+		summary: "image source message was deleted",
+		failTerminalWrite: true,
+	});
+	// Postpone the owner's retry timer: this test drives the next attempt itself, and
+	// an early timer would race the interrupted-row assertion.
+	const cleanupTimers = postponeTimers();
+	try {
+		const live = f.gateway.processImage(f.message as never, engagementForMessage(f.message as never, bot));
+		await f.reached;
+		await f.gateway.invalidateImageSource(f.id, "image source message was deleted");
+		f.releaseAdmission();
+		// The terminal write failed, so the owner cannot claim the intent is resolved;
+		// it must still refuse to send.
+		expect(await live).toBe("unavailable");
+		expect(f.requests).toEqual([]);
+		const interrupted = JSON.parse(await readFile(f.outboxPath, "utf8"));
+		expect(interrupted[0].terminal).toBeUndefined();
+		// Recovery retries the persisted intent and the retained in-memory fence
+		// terminalizes it instead of answering the deleted source.
+		await f.gateway.recoverMissedMessages();
+		await f.gateway.cursorsFlushed;
+		expect(JSON.parse(await readFile(f.outboxPath, "utf8"))).toEqual([
+			{ messageId: f.id, channelId: "new-dm", terminal: true, audited: true, dm: true },
+		]);
+		expect(f.requests).toEqual([]);
+	} finally {
+		f.releaseAdmission();
+		cleanupTimers();
+		await rm(f.home, { recursive: true, force: true });
+	}
+}, 12_000);

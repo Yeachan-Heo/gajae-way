@@ -1,13 +1,13 @@
 import { expect, spyOn, test } from "bun:test";
 import { Buffer } from "node:buffer";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import { Client } from "discord.js";
-import { startDiscordAdapter } from "../src/main";
-import { snowflakeFromTimestamp } from "../src/recovery";
+import { engagementForMessage, ReconnectingGateway, startDiscordAdapter } from "../src/main";
+import { saveRecoveryCursors, snowflakeFromTimestamp } from "../src/recovery";
 
 // The same valid PNG fixture used by the other adapter image tests.
 /** discord.js accepts a bare id or `{ message, force }`; the fake must accept both. */
@@ -20,6 +20,38 @@ const png = Uint8Array.from(
 		"base64",
 	),
 );
+
+const bot = { id: "bot" };
+const image = { data: "AQID", mimeType: "image/jpeg" as const };
+
+function dmImageMessage(id: string) {
+	return {
+		id,
+		content: "describe this",
+		author: { id: "owner", username: "owner", bot: false },
+		channel: { id: "new-dm", isDMBased: () => true },
+		attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo.png" }],
+	};
+}
+
+function presencePorts() {
+	const typing: string[] = [];
+	const armed: Array<{ conversationId: string; messageId: string; channelId: string }> = [];
+	return {
+		typing,
+		armed,
+		typingPort: {
+			begin: (conversationId: string) => typing.push(conversationId),
+			refresh: () => {},
+			end: () => {},
+		},
+		statusPort: {
+			arm: (conversationId: string, messageId: string, _engagement: unknown, channelId = conversationId) =>
+				armed.push({ conversationId, messageId, channelId }),
+			clear: () => {},
+		},
+	};
+}
 
 test("a transient image download failure retries a live new DM without reconnecting or sending text alone", async () => {
 	const home = await mkdtemp(join(tmpdir(), "discord-live-image-retry-"));
@@ -117,6 +149,201 @@ test("a transient image download failure retries a live new DM without reconnect
 		connect.mockRestore();
 		if (oldHome === undefined) delete process.env.GAJAEWAY_HOME;
 		else process.env.GAJAEWAY_HOME = oldHome;
+		await rm(home, { recursive: true, force: true });
+	}
+}, 15_000);
+
+test("live image acknowledgements restore presence without declining, duplicating, or restoring replayed intent", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-live-image-presence-"));
+	const cursorPath = join(home, "recovery-cursor.json");
+	await saveRecoveryCursors(cursorPath, {
+		recoveredThrough: {},
+		quarantined: {},
+		knownDms: {},
+		attempts: {},
+		deadLetters: [],
+		deadLetterDigest: {},
+		sequence: 0,
+		gatewayDbIdentity: "test-db",
+	});
+	const ports = presencePorts();
+	const requests: Array<{ verb: string; params: any }> = [];
+	let engaged = true;
+	let gate: Promise<void> | undefined;
+	let releaseHeld: (() => void) | undefined;
+	let sendStarted: (() => void) | undefined;
+	const channel = { messages: { fetch: async () => [] } };
+	const gateway = new ReconnectingGateway(
+		"unused-socket",
+		{ channels: { fetch: async () => channel } } as never,
+		{
+			token: "unused",
+			tokenFile: "unused",
+			configPath: "unused",
+			channels: { "channel-thread": { engagement: "open" } },
+		} as never,
+		ports.typingPort as never,
+		ports.statusPort as never,
+		cursorPath,
+		() => bot,
+		{
+			request: async (verb: string, params: unknown) => {
+				if (verb === "gateway.status") return { database: { identity: "test-db" } };
+				requests.push({ verb, params });
+				if (verb === "chat.send" && gate) {
+					sendStarted?.();
+					await gate;
+				}
+				return { engaged, turnId: "turn-1" };
+			},
+		} as never,
+		async () => {},
+		undefined,
+		undefined,
+		async () => ({ images: [image], notice: "" }),
+	);
+	try {
+		const live = dmImageMessage(snowflakeFromTimestamp(Date.now() - 90_000));
+		expect(await gateway.processImage(live as never, engagementForMessage(live as never, bot))).toBe("acked");
+		expect(ports.typing).toEqual(["new-dm"]);
+		expect(ports.armed).toEqual([{ conversationId: "new-dm", messageId: live.id, channelId: "new-dm" }]);
+
+		// An explicit decline is an acknowledged no-op, not a live turn to decorate.
+		engaged = false;
+		const declined = dmImageMessage(snowflakeFromTimestamp(Date.now() - 80_000));
+		expect(await gateway.processImage(declined as never, engagementForMessage(declined as never, bot))).toBe("acked");
+		expect(ports.typing).toEqual(["new-dm"]);
+		expect(ports.armed).toHaveLength(1);
+
+		// A duplicate Discord delivery shares the owner and must not arm presence twice.
+		engaged = true;
+		gate = new Promise<void>((resolve) => {
+			releaseHeld = resolve;
+		});
+		const openedSend = new Promise<void>((resolve) => {
+			sendStarted = resolve;
+		});
+		const duplicate = dmImageMessage(snowflakeFromTimestamp(Date.now() - 70_000));
+		const first = gateway.processImage(duplicate as never, engagementForMessage(duplicate as never, bot));
+		await openedSend;
+		const second = gateway.processImage(duplicate as never, engagementForMessage(duplicate as never, bot));
+		releaseHeld?.();
+		gate = undefined;
+		sendStarted = undefined;
+		expect(await first).toBe("acked");
+		expect(await second).toBe("acked");
+		expect(ports.typing).toEqual(["new-dm", "new-dm"]);
+		expect(ports.armed).toHaveLength(2);
+
+		// A recovered history delivery is not a fresh live owner, even when engaged.
+		const recovered = dmImageMessage(snowflakeFromTimestamp(Date.now() - 60_000));
+		expect(
+			await gateway.processImage(
+				recovered as never,
+				engagementForMessage(recovered as never, bot),
+				undefined,
+				undefined,
+				true,
+				true,
+			),
+		).toBe("acked");
+		expect(ports.typing).toEqual(["new-dm", "new-dm"]);
+		expect(ports.armed).toHaveLength(2);
+
+		// A channel mention answered in a thread arms presence on the thread origin.
+		const mentioned = {
+			id: snowflakeFromTimestamp(Date.now() - 50_000),
+			content: "<@bot> describe this",
+			author: { id: "owner", username: "owner", bot: false },
+			channel: { id: "channel-thread", name: "general" },
+			attachments: [{ name: "photo.png", contentType: "image/png", url: "https://cdn.discordapp.com/photo.png" }],
+			startThread: async () => ({ id: "thread-live" }),
+		};
+		expect(await gateway.processImage(mentioned as never, engagementForMessage(mentioned as never, bot))).toBe("acked");
+		expect(ports.typing.at(-1)).toBe("thread-live");
+		expect(ports.armed.at(-1)).toEqual({
+			conversationId: "thread-live",
+			messageId: mentioned.id,
+			channelId: "channel-thread",
+		});
+	} finally {
+		releaseHeld?.();
+		await rm(home, { recursive: true, force: true });
+	}
+}, 15_000);
+
+test("a persisted live image replayed after restart does not restore presence", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-live-image-restart-presence-"));
+	const cursorPath = join(home, "recovery-cursor.json");
+	const outboxPath = join(home, "image-outbox.json");
+	const ports = presencePorts();
+	const requests: Array<{ verb: string; params: any }> = [];
+	const id = snowflakeFromTimestamp(Date.now() - 90_000);
+	const channelId = "new-dm";
+	try {
+		await saveRecoveryCursors(cursorPath, {
+			// The watermark is past the intent, so it is eligible for independent durable
+			// replay instead of waiting for a history pass this fixture does not model.
+			recoveredThrough: { [channelId]: snowflakeFromTimestamp(Date.now() - 30_000) },
+			quarantined: {},
+			knownDms: { [channelId]: { lastSeenAt: new Date().toISOString(), seq: 1 } },
+			attempts: {},
+			deadLetters: [],
+			deadLetterDigest: {},
+			sequence: 1,
+			gatewayDbIdentity: "test-db",
+		});
+		// A crash after admission but before the first send leaves `live:true`; that
+		// marker proves where the intent started, not that its owner is live now.
+		await writeFile(
+			outboxPath,
+			JSON.stringify([
+				{
+					messageId: id,
+					channelId,
+					live: true,
+					request: {
+						messageId: id,
+						text: "describe this\n[image · photo.png]",
+						images: [image],
+						origin: { platform: "discord", kind: "dm", conversationId: channelId, peerId: "owner" },
+						engagement: { mentioned: false, group: false, authorId: "owner" },
+					},
+				},
+			]),
+		);
+		const channel = {
+			messages: {
+				fetch: async (query: unknown) =>
+					singleFetchId(query) === undefined ? [] : dmImageMessage(singleFetchId(query) as string),
+			},
+		};
+		const gateway = new ReconnectingGateway(
+			"unused-socket",
+			{ channels: { fetch: async () => channel } } as never,
+			{ token: "unused", tokenFile: "unused", configPath: "unused", channels: {} } as never,
+			ports.typingPort as never,
+			ports.statusPort as never,
+			cursorPath,
+			() => bot,
+			{
+				request: async (verb: string, params: unknown) => {
+					if (verb === "gateway.status") return { database: { identity: "test-db" } };
+					requests.push({ verb, params });
+					return { engaged: true, turnId: "turn-1" };
+				},
+			} as never,
+			async () => {},
+			undefined,
+			undefined,
+			async () => ({ images: [image], notice: "" }),
+		);
+		await gateway.recoverMissedMessages();
+		await gateway.cursorsFlushed;
+		expect(requests.filter((entry) => entry.verb === "chat.send").map((entry) => entry.params.messageId)).toEqual([id]);
+		expect(ports.typing).toEqual([]);
+		expect(ports.armed).toEqual([]);
+	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
 }, 15_000);
