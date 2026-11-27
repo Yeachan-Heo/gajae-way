@@ -3371,8 +3371,6 @@ async function editChat(
 	await runtime.personaSessions.notifyInbound(key);
 }
 
-
-
 async function createInboundTurnLifecycle(
 	input: PersonaTurnStartInput,
 	options: GatewayServerOptions,
