@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	appendDaily,
+	CAPTURE_TEXT_MAX_CHARS,
 	CorpusWriter,
 	initializeMemory,
 	mapListsAxis,
@@ -100,6 +101,44 @@ test("carriage returns are escaped and NUL bytes are stripped", async () => {
 	expect(body).toContain("- user: a\\nb\\ncd");
 	expect(body).not.toContain("\u0000");
 	expect(body.split("\n").filter((line) => line.startsWith("- user: "))).toHaveLength(1);
+});
+
+test("user and reply text past 500 characters are captured whole", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-doctrine-"));
+	const root = await initializeMemory(home);
+
+	const user = `${"u".repeat(900)}USER-END`;
+	const reply = `${"r".repeat(4000)}\nREPLY-END`;
+	const path = await appendDaily(root, "{}", user, reply);
+	const body = await readFile(join(root, path), "utf8");
+
+	expect(body).toContain(`- user: ${user}\n`);
+	expect(body).toContain(`- reply: ${"r".repeat(4000)}\\nREPLY-END\n`);
+	expect(body).not.toContain("[cut:");
+});
+
+test("text over the capture limit is cut on code points and states what it left out", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-doctrine-"));
+	const root = await initializeMemory(home);
+
+	// Each emoji is one code point but two UTF-16 units, so a code-unit cut at the
+	// limit would leave half a surrogate pair behind.
+	const reply = "😀".repeat(CAPTURE_TEXT_MAX_CHARS + 7);
+	const path = await appendDaily(root, "{}", "u", reply);
+	const line = (await readFile(join(root, path), "utf8")).split("\n").find((l) => l.startsWith("- reply: ")) ?? "";
+
+	expect(line).toBe(`- reply: ${"😀".repeat(CAPTURE_TEXT_MAX_CHARS)} [cut: 7 more characters]`);
+	expect(line.isWellFormed()).toBe(true);
+});
+
+test("origin stays bounded to 500 characters", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-doctrine-"));
+	const root = await initializeMemory(home);
+
+	const path = await appendDaily(root, `{"x":"${"o".repeat(800)}"}`, "u", "r");
+	const line = (await readFile(join(root, path), "utf8")).split("\n").find((l) => l.startsWith("- origin: ")) ?? "";
+
+	expect(line).toHaveLength("- origin: ".length + 500);
 });
 
 test("entry count grows by exactly one per capture", async () => {

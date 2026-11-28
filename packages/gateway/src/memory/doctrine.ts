@@ -706,6 +706,19 @@ export async function captureRoot(root: string, registry?: AxisRegistry): Promis
 	return axis.root;
 }
 
+/** Code points of user or reply text kept per capture; canonicalization reads only this copy. */
+export const CAPTURE_TEXT_MAX_CHARS = 16_000;
+
+/**
+ * User or reply text as captured. Cut on code points, so a surrogate pair is
+ * never split, and a cut always says how much it left out.
+ */
+function capturedText(text: string): string {
+	const points = Array.from(text);
+	if (points.length <= CAPTURE_TEXT_MAX_CHARS) return text;
+	return `${points.slice(0, CAPTURE_TEXT_MAX_CHARS).join("")} [cut: ${points.length - CAPTURE_TEXT_MAX_CHARS} more characters]`;
+}
+
 export async function appendDaily(
 	root: string,
 	originRefJson: string,
@@ -721,13 +734,9 @@ export async function appendDaily(
 	const path = join(root, await captureRoot(root, registry), `${date}.md`);
 	// Each field must stay on one physical line: a captured newline would let reply text
 	// containing "## " forge an entry delimiter and escape its own list item.
-	const bounded = (text: string) =>
-		text
-			.slice(0, 500)
-			.replaceAll("\u0000", "")
-			.replaceAll(/\r\n|\r|\n/g, "\\n");
+	const oneLine = (text: string) => text.replaceAll("\u0000", "").replaceAll(/\r\n|\r|\n/g, "\\n");
 	const intentMarker = intentId ? `- intent-id: ${intentId}\n` : "";
-	const entry = `\n## ${new Date().toISOString()}\n\n- origin: ${bounded(originRefJson)}\n${intentMarker}- user: ${bounded(userText)}\n- reply: ${bounded(replyText)}\n`;
+	const entry = `\n## ${new Date().toISOString()}\n\n- origin: ${oneLine(originRefJson.slice(0, 500))}\n${intentMarker}- user: ${oneLine(capturedText(userText))}\n- reply: ${oneLine(capturedText(replyText))}\n`;
 	await appendFile(path, entry, { encoding: "utf8" });
 	await regenerateMap(root, registry);
 	return relative(root, path).replaceAll("\\", "/");
