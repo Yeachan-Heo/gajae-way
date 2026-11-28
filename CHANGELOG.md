@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.5.3] - 2026-11-29
+
+### Fixes
+- **gateway**: Include the thread root in a thread's first turn context (#890, #891), and keep a thread open when its root's mention arrived as an edit (#888)
+- **gateway**: Keep confirmed recent replies scoped to their canonical origin when a thread has no root (#900)
+- **gateway**: Hold a saved turn whose result is not a completed authoring turn (refusal, `max_tokens`, cancellation, missing receipt) instead of delivering its body, and probe the given-up backlog one operation per sweep behind a durable cursor so it no longer delays open events (#827)
+- **gateway**: Keep owner identity independent of a channel's `ownerTarget`, falling back to the adapter-reported owners when the target has no peer (#901, #902), and reject explicit owners on non-chat targets (#904)
+- **gateway**: Keep one pre-send compaction barrier per session, and after repeated unresolved runs rotate the epoch to a fresh session with one notice to the origin (#875)
+- **gateway**: An uncorrelated end or idle broadcast no longer resets a turn's stall handling (#879) or extends a request's activity lease (#882)
+- **gateway**: End a preset model failure that is not transient after a bounded number of attempts instead of retrying forever (#895, #896)
+- **gateway**: Retire size-rolled monitor sessions with GJC's idle-fenced `session.close` (`ifIdle: true`); a busy session keeps its retirement record for a later pass. The broker operation journal records the idle-fenced close as its own kind, which migrates the database to schema 43 (#874)
+- **gateway**: Pass `GAJAEWAY_HOME` to broker sessions so `gajaeway` inside a session reaches the live home; `broker.env` may no longer set it, and the broker systemd unit no longer imports `broker.env` (#881)
+- **cli**: Flip the GJC pin only after the broker restart succeeds (#876, #878), and keep the flip when a manual restart started the new broker but its verification failed (#883, #884)
+- **memory**: Index subject-named axes as trees, and report every entry dropped by a cap (#893)
+- **release**: Build release binaries with Bun 1.4.4, because Bun 1.4.0 left darwin-arm64 binaries with invalid signatures that macOS killed on launch (0.4.4 through 0.5.2); every darwin binary is now re-signed, verified, and launched before packaging (#889)
+
 ## [0.5.2] - 2026-11-23
 
 ### Deps

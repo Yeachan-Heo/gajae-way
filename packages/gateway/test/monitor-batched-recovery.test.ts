@@ -7,6 +7,7 @@ import { MemoryClosureQueue } from "../src/memory/closure";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { Store } from "../src/store";
+import { MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS } from "../src/store/groups/monitors";
 import type { SessionPortResponder } from "./session-port.fake";
 import { sessionPortFromScript } from "./session-port.fake";
 
@@ -175,5 +176,74 @@ test("a mid-batch fence failure never leaves a coalesced authoring pointer half-
 		await propagatorRef.current?.drain().catch(() => {});
 		db.close();
 		await rm(fenceHome, { recursive: true, force: true });
+	}
+});
+
+test("historical recovery probes a shared batch once before an independent operation, including after restart", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-history-batch-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const db = database;
+	const registry = new MonitorRegistry(db);
+	const monitor = registry.add({
+		name: "history-batch",
+		trigger: { kind: "cron", schedule: "30 6 * * *" },
+		eventTypes: ["history.tick"],
+	});
+	const groups = [
+		{ opRef: "shared-operation", eventIds: ["a", "b", "d"] },
+		{ opRef: "independent-operation", eventIds: ["c"] },
+	];
+	db.transaction((tx) => {
+		for (const group of groups) {
+			const pointer = JSON.stringify({ sessionId: "s1", ...group });
+			for (const eventId of group.eventIds) {
+				db.monitors.eventCreate(tx, {
+					eventId,
+					monitorId: monitor.monitorId,
+					eventType: "history.tick",
+					payloadJson: "{}",
+					firedAt: new Date().toISOString(),
+				});
+				for (let attempt = 0; attempt < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS; attempt++)
+					db.monitors.eventIncrementAttempts(tx, eventId);
+				db.monitors.eventTerminalFail(tx, eventId, "authoring_turn_unresolved", "unresolved");
+				db.core.metaSet(`monitor_authoring_turn:${eventId}`, pointer);
+			}
+		}
+	});
+	const port = sessionPortFromScript({ bind: async () => ({ sessionId: "s1" }), respond: async () => "[]" });
+	const status = port.status.bind(port);
+	const probed: string[] = [];
+	port.status = async (input) => {
+		probed.push(input.opRef);
+		return status(input);
+	};
+	const createPropagator = () =>
+		new MonitorPropagator({
+			database: db,
+			registry,
+			sessionPort: port,
+			memory: new MemoryClosureQueue(db, home),
+			delivery: new DeliveryService(db),
+			emit: () => {},
+		});
+	const first = createPropagator();
+	await first.reconcile();
+	expect(probed).toEqual(["shared-operation"]);
+	expect(db.core.metaGet("monitor_authoring_recovery_cursor")).toBe("a");
+	await first.drain();
+	const restarted = createPropagator();
+	try {
+		await restarted.reconcile();
+		expect(probed).toEqual(["shared-operation", "independent-operation"]);
+		await restarted.reconcile();
+		expect(probed).toHaveLength(2);
+		expect(db.core.metaGet("monitor_authoring_recovery_cursor")).toBe("");
+		await restarted.reconcile();
+		expect(probed).toEqual(["shared-operation", "independent-operation", "shared-operation"]);
+		for (const group of groups)
+			for (const eventId of group.eventIds) expect(db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBeDefined();
+	} finally {
+		await restarted.drain();
 	}
 });

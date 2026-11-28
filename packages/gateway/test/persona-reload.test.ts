@@ -8,7 +8,7 @@ import { originKey } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { PersonaLoader, SELF_OPS_PREAMBLE_POINTER } from "../src/persona/persona";
 import { startUnixServer } from "../src/server/server";
-import { Store } from "../src/store";
+import { LATEST_SCHEMA_VERSION, Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
 
 const LOOPBACK_ORIGIN = { platform: "loopback" as const, kind: "loopback" as const, conversationId: "loopback" };
@@ -203,6 +203,49 @@ test("fresh persona workspace discovers the bundled self-ops skill without pream
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
+});
+
+test("seeded self-ops restart docs carry the escalated-hold drain exception and the current schema", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-self-ops-docs-"));
+	try {
+		const persona = new PersonaLoader(home);
+		await persona.ensureWorkspace();
+		const skillRoot = join(home, "workspace", ".gjc", "skills", "self-ops");
+		const service = await readFile(join(skillRoot, "service-control.md"), "utf8");
+		const config = await readFile(join(skillRoot, "config-and-restarts.md"), "utf8");
+		for (const body of [service, config]) {
+			expect(body).toContain("detached escalated hold");
+			expect(body).toContain("readopts");
+		}
+		// The exception is scoped: an unproven or live producer still blocks the drain.
+		expect(service).toContain("keeps the hold blocking");
+		expect(config).toContain("still blocks");
+		expect(config).toContain(`The current schema is ${LATEST_SCHEMA_VERSION};`);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("operator docs state the current schema as LATEST_SCHEMA_VERSION", async () => {
+	const root = join(import.meta.dir, "..", "..", "..");
+	const claim = /\b(?:current schema (?:is )?(?:version )?|currently schema )(\d+)/gi;
+	const files = ["docs/**/*.md", "README*.md", "packages/gateway/src/persona/self-ops/*.md"]
+		.flatMap((pattern) => [...new Bun.Glob(pattern).scanSync({ cwd: root })])
+		.sort();
+	const stated: { file: string; version: number }[] = [];
+	for (const file of files) {
+		for (const match of (await readFile(join(root, file), "utf8")).matchAll(claim))
+			stated.push({ file, version: Number(match[1]) });
+	}
+	// The files known to state it must keep doing so; a dropped statement would pass an equality check.
+	for (const file of [
+		"docs/runbooks/gajaeway-v1.md",
+		"docs/deployment.md",
+		"docs/architecture.md",
+		"packages/gateway/src/persona/self-ops/config-and-restarts.md",
+	])
+		expect({ file, found: stated.some((entry) => entry.file === file) }).toEqual({ file, found: true });
+	expect(stated).toEqual(stated.map(({ file }) => ({ file, version: LATEST_SCHEMA_VERSION })));
 });
 
 test("persona workspace maps relative memory writes to the canonical corpus", async () => {

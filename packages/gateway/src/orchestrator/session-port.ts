@@ -231,8 +231,13 @@ export interface SessionPort {
 	 * Closes a live session (`session.close`). Recoverable on the broker side and
 	 * never `session.delete`: gjc fences every later lifecycle op on one refused
 	 * delete, so the gateway retires lanes by closing and rebinding instead.
+	 *
+	 * Without `ifIdle` the close is forced: active work is aborted. With `ifIdle: true`
+	 * gjc checks idleness and fences prompt admission atomically; a busy host refuses
+	 * with `busy` (not applied, retryable) and stays live. Each kind has its own
+	 * journal operation, so a replay never changes the kind.
 	 */
-	close(input: { sessionId: string; repo: string }): Promise<void>;
+	close(input: { sessionId: string; repo: string; ifIdle?: boolean }): Promise<void>;
 }
 
 export interface RunningHostJob {
@@ -1012,8 +1017,10 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	#releaseCloseOperation(sessionId: string): void {
-		const previous = this.#database.bindings.brokerOperation(this.#authority, "session.close", sessionId);
-		if (previous) this.#releaseOperation(previous);
+		for (const operation of ["session.close", "session.close_if_idle"] as const) {
+			const previous = this.#database.bindings.brokerOperation(this.#authority, operation, sessionId);
+			if (previous) this.#releaseOperation(previous);
+		}
 	}
 
 	#createRotations(originKey: string): number {
@@ -1950,18 +1957,22 @@ export class BrokerSessionPort implements SessionPort {
 		return { percent, tokens: Math.round((percent / 100) * window) };
 	}
 
-	async close(input: { sessionId: string; repo: string }): Promise<void> {
+	async close(input: { sessionId: string; repo: string; ifIdle?: boolean }): Promise<void> {
 		this.#assertOwned(input);
 		assertControlAllowed("session.close", { operatorApproval: true });
-		await this.#closeSessionOperation(input.sessionId);
+		await this.#closeSessionOperation(input.sessionId, input.ifIdle === true);
 	}
 
-	async #closeSessionOperation(sessionId: string): Promise<void> {
+	async #closeSessionOperation(sessionId: string, ifIdle = false): Promise<void> {
 		// Journaled per session: retries replay a possibly applied close under its
 		// original idempotency key, including cleanup of a mismatched pending create.
-		// A completed close is not issued again.
-		const intent = this.#beginOperation("session.close", sessionId, `gw-close-${randomUUID()}`, () =>
-			JSON.stringify({ sessionId }),
+		// A completed close is not issued again. Forced and idle-fenced closes are
+		// separate journal operations with distinct keys and request bodies.
+		const intent = this.#beginOperation(
+			ifIdle ? "session.close_if_idle" : "session.close",
+			sessionId,
+			`${ifIdle ? "gw-close-idle" : "gw-close"}-${randomUUID()}`,
+			() => JSON.stringify(ifIdle ? { sessionId, ifIdle: true } : { sessionId }),
 		);
 		if (intent.state === "complete") return;
 		// Lifecycle op: the per-session `control` route prohibits it for the
@@ -1989,6 +2000,7 @@ export class BrokerSessionPort implements SessionPort {
 			);
 		} catch (error) {
 			// The broker answered that nothing was or can be closed: the intent is spent.
+			// An idle-fenced `busy` is such a refusal; a later attempt uses a new key.
 			if (isRefusedOutcome(error)) this.#releaseOperation(intent);
 			throw error;
 		}
@@ -2206,8 +2218,11 @@ export class BrokerSessionPort implements SessionPort {
 				brokerGeneration: 0,
 				repo: input.repo,
 				...(input.originKey ? { originKey: input.originKey } : {}),
-				onFrame: () => {
-					lastActivityAt = this.#now();
+				// Same rule as the handle's stall clock: uncorrelated lifecycle/idle
+				// broadcasts reach every relay on the session and are only status
+				// hints, so they must not extend this turn's wait.
+				onFrame: (frame) => {
+					if (frame.commandId !== undefined || frame.turnId !== undefined) lastActivityAt = this.#now();
 				},
 				onStall: ({ elapsedMs }) =>
 					console.warn(`session stall sessionId=${input.sessionId} opRef=${input.opRef} silentMs=${elapsedMs}`),

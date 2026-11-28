@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initializeMemory, memoryRoot, regenerateMap } from "../src/memory/doctrine";
@@ -168,6 +168,46 @@ test("migrating twice is a no-op on the second run", async () => {
 	const after = await fingerprint(root);
 	await initializeMemory(home);
 	expect(await fingerprint(root)).toEqual(after);
+});
+
+test("index policy upgrade rebuilds a map whose headings are current but whose pointers are the old recent window", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-policy-upgrade-"));
+	const root = memoryRoot(home);
+	// The corpus as a pre-upgrade gateway left it: every axis directory exists and
+	// the map carries every axis heading, but `projects` was a `recent` axis, so the
+	// map lists the last 20 project pointers and the alphabetically first is gone.
+	for (const axis of BUILT_IN_AXES) {
+		await mkdir(join(root, axis.root), { recursive: true, mode: 0o700 });
+		for (const partition of axis.partitions)
+			await mkdir(join(root, axis.root, partition), { recursive: true, mode: 0o700 });
+	}
+	const project = (index: number) => `projects/p-${String(index).padStart(2, "0")}.md`;
+	await writeFile(join(root, "projects/aie-zeitgeist.md"), "# first project\n");
+	for (let index = 0; index < 20; index++) await writeFile(join(root, project(index)), `# project ${index}\n`);
+	const headings = BUILT_IN_AXES.map((axis) => `## ${axis.id}`).join("\n\n");
+	const listed = Array.from({ length: 20 }, (_, index) => `- [${project(index)}](${project(index)})`).join("\n");
+	await writeFile(join(root, "MEMORY.md"), `# Memory map\n\n${headings}\n\n${listed}\n`);
+	const authored = await fingerprint(root);
+	expect(authored.has("projects/aie-zeitgeist.md")).toBe(true);
+
+	await initializeMemory(home);
+
+	// The omitted project is restored by the tree index, and nothing a human wrote
+	// changed. Only the generated map is allowed to differ.
+	const map = await readFile(join(root, "MEMORY.md"), "utf8");
+	expect(map).toContain("- [projects/aie-zeitgeist.md](projects/aie-zeitgeist.md)");
+	const after = await fingerprint(root);
+	for (const [path, hash] of authored)
+		if (path !== "MEMORY.md") expect(`${path}=${after.get(path)}`).toBe(`${path}=${hash}`);
+
+	// The marker now matches the resolved registry, so a second initialization is a
+	// no-op: the map is neither rewritten in place nor replaced by a rename.
+	const before = await stat(join(root, "MEMORY.md"));
+	await initializeMemory(home);
+	const settled = await stat(join(root, "MEMORY.md"));
+	expect(settled.ino).toBe(before.ino);
+	expect(settled.mtimeMs).toBe(before.mtimeMs);
+	expect(await readFile(join(root, "MEMORY.md"), "utf8")).toBe(map);
 });
 
 // ---------------------------------------------------------------- ops layout

@@ -272,3 +272,153 @@ test("after a disconnect the owner set refreshes and a removed member is revoked
 	).resolves.toMatchObject({ engaged: true });
 	expect(database.bindings.modelGet("discord/channel/chan-1")).toBeUndefined();
 });
+
+test("channel ownerTarget with explicit owner: configured owner may /model, app owner is rejected, non-owner members rejected", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-channel-owner-explicit-e2e-"));
+	const CONFIGURED_OWNER = "2000000000000000002";
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		model: { preset: "base" },
+		// Channel ownerTarget with explicit owner: not a DM, so peerId is not set
+		ownerTarget: {
+			origin: { platform: "discord", kind: "channel", conversationId: "owner-chan" },
+			owner: CONFIGURED_OWNER,
+		},
+		channels: { "discord:chan-1": { engagement: "mention-open" as const } },
+	};
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: async (originKey, epoch) => `session-${originKey}-${epoch}`,
+		respond: async () => "ok",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+
+	const gateway = adapterFor(config, [APP_OWNER]);
+	await gateway.connect();
+	await Bun.sleep(20);
+
+	// Configured owner can /model
+	const configuredOwnerSet = await gateway.requestInbound(
+		"m-configured-owner",
+		CHANNEL_ORIGIN,
+		"/model set frontier-heavy",
+		as(CONFIGURED_OWNER),
+	);
+	expect(configuredOwnerSet?.engaged).toBe(true);
+	expect(database.bindings.modelGet("discord/channel/chan-1")?.selection).toEqual({ preset: "frontier-heavy" });
+
+	// App owner (different from configured owner) is REJECTED
+	const appOwnerRejected = await gateway.requestInbound(
+		"m-app-owner-rejected",
+		CHANNEL_ORIGIN,
+		"/model set openai-only",
+		as(APP_OWNER),
+	);
+	expect(appOwnerRejected?.engaged).toBe(false);
+	expect(appOwnerRejected?.turnId).toBeNull();
+	// Model should not have changed
+	expect(database.bindings.modelGet("discord/channel/chan-1")?.selection).toEqual({ preset: "frontier-heavy" });
+
+	// Non-owner member is REJECTED
+	const memberRejected = await gateway.requestInbound("m-member-rejected", CHANNEL_ORIGIN, "/model clear", as(MEMBER));
+	expect(memberRejected?.engaged).toBe(false);
+	expect(memberRejected?.turnId).toBeNull();
+	// Model should not have changed
+	expect(database.bindings.modelGet("discord/channel/chan-1")?.selection).toEqual({ preset: "frontier-heavy" });
+});
+
+test("DM ownerTarget keeps working unchanged: peerId takes precedence over adapter owners", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-dm-owner-unchanged-e2e-"));
+	const DM_OWNER = "4000000000000000004";
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		model: { preset: "base" },
+		// DM ownerTarget with peerId: should work as before
+		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "dm-1", peerId: DM_OWNER } },
+		channels: { "discord:chan-1": { engagement: "mention-open" as const } },
+	};
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: async (originKey, epoch) => `session-${originKey}-${epoch}`,
+		respond: async () => "ok",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+
+	const gateway = adapterFor(config, [APP_OWNER]);
+	await gateway.connect();
+	await Bun.sleep(20);
+
+	// DM owner (from peerId) can /model
+	const dmOwnerSet = await gateway.requestInbound(
+		"m-dm-owner",
+		CHANNEL_ORIGIN,
+		"/model set frontier-heavy",
+		as(DM_OWNER),
+	);
+	expect(dmOwnerSet?.engaged).toBe(true);
+	expect(database.bindings.modelGet("discord/channel/chan-1")?.selection).toEqual({ preset: "frontier-heavy" });
+
+	// App owner is REJECTED (even though it's configured as app owner)
+	const appOwnerRejected = await gateway.requestInbound(
+		"m-app-owner-rejected-dm",
+		CHANNEL_ORIGIN,
+		"/model clear",
+		as(APP_OWNER),
+	);
+	expect(appOwnerRejected?.engaged).toBe(false);
+	expect(appOwnerRejected?.turnId).toBeNull();
+	expect(database.bindings.modelGet("discord/channel/chan-1")?.selection).toEqual({ preset: "frontier-heavy" });
+});
+
+test("channel ownerTarget without explicit owner field: fails closed, no access to anyone", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-channel-owner-no-field-e2e-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		model: { preset: "base" },
+		// Channel ownerTarget without explicit owner: incomplete config, should fail closed
+		ownerTarget: { origin: { platform: "discord", kind: "channel", conversationId: "owner-chan" } },
+		channels: { "discord:chan-1": { engagement: "mention-open" as const } },
+	};
+	const database = await Store.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: async (originKey, epoch) => `session-${originKey}-${epoch}`,
+		respond: async () => "ok",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+
+	const gateway = adapterFor(config, [APP_OWNER]);
+	await gateway.connect();
+	await Bun.sleep(20);
+
+	// App owner is REJECTED (incomplete config requires explicit owner)
+	const appOwnerRejected = await gateway.requestInbound(
+		"m-app-owner-rejected",
+		CHANNEL_ORIGIN,
+		"/model set frontier-heavy",
+		as(APP_OWNER),
+	);
+	expect(appOwnerRejected?.engaged).toBe(false);
+	expect(appOwnerRejected?.turnId).toBeNull();
+	expect(database.bindings.modelGet("discord/channel/chan-1")).toBeUndefined();
+});

@@ -1022,7 +1022,7 @@ export class BindingsGroup {
 								WHERE quarantine.kind = 'work' AND quarantine.subject_id = runtime.job_id
 							)
 					)
-				)) OR (state = 'pending' AND operation = 'session.close' AND created_at < ?)`,
+				)) OR (state = 'pending' AND operation IN ('session.close', 'session.close_if_idle') AND created_at < ?)`,
 			)
 			.run(tx, cutoff.completedBefore, JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL), cutoff.pendingBefore).changes;
 	}
@@ -1052,7 +1052,12 @@ export class BindingsGroup {
 	}
 }
 
-export type BrokerOperationKind = "session.create" | "turn.prompt" | "session.close";
+/**
+ * `session.close` is the forced close; `session.close_if_idle` is the same broker op
+ * sent with `ifIdle: true`. Separate rows keep a replay from turning one kind into
+ * the other under a shared idempotency key.
+ */
+export type BrokerOperationKind = "session.create" | "turn.prompt" | "session.close" | "session.close_if_idle";
 
 /** Normalized authenticated control refusal, never an accepted prompt receipt. */
 export const BROKER_PROMPT_BUSY_REFUSAL = { ok: false, error: { code: "busy" } } as const;

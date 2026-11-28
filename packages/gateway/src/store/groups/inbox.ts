@@ -32,6 +32,9 @@ export function editedOriginalId(inboundMessageId: string): string | undefined {
 	return /^edit:(.+):[0-9a-f]{16}$/.exec(inboundMessageId)?.[1];
 }
 
+/** Characters an edit row id adds around the original id: `edit:` plus `:` and the 16-hex hash. */
+const EDIT_ID_AFFIX_LENGTH = "edit:".length + 1 + 16;
+
 export interface CrossSessionWatchRow {
 	readonly watch_id: string;
 	readonly watcher_origin_key: string;
@@ -144,13 +147,23 @@ export class InboxGroup {
 		);
 	}
 
+	/**
+	 * Whether `messageId` joined a turn on this origin, either as itself or through an edit of
+	 * it. An edit is stored as its own row (`edit:<id>:<hash>`, see `editedOriginalId`), so a
+	 * message that only became a turn once the user edited a mention into it has no row under
+	 * its platform id; the edit row is the evidence that the persona answered it.
+	 */
 	messageJoinedTurn(originKey: string, messageId: string): boolean {
 		return (
 			this.#db
 				.prepare(
-					"SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND message_id = ? AND turn_role IN ('trigger', 'steer') LIMIT 1",
+					`SELECT 1 AS n FROM inbound_messages
+					 WHERE origin_key = ? AND turn_role IN ('trigger', 'steer')
+					   AND (message_id = ? OR (substr(message_id, 1, 5) = 'edit:'
+					        AND substr(message_id, 6, length(message_id) - ${EDIT_ID_AFFIX_LENGTH}) = ?))
+					 LIMIT 1`,
 				)
-				.get(originKey, messageId) !== null
+				.get(originKey, messageId, messageId) !== null
 		);
 	}
 
@@ -1303,6 +1316,14 @@ export class InboxGroup {
 		);
 	}
 
+	/** The inbound row of one message in this origin, whatever its state. */
+	messageRow(messageId: string, originKey: string): InboundMessageRow | undefined {
+		const row = this.#db
+			.prepare(`SELECT ${INBOUND_COLUMNS} FROM inbound_messages WHERE message_id = ? AND origin_key = ?`)
+			.get(messageId, originKey) as InboundMessageRow | null;
+		return row ?? undefined;
+	}
+
 	messageExists(messageId: string): boolean {
 		return this.#db.prepare("SELECT 1 FROM inbound_messages WHERE message_id = ?").get(messageId) !== null;
 	}
@@ -1348,6 +1369,41 @@ export class InboxGroup {
 		return this.#db
 			.prepare("SELECT origin_key, origin_ref_json, text, at FROM recall_snippets ORDER BY id DESC")
 			.all() as Array<{ origin_key: string; origin_ref_json: string; text: string; at: string }>;
+	}
+
+	/**
+	 * Get a specific message from conversation context.
+	 * Returns undefined if the message is not found in the conversation context.
+	 */
+	contextRowByMessage(originKey: string, messageId: string): ConversationContextRow | undefined {
+		const row = this.#db
+			.prepare(
+				"SELECT message_id, author_id, author_name, body, received_at FROM conversation_context WHERE origin_key = ? AND message_id = ?",
+			)
+			.get(originKey, messageId) as ConversationContextRow | null;
+		return row ?? undefined;
+	}
+
+	/**
+	 * Check if an origin has had any trigger or steer turns whose prompts were actually sent
+	 * (send_attempted_at is stamped immediately before the prompt is handed to the broker).
+	 * A bound trigger without send_attempted_at provably never reached turn.prompt and was
+	 * requeued; local preflight rejections do not stamp it. Only when a prompt was actually
+	 * sent should root insertion be suppressed on subsequent turns.
+	 * Optionally exclude a specific message (useful when checking on the first turn).
+	 */
+	hasThreadTurns(originKey: string, excludeMessageId?: string): boolean {
+		const params: [string, ...string[]] = [originKey];
+		const whereClause = excludeMessageId ? "AND message_id != ?" : "";
+		if (excludeMessageId) params.push(excludeMessageId);
+
+		return (
+			this.#db
+				.prepare(
+					`SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? ${whereClause} AND turn_role IN ('trigger', 'steer') AND send_attempted_at IS NOT NULL LIMIT 1`,
+				)
+				.get(...params) !== null
+		);
 	}
 
 	#assertNotQuarantined(messageId: string): void {

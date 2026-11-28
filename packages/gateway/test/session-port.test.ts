@@ -2172,8 +2172,11 @@ test("request keeps observing an accepted op on the CLI when its relay tears mid
 // tool activity the whole way, and were killed as SessionRequestTimeoutError
 // at the 1800 s mark with the work still landing. The wait is an inactivity
 // lease: frames attributed to the turn refresh it; silence still ends it.
-for (const progressing of [true, false]) {
-	test(`request wait is an activity lease: a turn that keeps emitting ${progressing ? "survives past" : "is not spared when silent for"} waitTimeoutMs`, async () => {
+// Uncorrelated session broadcasts (lifecycle/idle hints that reach every relay)
+// are not the turn's activity and must not extend it.
+for (const traffic of ["correlated", "silent", "uncorrelated"] as const) {
+	const progressing = traffic === "correlated";
+	test(`request wait is an activity lease: a turn with ${traffic} traffic ${progressing ? "survives past" : "is not spared past"} waitTimeoutMs`, async () => {
 		home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 		database = await Store.open(join(home, "gateway.db"));
 		const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
@@ -2210,8 +2213,12 @@ for (const progressing of [true, false]) {
 			now: () => clock,
 			sleep: async (ms) => {
 				clock += ms;
-				if (progressing)
+				if (traffic === "correlated")
 					relay.streams[0]!.host({ type: "event", kind: "tool_execution_update", ...ids, payload: { event: {} } });
+				else if (traffic === "uncorrelated") {
+					relay.streams[0]!.host({ type: "agent_end" });
+					relay.streams[0]!.host({ type: "activity", state: "idle" });
+				}
 				// Let the pushed frame reach the handle before the next deadline check.
 				await Bun.sleep(1);
 			},
@@ -2449,8 +2456,7 @@ test("runCompaction gives gjc's own request the compaction budget and reports a 
 	// One five-minute deadline end to end: the process bound (CLI slot wait included)
 	// is the whole budget, and gjc's request ends a little earlier so its reply is read.
 	expect(calls[0]!.timeoutMs).toBe(300_000);
-	expect(requestBudgetMs).toBeGreaterThan(40_000);
-	expect(requestBudgetMs).toBeLessThan(calls[0]!.timeoutMs!);
+	expect(requestBudgetMs).toBe(285_000);
 
 	// gjc's request timeout settles only the client; the host may still be compacting.
 	respond = async () => ({ exitCode: 1, stdout: commandError("timeout", "unknown"), stderr: "" });
@@ -2518,7 +2524,7 @@ test("runCompaction on the relay reports whether the host's ordered dispatcher a
 	reply = async () => ({ ok: false, error: { code: "internal", message: "Control operation failed." } });
 	expect(await port.runCompaction(target)).toEqual({ status: "failed", code: "internal", answered: true });
 	// Refused before ordered dispatch: the run never started and proves nothing about earlier ones.
-	for (const code of ["session_quiescing", "not_activated", "operation_not_session_owned"]) {
+	for (const code of ["session_quiescing", "not_activated", "operation_not_session_owned", "operation_prohibited"]) {
 		reply = async () => ({ ok: false, error: { code, message: "refused" } });
 		expect(await port.runCompaction(target)).toEqual({ status: "failed", code });
 	}

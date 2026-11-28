@@ -277,7 +277,10 @@ describe("runUpdate", () => {
 				gjc: { version: PINNED_GJC },
 			});
 			expect(await readFile(join(dir, ".gajaeway-release"), "utf8")).toBe("0.2.0\n");
-			expect(await readlink(homeLayout(home).gjcCurrent)).toBe(PINNED_GJC);
+			// The gjc version is installed but pin is not flipped until after restart succeeds.
+			// Verify the pin still points to the previous version until the restart completes.
+			const gjcCurrent = await readlink(homeLayout(home).gjcCurrent).catch(() => undefined);
+			expect(gjcCurrent).toBeUndefined();
 			const backups = (await readdir(dir)).filter((name) => name.startsWith("backup-0.1.1-"));
 			expect(backups).toHaveLength(1);
 			for (const name of ["gajaeway", "gajaeway-gateway", "gajaeway-slack"])
@@ -686,6 +689,50 @@ describe("runUpdate", () => {
 			expect((await readFile(join(dir, "gajaeway"), "utf8")).startsWith("old-")).toBe(true);
 		} finally {
 			await holder.release();
+			await rm(dir, { recursive: true, force: true });
+			await rm(home, { recursive: true, force: true });
+		}
+	});
+
+	test("an update defers gjc pin flip until after broker restart (issue #876)", async () => {
+		// When restart is queued, the gjc version should be passed to queueRestart
+		// so it can be pinned after the broker restarts successfully.
+		// This prevents the issue where the pin is flipped but the restart fails,
+		// leaving the broker on the old version while the pin points to the new version.
+		const dir = await binDirWith("0.1.1", ["gajaeway", "gajaeway-gateway"]);
+		const previousManifest = JSON.stringify({ gjc: { version: "0.19.0" } });
+		await writeFile(join(dir, "package.json"), `${previousManifest}\n`, "utf8");
+		const home = await homeWithConfig();
+		const newGjcVersion = "0.21.0";
+		let receivedGjcVersion: string | undefined;
+		try {
+			const result = await runUpdate({
+				args: { check: false, force: false, noRestart: false, binDir: dir },
+				home,
+				deps: {
+					fetchLatestRelease: async () => release("v0.2.0", [DARWIN_ASSET]),
+					downloadAsset: async () => new Uint8Array(0),
+					extractTarball: extractorFor(
+						CORE_BINARIES.map((name) => ({ name, marker: `staged-${name}` })),
+						newGjcVersion,
+					),
+					gjcInstallRunner,
+					serviceOptions: serviceOptions(home),
+					queueRestart: async (_home: string, _binDir: string, _trigger: string, gjcVersion?: string) => {
+						receivedGjcVersion = gjcVersion;
+						return { receiptId: "r-1", supervisorPid: 42 };
+					},
+					platform: "darwin",
+					arch: "arm64",
+				},
+			});
+			// Verify the new gjc version is passed to queueRestart for deferred pin flip
+			expect(receivedGjcVersion as string).toBe(newGjcVersion);
+			expect(result.restartQueued).toBe("r-1");
+			// Pin should NOT be flipped yet (it will be flipped after broker restarts)
+			const currentPin = await readlink(homeLayout(home).gjcCurrent).catch(() => undefined);
+			expect(currentPin).not.toBe(newGjcVersion);
+		} finally {
 			await rm(dir, { recursive: true, force: true });
 			await rm(home, { recursive: true, force: true });
 		}

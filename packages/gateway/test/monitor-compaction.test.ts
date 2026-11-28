@@ -134,11 +134,18 @@ async function realBrokerMonitorHarness(directory: string) {
 					ok: true,
 					result: {
 						operationRef: opRef,
-						status: {
-							status: output.has(opRef) ? "terminal_ok" : "unknown",
-							startedAt: started.get(opRef),
-							terminalAt: Date.now(),
-						},
+						status: output.has(opRef)
+							? {
+									// The CLI `session status` carries the same canonical terminal body as
+									// `turn.result`: a completed stop is proven by receipt and outcome, not
+									// by the `terminal_ok` word alone.
+									status: "terminal_ok",
+									receiptState: "present",
+									outcome: { reason: "end_turn", provenance: "agent" },
+									startedAt: started.get(opRef),
+									terminalAt: Date.now(),
+								}
+							: { status: "unknown" },
 						summary: { completed: output.has(opRef) },
 					},
 				}),
@@ -424,7 +431,7 @@ for (const restart of [false, true]) {
 			await active.submitAwaitable(f.monitor.monitorId, "budget.tick", {});
 			expect(f.jobs).toHaveBeenCalledTimes(1);
 			expect(f.close).toHaveBeenCalledTimes(1);
-			expect(f.close.mock.calls[0]?.[0]).toEqual({ sessionId: "event-session-e0", repo: process.cwd() });
+			expect(f.close.mock.calls[0]?.[0]).toEqual({ sessionId: "event-session-e0", repo: process.cwd(), ifIdle: true });
 			expect(f.sessionPort.closes.map(({ sessionId }) => sessionId)).toEqual(["event-session-e0"]);
 			expect(f.terminate).not.toHaveBeenCalled();
 			expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
@@ -558,6 +565,72 @@ for (const code of [
 		} finally {
 			log.mockRestore();
 			f.pipeline.dispose();
+			f.database.close();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+for (const restart of [false, true]) {
+	test(`work that starts after the last idle probe makes the idle-fenced close refuse busy and keeps the record${restart ? " across restart" : ""}`, async () => {
+		const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retire-busy-"));
+		const f = await retirementHarness(directory);
+		let active = f.pipeline;
+		const log = spyOn(console, "info").mockImplementation(() => {});
+		try {
+			await f.dispatch();
+			await f.dispatch();
+			const retired = f.database.core.metaGet(f.retiredKey)!;
+			// Every gateway probe reports idle; a turn starts after the last one, so gjc's
+			// atomic idle check refuses the close (the fake keeps the host live on error).
+			f.sessionPort.beforeRunningJobs = () => {
+				f.sessionPort.closeOutcomes.set("event-session-e0", [
+					new GjcCliError("gjc sdk session.close reported failure", 0, "", {
+						code: "busy",
+						outcomeCertainty: "not-applied",
+						retryability: "yes",
+					}),
+				]);
+			};
+			await f.dispatch();
+			f.sessionPort.beforeRunningJobs = undefined;
+			expect(f.close).toHaveBeenCalledTimes(1);
+			expect(f.close.mock.calls[0]?.[0]).toEqual({ sessionId: "event-session-e0", repo: process.cwd(), ifIdle: true });
+			// No forced fallback: no second close, no host signal, the host is still live.
+			expect(f.terminate).not.toHaveBeenCalled();
+			expect(await f.sessionPort.inspect({ sessionId: "event-session-e0", repo: process.cwd() })).toMatchObject({
+				live: true,
+			});
+			const kept = JSON.parse(f.database.core.metaGet(f.retiredKey)!);
+			expect(kept).toEqual({ ...JSON.parse(retired), lastAttemptAt: expect.any(Number) });
+			expect(kept).not.toHaveProperty("phase");
+			expect(log.mock.calls).toContainEqual([
+				`monitor retired session close for ${f.sessionKey}: session=event-session-e0 outcome=held:busy`,
+			]);
+			if (restart) {
+				f.pipeline.dispose();
+				active = new MonitorPropagator({
+					database: f.database,
+					registry: f.registry,
+					sessionPort: f.sessionPort,
+					memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+					delivery: new DeliveryService(f.database),
+					emit: () => {},
+				});
+			}
+			// A later cycle retries the idle-fenced close and retires once the host is idle.
+			await active.submitAwaitable(f.monitor.monitorId, "budget.tick", {});
+			expect(f.sessionPort.closes).toEqual([
+				{ sessionId: "event-session-e0", repo: process.cwd(), ifIdle: true },
+				{ sessionId: "event-session-e0", repo: process.cwd(), ifIdle: true },
+			]);
+			expect(f.database.core.metaGet(f.retiredKey)).toBeUndefined();
+			expect(log.mock.calls).toContainEqual([
+				`monitor retired session close for ${f.sessionKey}: session=event-session-e0 outcome=closed`,
+			]);
+		} finally {
+			log.mockRestore();
+			active.dispose();
 			f.database.close();
 			await rm(directory, { recursive: true, force: true });
 		}
