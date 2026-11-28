@@ -262,6 +262,28 @@ test("the owner is never dropped by the guest policy, even when the lookup faile
 	);
 });
 
+test("the guest-policy owner exemption follows the configured owner identity (#901)", () => {
+	const policy = { guestPolicy: { dm: "drop", channel: "drop" } };
+	const channelOwner = {
+		ownerTarget: { origin: { platform: "slack", kind: "channel", conversationId: "C1" }, owner: "U_OWNER" },
+		slack: policy,
+	} as unknown as GatewayConfig;
+	const guest = { mentioned: true, group: false, authorId: "U_OWNER", trust: "guest" } as const;
+	expect(checkSlackGuestPolicy(guest, { platform: "slack", kind: "dm" }, channelOwner)).toBe("allow");
+	// The adapter-reported owner counts only without an ownerTarget, and only on its own platform.
+	const adapter = { platformOwnerIds: ["U_APP"], platformOwnerPlatform: "slack" };
+	const app = { ...guest, authorId: "U_APP" };
+	expect(checkSlackGuestPolicy(app, { platform: "slack", kind: "dm" }, channelOwner, adapter)).toBe("drop");
+	const noTarget = { slack: policy } as unknown as GatewayConfig;
+	expect(checkSlackGuestPolicy(app, { platform: "slack", kind: "dm" }, noTarget, adapter)).toBe("allow");
+	expect(
+		checkSlackGuestPolicy(app, { platform: "slack", kind: "dm" }, noTarget, {
+			...adapter,
+			platformOwnerPlatform: "discord",
+		}),
+	).toBe("drop");
+});
+
 test("a trust claim on a non-Slack origin is ignored", () => {
 	const config = { slack: { guestPolicy: { dm: "drop", channel: "drop" } } } as unknown as GatewayConfig;
 	const guest = { mentioned: true, group: false, authorId: "123", trust: "guest" } as const;
