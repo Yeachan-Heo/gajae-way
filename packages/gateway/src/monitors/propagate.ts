@@ -12,7 +12,13 @@ import {
 	type ProtocolFailureReason,
 	parseOriginKey,
 } from "@gajae-gateway/protocol";
-import { envelopeErrorCode, GjcCliError, type StatusReport } from "@gajae-gateway/subsession";
+import {
+	envelopeErrorCode,
+	GjcCliError,
+	projectOpState,
+	requiresOperatorHold,
+	type StatusReport,
+} from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
@@ -885,9 +891,11 @@ export class MonitorPropagator {
 	}
 
 	/**
-	 * Untagged failed operations retain their existing terminal disposition. A
-	 * size-retired pointer needs definitive output loss or its exact durable busy
-	 * refusal before retirement; its tag applies even after retry exhaustion.
+	 * A canonically failed operation retains its terminal disposition. A raw
+	 * `failed` report whose receipt is missing/unknown is not a proven failure
+	 * (#827): it keeps the saved operation for a late receipt. A size-retired
+	 * pointer needs definitive output loss or its exact durable busy refusal before
+	 * retirement; its tag applies even after retry exhaustion.
 	 */
 	async #exhaustedTurnDisposition(row: MonitorEventDbRow, ownedLeaseId?: string): Promise<ExhaustedTurnDisposition> {
 		const raw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
@@ -906,8 +914,18 @@ export class MonitorPropagator {
 			return { kind: "hold", reason: "unresolved" };
 		}
 		const state = report.status?.status;
-		if (state === "failed" && !turn.sizeRolled) return { kind: "terminal", raw };
+		const projected = projectOpState(report.status);
+		// A raw `failed` report with a missing/unknown receipt is not a proven failure:
+		// canonically it projects to `terminal_missing_receipt`/`terminal_uncertain`, the
+		// operator-hold states. It keeps the saved operation identity until a
+		// correlated receipt or definitive no-send evidence resolves it (#827).
+		if (state === "failed" && !isUnaccountedTerminal(report.status) && !turn.sizeRolled)
+			return { kind: "terminal", raw };
 		if (state === "accepted" || state === "in_flight") return { kind: "hold", reason: "running" };
+		// A terminal transition that did not complete the turn (refusal, max_tokens,
+		// cancellation, missing/unknown receipt) has no result to recover: keep the
+		// pointer and leave the event held for operator judgement.
+		if (state === "terminal_ok" && projected !== "completed") return { kind: "hold", reason: "unresolved" };
 		if (state !== "terminal_ok" && !(state === "failed" && turn.sizeRolled)) {
 			// Durable no-send failures (busy-refused, submission-wedged, host-unavailable)
 			// are explicit evidence the operation was never sent. Forget the pointer and recover.
@@ -979,18 +997,28 @@ export class MonitorPropagator {
 	 * the original operation is terminal_ok AND its own result is readable, every
 	 * event of that batch is reopened together with its exhausted budget kept, so
 	 * the exhausted-turn path resumes the saved session/op-ref and harvests that
-	 * result; it can never send a fresh prompt. A failed or definitively
+	 * result; it can never send a fresh prompt. A resolved failure or a definitively
 	 * unreadable operation's pointer is dropped: there is nothing left to recover.
+	 * A raw `failed` report whose receipt is still missing keeps its identity, so a
+	 * late completed receipt can still recover the original result (#827).
 	 */
 	async #recoverUnresolvedTurns(): Promise<void> {
-		const visited = new Set<string>();
-		for (const candidate of this.#database.monitors.eventsGivenUp(AUTHORING_TURN_UNRESOLVED)) {
-			if (this.#closing) return;
-			if (visited.has(candidate.event_id)) continue;
+		if (this.#closing) return;
+		const cursor = this.#database.core.metaGet(AUTHORING_RECOVERY_CURSOR) ?? "";
+		const candidates = this.#database.monitors.eventsGivenUp(AUTHORING_TURN_UNRESOLVED, cursor);
+		if (!candidates.length) {
+			// Nothing left after the cursor: wrap so the next sweep starts over instead
+			// of abandoning candidates that were running when they were last probed.
+			if (cursor !== "") this.#database.core.metaSet(AUTHORING_RECOVERY_CURSOR, "");
+			return;
+		}
+		for (const candidate of candidates) {
+			// Advance before probing. One saved operation per sweep bounds what unrelated
+			// open work waits behind, and a slow or unreadable read never pins the scan.
+			this.#database.core.metaSet(AUTHORING_RECOVERY_CURSOR, candidate.event_id);
 			const raw = this.#database.core.metaGet(authoringTurnKey(candidate.event_id));
 			const turn = raw === undefined ? undefined : parseAuthoringTurnPointer(raw);
 			if (!raw || !turn?.eventIds.includes(candidate.event_id)) continue;
-			for (const eventId of turn.eventIds) visited.add(eventId);
 			const members = this.#database.monitors.eventsByIds([...turn.eventIds]);
 			const reopenable = (rows: readonly MonitorEventDbRow[]) =>
 				rows.length === turn.eventIds.length &&
@@ -1017,11 +1045,15 @@ export class MonitorPropagator {
 				continue;
 			}
 			const state = report.status?.status;
-			if (state === "failed") {
+			// Only a resolved end retires the pointer. A raw `failed` report whose receipt
+			// is still missing/unknown is unresolved: keep it for a late correlated
+			// receipt instead of forgetting an identity that may still become readable
+			// (#827).
+			if (state === "failed" && !isUnaccountedTerminal(report.status)) {
 				if (!turn.sizeRolled) this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, turn.eventIds, raw));
 				continue;
 			}
-			if (state !== "terminal_ok") continue;
+			if (state !== "terminal_ok" || !completedAuthoringTurn(report.status)) continue;
 			const output = await this.#readAuthoringResult(turn, members, report);
 			if (output.status === "unavailable" && (!turn.sizeRolled || output.definitiveLoss)) {
 				this.#database.transaction((tx) => this.#forgetAuthoringTurn(tx, turn.eventIds, raw));
@@ -1436,7 +1468,8 @@ export class MonitorPropagator {
 							);
 							if (!isBrokerPromptBusyRefusal(brokerOp)) {
 								// No positive never-admitted evidence: check actual status.
-								// Explicit failure permits fresh authoring; unknown status holds the pointer.
+								// A proven failure permits fresh authoring; every unresolved end holds
+								// the pointer instead of resending a prompt (#742, #827).
 								try {
 									const report = await this.#sessionPort.status({
 										sessionId,
@@ -1444,8 +1477,8 @@ export class MonitorPropagator {
 										opRef: prior.opRef,
 									});
 									const state = report.status?.status;
-									if (state === "failed") {
-										// Explicit failure permits fresh authoring
+									if (state === "failed" && !isUnaccountedTerminal(report.status)) {
+										// A proven failure or an ended attempt permits fresh authoring
 									} else {
 										// Durable no-send failures (busy-refused, submission-wedged, host-unavailable)
 										// are explicit evidence the operation was never sent. Permit fresh authoring.
@@ -1496,6 +1529,11 @@ export class MonitorPropagator {
 								continue;
 							}
 							// Otherwise resolve the old op against its own session.
+							// A terminal-but-unaccounted report (missing/unknown receipt or a
+							// terminal turn that did not complete) keeps its identity even across a
+							// failure roll; a completed turn whose result cannot be harvested
+							// cross-session still follows the documented failure-roll path.
+							let heldUnresolvedStatus = false;
 							try {
 								const report = await this.#sessionPort.status({
 									sessionId: prior.sessionId,
@@ -1503,6 +1541,10 @@ export class MonitorPropagator {
 									opRef: prior.opRef,
 								});
 								const state = report.status?.status;
+								heldUnresolvedStatus =
+									state === "terminal_ok"
+										? !completedAuthoringTurn(report.status)
+										: state === "failed" && isUnaccountedTerminal(report.status);
 								if (state === "accepted" || state === "in_flight") {
 									// Old turn still running: hold this dispatch, keep the pointer.
 									throw new AuthoringResultUnavailableError("output_pending");
@@ -1512,8 +1554,8 @@ export class MonitorPropagator {
 									// For safety, hold instead of attempting cross-session harvest.
 									throw new AuthoringResultUnavailableError("output_pending");
 								}
-								if (state === "failed") {
-									// A terminally failed turn permits a fresh prompt.
+								if (state === "failed" && !isUnaccountedTerminal(report.status)) {
+									// A proven failure or an ended attempt permits a fresh prompt.
 									eventIdsToForget.push(row.event_id);
 								} else if (state === "unknown" || typeof state === "undefined") {
 									// Unknown status: hold pointer for operator judgement (#742).
@@ -1536,6 +1578,14 @@ export class MonitorPropagator {
 									throw new AuthoringResultUnavailableError("output_pending");
 								}
 							} catch (error) {
+								// A terminal-but-unaccounted report is never overridden by a failure
+								// roll: a missing/unknown receipt, or a terminal turn that did not
+								// complete, says nothing about whether the turn was sent or produced
+								// an authoring result, so the saved identity must survive the roll
+								// (#827). Exact durable no-send evidence was already checked before
+								// the status read. A completed turn whose cross-session result is
+								// unreadable still keeps origin/dev's failure-roll fresh-authoring path.
+								if (error instanceof AuthoringResultUnavailableError && heldUnresolvedStatus) throw error;
 								// Unreadable status in old session after explicit failure roll: forget the pointer (#742/#738).
 								// Failure codes (session_*_stalled, session_submission_wedged, session_host_unavailable)
 								// are definitive reasons to roll. The old session context is invalid.
@@ -2005,6 +2055,10 @@ export class MonitorPropagator {
 			report = await readStatus();
 		}
 		if (report.status.status !== "terminal_ok") throw new SessionTerminalError(report);
+		// The turn ended, but not necessarily successfully: a refusal, max_tokens stop,
+		// cancellation, or a missing/unknown receipt carries no completed authoring
+		// result. Hold the saved operation instead of delivering its partial body.
+		if (!completedAuthoringTurn(report.status)) throw new AuthoringResultUnavailableError("output_pending");
 		const output = await this.#readAuthoringResult(turn, rows, report);
 		if (output.status === "proven") return output.text;
 		if (output.status === "unavailable" && (!turn.sizeRolled || output.definitiveLoss))
@@ -2020,8 +2074,12 @@ export class MonitorPropagator {
 	/**
 	 * The op-ref of a previous attempt's authoring turn for exactly these events
 	 * on this session, when that turn is still running or finished successfully.
-	 * A failed, unknown or unreadable prior turn is forgotten so the retry sends
-	 * a fresh prompt unless its persisted size-roll tag requires strict evidence.
+	 * A resolved failure is forgotten so the retry sends a fresh prompt. An unknown
+	 * or unreadable prior turn is held without resending, and so is an unaccounted
+	 * terminal transition (missing/unknown receipt) without exact no-send evidence:
+	 * that identity may still produce a late completed receipt (#827). An exact
+	 * authority-scoped busy refusal or operation-correlated durable no-send failure
+	 * proves the prompt was never admitted and releases the pointer for one send.
 	 */
 	async #reusableAuthoringTurn(eventIds: readonly string[], sessionId: string): Promise<string | undefined> {
 		const raw = this.#database.core.metaGet(authoringTurnKey(eventIds[0] ?? ""));
@@ -2071,14 +2129,33 @@ export class MonitorPropagator {
 			const report = await this.#sessionPort.status({ sessionId, repo: this.#repo, opRef: prior.opRef });
 			const state = report.status.status;
 			if (state === "accepted" || state === "in_flight" || state === "terminal_ok") return prior.opRef;
-			// Failed status: forget and let dispatch author fresh (#742).
 			if (state === "failed") {
+				// A raw `failed` report whose receipt is missing/unknown is not proof the
+				// turn failed. Hold the saved operation instead of resending a prompt that
+				// may duplicate work the unaccounted turn already did (#827) — unless an
+				// exact authority-scoped busy refusal, or a durable no-send failure on
+				// every member event of this exact session/op, proves it was never admitted.
+				if (isUnaccountedTerminal(report.status)) {
+					const authority = this.#database.bindings.brokerAuthority();
+					const neverAdmitted =
+						authority !== null &&
+						(this.#promptBusyRefused(prior) ||
+							prior.eventIds.every((eventId) =>
+								isDurableNoSendFailureForOperation(
+									this.#database.monitors.failure(eventId),
+									prior.sessionId,
+									prior.opRef,
+								),
+							));
+					if (!neverAdmitted) throw new AuthoringResultUnavailableError("output_pending");
+				}
 				forget();
 				return undefined;
 			}
 			// Unknown status: hold for operator judgement, do not forget or reuse (#742).
 			return undefined;
-		} catch {
+		} catch (error) {
+			if (error instanceof AuthoringResultUnavailableError) throw error;
 			// Unreadable status is not evidence of a live turn. Hold on throwing status.
 		}
 		return undefined;
@@ -2848,6 +2925,27 @@ export class MonitorPropagator {
 }
 
 /**
+ * A terminal transition that actually completed the turn. A refusal, max_tokens
+ * stop, cancellation, or missing/unknown receipt is terminal for the operation
+ * but produced no completed authoring result, and must never be delivered as
+ * one. Shared by every recovery path that harvests a saved operation.
+ */
+function completedAuthoringTurn(status: StatusReport["status"]): boolean {
+	return status.status === "terminal_ok" && projectOpState(status) === "completed";
+}
+
+/**
+ * A terminal-but-unaccounted operation (#827): the runtime reported a terminal
+ * transition while its receipt is missing or unknown, so the canonical projection
+ * is `terminal_missing_receipt`/`terminal_uncertain` — an operator hold, never a
+ * proven failure. A saved operation in this state keeps its identity until a
+ * correlated receipt or durable no-send evidence resolves it.
+ */
+function isUnaccountedTerminal(status: StatusReport["status"]): boolean {
+	return requiresOperatorHold(projectOpState(status));
+}
+
+/**
  * Verify that a failure is a durable no-send failure belonging to the specified operation (#742).
  * Checks both the code AND that the operation reference matches (sessionId + opRef).
  */
@@ -3034,6 +3132,12 @@ export function parseAuthoredArray(response: string): unknown {
 
 /** Failure code of an exhausted event given up on an unresolvable authoring turn (#702). */
 const AUTHORING_TURN_UNRESOLVED = "authoring_turn_unresolved";
+/**
+ * Restart-fair scan position for historical late-result recovery. One saved
+ * operation is probed per sweep, so the scan advances a durable cursor instead
+ * of holding every later candidate behind the first slow status read.
+ */
+const AUTHORING_RECOVERY_CURSOR = "monitor_authoring_recovery_cursor";
 
 /** Durable pointer from an event to the authoring turn its last dispatch started (#187). */
 function authoringTurnKey(eventId: string): string {
