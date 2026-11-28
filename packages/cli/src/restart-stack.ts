@@ -145,7 +145,7 @@ export interface RunRestartOptions {
 }
 
 const RECEIPT_FILE = "restart-stack.json";
-const VERIFY_TIMEOUT_MS = 90_000;
+const VERIFY_TIMEOUT_MS = 150_000; // Allow gateway startup + drain request timeout (135s) + socket binding buffer
 const POLL_MS = 1_000;
 const RESTART_DRAIN_WAIT_MS = 120_000;
 const RESTART_DRAIN_REQUEST_TIMEOUT_MS = RESTART_DRAIN_WAIT_MS + 15_000;
