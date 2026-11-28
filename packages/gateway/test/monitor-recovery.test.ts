@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PROTOCOL_FAILURE_REASONS } from "@gajae-gateway/protocol";
+import { monitorSessionOrigin, originKey, PROTOCOL_FAILURE_REASONS } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MemoryClosureQueue } from "../src/memory/closure";
@@ -2462,7 +2462,11 @@ describe("#702: an exhausted event held on an unresolvable authoring turn", () =
 			JSON.stringify(eventIds.map((eventId) => ({ eventId, note: `original ${eventId}` }))),
 		);
 		sessionPort.seedOperation("gw-m-successor", "s1", "terminal_ok", "successor answer");
-		await propagator.reconcile();
+		// The historical scan probes one saved operation per sweep and wraps at the end
+		// of the candidate list, so the sweep after the wrap is the one that probes this
+		// operation again and reopens it.
+		for (let sweep = 0; sweep < 3 && eventIds.some((id) => stage(db, id) !== "authored_no_delivery"); sweep++)
+			await propagator.reconcile();
 		for (const id of eventIds) {
 			expect(stage(db, id)).toBe("authored_no_delivery");
 			expect(db.monitors.authoredOutput(id)).toBe(`original ${id}`);
@@ -2543,14 +2547,26 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 		priorStatus: PriorStatus;
 		currentSessionId?: string;
 		priorSessionId?: string;
+		priorReceiptState?: "missing" | "unknown";
+		priorErrorCode?: string;
 		durableBusyRefusal?: boolean;
+		foreignBusyRefusal?: boolean;
+		noSendFailure?: {
+			code: "session_busy" | "session_submission_wedged" | "session_host_unavailable";
+			opRef?: string;
+			sessionId?: string;
+			eventIndex?: number;
+		};
+		batchSize?: number;
+		withoutAuthority?: boolean;
 	}) {
 		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-742-prior-pointer-"));
 		database = await Store.open(join(home, "gateway.db"));
 		const db = database;
 		const priorSessionId = options.priorSessionId ?? "s1";
 		const currentSessionId = options.currentSessionId ?? priorSessionId;
-		const eventId = crypto.randomUUID();
+		const eventIds = Array.from({ length: options.batchSize ?? 1 }, () => crypto.randomUUID());
+		const eventId = eventIds[0] as string;
 		const priorOpRef = crypto.randomUUID();
 		let prompts = 0;
 		let pointerAtPrompt: string | undefined;
@@ -2559,7 +2575,7 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 			pointerAtPrompt = db.core.metaGet(`monitor_authoring_turn:${eventId}`);
 			return JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "fresh" })));
 		}, currentSessionId);
-		attachTestBrokerOwnership(db, sessionPort, join(home, "agent"));
+		if (!options.withoutAuthority) attachTestBrokerOwnership(db, sessionPort, join(home, "agent"));
 
 		const monitor = new MonitorRegistry(db).add({
 			name: "test-monitor",
@@ -2567,26 +2583,31 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 			eventTypes: ["test.event"],
 		});
 		db.transaction((tx) => {
-			db.monitors.eventCreate(tx, {
-				eventId,
-				monitorId: monitor.monitorId,
-				eventType: "test.event",
-				payloadJson: JSON.stringify({}),
-				firedAt: new Date().toISOString(),
-			});
-			db.monitors.eventUpdate(tx, eventId, "admitted");
-			db.core.metaSet(
-				`monitor_authoring_turn:${eventId}`,
-				JSON.stringify({ sessionId: priorSessionId, opRef: priorOpRef, eventIds: [eventId] }),
-			);
+			const pointer = JSON.stringify({ sessionId: priorSessionId, opRef: priorOpRef, eventIds });
+			for (const id of eventIds) {
+				db.monitors.eventCreate(tx, {
+					eventId: id,
+					monitorId: monitor.monitorId,
+					eventType: "test.event",
+					payloadJson: JSON.stringify({}),
+					firedAt: new Date().toISOString(),
+				});
+				db.monitors.eventUpdate(tx, id, "admitted");
+				db.core.metaSet(`monitor_authoring_turn:${id}`, pointer);
+			}
 		});
 
 		const authority = db.bindings.brokerAuthority();
-		if (!authority) throw new Error("test broker authority was not initialized");
+		if (!authority && !options.withoutAuthority) throw new Error("test broker authority was not initialized");
 		if (options.durableBusyRefusal) {
+			if (!authority) throw new Error("test durable busy refusal requires a broker authority");
 			const scope = JSON.stringify([priorSessionId, priorOpRef]);
+			const owner = options.foreignBusyRefusal
+				? { canonicalAgentDir: join(home, "foreign-agent"), identity: `gjc:${join(home, "foreign-agent")}` }
+				: authority;
+			if (options.foreignBusyRefusal) db.transaction((tx) => db.bindings.setAuthority(tx, owner));
 			db.transaction((tx) => {
-				db.bindings.beginBrokerOperation(tx, authority, {
+				db.bindings.beginBrokerOperation(tx, owner, {
 					operation: "turn.prompt",
 					scope,
 					operationRef: priorOpRef,
@@ -2594,15 +2615,33 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 				});
 				db.bindings.completeBrokerOperation(
 					tx,
-					authority,
+					owner,
 					"turn.prompt",
 					scope,
 					priorOpRef,
 					JSON.stringify({ ok: false, error: { code: "busy" } }),
 				);
 			});
-			expect(db.bindings.brokerOperation(authority, "turn.prompt", scope)?.resultJson).toBe(
+			if (options.foreignBusyRefusal) db.transaction((tx) => db.bindings.setAuthority(tx, authority));
+			expect(db.bindings.brokerOperation(owner, "turn.prompt", scope)?.resultJson).toBe(
 				JSON.stringify({ ok: false, error: { code: "busy" } }),
+			);
+			if (options.foreignBusyRefusal)
+				expect(db.bindings.brokerOperation(authority, "turn.prompt", scope)).toBeUndefined();
+		}
+		if (options.noSendFailure) {
+			const failure = options.noSendFailure;
+			db.transaction((tx) =>
+				db.monitors.failureRecord(
+					tx,
+					eventIds[failure.eventIndex ?? 0] as string,
+					failure.code,
+					"durable no-send refusal",
+					{
+						sessionId: failure.sessionId ?? priorSessionId,
+						opRef: failure.opRef ?? priorOpRef,
+					},
+				),
 			);
 		}
 
@@ -2614,7 +2653,11 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 			if (options.priorStatus === "throws") throw new Error("broker_unavailable");
 			return {
 				operationRef: input.opRef,
-				status: { status: options.priorStatus },
+				status: {
+					status: options.priorStatus,
+					...(options.priorReceiptState ? { receiptState: options.priorReceiptState } : {}),
+					...(options.priorErrorCode ? { error: { code: options.priorErrorCode } } : {}),
+				},
 				summaryCompleted: false,
 			} as never;
 		};
@@ -2633,6 +2676,7 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 		return {
 			db,
 			eventId,
+			eventIds,
 			priorOpRef,
 			priorSessionId,
 			statusCalls,
@@ -2796,6 +2840,157 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 		expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBeUndefined();
 	});
 
+	// #827: a raw `failed` report whose receipt is missing/unknown is not proof the
+	// turn failed, so it must keep its saved operation instead of resending.
+	for (const unproven of [
+		{ label: "a missing receipt", receiptState: "missing" as const, errorCode: undefined },
+		{
+			label: "a prompt deadline kill without a receipt",
+			receiptState: "missing" as const,
+			errorCode: "prompt_deadline_exceeded",
+		},
+		{ label: "an unknown receipt", receiptState: "unknown" as const, errorCode: undefined },
+	] as const) {
+		test(`same-session failed prior status with ${unproven.label} holds the pointer without prompting`, async () => {
+			const result = await dispatchWithPriorPointer({
+				priorStatus: "failed",
+				priorReceiptState: unproven.receiptState,
+				...(unproven.errorCode ? { priorErrorCode: unproven.errorCode } : {}),
+			});
+			expectOldPointerStatus(result);
+			expect(result.prompts()).toBe(0);
+			expect(result.sessionPort.sendAttempts).toHaveLength(0);
+			expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBe(
+				JSON.stringify({ sessionId: result.priorSessionId, opRef: result.priorOpRef, eventIds: [result.eventId] }),
+			);
+			expect(result.db.monitors.eventGet(result.eventId)?.stage).toBe("failed");
+			expect(result.db.monitors.failure(result.eventId)?.code).toBe("authoring_result_unreadable");
+			expect(result.db.monitors.failure(result.eventId)?.detail).toContain('"code":"output_pending"');
+		});
+	}
+
+	// #827: an unaccounted terminal report is not proof of failure. Exact evidence
+	// that the prompt was never admitted releases the pointer for one fresh send;
+	// anything less keeps it.
+	const unaccountedReceipts = [
+		{ label: "a missing receipt", receiptState: "missing" as const, errorCode: undefined },
+		{
+			label: "a prompt deadline kill without a receipt",
+			receiptState: "missing" as const,
+			errorCode: "prompt_deadline_exceeded",
+		},
+		{ label: "an unknown receipt", receiptState: "unknown" as const, errorCode: undefined },
+	] as const;
+	for (const receipt of unaccountedReceipts) {
+		for (const evidence of [
+			{ label: "an exact authority-scoped busy refusal", durableBusyRefusal: true as const },
+			{
+				label: "an exact session-busy durable no-send failure",
+				noSendFailure: { code: "session_busy" as const },
+			},
+			{
+				label: "an exact wedged-submission durable no-send failure",
+				noSendFailure: { code: "session_submission_wedged" as const },
+			},
+			{
+				label: "an exact host-unavailable durable no-send failure",
+				noSendFailure: { code: "session_host_unavailable" as const },
+			},
+		] as const) {
+			test(`same-session failed prior status with ${receipt.label} and ${evidence.label} sends exactly one fresh prompt`, async () => {
+				const result = await dispatchWithPriorPointer({
+					priorStatus: "failed",
+					priorReceiptState: receipt.receiptState,
+					...(receipt.errorCode ? { priorErrorCode: receipt.errorCode } : {}),
+					...evidence,
+				});
+				expectOldPointerStatus(result);
+				expect(result.prompts()).toBe(1);
+				expect(result.sessionPort.sendAttempts).toHaveLength(1);
+				const replacement = JSON.parse(result.pointerAtPrompt() ?? "null");
+				expect(replacement).toMatchObject({ sessionId: result.priorSessionId, eventIds: [result.eventId] });
+				expect(replacement.opRef).not.toBe(result.priorOpRef);
+				expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBeUndefined();
+			});
+		}
+	}
+
+	for (const mismatch of [
+		{ label: "a stale operation", noSendFailure: { code: "session_busy" as const, opRef: "stale-op" } },
+		{ label: "another session", noSendFailure: { code: "session_busy" as const, sessionId: "other-session" } },
+	] as const) {
+		test(`same-session failed prior status with a missing receipt and ${mismatch.label} no-send failure holds the pointer`, async () => {
+			const result = await dispatchWithPriorPointer({
+				priorStatus: "failed",
+				priorReceiptState: "missing",
+				noSendFailure: mismatch.noSendFailure,
+			});
+			expect(result.prompts()).toBe(0);
+			expect(result.sessionPort.sendAttempts).toHaveLength(0);
+			expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBe(
+				JSON.stringify({ sessionId: result.priorSessionId, opRef: result.priorOpRef, eventIds: [result.eventId] }),
+			);
+			expect(result.db.monitors.eventGet(result.eventId)?.stage).toBe("failed");
+			expect(result.db.monitors.failure(result.eventId)?.code).toBe("authoring_result_unreadable");
+			expect(result.db.monitors.failure(result.eventId)?.detail).toContain('"code":"output_pending"');
+		});
+	}
+
+	test("same-session failed prior status with a missing receipt and a foreign-authority busy refusal holds the pointer", async () => {
+		const result = await dispatchWithPriorPointer({
+			priorStatus: "failed",
+			priorReceiptState: "missing",
+			durableBusyRefusal: true,
+			foreignBusyRefusal: true,
+		});
+		expect(result.prompts()).toBe(0);
+		expect(result.sessionPort.sendAttempts).toHaveLength(0);
+		expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBe(
+			JSON.stringify({ sessionId: result.priorSessionId, opRef: result.priorOpRef, eventIds: [result.eventId] }),
+		);
+		expect(result.db.monitors.eventGet(result.eventId)?.stage).toBe("failed");
+		expect(result.db.monitors.failure(result.eventId)?.code).toBe("authoring_result_unreadable");
+		expect(result.db.monitors.failure(result.eventId)?.detail).toContain('"code":"output_pending"');
+	});
+
+	test("same-session failed prior status with a missing receipt and exact no-send evidence but no authority holds the pointer", async () => {
+		const result = await dispatchWithPriorPointer({
+			priorStatus: "failed",
+			priorReceiptState: "missing",
+			noSendFailure: { code: "session_busy" },
+			withoutAuthority: true,
+		});
+		expect(result.prompts()).toBe(0);
+		expect(result.sessionPort.sendAttempts).toHaveLength(0);
+		expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBe(
+			JSON.stringify({ sessionId: result.priorSessionId, opRef: result.priorOpRef, eventIds: [result.eventId] }),
+		);
+		expect(result.db.monitors.eventGet(result.eventId)?.stage).toBe("failed");
+		expect(result.db.monitors.failure(result.eventId)?.code).toBe("authoring_result_unreadable");
+		expect(result.db.monitors.failure(result.eventId)?.detail).toContain('"code":"output_pending"');
+	});
+
+	test("same-session failed prior status with durable no-send evidence on only one batch member holds every pointer", async () => {
+		const result = await dispatchWithPriorPointer({
+			priorStatus: "failed",
+			priorReceiptState: "missing",
+			batchSize: 2,
+			noSendFailure: { code: "session_busy", eventIndex: 0 },
+		});
+		expect(result.prompts()).toBe(0);
+		expect(result.sessionPort.sendAttempts).toHaveLength(0);
+		const pointer = JSON.stringify({
+			sessionId: result.priorSessionId,
+			opRef: result.priorOpRef,
+			eventIds: result.eventIds,
+		});
+		for (const eventId of result.eventIds) {
+			expect(result.db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBe(pointer);
+			expect(result.db.monitors.eventGet(eventId)?.stage).toBe("failed");
+			expect(result.db.monitors.failure(eventId)?.code).toBe("authoring_result_unreadable");
+		}
+	});
+
 	test("moved binding with accepted prior status holds the pointer without prompting", async () => {
 		const result = await dispatchWithPriorPointer({
 			priorStatus: "accepted",
@@ -2859,6 +3054,24 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 		expect(replacement).toMatchObject({ sessionId: "s2", eventIds: [result.eventId] });
 		expect(replacement.opRef).not.toBe(result.priorOpRef);
 		expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBeUndefined();
+		expectOldPointerStatus(result);
+	});
+
+	test("moved binding with failed old-session missing receipt holds the pointer without prompting", async () => {
+		const result = await dispatchWithPriorPointer({
+			priorStatus: "failed",
+			priorReceiptState: "missing",
+			priorSessionId: "s1",
+			currentSessionId: "s2",
+		});
+		expect(result.prompts()).toBe(0);
+		expect(result.sessionPort.sendAttempts).toHaveLength(0);
+		expect(result.db.core.metaGet(`monitor_authoring_turn:${result.eventId}`)).toBe(
+			JSON.stringify({ sessionId: "s1", opRef: result.priorOpRef, eventIds: [result.eventId] }),
+		);
+		expect(result.db.monitors.eventGet(result.eventId)?.stage).toBe("failed");
+		expect(result.db.monitors.failure(result.eventId)?.code).toBe("authoring_result_unreadable");
+		expect(result.db.monitors.failure(result.eventId)?.detail).toContain('"code":"output_pending"');
 		expectOldPointerStatus(result);
 	});
 
@@ -2939,5 +3152,369 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 		} finally {
 			await rm(raceHome, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("#704 follow-up: historical recovery is bounded per sweep", () => {
+	test("one saved operation is probed per sweep and the cursor covers every candidate", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-history-cursor-"));
+		database = await Store.open(join(home, "gateway.db"));
+		const db = database;
+		const registry = new MonitorRegistry(db);
+		const monitor = registry.add({
+			name: "history",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["history.tick"],
+		});
+
+		// Three saved operations were given up and still need a status probe.
+		const opRefs: string[] = [];
+		for (let index = 0; index < 3; index++) {
+			const eventId = crypto.randomUUID();
+			const opRef = crypto.randomUUID();
+			opRefs.push(opRef);
+			createEvent(db, {
+				eventId,
+				monitorId: monitor.monitorId,
+				eventType: "history.tick",
+				payloadJson: "{}",
+				firedAt: new Date(Date.now() - 60_000).toISOString(),
+			});
+			for (let attempt = 0; attempt < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS; attempt++) {
+				updateEvent(db, eventId, "failed");
+				db.transaction((tx) => db.monitors.eventIncrementAttempts(tx, eventId));
+			}
+			db.transaction((tx) => db.monitors.eventTerminalFail(tx, eventId, "authoring_turn_unresolved", "unresolved"));
+			db.core.metaSet(
+				`monitor_authoring_turn:${eventId}`,
+				JSON.stringify({ sessionId: "s1", opRef, eventIds: [eventId] }),
+			);
+		}
+
+		const sessionPort = fakeSessionPort(async () => "[]");
+		const statusRead = sessionPort.status.bind(sessionPort);
+		const probed: string[] = [];
+		sessionPort.status = async (input) => {
+			if (opRefs.includes(input.opRef)) probed.push(input.opRef);
+			return await statusRead(input);
+		};
+
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry,
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(db),
+			emit: () => {},
+		});
+		propagators.push(propagator);
+
+		// One sweep examines one saved operation, not the whole backlog.
+		await propagator.reconcile();
+		expect(probed).toHaveLength(1);
+		expect(db.core.metaGet("monitor_authoring_recovery_cursor")).toBeDefined();
+
+		await propagator.reconcile();
+		await propagator.reconcile();
+		expect(probed).toHaveLength(3);
+		expect(new Set(probed)).toEqual(new Set(opRefs));
+
+		// Past the last candidate the scan wraps instead of abandoning the round-robin.
+		await propagator.reconcile();
+		expect(probed).toHaveLength(3);
+		expect(db.core.metaGet("monitor_authoring_recovery_cursor")).toBe("");
+		await propagator.reconcile();
+		expect(probed).toHaveLength(4);
+	});
+});
+
+describe("#704 follow-up: a terminal turn that did not complete is never authored as success", () => {
+	test("a refusal stop keeps its pointer and never persists or delivers the result", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-incomplete-turn-"));
+		database = await Store.open(join(home, "gateway.db"));
+		const db = database;
+		const monitor = new MonitorRegistry(db).add({
+			name: "proactive",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["proactive.tick"],
+		});
+		const eventId = crypto.randomUUID();
+		const opRef = crypto.randomUUID();
+		createEvent(db, {
+			eventId,
+			monitorId: monitor.monitorId,
+			eventType: "proactive.tick",
+			payloadJson: "{}",
+			firedAt: new Date().toISOString(),
+		});
+		const pointer = JSON.stringify({ sessionId: "s1", opRef, eventIds: [eventId] });
+		db.core.metaSet(`monitor_authoring_turn:${eventId}`, pointer);
+
+		const sessionPort = fakeSessionPort(async () => "[]");
+		// A terminal transition with a present receipt whose stop did not complete.
+		sessionPort.seedOperation(
+			opRef,
+			"s1",
+			"terminal_ok",
+			JSON.stringify([{ eventId, note: "must never be delivered" }]),
+			{ kind: "stopped", provenance: "agent", reason: "refusal" },
+		);
+		let clock = Date.now();
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry: new MonitorRegistry(db),
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(db),
+			emit: () => {},
+			now: () => clock,
+		});
+		propagators.push(propagator);
+
+		await propagator.reconcile();
+
+		expect(db.monitors.authoredOutput(eventId)).toBeUndefined();
+		expect(stage(db, eventId)).toBe("failed");
+		expect(db.monitors.eventGet(eventId)?.dispatch_attempts).toBe(1);
+		expect(db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBe(pointer);
+
+		// Past the retry backoff the same stopped turn is harvested again, and it still
+		// never becomes success or loses the pointer that keeps the identity.
+		clock += MONITOR_EVENT_RETRY_BACKOFF_MS[1]! + 1000;
+		await propagator.reconcile();
+		expect(db.monitors.eventGet(eventId)?.dispatch_attempts).toBe(2);
+		expect(db.monitors.authoredOutput(eventId)).toBeUndefined();
+		expect(stage(db, eventId)).toBe("failed");
+		expect(db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBe(pointer);
+	});
+});
+
+describe("#827: a raw failed report without a receipt is not a proven failure", () => {
+	/**
+	 * One operation saved by an earlier authoring attempt, with `attempts` reclaims
+	 * already consumed. The operation is seeded as a completed turn with a readable
+	 * original result, but reads as raw `failed`/`receiptState: "missing"` until the
+	 * test releases the late receipt.
+	 */
+	async function failedTurn(options: { attempts: number; batchSize?: number; errorCode?: string }) {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-827-"));
+		database = await Store.open(join(home, "gateway.db"));
+		const db = database;
+		const registry = new MonitorRegistry(db);
+		const monitor = registry.add({
+			name: "proactive",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["proactive.tick"],
+		});
+		let clock = Date.now();
+		const eventIds: string[] = [];
+		for (let index = 0; index < (options.batchSize ?? 1); index++) {
+			const eventId = crypto.randomUUID();
+			createEvent(db, {
+				eventId,
+				monitorId: monitor.monitorId,
+				eventType: "proactive.tick",
+				payloadJson: "{}",
+				firedAt: new Date(clock).toISOString(),
+			});
+			for (let attempt = 0; attempt < options.attempts; attempt++) {
+				updateEvent(db, eventId, "failed");
+				db.transaction((tx) => db.monitors.eventIncrementAttempts(tx, eventId));
+			}
+			eventIds.push(eventId);
+		}
+		const opRef = crypto.randomUUID();
+		const pointer = JSON.stringify({ sessionId: "s1", opRef, eventIds });
+		for (const eventId of eventIds) db.core.metaSet(`monitor_authoring_turn:${eventId}`, pointer);
+
+		let prompts = 0;
+		let receiptMissing = true;
+		const sessionPort = fakeSessionPort(async () => {
+			prompts++;
+			return "[]";
+		});
+		sessionPort.seedOperation(
+			opRef,
+			"s1",
+			"terminal_ok",
+			JSON.stringify(eventIds.map((eventId) => ({ eventId, note: `original ${eventId}` }))),
+		);
+		const readStatus = sessionPort.status.bind(sessionPort);
+		sessionPort.status = async (input) =>
+			input.opRef === opRef && receiptMissing
+				? {
+						operationRef: opRef,
+						status: {
+							status: "failed",
+							receiptState: "missing",
+							...(options.errorCode === undefined ? {} : { error: { code: options.errorCode } }),
+						},
+						summaryCompleted: true,
+					}
+				: await readStatus(input);
+
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry,
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(db),
+			emit: () => {},
+			now: () => clock,
+		});
+		propagators.push(propagator);
+		return {
+			db,
+			eventIds,
+			opRef,
+			pointer,
+			sessionPort,
+			propagator,
+			prompts: () => prompts,
+			advance: (ms: number) => {
+				clock += ms;
+			},
+			releaseReceipt: () => {
+				receiptMissing = false;
+			},
+		};
+	}
+
+	for (const unproven of [
+		{ label: "a missing receipt", errorCode: undefined },
+		{ label: "a prompt deadline kill without a receipt", errorCode: "prompt_deadline_exceeded" },
+	] as const) {
+		test(`normal retry holds ${unproven.label} and never resends`, async () => {
+			const { db, eventIds, pointer, sessionPort, propagator, prompts, advance } = await failedTurn({
+				attempts: 1,
+				...(unproven.errorCode === undefined ? {} : { errorCode: unproven.errorCode }),
+			});
+			const eventId = eventIds[0] as string;
+			// The event is due for its next reclaim; the saved operation still reports
+			// terminal-but-unaccounted, which is not a work verdict.
+			advance(MONITOR_EVENT_RETRY_BACKOFF_MS[1]! + 1000);
+			await propagator.reconcile();
+			expect(prompts()).toBe(0);
+			expect(sessionPort.sendAttempts).toHaveLength(0);
+			expect(db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBe(pointer);
+			expect(stage(db, eventId)).toBe("failed");
+			expect(db.monitors.eventGet(eventId)?.dispatch_attempts).toBe(2);
+			expect(db.monitors.failure(eventId)?.code).toBe("authoring_result_unreadable");
+		});
+	}
+
+	test("given-up recovery keeps a missing-receipt identity and harvests its late completed receipt", async () => {
+		const { db, eventIds, pointer, sessionPort, propagator, prompts, advance, releaseReceipt } = await failedTurn({
+			attempts: MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS,
+			batchSize: 2,
+		});
+		advance(MONITOR_EVENT_MAX_OPEN_AGE_MS + 60_000);
+		await propagator.reconcile();
+		for (const eventId of eventIds) {
+			expect(stage(db, eventId)).toBe("failed_no_retry");
+			expect(db.monitors.failure(eventId)?.code).toBe("authoring_turn_unresolved");
+			expect(db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBe(pointer);
+		}
+
+		// The given-up sweep probes the saved operation and keeps its identity: a raw
+		// failed report with a missing receipt is not proof of failure.
+		await propagator.reconcile();
+		for (const eventId of eventIds) {
+			expect(stage(db, eventId)).toBe("failed_no_retry");
+			expect(db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBe(pointer);
+		}
+		expect(prompts()).toBe(0);
+
+		// The original operation finally reports its completed receipt. The whole
+		// given-up batch reopens and is harvested from its own operation.
+		releaseReceipt();
+		for (let sweep = 0; sweep < 4 && eventIds.some((eventId) => stage(db, eventId) !== "authored_no_delivery"); sweep++)
+			await propagator.reconcile();
+		for (const eventId of eventIds) {
+			expect(stage(db, eventId)).toBe("authored_no_delivery");
+			expect(db.monitors.authoredOutput(eventId)).toBe(`original ${eventId}`);
+			expect(db.core.metaGet(`monitor_authoring_turn:${eventId}`)).toBeUndefined();
+		}
+		expect(sessionPort.sendAttempts).toHaveLength(0);
+		expect(prompts()).toBe(0);
+	});
+
+	test("a failed/missing moved-binding hold is not swallowed by a failure-roll catch", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-827-roll-"));
+		database = await Store.open(join(home, "gateway.db"));
+		const db = database;
+		const registry = new MonitorRegistry(db);
+		const monitor = registry.add({
+			name: "moved-roll",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["proactive.tick"],
+		});
+		const trigger = crypto.randomUUID();
+		const held = crypto.randomUUID();
+		const priorOpRef = crypto.randomUUID();
+		const pointer = JSON.stringify({ sessionId: "s0", opRef: priorOpRef, eventIds: [held] });
+		const firedAt = Date.now();
+		createEvent(db, {
+			eventId: trigger,
+			monitorId: monitor.monitorId,
+			eventType: "proactive.tick",
+			payloadJson: "{}",
+			firedAt: new Date(firedAt - 2_000).toISOString(),
+		});
+		createEvent(db, {
+			eventId: held,
+			monitorId: monitor.monitorId,
+			eventType: "proactive.tick",
+			payloadJson: "{}",
+			firedAt: new Date(firedAt - 1_000).toISOString(),
+		});
+		db.core.metaSet(`monitor_authoring_turn:${held}`, pointer);
+
+		let prompts = 0;
+		let failHost = true;
+		const sessionPort = fakeSessionPort(async (_sessionId, text) => {
+			prompts++;
+			return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "fresh" })));
+		}, "s2");
+		const request = sessionPort.request.bind(sessionPort);
+		// The first dispatch proves the host is unavailable, which arms a failure roll
+		// for the next dispatch in this same sweep. If the held report were swallowed by
+		// that roll, the held event would reuse the port and send a duplicate prompt.
+		sessionPort.request = async (input) => {
+			if (failHost) {
+				failHost = false;
+				throw new RelayHelloError(1, "stream_ended");
+			}
+			return await request(input);
+		};
+		const readStatus = sessionPort.status.bind(sessionPort);
+		sessionPort.status = async (input) =>
+			input.opRef === priorOpRef
+				? {
+						operationRef: priorOpRef,
+						status: { status: "failed", receiptState: "missing" },
+						summaryCompleted: true,
+					}
+				: await readStatus(input);
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry,
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(db),
+			emit: () => {},
+		});
+		propagators.push(propagator);
+		await propagator.reconcile();
+
+		expect(db.monitors.failure(trigger)?.code).toBe("session_host_unavailable");
+		expect(
+			propagator.sessionSafetyState(originKey(monitorSessionOrigin(monitor.monitorId, "proactive.tick"))).lastRoll,
+		).toBe("session_host_unavailable");
+		expect(prompts).toBe(0);
+		expect(sessionPort.sendAttempts).toHaveLength(0);
+		expect(db.core.metaGet(`monitor_authoring_turn:${held}`)).toBe(pointer);
+		expect(stage(db, held)).toBe("failed");
+		expect(db.monitors.failure(held)?.code).toBe("authoring_result_unreadable");
 	});
 });

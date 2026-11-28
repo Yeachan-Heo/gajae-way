@@ -376,16 +376,17 @@ export class OutboxGroup {
 			.all(Math.floor(nowMs / 1000)) as Array<{ origin_key: string; n: number; oldest_ms: number }>;
 	}
 
+	/** Confirmed non-reaction replies for one canonical origin, excluding deliveries already represented in context. */
 	confirmedConversation(
-		conversationId: string,
+		originKey: string,
 		floorAt: string,
 		limit: number,
 	): Array<{ created_at: string; payload_json: string }> {
 		return this.#db
 			.prepare(
-				"SELECT created_at, payload_json FROM deliveries WHERE state = 'confirmed' AND json_extract(payload_json, '$.origin.conversationId') = ? AND json_extract(payload_json, '$.reaction') IS NULL AND created_at >= ? AND NOT EXISTS (SELECT 1 FROM conversation_context WHERE conversation_context.message_id = 'post/' || deliveries.delivery_id) ORDER BY created_at DESC LIMIT ?",
+				"SELECT created_at, payload_json FROM deliveries WHERE origin_key = ? AND state = 'confirmed' AND json_extract(payload_json, '$.reaction') IS NULL AND created_at >= ? AND NOT EXISTS (SELECT 1 FROM conversation_context WHERE conversation_context.message_id = 'post/' || deliveries.delivery_id) ORDER BY created_at DESC LIMIT ?",
 			)
-			.all(conversationId, floorAt, limit) as Array<{ created_at: string; payload_json: string }>;
+			.all(originKey, floorAt, limit) as Array<{ created_at: string; payload_json: string }>;
 	}
 
 	unsettledTerminalDeliveryIds(): string[] {

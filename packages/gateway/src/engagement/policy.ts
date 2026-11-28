@@ -233,10 +233,11 @@ export function checkSlackGuestPolicy(
 	engagement: EngagementContext | undefined,
 	origin: Pick<OriginRef, "platform" | "kind">,
 	config: GatewayConfig,
+	connection?: { readonly platformOwnerIds?: readonly string[]; readonly platformOwnerPlatform?: string },
 ): GuestPolicyDecision {
 	if (origin.platform !== "slack") return "allow";
 	const authorId = engagement?.authorId;
-	if (authorId === undefined || authorId === ownerPeerId(config)) return "allow";
+	if (authorId === undefined || ownerIdMatches(authorId, config, connection, origin.platform)) return "allow";
 	const policy = config.slack?.guestPolicy;
 	if (policy?.denyUsers?.includes(authorId)) return "drop";
 	if (policy?.allowUsers?.includes(authorId)) return "allow";
@@ -262,6 +263,7 @@ export function decideEngagement(
 	 */
 	threadFollowUp = false,
 	mutedThread = false,
+	connection?: { readonly platformOwnerIds?: readonly string[]; readonly platformOwnerPlatform?: string },
 ): EngagementDecision {
 	// An adapter that already knows the room moved past this message records it
 	// and asks for nothing more. Checked before every other gate, loopback
@@ -269,14 +271,15 @@ export function decideEngagement(
 	if (engagement?.contextOnly === true) return { engaged: false, botAudienceAdmission: false };
 	if (origin.platform === "loopback") return { engaged: true, botAudienceAdmission: false };
 	// Check Slack guest policy: drops block the turn entirely
-	const guestDecision = checkSlackGuestPolicy(engagement, origin, config);
+	const guestDecision = checkSlackGuestPolicy(engagement, origin, config, connection);
 	if (guestDecision === "drop") {
 		const authorId = engagement?.authorId ?? "unknown";
 		const place = `slack ${origin.kind}${origin.kind === "channel" ? ` #${origin.conversationId}` : ""}`;
 		console.info(`gateway guest-policy drop authorId=${authorId} origin=${place} reason=guest_${origin.kind}_policy`);
 		return { engaged: false, botAudienceAdmission: false };
 	}
-	if (origin.kind === "dm") return { engaged: dmEngaged(engagement, config), botAudienceAdmission: false };
+	if (origin.kind === "dm")
+		return { engaged: dmEngaged(engagement, config, connection, origin), botAudienceAdmission: false };
 	if (mutedThread && !threadMuteAddressed(engagement, origin, config))
 		return { engaged: false, botAudienceAdmission: false };
 	if (!engagement?.group) return { engaged: false, botAudienceAdmission: false };
@@ -285,7 +288,7 @@ export function decideEngagement(
 		policy,
 		authorIsBot: engagement.authorIsBot === true,
 		addressed: engagement.mentioned || (origin.kind === "thread" && threadFollowUp),
-		authorized: closedAuthorAuthorized(engagement.authorId, config),
+		authorized: closedAuthorAuthorized(engagement.authorId, config, connection, origin),
 	});
 }
 
@@ -422,15 +425,48 @@ export function resolveChannelPolicy(
 	return undefined;
 }
 
-function closedAuthorAuthorized(authorId: string, config: GatewayConfig): boolean {
+function closedAuthorAuthorized(
+	authorId: string,
+	config: GatewayConfig,
+	connection?: { readonly platformOwnerIds?: readonly string[]; readonly platformOwnerPlatform?: string },
+	origin?: Pick<OriginRef, "platform">,
+): boolean {
 	const allowlist = config.mentionAllowlist;
-	if (!allowlist || allowlist.length === 0) return ownerPeerId(config) === authorId;
+	if (!allowlist || allowlist.length === 0) return ownerIdMatches(authorId, config, connection, origin?.platform);
 	return allowlist.includes(authorId);
 }
 
-function ownerPeerId(config: GatewayConfig): string | undefined {
-	const owner = config.ownerTarget?.origin;
-	return owner && "peerId" in owner ? (owner as { peerId?: string }).peerId : undefined;
+/**
+ * The operator-configured owner. A DM `ownerTarget` names it by `peerId`, a non-DM one by
+ * `owner`; either is scoped to the target's platform. `null` means an ownerTarget is set
+ * without an owner, which authorises nobody (fail closed); `undefined` means no ownerTarget,
+ * so adapter-reported owners apply (#862, #901).
+ */
+export function configuredOwner(
+	config: GatewayConfig,
+): { readonly platform: string; readonly id: string } | null | undefined {
+	const target = config.ownerTarget;
+	if (target === undefined) return undefined;
+	const id = target.origin.kind === "dm" ? (target.origin as { peerId?: string }).peerId : target.owner;
+	return id === undefined ? null : { platform: target.origin.platform, id };
+}
+
+/**
+ * Whether `authorId` is the owner. An ownerTarget replaces adapter-reported owners
+ * entirely; without one, adapter owners count only on the platform that reported them.
+ * `platform` is the author's platform when known.
+ */
+export function ownerIdMatches(
+	authorId: string,
+	config: GatewayConfig,
+	connection?: { readonly platformOwnerIds?: readonly string[]; readonly platformOwnerPlatform?: string },
+	platform?: string,
+): boolean {
+	const owner = configuredOwner(config);
+	if (owner === null) return false;
+	if (owner !== undefined) return authorId === owner.id && (platform === undefined || platform === owner.platform);
+	if (connection === undefined || platform !== connection.platformOwnerPlatform) return false;
+	return connection.platformOwnerIds?.includes(authorId) === true;
 }
 
 /**
@@ -438,13 +474,17 @@ function ownerPeerId(config: GatewayConfig): string | undefined {
  * and an absent or empty allowlist narrows to the owner rather than widening to
  * everyone. Unauthorised DMs are still recorded as unread context by the caller.
  */
-function dmEngaged(engagement: EngagementContext | undefined, config: GatewayConfig): boolean {
+function dmEngaged(
+	engagement: EngagementContext | undefined,
+	config: GatewayConfig,
+	connection?: { readonly platformOwnerIds?: readonly string[]; readonly platformOwnerPlatform?: string },
+	origin?: Pick<OriginRef, "platform">,
+): boolean {
 	const policy = config.dmPolicy ?? "allowlist";
 	if (policy === "open") return true;
 	const authorId = engagement?.authorId;
 	if (authorId === undefined) return false;
-	const ownerId = ownerPeerId(config);
-	if (ownerId !== undefined && authorId === ownerId) return true;
+	if (ownerIdMatches(authorId, config, connection, origin?.platform)) return true;
 	if (policy === "owner-only") return false;
 	const allowlist = config.mentionAllowlist;
 	if (!allowlist || allowlist.length === 0) return false;
