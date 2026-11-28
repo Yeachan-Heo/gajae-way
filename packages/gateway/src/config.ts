@@ -131,8 +131,12 @@ export interface GatewayConfigFile {
 	 * Unset means `allowlist`.
 	 */
 	readonly dmPolicy?: DmPolicy;
-	/** Default recipient origin for monitor/maintenance notes without their own channel target. */
-	readonly ownerTarget?: { readonly origin: OriginRef };
+	/**
+	 * Default recipient origin for monitor/maintenance notes without their own channel target.
+	 * When origin has a peerId (DM), that peerId is the owner.
+	 * When origin has no peerId (channel), the owner field specifies the explicit platform-scoped owner.
+	 */
+	readonly ownerTarget?: { readonly origin: OriginRef; readonly owner?: string };
 	/**
 	 * Consecutive context-class authoring failures (empty response,
 	 * context-length rejection, zero-token completion) before the monitor
@@ -501,12 +505,13 @@ function parseStallTimeout(value: unknown): number {
 	return value as number;
 }
 
-function parseOwnerTarget(value: unknown): { readonly origin: OriginRef } {
+function parseOwnerTarget(value: unknown): { readonly origin: OriginRef; readonly owner?: string } {
 	const input = requireObject(value, "ownerTarget");
-	if (Object.keys(input).some((key) => key !== "origin"))
-		throw new ConfigError("config_invalid", "ownerTarget may only contain origin");
+	if (Object.keys(input).some((key) => !["origin", "owner"].includes(key)))
+		throw new ConfigError("config_invalid", "ownerTarget may only contain origin and owner");
 	try {
-		return { origin: validateOriginRef(input.origin as OriginRef) };
+		const owner = input.owner !== undefined ? optionalString(input.owner, "ownerTarget.owner") : undefined;
+		return { origin: validateOriginRef(input.origin as OriginRef), ...(owner !== undefined ? { owner } : {}) };
 	} catch (error) {
 		throw new ConfigError(
 			"config_invalid",

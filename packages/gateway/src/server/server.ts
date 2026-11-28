@@ -5153,10 +5153,10 @@ function ownerPeerIdOf(config: GatewayConfig): string | undefined {
 
 /**
  * Whether `authorId` in an engagement or request params is the owner. Owner
- * identity is separate from the notification destination:
+ * identity is explicit operator configuration, not adapter defaults:
  * - If ownerTarget.origin has a peerId (DM), that peerId is the owner (#862).
- * - If ownerTarget.origin has no peerId (channel), fall back to adapter-reported
- *   owners for that platform (#901).
+ * - If ownerTarget.origin has no peerId (channel), ownerTarget.owner must be set
+ *   to explicitly configure the owner (no fallback to adapter owners) (#901).
  * - If ownerTarget is absent, use adapter-reported owners (#862).
  * No owner anywhere authorises nobody (fail closed). Owner-only verbs
  * (`/restart`, `/model`, `session.modelChoices`) require this.
@@ -5168,8 +5168,12 @@ function ownerAuthored(config: GatewayConfig, carrier: unknown, connection?: Con
 	// Check DM ownerTarget first (has explicit peerId)
 	const ownerPeerId = ownerPeerIdOf(config);
 	if (ownerPeerId !== undefined) return authorId === ownerPeerId;
-	// ownerTarget exists but has no peerId (e.g., channel destination):
-	// fall back to adapter-reported owners for identity (#901)
+	// Check channel ownerTarget with explicit owner field (no adapter fallback)
+	if (config.ownerTarget?.owner !== undefined) return authorId === config.ownerTarget.owner;
+	// ownerTarget exists but has neither peerId nor owner field:
+	// this configuration is incomplete; fail closed
+	if (config.ownerTarget !== undefined) return false;
+	// No ownerTarget: use adapter-reported owners (authority for their platform only)
 	if (connection === undefined) return false;
 	// Adapter-reported owners are authority for the DECLARED platform only
 	// (#862): the originless verb (session.modelChoices) must name the platform
