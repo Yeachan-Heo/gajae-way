@@ -1,9 +1,16 @@
 import { expect, test } from "bun:test";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { CONFIG_SCHEMA_VERSION, ENGAGEMENT_GATES, parseConfigFile, RESTART_REQUIRED_FIELDS } from "../src/config";
+import { dirname, join } from "node:path";
+import {
+	CONFIG_SCHEMA_VERSION,
+	ENGAGEMENT_GATES,
+	loadConfig,
+	parseConfigFile,
+	RESTART_REQUIRED_FIELDS,
+} from "../src/config";
 import { checkConfigFile, configCheckExitCode, defaultConfigPath, renderConfigCheck } from "../src/config-check";
+import { configuredOwner } from "../src/engagement/policy";
 
 async function configFile(body: string): Promise<string> {
 	const dir = await mkdtemp(join(tmpdir(), "gajaeway-config-check-"));
@@ -55,6 +62,103 @@ test("every defined engagement gate passes the offline preflight", async () => {
 		);
 		const result = await checkConfigFile(path);
 		expect(result.ok, `gate ${gate}`).toBe(true);
+	}
+});
+
+const CHAT_OWNER_ORIGINS = [
+	{ platform: "discord", kind: "channel", conversationId: "owner-channel" },
+	{ platform: "telegram", kind: "channel", conversationId: "owner-channel" },
+	{ platform: "slack", kind: "channel", conversationId: "owner-channel" },
+] as const;
+
+const NON_CHAT_OWNER_ORIGINS = [
+	{ platform: "loopback", kind: "loopback", conversationId: "loopback" },
+	{ platform: "monitor", kind: "eventtype", conversationId: "owner.audit" },
+	{ platform: "work", kind: "task", conversationId: "owner-task" },
+] as const;
+
+test("an explicit owner is accepted on a chat origin and scoped to its platform", async () => {
+	for (const origin of CHAT_OWNER_ORIGINS) {
+		const ownerTarget = { origin, owner: "owner-1" };
+		const path = await configFile(JSON.stringify({ schemaVersion: CONFIG_SCHEMA_VERSION, ownerTarget }));
+		const config = await loadConfig({ home: dirname(path), requireFile: true });
+		expect(config.ownerTarget).toEqual(ownerTarget);
+		expect(configuredOwner(config)).toEqual({ platform: origin.platform, id: "owner-1" });
+
+		const result = await checkConfigFile(path);
+		expect(result.ok, origin.platform).toBe(true);
+	}
+});
+
+test("a non-chat origin cannot name an explicit owner", async () => {
+	for (const origin of NON_CHAT_OWNER_ORIGINS) {
+		const body = { schemaVersion: CONFIG_SCHEMA_VERSION, ownerTarget: { origin, owner: "owner-1" } };
+		expect(() => parseConfigFile(body), origin.platform).toThrow(
+			/ownerTarget\.owner requires a discord, telegram or slack origin/,
+		);
+
+		const result = await checkConfigFile(await configFile(JSON.stringify(body)));
+		expect(result.ok, origin.platform).toBe(false);
+		if (result.ok) continue;
+		expect(result.code).toBe("config_invalid");
+		expect(result.message).toBe("ownerTarget.owner requires a discord, telegram or slack origin");
+		expect(configCheckExitCode(result)).toBe(1);
+	}
+});
+
+test("a non-chat origin without an owner stays valid and configures no owner", async () => {
+	for (const origin of NON_CHAT_OWNER_ORIGINS) {
+		const ownerTarget = { origin };
+		const path = await configFile(JSON.stringify({ schemaVersion: CONFIG_SCHEMA_VERSION, ownerTarget }));
+		const config = await loadConfig({ home: dirname(path), requireFile: true });
+		expect(config.ownerTarget).toEqual(ownerTarget);
+		expect(configuredOwner(config)).toBeNull();
+
+		const result = await checkConfigFile(path);
+		expect(result.ok, origin.platform).toBe(true);
+	}
+});
+
+test("a DM ownerTarget takes its owner from peerId and still refuses an explicit owner", async () => {
+	for (const platform of ["discord", "telegram", "slack"] as const) {
+		const origin = { platform, kind: "dm" as const, conversationId: "owner-dm", peerId: "owner-1" };
+		const path = await configFile(JSON.stringify({ schemaVersion: CONFIG_SCHEMA_VERSION, ownerTarget: { origin } }));
+		const config = await loadConfig({ home: dirname(path), requireFile: true });
+		expect(configuredOwner(config)).toEqual({ platform, id: "owner-1" });
+
+		const accepted = await checkConfigFile(path);
+		expect(accepted.ok, platform).toBe(true);
+	}
+
+	const origin = { platform: "discord", kind: "dm", conversationId: "owner-dm", peerId: "owner-1" };
+	const body = { schemaVersion: CONFIG_SCHEMA_VERSION, ownerTarget: { origin, owner: "owner-1" } };
+	expect(() => parseConfigFile(body)).toThrow(/a DM origin's peerId is the owner/);
+	const result = await checkConfigFile(await configFile(JSON.stringify(body)));
+	expect(result.ok).toBe(false);
+	if (result.ok) return;
+	expect(result.code).toBe("config_invalid");
+	expect(result.message).toContain("ownerTarget.owner is only for a non-DM origin");
+});
+
+test("ownerTarget keeps rejecting malformed shapes and unusable owner ids", async () => {
+	const origin = { platform: "discord", kind: "channel", conversationId: "owner-channel" };
+	for (const { ownerTarget, message } of [
+		{ ownerTarget: null, message: /ownerTarget must be an object/ },
+		{ ownerTarget: "discord", message: /ownerTarget must be an object/ },
+		{ ownerTarget: { origin, extra: true }, message: /ownerTarget may only contain origin and owner/ },
+		{ ownerTarget: { origin, owner: "" }, message: /ownerTarget\.owner must be a non-empty string/ },
+		{ ownerTarget: { origin, owner: 42 }, message: /ownerTarget\.owner must be a non-empty string/ },
+	]) {
+		const label = JSON.stringify(ownerTarget);
+		expect(() => parseConfigFile({ schemaVersion: CONFIG_SCHEMA_VERSION, ownerTarget }), label).toThrow(message);
+
+		const result = await checkConfigFile(
+			await configFile(JSON.stringify({ schemaVersion: CONFIG_SCHEMA_VERSION, ownerTarget })),
+		);
+		expect(result.ok, label).toBe(false);
+		if (result.ok) continue;
+		expect(result.code).toBe("config_invalid");
+		expect(result.message).toMatch(message);
 	}
 });
 
