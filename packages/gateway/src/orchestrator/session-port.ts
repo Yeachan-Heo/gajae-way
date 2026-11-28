@@ -35,7 +35,7 @@ import {
 	type BrokerOperationRecord,
 	isBrokerPromptBusyRefusal,
 } from "../store/groups/bindings";
-import { GjcCliUnavailableError, GjcCommandQueueTimeoutError, isBrokerUnavailable } from "./broker";
+import { GjcCliUnavailableError, GjcCommandQueueTimeoutError, isBrokerUnavailable, isCliQueueTimeout } from "./broker";
 import {
 	type FailedTransportCause,
 	type FailedTurnEvidence,
@@ -125,6 +125,10 @@ export interface SessionPort {
 	/** Positive local non-admission evidence, not native execution-end proof. */
 	promptRefusal?(input: { sessionId: string; repo: string; opRef: string }): "busy" | undefined;
 	bind(input: SessionBindInput): Promise<SessionBinding>;
+	/** Read-only observation of the SessionPort-owned durable create journal. */
+	hasPendingSessionCreate?(input: { readonly originKey: string; readonly epoch: number }): boolean;
+	/** True when the pending create has outlived the session-create readiness budget. */
+	pendingSessionCreateExceededReadiness?(input: { readonly originKey: string; readonly epoch: number }): boolean;
 	inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined>;
 	liveness?(input: { sessionId: string; repo: string }): Promise<SessionLiveness>;
 	/**
@@ -573,6 +577,8 @@ const BROKER_OPERATION_RETENTION_MS = 60 * 60_000;
 const BROKER_INTENT_RETENTION_MS = 24 * 60 * 60_000;
 /** Maximum poisoned-create-key epoch rotations permitted per origin. */
 export const MAX_POISONED_CREATE_ROTATIONS = 3;
+/** A bind only reconciles a bounded batch of pending creates from retired epochs. */
+const RETIRED_SESSION_CREATE_RECONCILIATION_LIMIT = 32;
 
 function createRotationMetaKey(originKey: string): string {
 	return `create_rotation:${originKey}`;
@@ -672,11 +678,63 @@ export class BrokerSessionPort implements SessionPort {
 		const key = `${input.originKey}#${input.epoch}`;
 		const existing = this.#bindings.get(key);
 		if (existing) return existing;
-		const pending = this.#bind(input).finally(() => {
-			if (this.#bindings.get(key) === pending) this.#bindings.delete(key);
-		});
+		const pending = this.#bind(input)
+			.then((binding) => {
+				if (input.epoch > 0) void this.#reconcileRetiredSessionCreates(input.originKey, input.epoch);
+				return binding;
+			})
+			.finally(() => {
+				if (this.#bindings.get(key) === pending) this.#bindings.delete(key);
+			});
 		this.#bindings.set(key, pending);
 		return pending;
+	}
+
+	hasPendingSessionCreate(input: { readonly originKey: string; readonly epoch: number }): boolean {
+		this.#database.bindings.assertAuthority(this.#authority);
+		return this.#database.bindings.hasPendingSessionCreate(JSON.stringify([input.originKey, input.epoch]));
+	}
+
+	pendingSessionCreateExceededReadiness(input: { readonly originKey: string; readonly epoch: number }): boolean {
+		const createdAt = this.#database.bindings.pendingSessionCreateCreatedAt(
+			this.#authority,
+			JSON.stringify([input.originKey, input.epoch]),
+		);
+		return createdAt !== undefined && this.#now() - createdAt > SESSION_CREATE_READINESS_MS;
+	}
+
+	async #reconcileRetiredSessionCreates(originKey: string, epoch: number): Promise<void> {
+		const pendingScopes = this.#database.bindings.pendingSessionCreateScopes(
+			this.#authority,
+			originKey,
+			epoch,
+			RETIRED_SESSION_CREATE_RECONCILIATION_LIMIT,
+		);
+		for (const { scope, epoch: retiredEpoch } of pendingScopes) {
+			try {
+				const pendingCreate = this.#database.bindings.brokerOperation(this.#authority, "session.create", scope);
+				if (pendingCreate?.state !== "pending") continue;
+
+				const created = await this.#createSession(pendingCreate.operationRef, pendingCreate.requestJson);
+				if (typeof created.sessionId !== "string" || created.sessionId.length === 0)
+					throw new Error("pending session.create intent did not return a session id");
+
+				const current = this.#database.bindings.getSessionRecord(originKey);
+				if (current?.sessionId !== created.sessionId) {
+					assertControlAllowed("session.close", { operatorApproval: true });
+					try {
+						await this.#closeSessionOperation(created.sessionId);
+					} catch (error) {
+						if (!isSessionGoneCode(sdkErrorCode(error))) throw error;
+					}
+				}
+				this.#releaseOperation(pendingCreate);
+			} catch (error) {
+				console.error(
+					`pending session.create reconciliation failed origin=${originKey} epoch=${retiredEpoch} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error))}`,
+				);
+			}
+		}
 	}
 
 	async #bind(input: SessionBindInput): Promise<SessionBinding> {
@@ -770,7 +828,8 @@ export class BrokerSessionPort implements SessionPort {
 							// A broker that went away mid-resume says nothing about the
 							// session: the caller waits for it rather than replacing a
 							// resumable session with a cold one.
-							if (error instanceof BrokerAuthorityError || isBrokerUnavailable(error)) throw error;
+							if (error instanceof BrokerAuthorityError || isBrokerUnavailable(error) || isCliQueueTimeout(error))
+								throw error;
 							// Saved authority cannot be resumed: replace it below.
 							console.error(
 								`session_resume_failed origin=${input.originKey} epoch=${input.epoch} session=${existing.sessionId} path=bind detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error))}`,
@@ -783,7 +842,8 @@ export class BrokerSessionPort implements SessionPort {
 				// An unavailable broker cannot vouch for the persisted session; reusing
 				// it would only move the failure to the first send, where it is no
 				// longer retryable. Surface it so the caller can wait for readiness.
-				if (error instanceof BrokerAuthorityError || isBrokerUnavailable(error)) throw error;
+				if (error instanceof BrokerAuthorityError || isBrokerUnavailable(error) || isCliQueueTimeout(error))
+					throw error;
 				// Any other inspect failure (unparsable output, timeout) keeps the binding.
 				indexed = true;
 			}
@@ -1046,7 +1106,8 @@ export class BrokerSessionPort implements SessionPort {
 				if (!state.disowned && state.live !== false) return;
 				lastCode = state.disowned ? "session_unavailable" : "not_live";
 			} catch (error) {
-				if (error instanceof BrokerAuthorityError || isBrokerUnavailable(error)) throw error;
+				if (error instanceof BrokerAuthorityError || isBrokerUnavailable(error) || isCliQueueTimeout(error))
+					throw error;
 				const code = sdkErrorCode(error);
 				if (!isSessionGoneCode(code)) return;
 				lastCode = code;
@@ -2905,6 +2966,8 @@ function sanitizeSdkFailure(error: unknown): Error {
 			stableErrorCode(error.code) ?? "sdk_error",
 			sanitizedDetails(error.details),
 		);
+	// Preserve local pool saturation separately from broker unavailability.
+	if (error instanceof GjcCommandQueueTimeoutError) return error;
 	if (error instanceof GjcCliError) {
 		const code = sdkErrorCode(error) ?? "sdk_error";
 		return new GjcCliError(

@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 43;
+export const LATEST_SCHEMA_VERSION = 45;
 
 export interface MigrationHost {
 	readonly database: {
@@ -961,6 +961,42 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(43, new Date().toISOString());
+		});
+	}
+	if (current < 44) {
+		host.withTransaction(() => {
+			const columns = new Set(
+				host.database
+					.statement<{ name: string }>("PRAGMA table_info(monitor_events)")
+					.all()
+					.map((row) => row.name),
+			);
+			if (!columns.has("session_origin_key"))
+				host.database.execute("ALTER TABLE monitor_events ADD COLUMN session_origin_key TEXT");
+			host.database.execute(
+				"CREATE INDEX IF NOT EXISTS broker_operations_pending_session_create_scope ON broker_operations(scope) WHERE operation = 'session.create' AND state = 'pending'",
+			);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(44, new Date().toISOString());
+		});
+	}
+	if (current < 45) {
+		host.withTransaction(() => {
+			const columns = new Set(
+				host.database
+					.statement<{ name: string }>("PRAGMA table_info(monitor_events)")
+					.all()
+					.map((row) => row.name),
+			);
+			if (!columns.has("escalation_epoch"))
+				host.database.execute("ALTER TABLE monitor_events ADD COLUMN escalation_epoch INTEGER NOT NULL DEFAULT 0");
+			host.database.execute(
+				"CREATE INDEX IF NOT EXISTS monitor_events_origin_epoch_recent ON monitor_events(monitor_id, session_origin_key, escalation_epoch, fired_at DESC)",
+			);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(45, new Date().toISOString());
 		});
 	}
 }

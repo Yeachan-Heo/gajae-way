@@ -265,6 +265,10 @@ export class BindingsGroup {
 			.run(tx, at, originRefJson, originKey);
 	}
 
+	updateSessionEpoch(tx: WriteTx, originKey: string, newEpoch: number): void {
+		this.#db.prepare("UPDATE sessions SET epoch = ? WHERE origin_key = ?").run(tx, newEpoch, originKey);
+	}
+
 	touchBoundSession(tx: WriteTx, originKey: string, sessionId: string, epoch: number, at: string): boolean {
 		return (
 			this.#db
@@ -1049,6 +1053,86 @@ export class BindingsGroup {
 				)
 				.get(operationRef, JSON.stringify(BROKER_PROMPT_BUSY_REFUSAL)) !== null
 		);
+	}
+
+	/**
+	 * Check if there is any pending session.create operation for the given scope.
+	 * Issue #780, P2 #1: used to distinguish a pending create from a missing
+	 * binding so recovery can retain its journal scope until the retired create
+	 * is replayed and any unbound session is closed.
+	 */
+	hasPendingSessionCreate(scope: string): boolean {
+		return (
+			this.#db
+				.prepare(
+					"SELECT 1 FROM broker_operations WHERE operation = 'session.create' AND scope = ? AND state = 'pending' LIMIT 1",
+				)
+				.get(scope) !== null
+		);
+	}
+
+	/** Count up to `limit` unresolved create scopes for durable monitor backpressure. */
+	pendingSessionCreateCount(originKey: string, limit: number, tx?: WriteTx): number {
+		if (!Number.isSafeInteger(limit) || limit < 0) throw new Error("pending session.create limit must be non-negative");
+		const scopePrefix = `${JSON.stringify([originKey]).slice(0, -1)},`;
+		const query = this.#db.prepare(
+			"SELECT scope FROM broker_operations WHERE operation = 'session.create' AND state = 'pending' AND scope >= ? AND scope < ? LIMIT ?",
+		);
+		return (
+			tx
+				? query.allWithWrite(tx, scopePrefix, `${scopePrefix}\uffff`, limit)
+				: query.all(scopePrefix, `${scopePrefix}\uffff`, limit)
+		).length;
+	}
+
+	/** Read a bounded set of unresolved retired create scopes for replay after a fresh bind. */
+	pendingSessionCreateScopes(
+		authority: BrokerAuthority,
+		originKey: string,
+		beforeEpoch: number,
+		limit: number,
+	): Array<{ scope: string; epoch: number }> {
+		this.assertAuthority(authority);
+		if (!Number.isSafeInteger(beforeEpoch) || beforeEpoch < 0)
+			throw new Error("pending session.create epoch must be non-negative");
+		if (!Number.isSafeInteger(limit) || limit < 0) throw new Error("pending session.create limit must be non-negative");
+		const scopePrefix = `${JSON.stringify([originKey]).slice(0, -1)},`;
+		const rows = this.#db
+			.prepare(
+				"SELECT scope FROM broker_operations WHERE authority_key = ? AND operation = 'session.create' AND state = 'pending' AND scope >= ? AND scope < ? ORDER BY scope LIMIT ?",
+			)
+			.all(brokerAuthorityKey(authority), scopePrefix, `${scopePrefix}\uffff`, limit) as Array<{ scope: string }>;
+		const scopes: Array<{ scope: string; epoch: number }> = [];
+		for (const { scope } of rows) {
+			try {
+				const parsed: unknown = JSON.parse(scope);
+				if (
+					Array.isArray(parsed) &&
+					parsed.length === 2 &&
+					parsed[0] === originKey &&
+					typeof parsed[1] === "number" &&
+					Number.isSafeInteger(parsed[1]) &&
+					parsed[1] >= 0 &&
+					parsed[1] < beforeEpoch
+				)
+					scopes.push({ scope, epoch: parsed[1] });
+			} catch {
+				// Malformed journal scopes do not authorize reconciliation.
+			}
+		}
+		return scopes.sort((left, right) => left.epoch - right.epoch).slice(0, limit);
+	}
+
+	pendingSessionCreateCreatedAt(authority: BrokerAuthority, scope: string): number | undefined {
+		this.assertAuthority(authority);
+		const row = this.#db
+			.prepare(
+				"SELECT created_at FROM broker_operations WHERE authority_key = ? AND operation = 'session.create' AND scope = ? AND state = 'pending'",
+			)
+			.get(brokerAuthorityKey(authority), scope) as { created_at: string } | null;
+		if (!row) return undefined;
+		const createdAt = Date.parse(row.created_at);
+		return Number.isFinite(createdAt) ? createdAt : undefined;
 	}
 }
 

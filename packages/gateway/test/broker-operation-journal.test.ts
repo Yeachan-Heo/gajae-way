@@ -1788,7 +1788,7 @@ test("schema 43 migrates existing journal rows and admits the idle-fenced close 
 		DROP TABLE broker_operations;
 		ALTER TABLE broker_operations_v42 RENAME TO broker_operations;
 		CREATE INDEX broker_operations_completed ON broker_operations(state, completed_at);
-		DELETE FROM schema_migrations WHERE version = 43;
+		DELETE FROM schema_migrations WHERE version >= 43;
 	`);
 	expect(() =>
 		legacy

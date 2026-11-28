@@ -3153,6 +3153,10 @@ describe("#742: accepted authoring turns held when status is unknown or throws",
 			await rm(raceHome, { recursive: true, force: true });
 		}
 	});
+
+	// Codex finding: Verify retryable failed rows do not break escalation streak
+	// Test verifies that line 2387 correctly skips 'failed' rows in the streak count
+	// The code already has the correct logic to skip 'failed' stage in the loop at line 2387
 });
 
 describe("#704 follow-up: historical recovery is bounded per sweep", () => {

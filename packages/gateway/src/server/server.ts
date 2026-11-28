@@ -1200,13 +1200,14 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		},
 		onReadinessFailure: ({ code, detail, originKey, at }) =>
 			readiness.recordFailure({
-				category: "monitor_delivery",
+				category: code === "monitor_bind_degraded" ? "monitor_bind" : "monitor_delivery",
 				code,
 				detail,
 				origin: originKey,
 				at,
 			}),
 		onReadinessSuccess: () => readiness.recordSuccess("monitor_delivery"),
+		onFirstAttemptBindSuccess: () => readiness.recordSuccess("monitor_bind"),
 		// AC7: the ONE production compaction seam. Native compaction runs through the
 		// broker-bound SessionPort, whose authenticated control receipt is the only
 		// affirmative compaction observation (logged by the TailRunner); the monitor
@@ -1806,6 +1807,7 @@ async function handleRequest(
 			const authoredEvents = batchEvents.filter((row) => row.stage === "authored").map((row) => row.event_id);
 			const confirmOutcome = confirmAndSettleMonitorDelivery(options.database, id, "delivered");
 			if (confirmOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
+			if (delivery) runtime.monitors.deliveryConfirmed(delivery.turnId);
 			if (runtime.delivery.get(id)?.state === "confirmed") runtime.restartTerminalDeliveryIds.delete(id);
 			if (confirmOutcome === "transitioned") {
 				runtime.readiness.recordSuccess("delivery");
@@ -4827,16 +4829,17 @@ function reportDeliveryExpired(
 		const current = database.outbox.get(expired.deliveryId);
 		if (current?.state !== "expired") return undefined;
 		const hasMonitorEvents = database.monitors.eventsByBatch(current.turnId).length > 0;
-		database.monitors.eventsFailExpiredDelivery(
+		const eventIds = database.monitors.eventsFailExpiredDelivery(
 			tx,
 			current.turnId,
 			current.deliveryId,
 			current.attempts,
 			safeDiagnosticField(reason),
 		);
-		return { current, hasMonitorEvents };
+		return { current, hasMonitorEvents, eventIds };
 	});
 	if (!expiration) return;
+	runtime.monitors.deliveryExpired(expiration.eventIds);
 	if (!readinessFailureRecorded) {
 		const code = expiration.current.lastError ?? "delivery_expired";
 		runtime.readiness.recordFailure({
