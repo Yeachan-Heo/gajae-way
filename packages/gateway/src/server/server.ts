@@ -64,7 +64,9 @@ import { ReactionBudget } from "../delivery/reaction-budget";
 import { type KevShadowInput, kevShadowEnabled, recordKevShadow } from "../engagement/kev-shadow";
 import {
 	BotAudienceTurnGuard,
+	configuredOwner,
 	decideEngagement,
+	ownerIdMatches,
 	resolveBotAudienceLimits,
 	resolveChannelPolicy,
 	threadFollowUpEngaged,
@@ -3034,7 +3036,7 @@ async function sendChat(
 		threadFollowUp,
 		authorId: engagement?.authorId,
 		authorIsBot,
-		ownerId: ownerPeerIdOf(runtime.config),
+		ownerId: configuredOwner(runtime.config)?.id,
 	});
 	// The value score on top of the authority decision. Measured in shadow on
 	// every engaged message; awaited, and able to skip the turn, only when the
@@ -5146,54 +5148,23 @@ function writeError(connection: Connection, error: unknown, id?: string): void {
 	connection.write({ v: PROFILE_VERSION, type: "error", ...(id ? { id } : {}), error: protocol.toPayload() });
 }
 
-function ownerPeerIdOf(config: GatewayConfig): string | undefined {
-	const owner = config.ownerTarget?.origin;
-	return owner && "peerId" in owner ? (owner as { peerId?: string }).peerId : undefined;
-}
-
 /**
- * Whether `authorId` in an engagement or request params is the owner. Owner
- * identity is explicit operator configuration, not adapter defaults:
- * - If ownerTarget.origin has a peerId (DM), that peerId is the owner (#862).
- * - If ownerTarget.origin has no peerId (channel), ownerTarget.owner must be set
- *   to explicitly configure the owner (no fallback to adapter owners) (#901).
- * - If ownerTarget is absent, use adapter-reported owners (#862).
- * No owner anywhere authorises nobody (fail closed). Owner-only verbs
- * (`/restart`, `/model`, `session.modelChoices`) require this.
+ * Whether `authorId` in an engagement or request params is the owner; see
+ * `ownerIdMatches`. Without a configured owner, an id the Discord adapter resolved from
+ * its own application at login (`hello.adapter.ownerIds`) authorises an author on that
+ * adapter's platform only: the originless verb (session.modelChoices) must name the
+ * platform the typing user speaks for. Owner-only verbs (`/restart`, `/model`,
+ * `session.modelChoices`) require this.
  */
 function ownerAuthored(config: GatewayConfig, carrier: unknown, connection?: Connection): boolean {
 	const record = (carrier ?? {}) as { authorId?: unknown; originPlatform?: unknown };
-	const authorId = record.authorId;
-	if (typeof authorId !== "string") return false;
-	// Check DM ownerTarget first (has explicit peerId)
-	const ownerPeerId = ownerPeerIdOf(config);
-	if (ownerPeerId !== undefined) return authorId === ownerPeerId;
-	// Check channel ownerTarget with explicit owner field (no adapter fallback)
-	if (config.ownerTarget?.owner !== undefined) return authorId === config.ownerTarget.owner;
-	// ownerTarget exists but has neither peerId nor owner field:
-	// this configuration is incomplete; fail closed
-	if (config.ownerTarget !== undefined) return false;
-	// No ownerTarget: use adapter-reported owners (authority for their platform only)
-	if (connection === undefined) return false;
-	// Adapter-reported owners are authority for the DECLARED platform only
-	// (#862): the originless verb (session.modelChoices) must name the platform
-	// the typing user speaks for, and it must be the platform this connection
-	// reported owners for.
-	if (record.originPlatform !== connection.platformOwnerPlatform) return false;
-	return connection.platformOwnerIds?.includes(authorId) === true;
+	if (typeof record.authorId !== "string") return false;
+	const platform = typeof record.originPlatform === "string" ? record.originPlatform : undefined;
+	return ownerIdMatches(record.authorId, config, connection, platform);
 }
 
-/**
- * The `ownerAuthored` gate for one chat origin: adapter-reported application
- * owners are consulted only when the origin is on the reporting adapter's own
- * platform (#862), so a slack or telegram author can never ride a discord
- * adapter's hello.
- */
+/** The `ownerAuthored` gate for one chat origin: the owner counts only on its own platform. */
 function ownerAuthoredOn(origin: OriginRef, config: GatewayConfig, carrier: unknown, connection?: Connection): boolean {
-	if (connection === undefined) return ownerAuthored(config, carrier, undefined);
-	// Consult the connection's reported owners only when the origin is on the
-	// platform that connection declared (#862).
-	if (origin.platform !== connection.platformOwnerPlatform) return ownerAuthored(config, carrier, undefined);
 	const record = (carrier ?? {}) as Record<string, unknown>;
 	return ownerAuthored(config, { ...record, originPlatform: origin.platform }, connection);
 }

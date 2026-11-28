@@ -124,145 +124,59 @@ describe("channel ownerTarget owner authorization (#901)", () => {
 	});
 });
 
-describe("DM engagement with channel ownerTarget and adapter owners (#901)", () => {
-	test("owner's DM is engaged with channel ownerTarget and adapter-reported owners", () => {
-		const ownerChannel = {
-			platform: "discord" as const,
-			kind: "channel" as const,
-			conversationId: "owner-channel",
-		} as const;
-		const config: GatewayConfig = {
-			schemaVersion: 1,
-			home: "/tmp",
-			gjc: { agentDir: "/tmp/agent" },
-			configPath: "/tmp/config.json",
-			socketPath: "/tmp/socket",
-			dbPath: "/tmp/db.sqlite",
-			dmPolicy: "allowlist",
-			ownerTarget: { origin: ownerChannel },
-		};
+describe("channel ownerTarget names its owner explicitly (#901)", () => {
+	const ownerChannel = { platform: "discord", kind: "channel", conversationId: "owner-channel" } as const;
+	const base: GatewayConfig = {
+		schemaVersion: 1,
+		home: "/tmp",
+		gjc: { agentDir: "/tmp/agent" },
+		configPath: "/tmp/config.json",
+		socketPath: "/tmp/socket",
+		dbPath: "/tmp/db.sqlite",
+		dmPolicy: "allowlist",
+	};
+	// The adapter reports a different application owner: it must never count once ownerTarget is set.
+	const connection = { platformOwnerIds: ["app-owner"], platformOwnerPlatform: "discord" };
+	const dm = { platform: "discord" as const, kind: "dm" as const, conversationId: "dm" };
+	const channel = { platform: "discord" as const, kind: "channel" as const, conversationId: "ch" };
+	const by = (authorId: string, group: boolean) => ({ mentioned: true, group, authorId });
 
-		// Mock connection with adapter-reported owner IDs
-		const connection = {
-			platformOwnerIds: ["owner-1"],
-			platformOwnerPlatform: "discord",
-		};
-
-		// Owner's DM should be engaged (owner from adapter)
-		const dm = { platform: "discord" as const, kind: "dm" as const, conversationId: "dm" };
-		const ownerDM = { mentioned: false, group: false, authorId: "owner-1" };
-		const ownerDecision = decideEngagement(dm, ownerDM, config, false, false, connection);
-		expect(ownerDecision.engaged).toBe(true);
-
-		// Non-owner's DM should not be engaged (no allowlist policy)
-		const nonOwnerDM = { mentioned: false, group: false, authorId: "user-1" };
-		const nonOwnerDecision = decideEngagement(dm, nonOwnerDM, config, false, false, connection);
-		expect(nonOwnerDecision.engaged).toBe(false);
+	test("the configured owner's DM and closed-channel mention engage; the adapter's app owner does not", () => {
+		const config = { ...base, ownerTarget: { origin: ownerChannel, owner: "owner-1" } };
+		expect(decideEngagement(dm, by("owner-1", false), config, false, false, connection).engaged).toBe(true);
+		expect(decideEngagement(channel, by("owner-1", true), config, false, false, connection).engaged).toBe(true);
+		expect(decideEngagement(dm, by("app-owner", false), config, false, false, connection).engaged).toBe(false);
+		expect(decideEngagement(channel, by("app-owner", true), config, false, false, connection).engaged).toBe(false);
+		expect(decideEngagement(dm, by("user-1", false), config, false, false, connection).engaged).toBe(false);
 	});
 
-	test("owner's DM is engaged even with channel ownerTarget if DM policy is open", () => {
-		const ownerChannel = {
-			platform: "discord" as const,
-			kind: "channel" as const,
-			conversationId: "owner-channel",
-		} as const;
-		const config: GatewayConfig = {
-			schemaVersion: 1,
-			home: "/tmp",
-			gjc: { agentDir: "/tmp/agent" },
-			configPath: "/tmp/config.json",
-			socketPath: "/tmp/socket",
-			dbPath: "/tmp/db.sqlite",
-			dmPolicy: "open",
-			ownerTarget: { origin: ownerChannel },
-		};
+	test("a channel ownerTarget without owner configures nobody: adapter owners do not fill in", () => {
+		const config = { ...base, ownerTarget: { origin: ownerChannel } };
+		expect(decideEngagement(dm, by("app-owner", false), config, false, false, connection).engaged).toBe(false);
+		expect(decideEngagement(channel, by("app-owner", true), config, false, false, connection).engaged).toBe(false);
+	});
 
-		const connection = {
-			platformOwnerIds: ["owner-1"],
-			platformOwnerPlatform: "discord",
-		};
-
-		// Any DM is engaged with open policy
-		const dm = { platform: "discord" as const, kind: "dm" as const, conversationId: "dm" };
-		const anyDM = { mentioned: false, group: false, authorId: "anyone" };
-		const decision = decideEngagement(dm, anyDM, config, false, false, connection);
-		expect(decision.engaged).toBe(true);
+	test("the configured owner counts only on the ownerTarget's platform", () => {
+		const config = { ...base, ownerTarget: { origin: ownerChannel, owner: "owner-1" } };
+		const slackDm = { platform: "slack" as const, kind: "dm" as const, conversationId: "D1", peerId: "owner-1" };
+		expect(decideEngagement(slackDm, by("owner-1", false), config).engaged).toBe(false);
 	});
 });
 
-describe("channel ownerTarget with adapter owner IDs (#901)", () => {
-	test("adapter-reported owner IDs authorize when ownerTarget is a channel", () => {
-		const ownerChannel = {
-			platform: "discord",
-			kind: "channel",
-			conversationId: "owner-channel",
-		} as const;
-		const config: GatewayConfig = {
-			schemaVersion: 1,
-			home: "/tmp",
-			gjc: { agentDir: "/tmp/agent" },
-			configPath: "/tmp/config.json",
-			socketPath: "/tmp/socket",
-			dbPath: "/tmp/db.sqlite",
-			ownerTarget: { origin: ownerChannel },
-		};
-
-		// Mock connection with adapter-reported owner IDs
-		const connection = {
-			platformOwnerIds: ["owner-1"],
-			platformOwnerPlatform: "discord",
-		};
-
-		// Owner (from adapter) can engage in a channel
-		const ownerEngagement = { mentioned: true, group: true, authorId: "owner-1" };
-		const channel = { platform: "discord" as const, kind: "channel" as const, conversationId: "ch" };
-		const ownerDecision = decideEngagement(channel, ownerEngagement, config, false, false, connection);
-		expect(ownerDecision.engaged).toBe(true);
-
-		// Non-owner cannot
-		const nonOwnerEngagement = { mentioned: true, group: true, authorId: "user-1" };
-		const nonOwnerDecision = decideEngagement(
-			channel as typeof channel,
-			nonOwnerEngagement,
-			config,
-			false,
-			false,
-			connection,
-		);
-		expect(nonOwnerDecision.engaged).toBe(false);
-	});
-
-	test("platform scoping respects adapter platform (#862)", () => {
-		const ownerChannel = {
-			platform: "discord",
-			kind: "channel",
-			conversationId: "owner-channel",
-		} as const;
-		const config: GatewayConfig = {
-			schemaVersion: 1,
-			home: "/tmp",
-			gjc: { agentDir: "/tmp/agent" },
-			configPath: "/tmp/config.json",
-			socketPath: "/tmp/socket",
-			dbPath: "/tmp/db.sqlite",
-			ownerTarget: { origin: ownerChannel },
-		};
-
-		// Connection reported Discord owner, but channel is Slack
-		const connection = {
-			platformOwnerIds: ["discord-owner"],
-			platformOwnerPlatform: "discord",
-		};
-
-		// Slack channel should not use Discord adapter's owner IDs
-		const slackChannel = { platform: "slack" as const, kind: "channel" as const, conversationId: "ch" };
-		const engagement = { mentioned: true, group: true, authorId: "discord-owner" };
-		const decision = decideEngagement(slackChannel, engagement, config, false, false, connection);
-		expect(decision.engaged).toBe(false);
-
-		// Discord channel can use Discord adapter's owner IDs
-		const discordChannel = { platform: "discord" as const, kind: "channel" as const, conversationId: "ch" };
-		const decision2 = decideEngagement(discordChannel, engagement, config, false, false, connection);
-		expect(decision2.engaged).toBe(true);
-	});
+test("ownerTarget.owner is accepted only on a non-DM origin and must be a non-empty string", async () => {
+	const { parseConfigFile } = await import("../src/config");
+	const channel = { platform: "discord", kind: "channel", conversationId: "reports" } as const;
+	expect(parseConfigFile({ schemaVersion: 1, ownerTarget: { origin: channel, owner: "owner-1" } }).ownerTarget).toEqual(
+		{
+			origin: channel,
+			owner: "owner-1",
+		},
+	);
+	const dm = { platform: "discord", kind: "dm", conversationId: "dm", peerId: "owner-1" };
+	expect(() => parseConfigFile({ schemaVersion: 1, ownerTarget: { origin: dm, owner: "owner-2" } })).toThrow(
+		"ownerTarget.owner is only for a non-DM origin",
+	);
+	expect(() => parseConfigFile({ schemaVersion: 1, ownerTarget: { origin: channel, owner: "" } })).toThrow(
+		"ownerTarget.owner must be a non-empty string",
+	);
 });

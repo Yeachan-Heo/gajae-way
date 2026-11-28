@@ -112,6 +112,8 @@ const SLACK_CHANNEL = { platform: "slack", kind: "channel", conversationId: "pub
 const APP_OWNER = "1111111111111111111";
 const TEAM_MEMBER = "2222222222222222222";
 const MEMBER = "3333333333333333333";
+/** The operator-configured owner of a channel ownerTarget (#901), distinct from the adapter's app owner. */
+const CONFIGURED_OWNER = "4444444444444444444";
 
 const mentionOpen = { "discord:public": { engagement: "mention-open" as const } };
 const as = (authorId: string) => ({ mentioned: true, group: true, authorId });
@@ -286,7 +288,7 @@ describe("adapter-reported application owners (#862)", () => {
 });
 
 describe("channel ownerTarget with identity fallback (#901)", () => {
-	test("channel ownerTarget: owner authorized, non-owner refused", async () => {
+	test("channel ownerTarget: the configured owner is authorized; the adapter app owner and members are not", async () => {
 		const home = await mkdtemp(join(tmpdir(), "gajaeway-channel-owner-target-"));
 		const channelOrigin = { platform: "discord" as const, kind: "channel" as const, conversationId: "reports" };
 		const config: GatewayConfig = {
@@ -299,7 +301,7 @@ describe("channel ownerTarget with identity fallback (#901)", () => {
 			logVerbosity: "info",
 			model: { preset: "base" },
 			// ownerTarget points to a channel (no peerId), but we also have adapter owners
-			ownerTarget: { origin: channelOrigin },
+			ownerTarget: { origin: channelOrigin, owner: CONFIGURED_OWNER },
 			channels: mentionOpen,
 		};
 		const database = await Store.open(config.dbPath);
@@ -322,7 +324,7 @@ describe("channel ownerTarget with identity fallback (#901)", () => {
 				await requestOverSocket(client, "owner-set", "chat.send", {
 					origin: CHANNEL,
 					text: "/model set frontier-heavy",
-					engagement: as(APP_OWNER),
+					engagement: as(CONFIGURED_OWNER),
 				}),
 			).toMatchObject({ type: "response", result: { engaged: true } });
 			expect(database.bindings.modelGet(key)?.selection).toEqual({ preset: "frontier-heavy" });
@@ -332,7 +334,7 @@ describe("channel ownerTarget with identity fallback (#901)", () => {
 				await requestOverSocket(client, "member-set", "chat.send", {
 					origin: CHANNEL,
 					text: "/model set other-model",
-					engagement: as(MEMBER),
+					engagement: as(APP_OWNER),
 				}),
 			).toMatchObject({ type: "response", result: { turnId: null, engaged: false } });
 			expect(database.bindings.modelGet(key)?.selection).toEqual({ preset: "frontier-heavy" });
@@ -342,7 +344,7 @@ describe("channel ownerTarget with identity fallback (#901)", () => {
 				await requestOverSocket(client, "channel-member-set", "chat.send", {
 					origin: CHANNEL,
 					text: "/model set channel-member-model",
-					engagement: as(TEAM_MEMBER),
+					engagement: as(MEMBER),
 				}),
 			).toMatchObject({ type: "response", result: { turnId: null, engaged: false } });
 			expect(database.bindings.modelGet(key)?.selection).toEqual({ preset: "frontier-heavy" });
@@ -357,7 +359,7 @@ describe("channel ownerTarget with identity fallback (#901)", () => {
 		}
 	});
 
-	test("channel ownerTarget: the app owner's DM is engaged on the real server, a non-owner's DM is not", async () => {
+	test("channel ownerTarget: the configured owner's DM is engaged on the real server; the adapter app owner's DM is not", async () => {
 		const home = await mkdtemp(join(tmpdir(), "gajaeway-channel-owner-dm-"));
 		const config: GatewayConfig = {
 			schemaVersion: 1,
@@ -369,7 +371,10 @@ describe("channel ownerTarget with identity fallback (#901)", () => {
 			logVerbosity: "info",
 			model: { preset: "base" },
 			// Default dmPolicy (allowlist) with no mentionAllowlist: only the owner may DM.
-			ownerTarget: { origin: { platform: "discord", kind: "channel", conversationId: "reports" } },
+			ownerTarget: {
+				origin: { platform: "discord", kind: "channel", conversationId: "reports" },
+				owner: CONFIGURED_OWNER,
+			},
 		};
 		const database = await Store.open(config.dbPath);
 		const port = attachTestBrokerOwnership(database, new ScriptedSessionPort(), join(home, "agent"));
@@ -387,16 +392,16 @@ describe("channel ownerTarget with identity fallback (#901)", () => {
 			await Bun.sleep(5);
 			expect(
 				await requestOverSocket(client, "owner-dm", "chat.send", {
-					origin: dm(APP_OWNER),
+					origin: dm(CONFIGURED_OWNER),
 					text: "/model set frontier-heavy",
-					engagement: { mentioned: true, group: false, authorId: APP_OWNER },
+					engagement: { mentioned: true, group: false, authorId: CONFIGURED_OWNER },
 				}),
 			).toMatchObject({ type: "response", result: { engaged: true } });
 			expect(
-				await requestOverSocket(client, "member-dm", "chat.send", {
-					origin: dm(MEMBER),
+				await requestOverSocket(client, "app-owner-dm", "chat.send", {
+					origin: dm(APP_OWNER),
 					text: "hello",
-					engagement: { mentioned: true, group: false, authorId: MEMBER },
+					engagement: { mentioned: true, group: false, authorId: APP_OWNER },
 				}),
 			).toMatchObject({ type: "response", result: { turnId: null, engaged: false } });
 		} finally {

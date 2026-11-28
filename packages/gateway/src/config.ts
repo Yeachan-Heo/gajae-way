@@ -132,9 +132,11 @@ export interface GatewayConfigFile {
 	 */
 	readonly dmPolicy?: DmPolicy;
 	/**
-	 * Default recipient origin for monitor/maintenance notes without their own channel target.
-	 * When origin has a peerId (DM), that peerId is the owner.
-	 * When origin has no peerId (channel), the owner field specifies the explicit platform-scoped owner.
+	 * Default recipient origin for monitor/maintenance notes without their own channel target,
+	 * and the operator-configured owner. A DM origin's `peerId` is the owner; a non-DM origin
+	 * names the owner with `owner` (a user id on the origin's platform). A non-DM origin
+	 * without `owner` configures no owner at all: adapter-reported owners are not consulted
+	 * once an ownerTarget is set (#862, #901).
 	 */
 	readonly ownerTarget?: { readonly origin: OriginRef; readonly owner?: string };
 	/**
@@ -507,17 +509,25 @@ function parseStallTimeout(value: unknown): number {
 
 function parseOwnerTarget(value: unknown): { readonly origin: OriginRef; readonly owner?: string } {
 	const input = requireObject(value, "ownerTarget");
-	if (Object.keys(input).some((key) => !["origin", "owner"].includes(key)))
+	if (Object.keys(input).some((key) => key !== "origin" && key !== "owner"))
 		throw new ConfigError("config_invalid", "ownerTarget may only contain origin and owner");
+	let origin: OriginRef;
 	try {
-		const owner = input.owner !== undefined ? optionalString(input.owner, "ownerTarget.owner") : undefined;
-		return { origin: validateOriginRef(input.origin as OriginRef), ...(owner !== undefined ? { owner } : {}) };
+		origin = validateOriginRef(input.origin as OriginRef);
 	} catch (error) {
 		throw new ConfigError(
 			"config_invalid",
 			`ownerTarget.origin is invalid: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
+	const owner = optionalString(input.owner, "ownerTarget.owner");
+	// A DM target already names its owner (peerId); a second id there could only disagree.
+	if (owner !== undefined && origin.kind === "dm")
+		throw new ConfigError(
+			"config_invalid",
+			"ownerTarget.owner is only for a non-DM origin; a DM origin's peerId is the owner",
+		);
+	return { origin, ...(owner === undefined ? {} : { owner }) };
 }
 
 function parseHandoffTargets(value: unknown): Readonly<Record<string, OriginRef>> {

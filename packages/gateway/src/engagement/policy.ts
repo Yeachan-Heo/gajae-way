@@ -396,36 +396,40 @@ function closedAuthorAuthorized(
 	origin?: Pick<OriginRef, "platform">,
 ): boolean {
 	const allowlist = config.mentionAllowlist;
-	if (!allowlist || allowlist.length === 0) return ownerIdMatches(authorId, config, connection, origin);
+	if (!allowlist || allowlist.length === 0) return ownerIdMatches(authorId, config, connection, origin?.platform);
 	return allowlist.includes(authorId);
 }
 
-function ownerPeerId(config: GatewayConfig): string | undefined {
-	const owner = config.ownerTarget?.origin;
-	return owner && "peerId" in owner ? (owner as { peerId?: string }).peerId : undefined;
+/**
+ * The operator-configured owner. A DM `ownerTarget` names it by `peerId`, a non-DM one by
+ * `owner`; either is scoped to the target's platform. `null` means an ownerTarget is set
+ * without an owner, which authorises nobody (fail closed); `undefined` means no ownerTarget,
+ * so adapter-reported owners apply (#862, #901).
+ */
+export function configuredOwner(
+	config: GatewayConfig,
+): { readonly platform: string; readonly id: string } | null | undefined {
+	const target = config.ownerTarget;
+	if (target === undefined) return undefined;
+	const id = target.origin.kind === "dm" ? (target.origin as { peerId?: string }).peerId : target.owner;
+	return id === undefined ? null : { platform: target.origin.platform, id };
 }
 
 /**
- * Check if an authorId matches the configured owner identity. When ownerTarget
- * is a DM, its peerId is the owner. When ownerTarget is a channel or absent,
- * fall back to adapter-reported platformOwnerIds (platform-scoped like #862).
+ * Whether `authorId` is the owner. An ownerTarget replaces adapter-reported owners
+ * entirely; without one, adapter owners count only on the platform that reported them.
+ * `platform` is the author's platform when known.
  */
-function ownerIdMatches(
+export function ownerIdMatches(
 	authorId: string,
 	config: GatewayConfig,
 	connection?: { readonly platformOwnerIds?: readonly string[]; readonly platformOwnerPlatform?: string },
-	origin?: Pick<OriginRef, "platform">,
+	platform?: string,
 ): boolean {
-	const dmOwnerId = ownerPeerId(config);
-	if (dmOwnerId !== undefined) {
-		// ownerTarget is a DM with a peerId: use it as owner identity
-		return authorId === dmOwnerId;
-	}
-	// ownerTarget is a channel (no peerId) or absent: fall back to platformOwnerIds
-	if (connection === undefined) return false;
-	// When using adapter-reported owner IDs, they are only valid on the platform
-	// the adapter reported them for (#862). If origin is provided, verify platform match.
-	if (origin !== undefined && String(origin.platform) !== connection.platformOwnerPlatform) return false;
+	const owner = configuredOwner(config);
+	if (owner === null) return false;
+	if (owner !== undefined) return authorId === owner.id && (platform === undefined || platform === owner.platform);
+	if (connection === undefined || platform !== connection.platformOwnerPlatform) return false;
 	return connection.platformOwnerIds?.includes(authorId) === true;
 }
 
@@ -444,7 +448,7 @@ function dmEngaged(
 	if (policy === "open") return true;
 	const authorId = engagement?.authorId;
 	if (authorId === undefined) return false;
-	if (ownerIdMatches(authorId, config, connection, origin)) return true;
+	if (ownerIdMatches(authorId, config, connection, origin?.platform)) return true;
 	if (policy === "owner-only") return false;
 	const allowlist = config.mentionAllowlist;
 	if (!allowlist || allowlist.length === 0) return false;
