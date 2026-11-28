@@ -134,7 +134,7 @@ export interface GatewayConfigFile {
 	/**
 	 * Default recipient origin for monitor/maintenance notes without their own channel target,
 	 * and the operator-configured owner. A DM origin's `peerId` is the owner; a non-DM origin
-	 * names the owner with `owner` (a user id on the origin's platform). A non-DM origin
+	 * on a chat platform names the owner with `owner` (a user id on that platform). A non-DM origin
 	 * without `owner` configures no owner at all: adapter-reported owners are not consulted
 	 * once an ownerTarget is set (#862, #901).
 	 */
@@ -527,6 +527,8 @@ function parseOwnerTarget(value: unknown): { readonly origin: OriginRef; readonl
 			"config_invalid",
 			"ownerTarget.owner is only for a non-DM origin; a DM origin's peerId is the owner",
 		);
+	if (owner !== undefined && !isChatPlatform(origin.platform))
+		throw new ConfigError("config_invalid", `ownerTarget.owner requires a ${describeChatPlatforms()} origin`);
 	return { origin, ...(owner === undefined ? {} : { owner }) };
 }
 
