@@ -2256,7 +2256,7 @@ test("releaseBrokerOperation drops only the row of the exact ref, pending or com
 	).toMatchObject({ operationRef: "gw-bind-3", resumed: false });
 });
 
-test("pruneBrokerOperations honors each cutoff and retains pending creates and prompts at any age", async () => {
+test("pruneBrokerOperations retains create intents and pending prompts at any age", async () => {
 	const { path, authority } = await setup();
 	const store = database!;
 	const begin = (
@@ -2274,11 +2274,13 @@ test("pruneBrokerOperations honors each cutoff and retains pending creates and p
 	begin("session.create", "create-pending");
 	begin("turn.prompt", "prompt-pending");
 	begin("session.close", "close-pending");
+	begin("session.create", "create-done");
 	begin("turn.prompt", "prompt-done");
 	begin("session.close", "close-done");
 	begin("session.close_if_idle", "idle-close-pending");
 	begin("session.close_if_idle", "idle-close-done");
 	for (const [operation, scope] of [
+		["session.create", "create-done"],
 		["turn.prompt", "prompt-done"],
 		["session.close", "close-done"],
 		["session.close_if_idle", "idle-close-done"],
@@ -2291,13 +2293,15 @@ test("pruneBrokerOperations honors each cutoff and retains pending creates and p
 
 	// Cutoffs before every row: nothing is old enough.
 	expect(prune(at(-60_000), at(-60_000))).toBe(0);
-	expect(journalRows(path)).toHaveLength(7);
+	expect(journalRows(path)).toHaveLength(8);
 
-	// Only the completed cutoff has passed: completed rows go, every pending intent stays.
+	// Only the completed cutoff has passed: the completed create stays as unreconciled
+	// evidence, and every pending intent (forced or idle-fenced) stays.
 	expect(prune(at(60_000), at(-60_000))).toBe(3);
 	expect(journalRows(path)).toEqual([
 		{ operation: "session.close", scope: "close-pending", state: "pending" },
 		{ operation: "session.close_if_idle", scope: "idle-close-pending", state: "pending" },
+		{ operation: "session.create", scope: "create-done", state: "complete" },
 		{ operation: "session.create", scope: "create-pending", state: "pending" },
 		{ operation: "turn.prompt", scope: "prompt-pending", state: "pending" },
 	]);
@@ -2305,6 +2309,7 @@ test("pruneBrokerOperations honors each cutoff and retains pending creates and p
 	// Only pending close intents (forced and idle-fenced) expire; a prompt's missing reconciliation record never authorizes a resend.
 	expect(prune(at(60_000), at(60_000))).toBe(2);
 	expect(journalRows(path)).toEqual([
+		{ operation: "session.create", scope: "create-done", state: "complete" },
 		{ operation: "session.create", scope: "create-pending", state: "pending" },
 		{ operation: "turn.prompt", scope: "prompt-pending", state: "pending" },
 	]);

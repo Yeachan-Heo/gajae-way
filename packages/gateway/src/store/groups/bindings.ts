@@ -414,6 +414,41 @@ export class BindingsGroup {
 		)?.repo;
 	}
 
+	/** Durable ownership and unreconciled creates for every epoch of an origin. */
+	workHistoryAuthorityEvidence(
+		authority: BrokerAuthority,
+		originKey: string,
+	): {
+		readonly bindings: readonly { readonly session_id: string; readonly epoch: number; readonly repo: string }[];
+		readonly creates: readonly { readonly scope: string; readonly state: string }[];
+	} {
+		this.assertAuthority(authority);
+		const key = brokerAuthorityKey(authority);
+		const bindings = this.#db
+			.prepare(
+				"SELECT session_id, epoch, repo FROM broker_owned_bindings WHERE authority_key = ? AND origin_key = ? ORDER BY session_id",
+			)
+			.all(key, originKey) as Array<{ session_id: string; epoch: number; repo: string }>;
+		const operations = this.#db
+			.prepare(
+				"SELECT scope, state FROM broker_operations WHERE authority_key = ? AND operation = 'session.create' ORDER BY scope",
+			)
+			.all(key) as Array<{ scope: string; state: string }>;
+		const creates = operations.filter((operation) => {
+			const scope: unknown = JSON.parse(operation.scope);
+			if (
+				!Array.isArray(scope) ||
+				scope.length !== 2 ||
+				typeof scope[0] !== "string" ||
+				!Number.isSafeInteger(scope[1]) ||
+				scope[1] < 0
+			)
+				throw new Error("invalid broker create scope");
+			return scope[0] === originKey;
+		});
+		return { bindings, creates };
+	}
+
 	hasCutovers(): boolean {
 		return this.#db.prepare("SELECT 1 FROM broker_cutovers LIMIT 1").get() !== null;
 	}
@@ -988,7 +1023,7 @@ export class BindingsGroup {
 
 	/**
 	 * Bounds the journal: completed operations older than `completedBefore` and
-	 * old pending close intents. Pending creates and prompts are never age-pruned:
+	 * old pending close intents. Create intents and pending prompts are never age-pruned:
 	 * a create may have applied before its binding was recorded, and an unknown
 	 * prompt status never authorizes resending its non-idempotent clientRef.
 	 * Busy refusals retain their fingerprint while retry/recovery is unresolved.
@@ -1002,7 +1037,7 @@ export class BindingsGroup {
 		return this.#db
 			.prepare(
 				`DELETE FROM broker_operations
-				WHERE (state = 'complete' AND completed_at < ? AND (
+				WHERE (state = 'complete' AND operation != 'session.create' AND completed_at < ? AND (
 					operation != 'turn.prompt' OR COALESCE(result_json, '') != ? OR EXISTS (
 						SELECT 1 FROM work_attempt_runtime runtime
 						JOIN lane_jobs job ON job.job_id = runtime.job_id AND job.lane_key = runtime.lane_key

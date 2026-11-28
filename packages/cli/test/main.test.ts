@@ -1748,19 +1748,40 @@ describe("work operator commands", () => {
 			});
 			expect(output.requests).toEqual([{ verb: "work.retire", params: { name: "fix" } }]);
 			expect(output.lines).toEqual([`retired: work/task/fix session=session-1 closed=${closed}`]);
+			expect(output.exitCode ?? 0).toBe(0);
 			expect(output.closed).toBe(true);
 		});
 	}
 
-	test("work retire prints refusal without inventing a session", async () => {
+	test("work retire prints historical disposition without claiming session closure", async () => {
 		const output = await run(["retire", "fix"], {
-			retired: false,
+			retired: true,
 			sessionKey: "work/task/fix",
-			reason: "active attempt",
+			sessionId: "",
+			closed: false,
+			disposition: "aborted",
 		});
-		expect(output.lines).toEqual(["not retired: active attempt"]);
+		expect(output.requests).toEqual([{ verb: "work.retire", params: { name: "fix" } }]);
+		expect(output.lines).toEqual(["disposed: work/task/fix state=aborted (history and worktree preserved)"]);
+		expect(output.exitCode ?? 0).toBe(0);
 		expect(output.closed).toBe(true);
 	});
+
+	for (const force of [false, true]) {
+		test(`work retire${force ? " --force" : ""} returns failure on refusal`, async () => {
+			const output = await run(["retire", "fix", ...(force ? ["--force"] : [])], {
+				retired: false,
+				sessionKey: "work/task/fix",
+				reason: "active attempt",
+			});
+			expect(output.requests).toEqual([
+				{ verb: "work.retire", params: { name: "fix", ...(force ? { force: true } : {}) } },
+			]);
+			expect(output.lines).toEqual(["not retired: active attempt"]);
+			expect(output.exitCode).toBe(1);
+			expect(output.closed).toBe(true);
+		});
+	}
 
 	test("work jobs renders bound and unbound lanes", async () => {
 		const output = await run(["jobs"], {
