@@ -131,7 +131,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] [--successor-of NAME --source-op REF --source-session ID --acknowledge-unresolved (start only; requires --repo and --base FULL_SHA; no --cwd/--resume)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--limit N] [--offset N] [--json]|ops integrity|ops restart-stack [--status|--recover --confirm-service-manager-settled]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
+	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] [--successor-of NAME --source-op REF --source-session ID --acknowledge-unresolved (start only; requires --repo and --base FULL_SHA; no --cwd/--resume)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops holds [--json]|ops holds abandon <opRef> --confirm|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--limit N] [--offset N] [--json]|ops integrity|ops restart-stack [--status|--recover --confirm-service-manager-settled]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -504,7 +504,7 @@ export function sloExitCode(result: OpsSloResult): number {
 }
 
 const OPS_USAGE =
-	"usage: gajaeway ops backup <path>|deliveries [--since ISO] [--state S] [--limit N] [--json]|redeliver <deliveryId>|redeliver --since <iso>|slo [--days N] [--json]|cycle [--limit N] [--offset N] [--json]|integrity|restart-stack [--status|--recover --confirm-service-manager-settled]";
+	"usage: gajaeway ops backup <path>|deliveries [--since ISO] [--state S] [--limit N] [--json]|holds [--json]|holds abandon <opRef> --confirm|redeliver <deliveryId>|redeliver --since <iso>|slo [--days N] [--json]|cycle [--limit N] [--offset N] [--json]|integrity|restart-stack [--status|--recover --confirm-service-manager-settled]";
 
 const OPS_CYCLE_USAGE = "usage: gajaeway ops cycle [--limit N] [--offset N] [--json]";
 
@@ -828,7 +828,9 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				const [command, path] = parsed.rest;
 				if (
 					command === undefined ||
-					!["backup", "deliveries", "redeliver", "integrity", "slo", "cycle", "restart-stack"].includes(command)
+					!["backup", "deliveries", "holds", "redeliver", "integrity", "slo", "cycle", "restart-stack"].includes(
+						command,
+					)
 				)
 					throw new Error(`unknown ops command: ${command ?? "(missing)"}\n${OPS_USAGE}`);
 				const deliveries = command === "deliveries" ? parseOpsDeliveriesArgs(parsed.rest.slice(1)) : undefined;
@@ -897,6 +899,72 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						console.log(`restart-stack ${receipt.id}: queued (supervisor pid ${supervisorPid})`);
 						console.log("read the outcome with: gajaeway ops restart-stack --status");
 					} else throw new Error(usage);
+					break;
+				}
+				if (command === "holds") {
+					const rest = parsed.rest.slice(1);
+					const json = rest.includes("--json");
+					if (rest[0] === "abandon") {
+						const opRef = rest[1];
+						const confirm = rest.includes("--confirm");
+						if (!opRef || opRef.startsWith("--") || rest.length > 3)
+							throw new Error("usage: gajaeway ops holds abandon <opRef> --confirm");
+						if (!confirm) {
+							console.error(
+								"refusing to abandon a hold without --confirm: it discards the hold's pending-answer fence",
+							);
+							process.exitCode = USAGE_EXIT_CODE;
+							break;
+						}
+						const client = await connectGatewaySocket(parsed.socket);
+						try {
+							const result = await client.request<{ cleared?: unknown; opRef?: unknown }>("ops.holds.abandon", {
+								opRef,
+								confirm: true,
+							});
+							console.log(`hold ${result.opRef ?? opRef} abandoned: cleared=${result.cleared === true}`);
+							console.log("run gajaeway ops holds to list the remaining holds");
+						} finally {
+							await client.close();
+						}
+						break;
+					}
+					if (rest.some((arg) => !arg.startsWith("--") && arg !== "abandon"))
+						throw new Error(`usage: gajaeway ops holds [--json]|abandon <opRef> --confirm`);
+					const client = await connectGatewaySocket(parsed.socket);
+					try {
+						const result = await client.request<{ holds?: unknown }>("ops.holds", {});
+						if (json) {
+							console.log(JSON.stringify(result));
+							break;
+						}
+						const holds = (result.holds ?? []) as Array<{
+							originKey: string;
+							opRef: string;
+							sessionId: string | null;
+							triggerState: string;
+							turnState: string | null;
+							heldSinceMs?: number;
+							escalated: boolean;
+							parked: boolean;
+							noticeConfirmed: boolean;
+							wouldBlockDrain: boolean;
+						}>;
+						if (holds.length === 0) {
+							console.log("holds: none");
+							break;
+						}
+						console.log("ORIGIN                                      OPREF  STATE     HELD      DRAIN");
+						for (const hold of holds) {
+							const held = hold.heldSinceMs === undefined ? "-" : `${Math.round(hold.heldSinceMs / 60_000)}m`;
+							const drain = hold.wouldBlockDrain ? "blocks-drain" : "exempt";
+							console.log(
+								`${hold.originKey.padEnd(43)} ${hold.opRef.padEnd(30)} ${String(hold.turnState ?? "-").padEnd(9)} ${held.padEnd(9)} ${drain}${hold.parked ? " parked" : ""}`,
+							);
+						}
+					} finally {
+						await client.close();
+					}
 					break;
 				}
 				let redeliverParams: { deliveryId: string } | { since: string } | undefined;

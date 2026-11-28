@@ -1251,9 +1251,10 @@ test("a disowned session id is not proof its host exited: the hold stays open pa
 		};
 		await clock.advance(MINUTE);
 		await f.manager.reconcile(f.originKey);
-		const mark = f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`);
-		expect(mark).toBeDefined();
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBeDefined();
 		// The broker stops serving the id; a detached host may still be running it.
+		const mark2 = f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`);
+		expect(mark2).toBeDefined();
 		const liveness = f.port.liveness.bind(f.port);
 		f.port.liveness = async (input) =>
 			input.sessionId === f.binding.sessionId ? { live: undefined, disowned: true } : await liveness(input);
@@ -1262,7 +1263,7 @@ test("a disowned session id is not proof its host exited: the hold stays open pa
 			await f.manager.reconcile(f.originKey);
 		}
 		expect(f.db.core.metaGet(`retired-hold-parked:${f.heldOpRef}`)).toBeUndefined();
-		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBe(mark);
+		expect(f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`)).toBe(mark2);
 		expect(f.logs.some((line) => line.startsWith("retired_hold_parked "))).toBe(false);
 	} finally {
 		await f.manager.stop();
@@ -2175,3 +2176,245 @@ for (const [label, operationRef] of [
 		});
 	}
 }
+
+/** The #859 shape: a stale escalated retired hold whose status is forever unreadable. */
+function staleHold(f: Awaited<ReturnType<typeof heldOrigin>>): void {
+	f.port.attachTail = async () => {
+		throw endpointStale();
+	};
+	f.port.status = async () => {
+		throw endpointStale();
+	};
+}
+
+test("a stale escalated retired hold past retiredHoldAbandonMs drains and its marker stays durable (#859)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("restart-drain-stale-aged", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		newerMessage: false,
+		clock,
+		retiredHoldAbandonMs: 120 * MINUTE,
+	});
+	staleHold(f);
+	try {
+		await f.manager.recover();
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBeDefined();
+		expect(f.notices).toHaveLength(1);
+		// The abandonment window must elapse before the drain may pass: the user
+		// was told at escalation, but the fence stays inside retiredHoldAbandonMs.
+		await expect(f.manager.drainForRestart("stale-aged-early-drain", 20)).resolves.toBe("timed_out");
+		await expect(f.manager.cancelRestartDrain("stale-aged-early-drain")).resolves.toBe(true);
+		await sweepMinutes(clock, f.manager, f.originKey, 121);
+		const mark = f.db.core.metaGet(`retired-hold-dead-since:${f.heldOpRef}`);
+		expect(mark).toBeDefined();
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBe("1");
+		await expect(f.manager.drainForRestart("stale-aged-drain", 20)).resolves.toBe("drained");
+		// The drain exempts, it never settles: recovery must still readopt the hold
+		// from its durable marker and pending trigger after the restart.
+		expect(f.db.inbox.turnRow(f.heldOpRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBe("1");
+		await f.manager.stop();
+		const restarted = f.startManager();
+		try {
+			await restarted.recover();
+			expect(f.logs.some((line) => line.includes("reason=unresolved_hold_readopted"))).toBe(true);
+			// A readopted detached hold on a dead host whose status stays unreadable
+			// must still exempt past its bound (the bound is durable, not per-actor).
+			await expect(restarted.drainForRestart("readopted-stale-drain", 20)).resolves.toBe("drained");
+			expect(f.port.sendAttempts).toHaveLength(0);
+		} finally {
+			await restarted.stop();
+		}
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a timed-out drain names its blocking holds and ops verbs settle one (#859)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("restart-drain-report", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		newerMessage: false,
+		clock,
+		retiredHoldAbandonMs: 120 * MINUTE,
+	});
+	staleHold(f);
+	try {
+		await f.manager.recover();
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBe("1");
+		await expect(f.manager.drainForRestart("reported-drain", 20)).resolves.toBe("timed_out");
+		// The cancel status names the blocking origin and opRef without probing again.
+		const blockers = f.manager.lastDrainBlockers;
+		expect(blockers).toHaveLength(1);
+		expect(blockers[0]).toMatchObject({
+			originKey: f.originKey,
+			opRef: f.heldOpRef,
+			sessionId: f.binding.sessionId,
+			escalated: true,
+			wouldBlockDrain: true,
+		});
+		expect(blockers[0]!.heldSinceMs).toBeDefined();
+
+		// The operator list shows the same hold, and a stale-status exemption is
+		// not reported as drain-blocking once its bound elapsed.
+		await sweepMinutes(clock, f.manager, f.originKey, 121);
+		await expect(f.manager.cancelRestartDrain("reported-drain")).resolves.toBe(true);
+		const holds = await f.manager.listHolds();
+		expect(holds).toHaveLength(1);
+		expect(holds[0]).toMatchObject({ opRef: f.heldOpRef, escalated: true, wouldBlockDrain: false });
+		await expect(f.manager.drainForRestart("aged-reported-drain", 20)).resolves.toBe("drained");
+
+		// Abandonment settles exactly one named hold; a settled opRef is refused.
+		const refused = await f.manager.abandonHold("no-such-op");
+		expect(refused).toEqual({ cleared: false, reason: "unknown_op_ref" });
+		const abandoned = await f.manager.abandonHold(f.heldOpRef);
+		expect(abandoned.cleared).toBe(true);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).toBe("done");
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBeUndefined();
+		expect(await f.manager.listHolds()).toHaveLength(0);
+		expect(f.port.sendAttempts.filter((send) => send.opRef === f.heldOpRef)).toHaveLength(0);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("an aged in_flight hold is reported as blocking in both lastDrainBlockers and ops.holds (#860)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("aged-inflight-reporting", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		newerMessage: false,
+		clock,
+		retiredHoldAbandonMs: 120 * MINUTE,
+	});
+	staleHold(f);
+	try {
+		await f.manager.recover();
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBe("1");
+		// First drain attempt: status unreadable, hold blocks.
+		await expect(f.manager.drainForRestart("aged-inflight-report-drain", 20)).resolves.toBe("timed_out");
+		// Advance past the age threshold.
+		await clock.advance(121 * MINUTE);
+		// Now make the status readable as in_flight (host revived).
+		f.port.status = async (input) => {
+			if (input.opRef === f.heldOpRef) {
+				return {
+					operationRef: f.heldOpRef,
+					status: { status: "in_flight" as const },
+					summaryCompleted: false,
+				};
+			}
+			throw endpointStale();
+		};
+		// Cancel the first drain before trying again.
+		await expect(f.manager.cancelRestartDrain("aged-inflight-report-drain")).resolves.toBe(true);
+		// Second drain attempt: status now shows in_flight (host revived).
+		// Drain times out because hold still blocks (cached verdict says blocked).
+		await expect(f.manager.drainForRestart("aged-inflight-report-drain-2", 20)).resolves.toBe("timed_out");
+		// Verify lastDrainBlockers reports the aged in_flight hold as blocking
+		const blockers = f.manager.lastDrainBlockers;
+		expect(blockers).toHaveLength(1);
+		expect(blockers[0]).toMatchObject({
+			originKey: f.originKey,
+			opRef: f.heldOpRef,
+			escalated: true,
+			wouldBlockDrain: true,
+		});
+		// Verify ops.holds also reports it as blocking (even without fresh probe)
+		const holds = await f.manager.listHolds();
+		expect(holds).toHaveLength(1);
+		expect(holds[0]).toMatchObject({
+			opRef: f.heldOpRef,
+			escalated: true,
+			wouldBlockDrain: true,
+		});
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a fresh, live unsettled turn still blocks the restart drain past any bound (#859)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("restart-drain-fresh-live", {
+		heldForMs: 11 * MINUTE,
+		live: true,
+		newerMessage: false,
+		clock,
+		retiredHoldAbandonMs: 120 * MINUTE,
+	});
+	f.port.seedAcceptedSend({ sessionId: f.binding.sessionId, repo: "", text: "", opRef: f.heldOpRef });
+	try {
+		await f.manager.recover();
+		// Still tracked, still readable, nothing stale about it: escalation never
+		// happened and the op keeps reporting in_flight.
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBeUndefined();
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).toBe("accepted");
+		const drain = f.manager.drainForRestart("fresh-live-drain", 1_000);
+		const outcome = await Promise.race([drain.then((value) => value), Bun.sleep(250).then(() => "pending")]);
+		expect(outcome).toBe("pending");
+		await expect(drain).resolves.toBe("timed_out");
+		expect(f.answers).toHaveLength(0);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).toBe("accepted");
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("an aged escalated hold whose status is in_flight still blocks the drain (#860)", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("restart-drain-aged-inflight", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		newerMessage: false,
+		clock,
+		retiredHoldAbandonMs: 120 * MINUTE,
+	});
+	staleHold(f);
+	try {
+		await f.manager.recover();
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBe("1");
+		// First drain attempt: status unreadable, hold blocks.
+		await expect(f.manager.drainForRestart("aged-inflight-drain", 20)).resolves.toBe("timed_out");
+		// Advance past the age threshold.
+		await clock.advance(121 * MINUTE);
+		// Now make the status readable as in_flight (host revived).
+		// Keep attachTail as failing (detached hold), but make status readable.
+		f.port.status = async (input) => {
+			if (input.opRef === f.heldOpRef) {
+				return {
+					operationRef: f.heldOpRef,
+					status: { status: "in_flight" as const },
+					summaryCompleted: false,
+				};
+			}
+			throw endpointStale();
+		};
+		// Second drain attempt: status now shows in_flight (host revived).
+		// Even though the hold is now aged, the latest probe found it in_flight (live).
+		// The drain must still timeout, it cannot skip the hold just because it's old.
+		await expect(f.manager.drainForRestart("aged-inflight-drain", 20)).resolves.toBe("timed_out");
+		// Verify the hold is still escalated (not exempted just for being old).
+		expect(f.db.core.metaGet(`escalated-hold:${f.heldOpRef}`)).toBe("1");
+		// Verify reporting: even though aged, an in_flight hold must report as wouldBlockDrain: true
+		const blockers = f.manager.lastDrainBlockers;
+		expect(blockers).toHaveLength(1);
+		expect(blockers[0]).toMatchObject({
+			originKey: f.originKey,
+			opRef: f.heldOpRef,
+			escalated: true,
+			wouldBlockDrain: true,
+		});
+		// Verify ops.holds also reports it as wouldBlockDrain: true
+		const holds = await f.manager.listHolds();
+		expect(holds).toHaveLength(1);
+		expect(holds[0]).toMatchObject({
+			opRef: f.heldOpRef,
+			escalated: true,
+			wouldBlockDrain: true,
+		});
+	} finally {
+		await f.manager.stop();
+	}
+});
