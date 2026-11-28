@@ -703,6 +703,7 @@ for (const shape of [
 							authorName: "Alice",
 							authorHandle: "alice",
 							serverLabel: "Workspace",
+							trust: "member",
 							...(!dm ? { channelLabel: "#general" } : {}),
 							...(thread
 								? {
@@ -1094,6 +1095,7 @@ test("Slack edits use nested identity, edited timestamp and rendered body equali
 						authorHandle: "alice",
 						channelLabel: "#general",
 						serverLabel: "Workspace",
+						trust: "member",
 					},
 				},
 			},
@@ -1662,7 +1664,7 @@ for (const command of ["/new", "/reset", "/restart", "/model", "/unknown"])
 								messageId: `slash-${engaged}`,
 								origin: { platform: "slack", kind: "dm", conversationId: "D1", peerId: "U1" },
 								text: command,
-								engagement: { mentioned: true, group: false, authorId: "U1", authorHandle: "alice" },
+								engagement: { mentioned: true, group: false, authorId: "U1", authorHandle: "alice", trust: "member" },
 							},
 						})),
 			);
@@ -2905,6 +2907,36 @@ test("#710: Event Subscriptions stay off after forced reconnect; suspect flag cl
 		expect(await f.recoverMissedMessages()).toBe(true);
 		expect(f.eventsSuspect()).toBeDefined();
 		expect(f.eventsSuspect()!.since).toBe(suspectSince);
+	} finally {
+		f.socket.stop();
+		f.recovery.stop();
+	}
+});
+
+test("Slack recovery states author trust: every author is classified, a failed lookup is unverified", async () => {
+	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false });
+	try {
+		const usersInfo = f.api.usersInfo.bind(f.api);
+		f.api.usersInfo = async (id: string) => {
+			if (id === "UGUEST") return { ...(await usersInfo(id)), is_restricted: true };
+			if (id === "UFAIL") throw new Error("ratelimited");
+			return await usersInfo(id);
+		};
+		f.api.history.C1 = [
+			{ type: "message", user: "UFAIL", ts: "1700000050.000003", text: "unknown" },
+			{ type: "message", user: "UGUEST", ts: "1700000050.000002", text: "guest" },
+			{ type: "message", user: "U1", ts: "1700000040.000001", text: "member" },
+		];
+		expect(await f.recoverMissedMessages()).toBe(true);
+		const trust = Object.fromEntries(
+			f.client.requests
+				.filter((request) => request.verb === "chat.send")
+				.map((request) => {
+					const params = request.params as { text: string; engagement: { trust?: string } };
+					return [params.text, params.engagement.trust];
+				}),
+		);
+		expect(trust).toEqual({ member: "member", guest: "guest", unknown: "unverified" });
 	} finally {
 		f.socket.stop();
 		f.recovery.stop();

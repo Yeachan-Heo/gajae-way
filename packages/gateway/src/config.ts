@@ -174,6 +174,24 @@ export interface GatewayConfigFile {
 	readonly sqlite?: { readonly journalMode?: SqliteJournalMode };
 	/** Chat notices around a stack restart; on unless `enabled` is false. */
 	readonly restartNotice?: RestartNoticeConfig;
+	/** Platform-specific policies. */
+	readonly slack?: SlackGatewayPolicy;
+}
+
+export interface SlackGatewayPolicy {
+	/** Guest account policy (is_restricted, is_ultra_restricted, is_stranger). */
+	readonly guestPolicy?: {
+		/** How to handle guest DMs: "drop" or "allow". Default: "drop". */
+		dm?: "drop" | "allow";
+		/** How to handle guests in channels: "drop" or "allow". Default: "allow" (see #899 for restricted mode). */
+		channel?: "drop" | "allow";
+		/** User IDs to always deny. */
+		denyUsers?: readonly string[];
+		/** User IDs to always allow despite being guests. */
+		allowUsers?: readonly string[];
+		/** Fail closed when users.info fails. Default: true. */
+		failClosed?: boolean;
+	};
 }
 
 export interface RestartNoticeConfig {
@@ -770,6 +788,31 @@ function parseDmPolicy(value: unknown): DmPolicy {
 	return value as DmPolicy;
 }
 
+function parseSlackConfig(value: unknown): SlackGatewayPolicy {
+	if (typeof value !== "object" || value === null || Array.isArray(value))
+		throw new ConfigError("config_invalid", "slack must be an object");
+	const config = value as Record<string, unknown>;
+	const guestPolicy = config.guestPolicy;
+	if (guestPolicy !== undefined) {
+		if (typeof guestPolicy !== "object" || guestPolicy === null || Array.isArray(guestPolicy))
+			throw new ConfigError("config_invalid", "slack.guestPolicy must be an object");
+		const policy = guestPolicy as Record<string, unknown>;
+		if (policy.dm !== undefined && policy.dm !== "drop" && policy.dm !== "allow")
+			throw new ConfigError("config_invalid", "slack.guestPolicy.dm must be 'drop' or 'allow'");
+		if (policy.channel !== undefined && !["drop", "allow"].includes(policy.channel as string))
+			throw new ConfigError("config_invalid", "slack.guestPolicy.channel must be 'drop' or 'allow'");
+		if (policy.denyUsers !== undefined) {
+			parseStringArray(policy.denyUsers, "slack.guestPolicy.denyUsers");
+		}
+		if (policy.allowUsers !== undefined) {
+			parseStringArray(policy.allowUsers, "slack.guestPolicy.allowUsers");
+		}
+		if (policy.failClosed !== undefined && typeof policy.failClosed !== "boolean")
+			throw new ConfigError("config_invalid", "slack.guestPolicy.failClosed must be a boolean");
+	}
+	return config as SlackGatewayPolicy;
+}
+
 function parseGjcConfig(value: unknown): { readonly agentDir?: string } | undefined {
 	if (value === undefined) return undefined;
 	const input = requireObject(value, "gjc");
@@ -866,6 +909,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(parseInterimSpeech(input.interimSpeech) ? { interimSpeech: parseInterimSpeech(input.interimSpeech) } : {}),
 		...(input.memory === undefined ? {} : { memory: parseMemory(input.memory) }),
 		...(parseGjcConfig(input.gjc) ? { gjc: parseGjcConfig(input.gjc) } : {}),
+		...(input.slack === undefined ? {} : { slack: parseSlackConfig(input.slack) }),
 	};
 }
 
@@ -989,6 +1033,7 @@ export const RELOADABLE_FIELDS = [
 	"handoffTargets",
 	"sessions",
 	"restartNotice",
+	"slack",
 ] as const;
 
 /** Fields bound to live startup resources and therefore changeable only by restart. */

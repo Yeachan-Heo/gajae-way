@@ -220,6 +220,34 @@ export interface EngagementDecision {
 	readonly botAudienceAdmission: boolean;
 }
 
+/** Decision result of Slack guest policy check: drop or allow. */
+export type GuestPolicyDecision = "drop" | "allow";
+
+/**
+ * Slack guest policy. Only Slack origins carry a trust the adapter verified. A
+ * guest, or an unverified author when `failClosed` is not false, is dropped in DMs
+ * and handled per `channel` elsewhere; the owner and `allowUsers` are never
+ * dropped, and `denyUsers` always are. Defaults: dm=drop, channel=allow.
+ */
+export function checkSlackGuestPolicy(
+	engagement: EngagementContext | undefined,
+	origin: Pick<OriginRef, "platform" | "kind">,
+	config: GatewayConfig,
+	connection?: { readonly platformOwnerIds?: readonly string[]; readonly platformOwnerPlatform?: string },
+): GuestPolicyDecision {
+	if (origin.platform !== "slack") return "allow";
+	const authorId = engagement?.authorId;
+	if (authorId === undefined || ownerIdMatches(authorId, config, connection, origin.platform)) return "allow";
+	const policy = config.slack?.guestPolicy;
+	if (policy?.denyUsers?.includes(authorId)) return "drop";
+	if (policy?.allowUsers?.includes(authorId)) return "allow";
+	const trust = engagement?.trust;
+	const isTrustMissing = trust === undefined && policy?.failClosed !== false;
+	const guest = trust === "guest" || (trust === "unverified" && policy?.failClosed !== false) || isTrustMissing;
+	if (!guest) return "allow";
+	return origin.kind === "dm" ? (policy?.dm ?? "drop") : (policy?.channel ?? "allow");
+}
+
 export function decideEngagement(
 	origin: Pick<OriginRef, "platform" | "kind" | "conversationId" | "parentId">,
 	engagement: EngagementContext | undefined,
@@ -242,6 +270,14 @@ export function decideEngagement(
 	// included, because it is a statement about the message, not the author.
 	if (engagement?.contextOnly === true) return { engaged: false, botAudienceAdmission: false };
 	if (origin.platform === "loopback") return { engaged: true, botAudienceAdmission: false };
+	// Check Slack guest policy: drops block the turn entirely
+	const guestDecision = checkSlackGuestPolicy(engagement, origin, config, connection);
+	if (guestDecision === "drop") {
+		const authorId = engagement?.authorId ?? "unknown";
+		const place = `slack ${origin.kind}${origin.kind === "channel" ? ` #${origin.conversationId}` : ""}`;
+		console.info(`gateway guest-policy drop authorId=${authorId} origin=${place} reason=guest_${origin.kind}_policy`);
+		return { engaged: false, botAudienceAdmission: false };
+	}
 	if (origin.kind === "dm")
 		return { engaged: dmEngaged(engagement, config, connection, origin), botAudienceAdmission: false };
 	if (mutedThread && !threadMuteAddressed(engagement, origin, config))

@@ -3412,6 +3412,8 @@ async function createInboundTurnLifecycle(
 				speechGated?: boolean;
 				/** Present when this row is a relayed handoff from another conversation (#72). */
 				handoff?: unknown;
+				/** Trust classification: "guest" for Slack is_restricted/is_ultra_restricted/is_stranger users. */
+				trust?: string;
 			})
 		: undefined;
 	const incomingHandoff = readHandoffProvenance(engagement?.handoff);
@@ -3583,8 +3585,9 @@ async function createInboundTurnLifecycle(
 	// context may not hold it. The bootstrap and a changed-AGENTS.md section are
 	// one-shot and ride their own send.
 	const sessionBootstrap = [bootstrap?.text, agentsMdSection].filter(Boolean).join("\n\n");
+	const baseSystemPreamble = await runtime.persona.systemPreamble();
 	const systemPreamble = [
-		await runtime.persona.systemPreamble(),
+		baseSystemPreamble,
 		currentConversationNotice(origin),
 		ATTACHMENT_SCOPE_NOTICE,
 		ACTION_GUARD_SYSTEM_NOTICE,

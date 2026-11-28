@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { resolveSlackDisplayName, SlackDirectory, type SlackUserLike } from "../src/author";
+import { resolveSlackDisplayName, SlackDirectory, type SlackUserLike, slackAuthorTrust } from "../src/author";
 
 test("Slack display names skip blanks at each precedence level", () => {
 	const user = {
@@ -85,4 +85,54 @@ test("Slack priming during a lookup preserves the fresher payload", async () => 
 	resolve({ id: "U1", name: "stale" });
 	expect((await request)?.name).toBe("fresh");
 	expect(directory.userName("U1")).toBe("fresh");
+});
+
+test("author trust: guests and Slack Connect strangers are guests, a failed lookup is unverified", () => {
+	expect(slackAuthorTrust({ id: "U1" })).toBe("member");
+	expect(slackAuthorTrust({ id: "U1", is_restricted: true })).toBe("guest");
+	expect(slackAuthorTrust({ id: "U1", is_ultra_restricted: true })).toBe("guest");
+	expect(slackAuthorTrust({ id: "U1", is_stranger: true })).toBe("guest");
+	expect(slackAuthorTrust(undefined)).toBe("unverified");
+});
+
+test("trust classification cache has a bounded TTL separate from display-name caching", async () => {
+	let now = 0;
+	let calls = 0;
+	const TRUST_TTL_MS = 3600_000; // 1 hour
+	const directory = new SlackDirectory(
+		{
+			async usersInfo(id) {
+				calls++;
+				if (calls === 1) return { id, name: "user", is_restricted: false }; // First call: member
+				return { id, name: "user", is_restricted: true }; // After TTL: guest
+			},
+			conversationsInfo: async (id) => ({ id }),
+		},
+		512,
+		() => now,
+	);
+
+	// First lookup: member with no restriction
+	let user = await directory.user("U1");
+	expect(user?.is_restricted).toBe(false);
+	expect(slackAuthorTrust(user)).toBe("member");
+	expect(calls).toBe(1);
+
+	// Within TTL: cached, no fresh fetch
+	now = TRUST_TTL_MS - 1;
+	user = await directory.user("U1");
+	expect(user?.is_restricted).toBe(false);
+	expect(calls).toBe(1); // No additional call
+
+	// After TTL: triggers fresh fetch to pick up trust changes
+	now = TRUST_TTL_MS;
+	user = await directory.user("U1");
+	expect(user?.is_restricted).toBe(true); // Status changed on Slack
+	expect(slackAuthorTrust(user)).toBe("guest");
+	expect(calls).toBe(2); // Fresh call after TTL
+
+	// Display name caching is independent: older primed values don't expire
+	directory.prime({ id: "U2", name: "primed", is_restricted: false });
+	now = TRUST_TTL_MS + 10_000_000; // Far beyond any cache expiry
+	expect(directory.userName("U2")).toBe("primed"); // Still available
 });

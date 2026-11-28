@@ -203,6 +203,12 @@ export interface EngagementContext {
 	 * real mention; the gateway still applies the configured mode and audience.
 	 */
 	readonly replyTo?: ReplyContext;
+	/**
+	 * Author trust set by the Slack adapter and honored only for Slack origins: "guest"
+	 * for Slack guests and Slack Connect strangers, "unverified" when the author lookup
+	 * failed. Subject to the gateway's `slack.guestPolicy`.
+	 */
+	readonly trust?: "member" | "guest" | "unverified";
 }
 
 export interface PromptImage {
