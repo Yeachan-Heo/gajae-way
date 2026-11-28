@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.5.3] - Unreleased
+## [0.5.3] - 2026-11-29
 
 ### Fixes
 - **gateway**: Include the thread root in a thread's first turn context (#890, #891), and keep a thread open when its root's mention arrived as an edit (#888)
